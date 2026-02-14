@@ -1,0 +1,72 @@
+{
+  "version": "1.0",
+  "project": "smoke-test",
+  "branchName": "test/smoke",
+  "description": "Minimal 3-task PRD for smoke testing the loop engine. Tasks simulate a simple feature: create module, add types, write tests.",
+  "priorityPhilosophy": {
+    "description": "Simple priority ordering",
+    "hierarchy": ["1. Implementation", "2. Testing"]
+  },
+  "globalAcceptanceCriteria": {
+    "description": "Smoke test criteria",
+    "criteria": ["All tasks complete successfully"]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-5: Fix immediately"
+    }
+  },
+  "userStories": [
+    {
+      "id": "SMOKE-001",
+      "title": "Create module structure",
+      "description": "Set up the module file and export from lib.rs.",
+      "acceptanceCriteria": [
+        "Module file created",
+        "Exported from lib.rs"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "Foundation task, no dependencies.",
+      "touchesFiles": ["src/feature/mod.rs", "src/lib.rs"],
+      "dependsOn": [],
+      "synergyWith": ["SMOKE-002"],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SMOKE-002",
+      "title": "Add data types",
+      "description": "Define core structs and enums for the feature.",
+      "acceptanceCriteria": [
+        "Item struct defined",
+        "ItemKind enum defined"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Depends on module structure from SMOKE-001.",
+      "touchesFiles": ["src/feature/types.rs", "src/feature/mod.rs"],
+      "dependsOn": ["SMOKE-001"],
+      "synergyWith": ["SMOKE-001", "SMOKE-003"],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "SMOKE-003",
+      "title": "Write unit tests",
+      "description": "Add tests for the data types.",
+      "acceptanceCriteria": [
+        "Tests for Item creation",
+        "Tests for ItemKind variants"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Depends on types from SMOKE-002. Has file overlap with SMOKE-002.",
+      "touchesFiles": ["src/feature/types.rs", "tests/feature_tests.rs"],
+      "dependsOn": ["SMOKE-002"],
+      "synergyWith": ["SMOKE-002"],
+      "batchWith": [],
+      "conflictsWith": []
+    }
+  ]
+}

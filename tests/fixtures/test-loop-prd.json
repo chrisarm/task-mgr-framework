@@ -1,0 +1,63 @@
+{
+  "version": "1.0",
+  "project": "e2e-loop-test",
+  "branchName": "test/e2e-loop",
+  "description": "Minimal 3-task PRD for E2E loop integration testing.",
+  "priorityPhilosophy": {
+    "description": "Simple priority ordering",
+    "hierarchy": ["1. Tasks"]
+  },
+  "globalAcceptanceCriteria": {
+    "description": "Test criteria",
+    "criteria": ["All tasks pass"]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Fix immediately"
+    }
+  },
+  "userStories": [
+    {
+      "id": "LOOP-001",
+      "title": "First task",
+      "description": "The first task to complete.",
+      "acceptanceCriteria": ["Task completes successfully"],
+      "priority": 1,
+      "passes": false,
+      "notes": "No dependencies.",
+      "touchesFiles": ["src/first.rs"],
+      "dependsOn": [],
+      "synergyWith": ["LOOP-002"],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "LOOP-002",
+      "title": "Second task",
+      "description": "The second task, depends on first.",
+      "acceptanceCriteria": ["Task completes successfully"],
+      "priority": 2,
+      "passes": false,
+      "notes": "Depends on LOOP-001.",
+      "touchesFiles": ["src/second.rs"],
+      "dependsOn": ["LOOP-001"],
+      "synergyWith": ["LOOP-001"],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "LOOP-003",
+      "title": "Third task",
+      "description": "The third and final task.",
+      "acceptanceCriteria": ["Task completes successfully"],
+      "priority": 3,
+      "passes": false,
+      "notes": "Depends on LOOP-002.",
+      "touchesFiles": ["src/third.rs"],
+      "dependsOn": ["LOOP-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+[package]
+name = "task-mgr"
+version = "0.1.0"
+edition = "2021"
+description = "A standalone CLI tool for managing AI agent loop tasks with SQLite as working state"
+license = "MIT"
+
+[dependencies]
+# CLI framework
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Database
+# Note: bundled includes FTS5 by default in SQLite 3.9+
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time and IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "1"
+
+# File locking
+fs2 = "0.4"
+
+# Man page generation
+clap_mangen = "0.2"
+
+# Async runtime (used for loop engine orchestration)
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# Signal handling (OS-level, works even when tokio runtime is blocked)
+signal-hook = "0.3"
+
+# POSIX process control (kill(2) for child termination)
+libc = "0.2"
+
+# HTTP client (sync, for OAuth + usage API)
+ureq = { version = "2", features = ["json"] }
+
+# Hashing (stale detection)
+md5 = "0.7"
+
+# Environment variable loading
+dotenvy = "0.15"
+
+# Glob expansion (batch mode)
+globwalk = "0.9"
+
+# Atomic file writes (credentials, deadlines)
+tempfile = "3"
+
+# Pattern matching (context scanner, detection engine)
+regex = "1"
+hostname = "0.4.2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

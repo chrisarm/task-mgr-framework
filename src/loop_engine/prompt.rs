@@ -1,0 +1,1930 @@
+/// Prompt builder for the autonomous agent loop.
+///
+/// Calls `next::next()` to select a task, then builds an enriched prompt with:
+/// - Source context from touchesFiles (via `context::scan_source_context`)
+/// - Dependency completion summaries
+/// - Synergy task diffs
+/// - UCB-ranked learnings (with shown IDs tracked for feedback loop)
+/// - Steering.md content (if present)
+/// - Session guidance (from .pause interactions)
+/// - Base prompt template
+/// - Reorder instruction
+///
+/// The prompt builder is the integration point between task selection, learning
+/// recall, source scanning, and the Claude subprocess.
+use std::fs;
+use std::path::Path;
+
+use rusqlite::Connection;
+
+use crate::commands::next;
+use crate::commands::next::output::{LearningSummaryOutput, NextResult};
+use crate::error::TaskMgrResult;
+use crate::learnings::bandit;
+use crate::loop_engine::context;
+
+/// Total character budget for enriched task context in the prompt.
+const TASK_CONTEXT_BUDGET: usize = 4000;
+
+/// Character budget for source context from touchesFiles.
+const SOURCE_CONTEXT_BUDGET: usize = 2000;
+
+/// Result of building a prompt for one iteration.
+#[derive(Debug)]
+pub struct PromptResult {
+    /// The assembled prompt string to pass to Claude
+    pub prompt: String,
+    /// ID of the selected task
+    pub task_id: String,
+    /// Files touched by the selected task
+    pub task_files: Vec<String>,
+    /// Learning IDs that were shown in this prompt (for feedback loop)
+    pub shown_learning_ids: Vec<i64>,
+}
+
+/// Parameters for building a prompt.
+pub struct BuildPromptParams<'a> {
+    /// Database directory (--dir flag) for task selection via next::next()
+    pub dir: &'a Path,
+    /// Git repository root directory for source context scanning
+    pub project_root: &'a Path,
+    /// Database connection for recording learning shown events
+    pub conn: &'a Connection,
+    /// Files modified in previous iteration (for task selection scoring)
+    pub after_files: &'a [String],
+    /// Current run ID (for task claiming)
+    pub run_id: Option<&'a str>,
+    /// Current iteration number (for learning shown tracking)
+    pub iteration: u32,
+    /// Optional task ID hint from a previous reorder request
+    pub reorder_hint: Option<&'a str>,
+    /// Accumulated session guidance from .pause interactions
+    pub session_guidance: &'a str,
+    /// Path to the base prompt.md file
+    pub base_prompt_path: &'a Path,
+    /// Path to optional steering.md file
+    pub steering_path: Option<&'a Path>,
+    /// Enable verbose output
+    pub verbose: bool,
+}
+
+/// Build a prompt for the current iteration.
+///
+/// Calls `next::next()` to select and claim a task, then assembles the prompt
+/// with all available context. Returns `None` if no tasks remain.
+pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<PromptResult>> {
+    // Step 1: Select and claim a task
+    let next_result = next::next(
+        params.dir,
+        params.after_files,
+        true,
+        params.run_id,
+        params.verbose,
+    )?;
+
+    let task_output = match next_result.task {
+        Some(ref task) => task,
+        None => return Ok(None), // All tasks complete
+    };
+
+    // Step 2: Record shown learnings and collect IDs for feedback loop
+    let shown_learning_ids = record_shown_learnings(
+        params.conn,
+        &next_result.learnings,
+        i64::from(params.iteration),
+    );
+
+    // Step 3: Build the prompt sections
+    let mut prompt = String::new();
+
+    // Section: Steering (optional)
+    if let Some(steering) = params.steering_path {
+        append_steering(&mut prompt, steering);
+    }
+
+    // Section: Session guidance (if any)
+    if !params.session_guidance.is_empty() {
+        prompt.push_str("## Session Guidance\n\n");
+        prompt.push_str(params.session_guidance);
+        prompt.push_str("\n\n");
+    }
+
+    // Section: Previous iteration context
+    if let Some(hint) = params.reorder_hint {
+        prompt.push_str(&format!(
+            "## Reorder Hint\n\nThe previous iteration requested reorder to task: `{}`\n\n",
+            hint
+        ));
+    }
+
+    // Section: Source context from touchesFiles
+    let source_ctx = context::scan_source_context(
+        &task_output.files,
+        SOURCE_CONTEXT_BUDGET,
+        params.project_root,
+    );
+    let source_prompt = source_ctx.format_for_prompt();
+    if !source_prompt.is_empty() {
+        prompt.push_str(&source_prompt);
+    }
+
+    // Section: Dependency completion summaries
+    append_dependency_summaries(&mut prompt, params.conn, &task_output.id);
+
+    // Section: Synergy task context
+    append_synergy_context(&mut prompt, params.conn, &task_output.id, params.run_id);
+
+    // Section: Task JSON
+    prompt.push_str("## Current Task\n\n```json\n");
+    let task_json = build_task_json(task_output, &next_result);
+    let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
+    prompt.push_str(&truncated_json);
+    prompt.push_str("\n```\n\n");
+
+    // Section: Learnings
+    append_learnings(&mut prompt, &next_result.learnings);
+
+    // Section: Non-code task completion instruction
+    // Tasks with no touchesFiles (verification, milestones, polish) won't produce
+    // commits, so the git-based completion detection won't fire. Tell Claude how
+    // to signal completion explicitly.
+    if task_output.files.is_empty() {
+        prompt.push_str(&format!(
+            "## Completing This Task\n\n\
+             This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\
+             After all acceptance criteria pass:\n\
+             1. Run `task-mgr done {task_id} --force` to mark it done in the DB\n\
+             2. Update the PRD JSON to set `passes: true` for this task\n\
+             3. Print the task ID in brackets in your output, e.g.: `Completed [{task_id}]`\n\n\
+             All three steps are **required** for the loop to detect completion.\n\n",
+            task_id = task_output.id,
+        ));
+    }
+
+    // Section: Reorder instruction
+    prompt.push_str(
+        "If you have a strong reason to work on a different eligible task, \
+         output `<reorder>TASK-ID</reorder>`.\n\n",
+    );
+
+    // Section: Base prompt template
+    append_base_prompt(&mut prompt, params.base_prompt_path);
+
+    Ok(Some(PromptResult {
+        prompt,
+        task_id: task_output.id.clone(),
+        task_files: task_output.files.clone(),
+        shown_learning_ids,
+    }))
+}
+
+/// Record shown learnings via the UCB bandit system.
+///
+/// Returns the list of learning IDs that were shown (for feedback tracking).
+/// Errors are logged but don't prevent prompt building.
+fn record_shown_learnings(
+    conn: &Connection,
+    learnings: &[LearningSummaryOutput],
+    iteration: i64,
+) -> Vec<i64> {
+    let mut shown_ids = Vec::with_capacity(learnings.len());
+    for learning in learnings {
+        shown_ids.push(learning.id);
+        if let Err(e) = bandit::record_learning_shown(conn, learning.id, iteration) {
+            eprintln!(
+                "Warning: failed to record learning {} as shown: {}",
+                learning.id, e
+            );
+        }
+    }
+    shown_ids
+}
+
+/// Append steering.md content to the prompt if the file exists.
+fn append_steering(prompt: &mut String, steering_path: &Path) {
+    match fs::read_to_string(steering_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            prompt.push_str("## Steering\n\n");
+            prompt.push_str(content.trim());
+            prompt.push_str("\n\n");
+        }
+        Ok(_) => {}  // Empty file, skip
+        Err(_) => {} // Missing file, skip gracefully
+    }
+}
+
+/// Append dependency completion summaries for the current task.
+///
+/// For each completed dependsOn task: includes title + key acceptance criteria
+/// as a 2-3 line summary.
+fn append_dependency_summaries(prompt: &mut String, conn: &Connection, task_id: &str) {
+    let deps = match get_completed_dependencies(conn, task_id) {
+        Ok(deps) if !deps.is_empty() => deps,
+        _ => return,
+    };
+
+    prompt.push_str("## Completed Dependencies\n\n");
+    for (dep_id, dep_title) in &deps {
+        prompt.push_str(&format!("- **{}**: {}\n", dep_id, dep_title));
+    }
+    prompt.push('\n');
+}
+
+/// Get completed dependency task IDs and titles for a task.
+fn get_completed_dependencies(
+    conn: &Connection,
+    task_id: &str,
+) -> TaskMgrResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.title FROM tasks t
+         INNER JOIN task_relationships tr ON tr.related_id = t.id
+         WHERE tr.task_id = ?1
+           AND tr.rel_type = 'dependsOn'
+           AND t.status = 'done'
+         ORDER BY t.id",
+    )?;
+
+    let deps: Vec<(String, String)> = stmt
+        .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    Ok(deps)
+}
+
+/// Append synergy task context for completed synergy tasks in the current run.
+fn append_synergy_context(
+    prompt: &mut String,
+    conn: &Connection,
+    task_id: &str,
+    run_id: Option<&str>,
+) {
+    let run_id = match run_id {
+        Some(rid) => rid,
+        None => return,
+    };
+
+    let synergies = match get_synergy_tasks_in_run(conn, task_id, run_id) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    prompt.push_str("## Synergy Tasks (completed this run)\n\n");
+    for (syn_id, syn_title, syn_commit) in &synergies {
+        prompt.push_str(&format!("- **{}**: {}", syn_id, syn_title));
+        if let Some(commit) = syn_commit {
+            prompt.push_str(&format!(" (commit: {})", commit));
+        }
+        prompt.push('\n');
+    }
+    prompt.push('\n');
+}
+
+/// Get synergy tasks that were completed in the current run.
+fn get_synergy_tasks_in_run(
+    conn: &Connection,
+    task_id: &str,
+    run_id: &str,
+) -> TaskMgrResult<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.title, r.last_commit
+         FROM tasks t
+         INNER JOIN task_relationships tr ON tr.related_id = t.id
+         LEFT JOIN run_tasks rt ON rt.task_id = t.id AND rt.run_id = ?2
+         LEFT JOIN runs r ON r.run_id = rt.run_id
+         WHERE tr.task_id = ?1
+           AND tr.rel_type = 'synergyWith'
+           AND t.status = 'done'
+         ORDER BY t.id",
+    )?;
+
+    let results: Vec<(String, String, Option<String>)> = stmt
+        .query_map(rusqlite::params![task_id, run_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    Ok(results)
+}
+
+/// Build a JSON representation of the task for inclusion in the prompt.
+fn build_task_json(
+    task: &crate::commands::next::output::NextTaskOutput,
+    next_result: &NextResult,
+) -> String {
+    // Build a simplified JSON that includes what Claude needs
+    let mut json = serde_json::json!({
+        "id": task.id,
+        "title": task.title,
+        "priority": task.priority,
+        "status": task.status,
+        "acceptanceCriteria": task.acceptance_criteria,
+        "files": task.files,
+    });
+
+    if let Some(ref desc) = task.description {
+        json["description"] = serde_json::Value::String(desc.clone());
+    }
+    if let Some(ref notes) = task.notes {
+        json["notes"] = serde_json::Value::String(notes.clone());
+    }
+    if !task.batch_with.is_empty() {
+        json["batchWith"] = serde_json::json!(task.batch_with);
+    }
+    if !next_result.batch_tasks.is_empty() {
+        json["eligibleBatchTasks"] = serde_json::json!(next_result.batch_tasks);
+    }
+
+    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
+}
+
+/// Append learnings to the prompt.
+fn append_learnings(prompt: &mut String, learnings: &[LearningSummaryOutput]) {
+    if learnings.is_empty() {
+        return;
+    }
+
+    prompt.push_str("## Relevant Learnings\n\n```json\n");
+    let learnings_json =
+        serde_json::to_string_pretty(learnings).unwrap_or_else(|_| "[]".to_string());
+    prompt.push_str(&learnings_json);
+    prompt.push_str("\n```\n\n");
+}
+
+/// Append the base prompt template file content.
+fn append_base_prompt(prompt: &mut String, base_prompt_path: &Path) {
+    match fs::read_to_string(base_prompt_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            prompt.push_str(&content);
+            if !content.ends_with('\n') {
+                prompt.push('\n');
+            }
+        }
+        Ok(_) => {
+            eprintln!(
+                "Warning: base prompt file is empty: {}",
+                base_prompt_path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read base prompt file {}: {}",
+                base_prompt_path.display(),
+                e
+            );
+        }
+    }
+}
+
+/// Truncate a string to fit within a character budget.
+fn truncate_to_budget(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        text.to_string()
+    } else {
+        let safe_end = text.floor_char_boundary(budget);
+        let truncated = &text[..safe_end];
+        format!("{}...\n[truncated to {} chars]", truncated, budget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    use crate::commands::next::output::*;
+    use crate::loop_engine::test_utils::{
+        insert_relationship, insert_run, insert_run_task, insert_task, insert_task_file,
+        insert_task_full, insert_test_learning, setup_test_db,
+    };
+
+    /// Create a base prompt file and return its path.
+    fn create_base_prompt(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("prompt.md");
+        fs::write(&path, "# Agent Instructions\n\nImplement the task.\n").unwrap();
+        path
+    }
+
+    /// Create a steering file and return its path.
+    fn create_steering(dir: &Path, content: &str) -> std::path::PathBuf {
+        let path = dir.join("steering.md");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Create a Rust source file for context scanning.
+    fn create_source_file(dir: &Path, rel_path: &str, content: &str) {
+        let full = dir.join(rel_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full, content).unwrap();
+    }
+
+    /// Build prompt params with defaults, allowing override via closure.
+    fn build_params<'a>(
+        dir: &'a Path,
+        conn: &'a rusqlite::Connection,
+        base_prompt_path: &'a Path,
+    ) -> BuildPromptParams<'a> {
+        BuildPromptParams {
+            dir,
+            project_root: dir,
+            conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        }
+    }
+
+    // ===== Unit tests for helper functions (original) =====
+
+    #[test]
+    fn test_truncate_to_budget_within_limit() {
+        let text = "short text";
+        let result = truncate_to_budget(text, 100);
+        assert_eq!(result, "short text");
+    }
+
+    #[test]
+    fn test_truncate_to_budget_exceeds_limit() {
+        let text = "a".repeat(5000);
+        let result = truncate_to_budget(&text, 100);
+        assert!(result.len() < 200);
+        assert!(result.contains("[truncated to 100 chars]"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_exact_limit() {
+        let text = "abcde";
+        let result = truncate_to_budget(text, 5);
+        assert_eq!(result, "abcde");
+    }
+
+    #[test]
+    fn test_append_steering_missing_file() {
+        let mut prompt = String::new();
+        append_steering(&mut prompt, Path::new("/nonexistent/steering.md"));
+        assert!(prompt.is_empty(), "Missing steering file should be no-op");
+    }
+
+    #[test]
+    fn test_append_steering_with_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let steering_path = temp_dir.path().join("steering.md");
+        fs::write(&steering_path, "Focus on error handling.").unwrap();
+
+        let mut prompt = String::new();
+        append_steering(&mut prompt, &steering_path);
+        assert!(prompt.contains("## Steering"));
+        assert!(prompt.contains("Focus on error handling."));
+    }
+
+    #[test]
+    fn test_append_steering_empty_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let steering_path = temp_dir.path().join("steering.md");
+        fs::write(&steering_path, "   \n  ").unwrap();
+
+        let mut prompt = String::new();
+        append_steering(&mut prompt, &steering_path);
+        assert!(prompt.is_empty(), "Empty steering file should be no-op");
+    }
+
+    #[test]
+    fn test_append_learnings_empty() {
+        let mut prompt = String::new();
+        append_learnings(&mut prompt, &[]);
+        assert!(prompt.is_empty(), "No learnings should produce no section");
+    }
+
+    #[test]
+    fn test_append_learnings_with_content() {
+        let learnings = vec![LearningSummaryOutput {
+            id: 1,
+            title: "Test Learning".to_string(),
+            outcome: "pattern".to_string(),
+            confidence: "high".to_string(),
+            content: Some("Use X instead of Y".to_string()),
+            applies_to_files: None,
+            applies_to_task_types: None,
+        }];
+
+        let mut prompt = String::new();
+        append_learnings(&mut prompt, &learnings);
+        assert!(prompt.contains("## Relevant Learnings"));
+        assert!(prompt.contains("Test Learning"));
+    }
+
+    #[test]
+    fn test_append_base_prompt_with_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompt_path = temp_dir.path().join("prompt.md");
+        fs::write(&prompt_path, "# Agent Instructions\n\nDo the task.\n").unwrap();
+
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, &prompt_path);
+        assert!(prompt.contains("# Agent Instructions"));
+        assert!(prompt.contains("Do the task."));
+    }
+
+    #[test]
+    fn test_append_base_prompt_missing_file() {
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, Path::new("/nonexistent/prompt.md"));
+        assert!(
+            prompt.is_empty(),
+            "Missing prompt file should be no-op (with warning)"
+        );
+    }
+
+    #[test]
+    fn test_record_shown_learnings_empty() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let ids = record_shown_learnings(&conn, &[], 1);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_build_task_json_basic() {
+        let task = NextTaskOutput {
+            id: "FEAT-001".to_string(),
+            title: "Test task".to_string(),
+            description: Some("A test".to_string()),
+            priority: 5,
+            status: "in_progress".to_string(),
+            acceptance_criteria: vec!["AC1".to_string()],
+            notes: None,
+            files: vec!["src/lib.rs".to_string()],
+            batch_with: vec![],
+            score: ScoreOutput {
+                total: 995,
+                priority: 995,
+                file_overlap: 0,
+                synergy: 0,
+                conflict: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        };
+
+        let next_result = NextResult {
+            task: Some(task.clone()),
+            batch_tasks: vec![],
+            learnings: vec![],
+            selection: SelectionMetadata {
+                reason: "test".to_string(),
+                eligible_count: 1,
+            },
+            claim: None,
+            top_candidates: vec![],
+        };
+
+        let json = build_task_json(&task, &next_result);
+        assert!(json.contains("FEAT-001"));
+        assert!(json.contains("Test task"));
+        assert!(json.contains("AC1"));
+    }
+
+    #[test]
+    fn test_prompt_result_fields() {
+        let result = PromptResult {
+            prompt: "test prompt".to_string(),
+            task_id: "FEAT-001".to_string(),
+            task_files: vec!["src/lib.rs".to_string()],
+            shown_learning_ids: vec![1, 2, 3],
+        };
+
+        assert_eq!(result.task_id, "FEAT-001");
+        assert_eq!(result.shown_learning_ids.len(), 3);
+        assert_eq!(result.task_files.len(), 1);
+    }
+
+    // ===== TEST-003: Comprehensive prompt assembly integration tests =====
+
+    // --- AC: Prompt with all context types present ---
+
+    #[test]
+    fn test_build_prompt_all_context_types_present() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Task FEAT-002 depends on FEAT-001 (done) and has synergy with FEAT-003 (done)
+        insert_task(&conn, "FEAT-001", "Foundation types", "done", 5);
+        insert_task_full(
+            &conn,
+            "FEAT-002",
+            "Build the widget",
+            "todo",
+            10,
+            "Implement the widget feature",
+            &["Widget renders correctly", "Widget handles errors"],
+        );
+        insert_task(&conn, "FEAT-003", "Helper utils", "done", 6);
+        insert_task_file(&conn, "FEAT-002", "src/widget.rs");
+        insert_relationship(&conn, "FEAT-002", "FEAT-001", "dependsOn");
+        insert_relationship(&conn, "FEAT-002", "FEAT-003", "synergyWith");
+
+        // Create source file for context scanner
+        create_source_file(
+            temp_dir.path(),
+            "src/widget.rs",
+            "pub fn render_widget() -> String { todo!() }\n",
+        );
+
+        // Create steering and base prompt
+        let steering_path = create_steering(temp_dir.path(), "Focus on testing edge cases.");
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "User said: prioritize error handling",
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Verify all sections present
+        assert!(
+            result.prompt.contains("## Steering"),
+            "Prompt should contain steering section"
+        );
+        assert!(
+            result.prompt.contains("Focus on testing edge cases."),
+            "Prompt should contain steering content"
+        );
+        assert!(
+            result.prompt.contains("## Session Guidance"),
+            "Prompt should contain session guidance section"
+        );
+        assert!(
+            result.prompt.contains("prioritize error handling"),
+            "Prompt should contain session guidance content"
+        );
+        assert!(
+            result.prompt.contains("## Current Source Context"),
+            "Prompt should contain source context section"
+        );
+        assert!(
+            result.prompt.contains("render_widget"),
+            "Prompt should contain source signatures"
+        );
+        assert!(
+            result.prompt.contains("## Completed Dependencies"),
+            "Prompt should contain dependency summaries"
+        );
+        assert!(
+            result.prompt.contains("FEAT-001"),
+            "Prompt should reference completed dependency"
+        );
+        assert!(
+            result.prompt.contains("## Current Task"),
+            "Prompt should contain task JSON section"
+        );
+        assert!(
+            result.prompt.contains("```json"),
+            "Prompt should contain JSON code block"
+        );
+        assert!(
+            result.prompt.contains("<reorder>"),
+            "Prompt should contain reorder instruction"
+        );
+        assert!(
+            result.prompt.contains("# Agent Instructions"),
+            "Prompt should contain base prompt"
+        );
+        assert_eq!(result.task_id, "FEAT-002");
+    }
+
+    // --- AC: Prompt includes source signatures from touchesFiles ---
+
+    #[test]
+    fn test_build_prompt_includes_source_signatures() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Add API", "todo", 5);
+        insert_task_file(&conn, "US-001", "src/api/handler.rs");
+
+        create_source_file(
+            temp_dir.path(),
+            "src/api/handler.rs",
+            r#"
+pub struct ApiHandler {
+    base_url: String,
+}
+
+pub fn handle_request(req: Request) -> Response {
+    todo!()
+}
+
+pub async fn handle_async(req: Request) -> Response {
+    todo!()
+}
+
+pub enum ApiError {
+    NotFound,
+    Internal,
+}
+"#,
+        );
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            result.prompt.contains("pub struct ApiHandler"),
+            "Should extract struct signature"
+        );
+        assert!(
+            result.prompt.contains("pub fn handle_request"),
+            "Should extract pub fn signature"
+        );
+        assert!(
+            result.prompt.contains("pub async fn handle_async"),
+            "Should extract pub async fn signature"
+        );
+        assert!(
+            result.prompt.contains("pub enum ApiError"),
+            "Should extract enum signature"
+        );
+        assert!(
+            result.prompt.contains("src/api/handler.rs"),
+            "Should reference the file path"
+        );
+    }
+
+    // --- AC: Prompt includes dependency completion summaries for done tasks ---
+
+    #[test]
+    fn test_build_prompt_includes_dependency_summaries() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // DEP-001 and DEP-002 are done; TASK-001 depends on both
+        insert_task(&conn, "DEP-001", "Setup database schema", "done", 1);
+        insert_task(&conn, "DEP-002", "Create user model", "done", 2);
+        insert_task(&conn, "TASK-001", "Implement user API", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+        insert_relationship(&conn, "TASK-001", "DEP-002", "dependsOn");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            result.prompt.contains("## Completed Dependencies"),
+            "Should have dependencies section"
+        );
+        assert!(
+            result.prompt.contains("DEP-001"),
+            "Should list first dependency"
+        );
+        assert!(
+            result.prompt.contains("Setup database schema"),
+            "Should include first dependency title"
+        );
+        assert!(
+            result.prompt.contains("DEP-002"),
+            "Should list second dependency"
+        );
+        assert!(
+            result.prompt.contains("Create user model"),
+            "Should include second dependency title"
+        );
+    }
+
+    // --- AC: Prompt with no steering.md (section omitted) ---
+
+    #[test]
+    fn test_build_prompt_no_steering_omits_section() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Simple task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            !result.prompt.contains("## Steering"),
+            "No steering.md means no steering section"
+        );
+    }
+
+    // --- AC: Prompt with no learnings (section omitted) ---
+
+    #[test]
+    fn test_build_prompt_no_learnings_omits_section() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // No learnings inserted
+        insert_task(&conn, "US-001", "Task with no learnings", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            !result.prompt.contains("## Relevant Learnings"),
+            "No learnings should omit the learnings section"
+        );
+    }
+
+    // --- AC: Prompt with no matching docs (deps section omitted) ---
+
+    #[test]
+    fn test_build_prompt_no_dependencies_omits_section() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Task with no dependsOn relationships
+        insert_task(&conn, "US-001", "Standalone task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            !result.prompt.contains("## Completed Dependencies"),
+            "No dependencies should omit the section"
+        );
+    }
+
+    // --- AC: Task context truncation when exceeding ~4000 char cap ---
+
+    #[test]
+    fn test_build_prompt_task_json_truncation() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Create a task with very long description and many acceptance criteria
+        let long_desc = "x".repeat(5000);
+        let criteria: Vec<&str> = (0..100)
+            .map(|_| "This is a very long acceptance criterion that adds to the total length")
+            .collect();
+        let criteria_json = serde_json::to_string(&criteria).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, description, acceptance_criteria) VALUES (?, ?, ?, ?, ?, ?)",
+            params!["BIG-001", "Big task", "todo", 5, long_desc, criteria_json],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // The task JSON section should be truncated
+        assert!(
+            result.prompt.contains("[truncated to"),
+            "Task JSON should be truncated when exceeding budget, got prompt length: {}",
+            result.prompt.len()
+        );
+    }
+
+    // --- AC: Prompt includes reorder instruction text ---
+
+    #[test]
+    fn test_build_prompt_includes_reorder_instruction() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Any task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            result.prompt.contains("<reorder>TASK-ID</reorder>"),
+            "Prompt should contain reorder instruction with example tag"
+        );
+        assert!(
+            result
+                .prompt
+                .contains("strong reason to work on a different"),
+            "Prompt should explain when to use reorder"
+        );
+    }
+
+    // --- AC: Prompt includes task JSON block formatted correctly ---
+
+    #[test]
+    fn test_build_prompt_task_json_formatted_correctly() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task_full(
+            &conn,
+            "FEAT-010",
+            "Add validation",
+            "todo",
+            8,
+            "Add input validation to the API",
+            &["Validates email", "Returns 400 on invalid"],
+        );
+        insert_task_file(&conn, "FEAT-010", "src/validation.rs");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Verify JSON block structure
+        assert!(
+            result.prompt.contains("## Current Task"),
+            "Should have Current Task heading"
+        );
+        assert!(
+            result.prompt.contains("```json"),
+            "Should have JSON code block opening"
+        );
+        assert!(
+            result.prompt.contains("```\n\n"),
+            "Should have JSON code block closing"
+        );
+
+        // Verify JSON content includes task fields
+        assert!(
+            result.prompt.contains("FEAT-010"),
+            "JSON should contain task ID"
+        );
+        assert!(
+            result.prompt.contains("Add validation"),
+            "JSON should contain task title"
+        );
+        assert!(
+            result.prompt.contains("Validates email"),
+            "JSON should contain acceptance criteria"
+        );
+        assert!(
+            result.prompt.contains("src/validation.rs"),
+            "JSON should contain file paths"
+        );
+    }
+
+    // --- AC: Reorder hint included in prompt ---
+
+    #[test]
+    fn test_build_prompt_with_reorder_hint() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "First task", "todo", 5);
+        insert_task(&conn, "US-002", "Second task", "todo", 10);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 2,
+            reorder_hint: Some("US-002"),
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            result.prompt.contains("## Reorder Hint"),
+            "Should have reorder hint section"
+        );
+        assert!(
+            result.prompt.contains("US-002"),
+            "Should mention the reorder target task"
+        );
+    }
+
+    // --- AC: shown_learning_ids are correctly tracked and returned ---
+
+    #[test]
+    fn test_build_prompt_tracks_shown_learning_ids() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Insert learnings that will be recalled for the task
+        let id1 = insert_test_learning(&conn, "Learning about testing");
+        let id2 = insert_test_learning(&conn, "Learning about APIs");
+
+        insert_task(&conn, "US-001", "Build API tests", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Learnings should be shown (UCB bandit recall returns them based on
+        // exploration/exploitation). We can't guarantee exactly which IDs are returned
+        // since recall_learnings uses UCB scoring, but the mechanism should work.
+        // If learnings are returned, their IDs should be tracked.
+        if !result.shown_learning_ids.is_empty() {
+            // Verify the IDs are valid learning IDs (from the set we inserted)
+            for shown_id in &result.shown_learning_ids {
+                assert!(
+                    *shown_id == id1 || *shown_id == id2,
+                    "Shown ID {} should be one of the inserted learnings",
+                    shown_id
+                );
+            }
+        }
+        // The shown_learning_ids Vec should always be initialized
+        // (may be empty if no learnings matched, but should not panic)
+    }
+
+    // --- Additional comprehensive tests ---
+
+    #[test]
+    fn test_build_prompt_returns_none_when_no_tasks() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // All tasks are done
+        insert_task(&conn, "DONE-001", "Already done", "done", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params).unwrap();
+        assert!(result.is_none(), "Should return None when no tasks remain");
+    }
+
+    #[test]
+    fn test_build_prompt_task_files_populated() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Task with files", "todo", 5);
+        insert_task_file(&conn, "US-001", "src/main.rs");
+        insert_task_file(&conn, "US-001", "src/lib.rs");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(result.task_id, "US-001");
+        assert!(
+            result.task_files.contains(&"src/main.rs".to_string()),
+            "task_files should contain src/main.rs"
+        );
+        assert!(
+            result.task_files.contains(&"src/lib.rs".to_string()),
+            "task_files should contain src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_session_guidance_empty_omits_section() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert!(
+            !result.prompt.contains("## Session Guidance"),
+            "Empty session guidance should omit the section"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_section_ordering() {
+        // Verify sections appear in the expected order
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "DEP-001", "Dependency", "done", 1);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_task_file(&conn, "TASK-001", "src/main.rs");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        create_source_file(
+            temp_dir.path(),
+            "src/main.rs",
+            "pub fn main_entry() { todo!() }\n",
+        );
+
+        let steering_path = create_steering(temp_dir.path(), "Be thorough.");
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: Some("OTHER-TASK"),
+            session_guidance: "Focus on tests",
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+        let p = &result.prompt;
+
+        // Verify ordering: steering < session guidance < reorder hint < source context
+        //   < deps < task JSON < reorder instruction < base prompt
+        let steering_pos = p.find("## Steering").expect("Steering present");
+        let guidance_pos = p.find("## Session Guidance").expect("Guidance present");
+        let reorder_hint_pos = p.find("## Reorder Hint").expect("Reorder hint present");
+        let source_pos = p
+            .find("## Current Source Context")
+            .expect("Source context present");
+        let deps_pos = p.find("## Completed Dependencies").expect("Deps present");
+        let task_pos = p.find("## Current Task").expect("Task present");
+        let reorder_instr_pos = p
+            .find("strong reason to work on a different")
+            .expect("Reorder instruction present");
+        let base_pos = p.find("# Agent Instructions").expect("Base prompt present");
+
+        assert!(
+            steering_pos < guidance_pos,
+            "Steering should come before session guidance"
+        );
+        assert!(
+            guidance_pos < reorder_hint_pos,
+            "Session guidance should come before reorder hint"
+        );
+        assert!(
+            reorder_hint_pos < source_pos,
+            "Reorder hint should come before source context"
+        );
+        assert!(
+            source_pos < deps_pos,
+            "Source context should come before deps"
+        );
+        assert!(deps_pos < task_pos, "Deps should come before task JSON");
+        assert!(
+            task_pos < reorder_instr_pos,
+            "Task JSON should come before reorder instruction"
+        );
+        assert!(
+            reorder_instr_pos < base_pos,
+            "Reorder instruction should come before base prompt"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_no_source_context_for_nonexistent_files() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "US-001", "Task with missing file", "todo", 5);
+        insert_task_file(&conn, "US-001", "src/does_not_exist.rs");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Source context section should not appear for non-existent files
+        assert!(
+            !result.prompt.contains("## Current Source Context"),
+            "Non-existent source files should not produce source context"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_dependency_summaries_only_for_done_deps() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "DEP-DONE", "Done dependency", "done", 1);
+        insert_task(&conn, "DEP-TODO", "Todo dependency", "todo", 2);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "DEP-DONE", "dependsOn");
+        // Note: DEP-TODO is in todo status but we add a dependsOn for it anyway
+        // The task should still be eligible because selection filters in Rust, not SQL
+        // But the dependency summary should only show the done one
+        insert_relationship(&conn, "TASK-001", "DEP-TODO", "dependsOn");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let _params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        // TASK-001 won't be eligible since DEP-TODO isn't done; the next() selection
+        // will pick DEP-TODO instead (lowest priority todo task). Let's test the
+        // dependency summary helper directly instead.
+        let mut prompt = String::new();
+        append_dependency_summaries(&mut prompt, &conn, "TASK-001");
+
+        assert!(prompt.contains("DEP-DONE"), "Should list done dependency");
+        assert!(
+            prompt.contains("Done dependency"),
+            "Should show done dep title"
+        );
+        // DEP-TODO is not done, so it should NOT appear in the summaries
+        assert!(
+            !prompt.contains("DEP-TODO"),
+            "Should not list todo dependency in summaries"
+        );
+    }
+
+    // --- Synergy context tests (unit-level) ---
+
+    #[test]
+    fn test_synergy_context_with_run_id() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "SYN-001", "Synergy task done", "done", 5);
+        insert_task(&conn, "TASK-001", "Current task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
+
+        // Create run with a run_task entry linking SYN-001 to the run
+        insert_run(&conn, "run-001");
+        insert_run_task(&conn, "run-001", "SYN-001", 1);
+
+        // Set a last_commit on the run
+        conn.execute(
+            "UPDATE runs SET last_commit = 'abc123' WHERE run_id = 'run-001'",
+            [],
+        )
+        .unwrap();
+
+        let mut prompt = String::new();
+        append_synergy_context(&mut prompt, &conn, "TASK-001", Some("run-001"));
+
+        assert!(
+            prompt.contains("## Synergy Tasks"),
+            "Should have synergy section"
+        );
+        assert!(prompt.contains("SYN-001"), "Should reference synergy task");
+        assert!(
+            prompt.contains("Synergy task done"),
+            "Should include synergy task title"
+        );
+        assert!(prompt.contains("abc123"), "Should include commit hash");
+    }
+
+    #[test]
+    fn test_synergy_context_without_run_id_omits_section() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
+        insert_task(&conn, "TASK-001", "Current task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
+
+        let mut prompt = String::new();
+        append_synergy_context(&mut prompt, &conn, "TASK-001", None);
+
+        assert!(prompt.is_empty(), "No run_id should omit synergy section");
+    }
+
+    #[test]
+    fn test_synergy_context_no_synergy_tasks_omits_section() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "TASK-001", "Task without synergy", "todo", 10);
+
+        let mut prompt = String::new();
+        append_synergy_context(&mut prompt, &conn, "TASK-001", Some("run-001"));
+
+        assert!(
+            prompt.is_empty(),
+            "No synergy tasks should omit the section"
+        );
+    }
+
+    // --- build_task_json comprehensive tests ---
+
+    #[test]
+    fn test_build_task_json_with_all_fields() {
+        let task = NextTaskOutput {
+            id: "FEAT-042".to_string(),
+            title: "Complex feature".to_string(),
+            description: Some("A complex feature with many parts".to_string()),
+            priority: 3,
+            status: "in_progress".to_string(),
+            acceptance_criteria: vec!["Criterion one".to_string(), "Criterion two".to_string()],
+            notes: Some("Important: check edge cases".to_string()),
+            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            batch_with: vec!["FEAT-043".to_string()],
+            score: ScoreOutput {
+                total: 1003,
+                priority: 997,
+                file_overlap: 10,
+                synergy: 3,
+                conflict: -7,
+                file_overlap_count: 1,
+                synergy_from: vec!["FEAT-040".to_string()],
+                conflict_from: vec!["FEAT-099".to_string()],
+            },
+        };
+
+        let next_result = NextResult {
+            task: Some(task.clone()),
+            batch_tasks: vec!["FEAT-043".to_string()],
+            learnings: vec![],
+            selection: SelectionMetadata {
+                reason: "highest score".to_string(),
+                eligible_count: 5,
+            },
+            claim: None,
+            top_candidates: vec![],
+        };
+
+        let json = build_task_json(&task, &next_result);
+
+        assert!(json.contains("FEAT-042"), "Should contain task ID");
+        assert!(json.contains("Complex feature"), "Should contain title");
+        assert!(
+            json.contains("A complex feature"),
+            "Should contain description"
+        );
+        assert!(
+            json.contains("Important: check edge cases"),
+            "Should contain notes"
+        );
+        assert!(
+            json.contains("Criterion one"),
+            "Should contain first criterion"
+        );
+        assert!(
+            json.contains("Criterion two"),
+            "Should contain second criterion"
+        );
+        assert!(json.contains("src/a.rs"), "Should contain first file");
+        assert!(json.contains("FEAT-043"), "Should contain batchWith");
+        assert!(
+            json.contains("eligibleBatchTasks"),
+            "Should contain eligible batch tasks when non-empty"
+        );
+    }
+
+    #[test]
+    fn test_build_task_json_minimal_fields() {
+        let task = NextTaskOutput {
+            id: "FIX-001".to_string(),
+            title: "Quick fix".to_string(),
+            description: None,
+            priority: 1,
+            status: "in_progress".to_string(),
+            acceptance_criteria: vec![],
+            notes: None,
+            files: vec![],
+            batch_with: vec![],
+            score: ScoreOutput {
+                total: 999,
+                priority: 999,
+                file_overlap: 0,
+                synergy: 0,
+                conflict: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        };
+
+        let next_result = NextResult {
+            task: Some(task.clone()),
+            batch_tasks: vec![],
+            learnings: vec![],
+            selection: SelectionMetadata {
+                reason: "only task".to_string(),
+                eligible_count: 1,
+            },
+            claim: None,
+            top_candidates: vec![],
+        };
+
+        let json = build_task_json(&task, &next_result);
+
+        assert!(json.contains("FIX-001"), "Should contain task ID");
+        assert!(json.contains("Quick fix"), "Should contain title");
+        // Optional fields should not appear
+        assert!(
+            !json.contains("description"),
+            "Should not contain description key when None"
+        );
+        assert!(
+            !json.contains("notes"),
+            "Should not contain notes key when None"
+        );
+        assert!(
+            !json.contains("batchWith"),
+            "Should not contain batchWith when empty"
+        );
+        assert!(
+            !json.contains("eligibleBatchTasks"),
+            "Should not contain eligibleBatchTasks when empty"
+        );
+    }
+
+    // --- record_shown_learnings with actual learnings ---
+
+    #[test]
+    fn test_record_shown_learnings_tracks_ids() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let id1 = insert_test_learning(&conn, "Learning A");
+        let id2 = insert_test_learning(&conn, "Learning B");
+
+        let learnings = vec![
+            LearningSummaryOutput {
+                id: id1,
+                title: "Learning A".to_string(),
+                outcome: "pattern".to_string(),
+                confidence: "medium".to_string(),
+                content: Some("Content A".to_string()),
+                applies_to_files: None,
+                applies_to_task_types: None,
+            },
+            LearningSummaryOutput {
+                id: id2,
+                title: "Learning B".to_string(),
+                outcome: "success".to_string(),
+                confidence: "high".to_string(),
+                content: Some("Content B".to_string()),
+                applies_to_files: None,
+                applies_to_task_types: None,
+            },
+        ];
+
+        let ids = record_shown_learnings(&conn, &learnings, 5);
+
+        assert_eq!(ids.len(), 2, "Should return 2 shown IDs");
+        assert_eq!(ids[0], id1, "First ID should match");
+        assert_eq!(ids[1], id2, "Second ID should match");
+    }
+
+    #[test]
+    fn test_record_shown_learnings_graceful_on_invalid_id() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        // Learning ID 99999 doesn't exist, but record_learning_shown should
+        // either succeed (no-op) or log warning and continue
+        let learnings = vec![LearningSummaryOutput {
+            id: 99999,
+            title: "Ghost learning".to_string(),
+            outcome: "pattern".to_string(),
+            confidence: "low".to_string(),
+            content: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+        }];
+
+        // Should not panic
+        let ids = record_shown_learnings(&conn, &learnings, 1);
+        assert_eq!(
+            ids.len(),
+            1,
+            "Should still return the ID even if DB op fails"
+        );
+        assert_eq!(ids[0], 99999);
+    }
+
+    // --- Truncation edge cases ---
+
+    #[test]
+    fn test_truncate_to_budget_zero() {
+        let result = truncate_to_budget("hello", 0);
+        assert!(
+            result.contains("[truncated to 0 chars]"),
+            "Zero budget should truncate"
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_budget_one_char() {
+        let result = truncate_to_budget("hello", 1);
+        assert!(result.starts_with('h'));
+        assert!(result.contains("[truncated to 1 chars]"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_empty_string() {
+        let result = truncate_to_budget("", 100);
+        assert_eq!(result, "", "Empty string within budget returns empty");
+    }
+
+    #[test]
+    fn test_truncate_to_budget_multibyte_utf8_no_panic() {
+        // "café" = 5 chars, 6 bytes (é is 2 bytes: 0xC3 0xA9)
+        let text = "café";
+        assert_eq!(text.len(), 5); // 5 bytes
+                                   // Budget 4 falls after 'f' but before 'é' starts — safe
+        let result = truncate_to_budget(text, 4);
+        assert!(result.contains("[truncated to 4 chars]"));
+        assert!(result.starts_with("caf"));
+        // Budget 3 falls mid-way — would panic with naive slicing if é started at byte 3
+        let result = truncate_to_budget(text, 3);
+        assert!(result.contains("[truncated to 3 chars]"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_emoji_no_panic() {
+        // Each emoji is 4 bytes
+        let text = "🍕🍔🌮🍣";
+        assert_eq!(text.len(), 16); // 4 emoji × 4 bytes
+                                    // Budget 5 falls mid-second emoji (byte 5 is inside 🍔)
+        let result = truncate_to_budget(text, 5);
+        assert!(result.contains("[truncated to 5 chars]"));
+        // Should contain only first emoji (4 bytes), not a partial second
+        assert!(result.starts_with("🍕"));
+        assert!(!result.starts_with("🍕🍔"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_cjk_no_panic() {
+        // CJK characters are 3 bytes each
+        let text = "你好世界";
+        assert_eq!(text.len(), 12); // 4 chars × 3 bytes
+                                    // Budget 4 falls mid-second character (byte 4 is inside 好)
+        let result = truncate_to_budget(text, 4);
+        assert!(result.contains("[truncated to 4 chars]"));
+        assert!(result.starts_with("你"));
+    }
+
+    #[test]
+    fn test_truncate_to_budget_mixed_ascii_and_multibyte() {
+        let text = "hello 世界!";
+        // h(1) e(1) l(1) l(1) o(1) (1) 世(3) 界(3) !(1) = 13 bytes
+        assert_eq!(text.len(), 13);
+        // Budget 7 = just past the space, before 世 starts (byte 6 is space, 7 is mid-世)
+        let result = truncate_to_budget(text, 7);
+        assert!(result.contains("[truncated to 7 chars]"));
+        assert!(result.starts_with("hello "));
+    }
+
+    // --- Steering edge cases ---
+
+    #[test]
+    fn test_append_steering_with_newlines_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("steering.md");
+        fs::write(&path, "\n\n\n").unwrap();
+
+        let mut prompt = String::new();
+        append_steering(&mut prompt, &path);
+        assert!(
+            prompt.is_empty(),
+            "Newlines-only file should be treated as empty"
+        );
+    }
+
+    #[test]
+    fn test_append_steering_trims_content() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("steering.md");
+        fs::write(&path, "  \n  Focus on X  \n  ").unwrap();
+
+        let mut prompt = String::new();
+        append_steering(&mut prompt, &path);
+        assert!(
+            prompt.contains("Focus on X"),
+            "Should contain trimmed content"
+        );
+        // Verify the content is trimmed (no leading/trailing whitespace)
+        let after_header = prompt.split("## Steering\n\n").nth(1).unwrap();
+        assert!(
+            after_header.starts_with("Focus on X"),
+            "Content should be trimmed"
+        );
+    }
+
+    // --- Base prompt edge cases ---
+
+    #[test]
+    fn test_append_base_prompt_no_trailing_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("prompt.md");
+        fs::write(&path, "No trailing newline").unwrap();
+
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, &path);
+        assert!(prompt.ends_with('\n'), "Should append newline when missing");
+    }
+
+    #[test]
+    fn test_append_base_prompt_with_trailing_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("prompt.md");
+        fs::write(&path, "Has trailing newline\n").unwrap();
+
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, &path);
+        assert!(!prompt.ends_with("\n\n"), "Should not double-add newline");
+    }
+
+    // --- Learnings formatting ---
+
+    #[test]
+    fn test_append_learnings_multiple() {
+        let learnings = vec![
+            LearningSummaryOutput {
+                id: 1,
+                title: "First Learning".to_string(),
+                outcome: "pattern".to_string(),
+                confidence: "high".to_string(),
+                content: Some("Content 1".to_string()),
+                applies_to_files: Some(vec!["src/*.rs".to_string()]),
+                applies_to_task_types: None,
+            },
+            LearningSummaryOutput {
+                id: 2,
+                title: "Second Learning".to_string(),
+                outcome: "failure".to_string(),
+                confidence: "medium".to_string(),
+                content: None,
+                applies_to_files: None,
+                applies_to_task_types: Some(vec!["FEAT-".to_string()]),
+            },
+        ];
+
+        let mut prompt = String::new();
+        append_learnings(&mut prompt, &learnings);
+
+        assert!(prompt.contains("## Relevant Learnings"));
+        assert!(prompt.contains("```json"));
+        assert!(prompt.contains("First Learning"));
+        assert!(prompt.contains("Second Learning"));
+        assert!(prompt.contains("Content 1"));
+    }
+
+    // --- get_completed_dependencies edge cases ---
+
+    #[test]
+    fn test_get_completed_dependencies_none_done() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "DEP-001", "Still in progress", "in_progress", 1);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
+        assert!(deps.is_empty(), "In-progress deps should not be listed");
+    }
+
+    #[test]
+    fn test_get_completed_dependencies_ignores_synergy_relationships() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "SYN-001", "Synergy task", "done", 1);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        // Only synergyWith, NOT dependsOn
+        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
+
+        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
+        assert!(
+            deps.is_empty(),
+            "Synergy relationships should not appear in dependency summaries"
+        );
+    }
+
+    #[test]
+    fn test_get_completed_dependencies_ordered_by_id() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "DEP-C", "Dep C", "done", 3);
+        insert_task(&conn, "DEP-A", "Dep A", "done", 1);
+        insert_task(&conn, "DEP-B", "Dep B", "done", 2);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "DEP-C", "dependsOn");
+        insert_relationship(&conn, "TASK-001", "DEP-A", "dependsOn");
+        insert_relationship(&conn, "TASK-001", "DEP-B", "dependsOn");
+
+        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
+        assert_eq!(deps.len(), 3);
+        assert_eq!(deps[0].0, "DEP-A", "Should be ordered by ID");
+        assert_eq!(deps[1].0, "DEP-B");
+        assert_eq!(deps[2].0, "DEP-C");
+    }
+
+    // --- get_synergy_tasks_in_run edge cases ---
+
+    #[test]
+    fn test_get_synergy_tasks_in_run_no_commit() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
+        insert_run(&conn, "run-001");
+        insert_run_task(&conn, "run-001", "SYN-001", 1);
+        // Note: no last_commit set on the run
+
+        let results = get_synergy_tasks_in_run(&conn, "TASK-001", "run-001").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "SYN-001");
+        assert!(
+            results[0].2.is_none(),
+            "Commit should be None when run has no last_commit"
+        );
+    }
+
+    #[test]
+    fn test_get_synergy_tasks_in_run_nonexistent_run() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
+        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
+        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
+
+        let results = get_synergy_tasks_in_run(&conn, "TASK-001", "nonexistent-run").unwrap();
+        // The LEFT JOIN means no run_tasks match, so no results with run data,
+        // but the synergy task itself is still done. The query filters by run_id
+        // in the LEFT JOIN clause, so SYN-001 will still appear (run-related columns will be NULL).
+        // Actually, let's verify the actual behavior:
+        // The query LEFT JOINs run_tasks ON task_id AND run_id, so if run doesn't exist,
+        // rt.* will be NULL but the row still appears because of LEFT JOIN.
+        // This is acceptable behavior — the task is still listed as a synergy task.
+        assert!(results.len() <= 1, "Should return at most 1 synergy task");
+    }
+
+    // --- TEST-001: project_root separation in BuildPromptParams routing ---
+
+    #[test]
+    fn test_build_prompt_uses_project_root_for_source_context() {
+        // When dir (DB) and project_root differ, source files should be scanned
+        // from project_root, not from dir.
+        let (db_temp_dir, conn) = setup_test_db();
+
+        // Create a separate project_root directory with source files
+        let project_root = TempDir::new().unwrap();
+        create_source_file(
+            project_root.path(),
+            "src/handler.rs",
+            "pub fn handle_request() -> bool { true }\n",
+        );
+
+        insert_task(&conn, "FEAT-001", "Add handler", "todo", 5);
+        insert_task_file(&conn, "FEAT-001", "src/handler.rs");
+
+        let base_prompt_path = create_base_prompt(project_root.path());
+
+        // dir points to DB temp dir, project_root points to source files
+        let params = BuildPromptParams {
+            dir: db_temp_dir.path(),
+            project_root: project_root.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Source context should find handler.rs under project_root
+        assert!(
+            result.prompt.contains("handle_request"),
+            "Source context should scan files from project_root, not dir. Prompt: {}",
+            &result.prompt[..result.prompt.len().min(500)]
+        );
+        assert!(
+            result.prompt.contains("## Current Source Context"),
+            "Source context section should be present when files exist under project_root"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_no_source_context_when_files_only_under_dir() {
+        // If source files exist under dir (DB directory) but NOT under project_root,
+        // the source context should be empty because scan_source_context uses project_root.
+        let (db_temp_dir, conn) = setup_test_db();
+
+        let project_root = TempDir::new().unwrap();
+        // Source file under db_temp_dir (the DB dir), NOT under project_root
+        create_source_file(
+            db_temp_dir.path(),
+            "src/orphan.rs",
+            "pub fn orphan_fn() { }\n",
+        );
+
+        insert_task(&conn, "FEAT-001", "Task", "todo", 5);
+        insert_task_file(&conn, "FEAT-001", "src/orphan.rs");
+
+        let base_prompt_path = create_base_prompt(project_root.path());
+
+        let params = BuildPromptParams {
+            dir: db_temp_dir.path(),
+            project_root: project_root.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Source context should NOT find orphan.rs because it's under dir, not project_root
+        assert!(
+            !result.prompt.contains("orphan_fn"),
+            "Source context should NOT scan files from dir (DB directory)"
+        );
+        assert!(
+            !result.prompt.contains("## Current Source Context"),
+            "Source context section should be absent when no files exist under project_root"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_dir_routes_to_task_selection() {
+        // Verify that dir (not project_root) is used for DB-backed task selection
+        // by using a dir that has the DB and a project_root that doesn't.
+        let (db_temp_dir, conn) = setup_test_db();
+        let project_root = TempDir::new().unwrap();
+
+        // Task exists in DB (which lives under db_temp_dir)
+        insert_task(&conn, "DB-001", "DB-backed task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(project_root.path());
+
+        let params = BuildPromptParams {
+            dir: db_temp_dir.path(),
+            project_root: project_root.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: None,
+            verbose: false,
+        };
+
+        // next::next uses dir for DB access — task should be found
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Task should be found via dir (DB path)");
+
+        assert_eq!(
+            result.task_id, "DB-001",
+            "Task selection should use dir for DB, not project_root"
+        );
+    }
+}

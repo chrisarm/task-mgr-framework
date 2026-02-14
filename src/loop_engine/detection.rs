@@ -1,0 +1,920 @@
+/// Output detection engine for analyzing Claude subprocess results.
+///
+/// Determines the `IterationOutcome` by inspecting the Claude process's
+/// stdout output and exit code. Checks for completion signals, blockers,
+/// reorder requests, rate-limit errors, crashes, and empty output.
+///
+/// Priority order (highest to lowest):
+/// Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
+use std::path::Path;
+
+use crate::loop_engine::config::{CrashType, IterationOutcome};
+
+/// Analyze Claude subprocess output and exit code to determine iteration outcome.
+///
+/// Checks output patterns in priority order:
+/// 1. `<promise>COMPLETE</promise>` in last 20 lines -> Completed
+/// 2. `<promise>BLOCKED</promise>` in last 20 lines -> Blocked
+/// 3. `<reorder>TASK-ID</reorder>` anywhere in output -> Reorder(task_id)
+/// 4. Rate-limit patterns (429, usage limit) -> RateLimit
+/// 5. Non-zero exit code -> Crash (categorized by exit code)
+/// 6. Empty output with exit 0 -> Empty
+///
+/// The `dir` parameter is reserved for future DB-based verification
+/// (secondary check: query remaining tasks).
+pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOutcome {
+    // Step 1: Check last 20 lines for completion/blocked signals
+    let last_20: Vec<&str> = output.lines().rev().take(20).collect();
+
+    let has_complete = last_20
+        .iter()
+        .any(|line| line.contains("<promise>COMPLETE</promise>"));
+    let has_blocked = last_20
+        .iter()
+        .any(|line| line.contains("<promise>BLOCKED</promise>"));
+
+    if has_complete {
+        return IterationOutcome::Completed;
+    }
+    if has_blocked {
+        return IterationOutcome::Blocked;
+    }
+
+    // Step 2: Check for reorder tag anywhere in output
+    if let Some(task_id) = extract_reorder_task_id(output) {
+        return IterationOutcome::Reorder(task_id);
+    }
+
+    // Step 3: Check for rate-limit patterns
+    if is_rate_limited(output) {
+        return IterationOutcome::RateLimit;
+    }
+
+    // Step 4: Check exit code for crashes
+    if exit_code != 0 {
+        return IterationOutcome::Crash(categorize_crash(exit_code));
+    }
+
+    // Step 5: Check for empty output
+    if output.trim().is_empty() {
+        return IterationOutcome::Empty;
+    }
+
+    // Default: no signal detected, treat as stale (no progress)
+    IterationOutcome::Stale
+}
+
+/// Extract task ID from `<reorder>TASK-ID</reorder>` tag in output.
+///
+/// Returns `None` if no valid reorder tag found. Requires both opening
+/// and closing tags with a non-empty task ID between them.
+fn extract_reorder_task_id(output: &str) -> Option<String> {
+    // Simple string-based extraction (no regex dependency needed for this)
+    let start_tag = "<reorder>";
+    let end_tag = "</reorder>";
+
+    let start_pos = output.find(start_tag)?;
+    let content_start = start_pos + start_tag.len();
+    let end_pos = output[content_start..].find(end_tag)?;
+    let task_id = output[content_start..content_start + end_pos].trim();
+
+    if task_id.is_empty() {
+        return None;
+    }
+
+    Some(task_id.to_string())
+}
+
+/// Check if output contains rate-limit error patterns.
+fn is_rate_limited(output: &str) -> bool {
+    let output_lower = output.to_lowercase();
+    output_lower.contains("rate_limit_error")
+        || output_lower.contains("429")
+            && (output_lower.contains("rate") || output_lower.contains("limit"))
+        || output_lower.contains("usage")
+            && output_lower.contains("limit")
+            && output_lower.contains("reached")
+}
+
+/// Categorize a crash by its exit code.
+fn categorize_crash(exit_code: i32) -> CrashType {
+    match exit_code {
+        137 => CrashType::OomOrKilled,
+        139 => CrashType::Segfault,
+        _ => CrashType::RuntimeError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_dir() -> PathBuf {
+        PathBuf::from("/tmp/test-detection")
+    }
+
+    // --- AC 1: COMPLETE detection in last 20 lines ---
+
+    #[test]
+    fn test_detects_complete_in_last_20_lines() {
+        let mut output = String::new();
+        // Add some lines of normal output
+        for i in 0..10 {
+            output.push_str(&format!("Working on task {}...\n", i));
+        }
+        output.push_str("<promise>COMPLETE</promise>\n");
+
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Completed,
+            "Should detect COMPLETE in last 20 lines"
+        );
+    }
+
+    #[test]
+    fn test_complete_on_last_line() {
+        let output = "Some work done\n<promise>COMPLETE</promise>";
+        let result = analyze_output(output, 0, &test_dir());
+        assert_eq!(result, IterationOutcome::Completed);
+    }
+
+    #[test]
+    fn test_complete_exactly_at_line_20_from_end() {
+        // Build output where COMPLETE is exactly the 20th line from the end
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("<promise>COMPLETE</promise>".to_string());
+        for i in 0..19 {
+            lines.push(format!("trailing line {}", i));
+        }
+        let output = lines.join("\n");
+
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Completed,
+            "COMPLETE on exactly line 20 from end should be detected"
+        );
+    }
+
+    #[test]
+    fn test_complete_outside_last_20_lines_not_detected() {
+        // Build output where COMPLETE is line 21 from end (outside window)
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("<promise>COMPLETE</promise>".to_string());
+        for i in 0..20 {
+            lines.push(format!("trailing line {}", i));
+        }
+        let output = lines.join("\n");
+
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_ne!(
+            result,
+            IterationOutcome::Completed,
+            "COMPLETE on line 21 from end should NOT be detected"
+        );
+    }
+
+    // --- AC 2: BLOCKED detection in last 20 lines ---
+
+    #[test]
+    fn test_detects_blocked_in_last_20_lines() {
+        let output = "Missing dependency\n<promise>BLOCKED</promise>\n";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Blocked,
+            "Should detect BLOCKED in last 20 lines"
+        );
+    }
+
+    #[test]
+    fn test_blocked_on_last_line() {
+        let output = "Cannot proceed\n<promise>BLOCKED</promise>";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(result, IterationOutcome::Blocked);
+    }
+
+    // --- AC 3: Reorder detection ---
+
+    #[test]
+    fn test_detects_reorder_with_task_id() {
+        let output = "I think LOOP-005 would be better.\n<reorder>LOOP-005</reorder>\nDone.";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Reorder("LOOP-005".to_string()),
+            "Should extract task ID from <reorder> tag"
+        );
+    }
+
+    #[test]
+    fn test_detects_reorder_with_different_task_id_format() {
+        let output = "Suggest switching to FEAT-024.\n<reorder>FEAT-024</reorder>";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(result, IterationOutcome::Reorder("FEAT-024".to_string()),);
+    }
+
+    #[test]
+    fn test_reorder_with_whitespace_around_task_id() {
+        let output = "<reorder>  LOOP-005  </reorder>";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Reorder("LOOP-005".to_string()),
+            "Should trim whitespace from task ID"
+        );
+    }
+
+    #[test]
+    fn test_reorder_empty_tag_not_detected() {
+        let output = "Some output\n<reorder></reorder>\nMore output";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_ne!(
+            result,
+            IterationOutcome::Reorder(String::new()),
+            "Empty reorder tag should not produce a Reorder outcome"
+        );
+    }
+
+    #[test]
+    fn test_reorder_missing_closing_tag_not_detected() {
+        let output = "Some output\n<reorder>LOOP-005\nMore output";
+        let result = analyze_output(&output, 0, &test_dir());
+        // Should NOT be Reorder since no closing tag
+        if let IterationOutcome::Reorder(_) = result {
+            panic!("Should not detect reorder without closing tag");
+        }
+    }
+
+    // --- AC 4: Rate-limit detection ---
+
+    #[test]
+    fn test_detects_rate_limit_error_pattern() {
+        let output = "Error: rate_limit_error - too many requests\n";
+        let result = analyze_output(&output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Should detect rate_limit_error pattern"
+        );
+    }
+
+    #[test]
+    fn test_detects_429_rate_pattern() {
+        let output = "HTTP 429 rate limit exceeded\n";
+        let result = analyze_output(&output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Should detect 429 rate pattern"
+        );
+    }
+
+    #[test]
+    fn test_detects_usage_limit_reached_pattern() {
+        let output = "Usage limit reached. Please wait.\n";
+        let result = analyze_output(&output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Should detect usage limit reached pattern"
+        );
+    }
+
+    // --- AC 5: Exit code crash categorization ---
+
+    #[test]
+    fn test_exit_137_returns_oom_or_killed() {
+        let output = "Some work was done\n";
+        let result = analyze_output(output, 137, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::OomOrKilled),
+            "Exit 137 should map to OomOrKilled"
+        );
+    }
+
+    #[test]
+    fn test_exit_139_returns_segfault() {
+        let output = "Some work was done\n";
+        let result = analyze_output(output, 139, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::Segfault),
+            "Exit 139 should map to Segfault"
+        );
+    }
+
+    #[test]
+    fn test_exit_1_returns_runtime_error() {
+        let output = "Error: something went wrong\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "Exit 1 should map to RuntimeError"
+        );
+    }
+
+    #[test]
+    fn test_exit_2_returns_runtime_error() {
+        let output = "Error: command not found\n";
+        let result = analyze_output(output, 2, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "Exit 2 should map to RuntimeError"
+        );
+    }
+
+    // --- AC 6: Empty output detection ---
+
+    #[test]
+    fn test_empty_output_with_exit_0_returns_empty() {
+        let result = analyze_output("", 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Empty,
+            "Empty string with exit 0 should return Empty"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_output_with_exit_0_returns_empty() {
+        let result = analyze_output("   \n  \n  ", 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Empty,
+            "Whitespace-only output with exit 0 should return Empty"
+        );
+    }
+
+    #[test]
+    fn test_nonempty_output_with_exit_0_returns_stale() {
+        let output = "Did some work but no completion signal\n";
+        let result = analyze_output(output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Stale,
+            "Non-empty output with exit 0 and no signal should return Stale"
+        );
+    }
+
+    // --- AC 7: COMPLETE takes priority over BLOCKED ---
+
+    #[test]
+    fn test_complete_takes_priority_over_blocked() {
+        let output =
+            "Working...\n<promise>BLOCKED</promise>\nFixed it!\n<promise>COMPLETE</promise>\n";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Completed,
+            "COMPLETE should take priority over BLOCKED when both present in last 20 lines"
+        );
+    }
+
+    #[test]
+    fn test_complete_takes_priority_even_when_blocked_appears_later() {
+        // Both in last 20 lines, BLOCKED after COMPLETE
+        let output =
+            "Start\n<promise>COMPLETE</promise>\nMore work\n<promise>BLOCKED</promise>\nEnd";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Completed,
+            "COMPLETE should take priority regardless of order"
+        );
+    }
+
+    // --- Additional edge cases for robust contract definition ---
+
+    #[test]
+    fn test_rate_limit_takes_priority_over_crash_exit_code() {
+        // Output contains rate limit pattern AND has non-zero exit code
+        let output = "Error: rate_limit_error\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Rate limit in output should take priority over crash exit code"
+        );
+    }
+
+    #[test]
+    fn test_complete_takes_priority_over_rate_limit() {
+        let output = "rate_limit_error earlier\nRecovered\n<promise>COMPLETE</promise>\n";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Completed,
+            "COMPLETE should take priority over rate limit pattern"
+        );
+    }
+
+    #[test]
+    fn test_blocked_takes_priority_over_reorder() {
+        let output = "<reorder>FEAT-005</reorder>\n<promise>BLOCKED</promise>\n";
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Blocked,
+            "BLOCKED should take priority over Reorder"
+        );
+    }
+
+    // --- Helper function unit tests ---
+
+    #[test]
+    fn test_extract_reorder_task_id_valid() {
+        let output = "text <reorder>FEAT-001</reorder> more text";
+        assert_eq!(
+            extract_reorder_task_id(output),
+            Some("FEAT-001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_reorder_task_id_empty() {
+        let output = "text <reorder></reorder> more text";
+        assert_eq!(extract_reorder_task_id(output), None);
+    }
+
+    #[test]
+    fn test_extract_reorder_task_id_missing_close() {
+        let output = "text <reorder>FEAT-001 more text";
+        assert_eq!(extract_reorder_task_id(output), None);
+    }
+
+    #[test]
+    fn test_extract_reorder_task_id_no_tag() {
+        let output = "no reorder tags here";
+        assert_eq!(extract_reorder_task_id(output), None);
+    }
+
+    #[test]
+    fn test_extract_reorder_task_id_whitespace_trimmed() {
+        let output = "<reorder>  TASK-ID  </reorder>";
+        assert_eq!(extract_reorder_task_id(output), Some("TASK-ID".to_string()));
+    }
+
+    #[test]
+    fn test_categorize_crash_137() {
+        assert_eq!(categorize_crash(137), CrashType::OomOrKilled);
+    }
+
+    #[test]
+    fn test_categorize_crash_139() {
+        assert_eq!(categorize_crash(139), CrashType::Segfault);
+    }
+
+    #[test]
+    fn test_categorize_crash_other() {
+        assert_eq!(categorize_crash(1), CrashType::RuntimeError);
+        assert_eq!(categorize_crash(2), CrashType::RuntimeError);
+        assert_eq!(categorize_crash(127), CrashType::RuntimeError);
+        assert_eq!(categorize_crash(255), CrashType::RuntimeError);
+    }
+
+    #[test]
+    fn test_is_rate_limited_positive() {
+        assert!(is_rate_limited("rate_limit_error"));
+        assert!(is_rate_limited("HTTP 429 rate limit"));
+        assert!(is_rate_limited("Usage limit reached"));
+    }
+
+    #[test]
+    fn test_is_rate_limited_negative() {
+        assert!(!is_rate_limited("normal output"));
+        assert!(!is_rate_limited("task completed successfully"));
+        assert!(!is_rate_limited(""));
+    }
+
+    // ======================================================================
+    // Comprehensive edge case tests (TEST-001)
+    // ======================================================================
+
+    // --- AC 1: COMPLETE on line 20 IS detected (boundary verification) ---
+
+    #[test]
+    fn test_complete_boundary_line_20_detected() {
+        // 1 COMPLETE line + 19 trailing lines = COMPLETE is 20th from end
+        let mut lines = vec!["<promise>COMPLETE</promise>".to_string()];
+        for i in 0..19 {
+            lines.push(format!("trailing {}", i));
+        }
+        let output = lines.join("\n");
+        assert_eq!(
+            analyze_output(&output, 0, &test_dir()),
+            IterationOutcome::Completed
+        );
+    }
+
+    // --- AC 2: COMPLETE on line 21 (just outside window) NOT detected ---
+
+    #[test]
+    fn test_complete_boundary_line_21_not_detected() {
+        // 1 COMPLETE line + 20 trailing lines = COMPLETE is 21st from end
+        let mut lines = vec!["<promise>COMPLETE</promise>".to_string()];
+        for i in 0..20 {
+            lines.push(format!("trailing {}", i));
+        }
+        let output = lines.join("\n");
+        assert_eq!(
+            analyze_output(&output, 0, &test_dir()),
+            IterationOutcome::Stale,
+            "COMPLETE on line 21 from end should NOT be detected"
+        );
+    }
+
+    // --- AC 3: Malformed reorder tags ---
+
+    #[test]
+    fn test_reorder_whitespace_only_task_id_not_detected() {
+        let output = "output\n<reorder>   </reorder>\nmore output";
+        let result = analyze_output(output, 0, &test_dir());
+        // Whitespace-only should NOT yield Reorder (trim leaves empty string)
+        if let IterationOutcome::Reorder(_) = result {
+            panic!("Whitespace-only reorder tag should not produce Reorder outcome");
+        }
+    }
+
+    #[test]
+    fn test_reorder_no_opening_tag() {
+        let output = "FEAT-001</reorder>";
+        assert_eq!(extract_reorder_task_id(output), None);
+    }
+
+    #[test]
+    fn test_reorder_nested_tags_extracts_first() {
+        let output = "<reorder><reorder>FEAT-001</reorder></reorder>";
+        // The inner tag content is "<reorder>FEAT-001", which ends at first "</reorder>"
+        let result = extract_reorder_task_id(output);
+        assert!(
+            result.is_some(),
+            "Should extract something from nested tags"
+        );
+    }
+
+    #[test]
+    fn test_reorder_multiple_tags_returns_first() {
+        let output = "text <reorder>FEAT-001</reorder> middle <reorder>FEAT-002</reorder> end";
+        assert_eq!(
+            extract_reorder_task_id(output),
+            Some("FEAT-001".to_string()),
+            "Should extract first reorder tag"
+        );
+    }
+
+    #[test]
+    fn test_reorder_tag_case_sensitive() {
+        // Tags should be case-sensitive (uppercase should NOT match)
+        let output = "<REORDER>FEAT-001</REORDER>";
+        assert_eq!(
+            extract_reorder_task_id(output),
+            None,
+            "Reorder tag should be case-sensitive"
+        );
+    }
+
+    #[test]
+    fn test_reorder_tag_with_newline_in_id() {
+        let output = "<reorder>FEAT\n001</reorder>";
+        let result = extract_reorder_task_id(output);
+        // The task ID will include the newline; trim only strips leading/trailing whitespace
+        // but \n in the middle stays
+        assert!(result.is_some(), "Newline in task ID should still extract");
+    }
+
+    // --- AC 4: Both COMPLETE and BLOCKED returns Completed ---
+
+    #[test]
+    fn test_complete_and_blocked_interleaved() {
+        let output = "<promise>BLOCKED</promise>\n\
+                      work\n\
+                      <promise>COMPLETE</promise>\n\
+                      <promise>BLOCKED</promise>";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "COMPLETE takes priority even when BLOCKED appears after it"
+        );
+    }
+
+    // --- AC 5: Rate limit pattern in middle of line ---
+
+    #[test]
+    fn test_rate_limit_in_middle_of_line() {
+        let output = "Error occurred: rate_limit_error was encountered during processing\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::RateLimit,
+            "Rate limit pattern in middle of line should be detected"
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_429_in_middle_of_line() {
+        let output = "The server responded with 429 rate limiting error";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_case_insensitive() {
+        assert!(is_rate_limited("RATE_LIMIT_ERROR"));
+        assert!(is_rate_limited("Rate_Limit_Error"));
+        assert!(is_rate_limited("Usage Limit Reached"));
+    }
+
+    #[test]
+    fn test_429_without_rate_context_is_not_rate_limit() {
+        // "429" alone without "rate" or "limit" should not trigger
+        let output = "There were 429 items in the list\n";
+        // Check: "429" is present, but need "rate" or "limit" too
+        // The condition is: "429" AND ("rate" OR "limit")
+        // "items" and "list" contain "limit"? No. "list" != "limit"
+        assert!(
+            !is_rate_limited(output),
+            "429 without rate/limit context should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_usage_limit_partial_match_not_triggered() {
+        // Need all three: "usage" + "limit" + "reached"
+        let output = "Usage statistics show the limit was high";
+        assert!(
+            !is_rate_limited(output),
+            "Need all three words: usage, limit, reached"
+        );
+    }
+
+    // --- AC 6: Very large output (10000+ lines) ---
+
+    #[test]
+    fn test_large_output_with_complete_at_end() {
+        let mut lines: Vec<String> = (0..10000)
+            .map(|i| format!("Working on item {}...", i))
+            .collect();
+        lines.push("<promise>COMPLETE</promise>".to_string());
+        let output = lines.join("\n");
+
+        assert_eq!(
+            analyze_output(&output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "Should detect COMPLETE in large output"
+        );
+    }
+
+    #[test]
+    fn test_large_output_with_complete_far_from_end() {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("<promise>COMPLETE</promise>".to_string());
+        for i in 0..10000 {
+            lines.push(format!("Working on item {}...", i));
+        }
+        let output = lines.join("\n");
+
+        assert_eq!(
+            analyze_output(&output, 0, &test_dir()),
+            IterationOutcome::Stale,
+            "COMPLETE far from end of large output should not be detected"
+        );
+    }
+
+    #[test]
+    fn test_large_output_no_signals() {
+        let lines: Vec<String> = (0..10000)
+            .map(|i| format!("Working on item {}...", i))
+            .collect();
+        let output = lines.join("\n");
+
+        assert_eq!(
+            analyze_output(&output, 0, &test_dir()),
+            IterationOutcome::Stale,
+            "Large output with no signals should be Stale"
+        );
+    }
+
+    #[test]
+    fn test_large_output_with_rate_limit_early() {
+        // Rate limit search is full-output, not last-20
+        let mut lines = vec!["rate_limit_error: too many requests".to_string()];
+        for i in 0..10000 {
+            lines.push(format!("line {}", i));
+        }
+        let output = lines.join("\n");
+
+        assert_eq!(
+            analyze_output(&output, 1, &test_dir()),
+            IterationOutcome::RateLimit,
+            "Rate limit anywhere in large output should be detected"
+        );
+    }
+
+    // --- AC 7: Unicode characters don't crash ---
+
+    #[test]
+    fn test_unicode_output_no_crash() {
+        let output = "日本語のテスト出力 🎉\n\
+                      Ñoño café résumé naïve\n\
+                      <promise>COMPLETE</promise>\n\
+                      이것은 한국어입니다 🚀";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "Unicode output should not crash detection"
+        );
+    }
+
+    #[test]
+    fn test_unicode_in_reorder_tag() {
+        let output = "<reorder>ТЕСТ-001</reorder>";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Reorder("ТЕСТ-001".to_string()),
+            "Unicode task IDs should be extracted correctly"
+        );
+    }
+
+    #[test]
+    fn test_emoji_heavy_output_no_crash() {
+        let output = "🔧 Working on task 🎯\n\
+                      ✅ Step 1 done\n\
+                      ✅ Step 2 done\n\
+                      🏁 <promise>COMPLETE</promise>";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+        );
+    }
+
+    #[test]
+    fn test_unicode_only_output_is_stale() {
+        let output = "日本語のテスト 🎉";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Stale,
+        );
+    }
+
+    // --- AC 8: Empty output additional edge cases ---
+
+    #[test]
+    fn test_empty_output_with_nonzero_exit_is_crash() {
+        let result = analyze_output("", 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "Empty output with non-zero exit should be Crash, not Empty"
+        );
+    }
+
+    #[test]
+    fn test_newlines_only_is_empty() {
+        let result = analyze_output("\n\n\n\n", 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Empty,
+            "Newlines-only output should be Empty"
+        );
+    }
+
+    #[test]
+    fn test_tabs_and_spaces_is_empty() {
+        let result = analyze_output("\t  \t  \n\t  ", 0, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Empty,
+            "Tabs and spaces only should be Empty"
+        );
+    }
+
+    // --- Additional priority/interaction edge cases ---
+
+    #[test]
+    fn test_complete_overrides_rate_limit_and_crash() {
+        // Complete in output, rate limit pattern, AND non-zero exit
+        let output = "rate_limit_error\nrecovered\n<promise>COMPLETE</promise>\n";
+        assert_eq!(
+            analyze_output(output, 137, &test_dir()),
+            IterationOutcome::Completed,
+            "COMPLETE should override both rate limit and crash"
+        );
+    }
+
+    #[test]
+    fn test_blocked_overrides_rate_limit() {
+        let output = "rate_limit_error happened\nbut then blocked\n<promise>BLOCKED</promise>\n";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Blocked,
+            "BLOCKED should override rate limit"
+        );
+    }
+
+    #[test]
+    fn test_reorder_overrides_rate_limit() {
+        // Reorder present, rate limit present, no complete/blocked
+        let output = "rate_limit_error\n<reorder>FEAT-005</reorder>\n";
+        // Wait - rate_limit_error IS in the output. But reorder is checked before rate limit.
+        // Actually looking at the code: Complete > Blocked > Reorder > RateLimit
+        // But rate_limit_error also present — need to check ordering
+        // Step 1: no COMPLETE/BLOCKED in last 20
+        // Step 2: reorder tag found → returns Reorder
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Reorder("FEAT-005".to_string()),
+            "Reorder should override rate limit"
+        );
+    }
+
+    #[test]
+    fn test_stale_returned_for_normal_output() {
+        let output =
+            "Did some work, compiled things, ran tests.\nAll green.\nNo completion signal.";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Stale,
+        );
+    }
+
+    // --- Partial/malformed promise tags ---
+
+    #[test]
+    fn test_partial_complete_tag_not_detected() {
+        let output = "<promise>COMPLET</promise>\n";
+        assert_ne!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "Partial COMPLETE text should not be detected"
+        );
+    }
+
+    #[test]
+    fn test_promise_tag_without_closing_not_detected() {
+        let output = "<promise>COMPLETE\nmore output\n";
+        assert_ne!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "Unclosed promise tag should not be detected"
+        );
+    }
+
+    #[test]
+    fn test_complete_text_without_promise_tags_not_detected() {
+        let output = "COMPLETE\n";
+        assert_ne!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "COMPLETE without promise tags should not be detected"
+        );
+    }
+
+    #[test]
+    fn test_promise_complete_with_extra_whitespace_not_detected() {
+        // Exact match required — no whitespace tolerance inside the tag
+        let output = "<promise> COMPLETE </promise>\n";
+        assert_ne!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "Whitespace inside <promise> tag should not match"
+        );
+    }
+
+    // --- Exit code edge cases ---
+
+    #[test]
+    fn test_exit_code_negative_is_crash() {
+        let output = "some output";
+        let result = analyze_output(output, -1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "Negative exit code should be RuntimeError"
+        );
+    }
+
+    #[test]
+    fn test_exit_code_127_command_not_found() {
+        let output = "command not found";
+        let result = analyze_output(output, 127, &test_dir());
+        assert_eq!(result, IterationOutcome::Crash(CrashType::RuntimeError),);
+    }
+
+    #[test]
+    fn test_exit_code_143_sigterm() {
+        let output = "terminated";
+        let result = analyze_output(output, 143, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::Crash(CrashType::RuntimeError),
+            "Exit 143 (SIGTERM) maps to RuntimeError (not special-cased)"
+        );
+    }
+}

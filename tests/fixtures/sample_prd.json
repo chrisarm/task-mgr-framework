@@ -1,0 +1,209 @@
+{
+  "branchName": "feature/sample-feature",
+  "description": "Sample PRD for integration testing with various task relationships.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "All tests pass",
+      "No compiler warnings"
+    ],
+    "description": "Common criteria for all tasks"
+  },
+  "priorityPhilosophy": {
+    "description": "Simple priority ordering for tests",
+    "hierarchy": [
+      "1. Core functionality",
+      "2. Supporting features",
+      "3. Documentation and cleanup"
+    ]
+  },
+  "project": "sample-test-project",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Fix immediately",
+      "medium": "11-20: Fix before release"
+    }
+  },
+  "taskPrefix": "3019e47c",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Create src/feature/mod.rs",
+        "Create src/feature/types.rs",
+        "Export public API from lib.rs"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Set up the foundational module structure for the feature.",
+      "id": "TASK-001",
+      "notes": "Foundation task - all other tasks depend on this.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [
+        "TASK-002"
+      ],
+      "title": "Create core module structure",
+      "touchesFiles": [
+        "src/feature/mod.rs",
+        "src/feature/types.rs",
+        "src/lib.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Define Item struct with id, name, value fields",
+        "Implement Serialize/Deserialize",
+        "Add validation methods"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TASK-001"
+      ],
+      "description": "Create the data structures needed for the feature.",
+      "id": "TASK-002",
+      "notes": "Models are the core domain objects.",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [
+        "TASK-001",
+        "TASK-003"
+      ],
+      "title": "Implement data models",
+      "touchesFiles": [
+        "src/feature/types.rs",
+        "src/feature/models.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Create Storage trait",
+        "Implement FileStorage backend",
+        "Add save() and load() methods"
+      ],
+      "batchWith": [
+        "TASK-004"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TASK-002"
+      ],
+      "description": "Create the persistence layer for storing items.",
+      "id": "TASK-003",
+      "notes": "Storage is needed before we can implement commands.",
+      "passes": false,
+      "priority": 3,
+      "synergyWith": [
+        "TASK-002"
+      ],
+      "title": "Implement storage layer",
+      "touchesFiles": [
+        "src/feature/storage.rs",
+        "src/feature/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test save and load roundtrip",
+        "Test error handling for missing files",
+        "Test concurrent access behavior"
+      ],
+      "batchWith": [
+        "TASK-003"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TASK-002"
+      ],
+      "description": "Write unit tests for the storage layer.",
+      "id": "TASK-004",
+      "notes": "Tests should be written alongside storage implementation.",
+      "passes": false,
+      "priority": 4,
+      "synergyWith": [
+        "TASK-003"
+      ],
+      "title": "Add storage tests",
+      "touchesFiles": [
+        "src/feature/storage.rs",
+        "tests/storage_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Add 'add' subcommand",
+        "Add 'list' subcommand",
+        "Add 'remove' subcommand",
+        "All commands use storage layer"
+      ],
+      "batchWith": [],
+      "conflictsWith": [
+        "TASK-007"
+      ],
+      "dependsOn": [
+        "TASK-003"
+      ],
+      "description": "Create the command-line interface for the feature.",
+      "id": "TASK-005",
+      "notes": "CLI depends on storage being complete.",
+      "passes": false,
+      "priority": 5,
+      "synergyWith": [],
+      "title": "Implement CLI commands",
+      "touchesFiles": [
+        "src/feature/cli.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test add command creates items",
+        "Test list command shows items",
+        "Test remove command deletes items"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TASK-005"
+      ],
+      "description": "Write integration tests for CLI commands.",
+      "id": "TASK-006",
+      "notes": "Integration tests verify end-to-end behavior.",
+      "passes": false,
+      "priority": 6,
+      "synergyWith": [
+        "TASK-005"
+      ],
+      "title": "Add CLI integration tests",
+      "touchesFiles": [
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Add help text for all commands",
+        "Add --verbose flag",
+        "Improve error messages"
+      ],
+      "batchWith": [],
+      "conflictsWith": [
+        "TASK-005"
+      ],
+      "dependsOn": [
+        "TASK-005"
+      ],
+      "description": "Improve the CLI argument handling for better UX.",
+      "id": "TASK-007",
+      "notes": "Nice-to-have improvements. Conflicts with TASK-005 since both modify CLI.",
+      "passes": false,
+      "priority": 10,
+      "severity": "low",
+      "synergyWith": [],
+      "title": "Refactor CLI argument parsing",
+      "touchesFiles": [
+        "src/feature/cli.rs",
+        "src/main.rs"
+      ]
+    }
+  ]
+}

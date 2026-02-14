@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: task-mgr
+
+jobs:
+  # Build binaries for all target platforms
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 - native build
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          # Linux aarch64 - cross compile
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          # macOS x86_64 - native build
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          # macOS aarch64 (Apple Silicon) - native build on arm64 runner
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build native
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Create release archive
+        id: archive
+        shell: bash
+        run: |
+          # Determine archive name and extension
+          VERSION="${GITHUB_REF#refs/tags/}"
+          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
+
+          # Create staging directory
+          mkdir -p staging
+
+          # Copy binary
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" staging/
+            ARCHIVE_FILE="${ARCHIVE_NAME}.zip"
+            cd staging && zip -r "../${ARCHIVE_FILE}" . && cd ..
+          else
+            cp "target/${{ matrix.target }}/release/${BINARY_NAME}" staging/
+            ARCHIVE_FILE="${ARCHIVE_NAME}.tar.gz"
+            tar -czvf "${ARCHIVE_FILE}" -C staging .
+          fi
+
+          # Generate SHA256 checksum
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "${ARCHIVE_FILE}" > "${ARCHIVE_FILE}.sha256"
+          else
+            sha256sum "${ARCHIVE_FILE}" > "${ARCHIVE_FILE}.sha256"
+          fi
+
+          echo "archive=${ARCHIVE_FILE}" >> $GITHUB_OUTPUT
+          echo "checksum=${ARCHIVE_FILE}.sha256" >> $GITHUB_OUTPUT
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.archive }}
+          path: ${{ steps.archive.outputs.archive }}
+          retention-days: 1
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.checksum }}
+          path: ${{ steps.archive.outputs.checksum }}
+          retention-days: 1
+
+  # Create GitHub Release with all artifacts
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Create combined checksums file
+        run: |
+          cd release
+          cat *.sha256 > checksums.txt
+          cat checksums.txt
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          cat > release_notes.md << 'EOF'
+          ## Installation
+
+          ### Download prebuilt binary
+
+          Download the appropriate archive for your platform from the assets below:
+
+          | Platform | Architecture | Archive |
+          |----------|-------------|---------|
+          | Linux | x86_64 | `task-mgr-${VERSION}-x86_64-unknown-linux-gnu.tar.gz` |
+          | Linux | aarch64 | `task-mgr-${VERSION}-aarch64-unknown-linux-gnu.tar.gz` |
+          | macOS | x86_64 | `task-mgr-${VERSION}-x86_64-apple-darwin.tar.gz` |
+          | macOS | aarch64 (Apple Silicon) | `task-mgr-${VERSION}-aarch64-apple-darwin.tar.gz` |
+
+          ### Verify checksum
+
+          ```bash
+          # Linux
+          sha256sum -c task-mgr-*.sha256
+
+          # macOS
+          shasum -a 256 -c task-mgr-*.sha256
+          ```
+
+          ### Install
+
+          ```bash
+          # Extract the archive
+          tar -xzf task-mgr-*.tar.gz
+
+          # Move to a directory in your PATH
+          sudo mv task-mgr /usr/local/bin/
+
+          # Verify installation
+          task-mgr --version
+          ```
+
+          ### Build from source
+
+          ```bash
+          cargo install --git https://github.com/anthropics/claude-code task-mgr
+          ```
+
+          ## Checksums
+
+          See `checksums.txt` or individual `.sha256` files for SHA256 checksums.
+          EOF
+
+          # Replace VERSION placeholder
+          sed -i "s/\${VERSION}/${VERSION}/g" release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+            release/checksums.txt
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
