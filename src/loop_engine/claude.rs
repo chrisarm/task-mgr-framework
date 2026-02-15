@@ -8,6 +8,7 @@
 /// When a `SignalFlag` is provided, a watchdog thread monitors for SIGINT/SIGTERM
 /// and escalates: SIGTERM → 3s grace → SIGKILL.
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,6 +36,11 @@ pub struct ClaudeResult {
 /// - stderr is inherited (passes through directly to the terminal)
 /// - The full environment is inherited by the subprocess
 ///
+/// When `working_dir` is `Some`, the subprocess runs in that directory. This is
+/// critical when using git worktrees: Claude's sandbox scopes file writes to its
+/// working directory, so it must run from the worktree (not the source repo) to
+/// be able to write files there.
+///
 /// When `signal_flag` is `Some`, a watchdog thread polls the flag every 200ms.
 /// On signal detection: sends SIGTERM to child, waits up to 3s, then SIGKILL.
 ///
@@ -45,12 +51,17 @@ pub struct ClaudeResult {
 pub fn spawn_claude(
     prompt: &str,
     signal_flag: Option<&SignalFlag>,
+    working_dir: Option<&Path>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = Command::new(&binary);
     cmd.args(["--print", "--dangerously-skip-permissions", "-p", prompt])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
 
     // Put child in its own process group so we can kill the entire tree on signal.
     // This also prevents Claude from receiving terminal SIGINT directly — the
@@ -354,7 +365,7 @@ mod tests {
     fn test_spawn_without_signal_flag() {
         // spawn_claude with None should behave like before
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None);
+        let result = spawn_claude("hello", None, None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -367,7 +378,7 @@ mod tests {
         // spawn_claude with a SignalFlag that is NOT signaled should work normally
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("test output", Some(&flag));
+        let result = spawn_claude("test output", Some(&flag), None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -487,7 +498,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // "60" is the argument to sleep — it will run for 60s unless killed
-        let result = spawn_claude("60", Some(&flag));
+        let result = spawn_claude("60", Some(&flag), None);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -510,7 +521,7 @@ mod tests {
         // If the child exits normally, the watchdog should stop cleanly
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("quick exit", Some(&flag));
+        let result = spawn_claude("quick exit", Some(&flag), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());

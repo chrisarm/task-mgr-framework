@@ -67,7 +67,7 @@ pub fn extract_learnings_from_output(
     let prompt = build_extraction_prompt(output, task_id);
 
     // Spawn Claude for extraction
-    let claude_result = match claude::spawn_claude(&prompt, None) {
+    let claude_result = match claude::spawn_claude(&prompt, None, None) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Warning: learning extraction spawn failed: {}", e);
