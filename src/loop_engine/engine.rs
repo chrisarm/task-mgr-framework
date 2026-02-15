@@ -765,7 +765,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
         let elapsed = start_time.elapsed().as_secs();
 
-        let result = match run_iteration(
+        let mut result = match run_iteration(
             &mut ctx,
             &conn,
             &run_config.db_dir,
@@ -838,6 +838,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
                     tasks_completed += 1;
 
+                    // Override outcome so stale tracker resets — task was actually completed
+                    result.outcome = IterationOutcome::Completed;
+
                     // Update PRD JSON to set passes: true
                     if let Err(e) = update_prd_task_passes(&paths.prd_file, task_id, true, task_prefix.as_deref()) {
                         eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
@@ -876,6 +879,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
                         tasks_completed += 1;
 
+                        // Override outcome so stale tracker resets — task was actually completed
+                        result.outcome = IterationOutcome::Completed;
+
                         if let Err(e) =
                             update_prd_task_passes(&paths.prd_file, completed_id, true, task_prefix.as_deref())
                         {
@@ -910,6 +916,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 );
                 if count > 0 {
                     tasks_completed += count as u32;
+
+                    // Override outcome so stale tracker resets — task was actually completed
+                    result.outcome = IterationOutcome::Completed;
+
                     eprintln!(
                         "Post-iteration reconciliation: marked {} task(s) done",
                         count
