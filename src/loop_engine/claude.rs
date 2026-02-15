@@ -56,6 +56,7 @@ pub fn spawn_claude(
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = Command::new(&binary);
     cmd.args(["--print", "--dangerously-skip-permissions", "-p", prompt])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
