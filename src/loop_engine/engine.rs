@@ -278,6 +278,39 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                 });
+            }
+
+            // Auto-recover: reset stale in_progress tasks to todo and retry.
+            // Safe because we hold the exclusive loop.lock — no other loop is running.
+            let recovered = conn
+                .execute(
+                    "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
+                    [],
+                )
+                .unwrap_or(0);
+
+            if recovered > 0 {
+                eprintln!(
+                    "Auto-recovered {} stale in_progress task(s), retrying task selection...",
+                    recovered
+                );
+                // Retry build_prompt once with the same params
+                match prompt::build_prompt(&prompt_params)? {
+                    Some(result) => result,
+                    None => {
+                        eprintln!(
+                            "No eligible tasks after recovery ({} remaining). Treating as stale.",
+                            remaining
+                        );
+                        return Ok(IterationResult {
+                            outcome: IterationOutcome::Stale,
+                            task_id: None,
+                            files_modified: vec![],
+                            should_stop: false,
+                            output: String::new(),
+                        });
+                    }
+                }
             } else {
                 eprintln!(
                     "No eligible tasks right now ({} remaining in todo/in-progress/blocked). Treating as stale.",
@@ -911,6 +944,25 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             }
         }
 
+        // Track consecutive stale iterations and abort if stuck
+        if matches!(result.outcome, IterationOutcome::Stale) {
+            ctx.stale_tracker.check("stale", "stale"); // same hash → increment
+            if ctx.stale_tracker.should_abort() {
+                eprintln!(
+                    "Aborting: no eligible tasks after {} consecutive stale iterations",
+                    ctx.stale_tracker.count()
+                );
+                exit_code = 1;
+                exit_reason = format!(
+                    "no eligible tasks after {} consecutive stale iterations",
+                    ctx.stale_tracker.count()
+                );
+                break;
+            }
+        } else {
+            ctx.stale_tracker.check("a", "b"); // different hash → reset
+        }
+
         // Check for terminal outcomes
         if result.should_stop {
             match &result.outcome {
@@ -1395,10 +1447,11 @@ fn reconcile_external_git_completions(
     reconciled
 }
 
-/// Check if the most recent git commit contains the task ID.
+/// Check recent git commits for the task ID.
 ///
 /// Returns the commit hash if found, None otherwise.
-/// Looks for patterns like `[TASK-001]`, `feat: TASK-001`, `TASK-001:`, etc.
+/// Checks the last 5 commits (subject + body) to handle multi-commit iterations
+/// where the task ID may appear in an earlier commit.
 /// Also tries the base ID (prefix stripped) as a fallback.
 fn check_git_for_task_completion(
     project_root: &Path,
@@ -1407,9 +1460,10 @@ fn check_git_for_task_completion(
 ) -> Option<String> {
     use std::process::Command;
 
-    // Get the most recent commit (hash and message)
+    // Get the last 5 commits: hash + full message (subject + body).
+    // Use a record separator to split multi-line commit messages.
     let output = Command::new("git")
-        .args(["log", "-1", "--format=%H %s"])
+        .args(["log", "-5", "--format=%H%x00%B%x00"])
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -1418,28 +1472,34 @@ fn check_git_for_task_completion(
         return None;
     }
 
-    let line = String::from_utf8_lossy(&output.stdout);
-    let line = line.trim();
-
-    if line.is_empty() {
-        return None;
-    }
-
-    // Split into hash and message
-    let (hash, message) = line.split_once(' ')?;
-
-    // Check if message contains the task ID (case-insensitive)
-    let message_upper = message.to_uppercase();
+    let raw = String::from_utf8_lossy(&output.stdout);
     let task_id_upper = task_id.to_uppercase();
     let base_id_upper = strip_task_prefix(task_id, task_prefix).to_uppercase();
 
-    if message_upper.contains(&task_id_upper)
-        || (task_id_upper != base_id_upper && message_upper.contains(&base_id_upper))
-    {
-        Some(hash.to_string())
-    } else {
-        None
+    // Each record is: <hash>\0<full message>\0
+    // Split on \0 and process pairs.
+    let parts: Vec<&str> = raw.split('\0').collect();
+    // parts layout: [hash, message, hash, message, ..., trailing-empty]
+    for chunk in parts.chunks(2) {
+        if chunk.len() < 2 {
+            break;
+        }
+        let hash = chunk[0].trim();
+        let message = chunk[1];
+
+        if hash.is_empty() {
+            continue;
+        }
+
+        let message_upper = message.to_uppercase();
+        if message_upper.contains(&task_id_upper)
+            || (task_id_upper != base_id_upper && message_upper.contains(&base_id_upper))
+        {
+            return Some(hash.to_string());
+        }
     }
+
+    None
 }
 
 /// Compute an MD5 hash of a file's contents.
@@ -1703,6 +1763,32 @@ mod tests {
         let hash = result.unwrap();
         assert_eq!(hash.len(), 40, "Should return full commit hash");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "Hash should be hex");
+    }
+
+    #[test]
+    fn test_check_git_completion_finds_task_in_earlier_commit() {
+        // Claude may create multiple commits; the task ID might be in an earlier one
+        let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
+        git_commit(temp_dir.path(), "feat: [TASK-001] implement feature");
+        git_commit(temp_dir.path(), "fix: adjust config formatting");
+        git_commit(temp_dir.path(), "chore: update lockfile");
+
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
+        assert!(result.is_some(), "Should find task ID in earlier commit (not just HEAD)");
+    }
+
+    #[test]
+    fn test_check_git_completion_finds_task_in_commit_body() {
+        // Task ID may appear in commit body, not just subject
+        let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "feat: implement tests\n\nCompletes TASK-001 acceptance criteria"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("create commit with body");
+
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
+        assert!(result.is_some(), "Should find task ID in commit body");
     }
 
     // --- update_prd_task_passes tests ---
@@ -2509,5 +2595,103 @@ mod tests {
             "aeb10a1f-FIX-001",
             Some("aeb10a1f"),
         ));
+    }
+
+    // --- Stale tracker wiring tests ---
+
+    #[test]
+    fn test_stale_abort_after_consecutive_stale_outcomes() {
+        // Simulates the outer loop's stale tracker wiring:
+        // 3 consecutive Stale outcomes should trigger abort.
+        let mut ctx = IterationContext::new(5);
+
+        // First stale
+        ctx.stale_tracker.check("stale", "stale");
+        assert!(!ctx.stale_tracker.should_abort(), "1 stale should not abort");
+
+        // Second stale
+        ctx.stale_tracker.check("stale", "stale");
+        assert!(!ctx.stale_tracker.should_abort(), "2 stale should not abort");
+
+        // Third stale
+        ctx.stale_tracker.check("stale", "stale");
+        assert!(ctx.stale_tracker.should_abort(), "3 consecutive stale should abort");
+    }
+
+    #[test]
+    fn test_stale_tracker_resets_on_non_stale_outcome() {
+        // Non-Stale outcomes reset the stale tracker, preventing abort.
+        let mut ctx = IterationContext::new(5);
+
+        // Two stale
+        ctx.stale_tracker.check("stale", "stale");
+        ctx.stale_tracker.check("stale", "stale");
+        assert_eq!(ctx.stale_tracker.count(), 2);
+
+        // Non-stale resets
+        ctx.stale_tracker.check("a", "b");
+        assert_eq!(ctx.stale_tracker.count(), 0, "Non-stale outcome should reset tracker");
+        assert!(!ctx.stale_tracker.should_abort());
+
+        // One more stale — not enough to abort
+        ctx.stale_tracker.check("stale", "stale");
+        assert_eq!(ctx.stale_tracker.count(), 1);
+        assert!(!ctx.stale_tracker.should_abort());
+    }
+
+    #[test]
+    fn test_stale_recovery_resets_in_progress_tasks() {
+        // Verifies the SQL recovery logic: in_progress tasks get reset to todo.
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+
+        // Insert tasks: one in_progress (stale), one blocked, one done
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('FEAT-001', 'Stale task', 'in_progress', 1),
+             ('FEAT-002', 'Blocked task', 'blocked', 2),
+             ('FEAT-003', 'Done task', 'done', 3);",
+        )
+        .unwrap();
+
+        // Simulate the auto-recovery SQL from run_iteration
+        let recovered = conn
+            .execute(
+                "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(recovered, 1, "Should recover exactly 1 in_progress task");
+
+        // Verify the task was reset
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'FEAT-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "todo", "in_progress task should be reset to todo");
+
+        // Verify other tasks are unaffected
+        let blocked_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'FEAT-002'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_status, "blocked", "Blocked task should be unaffected");
+
+        let done_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'FEAT-003'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(done_status, "done", "Done task should be unaffected");
     }
 }
