@@ -47,12 +47,26 @@ pub fn spawn_claude(
     signal_flag: Option<&SignalFlag>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-    let mut child = Command::new(&binary)
-        .args(["--print", "--dangerously-skip-permissions", "-p", prompt])
+    let mut cmd = Command::new(&binary);
+    cmd.args(["--print", "--dangerously-skip-permissions", "-p", prompt])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| {
+        .stderr(Stdio::inherit());
+
+    // Put child in its own process group so we can kill the entire tree on signal.
+    // This also prevents Claude from receiving terminal SIGINT directly — the
+    // watchdog thread is solely responsible for termination.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 TaskMgrError::IoErrorWithContext {
                     file_path: binary.clone(),
@@ -155,20 +169,23 @@ fn watchdog_loop(child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
     const GRACE_PERIOD: Duration = Duration::from_secs(3);
     const GRACE_POLL: Duration = Duration::from_millis(100);
 
+    // Kill the process group (negative PID) so that Claude AND all its child
+    // processes are terminated. This prevents orphaned children from holding
+    // the stdout pipe open and blocking the main thread in reader.lines().
+    let pgid = -(child_pid as i32);
+
     // Poll until signaled or told to stop
     while !stop.load(Ordering::Acquire) {
         if signal_flag.is_signaled() {
-            let pid = child_pid as i32;
-
             eprintln!(
-                "\nSignal received, terminating Claude subprocess (pid {})...",
-                pid
+                "\nSignal received, terminating Claude process group (pgid {})...",
+                child_pid
             );
 
-            // Send SIGTERM
-            let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
+            // Send SIGTERM to the entire process group
+            let ret = unsafe { libc::kill(pgid, libc::SIGTERM) };
             if ret == -1 {
-                // ESRCH: process already exited — nothing to do
+                // ESRCH: process group already exited — nothing to do
                 return;
             }
 
@@ -180,18 +197,18 @@ fn watchdog_loop(child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
                     // Main thread reaped the child
                     return;
                 }
-                // Check if child still exists
-                let ret = unsafe { libc::kill(pid, 0) };
+                // Check if process group leader still exists
+                let ret = unsafe { libc::kill(pgid, 0) };
                 if ret == -1 {
-                    // Process exited
+                    // Process group exited
                     return;
                 }
             }
 
-            // Grace period expired — force kill
-            eprintln!("Grace period expired, sending SIGKILL to pid {}...", pid);
+            // Grace period expired — force kill the entire group
+            eprintln!("Grace period expired, sending SIGKILL to process group {}...", child_pid);
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
+                libc::kill(pgid, libc::SIGKILL);
             }
             return;
         }

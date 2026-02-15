@@ -721,10 +721,7 @@ mod tests {
 
     #[test]
     fn test_validate_git_repo_succeeds_in_git_repo() {
-        // The project root is a git repo
-        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("task-mgr should have a parent directory");
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(validate_git_repo(project_root).is_ok());
     }
 
@@ -745,9 +742,7 @@ mod tests {
 
     #[test]
     fn test_get_current_branch_returns_nonempty_string() {
-        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("task-mgr should have a parent directory");
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let branch = get_current_branch(project_root).expect("should get branch");
         assert!(!branch.is_empty(), "Branch name should not be empty");
     }

@@ -110,7 +110,8 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>) {
 
         // Heartbeat if no changes for HEARTBEAT_INTERVAL_SECS
         if last_change_time.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-            eprintln!("[monitor] heartbeat: still running, no new changes");
+            let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+            eprintln!("[monitor {}] heartbeat: still running, no new changes", ts);
             last_change_time = Instant::now();
         }
 
@@ -121,11 +122,9 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>) {
 
 /// Print changed files from `git status --porcelain` output to stderr.
 fn print_status_change(status: &str) {
-    let file_count = status.lines().filter(|l| !l.is_empty()).count();
-    eprintln!("[monitor] {} file(s) changed:", file_count);
-    for line in status.lines().filter(|l| !l.is_empty()) {
-        eprintln!("[monitor]   {}", line);
-    }
+    let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+    let files: Vec<&str> = status.lines().filter(|l| !l.is_empty()).collect();
+    eprintln!("[monitor {}] {} file(s) changed: {}", ts, files.len(), files.join(", "));
 }
 
 #[cfg(test)]
