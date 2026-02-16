@@ -155,6 +155,8 @@ pub fn run_iteration(
     elapsed_secs: u64,
     verbose: bool,
     usage_params: &UsageParams,
+    prd_path: Option<&Path>,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<IterationResult> {
     // Step 0: Check for SIGINT/SIGTERM
     if signal_flag.is_signaled() {
@@ -282,6 +284,14 @@ pub fn run_iteration(
 
             // Auto-recover: reset stale in_progress tasks to todo and retry.
             // Safe because we hold the exclusive loop.lock — no other loop is running.
+            //
+            // First, reconcile any in_progress tasks that have passes: true in the PRD.
+            // These were completed but the DB status was never updated (e.g., rate limit
+            // interrupted git detection). Mark them done instead of resetting to todo.
+            if let Some(prd) = prd_path {
+                reconcile_passes_with_db(conn, prd, task_prefix);
+            }
+
             let recovered = conn
                 .execute(
                     "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
@@ -781,6 +791,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             elapsed,
             run_config.config.verbose,
             &usage_params,
+            Some(run_config.prd_file.as_path()),
+            task_prefix.as_deref(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -818,38 +830,38 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
         // Check git for task completion: if recent commit contains task ID, mark done
         if let Some(ref task_id) = result.task_id {
-            if !matches!(
-                result.outcome,
-                IterationOutcome::Crash(_) | IterationOutcome::Empty | IterationOutcome::RateLimit
-            ) {
+            if !matches!(result.outcome, IterationOutcome::Empty) {
                 if let Some(commit_hash) = check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref()) {
                     // Mark task done in DB
                     let task_ids = [task_id.clone()];
-                    if let Err(e) = complete_cmd::complete(
+                    match complete_cmd::complete(
                         &mut conn,
                         &task_ids,
                         Some(&run_id),
                         Some(&commit_hash),
                         false, // force
                     ) {
-                        eprintln!("Warning: failed to mark task {} as done in DB: {}", task_id, e);
-                    }
-                    last_claimed_task = None;
+                        Ok(_) => {
+                            last_claimed_task = None;
+                            tasks_completed += 1;
 
-                    tasks_completed += 1;
+                            // Override outcome so stale tracker resets — task was actually completed
+                            result.outcome = IterationOutcome::Completed;
 
-                    // Override outcome so stale tracker resets — task was actually completed
-                    result.outcome = IterationOutcome::Completed;
-
-                    // Update PRD JSON to set passes: true
-                    if let Err(e) = update_prd_task_passes(&paths.prd_file, task_id, true, task_prefix.as_deref()) {
-                        eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
-                    } else {
-                        eprintln!(
-                            "Task {} completed (commit {})",
-                            task_id,
-                            &commit_hash[..7.min(commit_hash.len())]
-                        );
+                            // Update PRD JSON to set passes: true
+                            if let Err(e) = update_prd_task_passes(&paths.prd_file, task_id, true, task_prefix.as_deref()) {
+                                eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
+                            } else {
+                                eprintln!(
+                                    "Task {} completed (commit {})",
+                                    task_id,
+                                    &commit_hash[..7.min(commit_hash.len())]
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to mark task {} as done in DB: {}", task_id, e);
+                        }
                     }
                 } else {
                     // Fallback: scan Claude's output for ANY completed task IDs.
@@ -859,41 +871,44 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                         scan_output_for_completed_tasks(&result.output, &conn, task_prefix.as_deref());
                     for completed_id in &completed_ids {
                         let ids = [completed_id.clone()];
-                        if let Err(e) = complete_cmd::complete(
+                        match complete_cmd::complete(
                             &mut conn,
                             &ids,
                             Some(&run_id),
                             None, // no commit hash — different repo
                             false,
                         ) {
-                            eprintln!(
-                                "Warning: failed to mark task {} as done: {}",
-                                completed_id, e
-                            );
-                        }
+                            Ok(_) => {
+                                // Clear tracker if the claimed task was completed via output scan
+                                if result.task_id.as_deref() == Some(completed_id.as_str()) {
+                                    last_claimed_task = None;
+                                }
 
-                        // Clear tracker if the claimed task was completed via output scan
-                        if result.task_id.as_deref() == Some(completed_id.as_str()) {
-                            last_claimed_task = None;
-                        }
+                                tasks_completed += 1;
 
-                        tasks_completed += 1;
+                                // Override outcome so stale tracker resets — task was actually completed
+                                result.outcome = IterationOutcome::Completed;
 
-                        // Override outcome so stale tracker resets — task was actually completed
-                        result.outcome = IterationOutcome::Completed;
-
-                        if let Err(e) =
-                            update_prd_task_passes(&paths.prd_file, completed_id, true, task_prefix.as_deref())
-                        {
-                            eprintln!(
-                                "Warning: failed to update PRD for task {}: {}",
-                                completed_id, e
-                            );
-                        } else {
-                            eprintln!(
-                                "Task {} completed (detected from output)",
-                                completed_id
-                            );
+                                if let Err(e) =
+                                    update_prd_task_passes(&paths.prd_file, completed_id, true, task_prefix.as_deref())
+                                {
+                                    eprintln!(
+                                        "Warning: failed to update PRD for task {}: {}",
+                                        completed_id, e
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Task {} completed (detected from output)",
+                                        completed_id
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: failed to mark task {} as done: {}",
+                                    completed_id, e
+                                );
+                            }
                         }
                     }
                 }
@@ -903,10 +918,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         // Post-iteration: reconcile external git completions
         // Catches tasks completed in the current iteration (and any missed from prior)
         if let Some(ref ext_repo) = external_repo_path {
-            if !matches!(
-                result.outcome,
-                IterationOutcome::Crash(_) | IterationOutcome::Empty | IterationOutcome::RateLimit
-            ) {
+            if !matches!(result.outcome, IterationOutcome::Empty) {
                 let count = reconcile_external_git_completions(
                     ext_repo,
                     &mut conn,
@@ -1266,6 +1278,70 @@ fn update_prd_task_passes(
     })?;
 
     Ok(())
+}
+
+/// Reconcile in_progress tasks against PRD passes status.
+///
+/// If a task is `in_progress` in the DB but has `passes: true` in the PRD JSON,
+/// it was completed but the DB was never updated (e.g., rate limit interrupted
+/// git detection). Mark it `done` to prevent infinite re-selection loops.
+fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Option<&str>) {
+    use std::fs;
+
+    // Get all in_progress task IDs from the DB
+    let mut stmt = match conn.prepare("SELECT id FROM tasks WHERE status = 'in_progress'") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let in_progress_ids: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    if in_progress_ids.is_empty() {
+        return;
+    }
+
+    // Read PRD and build a set of task IDs with passes: true
+    let content = match fs::read_to_string(prd_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let prd: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let stories = match prd.get("userStories").and_then(|v| v.as_array()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let passing_ids: std::collections::HashSet<&str> = stories
+        .iter()
+        .filter(|s| s.get("passes").and_then(|v| v.as_bool()) == Some(true))
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
+        .collect();
+
+    // For each in_progress task, check if its base ID (prefix-stripped) has passes: true
+    for task_id in &in_progress_ids {
+        let base_id = strip_task_prefix(task_id, task_prefix);
+        if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
+            match conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
+                [task_id.as_str()],
+            ) {
+                Ok(1) => {
+                    eprintln!(
+                        "Reconciled task {} as done (passes: true in PRD but was in_progress in DB)",
+                        task_id
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Strip the auto-generated task prefix from a DB task ID to recover the base ID.
