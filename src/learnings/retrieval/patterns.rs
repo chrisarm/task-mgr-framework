@@ -184,14 +184,32 @@ fn get_task_error(conn: &Connection, task_id: &str) -> TaskMgrResult<Option<Stri
     }
 }
 
-/// Extracts the task type prefix from a task ID.
-/// E.g., "US-001" -> "US-", "FIX-123" -> "FIX-"
-pub(crate) fn extract_task_prefix(task_id: &str) -> String {
-    if let Some(dash_pos) = task_id.find('-') {
-        task_id[..=dash_pos].to_string()
-    } else {
-        task_id.to_string()
+/// Strips a leading UUID prefix (8 hex chars followed by `-`) from a task ID.
+///
+/// E.g., `"f424ade5-PA-FEAT-003"` → `"PA-FEAT-003"`, `"US-001"` → `"US-001"`.
+fn strip_uuid_prefix(task_id: &str) -> &str {
+    // UUID prefix is exactly 8 hex digits followed by a dash
+    if task_id.len() >= 9 {
+        let (prefix, rest) = task_id.split_at(9);
+        if prefix.len() == 9
+            && prefix.as_bytes()[8] == b'-'
+            && prefix[..8].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return rest;
+        }
     }
+    task_id
+}
+
+/// Extracts the task type prefix from a task ID.
+///
+/// First strips any leading UUID prefix, then returns the full remaining ID.
+/// The caller's `applies_to_task_types` entries use `starts_with()` matching,
+/// so returning the full ID (e.g., `"US-001"`) lets `"US-"` match naturally.
+///
+/// E.g., `"f424ade5-PA-FEAT-003"` → `"PA-FEAT-003"`, `"US-001"` → `"US-001"`.
+pub(crate) fn extract_task_prefix(task_id: &str) -> String {
+    strip_uuid_prefix(task_id).to_string()
 }
 
 /// Loads learnings that have applicability metadata.

@@ -29,6 +29,16 @@ fn setup_db() -> (TempDir, rusqlite::Connection) {
     (temp_dir, conn)
 }
 
+/// Set up a fresh database with schema and all migrations (needed for UCB columns).
+fn setup_db_with_migrations() -> (TempDir, rusqlite::Connection) {
+    use task_mgr::db::migrations::run_migrations;
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+    (temp_dir, conn)
+}
+
 // =============================================================================
 // Test: create learning -> verify stored correctly
 // =============================================================================
@@ -155,7 +165,7 @@ fn test_create_learning_with_minimal_fields() {
 
 #[test]
 fn test_recall_by_file_pattern_matches() {
-    let (temp_dir, conn) = setup_db();
+    let (temp_dir, conn) = setup_db_with_migrations();
 
     // Import sample PRD to get tasks with files
     init::init(
@@ -222,13 +232,15 @@ fn test_recall_by_file_pattern_matches() {
     };
     let result = recall_learnings(&conn, params).unwrap();
 
-    assert_eq!(result.count, 1);
+    // DB pattern matches via file, CLI pattern comes via UCB fallback
+    assert_eq!(result.count, 2);
+    // File-matched learning should be first (higher relevance tier)
     assert_eq!(result.learnings[0].title, "Database pattern");
 }
 
 #[test]
 fn test_recall_file_pattern_with_wildcard() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_migrations();
 
     // Create learning with glob pattern
     let params = RecordLearningParams {
@@ -277,7 +289,7 @@ fn test_recall_file_pattern_with_wildcard() {
 
 #[test]
 fn test_recall_by_task_type_prefix_matches() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_migrations();
 
     // Create learnings for different task types
     let us_learning = RecordLearningParams {
@@ -340,30 +352,30 @@ fn test_recall_by_task_type_prefix_matches() {
     )
     .unwrap();
 
-    // Recall for US task - should match US pattern
+    // Recall for US task - US pattern should be first, others via UCB fallback
     let us_params = RecallParams {
         for_task: Some("US-001".to_string()),
         limit: 10,
         ..Default::default()
     };
     let us_result = recall_learnings(&conn, us_params).unwrap();
-    assert_eq!(us_result.count, 1);
+    assert_eq!(us_result.count, 3); // 1 type match + 2 UCB fallback
     assert_eq!(us_result.learnings[0].title, "User story pattern");
 
-    // Recall for FIX task - should match FIX pattern
+    // Recall for FIX task - FIX pattern should be first, others via UCB fallback
     let fix_params = RecallParams {
         for_task: Some("FIX-001".to_string()),
         limit: 10,
         ..Default::default()
     };
     let fix_result = recall_learnings(&conn, fix_params).unwrap();
-    assert_eq!(fix_result.count, 1);
+    assert_eq!(fix_result.count, 3); // 1 type match + 2 UCB fallback
     assert_eq!(fix_result.learnings[0].title, "Bug fix pattern");
 }
 
 #[test]
 fn test_recall_task_type_multiple_prefixes() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_migrations();
 
     // Create a learning that applies to multiple task types
     let params = RecordLearningParams {
@@ -399,28 +411,34 @@ fn test_recall_task_type_multiple_prefixes() {
     )
     .unwrap();
 
-    // Both US and FIX should match
+    // Both US and FIX should match via type prefix (learning is first)
     let us_params = RecallParams {
         for_task: Some("US-002".to_string()),
         limit: 10,
         ..Default::default()
     };
-    assert_eq!(recall_learnings(&conn, us_params).unwrap().count, 1);
+    let us_result = recall_learnings(&conn, us_params).unwrap();
+    assert_eq!(us_result.count, 1);
+    assert_eq!(us_result.learnings[0].title, "Multi-type pattern");
 
     let fix_params = RecallParams {
         for_task: Some("FIX-002".to_string()),
         limit: 10,
         ..Default::default()
     };
-    assert_eq!(recall_learnings(&conn, fix_params).unwrap().count, 1);
+    let fix_result = recall_learnings(&conn, fix_params).unwrap();
+    assert_eq!(fix_result.count, 1);
+    assert_eq!(fix_result.learnings[0].title, "Multi-type pattern");
 
-    // SEC should NOT match
+    // SEC doesn't type-match, but UCB fallback returns it as exploration candidate
     let sec_params = RecallParams {
         for_task: Some("SEC-001".to_string()),
         limit: 10,
         ..Default::default()
     };
-    assert_eq!(recall_learnings(&conn, sec_params).unwrap().count, 0);
+    let sec_result = recall_learnings(&conn, sec_params).unwrap();
+    assert_eq!(sec_result.count, 1);
+    assert_eq!(sec_result.learnings[0].title, "Multi-type pattern");
 }
 
 // =============================================================================
@@ -699,16 +717,15 @@ fn test_recall_increments_times_shown() {
     };
     recall_learnings(&conn, params.clone()).unwrap();
 
-    // Verify incremented
+    // Recall no longer increments times_shown (bandit::record_learning_shown does)
     let after_one = get_learning(&conn, learning.learning_id).unwrap().unwrap();
-    assert_eq!(after_one.times_shown, 1);
+    assert_eq!(after_one.times_shown, 0);
 
-    // Recall again
+    // Recall again — still 0
     recall_learnings(&conn, params.clone()).unwrap();
 
-    // Verify incremented again
     let after_two = get_learning(&conn, learning.learning_id).unwrap().unwrap();
-    assert_eq!(after_two.times_shown, 2);
+    assert_eq!(after_two.times_shown, 0);
 }
 
 // =============================================================================

@@ -294,6 +294,15 @@ mod tests {
         (temp_dir, conn)
     }
 
+    fn setup_db_with_migrations() -> (TempDir, Connection) {
+        use crate::db::migrations::run_migrations;
+        let temp_dir = TempDir::new().unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
+        create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
+        (temp_dir, conn)
+    }
+
     fn create_test_learning(
         conn: &Connection,
         title: &str,
@@ -467,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_recall_with_for_task() {
-        let (_temp_dir, conn) = setup_db();
+        let (_temp_dir, conn) = setup_db_with_migrations();
 
         // Create a task with files
         conn.execute(
@@ -523,7 +532,9 @@ mod tests {
         };
         let result = recall(&conn, recall_params).unwrap();
 
-        assert_eq!(result.count, 1);
+        // DB pattern matches via file, CLI pattern comes via UCB fallback
+        assert_eq!(result.count, 2);
+        // File-matched learning should be first (higher relevance tier)
         assert_eq!(result.learnings[0].title, "DB pattern");
     }
 

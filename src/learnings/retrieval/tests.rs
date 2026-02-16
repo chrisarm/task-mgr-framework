@@ -274,7 +274,7 @@ fn test_patterns_backend_type_matching() {
 
     let backend = PatternsBackend;
     let query = RetrievalQuery {
-        task_prefix: Some("US-".to_string()),
+        task_prefix: Some("US-001".to_string()),
         limit: 10,
         ..Default::default()
     };
@@ -445,11 +445,33 @@ fn test_composite_preserves_insertion_order() {
 
 #[test]
 fn test_extract_task_prefix() {
-    assert_eq!(extract_task_prefix("US-001"), "US-");
-    assert_eq!(extract_task_prefix("FIX-123"), "FIX-");
-    assert_eq!(extract_task_prefix("SEC-42"), "SEC-");
-    assert_eq!(extract_task_prefix("TECH-999"), "TECH-");
+    assert_eq!(extract_task_prefix("US-001"), "US-001");
+    assert_eq!(extract_task_prefix("FIX-123"), "FIX-123");
+    assert_eq!(extract_task_prefix("SEC-42"), "SEC-42");
+    assert_eq!(extract_task_prefix("TECH-999"), "TECH-999");
     assert_eq!(extract_task_prefix("nodash"), "nodash");
+}
+
+#[test]
+fn test_extract_task_prefix_uuid_prefixed() {
+    assert_eq!(
+        extract_task_prefix("f424ade5-PA-FEAT-003"),
+        "PA-FEAT-003"
+    );
+    assert_eq!(extract_task_prefix("abcdef01-US-001"), "US-001");
+    assert_eq!(extract_task_prefix("00000000-FIX-42"), "FIX-42");
+}
+
+#[test]
+fn test_extract_task_prefix_edge_cases() {
+    // 7 hex chars — too short for UUID prefix, no strip
+    assert_eq!(extract_task_prefix("abcdef0-X"), "abcdef0-X");
+    // No dash after hex — not a UUID prefix
+    assert_eq!(extract_task_prefix("abcdef01X"), "abcdef01X");
+    // Empty string
+    assert_eq!(extract_task_prefix(""), "");
+    // Exactly 9 chars (8 hex + dash) with nothing after — returns empty
+    assert_eq!(extract_task_prefix("abcdef01-"), "");
 }
 
 #[test]

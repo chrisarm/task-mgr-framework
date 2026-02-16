@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use crate::models::{Learning, LearningOutcome};
 use crate::TaskMgrResult;
 
-use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery};
+use super::bandit;
+use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery, ScoredLearning};
 use super::retrieval::patterns::resolve_task_context;
 
 /// Parameters for recalling learnings.
@@ -94,15 +95,27 @@ pub fn recall_learnings_with_backend(
     }
 
     // Retrieve via backend
-    let scored = backend.retrieve(conn, &query)?;
+    let mut scored = backend.retrieve(conn, &query)?;
+
+    // UCB fallback + re-ranking only for task-based recall (not CLI free-text queries)
+    if params.for_task.is_some() {
+        // Fill empty slots with exploration candidates
+        if scored.len() < limit {
+            let exclude_ids: Vec<i64> = scored.iter().filter_map(|s| s.learning.id).collect();
+            let remaining = limit - scored.len();
+            let fallback = load_ucb_fallback(conn, &exclude_ids, remaining)?;
+            scored.extend(fallback);
+        }
+
+        // Re-rank: relevance tier dominates, UCB breaks ties within tiers
+        rerank_with_ucb(conn, &mut scored)?;
+    }
 
     // Extract learnings
     let learnings: Vec<Learning> = scored.into_iter().map(|s| s.learning).collect();
 
-    // Update times_shown for returned learnings
-    if !learnings.is_empty() {
-        update_shown_stats(conn, &learnings)?;
-    }
+    // Note: times_shown is updated by bandit::record_learning_shown() in
+    // loop_engine/prompt.rs — not here. The recall module is retrieval-only.
 
     Ok(RecallResult {
         count: learnings.len(),
@@ -148,6 +161,122 @@ pub fn update_shown_stats(conn: &Connection, learnings: &[Learning]) -> TaskMgrR
     let params: Vec<&dyn rusqlite::ToSql> =
         ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
     conn.execute(&sql, params.as_slice())?;
+
+    Ok(())
+}
+
+/// Loads UCB-ranked fallback learnings to fill empty recall slots.
+///
+/// Loads all learnings not in `exclude_ids`, ranks them by UCB score, and
+/// returns up to `remaining_slots` as exploration candidates.
+fn load_ucb_fallback(
+    conn: &Connection,
+    exclude_ids: &[i64],
+    remaining_slots: usize,
+) -> TaskMgrResult<Vec<ScoredLearning>> {
+    if remaining_slots == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Load all learnings, optionally excluding already-matched IDs
+    let learnings: Vec<Learning> = if exclude_ids.is_empty() {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, created_at, task_id, run_id, outcome, title, content,
+                   root_cause, solution,
+                   applies_to_files, applies_to_task_types, applies_to_errors,
+                   confidence, times_shown, times_applied, last_shown_at, last_applied_at
+            FROM learnings
+            "#,
+        )?;
+        let result = stmt
+            .query_map([], |row| {
+                Learning::try_from(row)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        result
+    } else {
+        let placeholders: Vec<String> =
+            (1..=exclude_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            r#"
+            SELECT id, created_at, task_id, run_id, outcome, title, content,
+                   root_cause, solution,
+                   applies_to_files, applies_to_task_types, applies_to_errors,
+                   confidence, times_shown, times_applied, last_shown_at, last_applied_at
+            FROM learnings
+            WHERE id NOT IN ({})
+            "#,
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = exclude_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let result = stmt
+            .query_map(params.as_slice(), |row| {
+                Learning::try_from(row)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        result
+    };
+
+    // Rank by UCB
+    let ranked = bandit::rank_learnings_by_ucb(conn, learnings)?;
+
+    // Take remaining_slots from the top, tag as exploration candidates
+    Ok(ranked
+        .into_iter()
+        .take(remaining_slots)
+        .map(|learning| ScoredLearning {
+            learning,
+            relevance_score: 0.1,
+            match_reason: Some("UCB exploration".to_string()),
+        })
+        .collect())
+}
+
+/// Re-ranks scored learnings so relevance tier dominates and UCB breaks ties.
+///
+/// Sort key: `relevance_score * 100.0 + ucb_score`. Pattern-matched learnings
+/// (relevance 2/5/10) always outrank fallback learnings (0.1). Within the same
+/// relevance tier, UCB balances exploitation and exploration.
+fn rerank_with_ucb(conn: &Connection, scored: &mut [ScoredLearning]) -> TaskMgrResult<()> {
+    if scored.is_empty() {
+        return Ok(());
+    }
+
+    let total_window_shows = bandit::get_total_window_shows(conn)?;
+
+    scored.sort_by(|a, b| {
+        let ucb_a = a
+            .learning
+            .id
+            .and_then(|id| bandit::get_window_stats(conn, id).ok())
+            .map(|stats| {
+                bandit::calculate_ucb_score(&stats, a.learning.confidence, total_window_shows)
+            })
+            .unwrap_or(0.0);
+
+        let ucb_b = b
+            .learning
+            .id
+            .and_then(|id| bandit::get_window_stats(conn, id).ok())
+            .map(|stats| {
+                bandit::calculate_ucb_score(&stats, b.learning.confidence, total_window_shows)
+            })
+            .unwrap_or(0.0);
+
+        let score_a = a.relevance_score * 100.0 + ucb_a;
+        let score_b = b.relevance_score * 100.0 + ucb_b;
+
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(())
 }

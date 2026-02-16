@@ -228,7 +228,7 @@ fn test_recall_updates_times_shown() {
     };
     recall_learnings(&conn, params).unwrap();
 
-    // Verify times_shown was incremented
+    // Recall no longer increments times_shown (bandit::record_learning_shown does)
     let after: i32 = conn
         .query_row(
             "SELECT times_shown FROM learnings WHERE id = ?1",
@@ -236,12 +236,12 @@ fn test_recall_updates_times_shown() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(after, 1);
+    assert_eq!(after, 0);
 }
 
 #[test]
 fn test_recall_for_task_file_matching() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_fts5();
 
     // Create a task with files
     conn.execute(
@@ -297,13 +297,15 @@ fn test_recall_for_task_file_matching() {
     };
     let result = recall_learnings(&conn, recall_params).unwrap();
 
-    assert_eq!(result.count, 1);
+    // DB pattern matches via file, CLI pattern comes via UCB fallback
+    assert_eq!(result.count, 2);
+    // File-matched learning should be first (higher relevance tier)
     assert_eq!(result.learnings[0].title, "DB pattern");
 }
 
 #[test]
 fn test_recall_for_task_type_matching() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_fts5();
 
     // Create a task
     conn.execute(
@@ -354,13 +356,15 @@ fn test_recall_for_task_type_matching() {
     };
     let result = recall_learnings(&conn, recall_params).unwrap();
 
-    assert_eq!(result.count, 1);
+    // US pattern matches via type prefix, FIX pattern comes via UCB fallback
+    assert_eq!(result.count, 2);
+    // Type-matched learning should be first (higher relevance tier)
     assert_eq!(result.learnings[0].title, "US pattern");
 }
 
 #[test]
 fn test_recall_for_nonexistent_task() {
-    let (_temp_dir, conn) = setup_db();
+    let (_temp_dir, conn) = setup_db_with_fts5();
 
     // Create a learning with applicability
     let params = RecordLearningParams {
@@ -379,7 +383,7 @@ fn test_recall_for_nonexistent_task() {
     };
     record_learning(&conn, params).unwrap();
 
-    // Recall for nonexistent task - should return empty
+    // Recall for nonexistent task — UCB fallback fills empty slots
     let recall_params = RecallParams {
         for_task: Some("NONEXISTENT".to_string()),
         limit: 10,
@@ -387,8 +391,8 @@ fn test_recall_for_nonexistent_task() {
     };
     let result = recall_learnings(&conn, recall_params).unwrap();
 
-    // Should find no matches because task has no files to match against
-    assert_eq!(result.count, 0);
+    // UCB fallback returns the learning as an exploration candidate
+    assert_eq!(result.count, 1);
 }
 
 #[test]
@@ -523,4 +527,184 @@ fn test_fts5_fallback_to_like_without_migration() {
 
     assert_eq!(result.count, 1);
     assert_eq!(result.learnings[0].title, "Database error");
+}
+
+// ========== UCB Fallback Tests ==========
+
+#[test]
+fn test_ucb_fallback_fills_empty_slots() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    // Create a task with a file
+    conn.execute(
+        "INSERT INTO tasks (id, title) VALUES ('US-001', 'Test Task')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES ('US-001', 'src/db/schema.rs')",
+        [],
+    )
+    .unwrap();
+
+    // Create 1 learning that will pattern-match (file match)
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "DB pattern".to_string(),
+        content: "Use transactions".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Create 4 learnings with no applicability (won't pattern-match)
+    for i in 1..=4 {
+        create_test_learning(
+            &conn,
+            &format!("Unmatched {}", i),
+            &format!("Content {}", i),
+            LearningOutcome::Pattern,
+        );
+    }
+
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings(&conn, recall_params).unwrap();
+
+    // 1 pattern match + 4 UCB fallback = 5 total
+    assert_eq!(result.count, 5);
+    // Pattern-matched learning should be first (highest relevance tier)
+    assert_eq!(result.learnings[0].title, "DB pattern");
+}
+
+#[test]
+fn test_ucb_fallback_excludes_already_matched() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    // Create a task
+    conn.execute(
+        "INSERT INTO tasks (id, title) VALUES ('US-001', 'Test Task')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES ('US-001', 'src/db/schema.rs')",
+        [],
+    )
+    .unwrap();
+
+    // Create 1 learning that will pattern-match
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "DB pattern".to_string(),
+        content: "Use transactions".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let result = recall_learnings(&conn, recall_params).unwrap();
+
+    // Only 1 learning exists, so no duplicates possible — just 1 result
+    assert_eq!(result.count, 1);
+    // Verify no duplicate IDs
+    let ids: Vec<Option<i64>> = result.learnings.iter().map(|l| l.id).collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len(), "No duplicate learning IDs");
+}
+
+#[test]
+fn test_ucb_fallback_only_activates_for_task() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    // Create learnings that won't text-match
+    create_test_learning(&conn, "Alpha", "Unrelated", LearningOutcome::Pattern);
+    create_test_learning(&conn, "Beta", "Unrelated", LearningOutcome::Pattern);
+
+    // CLI recall with query but no --for-task: no UCB fallback
+    let recall_params = RecallParams {
+        query: Some("nonexistent-query-xyz".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let result = recall_learnings(&conn, recall_params).unwrap();
+
+    // No text match, no for_task → no fallback → 0 results
+    assert_eq!(result.count, 0);
+}
+
+#[test]
+fn test_rerank_preserves_relevance_tiers() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    // Create a task with a file
+    conn.execute(
+        "INSERT INTO tasks (id, title) VALUES ('US-001', 'Test Task')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES ('US-001', 'src/db/schema.rs')",
+        [],
+    )
+    .unwrap();
+
+    // Create a file-matched learning (relevance = 10.0)
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "File matched".to_string(),
+        content: "High relevance".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Low, // Low confidence, but high relevance tier
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Create a fallback learning (will get relevance = 0.1)
+    create_test_learning(
+        &conn,
+        "Fallback",
+        "Low relevance",
+        LearningOutcome::Pattern,
+    );
+
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings(&conn, recall_params).unwrap();
+
+    assert_eq!(result.count, 2);
+    // File-matched (10.0 * 100 + ucb) always beats fallback (0.1 * 100 + ucb)
+    assert_eq!(result.learnings[0].title, "File matched");
+    assert_eq!(result.learnings[1].title, "Fallback");
 }
