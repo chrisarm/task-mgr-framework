@@ -916,6 +916,30 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                         }
                     }
                 }
+
+                // Final fallback: Claude reports the task as "already complete" without committing.
+                // This catches tasks completed in a prior run where the DB was never updated.
+                if !matches!(result.outcome, IterationOutcome::Completed) {
+                    if detection::is_task_reported_already_complete(
+                        &result.output,
+                        task_id,
+                        task_prefix.as_deref(),
+                    ) {
+                        if let Ok(()) = mark_task_done(
+                            &mut conn,
+                            task_id,
+                            &run_id,
+                            None,
+                            &paths.prd_file,
+                            task_prefix.as_deref(),
+                        ) {
+                            last_claimed_task = None;
+                            tasks_completed += 1;
+                            result.outcome = IterationOutcome::Completed;
+                            eprintln!("Task {} completed (reported as already done)", task_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -1281,6 +1305,26 @@ fn update_prd_task_passes(
         source: e,
     })?;
 
+    Ok(())
+}
+
+/// Mark a task as done in the DB and update the PRD JSON.
+///
+/// Consolidates the repeated pattern of complete + PRD update used by
+/// git-check, output-scan, and already-complete detection paths.
+fn mark_task_done(
+    conn: &mut Connection,
+    task_id: &str,
+    run_id: &str,
+    commit_hash: Option<&str>,
+    prd_path: &Path,
+    task_prefix: Option<&str>,
+) -> Result<(), crate::TaskMgrError> {
+    let task_ids = [task_id.to_string()];
+    complete_cmd::complete(conn, &task_ids, Some(run_id), commit_hash, false)?;
+    if let Err(e) = update_prd_task_passes(prd_path, task_id, true, task_prefix) {
+        eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
+    }
     Ok(())
 }
 

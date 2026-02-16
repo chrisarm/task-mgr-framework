@@ -105,6 +105,57 @@ fn categorize_crash(exit_code: i32) -> CrashType {
     }
 }
 
+/// Check if Claude's output reports a specific task as already complete.
+///
+/// Catches the case where a task was completed in a prior run but the DB
+/// was never updated. Claude recognizes the work is done and reports it
+/// (e.g., "This task is already complete"), but makes no commit — so
+/// neither the git check nor the bracket-pattern scan can detect it.
+///
+/// Returns true when both conditions are met:
+/// 1. The output contains the task ID (full or prefix-stripped)
+/// 2. The output contains an "already complete" indicator phrase
+pub fn is_task_reported_already_complete(
+    output: &str,
+    task_id: &str,
+    task_prefix: Option<&str>,
+) -> bool {
+    // Condition 1: output mentions this task
+    let has_task_id = output.contains(task_id) || {
+        let base_id = strip_prefix(task_id, task_prefix);
+        base_id != task_id && output.contains(base_id)
+    };
+    if !has_task_id {
+        return false;
+    }
+
+    // Condition 2: output signals "already done"
+    let output_lower = output.to_lowercase();
+    let already_complete_signals = [
+        "already complete",
+        "already completed",
+        "already done",
+        "already been completed",
+        "was completed in a previous",
+        "no further work is needed",
+        "no further work needed",
+    ];
+    already_complete_signals
+        .iter()
+        .any(|signal| output_lower.contains(signal))
+}
+
+/// Strip a task prefix (e.g. "a3e1b7c9-FEAT-001" → "FEAT-001").
+fn strip_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &'a str {
+    match prefix {
+        Some(pfx) => {
+            let with_dash = format!("{}-", pfx);
+            task_id.strip_prefix(&with_dash).unwrap_or(task_id)
+        }
+        None => task_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,5 +967,61 @@ mod tests {
             IterationOutcome::Crash(CrashType::RuntimeError),
             "Exit 143 (SIGTERM) maps to RuntimeError (not special-cased)"
         );
+    }
+
+    // --- is_task_reported_already_complete tests ---
+
+    #[test]
+    fn test_already_complete_with_full_task_id() {
+        let output = "This task (`a3e1b7c9-TEST-003`) is already complete.\nNo further work needed.";
+        assert!(is_task_reported_already_complete(
+            output,
+            "a3e1b7c9-TEST-003",
+            Some("a3e1b7c9"),
+        ));
+    }
+
+    #[test]
+    fn test_already_complete_with_base_id() {
+        let output = "This task (TEST-003) is already completed in a previous iteration.";
+        assert!(is_task_reported_already_complete(
+            output,
+            "a3e1b7c9-TEST-003",
+            Some("a3e1b7c9"),
+        ));
+    }
+
+    #[test]
+    fn test_already_complete_no_task_id_in_output() {
+        let output = "This task is already complete. No further work needed.";
+        assert!(
+            !is_task_reported_already_complete(output, "a3e1b7c9-TEST-003", Some("a3e1b7c9")),
+            "Should not match when task ID is absent from output"
+        );
+    }
+
+    #[test]
+    fn test_already_complete_no_signal_phrase() {
+        let output = "Working on a3e1b7c9-TEST-003... implemented the feature.";
+        assert!(
+            !is_task_reported_already_complete(output, "a3e1b7c9-TEST-003", Some("a3e1b7c9")),
+            "Should not match when no 'already complete' signal is present"
+        );
+    }
+
+    #[test]
+    fn test_already_complete_case_insensitive_signal() {
+        let output = "Task TEST-003 was ALREADY COMPLETED in a prior run.";
+        assert!(is_task_reported_already_complete(
+            output,
+            "a3e1b7c9-TEST-003",
+            Some("a3e1b7c9"),
+        ));
+    }
+
+    #[test]
+    fn test_already_complete_no_prefix() {
+        let output = "Task FEAT-001 is already done. Nothing to do.";
+        assert!(is_task_reported_already_complete(output, "FEAT-001", None));
     }
 }
