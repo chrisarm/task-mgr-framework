@@ -285,9 +285,8 @@ pub fn run_iteration(
             // Auto-recover: reset stale in_progress tasks to todo and retry.
             // Safe because we hold the exclusive loop.lock — no other loop is running.
             //
-            // First, reconcile any in_progress tasks that have passes: true in the PRD.
-            // These were completed but the DB status was never updated (e.g., rate limit
-            // interrupted git detection). Mark them done instead of resetting to todo.
+            // First, reconcile any tasks that have passes: true in the PRD.
+            // These were completed but the DB status was never updated.
             if let Some(prd) = prd_path {
                 reconcile_passes_with_db(conn, prd, task_prefix);
             }
@@ -599,6 +598,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let branch_name = prd_metadata.branch_name;
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
+
+    // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
+    // This catches tasks completed in a previous run where the DB status was never
+    // updated (e.g., rate limit interrupted git detection, or loop exit reset them).
+    reconcile_passes_with_db(&conn, &run_config.prd_file, task_prefix.as_deref());
 
     // Resolve external git repo path: CLI flag overrides PRD metadata
     let external_repo_path: Option<PathBuf> = run_config
@@ -1280,26 +1284,27 @@ fn update_prd_task_passes(
     Ok(())
 }
 
-/// Reconcile in_progress tasks against PRD passes status.
+/// Reconcile non-done tasks against PRD passes status.
 ///
-/// If a task is `in_progress` in the DB but has `passes: true` in the PRD JSON,
+/// If a task is `todo` or `in_progress` in the DB but has `passes: true` in the PRD JSON,
 /// it was completed but the DB was never updated (e.g., rate limit interrupted
-/// git detection). Mark it `done` to prevent infinite re-selection loops.
+/// git detection, or a previous loop exit reset it). Mark it `done` to prevent
+/// infinite re-selection loops.
 fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Option<&str>) {
     use std::fs;
 
-    // Get all in_progress task IDs from the DB
-    let mut stmt = match conn.prepare("SELECT id FROM tasks WHERE status = 'in_progress'") {
+    // Get all todo/in_progress task IDs from the DB
+    let mut stmt = match conn.prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')") {
         Ok(s) => s,
         Err(_) => return,
     };
-    let in_progress_ids: Vec<String> = stmt
+    let candidate_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    if in_progress_ids.is_empty() {
+    if candidate_ids.is_empty() {
         return;
     }
 
@@ -1324,17 +1329,17 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
         .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
         .collect();
 
-    // For each in_progress task, check if its base ID (prefix-stripped) has passes: true
-    for task_id in &in_progress_ids {
+    // For each non-done task, check if its base ID (prefix-stripped) has passes: true
+    for task_id in &candidate_ids {
         let base_id = strip_task_prefix(task_id, task_prefix);
         if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
             match conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
+                "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
                 [task_id.as_str()],
             ) {
                 Ok(1) => {
                     eprintln!(
-                        "Reconciled task {} as done (passes: true in PRD but was in_progress in DB)",
+                        "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
                         task_id
                     );
                 }
