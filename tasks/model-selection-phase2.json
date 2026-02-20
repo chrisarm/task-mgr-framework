@@ -1,0 +1,775 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "feat/model-selection-phase2",
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "description": "Phase 2: Wire model resolution logic into the live loop engine. Each iteration resolves the correct model via synergy cluster analysis, passes --model to Claude subprocess, injects escalation policy for non-opus models, auto-escalates on crash recovery, and displays the active model in iteration headers.",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases. Tests verify boundaries work correctly",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works according to the plan",
+      "3. CORRECTNESS - Code compiles, type-checks, passes all tests deterministically",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings",
+      "5. POLISH - Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Ship solid working code first, then use tests to improve it",
+      "Test the boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
+    }
+  },
+  "userStories": [
+    {
+      "id": "TEST-INIT-001",
+      "title": "Initial tests for spawn_claude --model flag",
+      "description": "Write tests BEFORE implementation for the --model flag on spawn_claude(). Use CLAUDE_BINARY=echo approach to verify argument ordering. Tests should initially fail or use #[ignore].",
+      "acceptanceCriteria": [
+        "Test: when model is Some('claude-opus-4-6'), echoed args contain '--model claude-opus-4-6' before '-p'",
+        "Test: when model is None, echoed args do NOT contain '--model'",
+        "Test: when model is Some(''), treated as None — no --model flag in args",
+        "Known-bad discriminator: test that --model appears BEFORE -p (rejects implementations that append --model after -p)",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "priority": 1,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "TDD: Write these tests first. Use CLAUDE_BINARY=echo to capture args. The spawn_claude function currently has no model param — tests define the expected new signature.",
+      "edgeCases": [
+        "Empty string model Some('') must be treated as None — no --model '' passed to subprocess",
+        "Model string with spaces or special characters: should pass through verbatim",
+        "Very long model string: should not truncate"
+      ],
+      "invariants": [
+        "--model flag must always appear BEFORE -p flag when present",
+        "When model is None, arg list must be identical to current behavior",
+        "--print and --dangerously-skip-permissions must always be present regardless of model"
+      ],
+      "failureModes": [
+        {"cause": "--model flag placed after -p", "expectedBehavior": "Test fails — flag position matters for CLI parsing"},
+        {"cause": "Some('') passed as --model ''", "expectedBehavior": "Claude CLI may error on empty model string"}
+      ],
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Tests must verify exact arg ordering, not just presence", "Empty string must be normalized to None"],
+        "performance": ["N/A for test task"],
+        "style": ["Use CLAUDE_BINARY=echo pattern consistent with existing tests in claude.rs"]
+      }
+    },
+    {
+      "id": "TEST-INIT-002",
+      "title": "Initial tests for prompt model resolution",
+      "description": "Write tests BEFORE implementation for model resolution in build_prompt(). Tests should verify PromptResult.resolved_model is populated correctly based on task model, difficulty, prd_default, and synergyWith relationships.",
+      "acceptanceCriteria": [
+        "Test: task with explicit model='claude-opus-4-6' → resolved_model is Some('claude-opus-4-6')",
+        "Test: task with difficulty='high' and no explicit model → resolved_model is opus",
+        "Test: task with no model, no difficulty, prd_default='claude-haiku-4-5-20251001' → resolved_model is haiku",
+        "Test: task with synergyWith partner that has higher-tier model → resolved_model is the higher tier",
+        "Test: no default_model in prd_metadata → resolved_model falls back to None gracefully",
+        "Known-bad discriminator: synergy partner with opus model overrides selected task's haiku → rejects implementations that ignore synergy",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "priority": 2,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "TDD: Tests define expected behavior for PromptResult.resolved_model and BuildPromptParams.default_model. The synergy cluster uses explicit synergyWith relationships from the task_relationships table, NOT file overlap. Use insert_relationship() from test_utils.rs to set up synergyWith relationships in the test DB.",
+      "edgeCases": [
+        "No default_model in prd_metadata → falls back to None",
+        "Task with empty string model Some('') → normalized to None in resolved_model",
+        "No synergyWith partners → synergy cluster is just the selected task",
+        "Multiple synergy partners with different tiers → highest tier wins"
+      ],
+      "invariants": [
+        "Tier precedence: task_model > difficulty='high' > prd_default > None",
+        "Synergy cluster model = max tier across all cluster members",
+        "resolved_model is never Some('')"
+      ],
+      "failureModes": [
+        {"cause": "prd_metadata table has no default_model column (pre-v7 DB)", "expectedBehavior": "Graceful fallback to None via .ok().flatten()"},
+        {"cause": "synergyWith references a non-existent task", "expectedBehavior": "Skip missing synergy partner, don't panic"}
+      ],
+      "touchesFiles": ["src/loop_engine/prompt.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-003"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Must test all tier precedence combinations", "Synergy escalation must pick highest tier not first found"],
+        "performance": ["N/A for test task"],
+        "style": ["Use test helpers consistent with existing prompt.rs tests"]
+      }
+    },
+    {
+      "id": "TEST-INIT-003",
+      "title": "Initial tests for escalation template loading",
+      "description": "Write tests BEFORE implementation for load_escalation_template() and its integration into build_prompt(). Tests should verify template is loaded for non-opus models and omitted for opus.",
+      "acceptanceCriteria": [
+        "Test: load_escalation_template with valid file returns Some(content)",
+        "Test: load_escalation_template with missing file returns None",
+        "Test: escalation section injected into prompt when resolved_model is haiku or sonnet",
+        "Test: escalation section NOT injected when resolved_model is opus or None",
+        "Known-bad discriminator: test that template content appears BEFORE reorder instruction (rejects implementations that append template at end)",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "priority": 3,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "TDD: Template path resolved from base_prompt_path's parent directory (e.g., scripts/prompt.md → scripts/escalation-policy.md). Use temp directories for test isolation.",
+      "edgeCases": [
+        "Missing template file → None returned, warning printed to stderr",
+        "Empty template file → Some('') returned, empty section injected (harmless)",
+        "Template file with unicode content → passed through verbatim"
+      ],
+      "invariants": [
+        "Template is loaded fresh each iteration (not cached) to allow hot-editing",
+        "Escalation section is NEVER present when model is opus or None",
+        "Escalation section appears BEFORE reorder instruction in prompt ordering"
+      ],
+      "failureModes": [
+        {"cause": "Template file permissions deny read", "expectedBehavior": "Return None, print warning to stderr"},
+        {"cause": "base_prompt_path has no parent (e.g., just 'prompt.md')", "expectedBehavior": "Resolve relative to current directory or return None gracefully"}
+      ],
+      "touchesFiles": ["src/loop_engine/prompt.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Template presence/absence must correlate exactly with model tier", "Section ordering in prompt must match PRD spec"],
+        "performance": ["File I/O per iteration is acceptable — template is small"],
+        "style": ["Use tempdir for test isolation, consistent with existing prompt tests"]
+      }
+    },
+    {
+      "id": "TEST-INIT-004",
+      "title": "Initial tests for crash recovery model escalation",
+      "description": "Write tests BEFORE implementation for crash recovery escalation in IterationContext. Tests verify that same-task crashes trigger model escalation and different-task iterations do not.",
+      "acceptanceCriteria": [
+        "Test: same task_id + last_was_crash=true → escalate_model() called, model goes up one tier",
+        "Test: different task_id + last_was_crash=true → no escalation",
+        "Test: same task_id + last_was_crash=false → no escalation",
+        "Test: escalation from haiku → sonnet, sonnet → opus verified",
+        "Test: already opus + crash → stays opus (no panic, no error)",
+        "Test: resolved_model=None + crash → stays None (can't escalate unknown baseline)",
+        "Known-bad discriminator: test that escalation only triggers when BOTH conditions met (same task AND crash)",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "priority": 4,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "TDD: Tests define expected IterationContext fields (last_task_id, last_was_crash) and the escalation check logic. Escalation is independent of CrashTracker backoff — they operate separately.",
+      "edgeCases": [
+        "First iteration: last_task_id=None → no escalation possible",
+        "Crash on task with None model → stays None",
+        "Multiple consecutive crashes on same task → escalates once per crash (haiku→sonnet→opus→opus)"
+      ],
+      "invariants": [
+        "Escalation requires BOTH same task_id AND last_was_crash",
+        "Escalation ceiling is opus — never goes beyond",
+        "None model is never escalated (can't escalate unknown baseline)",
+        "Escalation is independent of CrashTracker backoff logic"
+      ],
+      "failureModes": [
+        {"cause": "last_task_id not set after iteration completes", "expectedBehavior": "Next iteration has no crash context, no escalation"},
+        {"cause": "Crash outcome not properly detected", "expectedBehavior": "last_was_crash stays false, no escalation"}
+      ],
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Both conditions (same task + crash) must be checked", "Escalation uses model::escalate_model() — don't reimplement"],
+        "performance": ["N/A for test task"],
+        "style": ["Test crash scenarios without spawning real processes"]
+      }
+    },
+    {
+      "id": "TEST-INIT-005",
+      "title": "Initial tests for iteration header model display",
+      "description": "Write tests BEFORE implementation for model display in print_iteration_header(). Tests verify the model name appears in the header output.",
+      "acceptanceCriteria": [
+        "Test: model=Some('claude-sonnet-4-6') → header contains 'Model: claude-sonnet-4-6'",
+        "Test: model=None → header contains 'Model: (default)'",
+        "Test: header still contains iteration count, task_id, and elapsed time alongside model",
+        "Known-bad discriminator: test that model display is present in the formatted output (rejects implementations that accept the param but don't render it)",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "priority": 5,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "TDD: print_iteration_header currently outputs to stderr via eprintln!. Tests may need to capture stderr or refactor to a format function. Consider adding a format_iteration_header that returns String for testability, with print_iteration_header as a thin wrapper.",
+      "edgeCases": [
+        "Very long model name → should not break formatting (truncate_display may apply)",
+        "Model name with unicode characters → display verbatim",
+        "Model name that is literal string 'None' → displays as 'Model: None' not 'Model: (default)'"
+      ],
+      "invariants": [
+        "Iteration count, task_id, and elapsed time always present regardless of model",
+        "Model display always present — either name or '(default)'"
+      ],
+      "failureModes": [
+        {"cause": "Model param added but not rendered in output", "expectedBehavior": "Known-bad discriminator test catches this"}
+      ],
+      "touchesFiles": ["src/loop_engine/display.rs"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Model text must be visually present in header output"],
+        "performance": ["N/A for test task"],
+        "style": ["Consistent with existing display.rs formatting patterns"]
+      }
+    },
+    {
+      "id": "FEAT-001",
+      "title": "Add --model flag to spawn_claude subprocess (US-009)",
+      "description": "Add model: Option<&str> parameter to spawn_claude(). When Some(m) and m is non-empty, insert --model and m into args before -p. When None or Some(''), omit --model entirely. Update the sole call site in engine.rs to pass None for backward compatibility.",
+      "acceptanceCriteria": [
+        "spawn_claude() signature is (prompt, signal_flag, working_dir, model: Option<&str>)",
+        "When model is Some('claude-opus-4-6'), args are: --print --dangerously-skip-permissions --model claude-opus-4-6 -p <prompt>",
+        "When model is None, args are unchanged: --print --dangerously-skip-permissions -p <prompt>",
+        "When model is Some(''), treated as None — no --model flag",
+        "Sole call site in engine.rs updated to pass None",
+        "All TEST-INIT-001 tests pass",
+        "cargo check and cargo clippy pass with no warnings"
+      ],
+      "priority": 6,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Guard empty strings: if let Some(m) = model { if !m.trim().is_empty() { cmd.args(['--model', m]); } }. The call site in engine.rs (~line 349) passes None initially — FEAT-006 will wire the real model later.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": ["FEAT-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["--model must appear before -p in arg list", "Empty string must be guarded", "Existing behavior unchanged when None"],
+        "performance": ["No overhead when model is None"],
+        "style": ["Use if let Some(m) pattern, not unwrap()", "Guard with !m.trim().is_empty()"]
+      }
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Add model display to iteration header (US-012)",
+      "description": "Add model: Option<&str> parameter to print_iteration_header(). Display 'Model: <name>' when Some, 'Model: (default)' when None. Update sole call site in engine.rs to pass None initially.",
+      "acceptanceCriteria": [
+        "print_iteration_header() signature adds model: Option<&str> as last parameter",
+        "Header output includes 'Model: claude-sonnet-4-6' when model is Some",
+        "Header output includes 'Model: (default)' when model is None",
+        "Existing header info (iteration, task_id, elapsed) unchanged",
+        "Sole call site in engine.rs (~line 344) updated to pass None",
+        "All TEST-INIT-005 tests pass"
+      ],
+      "priority": 7,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Consider adding a format_iteration_header() -> String for testability, with print_iteration_header as a thin eprintln! wrapper. The call site passes None initially — FEAT-006 wires the real model.",
+      "touchesFiles": ["src/loop_engine/display.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["TEST-INIT-005"],
+      "synergyWith": ["FEAT-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Model display must always be present — either name or '(default)'", "Existing header elements unaffected"],
+        "performance": ["Negligible — one extra format arg"],
+        "style": ["Match existing eprintln! formatting style in display.rs", "Use truncate_display for long model names if needed"]
+      }
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Prompt builder model resolution (US-008)",
+      "description": "Wire model resolution into build_prompt(). Add default_model to PrdMetadata and BuildPromptParams. Add resolved_model to PromptResult. Query synergyWith partners' model/difficulty, resolve task models, pick highest tier for iteration. Normalize Some('') to None.",
+      "acceptanceCriteria": [
+        "PrdMetadata struct in engine.rs has default_model: Option<String> field",
+        "read_prd_metadata() queries default_model from prd_metadata table",
+        "BuildPromptParams has default_model: Option<&'a str> field",
+        "PromptResult has resolved_model: Option<String> field",
+        "New helper load_synergy_partner_models(conn, task_id) queries synergyWith partners' model and difficulty from task_relationships table (columns: related_id, rel_type)",
+        "build_prompt() calls resolve_task_model for selected task and each synergy partner",
+        "build_prompt() calls resolve_iteration_model with all resolved models",
+        "resolved_model is normalized: Some('') becomes None",
+        "When no synergyWith partners exist, cluster is just the selected task",
+        "When prd_metadata has no default_model, falls back to None gracefully",
+        "run_loop passes default_model through run_iteration to BuildPromptParams",
+        "All TEST-INIT-002 tests pass"
+      ],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Synergy cluster uses explicit synergyWith relationships from task_relationships table (NOT file overlap — deliberate simplification from PRD FR-006). Query pattern: SELECT t.model, t.difficulty FROM tasks t INNER JOIN task_relationships tr ON tr.related_id = t.id WHERE tr.task_id = ? AND tr.rel_type = 'synergyWith' AND t.status IN ('todo', 'in_progress'). Thread default_model: read_prd_metadata → run_loop → run_iteration → BuildPromptParams → build_prompt. Use insert_relationship() from test_utils.rs for test setup.",
+      "touchesFiles": ["src/loop_engine/prompt.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["TEST-INIT-002"],
+      "synergyWith": ["FEAT-004"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Tier precedence: task_model > difficulty=high > prd_default > None", "Synergy cluster uses highest tier across all members", "Some('') normalized to None"],
+        "performance": ["Single DB query for synergy partners' model data", "No N+1 queries"],
+        "style": ["New helpers are pure where possible", "DB queries use parameterized statements", "Use existing model.rs functions — don't reimplement tier logic"]
+      }
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Escalation policy template injection (US-010)",
+      "description": "Create the escalation-policy.md template file. Add load_escalation_template() helper that resolves the template from base_prompt_path's parent directory. In build_prompt(), inject the escalation section when resolved_model is non-opus (tier < Opus). Section goes BEFORE reorder instruction.",
+      "acceptanceCriteria": [
+        "scripts/escalation-policy.md created with content from PRD appendix",
+        "New helper load_escalation_template(base_prompt_path: &Path) -> Option<String>",
+        "Template path resolved as base_prompt_path.parent()/escalation-policy.md",
+        "When resolved_model tier < Opus, escalation section injected as '## Model Escalation Policy\\n\\n{contents}\\n\\n---\\n\\n'",
+        "When resolved_model is opus or None, NO escalation section injected",
+        "When template file missing, returns None and prints warning to stderr",
+        "Escalation section appears BEFORE reorder instruction in prompt ordering",
+        "All TEST-INIT-003 tests pass"
+      ],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Template is loaded fresh each iteration (not cached) to allow hot-editing. The model_tier() function from model.rs determines the tier. Inject position: after section 9 (non-code instruction) and before section 11 (reorder instruction) per PRD appendix ordering. Use eprintln! for the missing-file warning.",
+      "touchesFiles": ["src/loop_engine/prompt.rs", "scripts/escalation-policy.md"],
+      "dependsOn": ["TEST-INIT-003", "FEAT-003"],
+      "synergyWith": ["FEAT-003"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Template only injected for non-opus models", "Section ordering matches PRD spec exactly", "Missing file handled gracefully"],
+        "performance": ["File read per iteration is acceptable — template file is small", "No caching by design"],
+        "style": ["Use std::fs::read_to_string with proper error handling", "Warning to stderr, not stdout", "Helper function is independently testable"]
+      }
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Crash recovery model escalation fields (US-011)",
+      "description": "Add last_task_id: Option<String> and last_was_crash: bool to IterationContext. At the end of each iteration (same location as ctx.last_files assignment ~line 413 of engine.rs), update these fields based on the iteration outcome. The actual escalation check is wired in FEAT-006.",
+      "acceptanceCriteria": [
+        "IterationContext has last_task_id: Option<String> field, initialized to None",
+        "IterationContext has last_was_crash: bool field, initialized to false",
+        "After each iteration, last_task_id is set to the task_id that was worked on",
+        "After each iteration, last_was_crash is set based on whether the outcome was a crash",
+        "Fields are set at the same code location as ctx.last_files (~line 413)",
+        "All TEST-INIT-004 tests pass"
+      ],
+      "priority": 10,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "This task only adds the fields and updates them. The escalation CHECK (if same task + crash → call escalate_model) is done in FEAT-006 which orchestrates the full flow. Crash detection: match on IterationOutcome::Crash(CrashType) variant. last_was_crash is independent of CrashTracker backoff logic.",
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["TEST-INIT-004"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["FEAT-006"],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Must correctly identify crash outcomes vs non-crash outcomes", "Fields must be set for every iteration, not just crashes"],
+        "performance": ["No overhead — simple field assignments"],
+        "style": ["Set fields at same location as existing ctx.last_files for consistency"]
+      }
+    },
+    {
+      "id": "FEAT-006",
+      "title": "Engine orchestration — wire model through run_iteration (US-013)",
+      "description": "Wire all model selection features together in run_iteration(). After build_prompt(), read resolved_model. Apply crash escalation if same task crashed. Pass effective model to spawn_claude() and print_iteration_header(). Log model to progress file.",
+      "acceptanceCriteria": [
+        "After build_prompt(), effective_model = prompt_result.resolved_model",
+        "If ctx.last_task_id == Some(current_task_id) AND ctx.last_was_crash → effective_model = model::escalate_model(effective_model)",
+        "Escalation logged to stderr: 'Model escalated for crash recovery: {old} → {new}'",
+        "effective_model passed to spawn_claude() as model parameter",
+        "effective_model passed to print_iteration_header() as model parameter",
+        "Model name logged to progress file on each iteration",
+        "No change to IterationOutcome enum or return types",
+        "When effective_model is None, all downstream calls receive None (CLI default behavior)",
+        "log_iteration() signature in progress.rs updated to accept model: Option<&str> parameter",
+        "cargo test passes with no regressions"
+      ],
+      "priority": 12,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "This is the orchestration task that wires FEAT-001 through FEAT-005 together. Crash escalation timing per FR-009: AFTER build_prompt resolves base model, BEFORE spawn_claude. The log_iteration function in progress.rs needs a model parameter added. Import model::escalate_model and model::model_tier.",
+      "touchesFiles": ["src/loop_engine/engine.rs", "src/loop_engine/progress.rs"],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Crash escalation only when BOTH same task AND crash", "Escalation timing: after build_prompt, before spawn_claude", "None model passed through without escalation"],
+        "performance": ["No extra DB queries — model comes from PromptResult", "escalate_model is O(1)"],
+        "style": ["Use model:: prefix for imported functions", "Log escalation clearly with old → new model names", "Match existing engine.rs patterns for iteration orchestration"]
+      }
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review implementation for quality, security, and integration wiring",
+      "description": "Review all implementation tasks (FEAT-001 through FEAT-006) for code quality, error handling, security, and critically verify all new code is fully integrated and reachable from production entry points.",
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context via ? operator",
+        "Security: no injection vulnerabilities in model string handling",
+        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "Edge case coverage: each edgeCases entry from TEST-INIT tasks has a corresponding test",
+        "Integration wiring verified: spawn_claude receives model from engine, not hardcoded None",
+        "Integration wiring verified: print_iteration_header receives model from engine",
+        "Integration wiring verified: build_prompt populates resolved_model from DB data",
+        "Integration wiring verified: escalation template loaded and injected correctly",
+        "Integration wiring verified: crash recovery fields set and checked",
+        "No dead code warnings for new code in cargo check/clippy",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "priority": 13,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue found: 1) Add a CODE-FIX-xxx or WIRE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. Mark CODE-REVIEW-1 as passes:true once review complete and tasks created. If no issues, mark passes:true with note.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/display.rs", "src/loop_engine/prompt.rs", "src/loop_engine/engine.rs", "src/loop_engine/progress.rs", "scripts/escalation-policy.md"],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review implementation for refactoring opportunities",
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues. Focus on: prompt.rs build_prompt growth, engine.rs run_iteration complexity, new helper function design.",
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "No tight coupling between modules",
+        "Code is easy to change and extend",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "priority": 17,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Key areas to review: 1) build_prompt() was already 105 lines and grew with model resolution + escalation template — may need extraction. 2) run_iteration() was 285 lines — orchestration additions should be clean. 3) New helpers should be independently testable. For each issue: add REFACTOR-1-xxx (priority 18-19) to JSON and MILESTONE-1 dependsOn.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/display.rs", "src/loop_engine/prompt.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["CODE-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-1",
+      "title": "Phase 1 gate: initial tests pass, implementation reviewed and refactored",
+      "description": "Gate checkpoint before comprehensive testing phase. All initial tests pass, all implementation complete, code reviewed, refactored, and fully wired in.",
+      "acceptanceCriteria": [
+        "All initial tests (TEST-INIT-001 through TEST-INIT-005) pass",
+        "All implementation tasks (FEAT-001 through FEAT-006) pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx or WIRE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points (no dead code)",
+        "No unused warnings for new code in cargo check/cargo clippy",
+        "cargo test passes with zero failures",
+        "cargo fmt --check passes"
+      ],
+      "priority": 20,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in. This milestone dynamically depends on any CODE-FIX-xxx, WIRE-FIX-xxx, or REFACTOR-1-xxx tasks spawned by reviews.",
+      "touchesFiles": [],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "TEST-INIT-004", "TEST-INIT-005", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "TEST-001",
+      "title": "Comprehensive tests for spawn_claude model flag",
+      "description": "Expand test coverage for spawn_claude --model beyond initial happy path. Cover parameterized model strings, interaction with other args, and robustness.",
+      "acceptanceCriteria": [
+        "Parameterized tests (#[rstest]) for multiple model strings: opus, sonnet, haiku, custom names",
+        "Test: model string with hyphens, underscores, dots passes through correctly",
+        "Test: --model does not interfere with --dangerously-skip-permissions or --print flags",
+        "Test: None model produces identical args to pre-Phase-2 behavior",
+        "80%+ coverage for spawn_claude function"
+      ],
+      "priority": 25,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Build on TEST-INIT-001. Focus on robustness and parameterized coverage. Use CLAUDE_BINARY=echo approach.",
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": ["TEST-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["All model string variants produce correct CLI args"],
+        "performance": ["N/A"],
+        "style": ["Use #[rstest] for parameterized tests where appropriate"]
+      }
+    },
+    {
+      "id": "TEST-002",
+      "title": "Comprehensive tests for prompt model resolution",
+      "description": "Expand test coverage for model resolution in build_prompt(). Cover complex synergy scenarios, fallback chains, and edge cases in tier precedence.",
+      "acceptanceCriteria": [
+        "Test: multiple synergy partners with mixed tiers (haiku + opus) → opus wins",
+        "Test: synergy partner with None model and default haiku → selected task's model wins",
+        "Test: selected task has no model, difficulty=medium, prd_default=sonnet → resolved is sonnet",
+        "Test: all synergy partners have None model → falls back to prd_default",
+        "Test: empty synergyWith list → cluster is just selected task",
+        "Test: difficulty=high with no task model and no prd_default → resolved is opus",
+        "80%+ coverage for model resolution path in build_prompt"
+      ],
+      "priority": 28,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Build on TEST-INIT-002. Focus on complex multi-task synergy scenarios and the full fallback chain. May reveal implementation gaps → create IMPL-FIX tasks if needed.",
+      "touchesFiles": ["src/loop_engine/prompt.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": ["TEST-003"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["All tier precedence combinations verified", "Synergy cluster resolution is correct for all topology shapes"],
+        "performance": ["N/A"],
+        "style": ["Use test helpers to reduce setup boilerplate"]
+      }
+    },
+    {
+      "id": "TEST-003",
+      "title": "Comprehensive tests for escalation template",
+      "description": "Expand test coverage for escalation template loading and injection. Cover file system edge cases and prompt ordering verification.",
+      "acceptanceCriteria": [
+        "Test: template with very large content (>10KB) loads and injects correctly",
+        "Test: template with markdown headers doesn't interfere with prompt structure",
+        "Test: switching from non-opus to opus model between iterations → template disappears",
+        "Test: base_prompt_path in different directory → template resolves from correct parent",
+        "Test: concurrent read of template file during hot-edit (no panic on partial read)"
+      ],
+      "priority": 30,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Build on TEST-INIT-003. Focus on file system edge cases and hot-edit scenarios. Use temp directories for isolation.",
+      "touchesFiles": ["src/loop_engine/prompt.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": ["TEST-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Template injection correlates exactly with model tier across all scenarios"],
+        "performance": ["Large template handling is bounded"],
+        "style": ["Use tempdir consistently for file system tests"]
+      }
+    },
+    {
+      "id": "TEST-004",
+      "title": "Comprehensive tests for crash recovery escalation",
+      "description": "Expand test coverage for crash recovery model escalation. Cover multi-crash sequences, mixed task transitions, and interaction with existing CrashTracker.",
+      "acceptanceCriteria": [
+        "Test: three consecutive crashes on same task: haiku → sonnet → opus → opus",
+        "Test: crash on task A, then success on task A, then crash on task A → escalates again",
+        "Test: crash on task A, then crash on task B → no escalation for task B",
+        "Test: crash escalation is independent of CrashTracker backoff count",
+        "Test: escalation log message contains old and new model names"
+      ],
+      "priority": 33,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Build on TEST-INIT-004. Focus on multi-iteration sequences and interaction with CrashTracker. May need to simulate multiple iteration cycles.",
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Multi-crash escalation ladder is correct", "Independence from CrashTracker verified"],
+        "performance": ["N/A"],
+        "style": ["Test names clearly describe the multi-step scenario"]
+      }
+    },
+    {
+      "id": "REFACTOR-REVIEW-2",
+      "title": "Review test code for refactoring opportunities",
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements across all test files modified in this feature.",
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns (e.g., test DB setup with model fields)",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "priority": 39,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue found: 1) Add REFACTOR-2-xxx task (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON changes. Focus on: shared test DB setup for model fields, common assertion patterns, CLAUDE_BINARY=echo test helpers.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/prompt.rs", "src/loop_engine/engine.rs", "src/loop_engine/display.rs"],
+      "dependsOn": ["TEST-001", "TEST-002", "TEST-003", "TEST-004"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-2",
+      "title": "Phase 2 gate: full test coverage achieved",
+      "description": "Gate before integration/verification. All comprehensive tests pass, test code reviewed and refactored.",
+      "acceptanceCriteria": [
+        "All comprehensive tests (TEST-001 through TEST-004) pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "MILESTONE-1 passes",
+        "cargo test passes with zero failures",
+        "No new warnings in cargo clippy"
+      ],
+      "priority": 50,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Full test coverage achieved, test code refactored. This milestone dynamically depends on any REFACTOR-2-xxx tasks spawned by REFACTOR-REVIEW-2.",
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-1", "TEST-001", "TEST-002", "TEST-003", "TEST-004", "REFACTOR-REVIEW-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "INT-001",
+      "title": "Integration test: end-to-end model resolution through subprocess",
+      "description": "End-to-end integration test verifying the full model selection pipeline: PRD with model fields → DB → build_prompt → resolved_model → spawn_claude with --model flag. Use CLAUDE_BINARY=echo to verify args.",
+      "acceptanceCriteria": [
+        "Test: PRD with default_model=haiku + one high-difficulty task → iteration uses opus (--model claude-opus-4-6 in args)",
+        "Test: PRD with default_model=sonnet + task with explicit opus model → iteration uses opus",
+        "Test: PRD with no default_model + task with no model → no --model flag in args",
+        "Test: crash on haiku task → retry iteration uses sonnet (--model claude-sonnet-4-6)",
+        "Test: escalation template appears in prompt for haiku/sonnet iterations but not opus",
+        "Test: iteration header displays the correct model name",
+        "All tests use CLAUDE_BINARY=echo and temp DB for isolation"
+      ],
+      "priority": 55,
+      "estimatedEffort": "high",
+      "passes": false,
+      "notes": "These tests exercise the full pipeline end-to-end. They should import/init a test PRD with model fields, run one or more iterations with CLAUDE_BINARY=echo, and verify the model flows correctly through to the subprocess args and prompt content. Reference existing integration tests in the codebase for patterns.",
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["MILESTONE-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "qualityDimensions": {
+        "correctness": ["Full pipeline verified: PRD → DB → prompt → subprocess args", "Crash escalation verified end-to-end"],
+        "performance": ["Tests must complete in <30 seconds each"],
+        "style": ["Use test fixtures consistent with existing integration test patterns"]
+      }
+    },
+    {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final refactoring review for maintainability",
+      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity before merge.",
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows project patterns (see CLAUDE.md)",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "priority": 70,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Final opportunity to improve code before merge. For each issue: add REFACTOR-3-xxx (priority 71-85) to JSON and MILESTONE-FINAL dependsOn. Focus areas: build_prompt growth, run_iteration complexity, test helper consolidation.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/display.rs", "src/loop_engine/prompt.rs", "src/loop_engine/engine.rs", "src/loop_engine/progress.rs"],
+      "dependsOn": ["INT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "VERIFY-001",
+      "title": "Final verification — all checks pass",
+      "description": "Run full test suite and all quality checks. Verify all acceptance criteria from PRD are met.",
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check passes with no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes with zero failures",
+        "PRD success metric: PRD with haiku default + high-difficulty task → opus used",
+        "PRD success metric: crash on haiku task → retry uses sonnet",
+        "PRD success metric: escalation section present for haiku/sonnet, absent for opus",
+        "No dead code warnings for any new code"
+      ],
+      "priority": 90,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Final validation gate. Verify all PRD success metrics are covered by passing tests.",
+      "touchesFiles": [],
+      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-FINAL",
+      "title": "Ready for merge — all gates pass",
+      "description": "Final gate before merge to main. All tests pass, all reviews complete, all acceptance criteria met.",
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All user stories from PRD have corresponding passing tests",
+        "Zero warnings in cargo check and cargo clippy",
+        "cargo test passes with zero failures",
+        "Feature branch is ready for merge to main"
+      ],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "All acceptance criteria met. Ready for merge.",
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-2", "VERIFY-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    }
+  ]
+}
