@@ -202,16 +202,7 @@ pub fn build_task_output(scored_task: &ScoredTask, claimed: bool) -> NextTaskOut
         model: scored_task.task.model.clone(),
         difficulty: scored_task.task.difficulty.clone(),
         escalation_note: scored_task.task.escalation_note.clone(),
-        score: ScoreOutput {
-            total: scored_task.total_score,
-            priority: scored_task.score_breakdown.priority_score,
-            file_overlap: scored_task.score_breakdown.file_score,
-            synergy: scored_task.score_breakdown.synergy_score,
-            conflict: scored_task.score_breakdown.conflict_score,
-            file_overlap_count: scored_task.score_breakdown.file_overlap_count,
-            synergy_from: scored_task.score_breakdown.synergy_from.clone(),
-            conflict_from: scored_task.score_breakdown.conflict_from.clone(),
-        },
+        score: ScoreOutput::from(&scored_task.score_breakdown),
     }
 }
 
