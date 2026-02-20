@@ -62,17 +62,17 @@ pub fn import_learnings(
 
     let conn = open_connection(dir)?;
 
-    // Build set of existing learning hashes for deduplication
-    let existing_hashes = load_existing_hashes(&conn)?;
+    // Build set of existing learning keys for deduplication
+    let existing_keys = load_existing_keys(&conn)?;
 
     let mut imported = 0;
     let mut skipped = 0;
     let mut tags_imported = 0;
 
     for learning in &learnings {
-        let hash = compute_learning_hash(&learning.title, &learning.content);
+        let key = compute_dedup_key(&learning.title, &learning.content);
 
-        if existing_hashes.contains(&hash) {
+        if existing_keys.contains(&key) {
             skipped += 1;
             continue;
         }
@@ -116,14 +116,13 @@ fn parse_learnings(content: &str) -> TaskMgrResult<Vec<LearningExport>> {
     ))
 }
 
-/// Compute a hash for deduplication based on title + content.
-fn compute_learning_hash(title: &str, content: &str) -> String {
-    let input = format!("{}:{}", title, content);
-    format!("{:x}", md5::compute(input.as_bytes()))
+/// Compute a dedup key based on title + content.
+fn compute_dedup_key(title: &str, content: &str) -> String {
+    format!("{}:{}", title, content)
 }
 
-/// Load hashes of all existing learnings in the database.
-fn load_existing_hashes(conn: &rusqlite::Connection) -> TaskMgrResult<HashSet<String>> {
+/// Load dedup keys of all existing learnings in the database.
+fn load_existing_keys(conn: &rusqlite::Connection) -> TaskMgrResult<HashSet<String>> {
     let mut stmt = conn.prepare("SELECT title, content FROM learnings")?;
     let rows = stmt.query_map([], |row| {
         let title: String = row.get(0)?;
@@ -131,13 +130,13 @@ fn load_existing_hashes(conn: &rusqlite::Connection) -> TaskMgrResult<HashSet<St
         Ok((title, content))
     })?;
 
-    let mut hashes = HashSet::new();
+    let mut keys = HashSet::new();
     for row in rows {
         let (title, content) = row?;
-        hashes.insert(compute_learning_hash(&title, &content));
+        keys.insert(compute_dedup_key(&title, &content));
     }
 
-    Ok(hashes)
+    Ok(keys)
 }
 
 /// Convert a LearningExport to RecordLearningParams.

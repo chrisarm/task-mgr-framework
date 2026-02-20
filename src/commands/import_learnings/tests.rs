@@ -5,7 +5,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use super::{
-    compute_learning_hash, format_text, import_learnings, parse_learnings, ImportLearningsResult,
+    compute_dedup_key, format_text, import_learnings, parse_learnings, ImportLearningsResult,
 };
 use crate::db::migrations;
 use crate::db::open_connection;
@@ -95,35 +95,35 @@ fn test_parse_learnings_wrong_format() {
     assert!(result.is_err());
 }
 
-// --- compute_learning_hash tests ---
+// --- compute_dedup_key tests ---
 
 #[test]
 fn test_hash_deterministic() {
-    let h1 = compute_learning_hash("title", "content");
-    let h2 = compute_learning_hash("title", "content");
+    let h1 = compute_dedup_key("title", "content");
+    let h2 = compute_dedup_key("title", "content");
     assert_eq!(h1, h2);
 }
 
 #[test]
 fn test_hash_different_titles() {
-    let h1 = compute_learning_hash("title1", "content");
-    let h2 = compute_learning_hash("title2", "content");
+    let h1 = compute_dedup_key("title1", "content");
+    let h2 = compute_dedup_key("title2", "content");
     assert_ne!(h1, h2);
 }
 
 #[test]
 fn test_hash_different_content() {
-    let h1 = compute_learning_hash("title", "content1");
-    let h2 = compute_learning_hash("title", "content2");
+    let h1 = compute_dedup_key("title", "content1");
+    let h2 = compute_dedup_key("title", "content2");
     assert_ne!(h1, h2);
 }
 
 #[test]
 fn test_hash_empty_strings() {
-    let h = compute_learning_hash("", "");
+    let h = compute_dedup_key("", "");
     assert!(!h.is_empty());
-    // MD5 of ":" should be deterministic
-    assert_eq!(h, compute_learning_hash("", ""));
+    // Key for empty strings should be deterministic
+    assert_eq!(h, compute_dedup_key("", ""));
 }
 
 // --- import_learnings integration tests ---
