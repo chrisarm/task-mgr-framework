@@ -591,6 +591,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec!["src/main.rs".to_string()],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -637,6 +640,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec![],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -737,6 +743,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec![],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,

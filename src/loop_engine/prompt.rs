@@ -327,6 +327,15 @@ fn build_task_json(
     if let Some(ref notes) = task.notes {
         json["notes"] = serde_json::Value::String(notes.clone());
     }
+    if let Some(ref model) = task.model {
+        json["model"] = serde_json::Value::String(model.clone());
+    }
+    if let Some(ref difficulty) = task.difficulty {
+        json["difficulty"] = serde_json::Value::String(difficulty.clone());
+    }
+    if let Some(ref escalation_note) = task.escalation_note {
+        json["escalationNote"] = serde_json::Value::String(escalation_note.clone());
+    }
     if !task.batch_with.is_empty() {
         json["batchWith"] = serde_json::json!(task.batch_with);
     }
@@ -563,6 +572,9 @@ mod tests {
             notes: None,
             files: vec!["src/lib.rs".to_string()],
             batch_with: vec![],
+            model: None,
+            difficulty: None,
+            escalation_note: None,
             score: ScoreOutput {
                 total: 995,
                 priority: 995,
@@ -1359,6 +1371,9 @@ pub enum ApiError {
             notes: Some("Important: check edge cases".to_string()),
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             batch_with: vec!["FEAT-043".to_string()],
+            model: Some("claude-opus-4-6".to_string()),
+            difficulty: Some("high".to_string()),
+            escalation_note: Some("Complex architectural task".to_string()),
             score: ScoreOutput {
                 total: 1003,
                 priority: 997,
@@ -1409,6 +1424,26 @@ pub enum ApiError {
             json.contains("eligibleBatchTasks"),
             "Should contain eligible batch tasks when non-empty"
         );
+        assert!(
+            json.contains("claude-opus-4-6"),
+            "Should contain model when present"
+        );
+        assert!(
+            json.contains("\"difficulty\""),
+            "Should contain difficulty key when present"
+        );
+        assert!(
+            json.contains("high"),
+            "Should contain difficulty value when present"
+        );
+        assert!(
+            json.contains("escalationNote"),
+            "Should contain escalationNote key when present"
+        );
+        assert!(
+            json.contains("Complex architectural task"),
+            "Should contain escalation note value when present"
+        );
     }
 
     #[test]
@@ -1423,6 +1458,9 @@ pub enum ApiError {
             notes: None,
             files: vec![],
             batch_with: vec![],
+            model: None,
+            difficulty: None,
+            escalation_note: None,
             score: ScoreOutput {
                 total: 999,
                 priority: 999,
@@ -1467,6 +1505,18 @@ pub enum ApiError {
         assert!(
             !json.contains("eligibleBatchTasks"),
             "Should not contain eligibleBatchTasks when empty"
+        );
+        assert!(
+            !json.contains("model"),
+            "Should not contain model key when None"
+        );
+        assert!(
+            !json.contains("difficulty"),
+            "Should not contain difficulty key when None"
+        );
+        assert!(
+            !json.contains("escalationNote"),
+            "Should not contain escalationNote key when None"
         );
     }
 
