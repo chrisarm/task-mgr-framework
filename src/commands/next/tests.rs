@@ -1,17 +1,13 @@
 //! Tests for the next command module.
 
 #[cfg(test)]
-mod selection_tests {
-    use crate::commands::next::selection::{
-        format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult,
-    };
+mod test_helpers {
     use crate::db::migrations::run_migrations;
     use crate::db::{create_schema, open_connection};
-    use crate::models::Task;
     use rusqlite::{params, Connection};
     use tempfile::TempDir;
 
-    fn setup_test_db() -> (TempDir, Connection) {
+    pub fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
@@ -19,7 +15,7 @@ mod selection_tests {
         (temp_dir, conn)
     }
 
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
+    pub fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
             params![id, title, status, priority],
@@ -27,7 +23,7 @@ mod selection_tests {
         .unwrap();
     }
 
-    fn insert_test_task_file(conn: &Connection, task_id: &str, file_path: &str) {
+    pub fn insert_test_task_file(conn: &Connection, task_id: &str, file_path: &str) {
         conn.execute(
             "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
             params![task_id, file_path],
@@ -35,7 +31,7 @@ mod selection_tests {
         .unwrap();
     }
 
-    fn insert_test_relationship(
+    pub fn insert_test_relationship(
         conn: &Connection,
         task_id: &str,
         related_id: &str,
@@ -47,6 +43,17 @@ mod selection_tests {
         )
         .unwrap();
     }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::test_helpers::{
+        insert_test_relationship, insert_test_task, insert_test_task_file, setup_test_db,
+    };
+    use crate::commands::next::selection::{
+        format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult,
+    };
+    use crate::models::Task;
 
     #[test]
     fn test_select_no_tasks() {
@@ -379,45 +386,14 @@ mod selection_tests {
 
 #[cfg(test)]
 mod next_command_tests {
+    use super::test_helpers::{insert_test_relationship, insert_test_task, setup_test_db};
     use crate::commands::next::next;
     use crate::commands::next::output::{
         build_task_output, format_next_text, format_next_verbose, CandidateSummary, ClaimMetadata,
         LearningSummaryOutput, NextResult, NextTaskOutput, ScoreOutput, SelectionMetadata,
     };
     use crate::commands::next::selection::{ScoreBreakdown, ScoredTask};
-    use crate::db::migrations::run_migrations;
-    use crate::db::{create_schema, open_connection};
-    use rusqlite::{params, Connection};
-    use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let mut conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        run_migrations(&mut conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
-
-    fn insert_test_relationship(
-        conn: &Connection,
-        task_id: &str,
-        related_id: &str,
-        rel_type: &str,
-    ) {
-        conn.execute(
-            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES (?, ?, ?)",
-            params![task_id, related_id, rel_type],
-        )
-        .unwrap();
-    }
+    use crate::db::open_connection;
 
     #[test]
     fn test_next_no_tasks() {
@@ -998,27 +974,8 @@ mod next_command_tests {
 
 #[cfg(test)]
 mod decay_tests {
+    use super::test_helpers::{insert_test_task, setup_test_db};
     use crate::commands::next::decay::{apply_decay, find_decay_warnings};
-    use crate::db::migrations::run_migrations;
-    use crate::db::{create_schema, open_connection};
-    use rusqlite::{params, Connection};
-    use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let mut conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        run_migrations(&mut conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn test_apply_decay_with_zero_threshold() {
