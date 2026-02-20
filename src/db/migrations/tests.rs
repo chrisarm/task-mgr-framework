@@ -317,6 +317,8 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
+    // Migrate down from version 6 to version 5 (reverts prd_files)
+    migrate_down(&mut conn).unwrap();
     // Migrate down from version 5 to version 4 (reverts task_prefix)
     migrate_down(&mut conn).unwrap();
     // Migrate down from version 4 to version 3 (reverts external_git_repo)

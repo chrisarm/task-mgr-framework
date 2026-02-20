@@ -47,6 +47,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
+use super::schema::create_schema;
 
 /// Opens a SQLite connection with appropriate pragmas set for reliability and performance.
 ///
@@ -97,6 +98,9 @@ pub fn open_connection(db_dir: &Path) -> TaskMgrResult<Connection> {
 
     // Store temporary tables and indices in memory
     conn.pragma_update(None, "temp_store", "MEMORY")?;
+
+    // Ensure base schema exists (idempotent - uses CREATE TABLE IF NOT EXISTS)
+    create_schema(&conn)?;
 
     Ok(conn)
 }

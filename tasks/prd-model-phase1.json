@@ -1,0 +1,760 @@
+{
+  "branchName": "feat/model-selection-phase1",
+  "description": "Phase 1: Add model/difficulty/escalationNote data layer + pure model resolution logic. Enables PRD-level default model, per-task overrides, difficulty-based escalation, synergy cluster analysis, and crash-recovery model escalation — all as pure testable functions and round-trip-safe data fields.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases. Tests verify boundaries work correctly",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works according to the plan",
+      "3. CORRECTNESS - Code compiles, type-checks, passes all tests deterministically",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings",
+      "5. POLISH - Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Ship solid working code first, then use tests to improve it",
+      "Test the boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "cc71a281",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Test model_tier: opus/sonnet/haiku substrings map to correct tiers, None and unknown strings return Default",
+        "Test resolve_task_model: task.model wins over difficulty, difficulty 'high' forces opus when no task model, prd_default used as fallback, all-None returns None",
+        "Known-bad discriminator: test that difficulty 'medium' does NOT escalate to opus (rejects naive 'any difficulty = opus' impl)",
+        "Test resolve_iteration_model: highest tier wins in synergy cluster, empty touchesFiles yields single-task cluster",
+        "Test escalate_model: haiku->sonnet, sonnet->opus, opus->opus, None->None",
+        "Test file compiles and all tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementing model.rs. Cover model_tier(), resolve_task_model(), resolve_iteration_model(), escalate_model() with happy path, edge cases, and known-bad discriminators.",
+      "edgeCases": [
+        "model_tier with empty string '' should return Default, not panic",
+        "model_tier with 'claude-opus-4-6' vs just 'opus' - both should match Opus",
+        "resolve_task_model with task_model=Some('') (empty string) - should it be treated as None or pass through?",
+        "resolve_iteration_model with zero pending tasks - selected task alone determines model",
+        "escalate_model with unknown model string like 'gpt-4' - should return same string unchanged"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Difficulty string comparison is case-sensitive",
+          "expectedBehavior": "Only exact 'high' triggers escalation, not 'High' or 'HIGH'"
+        },
+        {
+          "cause": "Empty touchesFiles on both selected and candidate tasks",
+          "expectedBehavior": "No overlap found, cluster is just selected task"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "model_tier(Some(OPUS_MODEL)) == ModelTier::Opus always",
+        "resolve_task_model(Some(x), _, _) == Some(x) for any non-None x (task model always wins)",
+        "escalate_model output tier >= input tier (never downgrades)",
+        "resolve_iteration_model output tier >= resolve_task_model output for selected task (cluster can only upgrade)"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first in src/loop_engine/model.rs #[cfg(test)] mod tests. Tests should define expected behavior for the pure functions that will be implemented in FEAT-001.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [],
+      "title": "Initial tests for model resolution pure logic",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test migration v6 up: columns added to tasks and prd_metadata tables, schema_version = 6",
+        "Test migration v6 down: schema_version reverts to 5",
+        "Test insert_task with model/difficulty/escalation_note: values stored and retrievable",
+        "Test insert_prd_metadata with default_model: value stored and retrievable",
+        "Test PrdFile/PrdUserStory parsing: JSON with model/difficulty/escalationNote fields deserializes correctly",
+        "Test backward compat: JSON without model/difficulty fields parses with None defaults",
+        "Known-bad discriminator: test that escalationNote uses camelCase in JSON (not snake_case)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for schema migration v6 (model/difficulty/escalation_note columns) and JSON round-trip (parse -> import -> export preserves fields).",
+      "edgeCases": [
+        "Migration on empty database (fresh install, no existing tasks)",
+        "Migration on database with existing tasks (columns added with NULL default)",
+        "Export with all new fields NULL: fields should be omitted from JSON (skip_serializing_if)",
+        "Import with escalationNote but no difficulty: both stored independently"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "ALTER TABLE on a table with existing rows",
+          "expectedBehavior": "Existing rows get NULL for new columns, no data loss"
+        },
+        {
+          "cause": "TryFrom<Row> on pre-v6 database (columns don't exist)",
+          "expectedBehavior": ".ok().flatten() returns None gracefully, no panic"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Migration is idempotent - running v6 on a v6 DB is a no-op",
+        "All new columns are nullable - INSERT without them succeeds",
+        "JSON round-trip: parse(export(import(json))) == parse(json) for new fields"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Tests in src/db/migrations/tests.rs for migration, and integration test for round-trip. Round-trip test: create JSON string -> parse PrdFile -> insert -> export -> verify fields match.",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [
+        "TEST-INIT-001"
+      ],
+      "title": "Initial tests for migration v6 and data round-trip",
+      "touchesFiles": [
+        "src/db/migrations/tests.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "ModelTier enum with Default(0), Haiku(1), Sonnet(2), Opus(3) variants deriving Ord, PartialOrd, Eq, PartialEq",
+        "Constants: OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL matching claude-loop.sh values",
+        "model_tier(Option<&str>) -> ModelTier: substring match on opus/sonnet/haiku",
+        "resolve_task_model(task_model, difficulty, prd_default) -> Option<String>: precedence task > high-difficulty > prd_default > None",
+        "resolve_iteration_model(selected_id, selected_files, task_models) -> Option<String>: synergy cluster + highest tier",
+        "escalate_model(current) -> Option<String>: haiku->sonnet->opus->opus, None->None",
+        "pub mod model; added to src/loop_engine/mod.rs",
+        "All TEST-INIT-001 tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Create src/loop_engine/model.rs with ModelTier enum, model constants, and pure functions: model_tier, resolve_task_model, resolve_iteration_model, escalate_model. Register as pub mod model in mod.rs.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Pure logic only, no DB or I/O. This is the core of the feature. Follow patterns in crash.rs and stale.rs (pure state machines with no I/O).",
+      "passes": true,
+      "priority": 6,
+      "synergyWith": [],
+      "title": "Pure model resolution module (model.rs)",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "v6.rs follows v5.rs pattern: Migration struct with version, description, up_sql, down_sql",
+        "up_sql: ALTER TABLE tasks ADD COLUMN model TEXT, difficulty TEXT, escalation_note TEXT; ALTER TABLE prd_metadata ADD COLUMN default_model TEXT",
+        "down_sql: UPDATE global_state SET schema_version = 5 (columns left in place for SQLite compat)",
+        "mod.rs: CURRENT_SCHEMA_VERSION = 6, mod v6 added, &v6::MIGRATION in MIGRATIONS array",
+        "All TEST-INIT-002 migration tests pass",
+        "Existing v5 databases upgrade cleanly"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Create src/db/migrations/v6.rs adding model TEXT, difficulty TEXT, escalation_note TEXT to tasks table and default_model TEXT to prd_metadata table. Bump CURRENT_SCHEMA_VERSION to 6.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Follow exact pattern of v5.rs. All new columns must be nullable (TEXT without NOT NULL). The up_sql must include UPDATE global_state SET schema_version = 6.",
+      "passes": true,
+      "priority": 7,
+      "synergyWith": [],
+      "title": "Database migration v6: model/difficulty columns",
+      "touchesFiles": [
+        "src/db/migrations/v6.rs",
+        "src/db/migrations/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "PrdFile has: #[serde(default)] pub model: Option<String>",
+        "PrdUserStory has: #[serde(default)] pub model: Option<String>",
+        "PrdUserStory has: #[serde(default)] pub difficulty: Option<String>",
+        "PrdUserStory has: #[serde(default)] pub escalation_note: Option<String>",
+        "Existing PRD JSON files without these fields parse without error",
+        "New JSON with model/difficulty/escalationNote deserializes correctly"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Add model: Option<String> to PrdFile, and model/difficulty/escalation_note to PrdUserStory in parse.rs. All fields use #[serde(default)] for backward compatibility.",
+      "estimatedEffort": "low",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "serde(rename_all = camelCase) is already on both structs, so escalation_note in Rust maps to escalationNote in JSON automatically. All new fields MUST use #[serde(default)] to maintain backward compat.",
+      "passes": true,
+      "priority": 8,
+      "synergyWith": [
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "title": "Parse structs: add model/difficulty/escalationNote fields",
+      "touchesFiles": [
+        "src/commands/init/parse.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Task struct has: pub model: Option<String>, pub difficulty: Option<String>, pub escalation_note: Option<String>",
+        "All three use #[serde(skip_serializing_if = \"Option::is_none\")]",
+        "Task::new() initializes all three as None",
+        "TryFrom<&Row> reads with .ok().flatten() pattern (handles pre-v6 DBs where columns don't exist)",
+        "Existing tests that construct Task still compile"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Add model, difficulty, escalation_note optional fields to the Task struct and update TryFrom<&Row> to read them gracefully from the database.",
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Follow the pattern of blocked_at_iteration/skipped_at_iteration fields which use the same .ok().flatten() approach for optional columns.",
+      "passes": true,
+      "priority": 8,
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "Task model: add model/difficulty/escalation_note fields",
+      "touchesFiles": [
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "insert_task: INSERT includes model, difficulty, escalation_note columns (3 new params)",
+        "update_task: UPDATE SET includes model, difficulty, escalation_note columns (3 new params)",
+        "insert_prd_metadata: INSERT includes default_model column (1 new param from prd.model)",
+        "All params read from PrdUserStory/PrdFile struct fields",
+        "Existing tests that call these functions still pass",
+        "NULL values stored when fields are None"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Update insert_task, update_task, and insert_prd_metadata in import.rs to persist the new fields from PrdUserStory/PrdFile to the database.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "Callers (in init/mod.rs) don't change — they pass PrdUserStory/PrdFile which now has the new fields. Only the SQL queries and params arrays change.",
+      "passes": true,
+      "priority": 9,
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "title": "Import: add model/difficulty/escalation_note to INSERT/UPDATE",
+      "touchesFiles": [
+        "src/commands/init/import.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "ExportedPrd has: #[serde(skip_serializing_if = \"Option::is_none\")] pub model: Option<String>",
+        "ExportedUserStory has: model, difficulty, escalation_note (all Option<String>, skip_serializing_if)",
+        "PrdMetadata has: pub default_model: Option<String>",
+        "load_prd_metadata SELECT includes default_model column",
+        "load_tasks SELECT includes model, difficulty, escalation_note columns",
+        "Exported JSON omits fields when NULL, includes them when present",
+        "Full round-trip test passes: JSON -> init -> export -> fields preserved"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Update ExportedPrd, ExportedUserStory, PrdMetadata, and the load functions in export/prd.rs to include model/difficulty/escalation_note fields.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "ExportedUserStory uses #[serde(rename_all = camelCase)] so escalation_note auto-maps to escalationNote. Use skip_serializing_if = Option::is_none for clean JSON output.",
+      "passes": true,
+      "priority": 10,
+      "synergyWith": [],
+      "title": "Export: add model/difficulty/escalationNote to exported JSON",
+      "touchesFiles": [
+        "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "NextTaskOutput has: model, difficulty, escalation_note (all Option<String>, skip_serializing_if)",
+        "build_task_output() populates from scored_task.task.model/.difficulty/.escalation_note",
+        "build_task_json() includes model/difficulty/escalationNote in JSON when present",
+        "task-mgr next JSON output shows new fields when present",
+        "Existing tests that construct NextTaskOutput updated to include new fields"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-004"
+      ],
+      "description": "Add model, difficulty, escalation_note to NextTaskOutput and populate them in build_task_output(). Update build_task_json() in prompt.rs to include these in the task JSON block.",
+      "estimatedEffort": "low",
+      "id": "FEAT-007",
+      "modifiesBehavior": false,
+      "notes": "build_task_json is in prompt.rs. It conditionally adds optional fields like description/notes. Follow the same pattern for model/difficulty/escalation_note.",
+      "passes": true,
+      "priority": 11,
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "title": "NextTaskOutput: add model/difficulty/escalation_note fields",
+      "touchesFiles": [
+        "src/commands/next/output.rs",
+        "src/loop_engine/prompt.rs",
+        "src/commands/next/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All SQL queries match column count with params count",
+        "All serde annotations correct (camelCase, skip_serializing_if, default)",
+        "TryFrom<Row> handles missing columns gracefully (no panic on pre-v6 DB)",
+        "All new pub functions/structs are reachable from production code paths",
+        "No unused code warnings for new fields/functions",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review all implementation tasks for code quality, error handling, correct SQL queries, serde annotations, and verify all new code is wired in.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. No issues found - all 7 acceptance criteria pass. No CODE-FIX tasks needed. Verified: no unwrap() in prod, SQL column/param counts match, serde annotations correct, TryFrom graceful, all pub items reachable, no unused warnings.",
+      "passes": true,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review Phase 1 implementation for quality and integration",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/loop_engine/mod.rs",
+        "src/db/migrations/v6.rs",
+        "src/db/migrations/mod.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs",
+        "src/models/task.rs",
+        "src/commands/next/output.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "No tight coupling between modules",
+        "Code is easy to change and extend",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues before testing phase.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. No refactoring needed. All Phase 1 functions are under 30 lines, no DRY violations introduced, zero coupling in model.rs (pure functions), code follows established patterns and is easy to extend. Pre-existing long functions in import.rs/export/prd.rs are long due to SQL column count, not complexity — outside Phase 1 scope.",
+      "passes": true,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/db/migrations/v6.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs",
+        "src/models/task.rs",
+        "src/commands/next/output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-INIT tests pass: cargo test --lib loop_engine::model",
+        "All FEAT tasks pass: migration, parse, import, export, model, next output all working",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "cargo check - zero warnings",
+        "cargo clippy -- -D warnings - zero warnings",
+        "cargo fmt --check - passes",
+        "All new code is reachable from production entry points (no dead code)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Gate: all initial tests pass, implementation reviewed and refactored, all new code reachable from production paths.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Gate before comprehensive testing. All initial tests pass, implementation reviewed and fully wired in.",
+      "passes": true,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 implementation complete and reviewed",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Test model_tier with case variants: 'OPUS', 'Opus', 'claude-OPUS-4' all return Opus",
+        "Test resolve_task_model with empty string task_model (should treat as valid override, not None)",
+        "Test synergy cluster with 3+ overlapping tasks at different tiers",
+        "Test synergy cluster with partial file overlap (some files match, some don't)",
+        "Test escalate_model with unknown model string returns same string (no crash)",
+        "Parameterized tests for all precedence combinations from PRD appendix table"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand model.rs tests beyond happy path. Cover: case sensitivity, empty strings, unknown model names, overlapping synergy clusters, single-task clusters, multi-tier clusters.",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Focus on robustness. These tests should catch subtle bugs in tier comparison, synergy clustering, and precedence logic.",
+      "passes": true,
+      "priority": 25,
+      "synergyWith": [
+        "TEST-002"
+      ],
+      "title": "Comprehensive tests for model resolution edge cases",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Round-trip test: PRD with top-level model + per-task model + difficulty + escalationNote",
+        "Round-trip test: PRD with only some tasks having model overrides (others NULL)",
+        "Round-trip test: PRD with no model fields at all (backward compat)",
+        "Test update_task preserves model/difficulty/escalation_note on re-import",
+        "Test that exported JSON uses camelCase: escalationNote not escalation_note",
+        "Test that NULL fields are omitted from exported JSON (not serialized as null)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Full integration tests: create PRD JSON with all combinations of model/difficulty/escalationNote, import to DB, export, verify round-trip fidelity.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "modifiesBehavior": false,
+      "notes": "Use tempfile for test DBs. Verify both the DB state (direct SQL query) and the exported JSON content. Test the full pipeline: parse -> insert -> load -> export -> parse again.",
+      "passes": true,
+      "priority": 28,
+      "synergyWith": [
+        "TEST-001"
+      ],
+      "title": "Comprehensive tests for data round-trip with model fields",
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/init/parse.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test build_task_output populates model/difficulty/escalation_note from scored_task",
+        "Test build_task_json includes model field in JSON when present",
+        "Test build_task_json includes difficulty field in JSON when present",
+        "Test build_task_json includes escalationNote (camelCase) in JSON when present",
+        "Test build_task_json omits all three fields when None",
+        "Test format_next_text still works (no regression in text output)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Test that model/difficulty/escalation_note flow through NextTaskOutput and appear correctly in the prompt's task JSON block.",
+      "estimatedEffort": "low",
+      "id": "TEST-003",
+      "modifiesBehavior": false,
+      "notes": "Tests in prompt.rs and next/tests.rs. Existing test helpers like setup_test_db, insert_task should work — just need to also set model/difficulty columns.",
+      "passes": true,
+      "priority": 30,
+      "synergyWith": [
+        "TEST-001",
+        "TEST-002"
+      ],
+      "title": "Comprehensive tests for NextTaskOutput model fields and prompt JSON",
+      "touchesFiles": [
+        "src/loop_engine/prompt.rs",
+        "src/commands/next/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002",
+        "TEST-003"
+      ],
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. Found 1 issue: duplicated test helpers (setup_test_db, insert_test_task, insert_test_relationship) across 3 test modules in next/tests.rs. model.rs and migrations/tests.rs are clean. Test names are clear across all files. Created REFACTOR-2-001 for the duplication.",
+      "passes": true,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/commands/next/tests.rs",
+        "src/db/migrations/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "setup_test_db() defined once and used by all 3 test modules",
+        "insert_test_task() defined once and used by all 3 test modules",
+        "insert_test_relationship() defined once and used by both selection_tests and next_command_tests",
+        "insert_test_task_file() remains accessible from selection_tests",
+        "All existing tests pass without modification",
+        "No new warnings from cargo clippy"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Extract duplicated test helper functions (setup_test_db, insert_test_task, insert_test_relationship) from selection_tests, next_command_tests, and decay_tests into a shared test_helpers module at the file level in src/commands/next/tests.rs.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "3 copies of setup_test_db() and insert_test_task(), 2 copies of insert_test_relationship(). Create a #[cfg(test)] mod test_helpers at the file level with pub(super) visibility, then use super::test_helpers::* in each submodule.",
+      "passes": true,
+      "priority": 41,
+      "synergyWith": [],
+      "title": "Deduplicate test helpers in next/tests.rs",
+      "touchesFiles": [
+        "src/commands/next/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-xxx comprehensive tests pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "cargo test - all tests pass with zero failures",
+        "cargo clippy -- -D warnings - zero warnings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "TEST-003",
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001"
+      ],
+      "description": "Gate: comprehensive tests pass, test code refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "passes": true,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Full test coverage achieved",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Create test PRD JSON with model at top level and per-task model/difficulty/escalationNote",
+        "task-mgr init --from-json imports successfully",
+        "task-mgr next --json output includes model/difficulty/escalation_note fields",
+        "task-mgr export --to-json output preserves all model/difficulty/escalationNote fields",
+        "task-mgr init with existing DB (re-import) preserves model/difficulty via update_task"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Test the full CLI flow: task-mgr init --from-json with a PRD containing model fields, task-mgr next shows model fields, task-mgr export preserves them.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "Use the integration test pattern from tests/ directory. May need a test fixture JSON file with model fields.",
+      "passes": true,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration test: end-to-end PRD with model fields via CLI",
+      "touchesFiles": [
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows project patterns (see CLAUDE.md)",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge. For each issue found: 1) Add REFACTOR-3-xxx task (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON changes.",
+      "passes": true,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/loop_engine/model.rs",
+        "src/db/migrations/v6.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs",
+        "src/models/task.rs",
+        "src/commands/next/output.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test - all tests pass (including all new model/migration/round-trip tests)",
+        "cargo clippy -- -D warnings - zero warnings",
+        "cargo fmt --check - passes",
+        "cargo check - zero warnings",
+        "Verify: PrdFile parses model field, PrdUserStory parses model/difficulty/escalationNote",
+        "Verify: Migration v6 adds correct columns",
+        "Verify: Round-trip JSON preserves all new fields",
+        "Verify: model.rs all functions have tests",
+        "Verify: NextTaskOutput includes model/difficulty/escalation_note"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Run full test suite, clippy, fmt, and verify zero regressions. Verify all Phase 1 acceptance criteria from PRD are met.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "All 9 acceptance criteria verified. cargo fmt ✓, cargo check ✓ (0 warnings), cargo clippy ✓ (0 warnings), cargo test ✓ (1685 tests, 0 failures). PrdFile/PrdUserStory fields verified, migration v6 verified, round-trip JSON verified, model.rs 50 tests verified, NextTaskOutput fields verified.",
+      "passes": true,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification - all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All user stories from PRD Phase 1 (US-001 through US-007) satisfied",
+        "Zero cargo warnings, zero test failures",
+        "Branch is ready for merge to main"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "All Phase 1 acceptance criteria met, code reviewed, tested, and ready for merge to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate. After this passes, Phase 2 (loop engine integration) can begin.",
+      "passes": true,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 complete - ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

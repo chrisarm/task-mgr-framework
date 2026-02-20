@@ -41,7 +41,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::db::{create_schema, open_connection};
+use crate::db::open_connection;
 use crate::error::validate_safe_path;
 use crate::TaskMgrError;
 use crate::TaskMgrResult;
@@ -111,7 +111,7 @@ fn generate_prefix() -> String {
 use import::{
     delete_task_files, delete_task_relationships, drop_existing_data, get_delete_preview,
     get_existing_task_ids, insert_prd_metadata, insert_task, insert_task_file,
-    insert_task_relationships, is_fresh_database, update_task,
+    insert_task_relationships, is_fresh_database, register_prd_files, update_task,
 };
 
 /// Initialize the database from JSON PRD file(s).
@@ -146,11 +146,8 @@ pub fn init(
     dry_run: bool,
     prefix_mode: PrefixMode,
 ) -> TaskMgrResult<InitResult> {
-    // Open/create database connection
+    // Open/create database connection (schema created automatically)
     let mut conn = open_connection(dir)?;
-
-    // Create schema (idempotent) - needed even for dry-run to query counts
-    create_schema(&conn)?;
 
     // Run pending migrations (e.g. v4 adds external_git_repo column)
     crate::db::run_migrations(&mut conn)?;
@@ -184,6 +181,7 @@ pub fn init(
     let mut warnings: Vec<String> = Vec::new();
     let mut tasks_skipped = 0;
     let mut resolved_prefix: Option<String> = None;
+    let mut json_file_registrations: Vec<(std::path::PathBuf, PrdFile)> = Vec::new();
 
     // Get existing task IDs if in append mode
     if append && !fresh_import {
@@ -278,8 +276,23 @@ pub fn init(
                 user_stories: Vec::new(), // We'll collect stories separately
                 external_git_repo: prd.external_git_repo.clone(),
                 task_prefix: resolved_prefix.clone().or(prd.task_prefix.clone()),
+                prd_file: prd.prd_file.clone(),
             });
         }
+
+        // Track JSON file + PRD for prd_files registration
+        json_file_registrations.push((json_path.to_path_buf(), PrdFile {
+            project: prd.project.clone(),
+            branch_name: None,
+            description: None,
+            priority_philosophy: None,
+            global_acceptance_criteria: None,
+            review_guidelines: None,
+            user_stories: Vec::new(),
+            external_git_repo: None,
+            task_prefix: None,
+            prd_file: prd.prd_file.clone(),
+        }));
 
         // Collect new stories (with prefix applied)
         for story in prd.user_stories {
@@ -368,6 +381,12 @@ pub fn init(
     // Insert PRD metadata
     if let Some(metadata) = prd_metadata {
         insert_prd_metadata(&tx, &metadata, raw_json.as_deref())?;
+    }
+
+    // Register PRD files for archive discovery
+    let tasks_dir = dir.join("tasks");
+    for (json_path, prd_for_reg) in &json_file_registrations {
+        register_prd_files(&tx, json_path, prd_for_reg, &tasks_dir)?;
     }
 
     // Import new tasks

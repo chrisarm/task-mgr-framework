@@ -1,0 +1,281 @@
+
+## 2026-02-20 04:14:39 UTC - Iteration 1
+- Task: TEST-INIT-001
+- Outcome: Blocked
+- Files: test/restaurant_agent/calls/call_actor_test.exs
+---
+
+## 2026-02-20 04:15:25 UTC - Iteration 2
+- Task: TEST-INIT-002
+- Outcome: Blocked
+- Files: test/restaurant_agent/calls/call_supervisor_test.exs
+---
+
+## 2026-02-20 04:20:13 UTC - Iteration 3
+- Task: cc71a281-TEST-INIT-001
+- Outcome: Stale
+- Files: src/loop_engine/model.rs
+---
+
+## 2026-02-20 04:21:41 UTC - Iteration 4
+- Task: cc71a281-FEAT-001
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/loop_engine/mod.rs
+---
+
+## 2026-02-20 04:22:33 UTC - Iteration 5
+- Task: TEST-INIT-003
+- Outcome: Blocked
+- Files: test/restaurant_agent/audio/barge_in_handler_test.exs
+---
+
+## 2026-02-20 04:32:11 UTC - Iteration 6
+- Task: cc71a281-TEST-INIT-002
+- Outcome: Stale
+- Files: src/db/migrations/tests.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs
+---
+
+## 2026-02-19 - Iteration 7
+- Task: cc71a281-FEAT-002
+- Outcome: Complete (already implemented)
+- What: v6.rs migration already existed from TEST-INIT-002 commit. Verified all acceptance criteria met.
+- Files: src/db/migrations/v6.rs (existing), src/db/migrations/mod.rs (existing)
+- Quality: cargo fmt ✓, cargo check ✓, cargo clippy ✓, 22/22 migration tests pass
+- **Learnings:** Migration was bundled into the TEST-INIT-002 test commit. The test-first approach meant implementation artifacts were created alongside tests.
+---
+
+## 2026-02-20 04:34:16 UTC - Iteration 7
+- Task: cc71a281-FEAT-002
+- Outcome: Stale
+- Files: src/db/migrations/v6.rs, src/db/migrations/mod.rs
+---
+
+## 2026-02-20 04:37:03 UTC - Iteration 8
+- Task: cc71a281-FEAT-003
+- Outcome: Stale
+- Files: src/commands/init/parse.rs
+---
+
+## 2026-02-20 04:38:57 UTC - Iteration 9
+- Task: cc71a281-FEAT-004
+- Outcome: Stale
+- Files: src/models/task.rs
+---
+
+## 2026-02-20 04:40:19 UTC - Iteration 10
+- Task: cc71a281-FEAT-005
+- Outcome: Stale
+- Files: src/commands/init/import.rs
+---
+
+## 2026-02-20 04:41:19 UTC - Iteration 11
+- Task: cc71a281-FEAT-006
+- Outcome: Stale
+- Files: src/commands/export/prd.rs
+---
+
+## 2026-02-20 04:45:09 UTC - Iteration 12
+- Task: cc71a281-FEAT-007
+- Outcome: Stale
+- Files: src/commands/next/output.rs, src/loop_engine/prompt.rs, src/commands/next/tests.rs
+---
+
+## 2026-02-19 - FEAT-006
+- What: Fixed ExportedPrd and PrdFile field naming from `default_model` to `model` for correct JSON round-trip. With `rename_all = "camelCase"`, `default_model` serialized as `"defaultModel"` but PRD JSON uses `"model"`. PrdMetadata (internal struct) and DB column retain `default_model` naming.
+- Files changed: src/commands/export/prd.rs, src/commands/export/mod.rs, src/commands/export/tests.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/init/mod.rs, src/commands/init/tests.rs
+- Quality: cargo fmt ✓, cargo check ✓, cargo clippy ✓, all tests pass
+- **Learnings:** When `rename_all = "camelCase"` is active, the Rust field name must match the JSON key's pre-camelCase form. `default_model` → `"defaultModel"` ≠ `"model"`. The DB column name is independent from the serde field name — internal structs like PrdMetadata can use different naming than serialized structs.
+---
+
+## 2026-02-20 04:54:47 UTC - Iteration 13
+- Task: FEAT-007
+- Outcome: Stale
+- Files: native/audio_nif/src/denoise.rs, native/audio_nif/src/lib.rs, lib/restaurant_agent/native/audio.ex, lib/restaurant_agent/audio/denoise.ex, test/restaurant_agent/audio/denoise_test.exs
+---
+
+## 2026-02-20 04:58:26 UTC - Iteration 14
+- Task: cc71a281-CODE-REVIEW-1
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/loop_engine/mod.rs, src/db/migrations/v6.rs, src/db/migrations/mod.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs, src/loop_engine/prompt.rs
+---
+
+## 2026-02-19 - CODE-REVIEW-1
+- What: Reviewed all 10 source files against 7 acceptance criteria. No issues found.
+- Verified: No unwrap() in production, SQL column/param counts match, serde annotations correct, TryFrom<Row> uses .ok().flatten() for graceful handling, all new pub items reachable from production paths, no unused code warnings.
+- Integration wiring verified: pub mod model, mod v6 + MIGRATIONS array, CURRENT_SCHEMA_VERSION=6, field flow parse→import→DB→export, ExportedPrd.model mapped from PrdMetadata.default_model.
+- Quality: cargo fmt ✓, cargo check ✓, cargo clippy ✓, cargo test ✓ (all pass)
+- No CODE-FIX tasks needed.
+- **Learnings:** Phase 1 implementation was clean - TDD approach and following existing patterns (v5 migration, blocked_at_iteration TryFrom) prevented common integration bugs.
+---
+
+## 2026-02-20 05:02:57 UTC - Iteration 15
+- Task: cc71a281-CODE-REVIEW-1
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/loop_engine/mod.rs, src/db/migrations/v6.rs, src/db/migrations/mod.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs, src/loop_engine/prompt.rs
+---
+
+## 2026-02-19 - REFACTOR-REVIEW-1
+- What: Reviewed all 7 Phase 1 implementation files against DRY, function length, coupling, and maintainability criteria. No issues found.
+- Findings: All Phase 1 functions (model.rs) are well under 30 lines. No DRY violations introduced. model.rs has zero coupling (pure functions, no I/O). Pre-existing long functions in import.rs/export/prd.rs are long due to SQL column count — outside Phase 1 scope.
+- Quality: cargo fmt ✓, cargo clippy ✓, cargo test ✓ (1752 tests, 0 failures)
+- No REFACTOR-1-xxx tasks needed.
+- **Learnings:** Schema extension pattern (add field to parse → task → import → export) inherently produces long CRUD functions. This is a property of the pattern, not a refactoring target.
+---
+
+## 2026-02-20 05:06:52 UTC - Iteration 16
+- Task: cc71a281-REFACTOR-REVIEW-1
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/db/migrations/v6.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs
+---
+
+## 2026-02-20 05:19:32 UTC - Iteration 1
+- Task: TEST-INIT-003
+- Outcome: Blocked
+- Files: test/restaurant_agent/audio/barge_in_handler_test.exs
+---
+
+## 2026-02-20 05:20:17 UTC - Iteration 2
+- Task: TEST-INIT-004
+- Outcome: Reorder (BLOCKED)
+- Files: test/restaurant_agent/security/call_limits_test.exs, test/restaurant_agent/calls_test.exs
+---
+
+## 2026-02-19 - MILESTONE-1
+- What: Phase 1 implementation complete and reviewed. All acceptance criteria verified.
+- Results:
+  - cargo test --lib loop_engine::model: 28/28 tests pass
+  - cargo test: 1643/1643 tests pass (0 failures)
+  - cargo check: zero warnings
+  - cargo clippy -- -D warnings: zero warnings
+  - cargo fmt --check: passes
+  - All new code reachable from production entry points (verified 7 integration points)
+  - CODE-REVIEW-1: passed, no CODE-FIX tasks spawned
+  - REFACTOR-REVIEW-1: passed, no REFACTOR tasks spawned
+- **Learnings:** Phase 1 TDD approach and pattern-following produced clean integration. All fields properly wired through parse → import → DB → export → output pipeline.
+---
+
+## 2026-02-20 05:24:18 UTC - Iteration 3
+- Task: cc71a281-MILESTONE-1
+- Outcome: Stale
+- Files: (none)
+---
+
+## 2026-02-20 05:28:09 UTC - Iteration 4
+- Task: cc71a281-TEST-001
+- Outcome: Stale
+- Files: src/loop_engine/model.rs
+---
+
+## 2026-02-20 05:32:05 UTC - Iteration 5
+- Task: cc71a281-TEST-002
+- Outcome: Stale
+- Files: src/commands/init/import.rs, src/commands/export/prd.rs, src/commands/init/parse.rs
+---
+
+## 2026-02-20 05:41:03 UTC - Iteration 6
+- Task: cc71a281-TEST-003
+- Outcome: Stale
+- Files: src/loop_engine/prompt.rs, src/commands/next/tests.rs
+---
+
+## 2026-02-19 - REFACTOR-REVIEW-2
+- What: Reviewed test code in model.rs, next/tests.rs, and migrations/tests.rs for duplication, helper extraction, and clarity.
+- Findings:
+  - **next/tests.rs**: 3 copies of `setup_test_db()` and `insert_test_task()`, 2 copies of `insert_test_relationship()` across `selection_tests`, `next_command_tests`, and `decay_tests` modules. Created REFACTOR-2-001 to extract shared helpers.
+  - **model.rs**: Clean. Pure function tests with no setup needed. Minor overlap between TEST-INIT-001 and TEST-001 case-insensitive tests (harmless).
+  - **migrations/tests.rs**: Clean. Single `setup_db()` used throughout.
+  - Test names clear and descriptive across all files.
+- Created: REFACTOR-2-001 (priority 41) - Deduplicate test helpers in next/tests.rs
+- **Learnings:** Pre-existing test helper duplication in Rust is common when test modules are separate `mod` blocks in the same file. A shared `test_helpers` module with `pub(super)` visibility is the standard Rust pattern to fix this.
+---
+
+## 2026-02-20 05:44:18 UTC - Iteration 7
+- Task: cc71a281-REFACTOR-REVIEW-2
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/commands/next/tests.rs, src/db/migrations/tests.rs
+---
+
+## 2026-02-20 05:48:02 UTC - Iteration 8
+- Task: cc71a281-REFACTOR-2-001
+- Outcome: Stale
+- Files: src/commands/next/tests.rs
+---
+
+## 2026-02-20 05:49:33 UTC - Iteration 9
+- Task: cc71a281-MILESTONE-2
+- Outcome: Stale
+- Files: (none)
+---
+
+## 2026-02-20 05:53:11 UTC - Iteration 10
+- Task: cc71a281-INT-001
+- Outcome: Stale
+- Files: tests/
+---
+
+## 2026-02-20 05:56:04 UTC - Iteration 11
+- Task: cc71a281-REFACTOR-REVIEW-3
+- Outcome: Empty
+- Files: src/loop_engine/model.rs, src/db/migrations/v6.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs, src/loop_engine/prompt.rs
+---
+
+## 2026-02-20 05:59:38 UTC - Iteration 12
+- Task: cc71a281-REFACTOR-REVIEW-3
+- Outcome: Empty
+- Files: src/loop_engine/model.rs, src/db/migrations/v6.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs, src/loop_engine/prompt.rs
+---
+
+## 2026-02-20 06:04:22 UTC - Iteration 13
+- Task: cc71a281-REFACTOR-REVIEW-3
+- Outcome: Stale
+- Files: src/loop_engine/model.rs, src/db/migrations/v6.rs, src/commands/init/parse.rs, src/commands/init/import.rs, src/commands/export/prd.rs, src/models/task.rs, src/commands/next/output.rs, src/loop_engine/prompt.rs
+---
+
+## 2026-02-19 - cc71a281-VERIFY-001
+- What: Final verification - all quality checks and acceptance criteria pass
+- Results:
+  - cargo fmt --check: passes
+  - cargo check: zero warnings
+  - cargo clippy -- -D warnings: zero warnings
+  - cargo test: 1685 tests (1670 unit + 15 integration), 0 failures
+  - PrdFile.model and PrdUserStory.model/difficulty/escalation_note verified (parse.rs)
+  - Migration v6: 4 columns added, schema_version=6, registered in MIGRATIONS array
+  - Round-trip JSON: 10+ tests verify full parse→import→export→reimport fidelity
+  - model.rs: 50 tests covering all 4 public functions with edge cases
+  - NextTaskOutput: model/difficulty/escalation_note fields verified in output.rs and prompt.rs
+- Files: (verification only, no files changed)
+- **Learnings:** All Phase 1 implementation and testing complete. Branch ready for MILESTONE-FINAL.
+---
+
+## 2026-02-20 06:08:29 UTC - Iteration 14
+- Task: cc71a281-VERIFY-001
+- Outcome: Stale
+- Files: (none)
+---
+
+## 2026-02-19 - MILESTONE-FINAL
+- Task: cc71a281-MILESTONE-FINAL
+- Outcome: COMPLETE
+- All acceptance criteria verified:
+  - cargo fmt --check: PASS (clean)
+  - cargo clippy -- -D warnings: PASS (zero warnings)
+  - cargo test: PASS (1797 tests, 0 failures across 13 test suites)
+  - US-001 through US-007: All implemented and tested
+  - VERIFY-001: passed
+  - REFACTOR-REVIEW-3: passed (spawned REFACTOR-3-001, completed)
+- Branch feat/model-selection-phase1 is ready for merge to main
+- 11 commits on feature branch implementing full Phase 1 data layer
+- **Learnings:** Phase 1 complete. Pure model resolution logic, DB migration v6, parse/import/export pipeline, and NextTaskOutput all wired and tested.
+---
+
+## 2026-02-20 06:12:57 UTC - Iteration 15
+- Task: cc71a281-MILESTONE-FINAL
+- Outcome: Stale
+- Files: (none)
+---
+
+## 2026-02-20 06:13:57 UTC - Iteration 16
+- Task: (none)
+- Outcome: Completed
+- Files: (none)
+---

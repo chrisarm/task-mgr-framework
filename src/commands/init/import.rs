@@ -4,6 +4,7 @@
 //! task data in the SQLite database.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use rusqlite::Connection;
 
@@ -23,6 +24,8 @@ pub fn drop_existing_data(conn: &Connection) -> TaskMgrResult<()> {
     conn.execute("DELETE FROM task_relationships", [])?;
     conn.execute("DELETE FROM task_files", [])?;
     conn.execute("DELETE FROM tasks", [])?;
+    // prd_files may not exist in pre-v6 databases
+    let _ = conn.execute("DELETE FROM prd_files", []);
     conn.execute("DELETE FROM prd_metadata", [])?;
     // Reset global_state but don't delete the row
     conn.execute(
@@ -249,5 +252,60 @@ pub fn delete_task_relationships(conn: &Connection, task_id: &str) -> TaskMgrRes
         "DELETE FROM task_relationships WHERE task_id = ?",
         [task_id],
     )?;
+    Ok(())
+}
+
+/// Insert a PRD file record into the prd_files table.
+pub fn insert_prd_file(
+    conn: &Connection,
+    file_path: &str,
+    file_type: &str,
+) -> TaskMgrResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, ?)",
+        [file_path, file_type],
+    )?;
+    Ok(())
+}
+
+/// Register all files associated with a PRD in the prd_files table.
+///
+/// Records:
+/// 1. The task list JSON file as `task_list` type
+/// 2. The derived prompt file (`<stem>-prompt.md`) as `prompt` type if it exists
+/// 3. The PRD markdown file from `prd.prd_file` as `prd` type if set
+///
+/// All paths are stored relative to the tasks directory.
+pub fn register_prd_files(
+    conn: &Connection,
+    json_path: &Path,
+    prd: &PrdFile,
+    tasks_dir: &Path,
+) -> TaskMgrResult<()> {
+    // Store the JSON task list path (relative to tasks dir)
+    let json_relative = json_path
+        .strip_prefix(tasks_dir)
+        .unwrap_or(json_path)
+        .to_string_lossy();
+    insert_prd_file(conn, &json_relative, "task_list")?;
+
+    // Derive prompt file path: <stem>-prompt.md
+    if let Some(stem) = json_path.file_stem() {
+        let prompt_name = format!("{}-prompt.md", stem.to_string_lossy());
+        let prompt_path = json_path.with_file_name(&prompt_name);
+        if prompt_path.exists() {
+            let prompt_relative = prompt_path
+                .strip_prefix(tasks_dir)
+                .unwrap_or(&prompt_path)
+                .to_string_lossy();
+            insert_prd_file(conn, &prompt_relative, "prompt")?;
+        }
+    }
+
+    // Store PRD markdown file if specified
+    if let Some(ref prd_file) = prd.prd_file {
+        insert_prd_file(conn, prd_file, "prd")?;
+    }
+
     Ok(())
 }

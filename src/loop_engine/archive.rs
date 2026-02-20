@@ -20,6 +20,8 @@ pub struct ArchiveResult {
     pub archived: Vec<ArchivedItem>,
     /// Learnings extracted from progress.txt
     pub learnings_extracted: usize,
+    /// Number of tasks cleared from the database
+    pub tasks_cleared: usize,
     /// Whether this was a dry run
     pub dry_run: bool,
     /// Human-readable message
@@ -49,6 +51,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
+            tasks_cleared: 0,
             dry_run,
             message: "No PRD metadata found in database.".to_string(),
         });
@@ -59,6 +62,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
+            tasks_cleared: 0,
             dry_run,
             message: format!(
                 "PRD '{}' is not fully completed. Only completed PRDs can be archived.",
@@ -91,8 +95,8 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
         0
     };
 
-    // Discover files to archive
-    let files_to_archive = discover_archivable_files(&tasks_dir, &info.project)?;
+    // Discover files to archive (prefer prd_files table, fall back to project name)
+    let files_to_archive = discover_archivable_files(&conn, &tasks_dir, &info.project)?;
 
     let mut archived_items = Vec::new();
     for source in &files_to_archive {
@@ -130,22 +134,36 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
         }
     }
 
+    // Count tasks before clearing (for reporting)
+    let task_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // Clear task data from DB after archiving files (preserving learnings)
+    if !dry_run && !archived_items.is_empty() {
+        clear_task_data(&conn)?;
+    }
+
     let action = if dry_run { "Would archive" } else { "Archived" };
+    let clear_action = if dry_run { "Would clear" } else { "Cleared" };
     let message = if archived_items.is_empty() {
         format!("No archivable files found for project '{}'.", info.project)
     } else {
         format!(
-            "{} {} file(s) to archive/{}. {} learning(s) extracted.",
+            "{} {} file(s) to archive/{}. {} learning(s) extracted. {} {} task(s) from database.",
             action,
             archived_items.len(),
             archive_folder_name,
-            learnings_count
+            learnings_count,
+            clear_action,
+            task_count
         )
     };
 
     Ok(ArchiveResult {
         archived: archived_items,
         learnings_extracted: learnings_count,
+        tasks_cleared: task_count,
         dry_run,
         message,
     })
@@ -193,6 +211,18 @@ pub fn format_text(result: &ArchiveResult) -> String {
         ));
     }
 
+    if result.tasks_cleared > 0 {
+        let verb = if result.dry_run {
+            "Would clear"
+        } else {
+            "Cleared"
+        };
+        out.push_str(&format!(
+            "{} {} task(s) from database (learnings preserved)\n",
+            verb, result.tasks_cleared
+        ));
+    }
+
     out.push_str(&format!("\n{}\n", result.message));
 
     out
@@ -223,7 +253,10 @@ fn get_project_info(conn: &rusqlite::Connection) -> TaskMgrResult<Option<PrdInfo
     Ok(result)
 }
 
-/// Check if all tasks in the PRD are completed (status = 'done').
+/// Check if all tasks in the PRD are in a terminal state.
+///
+/// A PRD is archivable when no tasks are `todo`, `in_progress`, or `blocked`.
+/// Terminal states: `done`, `skipped`, `irrelevant`.
 fn is_prd_completed(conn: &rusqlite::Connection) -> TaskMgrResult<bool> {
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
@@ -233,15 +266,15 @@ fn is_prd_completed(conn: &rusqlite::Connection) -> TaskMgrResult<bool> {
         return Ok(false);
     }
 
-    let done: i64 = conn
+    let non_terminal: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'done'",
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('todo', 'in_progress', 'blocked')",
             [],
             |row| row.get(0),
         )
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    Ok(done == total)
+    Ok(non_terminal == 0)
 }
 
 /// Strip common branch prefixes (feat/, fix/, chore/, ralph/).
@@ -257,35 +290,91 @@ fn strip_branch_prefix(branch: &str) -> String {
 
 /// Discover files associated with the PRD that should be archived.
 ///
-/// Looks for:
-/// - `<project>.json` or files matching the project name
-/// - `<project>-prompt.md` (prompt file)
-/// - `prd-<project>.md` (PRD markdown)
-/// - `<project>-prompt.md` variants
-fn discover_archivable_files(tasks_dir: &Path, project: &str) -> TaskMgrResult<Vec<PathBuf>> {
+/// Prefers the `prd_files` table (v6+) for accurate file discovery.
+/// Falls back to project-name-based guessing for pre-v6 databases.
+/// Always includes `progress.txt` if it exists (not tracked in prd_files).
+fn discover_archivable_files(
+    conn: &rusqlite::Connection,
+    tasks_dir: &Path,
+    project: &str,
+) -> TaskMgrResult<Vec<PathBuf>> {
     let mut files = Vec::new();
 
-    // Generate candidate file patterns based on project name
-    let candidates = vec![
-        format!("{}.json", project),
-        format!("{}-prompt.md", project),
-        format!("prd-{}.md", project),
-    ];
+    // Try prd_files table first (v6+ databases)
+    let prd_file_paths = query_prd_files(conn);
 
-    for candidate in &candidates {
-        let path = tasks_dir.join(candidate);
-        if path.exists() {
-            files.push(path);
+    if !prd_file_paths.is_empty() {
+        // Use paths from the database
+        for relative_path in &prd_file_paths {
+            let path = tasks_dir.join(relative_path);
+            if path.exists() {
+                files.push(path);
+            }
+        }
+    } else {
+        // Fallback: guess from project name (pre-v6 databases)
+        let candidates = vec![
+            format!("{}.json", project),
+            format!("{}-prompt.md", project),
+            format!("prd-{}.md", project),
+        ];
+
+        for candidate in &candidates {
+            let path = tasks_dir.join(candidate);
+            if path.exists() {
+                files.push(path);
+            }
         }
     }
 
-    // Also look for progress.txt to archive
+    // Always include progress.txt (not tracked in prd_files)
     let progress_path = tasks_dir.join("progress.txt");
     if progress_path.exists() {
         files.push(progress_path);
     }
 
     Ok(files)
+}
+
+/// Query the prd_files table for file paths. Returns empty vec if table doesn't exist.
+fn query_prd_files(conn: &rusqlite::Connection) -> Vec<String> {
+    let result: Result<Vec<String>, rusqlite::Error> = (|| {
+        let mut stmt = conn.prepare("SELECT file_path FROM prd_files WHERE prd_id = 1")?;
+        let paths = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(paths)
+    })();
+
+    result.unwrap_or_default()
+}
+
+/// Clear task data from the database, preserving learnings.
+///
+/// Deletes from: run_tasks, runs, task_relationships, task_files, tasks,
+/// prd_files, prd_metadata. Resets global_state counters.
+/// Preserves: learnings, learning_tags.
+fn clear_task_data(conn: &rusqlite::Connection) -> TaskMgrResult<()> {
+    conn.execute("DELETE FROM run_tasks", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    conn.execute("DELETE FROM runs", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    conn.execute("DELETE FROM task_relationships", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    conn.execute("DELETE FROM task_files", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    conn.execute("DELETE FROM tasks", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    // prd_files may not exist in pre-v6 databases
+    let _ = conn.execute("DELETE FROM prd_files", []);
+    conn.execute("DELETE FROM prd_metadata", [])
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    conn.execute(
+        "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL, updated_at = datetime('now') WHERE id = 1",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+    Ok(())
 }
 
 /// Extract learnings from progress.txt.
@@ -526,9 +615,14 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_archivable_files() {
+    fn test_discover_archivable_files_fallback() {
+        // When prd_files table is empty, falls back to project-name-based discovery
         let dir = TempDir::new().unwrap();
         let tasks_dir = dir.path();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         // Create some files
         fs::write(tasks_dir.join("my-project.json"), "{}").unwrap();
@@ -537,7 +631,7 @@ mod tests {
         fs::write(tasks_dir.join("progress.txt"), "# Progress").unwrap();
         fs::write(tasks_dir.join("unrelated.txt"), "other").unwrap();
 
-        let files = discover_archivable_files(tasks_dir, "my-project").unwrap();
+        let files = discover_archivable_files(&conn, tasks_dir, "my-project").unwrap();
         assert_eq!(files.len(), 4);
 
         let filenames: Vec<String> = files
@@ -554,7 +648,11 @@ mod tests {
     #[test]
     fn test_discover_archivable_files_none_exist() {
         let dir = TempDir::new().unwrap();
-        let files = discover_archivable_files(dir.path(), "nonexistent").unwrap();
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        let files = discover_archivable_files(&conn, dir.path(), "nonexistent").unwrap();
         assert!(files.is_empty());
     }
 
@@ -566,6 +664,7 @@ mod tests {
                 destination: "archive/2026-02-05-feature/my-project.json".to_string(),
             }],
             learnings_extracted: 2,
+            tasks_cleared: 3,
             dry_run: true,
             message:
                 "Would archive 1 file(s) to archive/2026-02-05-feature. 2 learning(s) extracted."
@@ -586,6 +685,7 @@ mod tests {
                 destination: "archive/2026-02-05-feature/my-project.json".to_string(),
             }],
             learnings_extracted: 0,
+            tasks_cleared: 0,
             dry_run: false,
             message: "Archived 1 file(s) to archive/2026-02-05-feature. 0 learning(s) extracted."
                 .to_string(),
@@ -602,6 +702,7 @@ mod tests {
         let result = ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
+            tasks_cleared: 0,
             dry_run: false,
             message: "No archivable files found.".to_string(),
         };
@@ -618,6 +719,7 @@ mod tests {
                 destination: "archive/dir/a.json".to_string(),
             }],
             learnings_extracted: 5,
+            tasks_cleared: 0,
             dry_run: true,
             message: "test".to_string(),
         };
@@ -763,6 +865,18 @@ mod tests {
             .to_string();
         assert!(folder_name.contains("test-branch"));
         assert!(!folder_name.contains("ralph/"));
+
+        // Verify DB was cleared
+        assert_eq!(result.tasks_cleared, 1);
+        let conn = crate::db::open_connection(dir.path()).unwrap();
+        let task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_count, 0);
+        let metadata_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(metadata_count, 0);
     }
 
     #[test]
@@ -826,5 +940,274 @@ mod tests {
         let result = run_archive(dir.path(), false).unwrap();
         assert!(result.archived.is_empty());
         assert!(result.message.contains("not fully completed"));
+    }
+
+    #[test]
+    fn test_run_archive_preserves_learnings() {
+        use crate::learnings::crud::{record_learning, RecordLearningParams};
+        use crate::models::{Confidence, LearningOutcome};
+
+        let dir = TempDir::new().unwrap();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Done', 1, 'done')",
+            [],
+        )
+        .unwrap();
+
+        // Record a learning in the database
+        let params = RecordLearningParams {
+            outcome: LearningOutcome::Success,
+            title: "Archive test learning".to_string(),
+            content: "This learning should survive archive".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::High,
+        };
+        record_learning(&conn, params).unwrap();
+
+        drop(conn);
+
+        // Create tasks dir with files to archive
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+        assert_eq!(result.tasks_cleared, 1);
+
+        // Verify learnings survived
+        let conn = crate::db::open_connection(dir.path()).unwrap();
+        let learning_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(learning_count, 1);
+
+        let title: String = conn
+            .query_row("SELECT title FROM learnings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Archive test learning");
+
+        // Verify learning_tags survived (tags table should still exist)
+        let tag_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learning_tags", [], |row| row.get(0))
+            .unwrap();
+        // No tags were added, but table should still be accessible
+        assert_eq!(tag_count, 0);
+    }
+
+    #[test]
+    fn test_prd_files_drives_discovery() {
+        let dir = TempDir::new().unwrap();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        // Insert prd_files entries (simulating what init would do)
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project) VALUES (1, 'model-selection')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-phase1.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-phase1-prompt.md', 'prompt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-selection.md', 'prd')",
+            [],
+        )
+        .unwrap();
+
+        // Create the files on disk
+        let tasks_dir = dir.path();
+        fs::write(tasks_dir.join("prd-model-phase1.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("prd-model-phase1-prompt.md"), "# Prompt").unwrap();
+        fs::write(tasks_dir.join("prd-model-selection.md"), "# PRD").unwrap();
+        // Also create a project-name file that should NOT be found
+        // (prd_files takes precedence over project-name guessing)
+        fs::write(tasks_dir.join("model-selection.json"), "{}").unwrap();
+
+        let files = discover_archivable_files(&conn, tasks_dir, "model-selection").unwrap();
+
+        let filenames: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        // Should find prd_files entries, NOT project-name-based guesses
+        assert_eq!(files.len(), 3);
+        assert!(filenames.contains(&"prd-model-phase1.json".to_string()));
+        assert!(filenames.contains(&"prd-model-phase1-prompt.md".to_string()));
+        assert!(filenames.contains(&"prd-model-selection.md".to_string()));
+        // Should NOT include the project-name-guessed file
+        assert!(!filenames.contains(&"model-selection.json".to_string()));
+    }
+
+    #[test]
+    fn test_skipped_and_irrelevant_tasks_are_terminal() {
+        let dir = TempDir::new().unwrap();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
+            [],
+        )
+        .unwrap();
+
+        // Mix of done, skipped, and irrelevant — all terminal
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-001', 'Done', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-002', 'Skipped', 2, 'skipped')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-003', 'Irrelevant', 3, 'irrelevant')",
+            [],
+        )
+        .unwrap();
+
+        // PRD should be considered completed
+        assert!(is_prd_completed(&conn).unwrap());
+
+        drop(conn);
+
+        // Create tasks dir with files
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+        assert_eq!(result.tasks_cleared, 3);
+        assert!(!result.archived.is_empty());
+    }
+
+    #[test]
+    fn test_skipped_task_blocks_archive_when_mixed_with_todo() {
+        let dir = TempDir::new().unwrap();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project) VALUES (1, 'test-project')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-001', 'Done', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-002', 'Todo', 2, 'todo')",
+            [],
+        )
+        .unwrap();
+
+        // PRD should NOT be considered completed (todo task remains)
+        assert!(!is_prd_completed(&conn).unwrap());
+    }
+
+    #[test]
+    fn test_init_registers_prd_files() {
+        use crate::commands::init::{init, PrefixMode};
+
+        let dir = TempDir::new().unwrap();
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+
+        let json = r#"{
+            "project": "test-project",
+            "prdFile": "prd-model-selection.md",
+            "userStories": [
+                {"id": "US-001", "title": "Task 1", "priority": 1, "passes": true}
+            ]
+        }"#;
+        let json_path = tasks_dir.join("prd-model-phase1.json");
+        fs::write(&json_path, json).unwrap();
+
+        // Create the prompt file so it gets registered
+        fs::write(tasks_dir.join("prd-model-phase1-prompt.md"), "# Prompt").unwrap();
+
+        init(
+            dir.path(),
+            &[&json_path],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Disabled,
+        )
+        .unwrap();
+
+        let conn = crate::db::open_connection(dir.path()).unwrap();
+
+        // Verify prd_files entries
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(file_count, 3); // task_list + prompt + prd
+
+        // Verify specific entries
+        let task_list: String = conn
+            .query_row(
+                "SELECT file_path FROM prd_files WHERE file_type = 'task_list'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_list, "prd-model-phase1.json");
+
+        let prompt: String = conn
+            .query_row(
+                "SELECT file_path FROM prd_files WHERE file_type = 'prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, "prd-model-phase1-prompt.md");
+
+        let prd: String = conn
+            .query_row(
+                "SELECT file_path FROM prd_files WHERE file_type = 'prd'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prd, "prd-model-selection.md");
     }
 }

@@ -59,4 +59,8 @@ pub struct PrdFile {
     /// written back to the JSON file for stability across re-imports.
     #[serde(default)]
     pub task_prefix: Option<String>,
+    /// Path to the PRD markdown file (e.g. `prd-model-selection.md`).
+    /// Stored in `prd_files` for archive file discovery.
+    #[serde(default)]
+    pub prd_file: Option<String>,
 }

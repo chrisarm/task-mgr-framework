@@ -49,6 +49,31 @@ pub fn create_global_state_table(conn: &Connection) -> TaskMgrResult<()> {
     Ok(())
 }
 
+/// Creates the prd_files table for tracking files associated with a PRD.
+///
+/// Used by the `archive` command to discover which files to move.
+pub fn create_prd_files_table(conn: &Connection) -> TaskMgrResult<()> {
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS prd_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prd_id INTEGER NOT NULL DEFAULT 1 REFERENCES prd_metadata(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            file_type TEXT NOT NULL CHECK(file_type IN ('prd', 'task_list', 'prompt')),
+            UNIQUE(prd_id, file_path)
+        )
+        "#,
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prd_files_prd_id ON prd_files(prd_id)",
+        [],
+    )?;
+
+    Ok(())
+}
+
 /// Initializes global_state with default values if not exists.
 pub fn initialize_global_state(conn: &Connection) -> TaskMgrResult<()> {
     conn.execute(

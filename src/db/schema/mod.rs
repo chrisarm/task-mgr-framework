@@ -61,6 +61,7 @@ pub fn create_schema(conn: &Connection) -> TaskMgrResult<()> {
 
     // Create metadata tables
     metadata::create_prd_metadata_table(conn)?;
+    metadata::create_prd_files_table(conn)?;
     metadata::create_global_state_table(conn)?;
     metadata::initialize_global_state(conn)?;
 
