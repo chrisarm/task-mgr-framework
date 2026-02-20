@@ -298,7 +298,7 @@
       "id": "FIX-005",
       "modifiesBehavior": true,
       "notes": "The UPDATE runs inside the transaction from FIX-004. Use tx.execute() not conn.execute(). DateTime edge case: learning.last_shown_at can be None even when times_shown > 0 — preserve as-is (pass NULL to SQL).",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [

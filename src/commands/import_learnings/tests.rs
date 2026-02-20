@@ -4,6 +4,8 @@ use std::fs;
 
 use tempfile::TempDir;
 
+use chrono::{DateTime, NaiveDateTime, Utc};
+
 use super::{
     compute_dedup_key, format_text, import_learnings, parse_learnings, ImportLearningsResult,
 };
@@ -502,4 +504,123 @@ fn test_format_text_with_tags_and_reset() {
     let text = format_text(&result);
     assert!(text.contains("Tags imported: 4"));
     assert!(text.contains("reset"));
+}
+
+// --- stats preservation tests ---
+
+/// Helper to build a fixed DateTime<Utc> from a SQLite-format string.
+fn fixed_datetime(s: &str) -> DateTime<Utc> {
+    let naive =
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").expect("valid datetime string");
+    DateTime::from_naive_utc_and_offset(naive, Utc)
+}
+
+#[test]
+fn test_import_preserves_stats_when_no_reset() {
+    let (dir, _conn) = setup_test_db();
+
+    let mut learning = make_learning("Stats Preserve", "Content");
+    learning.times_shown = 10;
+    learning.times_applied = 5;
+    learning.last_shown_at = Some(fixed_datetime("2026-01-15 10:30:00"));
+    learning.last_applied_at = Some(fixed_datetime("2026-01-14 08:00:00"));
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    assert_eq!(result.learnings_imported, 1);
+    assert!(!result.stats_reset);
+
+    // Verify stats are preserved in DB
+    let conn = open_connection(dir.path()).unwrap();
+    let (shown, applied, last_shown, last_applied): (i32, i32, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT times_shown, times_applied, last_shown_at, last_applied_at \
+             FROM learnings WHERE title = ?1",
+            rusqlite::params!["Stats Preserve"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(shown, 10);
+    assert_eq!(applied, 5);
+    assert_eq!(last_shown.unwrap(), "2026-01-15 10:30:00");
+    assert_eq!(last_applied.unwrap(), "2026-01-14 08:00:00");
+}
+
+#[test]
+fn test_import_preserves_stats_with_none_datetimes() {
+    let (dir, _conn) = setup_test_db();
+
+    // times_shown > 0 but last_shown_at is None — preserve as-is
+    let mut learning = make_learning("None Dates", "Content");
+    learning.times_shown = 3;
+    learning.times_applied = 0;
+    // last_shown_at and last_applied_at default to None
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    import_learnings(dir.path(), &import_file, false).unwrap();
+
+    let conn = open_connection(dir.path()).unwrap();
+    let (shown, applied, last_shown, last_applied): (i32, i32, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT times_shown, times_applied, last_shown_at, last_applied_at \
+             FROM learnings WHERE title = ?1",
+            rusqlite::params!["None Dates"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(shown, 3);
+    assert_eq!(applied, 0);
+    assert!(last_shown.is_none());
+    assert!(last_applied.is_none());
+}
+
+#[test]
+fn test_format_text_stats_preserved() {
+    let result = ImportLearningsResult {
+        source_file: "learnings.json".to_string(),
+        learnings_imported: 3,
+        learnings_skipped: 0,
+        tags_imported: 0,
+        stats_reset: false,
+    };
+    let text = format_text(&result);
+    assert!(text.contains("preserved from export"));
+    assert!(!text.contains("reset to zero"));
+}
+
+#[test]
+fn test_format_text_stats_reset() {
+    let result = ImportLearningsResult {
+        source_file: "learnings.json".to_string(),
+        learnings_imported: 2,
+        learnings_skipped: 0,
+        tags_imported: 0,
+        stats_reset: true,
+    };
+    let text = format_text(&result);
+    assert!(text.contains("reset to zero"));
+    assert!(!text.contains("preserved from export"));
+}
+
+#[test]
+fn test_format_text_no_stats_line_when_zero_imported() {
+    let result = ImportLearningsResult {
+        source_file: "learnings.json".to_string(),
+        learnings_imported: 0,
+        learnings_skipped: 5,
+        tags_imported: 0,
+        stats_reset: false,
+    };
+    let text = format_text(&result);
+    // No stats line when nothing was imported and not resetting
+    assert!(!text.contains("preserved"));
+    assert!(!text.contains("reset"));
 }

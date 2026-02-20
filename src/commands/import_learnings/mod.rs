@@ -13,10 +13,15 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use chrono::{DateTime, Utc};
+
 use crate::db::open_connection;
 use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{LearningExport, ProgressExport};
 use crate::{TaskMgrError, TaskMgrResult};
+
+/// SQLite datetime format (matches parse_datetime in models/datetime.rs).
+const SQLITE_DATETIME_FMT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Result of the import-learnings command.
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +88,12 @@ pub fn import_learnings(
 
         let params = learning_to_params(learning);
         let result = record_learning(&tx, params)?;
+
+        // Preserve stats from export when not resetting
+        if !reset_stats {
+            update_stats(&tx, result.learning_id, learning)?;
+        }
+
         imported += 1;
         tags_imported += result.tags_added;
     }
@@ -171,6 +182,41 @@ fn learning_to_params(learning: &LearningExport) -> RecordLearningParams {
     }
 }
 
+/// Format a DateTime<Utc> as a SQLite-compatible string.
+fn format_sqlite_datetime(dt: &DateTime<Utc>) -> String {
+    dt.format(SQLITE_DATETIME_FMT).to_string()
+}
+
+/// Update bandit statistics for an imported learning.
+///
+/// Preserves times_shown, times_applied, last_shown_at, and last_applied_at
+/// from the source export. Called only when reset_stats=false.
+fn update_stats(
+    conn: &rusqlite::Connection,
+    learning_id: i64,
+    learning: &LearningExport,
+) -> TaskMgrResult<()> {
+    let last_shown = learning.last_shown_at.as_ref().map(format_sqlite_datetime);
+    let last_applied = learning
+        .last_applied_at
+        .as_ref()
+        .map(format_sqlite_datetime);
+
+    conn.execute(
+        "UPDATE learnings SET times_shown = ?1, times_applied = ?2, \
+         last_shown_at = ?3, last_applied_at = ?4 WHERE id = ?5",
+        rusqlite::params![
+            learning.times_shown,
+            learning.times_applied,
+            last_shown,
+            last_applied,
+            learning_id,
+        ],
+    )?;
+
+    Ok(())
+}
+
 /// Format import learnings result for text output.
 pub fn format_text(result: &ImportLearningsResult) -> String {
     let mut output = String::new();
@@ -194,6 +240,8 @@ pub fn format_text(result: &ImportLearningsResult) -> String {
 
     if result.stats_reset {
         output.push_str("Bandit statistics: reset to zero\n");
+    } else if result.learnings_imported > 0 {
+        output.push_str("Bandit statistics: preserved from export\n");
     }
 
     output
