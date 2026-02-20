@@ -36,9 +36,7 @@ impl RetrievalBackend for PatternsBackend {
         query: &RetrievalQuery,
     ) -> TaskMgrResult<Vec<ScoredLearning>> {
         // Patterns backend needs task context to work
-        if query.task_files.is_empty()
-            && query.task_prefix.is_none()
-            && query.task_error.is_none()
+        if query.task_files.is_empty() && query.task_prefix.is_none() && query.task_error.is_none()
         {
             return Ok(Vec::new());
         }

@@ -6,6 +6,7 @@
 use std::time::Instant;
 use tempfile::TempDir;
 
+use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 
 /// Helper to insert a task with specified properties.
@@ -43,8 +44,9 @@ fn insert_relationship(
 /// Create a 200-task benchmark database with realistic relationships.
 fn create_benchmark_db() -> (TempDir, rusqlite::Connection) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
+    let mut conn = open_connection(temp_dir.path()).expect("Failed to open connection");
     create_schema(&conn).expect("Failed to create schema");
+    run_migrations(&mut conn).expect("Failed to run migrations");
 
     // Create 200 tasks with varying statuses and priorities
     // Distribution: 120 todo, 50 done, 15 blocked, 10 skipped, 5 irrelevant
@@ -379,8 +381,9 @@ fn test_benchmark_worst_case_all_todo() {
     // Create a database where all 200 tasks are in 'todo' status
     // This is the worst case for task selection
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
+    let mut conn = open_connection(temp_dir.path()).expect("Failed to open connection");
     create_schema(&conn).expect("Failed to create schema");
+    run_migrations(&mut conn).expect("Failed to run migrations");
 
     // Create 200 todo tasks
     for i in 0..200 {
@@ -434,8 +437,9 @@ fn test_benchmark_worst_case_all_todo() {
 fn test_benchmark_many_files_overlap() {
     // Test performance when there are many file overlaps to check
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
+    let mut conn = open_connection(temp_dir.path()).expect("Failed to open connection");
     create_schema(&conn).expect("Failed to create schema");
+    run_migrations(&mut conn).expect("Failed to run migrations");
 
     // Create 200 todo tasks with many files each
     for i in 0..200 {

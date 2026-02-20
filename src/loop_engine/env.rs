@@ -202,7 +202,9 @@ fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
         .args(["rev-parse", "--git-dir"])
         .current_dir(dir)
         .output()
-        .map_err(|e| TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e))?;
+        .map_err(|e| {
+            TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e)
+        })?;
 
     if !output.status.success() {
         return Ok(false);
@@ -1841,10 +1843,7 @@ mod tests {
         let project_root = Path::new("/home/user/myproject");
         let path = compute_worktree_path(project_root, "main");
 
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/myproject-worktrees/main")
-        );
+        assert_eq!(path, PathBuf::from("/home/user/myproject-worktrees/main"));
     }
 
     #[test]
@@ -2040,7 +2039,10 @@ detached
 
         let result = is_inside_worktree(tmp.path());
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "Main repo should not be detected as worktree");
+        assert!(
+            !result.unwrap(),
+            "Main repo should not be detected as worktree"
+        );
     }
 
     #[test]

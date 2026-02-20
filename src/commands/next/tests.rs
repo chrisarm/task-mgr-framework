@@ -1,23 +1,21 @@
 //! Tests for the next command module.
 
 #[cfg(test)]
-mod selection_tests {
-    use crate::commands::next::selection::{
-        format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult,
-    };
+mod test_helpers {
+    use crate::db::migrations::run_migrations;
     use crate::db::{create_schema, open_connection};
-    use crate::models::Task;
     use rusqlite::{params, Connection};
     use tempfile::TempDir;
 
-    fn setup_test_db() -> (TempDir, Connection) {
+    pub fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
+    pub fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
         conn.execute(
             "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
             params![id, title, status, priority],
@@ -25,7 +23,7 @@ mod selection_tests {
         .unwrap();
     }
 
-    fn insert_test_task_file(conn: &Connection, task_id: &str, file_path: &str) {
+    pub fn insert_test_task_file(conn: &Connection, task_id: &str, file_path: &str) {
         conn.execute(
             "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
             params![task_id, file_path],
@@ -33,7 +31,7 @@ mod selection_tests {
         .unwrap();
     }
 
-    fn insert_test_relationship(
+    pub fn insert_test_relationship(
         conn: &Connection,
         task_id: &str,
         related_id: &str,
@@ -45,6 +43,17 @@ mod selection_tests {
         )
         .unwrap();
     }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::test_helpers::{
+        insert_test_relationship, insert_test_task, insert_test_task_file, setup_test_db,
+    };
+    use crate::commands::next::selection::{
+        format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult,
+    };
+    use crate::models::Task;
 
     #[test]
     fn test_select_no_tasks() {
@@ -377,42 +386,14 @@ mod selection_tests {
 
 #[cfg(test)]
 mod next_command_tests {
+    use super::test_helpers::{insert_test_relationship, insert_test_task, setup_test_db};
     use crate::commands::next::next;
     use crate::commands::next::output::{
-        format_next_text, format_next_verbose, CandidateSummary, ClaimMetadata,
+        build_task_output, format_next_text, format_next_verbose, CandidateSummary, ClaimMetadata,
         LearningSummaryOutput, NextResult, NextTaskOutput, ScoreOutput, SelectionMetadata,
     };
-    use crate::db::{create_schema, open_connection};
-    use rusqlite::{params, Connection};
-    use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
-
-    fn insert_test_relationship(
-        conn: &Connection,
-        task_id: &str,
-        related_id: &str,
-        rel_type: &str,
-    ) {
-        conn.execute(
-            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES (?, ?, ?)",
-            params![task_id, related_id, rel_type],
-        )
-        .unwrap();
-    }
+    use crate::commands::next::selection::{ScoreBreakdown, ScoredTask};
+    use crate::db::open_connection;
 
     #[test]
     fn test_next_no_tasks() {
@@ -591,6 +572,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec!["src/main.rs".to_string()],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -637,6 +621,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec![],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -724,6 +711,188 @@ mod next_command_tests {
         assert!(result.top_candidates.is_empty());
     }
 
+    // ===== TEST-003: build_task_output model field tests =====
+
+    #[test]
+    fn test_build_task_output_populates_model_fields() {
+        let mut task = crate::models::Task::new("FEAT-001", "Model test task");
+        task.model = Some("claude-opus-4-6".to_string());
+        task.difficulty = Some("high".to_string());
+        task.escalation_note = Some("Complex architectural decision".to_string());
+
+        let scored = ScoredTask {
+            task,
+            files: vec!["src/lib.rs".to_string()],
+            batch_with: vec![],
+            total_score: 990,
+            score_breakdown: ScoreBreakdown {
+                priority_score: 950,
+                file_score: 0,
+                synergy_score: 0,
+                conflict_score: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        };
+
+        let output = build_task_output(&scored, false);
+
+        assert_eq!(
+            output.model,
+            Some("claude-opus-4-6".to_string()),
+            "model should be populated from scored_task"
+        );
+        assert_eq!(
+            output.difficulty,
+            Some("high".to_string()),
+            "difficulty should be populated from scored_task"
+        );
+        assert_eq!(
+            output.escalation_note,
+            Some("Complex architectural decision".to_string()),
+            "escalation_note should be populated from scored_task"
+        );
+    }
+
+    #[test]
+    fn test_build_task_output_none_model_fields() {
+        let task = crate::models::Task::new("FEAT-002", "No model fields");
+
+        let scored = ScoredTask {
+            task,
+            files: vec![],
+            batch_with: vec![],
+            total_score: 950,
+            score_breakdown: ScoreBreakdown {
+                priority_score: 950,
+                file_score: 0,
+                synergy_score: 0,
+                conflict_score: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        };
+
+        let output = build_task_output(&scored, false);
+
+        assert!(output.model.is_none(), "model should be None when not set");
+        assert!(
+            output.difficulty.is_none(),
+            "difficulty should be None when not set"
+        );
+        assert!(
+            output.escalation_note.is_none(),
+            "escalation_note should be None when not set"
+        );
+    }
+
+    #[test]
+    fn test_build_task_output_claimed_preserves_model_fields() {
+        let mut task = crate::models::Task::new("FEAT-003", "Claimed with model");
+        task.model = Some("claude-sonnet-4-6".to_string());
+        task.difficulty = Some("medium".to_string());
+        task.escalation_note = None;
+
+        let scored = ScoredTask {
+            task,
+            files: vec![],
+            batch_with: vec![],
+            total_score: 960,
+            score_breakdown: ScoreBreakdown {
+                priority_score: 960,
+                file_score: 0,
+                synergy_score: 0,
+                conflict_score: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        };
+
+        let output = build_task_output(&scored, true);
+
+        assert_eq!(
+            output.status, "in_progress",
+            "claimed task should be in_progress"
+        );
+        assert_eq!(
+            output.model,
+            Some("claude-sonnet-4-6".to_string()),
+            "model should be preserved when claimed"
+        );
+        assert_eq!(
+            output.difficulty,
+            Some("medium".to_string()),
+            "difficulty should be preserved when claimed"
+        );
+        assert!(
+            output.escalation_note.is_none(),
+            "escalation_note should remain None"
+        );
+    }
+
+    // ===== TEST-003: format_next_text regression with model fields =====
+
+    #[test]
+    fn test_format_next_text_with_model_fields_no_regression() {
+        let result = NextResult {
+            task: Some(NextTaskOutput {
+                id: "FEAT-001".to_string(),
+                title: "Task with model".to_string(),
+                description: Some("A test task with model fields".to_string()),
+                priority: 10,
+                status: "in_progress".to_string(),
+                acceptance_criteria: vec!["AC1".to_string()],
+                notes: None,
+                files: vec!["src/lib.rs".to_string()],
+                batch_with: vec![],
+                model: Some("claude-opus-4-6".to_string()),
+                difficulty: Some("high".to_string()),
+                escalation_note: Some("Complex task needing opus".to_string()),
+                score: ScoreOutput {
+                    total: 990,
+                    priority: 990,
+                    file_overlap: 0,
+                    synergy: 0,
+                    conflict: 0,
+                    file_overlap_count: 0,
+                    synergy_from: vec![],
+                    conflict_from: vec![],
+                },
+            }),
+            batch_tasks: vec![],
+            learnings: vec![],
+            selection: SelectionMetadata {
+                reason: "Selected by priority".to_string(),
+                eligible_count: 1,
+            },
+            claim: None,
+            top_candidates: vec![],
+        };
+
+        let text = format_next_text(&result);
+        // Core format_next_text output should still work with model fields populated
+        assert!(
+            text.contains("Next Task: FEAT-001 - Task with model"),
+            "Task header should still render"
+        );
+        assert!(
+            text.contains("Priority: 10"),
+            "Priority should still render"
+        );
+        assert!(
+            text.contains("Status:   in_progress"),
+            "Status should still render"
+        );
+        assert!(
+            text.contains("[ ] AC1"),
+            "Acceptance criteria should still render"
+        );
+        assert!(text.contains("src/lib.rs"), "Files should still render");
+    }
+
     #[test]
     fn test_format_next_verbose_output() {
         let result = NextResult {
@@ -737,6 +906,9 @@ mod next_command_tests {
                 notes: None,
                 files: vec![],
                 batch_with: vec![],
+                model: None,
+                difficulty: None,
+                escalation_note: None,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -802,25 +974,8 @@ mod next_command_tests {
 
 #[cfg(test)]
 mod decay_tests {
+    use super::test_helpers::{insert_test_task, setup_test_db};
     use crate::commands::next::decay::{apply_decay, find_decay_warnings};
-    use crate::db::{create_schema, open_connection};
-    use rusqlite::{params, Connection};
-    use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_test_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn test_apply_decay_with_zero_threshold() {

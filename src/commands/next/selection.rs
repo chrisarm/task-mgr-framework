@@ -274,7 +274,9 @@ fn get_todo_tasks(conn: &Connection) -> TaskMgrResult<Vec<Task>> {
         "SELECT id, title, description, priority, status, notes, \
          acceptance_criteria, review_scope, severity, source_review, \
          created_at, updated_at, started_at, completed_at, \
-         last_error, error_count \
+         last_error, error_count, \
+         blocked_at_iteration, skipped_at_iteration, \
+         model, difficulty, escalation_note \
          FROM tasks WHERE status = 'todo' ORDER BY priority ASC",
     )?;
 

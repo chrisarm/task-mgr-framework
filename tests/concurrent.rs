@@ -38,7 +38,12 @@ fn setup_initialized_tempdir() -> TempDir {
 
     let status = Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", prd_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
         .status()
         .expect("Failed to run init");
 

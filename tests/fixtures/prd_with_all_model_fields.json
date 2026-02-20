@@ -1,0 +1,55 @@
+{
+  "branchName": "feature/model-test",
+  "description": "PRD with all model selection fields populated.",
+  "project": "model-test-project",
+  "model": "claude-sonnet-4-6",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "AC-1 for task 1"
+      ],
+      "dependsOn": [],
+      "description": "Task with explicit model override and high difficulty.",
+      "difficulty": "high",
+      "escalationNote": "Needs opus for complex refactor",
+      "id": "MT-001",
+      "model": "claude-opus-4-6",
+      "notes": "Complex task requiring opus.",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Complex refactor task",
+      "touchesFiles": [
+        "src/core.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "AC-1 for task 2",
+        "AC-2 for task 2"
+      ],
+      "dependsOn": [
+        "MT-001"
+      ],
+      "description": "Task with haiku model and low difficulty.",
+      "difficulty": "low",
+      "escalationNote": "Simple task, haiku is fine",
+      "id": "MT-002",
+      "model": "claude-haiku-4-5-20251001",
+      "notes": "Simple formatting task.",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [
+        "MT-001"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Simple formatting fix",
+      "touchesFiles": [
+        "src/format.rs"
+      ]
+    }
+  ]
+}

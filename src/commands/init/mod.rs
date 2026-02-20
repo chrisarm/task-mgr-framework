@@ -70,10 +70,26 @@ fn prefix_id(prefix: &str, id: &str) -> String {
 /// Apply a prefix to all IDs and cross-references in a story.
 fn prefix_story(prefix: &str, story: &mut PrdUserStory) {
     story.id = prefix_id(prefix, &story.id);
-    story.depends_on = story.depends_on.iter().map(|d| prefix_id(prefix, d)).collect();
-    story.synergy_with = story.synergy_with.iter().map(|s| prefix_id(prefix, s)).collect();
-    story.batch_with = story.batch_with.iter().map(|b| prefix_id(prefix, b)).collect();
-    story.conflicts_with = story.conflicts_with.iter().map(|c| prefix_id(prefix, c)).collect();
+    story.depends_on = story
+        .depends_on
+        .iter()
+        .map(|d| prefix_id(prefix, d))
+        .collect();
+    story.synergy_with = story
+        .synergy_with
+        .iter()
+        .map(|s| prefix_id(prefix, s))
+        .collect();
+    story.batch_with = story
+        .batch_with
+        .iter()
+        .map(|b| prefix_id(prefix, b))
+        .collect();
+    story.conflicts_with = story
+        .conflicts_with
+        .iter()
+        .map(|c| prefix_id(prefix, c))
+        .collect();
 }
 
 /// Write an auto-generated `taskPrefix` back to the PRD JSON file.
@@ -82,13 +98,20 @@ fn write_prefix_to_json(json_path: &Path, prefix: &str) -> TaskMgrResult<()> {
     let content = std::fs::read_to_string(json_path).map_err(|e| {
         TaskMgrError::IoError(std::io::Error::new(
             e.kind(),
-            format!("Failed to read {} for prefix write-back: {}", json_path.display(), e),
+            format!(
+                "Failed to read {} for prefix write-back: {}",
+                json_path.display(),
+                e
+            ),
         ))
     })?;
 
     let mut value: serde_json::Value = serde_json::from_str(&content)?;
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("taskPrefix".to_string(), serde_json::Value::String(prefix.to_string()));
+        obj.insert(
+            "taskPrefix".to_string(),
+            serde_json::Value::String(prefix.to_string()),
+        );
     }
 
     let output = serde_json::to_string_pretty(&value)?;
@@ -277,6 +300,7 @@ pub fn init(
                 external_git_repo: prd.external_git_repo.clone(),
                 task_prefix: resolved_prefix.clone().or(prd.task_prefix.clone()),
                 prd_file: prd.prd_file.clone(),
+                model: prd.model.clone(),
             });
         }
 
@@ -292,6 +316,7 @@ pub fn init(
             external_git_repo: None,
             task_prefix: None,
             prd_file: prd.prd_file.clone(),
+            model: None,
         }));
 
         // Collect new stories (with prefix applied)

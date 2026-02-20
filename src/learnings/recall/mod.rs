@@ -25,8 +25,8 @@ use crate::models::{Learning, LearningOutcome};
 use crate::TaskMgrResult;
 
 use super::bandit;
-use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery, ScoredLearning};
 use super::retrieval::patterns::resolve_task_context;
+use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery, ScoredLearning};
 
 /// Parameters for recalling learnings.
 #[derive(Debug, Clone, Default)]

@@ -79,23 +79,20 @@ pub fn spawn_claude(
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: format!(
-                        "spawning Claude subprocess (is '{}' in your PATH?)",
-                        binary
-                    ),
-                    source: e,
-                }
-            } else {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: "spawning Claude subprocess".to_string(),
-                    source: e,
-                }
+        if e.kind() == std::io::ErrorKind::NotFound {
+            TaskMgrError::IoErrorWithContext {
+                file_path: binary.clone(),
+                operation: format!("spawning Claude subprocess (is '{}' in your PATH?)", binary),
+                source: e,
             }
-        })?;
+        } else {
+            TaskMgrError::IoErrorWithContext {
+                file_path: binary.clone(),
+                operation: "spawning Claude subprocess".to_string(),
+                source: e,
+            }
+        }
+    })?;
 
     // Extract PID before starting watchdog — no race condition
     let child_pid = child.id();
@@ -218,7 +215,10 @@ fn watchdog_loop(child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
             }
 
             // Grace period expired — force kill the entire group
-            eprintln!("Grace period expired, sending SIGKILL to process group {}...", child_pid);
+            eprintln!(
+                "Grace period expired, sending SIGKILL to process group {}...",
+                child_pid
+            );
             unsafe {
                 libc::kill(pgid, libc::SIGKILL);
             }
@@ -504,10 +504,16 @@ mod tests {
 
         std::env::remove_var("CLAUDE_BINARY");
 
-        assert!(result.is_ok(), "spawn_claude should not error on signal kill");
+        assert!(
+            result.is_ok(),
+            "spawn_claude should not error on signal kill"
+        );
         let res = result.unwrap();
         // Child was killed by signal, exit code should be 128+SIGTERM or 128+SIGKILL
-        assert_ne!(res.exit_code, 0, "Signal-killed process should have non-zero exit");
+        assert_ne!(
+            res.exit_code, 0,
+            "Signal-killed process should have non-zero exit"
+        );
         // Should complete well under 10s (signal at 500ms + 3s grace max = ~3.5s)
         assert!(
             elapsed.as_secs() < 10,

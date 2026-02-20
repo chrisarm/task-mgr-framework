@@ -219,6 +219,18 @@ pub struct Task {
     /// Global iteration when task was skipped (for decay tracking)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_at_iteration: Option<i64>,
+
+    /// Preferred model for this task (e.g., "claude-opus-4-6")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Difficulty level for this task (e.g., "low", "medium", "high")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+
+    /// Note explaining why this task was escalated to a higher-tier model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_note: Option<String>,
 }
 
 impl Task {
@@ -245,6 +257,9 @@ impl Task {
             error_count: 0,
             blocked_at_iteration: None,
             skipped_at_iteration: None,
+            model: None,
+            difficulty: None,
+            escalation_note: None,
         }
     }
 
@@ -313,6 +328,9 @@ impl TryFrom<&Row<'_>> for Task {
             error_count: row.get("error_count")?,
             blocked_at_iteration: row.get("blocked_at_iteration").ok().flatten(),
             skipped_at_iteration: row.get("skipped_at_iteration").ok().flatten(),
+            model: row.get("model").ok().flatten(),
+            difficulty: row.get("difficulty").ok().flatten(),
+            escalation_note: row.get("escalation_note").ok().flatten(),
         })
     }
 }

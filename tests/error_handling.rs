@@ -38,7 +38,15 @@ fn test_init_with_nonexistent_file() {
     let temp_dir = TempDir::new().unwrap();
     let nonexistent = temp_dir.path().join("does_not_exist.json");
 
-    let result = init::init(temp_dir.path(), &[nonexistent], false, false, false, false, init::PrefixMode::Disabled);
+    let result = init::init(
+        temp_dir.path(),
+        &[nonexistent],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    );
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -65,7 +73,15 @@ fn test_init_with_invalid_json() {
     // Write invalid JSON content
     fs::write(&invalid_json, "{ not valid json }").unwrap();
 
-    let result = init::init(temp_dir.path(), &[invalid_json], false, false, false, false, init::PrefixMode::Disabled);
+    let result = init::init(
+        temp_dir.path(),
+        &[invalid_json],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    );
 
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -409,7 +425,15 @@ fn test_init_duplicate_task_ids_across_files() {
     .unwrap();
 
     // Try to import both files
-    let result = init::init(temp_dir.path(), &[file1, file2], false, false, false, false, init::PrefixMode::Disabled);
+    let result = init::init(
+        temp_dir.path(),
+        &[file1, file2],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    );
 
     assert!(result.is_err());
     let err = result.unwrap_err();

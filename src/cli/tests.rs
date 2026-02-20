@@ -2182,7 +2182,13 @@ fn test_loop_with_all_options() {
 
 #[test]
 fn test_loop_with_no_worktree() {
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--yes", "--no-worktree"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "tasks/prd.json",
+        "--yes",
+        "--no-worktree",
+    ]);
     match cli.command {
         Commands::Loop { no_worktree, .. } => {
             assert!(no_worktree, "--no-worktree should set flag to true");
@@ -2202,13 +2208,8 @@ fn test_loop_with_external_repo() {
         "../restaurant_agent_ex",
     ]);
     match cli.command {
-        Commands::Loop {
-            external_repo, ..
-        } => {
-            assert_eq!(
-                external_repo,
-                Some(PathBuf::from("../restaurant_agent_ex"))
-            );
+        Commands::Loop { external_repo, .. } => {
+            assert_eq!(external_repo, Some(PathBuf::from("../restaurant_agent_ex")));
         }
         _ => panic!("Expected Loop command"),
     }

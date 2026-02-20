@@ -100,8 +100,8 @@ pub fn insert_prd_metadata(
         r#"INSERT OR REPLACE INTO prd_metadata
            (id, project, branch_name, description, priority_philosophy,
             global_acceptance_criteria, review_guidelines, raw_json,
-            external_git_repo, task_prefix, updated_at)
-           VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"#,
+            external_git_repo, task_prefix, default_model, updated_at)
+           VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"#,
         rusqlite::params![
             prd.project,
             prd.branch_name,
@@ -112,6 +112,7 @@ pub fn insert_prd_metadata(
             raw_json,
             prd.external_git_repo,
             prd.task_prefix,
+            prd.model,
         ],
     )?;
 
@@ -140,8 +141,8 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
     conn.execute(
         r#"INSERT INTO tasks
            (id, title, description, priority, status, notes, acceptance_criteria,
-            review_scope, severity, source_review)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            review_scope, severity, source_review, model, difficulty, escalation_note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             story.id,
             story.title,
@@ -153,6 +154,9 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             review_scope,
             story.severity,
             story.source_review,
+            story.model,
+            story.difficulty,
+            story.escalation_note,
         ],
     )?;
 
@@ -222,7 +226,8 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
         r#"UPDATE tasks SET
            title = ?, description = ?, priority = ?, notes = ?,
            acceptance_criteria = ?, review_scope = ?, severity = ?,
-           source_review = ?, updated_at = datetime('now')
+           source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
+           updated_at = datetime('now')
            WHERE id = ?"#,
         rusqlite::params![
             story.title,
@@ -233,6 +238,9 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             review_scope,
             story.severity,
             story.source_review,
+            story.model,
+            story.difficulty,
+            story.escalation_note,
             story.id,
         ],
     )?;

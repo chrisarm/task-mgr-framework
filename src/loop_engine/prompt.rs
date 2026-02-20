@@ -327,6 +327,15 @@ fn build_task_json(
     if let Some(ref notes) = task.notes {
         json["notes"] = serde_json::Value::String(notes.clone());
     }
+    if let Some(ref model) = task.model {
+        json["model"] = serde_json::Value::String(model.clone());
+    }
+    if let Some(ref difficulty) = task.difficulty {
+        json["difficulty"] = serde_json::Value::String(difficulty.clone());
+    }
+    if let Some(ref escalation_note) = task.escalation_note {
+        json["escalationNote"] = serde_json::Value::String(escalation_note.clone());
+    }
     if !task.batch_with.is_empty() {
         json["batchWith"] = serde_json::json!(task.batch_with);
     }
@@ -563,6 +572,9 @@ mod tests {
             notes: None,
             files: vec!["src/lib.rs".to_string()],
             batch_with: vec![],
+            model: None,
+            difficulty: None,
+            escalation_note: None,
             score: ScoreOutput {
                 total: 995,
                 priority: 995,
@@ -1359,6 +1371,9 @@ pub enum ApiError {
             notes: Some("Important: check edge cases".to_string()),
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             batch_with: vec!["FEAT-043".to_string()],
+            model: Some("claude-opus-4-6".to_string()),
+            difficulty: Some("high".to_string()),
+            escalation_note: Some("Complex architectural task".to_string()),
             score: ScoreOutput {
                 total: 1003,
                 priority: 997,
@@ -1409,6 +1424,26 @@ pub enum ApiError {
             json.contains("eligibleBatchTasks"),
             "Should contain eligible batch tasks when non-empty"
         );
+        assert!(
+            json.contains("claude-opus-4-6"),
+            "Should contain model when present"
+        );
+        assert!(
+            json.contains("\"difficulty\""),
+            "Should contain difficulty key when present"
+        );
+        assert!(
+            json.contains("high"),
+            "Should contain difficulty value when present"
+        );
+        assert!(
+            json.contains("escalationNote"),
+            "Should contain escalationNote key when present"
+        );
+        assert!(
+            json.contains("Complex architectural task"),
+            "Should contain escalation note value when present"
+        );
     }
 
     #[test]
@@ -1423,6 +1458,9 @@ pub enum ApiError {
             notes: None,
             files: vec![],
             batch_with: vec![],
+            model: None,
+            difficulty: None,
+            escalation_note: None,
             score: ScoreOutput {
                 total: 999,
                 priority: 999,
@@ -1467,6 +1505,216 @@ pub enum ApiError {
         assert!(
             !json.contains("eligibleBatchTasks"),
             "Should not contain eligibleBatchTasks when empty"
+        );
+        assert!(
+            !json.contains("model"),
+            "Should not contain model key when None"
+        );
+        assert!(
+            !json.contains("difficulty"),
+            "Should not contain difficulty key when None"
+        );
+        assert!(
+            !json.contains("escalationNote"),
+            "Should not contain escalationNote key when None"
+        );
+    }
+
+    // ===== TEST-003: Individual model field tests for build_task_json =====
+
+    /// Helper to create a minimal NextTaskOutput with configurable model fields.
+    fn task_output_with_model_fields(
+        model: Option<&str>,
+        difficulty: Option<&str>,
+        escalation_note: Option<&str>,
+    ) -> NextTaskOutput {
+        NextTaskOutput {
+            id: "TEST-001".to_string(),
+            title: "Test".to_string(),
+            description: None,
+            priority: 10,
+            status: "todo".to_string(),
+            acceptance_criteria: vec![],
+            notes: None,
+            files: vec![],
+            batch_with: vec![],
+            model: model.map(String::from),
+            difficulty: difficulty.map(String::from),
+            escalation_note: escalation_note.map(String::from),
+            score: ScoreOutput {
+                total: 990,
+                priority: 990,
+                file_overlap: 0,
+                synergy: 0,
+                conflict: 0,
+                file_overlap_count: 0,
+                synergy_from: vec![],
+                conflict_from: vec![],
+            },
+        }
+    }
+
+    fn empty_next_result(task: &NextTaskOutput) -> NextResult {
+        NextResult {
+            task: Some(task.clone()),
+            batch_tasks: vec![],
+            learnings: vec![],
+            selection: SelectionMetadata {
+                reason: "test".to_string(),
+                eligible_count: 1,
+            },
+            claim: None,
+            top_candidates: vec![],
+        }
+    }
+
+    #[test]
+    fn test_build_task_json_model_field_only() {
+        let task = task_output_with_model_fields(Some("claude-haiku-4-5-20251001"), None, None);
+        let result = empty_next_result(&task);
+        let json = build_task_json(&task, &result);
+
+        assert!(
+            json.contains("\"model\""),
+            "JSON should contain model key when model is set"
+        );
+        assert!(
+            json.contains("claude-haiku-4-5-20251001"),
+            "JSON should contain model value"
+        );
+        assert!(
+            !json.contains("\"difficulty\""),
+            "JSON should not contain difficulty key when None"
+        );
+        assert!(
+            !json.contains("\"escalationNote\""),
+            "JSON should not contain escalationNote key when None"
+        );
+    }
+
+    #[test]
+    fn test_build_task_json_difficulty_field_only() {
+        let task = task_output_with_model_fields(None, Some("medium"), None);
+        let result = empty_next_result(&task);
+        let json = build_task_json(&task, &result);
+
+        assert!(
+            !json.contains("\"model\""),
+            "JSON should not contain model key when None"
+        );
+        assert!(
+            json.contains("\"difficulty\""),
+            "JSON should contain difficulty key when set"
+        );
+        assert!(
+            json.contains("medium"),
+            "JSON should contain difficulty value"
+        );
+        assert!(
+            !json.contains("\"escalationNote\""),
+            "JSON should not contain escalationNote key when None"
+        );
+    }
+
+    #[test]
+    fn test_build_task_json_escalation_note_field_only() {
+        let task =
+            task_output_with_model_fields(None, None, Some("Needs opus for complex reasoning"));
+        let result = empty_next_result(&task);
+        let json = build_task_json(&task, &result);
+
+        assert!(
+            !json.contains("\"model\""),
+            "JSON should not contain model key when None"
+        );
+        assert!(
+            !json.contains("\"difficulty\""),
+            "JSON should not contain difficulty key when None"
+        );
+        assert!(
+            json.contains("\"escalationNote\""),
+            "JSON key should be camelCase escalationNote"
+        );
+        assert!(
+            json.contains("Needs opus for complex reasoning"),
+            "JSON should contain escalation note value"
+        );
+    }
+
+    // ===== TEST-003: Integration test - prompt with model fields from DB =====
+
+    #[test]
+    fn test_build_prompt_task_json_includes_model_fields() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-001", "Task with model fields", "todo", 5);
+        // Set model fields directly via SQL since insert_task doesn't support them
+        conn.execute(
+            "UPDATE tasks SET model = ?1, difficulty = ?2, escalation_note = ?3 WHERE id = 'MOD-001'",
+            params!["claude-opus-4-6", "high", "Complex multi-file refactor"],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Verify model fields appear in the task JSON block
+        assert!(
+            result.prompt.contains("claude-opus-4-6"),
+            "Prompt JSON should contain model value"
+        );
+        assert!(
+            result.prompt.contains("\"difficulty\""),
+            "Prompt JSON should contain difficulty key"
+        );
+        assert!(
+            result.prompt.contains("high"),
+            "Prompt JSON should contain difficulty value"
+        );
+        assert!(
+            result.prompt.contains("escalationNote"),
+            "Prompt JSON should contain escalationNote key (camelCase)"
+        );
+        assert!(
+            result.prompt.contains("Complex multi-file refactor"),
+            "Prompt JSON should contain escalation note value"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_task_json_omits_model_fields_when_none() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Task without model fields
+        insert_task(&conn, "PLAIN-001", "Plain task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Extract just the JSON block between ```json and ```
+        let json_start = result.prompt.find("```json\n").unwrap() + 8;
+        let json_end = result.prompt[json_start..].find("\n```").unwrap() + json_start;
+        let json_block = &result.prompt[json_start..json_end];
+
+        assert!(
+            !json_block.contains("\"model\""),
+            "JSON should not contain model key when None"
+        );
+        assert!(
+            !json_block.contains("\"difficulty\""),
+            "JSON should not contain difficulty key when None"
+        );
+        assert!(
+            !json_block.contains("\"escalationNote\""),
+            "JSON should not contain escalationNote key when None"
         );
     }
 

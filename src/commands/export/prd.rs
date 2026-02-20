@@ -49,6 +49,12 @@ pub struct ExportedUserStory {
     pub batch_with: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts_with: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_note: Option<String>,
 }
 
 /// JSON structure for the exported PRD file.
@@ -66,6 +72,8 @@ pub struct ExportedPrd {
     pub global_acceptance_criteria: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_guidelines: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub user_stories: Vec<ExportedUserStory>,
 }
 
@@ -77,6 +85,7 @@ pub(crate) struct PrdMetadata {
     pub priority_philosophy: Option<Value>,
     pub global_acceptance_criteria: Option<Value>,
     pub review_guidelines: Option<Value>,
+    pub default_model: Option<String>,
 }
 
 /// Load PRD metadata from the database.
@@ -93,12 +102,14 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
             priority_philosophy: None,
             global_acceptance_criteria: None,
             review_guidelines: None,
+            default_model: None,
         });
     }
 
     conn.query_row(
         r#"SELECT project, branch_name, description,
-           priority_philosophy, global_acceptance_criteria, review_guidelines
+           priority_philosophy, global_acceptance_criteria, review_guidelines,
+           default_model
            FROM prd_metadata WHERE id = 1"#,
         [],
         |row| {
@@ -108,6 +119,7 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
             let priority_str: Option<String> = row.get(3)?;
             let global_str: Option<String> = row.get(4)?;
             let review_str: Option<String> = row.get(5)?;
+            let default_model: Option<String> = row.get(6)?;
 
             // Parse JSON strings back to Values
             let priority_philosophy = priority_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -121,6 +133,7 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
                 priority_philosophy,
                 global_acceptance_criteria,
                 review_guidelines,
+                default_model,
             })
         },
     )
@@ -132,7 +145,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
     // Load all tasks ordered by ID
     let mut stmt = conn.prepare(
         r#"SELECT id, title, description, priority, status, notes,
-           acceptance_criteria, review_scope, severity, source_review
+           acceptance_criteria, review_scope, severity, source_review,
+           model, difficulty, escalation_note
            FROM tasks ORDER BY id"#,
     )?;
 
@@ -147,6 +161,9 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         let review_scope_str: Option<String> = row.get(7)?;
         let severity: Option<String> = row.get(8)?;
         let source_review: Option<String> = row.get(9)?;
+        let model: Option<String> = row.get(10)?;
+        let difficulty: Option<String> = row.get(11)?;
+        let escalation_note: Option<String> = row.get(12)?;
 
         Ok((
             id,
@@ -159,6 +176,9 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             review_scope_str,
             severity,
             source_review,
+            model,
+            difficulty,
+            escalation_note,
         ))
     })?;
 
@@ -182,6 +202,9 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             review_scope_str,
             severity,
             source_review,
+            model,
+            difficulty,
+            escalation_note,
         ) = row?;
 
         // Map status to passes boolean
@@ -229,6 +252,9 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             synergy_with,
             batch_with,
             conflicts_with,
+            model,
+            difficulty,
+            escalation_note,
         });
     }
 

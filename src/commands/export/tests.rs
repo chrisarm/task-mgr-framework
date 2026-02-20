@@ -3,7 +3,7 @@
 use super::*;
 use crate::commands::init;
 use crate::commands::init::PrefixMode;
-use crate::db::create_schema;
+use crate::db::{create_schema, run_migrations};
 use std::fs;
 use tempfile::TempDir;
 
@@ -57,7 +57,16 @@ fn test_export_basic() {
     fs::write(&json_path, create_test_prd()).unwrap();
 
     // Import first
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Export
     let export_path = temp_dir.path().join("exported.json");
@@ -75,7 +84,16 @@ fn test_export_with_progress() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     let result = export(temp_dir.path(), &export_path, true, None).unwrap();
@@ -95,7 +113,16 @@ fn test_export_with_learnings_file() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     let learnings_path = temp_dir.path().join("learnings.json");
@@ -111,7 +138,16 @@ fn test_export_preserves_metadata() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -135,7 +171,16 @@ fn test_export_maps_status_to_passes() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -166,7 +211,16 @@ fn test_export_sorts_arrays_alphabetically() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -189,7 +243,16 @@ fn test_export_tasks_ordered_by_id() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -205,8 +268,9 @@ fn test_export_tasks_ordered_by_id() {
 #[test]
 fn test_export_empty_database() {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     let result = export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -226,7 +290,16 @@ fn test_export_preserves_relationships() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -255,7 +328,16 @@ fn test_export_preserves_acceptance_criteria() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init::init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let export_path = temp_dir.path().join("exported.json");
     export(temp_dir.path(), &export_path, false, None).unwrap();
@@ -354,4 +436,182 @@ fn test_calculate_statistics() {
     assert_eq!(stats.pending_tasks, 1);
     assert_eq!(stats.blocked_tasks, 1);
     assert!((stats.completion_percentage - 33.333).abs() < 0.01);
+}
+
+// ============================================================================
+// Model selection round-trip tests (parse -> import -> export)
+// ============================================================================
+
+#[test]
+fn test_round_trip_preserves_model_fields() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "round-trip-test",
+        "model": "claude-sonnet-4-6",
+        "userStories": [
+            {
+                "id": "US-001",
+                "title": "Task with model",
+                "priority": 1,
+                "passes": false,
+                "model": "claude-opus-4-6",
+                "difficulty": "high",
+                "escalationNote": "Bumped after compile failure"
+            },
+            {
+                "id": "US-002",
+                "title": "Task without model",
+                "priority": 2,
+                "passes": false
+            }
+        ]
+    }"#;
+
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, json).unwrap();
+
+    // Import
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Export
+    let export_path = temp_dir.path().join("exported.json");
+    export(temp_dir.path(), &export_path, false, None).unwrap();
+
+    // Re-parse exported JSON
+    let exported_json = fs::read_to_string(&export_path).unwrap();
+    let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
+
+    // Verify PRD-level model preserved
+    assert_eq!(
+        exported.model,
+        Some("claude-sonnet-4-6".to_string()),
+        "model should survive round-trip"
+    );
+
+    // Verify US-001 model fields preserved
+    let us001 = exported
+        .user_stories
+        .iter()
+        .find(|s| s.id == "US-001")
+        .expect("US-001 should be exported");
+    assert_eq!(us001.model, Some("claude-opus-4-6".to_string()));
+    assert_eq!(us001.difficulty, Some("high".to_string()));
+    assert_eq!(
+        us001.escalation_note,
+        Some("Bumped after compile failure".to_string())
+    );
+
+    // Verify US-002 has None for model fields
+    let us002 = exported
+        .user_stories
+        .iter()
+        .find(|s| s.id == "US-002")
+        .expect("US-002 should be exported");
+    assert_eq!(us002.model, None);
+    assert_eq!(us002.difficulty, None);
+    assert_eq!(us002.escalation_note, None);
+}
+
+#[test]
+fn test_round_trip_model_fields_omitted_from_json_when_none() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "omission-test",
+        "userStories": [
+            {"id": "US-001", "title": "Plain task", "priority": 1, "passes": false}
+        ]
+    }"#;
+
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, json).unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let export_path = temp_dir.path().join("exported.json");
+    export(temp_dir.path(), &export_path, false, None).unwrap();
+
+    // Verify that None fields are omitted from JSON output (skip_serializing_if)
+    let exported_json = fs::read_to_string(&export_path).unwrap();
+    assert!(
+        !exported_json.contains("\"model\""),
+        "model:null should be omitted from JSON"
+    );
+    assert!(
+        !exported_json.contains("\"difficulty\""),
+        "difficulty:null should be omitted from JSON"
+    );
+    assert!(
+        !exported_json.contains("\"escalationNote\""),
+        "escalationNote:null should be omitted from JSON"
+    );
+    assert!(
+        !exported_json.contains("\"defaultModel\""),
+        "defaultModel:null should be omitted from JSON"
+    );
+}
+
+#[test]
+fn test_export_preserves_model_fields_in_json_format() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "json-format-test",
+        "model": "claude-haiku-4-5-20251001",
+        "userStories": [
+            {
+                "id": "US-001",
+                "title": "Formatted task",
+                "priority": 1,
+                "passes": false,
+                "model": "claude-sonnet-4-6",
+                "difficulty": "medium",
+                "escalationNote": "Test note"
+            }
+        ]
+    }"#;
+
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, json).unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let export_path = temp_dir.path().join("exported.json");
+    export(temp_dir.path(), &export_path, false, None).unwrap();
+
+    // Verify JSON uses camelCase keys (from serde rename_all)
+    let exported_json = fs::read_to_string(&export_path).unwrap();
+    assert!(
+        exported_json.contains("\"escalationNote\""),
+        "exported JSON should use camelCase escalationNote"
+    );
+    assert!(
+        exported_json.contains("\"model\""),
+        "exported JSON should contain model field"
+    );
 }

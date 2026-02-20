@@ -69,6 +69,15 @@ pub struct NextTaskOutput {
     pub files: Vec<String>,
     /// Task IDs in batchWith relationship
     pub batch_with: Vec<String>,
+    /// Preferred model for this task (e.g., "claude-opus-4-6")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Difficulty level for this task (e.g., "low", "medium", "high")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    /// Note explaining why this task was escalated to a higher-tier model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_note: Option<String>,
     /// Score breakdown for transparency
     pub score: ScoreOutput,
 }
@@ -190,16 +199,10 @@ pub fn build_task_output(scored_task: &ScoredTask, claimed: bool) -> NextTaskOut
         notes: scored_task.task.notes.clone(),
         files: scored_task.files.clone(),
         batch_with: scored_task.batch_with.clone(),
-        score: ScoreOutput {
-            total: scored_task.total_score,
-            priority: scored_task.score_breakdown.priority_score,
-            file_overlap: scored_task.score_breakdown.file_score,
-            synergy: scored_task.score_breakdown.synergy_score,
-            conflict: scored_task.score_breakdown.conflict_score,
-            file_overlap_count: scored_task.score_breakdown.file_overlap_count,
-            synergy_from: scored_task.score_breakdown.synergy_from.clone(),
-            conflict_from: scored_task.score_breakdown.conflict_from.clone(),
-        },
+        model: scored_task.task.model.clone(),
+        difficulty: scored_task.task.difficulty.clone(),
+        escalation_note: scored_task.task.escalation_note.clone(),
+        score: ScoreOutput::from(&scored_task.score_breakdown),
     }
 }
 

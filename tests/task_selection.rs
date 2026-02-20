@@ -108,7 +108,16 @@ fn test_highest_priority_task_selected_when_no_other_factors() {
     fs::write(&prd_path, prd_content).unwrap();
 
     // Import the PRD
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Select next task without any after_files
     let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
@@ -157,7 +166,16 @@ fn test_file_overlap_boosts_task_selection() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Pass after_files that overlap with TASK-002
     // TASK-001: priority score = 990, file overlap = 0, total = 990
@@ -219,7 +237,16 @@ fn test_dependencies_block_task_selection_until_satisfied() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // First selection: TASK-002 has higher priority but is blocked by dependency
     let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
@@ -268,7 +295,16 @@ fn test_dependencies_satisfied_by_done_status() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // TASK-002 should be selected since TASK-001 is done
     let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
@@ -317,7 +353,16 @@ fn test_dependencies_satisfied_by_completing_task() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // First, complete TASK-001 (use force=true since task is in todo status after import)
     let mut conn = open_connection(temp_dir.path()).unwrap();
@@ -342,7 +387,16 @@ fn test_synergy_bonus_from_recently_completed_tasks() {
     // TASK-001 has synergy with TASK-002, and TASK-002 has synergy with TASK-001 and TASK-003
     let prd_path = sample_prd_path();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // In sample PRD:
     // - TASK-001 is done (passes: true)
@@ -409,7 +463,16 @@ fn test_conflict_penalty_from_recently_completed_tasks() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Note: The current next() implementation doesn't pass recently_completed from
     // the select_next_task call. The conflict scoring only works with explicit
@@ -495,7 +558,16 @@ fn test_conflict_penalty_changes_selection() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // With recently_completed = ["TASK-001"]:
     // TASK-002: 986 - 5 = 981
@@ -522,7 +594,16 @@ fn test_batch_tasks_included_in_output() {
     // TASK-003 and TASK-004 have batchWith relationship to each other
     let prd_path = sample_prd_path();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // TASK-003 depends on TASK-002 which is done (passes: true)
     // TASK-003 has batchWith: ["TASK-004"]
@@ -591,7 +672,16 @@ fn test_batch_tasks_excludes_completed_tasks() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
 
@@ -629,7 +719,16 @@ fn test_all_tasks_done_returns_no_task() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
 
@@ -676,7 +775,16 @@ fn test_all_tasks_blocked_returns_no_task() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Set TASK-001 to 'blocked' status - this means TASK-002's dependency won't be satisfied
     // and TASK-001 itself is not eligible (not 'todo')
@@ -742,7 +850,16 @@ fn test_combined_scoring_factors() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // With after_files and recently_completed:
     // TASK-002: 990 + 0 + 0 = 990
@@ -789,7 +906,16 @@ fn test_next_with_claim_updates_status() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Select with --claim
     let result = next::next(temp_dir.path(), &[], true, None, false).unwrap();
@@ -830,7 +956,16 @@ fn test_verbose_output_includes_top_candidates() {
     let prd_path = temp_dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_content).unwrap();
 
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Select with verbose=true
     let result = next::next(temp_dir.path(), &[], false, None, true).unwrap();

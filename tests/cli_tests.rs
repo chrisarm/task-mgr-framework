@@ -34,7 +34,12 @@ fn setup_initialized_tempdir() -> TempDir {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", prd_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -79,7 +84,12 @@ fn test_init_from_json() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", prd_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
         .assert()
         .success()
         // Output is "Initialized: 7 tasks, 14 files, 16 relationships"
@@ -98,7 +108,12 @@ fn test_init_creates_database() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", prd_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
@@ -321,7 +336,12 @@ fn test_init_nonexistent_file_returns_error() {
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", "/nonexistent/path/to/file.json"])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            "/nonexistent/path/to/file.json",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error").or(predicate::str::contains("No such file")));
@@ -428,7 +448,12 @@ fn test_database_isolation() {
     for temp_dir in [&temp_dir1, &temp_dir2] {
         Command::new(cargo_bin("task-mgr"))
             .args(["--dir", temp_dir.path().to_str().unwrap()])
-            .args(["init", "--no-prefix", "--from-json", prd_path.to_str().unwrap()])
+            .args([
+                "init",
+                "--no-prefix",
+                "--from-json",
+                prd_path.to_str().unwrap(),
+            ])
             .assert()
             .success();
     }
@@ -511,7 +536,12 @@ fn test_export_roundtrip() {
     let temp_dir2 = TempDir::new().unwrap();
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir2.path().to_str().unwrap()])
-        .args(["init", "--no-prefix", "--from-json", export_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            export_path.to_str().unwrap(),
+        ])
         .assert()
         .success();
 

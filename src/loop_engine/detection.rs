@@ -973,7 +973,8 @@ mod tests {
 
     #[test]
     fn test_already_complete_with_full_task_id() {
-        let output = "This task (`a3e1b7c9-TEST-003`) is already complete.\nNo further work needed.";
+        let output =
+            "This task (`a3e1b7c9-TEST-003`) is already complete.\nNo further work needed.";
         assert!(is_task_reported_already_complete(
             output,
             "a3e1b7c9-TEST-003",

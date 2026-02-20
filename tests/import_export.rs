@@ -36,8 +36,16 @@ fn test_import_export_round_trip() {
     let original: Value = serde_json::from_str(&original_json).unwrap();
 
     // Import the PRD
-    let init_result =
-        init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    let init_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     assert!(
         init_result.tasks_imported > 0,
         "Should import at least one task"
@@ -127,7 +135,16 @@ fn test_import_modify_export() {
         .expect("Task should have an id");
 
     // Import the PRD
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Complete the task (use force=true since task is in todo status after import)
     let mut conn = open_connection(temp_dir.path()).unwrap();
@@ -176,8 +193,16 @@ fn test_import_with_force_replaces_data() {
     let prd_path = sample_prd_path();
 
     // First import
-    let first_result =
-        init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    let first_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     assert!(first_result.tasks_imported > 0);
 
     // Modify a task in the database
@@ -190,8 +215,16 @@ fn test_import_with_force_replaces_data() {
     drop(conn);
 
     // Re-import with --force
-    let force_result =
-        init::init(temp_dir.path(), &[&prd_path], true, false, false, false, init::PrefixMode::Disabled).unwrap();
+    let force_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        true,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     assert!(
         force_result.fresh_import,
         "--force should result in fresh import"
@@ -218,7 +251,16 @@ fn test_export_sorts_arrays_deterministically() {
     let prd_path = sample_prd_path();
 
     // Import
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Export twice
     let export_path1 = temp_dir.path().join("export1.json");
@@ -248,7 +290,16 @@ fn test_relationships_preserved_in_round_trip() {
     let original: Value = serde_json::from_str(&original_json).unwrap();
 
     // Import and export
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     let export_path = temp_dir.path().join("exported.json");
     export::export(temp_dir.path(), &export_path, false, None).unwrap();
 
@@ -347,7 +398,16 @@ fn test_touches_files_preserved_in_round_trip() {
     let original: Value = serde_json::from_str(&original_json).unwrap();
 
     // Import and export
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     let export_path = temp_dir.path().join("exported.json");
     export::export(temp_dir.path(), &export_path, false, None).unwrap();
 
@@ -404,7 +464,16 @@ fn test_acceptance_criteria_preserved_in_round_trip() {
     let original: Value = serde_json::from_str(&original_json).unwrap();
 
     // Import and export
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     let export_path = temp_dir.path().join("exported.json");
     export::export(temp_dir.path(), &export_path, false, None).unwrap();
 

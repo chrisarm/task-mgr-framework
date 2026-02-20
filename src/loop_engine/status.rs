@@ -275,10 +275,7 @@ fn query_pending_tasks(
 /// or `("", None)` when no filtering is needed.
 fn prefix_filter(task_prefix: Option<&str>) -> (String, Option<String>) {
     match task_prefix {
-        Some(prefix) => (
-            "WHERE id LIKE ?".to_string(),
-            Some(format!("{}-%", prefix)),
-        ),
+        Some(prefix) => ("WHERE id LIKE ?".to_string(), Some(format!("{}-%", prefix))),
         None => (String::new(), None),
     }
 }

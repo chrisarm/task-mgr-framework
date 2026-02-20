@@ -43,8 +43,16 @@ fn test_full_loop_cycle() {
     let prd_path = sample_prd_path();
 
     // Step 1: Initialize from PRD
-    let init_result =
-        init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    let init_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     assert!(init_result.tasks_imported > 0, "Should import tasks");
 
     // Step 2: Begin a run
@@ -129,7 +137,16 @@ fn test_failure_flow_with_learning() {
     let prd_path = sample_prd_path();
 
     // Initialize and begin a run
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let begin_result = begin(&conn).unwrap();
@@ -223,7 +240,16 @@ fn test_doctor_fixes_stale_after_crash() {
     let prd_path = sample_prd_path();
 
     // Initialize
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Begin a run
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -309,7 +335,16 @@ fn test_crash_recovery_via_export() {
     let prd_path = sample_prd_path();
 
     // Initialize and begin a run
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let begin_result = begin(&conn).unwrap();
@@ -394,7 +429,16 @@ fn test_multiple_iterations_respect_dependencies() {
     let prd_path = sample_prd_path();
 
     // Initialize
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Begin a run
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -487,7 +531,16 @@ fn test_doctor_dry_run() {
     let prd_path = sample_prd_path();
 
     // Initialize
-    init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Begin a run and claim a task
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -555,8 +608,16 @@ fn test_full_feedback_loop_lifecycle() {
     let prd_path = test_loop_prd_path();
 
     // Step 1: Initialize from test PRD
-    let init_result =
-        init::init(temp_dir.path(), &[&prd_path], false, false, false, false, init::PrefixMode::Disabled).unwrap();
+    let init_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
     assert_eq!(init_result.tasks_imported, 3, "Should import 3 tasks");
 
     // Step 2: Insert learnings that will be recalled during prompt building

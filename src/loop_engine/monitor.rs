@@ -124,7 +124,12 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>) {
 fn print_status_change(status: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
     let files: Vec<&str> = status.lines().filter(|l| !l.is_empty()).collect();
-    eprintln!("[monitor {}] {} file(s) changed: {}", ts, files.len(), files.join(", "));
+    eprintln!(
+        "[monitor {}] {} file(s) changed: {}",
+        ts,
+        files.len(),
+        files.join(", ")
+    );
 }
 
 #[cfg(test)]

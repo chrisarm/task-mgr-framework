@@ -345,14 +345,14 @@ pub fn run_iteration(
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
     let monitor_handle = monitor::start_monitor(project_root);
-    let claude_result = claude::spawn_claude(&prompt_result.prompt, Some(signal_flag), Some(project_root));
+    let claude_result =
+        claude::spawn_claude(&prompt_result.prompt, Some(signal_flag), Some(project_root));
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
 
     // Step 7: Analyze output
     let claude_output = claude_result.output;
-    let outcome =
-        detection::analyze_output(&claude_output, claude_result.exit_code, project_root);
+    let outcome = detection::analyze_output(&claude_output, claude_result.exit_code, project_root);
 
     // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
     if outcome == IterationOutcome::RateLimit && usage_params.enabled {
@@ -382,7 +382,10 @@ pub fn run_iteration(
             Some(run_id),
         ) {
             Ok(r) if r.learnings_extracted > 0 => {
-                eprintln!("Extracted {} learning(s) from output", r.learnings_extracted);
+                eprintln!(
+                    "Extracted {} learning(s) from output",
+                    r.learnings_extracted
+                );
             }
             Ok(_) => {}
             Err(e) => eprintln!("Warning: learning extraction failed: {}", e),
@@ -623,11 +626,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let working_root = if let Some(ref branch) = branch_name {
         if run_config.config.use_worktrees {
             // Create or reuse worktree for this branch
-            match env::ensure_worktree(
-                &run_config.source_root,
-                branch,
-                run_config.config.yes_mode,
-            ) {
+            match env::ensure_worktree(&run_config.source_root, branch, run_config.config.yes_mode)
+            {
                 Ok(wt_path) => wt_path,
                 Err(e) => {
                     eprintln!("Error setting up worktree: {}", e);
@@ -835,7 +835,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         // Check git for task completion: if recent commit contains task ID, mark done
         if let Some(ref task_id) = result.task_id {
             if !matches!(result.outcome, IterationOutcome::Empty) {
-                if let Some(commit_hash) = check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref()) {
+                if let Some(commit_hash) =
+                    check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref())
+                {
                     // Mark task done in DB
                     let task_ids = [task_id.clone()];
                     match complete_cmd::complete(
@@ -853,8 +855,16 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                             result.outcome = IterationOutcome::Completed;
 
                             // Update PRD JSON to set passes: true
-                            if let Err(e) = update_prd_task_passes(&paths.prd_file, task_id, true, task_prefix.as_deref()) {
-                                eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
+                            if let Err(e) = update_prd_task_passes(
+                                &paths.prd_file,
+                                task_id,
+                                true,
+                                task_prefix.as_deref(),
+                            ) {
+                                eprintln!(
+                                    "Warning: failed to update PRD for task {}: {}",
+                                    task_id, e
+                                );
                             } else {
                                 eprintln!(
                                     "Task {} completed (commit {})",
@@ -864,15 +874,21 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to mark task {} as done in DB: {}", task_id, e);
+                            eprintln!(
+                                "Warning: failed to mark task {} as done in DB: {}",
+                                task_id, e
+                            );
                         }
                     }
                 } else {
                     // Fallback: scan Claude's output for ANY completed task IDs.
                     // Claude may complete the claimed task or others in a single iteration,
                     // and commits happen in a different repo (e.g. restaurant_agent_ex/).
-                    let completed_ids =
-                        scan_output_for_completed_tasks(&result.output, &conn, task_prefix.as_deref());
+                    let completed_ids = scan_output_for_completed_tasks(
+                        &result.output,
+                        &conn,
+                        task_prefix.as_deref(),
+                    );
                     for completed_id in &completed_ids {
                         let ids = [completed_id.clone()];
                         match complete_cmd::complete(
@@ -893,9 +909,12 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                                 // Override outcome so stale tracker resets — task was actually completed
                                 result.outcome = IterationOutcome::Completed;
 
-                                if let Err(e) =
-                                    update_prd_task_passes(&paths.prd_file, completed_id, true, task_prefix.as_deref())
-                                {
+                                if let Err(e) = update_prd_task_passes(
+                                    &paths.prd_file,
+                                    completed_id,
+                                    true,
+                                    task_prefix.as_deref(),
+                                ) {
                                     eprintln!(
                                         "Warning: failed to update PRD for task {}: {}",
                                         completed_id, e
@@ -919,25 +938,25 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
                 // Final fallback: Claude reports the task as "already complete" without committing.
                 // This catches tasks completed in a prior run where the DB was never updated.
-                if !matches!(result.outcome, IterationOutcome::Completed) {
-                    if detection::is_task_reported_already_complete(
+                if !matches!(result.outcome, IterationOutcome::Completed)
+                    && detection::is_task_reported_already_complete(
                         &result.output,
                         task_id,
                         task_prefix.as_deref(),
+                    )
+                {
+                    if let Ok(()) = mark_task_done(
+                        &mut conn,
+                        task_id,
+                        &run_id,
+                        None,
+                        &paths.prd_file,
+                        task_prefix.as_deref(),
                     ) {
-                        if let Ok(()) = mark_task_done(
-                            &mut conn,
-                            task_id,
-                            &run_id,
-                            None,
-                            &paths.prd_file,
-                            task_prefix.as_deref(),
-                        ) {
-                            last_claimed_task = None;
-                            tasks_completed += 1;
-                            result.outcome = IterationOutcome::Completed;
-                            eprintln!("Task {} completed (reported as already done)", task_id);
-                        }
+                        last_claimed_task = None;
+                        tasks_completed += 1;
+                        result.outcome = IterationOutcome::Completed;
+                        eprintln!("Task {} completed (reported as already done)", task_id);
                     }
                 }
             }
@@ -1254,13 +1273,12 @@ fn update_prd_task_passes(
     use std::fs;
 
     // Read the PRD file
-    let content = fs::read_to_string(prd_path).map_err(|e| {
-        crate::TaskMgrError::IoErrorWithContext {
+    let content =
+        fs::read_to_string(prd_path).map_err(|e| crate::TaskMgrError::IoErrorWithContext {
             file_path: prd_path.display().to_string(),
             operation: "reading PRD file".to_string(),
             source: e,
-        }
-    })?;
+        })?;
 
     // Parse as generic JSON Value to preserve structure
     let mut prd: serde_json::Value = serde_json::from_str(&content)?;
@@ -1338,10 +1356,11 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
     use std::fs;
 
     // Get all todo/in_progress task IDs from the DB
-    let mut stmt = match conn.prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')") {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let mut stmt =
+        match conn.prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
     let candidate_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))
         .ok()
@@ -1377,17 +1396,14 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
     for task_id in &candidate_ids {
         let base_id = strip_task_prefix(task_id, task_prefix);
         if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
-            match conn.execute(
+            if let Ok(1) = conn.execute(
                 "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
                 [task_id.as_str()],
             ) {
-                Ok(1) => {
-                    eprintln!(
-                        "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
-                        task_id
-                    );
-                }
-                _ => {}
+                eprintln!(
+                    "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
+                    task_id
+                );
             }
         }
     }
@@ -1445,12 +1461,11 @@ fn scan_output_for_completed_tasks(
     let mut completed = Vec::new();
 
     // Query all non-done task IDs
-    let mut stmt = match conn.prepare(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-    ) {
-        Ok(s) => s,
-        Err(_) => return completed,
-    };
+    let mut stmt =
+        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
+            Ok(s) => s,
+            Err(_) => return completed,
+        };
 
     let task_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))
@@ -1524,15 +1539,14 @@ fn reconcile_external_git_completions(
     let commit_lines_upper = output.to_uppercase();
 
     // Query all incomplete task IDs
-    let mut stmt = match conn.prepare(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-            return 0;
-        }
-    };
+    let mut stmt =
+        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+                return 0;
+            }
+        };
 
     let task_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))
@@ -1556,8 +1570,8 @@ fn reconcile_external_git_completions(
                 conn,
                 &ids,
                 Some(run_id),
-                None,  // no specific commit hash from oneline
-                true,  // force: allow any status → done
+                None, // no specific commit hash from oneline
+                true, // force: allow any status → done
             ) {
                 // Likely already done or invalid transition — skip silently
                 if run_id.is_empty() {
@@ -1574,7 +1588,10 @@ fn reconcile_external_git_completions(
                 );
             }
 
-            eprintln!("Reconciled task {} (found in external repo commits)", task_id);
+            eprintln!(
+                "Reconciled task {} (found in external repo commits)",
+                task_id
+            );
             reconciled += 1;
         }
     }
@@ -1788,7 +1805,8 @@ mod tests {
 
     #[test]
     fn test_check_output_finds_task_id_in_brackets() {
-        let output = "Some output\nfeat: [FEAT-005] Implement Tool Declarations module\nMore output";
+        let output =
+            "Some output\nfeat: [FEAT-005] Implement Tool Declarations module\nMore output";
         assert!(check_output_for_task_completion(output, "FEAT-005", None));
     }
 
@@ -1885,7 +1903,10 @@ mod tests {
         git_commit(temp_dir.path(), "feat: unrelated commit");
 
         let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None);
-        assert!(result.is_none(), "Should return None when task ID not in commit");
+        assert!(
+            result.is_none(),
+            "Should return None when task ID not in commit"
+        );
     }
 
     #[test]
@@ -1897,7 +1918,10 @@ mod tests {
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.len(), 40, "Should return full commit hash");
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "Hash should be hex");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should be hex"
+        );
     }
 
     #[test]
@@ -1909,7 +1933,10 @@ mod tests {
         git_commit(temp_dir.path(), "chore: update lockfile");
 
         let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
-        assert!(result.is_some(), "Should find task ID in earlier commit (not just HEAD)");
+        assert!(
+            result.is_some(),
+            "Should find task ID in earlier commit (not just HEAD)"
+        );
     }
 
     #[test]
@@ -1917,7 +1944,12 @@ mod tests {
         // Task ID may appear in commit body, not just subject
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "feat: implement tests\n\nCompletes TASK-001 acceptance criteria"])
+            .args([
+                "commit",
+                "--allow-empty",
+                "-m",
+                "feat: implement tests\n\nCompletes TASK-001 acceptance criteria",
+            ])
             .current_dir(temp_dir.path())
             .output()
             .expect("create commit with body");
@@ -2064,11 +2096,7 @@ mod tests {
         let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
-        std::fs::write(
-            &prd_path,
-            r#"{"project":"test","userStories":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(&prd_path, r#"{"project":"test","userStories":[]}"#).unwrap();
 
         let count = reconcile_external_git_completions(
             Path::new("/nonexistent/repo"),
@@ -2217,7 +2245,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(count, 0, "No matching commits should mean no reconciliation");
+        assert_eq!(
+            count, 0,
+            "No matching commits should mean no reconciliation"
+        );
     }
 
     // --- startup recovery tests ---
@@ -2338,7 +2369,10 @@ mod tests {
         let hash1 = hash_file(&path);
         let hash2 = hash_file(&path);
         assert_eq!(hash1, hash2, "Same content should produce same hash");
-        assert!(!hash1.is_empty(), "Hash should not be empty for readable file");
+        assert!(
+            !hash1.is_empty(),
+            "Hash should not be empty for readable file"
+        );
     }
 
     #[test]
@@ -2352,7 +2386,10 @@ mod tests {
         std::fs::write(&path, r#"{"tasks": [1, 2, 3]}"#).unwrap();
         let hash_after = hash_file(&path);
 
-        assert_ne!(hash_before, hash_after, "Different content should produce different hash");
+        assert_ne!(
+            hash_before, hash_after,
+            "Different content should produce different hash"
+        );
     }
 
     #[test]
@@ -2429,7 +2466,10 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: P3-FEAT-001 Implement CallSupervisor");
+        git_commit(
+            ext_repo.path(),
+            "feat: P3-FEAT-001 Implement CallSupervisor",
+        );
         git_commit(ext_repo.path(), "feat: P3-FEAT-002 Implement CallActor");
         git_commit(ext_repo.path(), "feat: P3-FEAT-003 Implement BargeIn");
 
@@ -2532,7 +2572,11 @@ mod tests {
         let output = "Completed [FEAT-001] and [FEAT-002]";
         let completed = scan_output_for_completed_tasks(output, &conn, None);
 
-        assert_eq!(completed.len(), 1, "Should only find FEAT-002, not already-done FEAT-001");
+        assert_eq!(
+            completed.len(),
+            1,
+            "Should only find FEAT-002, not already-done FEAT-001"
+        );
         assert_eq!(completed[0], "FEAT-002");
     }
 
@@ -2550,10 +2594,7 @@ mod tests {
 
     #[test]
     fn test_strip_task_prefix_with_human_prefix() {
-        assert_eq!(
-            strip_task_prefix("P5.1-FIX-001", Some("P5.1")),
-            "FIX-001"
-        );
+        assert_eq!(strip_task_prefix("P5.1-FIX-001", Some("P5.1")), "FIX-001");
     }
 
     #[test]
@@ -2608,7 +2649,10 @@ mod tests {
             Some("aeb10a1f"),
         );
 
-        assert_eq!(count, 1, "Should match base ID FIX-001 in commit even though DB has aeb10a1f-FIX-001");
+        assert_eq!(
+            count, 1,
+            "Should match base ID FIX-001 in commit even though DB has aeb10a1f-FIX-001"
+        );
 
         // Verify task is done
         let status: String = conn
@@ -2692,11 +2736,8 @@ mod tests {
         let repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(repo.path(), "feat: FIX-001 implement feature");
 
-        let result = check_git_for_task_completion(
-            repo.path(),
-            "aeb10a1f-FIX-001",
-            Some("aeb10a1f"),
-        );
+        let result =
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"));
         assert!(result.is_some(), "Should match base ID FIX-001 in commit");
     }
 
@@ -2718,7 +2759,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&prd_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["userStories"][0]["passes"], true, "Should update via base ID fallback");
+        assert_eq!(
+            parsed["userStories"][0]["passes"], true,
+            "Should update via base ID fallback"
+        );
     }
 
     #[test]
@@ -2742,15 +2786,24 @@ mod tests {
 
         // First stale
         ctx.stale_tracker.check("stale", "stale");
-        assert!(!ctx.stale_tracker.should_abort(), "1 stale should not abort");
+        assert!(
+            !ctx.stale_tracker.should_abort(),
+            "1 stale should not abort"
+        );
 
         // Second stale
         ctx.stale_tracker.check("stale", "stale");
-        assert!(!ctx.stale_tracker.should_abort(), "2 stale should not abort");
+        assert!(
+            !ctx.stale_tracker.should_abort(),
+            "2 stale should not abort"
+        );
 
         // Third stale
         ctx.stale_tracker.check("stale", "stale");
-        assert!(ctx.stale_tracker.should_abort(), "3 consecutive stale should abort");
+        assert!(
+            ctx.stale_tracker.should_abort(),
+            "3 consecutive stale should abort"
+        );
     }
 
     #[test]
@@ -2765,7 +2818,11 @@ mod tests {
 
         // Non-stale resets
         ctx.stale_tracker.check("a", "b");
-        assert_eq!(ctx.stale_tracker.count(), 0, "Non-stale outcome should reset tracker");
+        assert_eq!(
+            ctx.stale_tracker.count(),
+            0,
+            "Non-stale outcome should reset tracker"
+        );
         assert!(!ctx.stale_tracker.should_abort());
 
         // One more stale — not enough to abort
@@ -2818,7 +2875,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(blocked_status, "blocked", "Blocked task should be unaffected");
+        assert_eq!(
+            blocked_status, "blocked",
+            "Blocked task should be unaffected"
+        );
 
         let done_status: String = conn
             .query_row(

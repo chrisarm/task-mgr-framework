@@ -111,9 +111,24 @@ fn test_recall_with_text_query() {
 fn test_recall_with_outcome_filter() {
     let (_temp_dir, conn) = setup_db();
 
-    create_test_learning(&conn, "Failure 1", "Content about failure", LearningOutcome::Failure);
-    create_test_learning(&conn, "Success 1", "Content about success", LearningOutcome::Success);
-    create_test_learning(&conn, "Failure 2", "Another failure story", LearningOutcome::Failure);
+    create_test_learning(
+        &conn,
+        "Failure 1",
+        "Content about failure",
+        LearningOutcome::Failure,
+    );
+    create_test_learning(
+        &conn,
+        "Success 1",
+        "Content about success",
+        LearningOutcome::Success,
+    );
+    create_test_learning(
+        &conn,
+        "Failure 2",
+        "Another failure story",
+        LearningOutcome::Failure,
+    );
 
     let params = RecallParams {
         query: Some("Content".to_string()),
@@ -208,7 +223,12 @@ fn test_recall_with_limit() {
 fn test_recall_updates_times_shown() {
     let (_temp_dir, conn) = setup_db();
 
-    let learning_id = create_test_learning(&conn, "Test search target", "Searchable content", LearningOutcome::Pattern);
+    let learning_id = create_test_learning(
+        &conn,
+        "Test search target",
+        "Searchable content",
+        LearningOutcome::Pattern,
+    );
 
     // Verify initial times_shown is 0
     let initial: i32 = conn
@@ -689,12 +709,7 @@ fn test_rerank_preserves_relevance_tiers() {
     record_learning(&conn, params).unwrap();
 
     // Create a fallback learning (will get relevance = 0.1)
-    create_test_learning(
-        &conn,
-        "Fallback",
-        "Low relevance",
-        LearningOutcome::Pattern,
-    );
+    create_test_learning(&conn, "Fallback", "Low relevance", LearningOutcome::Pattern);
 
     let recall_params = RecallParams {
         for_task: Some("US-001".to_string()),

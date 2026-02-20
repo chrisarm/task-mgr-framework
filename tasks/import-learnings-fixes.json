@@ -1,0 +1,634 @@
+{
+  "branchName": "fix/import-learnings-bugs",
+  "description": "Fix 5 bugs in import-learnings: no-op --reset-stats, no-op --learnings-only, missing transaction, task_id FK violation, unnecessary MD5 dedup.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases. Tests verify boundaries work correctly",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works according to the plan",
+      "3. CORRECTNESS - Code compiles, type-checks, passes all tests deterministically",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings",
+      "5. POLISH - Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Ship solid working code first, then use tests to improve it",
+      "Test the boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "3c39387a",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "test_import_does_not_carry_task_id: Import learning with task_id='NONEXISTENT-001', verify DB has task_id IS NULL",
+        "test_import_preserves_stats_when_no_reset: Import learning with times_shown=10, times_applied=5, last_shown_at/last_applied_at set; import with reset_stats=false; verify all 4 fields preserved in DB",
+        "test_import_deduplicates_within_batch: Import file with two identical title+content learnings; assert 1 imported, 1 skipped",
+        "test_import_atomicity_all_or_nothing: Import batch of 3 learnings in a transaction; verify all 3 appear in DB after success",
+        "test_format_text_stats_preserved: ImportLearningsResult with stats_reset=false, learnings_imported=3; assert output contains 'preserved from export'",
+        "test_format_text_stats_reset: ImportLearningsResult with stats_reset=true; assert output contains 'reset to zero'",
+        "Tests compile (may use #[ignore] or be expected to fail until implementation)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write failing tests BEFORE implementation for all 5 bug fixes: task_id FK nullification, stats preservation, within-batch dedup, transaction atomicity, and dedup key rename. Tests should define expected behavior for the fixed code.",
+      "edgeCases": [
+        "Learning with task_id referencing non-existent task: must set task_id to None",
+        "last_shown_at is None but times_shown > 0: preserve as-is (NULL datetime, non-zero count)",
+        "Duplicate learnings within same import file: detect and skip within-batch",
+        "Empty import file []: 0 imported, 0 skipped, success",
+        "DateTime format mismatch: must use %Y-%m-%d %H:%M:%S not RFC 3339",
+        "Import interrupted mid-batch: transaction rollback, no partial writes"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "FK violation on task_id",
+          "expectedBehavior": "task_id set to None, import succeeds"
+        },
+        {
+          "cause": "Duplicate learning in batch",
+          "expectedBehavior": "Second duplicate skipped, count reflects 1 imported + 1 skipped"
+        },
+        {
+          "cause": "Mid-batch failure",
+          "expectedBehavior": "Transaction rolls back, 0 learnings imported"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Dedup key for same title+content always produces the same result",
+        "Dedup key for different title OR content always produces different results",
+        "After successful import, DB learning count increases by exactly the number of non-duplicate learnings",
+        "After failed import, DB learning count is unchanged (transaction rollback)"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Update existing test call sites to remove learnings_only parameter (will require implementation change first for compilation). Tests for stats preservation must use fixed datetimes, not Utc::now(). Use chrono::DateTime::parse_from_rfc3339 or NaiveDateTime to construct fixed test datetimes.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Each PRD edge case has a corresponding test",
+          "Stats preservation test uses fixed datetimes and verifies round-trip through SQLite format"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing test patterns in tests.rs (setup_test_db helper, make_learning helper)"
+        ]
+      },
+      "synergyWith": [
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FIX-005"
+      ],
+      "title": "Initial tests for import_learnings bug fixes",
+      "touchesFiles": [
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "task_id set to None in learning_to_params()",
+        "Comment explains rationale (matches run_id comment)",
+        "test_import_does_not_carry_task_id passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "In learning_to_params() (src/commands/import_learnings/mod.rs line 153), change task_id: learning.task_id.clone() to task_id: None. Mirrors the existing run_id: None pattern on the next line. Source DB task IDs won't exist in target DB.",
+      "estimatedEffort": "low",
+      "id": "FIX-001",
+      "modifiesBehavior": true,
+      "notes": "1-line change. Existing test_import_does_not_carry_run_id (line 336) shows the pattern to mirror.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "task_id must be None for all imported learnings regardless of export value"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Match existing run_id: None comment style"
+        ]
+      },
+      "synergyWith": [
+        "FIX-002"
+      ],
+      "title": "Fix task_id FK violation on import",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Function renamed from compute_learning_hash to compute_dedup_key",
+        "Body uses format!(\"{}:{}\", title, content) instead of md5::compute",
+        "All call sites updated (lines 73 and 137)",
+        "Test imports updated",
+        "Existing dedup tests pass (determinism, uniqueness, empty strings)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Rename compute_learning_hash to compute_dedup_key. Replace body with format!(\"{}:{}\", title, content). Remove md5::compute call. Update call sites (lines 73, 137) and test imports. md5 crate stays in Cargo.toml (used by loop_engine/engine.rs).",
+      "estimatedEffort": "low",
+      "id": "FIX-002",
+      "modifiesBehavior": false,
+      "notes": "Also rename load_existing_hashes to load_existing_keys for consistency.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": {
+        "correctness": [
+          "Dedup behavior identical to before — same collision class"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "No md5 import in import_learnings module"
+        ]
+      },
+      "synergyWith": [
+        "FIX-001"
+      ],
+      "title": "Replace MD5 dedup with direct string key",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "--learnings-only arg removed from CLI definition in src/cli/commands.rs",
+        "Example referencing --learnings-only removed from after_help",
+        "learnings_only removed from ImportLearnings destructure in main.rs",
+        "learnings_only parameter removed from import_learnings() signature",
+        "learnings_only field removed from ImportLearningsResult struct",
+        "All test call sites updated (4-arg to 3-arg)",
+        "All test assertions on learnings_only removed",
+        "format_text tests updated to not include learnings_only in result construction"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Remove the --learnings-only CLI flag, function parameter, and result struct field. Run history import was never implemented — the flag is misleading. Changes span 4 files: cli/commands.rs (arg + example), main.rs (destructure + call), import_learnings/mod.rs (param + struct + result), tests.rs (all call sites + assertions).",
+      "estimatedEffort": "medium",
+      "id": "FIX-003",
+      "modifiesBehavior": true,
+      "notes": "This is a multi-file change. Update tests.rs FIRST (will fail to compile until mod.rs is updated), then mod.rs, then cli/commands.rs, then main.rs. Or do all together since they're interdependent.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": {
+        "correctness": [
+          "CLI --help must not show --learnings-only"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Clean removal — no deprecation stubs, no backwards-compat shims"
+        ]
+      },
+      "synergyWith": [
+        "FIX-004"
+      ],
+      "title": "Remove --learnings-only flag",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "conn declared as mut: let mut conn = open_connection(dir)?",
+        "load_existing_keys called before conn.transaction()",
+        "Insert loop wrapped in let tx = conn.transaction()? ... tx.commit()?",
+        "record_learning called with &tx (auto-deref to &Connection)",
+        "Within-batch dedup: seen.insert(key) used to track + check in one operation",
+        "test_import_deduplicates_within_batch passes",
+        "test_import_atomicity_all_or_nothing passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FIX-002",
+        "FIX-003"
+      ],
+      "description": "Make import atomic by wrapping the insert loop in a SQLite transaction. Also add within-batch dedup by converting existing_keys from a snapshot into a mutable 'seen' set that tracks keys inserted during the current batch. Pattern: load_existing_keys() before conn.transaction() (avoids mutable borrow conflict), then seen.insert(key) returns false if already present. Pass &tx to record_learning (auto-derefs to &Connection).",
+      "estimatedEffort": "medium",
+      "id": "FIX-004",
+      "modifiesBehavior": false,
+      "notes": "Transaction pattern from codebase: see src/commands/skip.rs lines 59-69. load_existing_keys must be called BEFORE conn.transaction() because transaction() takes &mut conn, preventing further borrows. The LockGuard in main.rs already ensures single-writer access.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": {
+        "correctness": [
+          "Failed import must leave DB unchanged (transaction rollback)",
+          "Within-batch duplicates must be detected and skipped"
+        ],
+        "performance": [
+          "Single transaction for entire batch — SQLite handles this efficiently"
+        ],
+        "style": [
+          "Follow conn.transaction() / tx.commit() pattern from skip.rs"
+        ]
+      },
+      "synergyWith": [
+        "FIX-005"
+      ],
+      "title": "Wrap import loop in a transaction with within-batch dedup",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "When reset_stats=false: UPDATE sets times_shown, times_applied, last_shown_at, last_applied_at from LearningExport",
+        "When reset_stats=true: no UPDATE, stats default to zero",
+        "Datetimes formatted as %Y-%m-%d %H:%M:%S (not RFC 3339)",
+        "format_text shows 'Bandit statistics: preserved from export' when !stats_reset && learnings_imported > 0",
+        "format_text shows 'Bandit statistics: reset to zero' when stats_reset",
+        "test_import_preserves_stats_when_no_reset passes",
+        "test_import_with_reset_stats still passes (existing test)",
+        "test_format_text_stats_preserved passes",
+        "test_format_text_stats_reset passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FIX-004"
+      ],
+      "description": "Make --reset-stats actually control stats preservation. Default behavior (no flag): preserve stats from export via post-insert UPDATE. With --reset-stats: stats start at zero (current behavior, no UPDATE needed). After each record_learning call, if !reset_stats, execute UPDATE learnings SET times_shown, times_applied, last_shown_at, last_applied_at WHERE id = learning_id. CRITICAL: format datetimes as %Y-%m-%d %H:%M:%S (SQLite format), NOT to_rfc3339(). Also update format_text to show 'preserved from export' vs 'reset to zero'.",
+      "estimatedEffort": "medium",
+      "id": "FIX-005",
+      "modifiesBehavior": true,
+      "notes": "The UPDATE runs inside the transaction from FIX-004. Use tx.execute() not conn.execute(). DateTime edge case: learning.last_shown_at can be None even when times_shown > 0 — preserve as-is (pass NULL to SQL).",
+      "passes": false,
+      "priority": 10,
+      "qualityDimensions": {
+        "correctness": [
+          "Stats must exactly match export values after import with reset_stats=false",
+          "Datetimes must survive round-trip: export → JSON → import → DB → export"
+        ],
+        "performance": [
+          "One extra UPDATE per learning when preserving stats — acceptable"
+        ],
+        "style": [
+          "Use %Y-%m-%d %H:%M:%S format to match parse_datetime in models/datetime.rs"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Implement --reset-stats properly with post-insert UPDATE",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context",
+        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "Edge case coverage: each edgeCases entry has a corresponding test",
+        "Transaction correctly wraps all inserts",
+        "DateTime format verified as %Y-%m-%d %H:%M:%S",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FIX-005"
+      ],
+      "description": "Review all FIX-xxx implementations for code quality, error handling, and integration wiring. Verify quality dimensions were met for each task. Verify each edgeCases entry on TEST-INIT-001 has a corresponding test.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add a CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review import_learnings fixes for quality and integration",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "No tight coupling between modules",
+        "Code is easy to change and extend",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Small scope — only 4 files changed. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review import_learnings for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-INIT-001 tests pass",
+        "All FIX-xxx tasks complete",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "cargo test -- import_learnings passes with 0 failures",
+        "cargo clippy -- -D warnings passes",
+        "cargo fmt --check passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FIX-005",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Gate: all initial tests pass, all fixes implemented, code reviewed, refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Initial tests pass, implementation reviewed and refactored",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Error test: import file with invalid JSON returns meaningful error",
+        "Error test: import file that doesn't exist returns IoError",
+        "Parameterized: test various LearningOutcome values (pattern, failure, workaround, success) round-trip correctly",
+        "Parameterized: test all Confidence levels (high, medium, low) round-trip correctly",
+        "Boundary: import 0 learnings (empty array)",
+        "Boundary: import learning with all optional fields None",
+        "Boundary: import learning with all optional fields populated",
+        "Round-trip: export learnings, import to fresh DB, compare field-by-field",
+        "Stats round-trip: export with stats, import with reset_stats=false, verify stats match",
+        "80%+ coverage for import_learnings module"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage beyond initial tests. Cover: error handling, parameterized edge cases, boundary values, malformed input, and round-trip fidelity (export then import).",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Some of these tests may already exist. Check existing test file first and only add missing coverage. Use #[rstest] for parameterized tests if the crate is available, otherwise use separate test functions.",
+      "passes": false,
+      "priority": 25,
+      "qualityDimensions": {
+        "correctness": [
+          "Tests must verify content, not just 'no crash'"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing test patterns, reuse setup_test_db and make_learning helpers"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Comprehensive tests for import_learnings",
+      "touchesFiles": [
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001"
+      ],
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-001 comprehensive tests pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "cargo test -- import_learnings passes with 0 failures",
+        "Test coverage for import_learnings module >= 80%"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Gate: comprehensive tests pass, test code reviewed and refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "passes": false,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Full test coverage achieved, test code refactored",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "E2E test: init PRD → learn → export --learnings-file → import --from-json to fresh DB → verify field-by-field match",
+        "E2E test: same flow with --reset-stats → verify stats are zeroed",
+        "CLI verification: cargo run -- import-learnings --help output does not contain 'learnings-only'",
+        "cargo test passes with 0 failures"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "End-to-end integration test: init a PRD, add learnings with stats, export with --learnings-file, import to a fresh DB, verify all fields match including stats. Also verify CLI help text no longer shows --learnings-only.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "This can be a test in tests.rs or a separate integration test file. The key is testing the full pipeline, not just individual functions.",
+      "passes": false,
+      "priority": 55,
+      "qualityDimensions": {
+        "correctness": [
+          "Round-trip must preserve all learning fields exactly"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing integration test patterns"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Integration test: export-import round-trip",
+      "touchesFiles": [
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across implementation and tests",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check passes with 0 warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes with 0 failures (full suite, not just import_learnings)",
+        "cargo run -- import-learnings --help shows --reset-stats but not --learnings-only",
+        "All 5 PRD goals verified as met"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Run full test suite and all quality checks. Verify all acceptance criteria from PRD are met.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification - all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All user stories from PRD have corresponding passing tests",
+        "No regressions in existing test suite"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Final gate: all tests pass, all reviews complete, all fixes verified.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Ready for merge to main.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Ready for merge - all fixes verified",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
