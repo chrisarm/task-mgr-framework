@@ -155,6 +155,37 @@ mod tests {
         assert_eq!(model_tier(Some("Haiku")), ModelTier::Haiku);
     }
 
+    /// AC: 'OPUS', 'Opus', 'claude-OPUS-4' all return Opus
+    #[test]
+    fn test_model_tier_case_variants_opus() {
+        assert_eq!(model_tier(Some("OPUS")), ModelTier::Opus);
+        assert_eq!(model_tier(Some("Opus")), ModelTier::Opus);
+        assert_eq!(model_tier(Some("claude-OPUS-4")), ModelTier::Opus);
+        assert_eq!(model_tier(Some("oPuS")), ModelTier::Opus);
+    }
+
+    #[test]
+    fn test_model_tier_case_variants_sonnet() {
+        assert_eq!(model_tier(Some("SONNET")), ModelTier::Sonnet);
+        assert_eq!(model_tier(Some("Sonnet")), ModelTier::Sonnet);
+        assert_eq!(model_tier(Some("claude-SONNET-4")), ModelTier::Sonnet);
+        assert_eq!(model_tier(Some("sOnNeT")), ModelTier::Sonnet);
+    }
+
+    #[test]
+    fn test_model_tier_case_variants_haiku() {
+        assert_eq!(model_tier(Some("HAIKU")), ModelTier::Haiku);
+        assert_eq!(model_tier(Some("Haiku")), ModelTier::Haiku);
+        assert_eq!(model_tier(Some("claude-HAIKU-5")), ModelTier::Haiku);
+        assert_eq!(model_tier(Some("hAiKu")), ModelTier::Haiku);
+    }
+
+    #[test]
+    fn test_model_tier_whitespace_only_returns_default() {
+        assert_eq!(model_tier(Some("  ")), ModelTier::Default);
+        assert_eq!(model_tier(Some("\t")), ModelTier::Default);
+    }
+
     #[test]
     fn test_model_tier_ordering() {
         assert!(ModelTier::Opus > ModelTier::Sonnet);
@@ -232,6 +263,123 @@ mod tests {
         );
     }
 
+    /// AC: empty string task_model is Some(""), a valid override—not treated as None.
+    #[test]
+    fn test_resolve_task_model_empty_string_is_valid_override() {
+        let result = resolve_task_model(Some(""), Some("high"), Some(SONNET_MODEL));
+        assert_eq!(
+            result,
+            Some(String::new()),
+            "empty string task_model is Some, should override difficulty and prd_default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_model_empty_string_without_fallbacks() {
+        let result = resolve_task_model(Some(""), None, None);
+        assert_eq!(
+            result,
+            Some(String::new()),
+            "empty string task_model should still be returned"
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_model_unknown_difficulty_falls_through() {
+        let result = resolve_task_model(None, Some("critical"), None);
+        assert_eq!(
+            result, None,
+            "unrecognized difficulty should not trigger any escalation"
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_model_unknown_difficulty_with_prd_default() {
+        let result = resolve_task_model(None, Some("critical"), Some(HAIKU_MODEL));
+        assert_eq!(
+            result,
+            Some(HAIKU_MODEL.to_string()),
+            "unrecognized difficulty should fall through to prd_default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_task_model_empty_difficulty_falls_through() {
+        let result = resolve_task_model(None, Some(""), Some(SONNET_MODEL));
+        assert_eq!(
+            result,
+            Some(SONNET_MODEL.to_string()),
+            "empty difficulty string should fall through to prd_default"
+        );
+    }
+
+    // ============ Parameterized precedence table ============
+
+    /// Exhaustive precedence combinations: task_model × difficulty × prd_default.
+    /// Each row tests one combination to verify the full precedence chain.
+    #[test]
+    fn test_resolve_task_model_precedence_table() {
+        // (task_model, difficulty, prd_default) → expected
+        let cases: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>)> = vec![
+            // Row 1: all None
+            (None, None, None, None),
+            // Row 2: only prd_default set
+            (None, None, Some(SONNET_MODEL), Some(SONNET_MODEL)),
+            // Row 3: high difficulty, no prd_default
+            (None, Some("high"), None, Some(OPUS_MODEL)),
+            // Row 4: high difficulty beats prd_default
+            (None, Some("high"), Some(SONNET_MODEL), Some(OPUS_MODEL)),
+            // Row 5: medium difficulty, no fallback
+            (None, Some("medium"), None, None),
+            // Row 6: medium difficulty, falls through to prd_default
+            (None, Some("medium"), Some(HAIKU_MODEL), Some(HAIKU_MODEL)),
+            // Row 7: low difficulty, no fallback
+            (None, Some("low"), None, None),
+            // Row 8: low difficulty, falls through to prd_default
+            (None, Some("low"), Some(SONNET_MODEL), Some(SONNET_MODEL)),
+            // Row 9: task_model alone
+            (Some(HAIKU_MODEL), None, None, Some(HAIKU_MODEL)),
+            // Row 10: task_model beats prd_default
+            (Some(HAIKU_MODEL), None, Some(OPUS_MODEL), Some(HAIKU_MODEL)),
+            // Row 11: task_model beats high difficulty
+            (Some(HAIKU_MODEL), Some("high"), None, Some(HAIKU_MODEL)),
+            // Row 12: task_model wins over everything
+            (
+                Some(HAIKU_MODEL),
+                Some("high"),
+                Some(OPUS_MODEL),
+                Some(HAIKU_MODEL),
+            ),
+            // Row 13: task_model wins with medium difficulty
+            (
+                Some(SONNET_MODEL),
+                Some("medium"),
+                Some(OPUS_MODEL),
+                Some(SONNET_MODEL),
+            ),
+            // Row 14: task_model wins with low difficulty
+            (
+                Some(OPUS_MODEL),
+                Some("low"),
+                Some(HAIKU_MODEL),
+                Some(OPUS_MODEL),
+            ),
+        ];
+
+        for (i, (task_model, difficulty, prd_default, expected)) in cases.iter().enumerate() {
+            let result = resolve_task_model(*task_model, *difficulty, *prd_default);
+            assert_eq!(
+                result,
+                expected.map(String::from),
+                "precedence row {} failed: task={:?}, diff={:?}, prd={:?}",
+                i + 1,
+                task_model,
+                difficulty,
+                prd_default,
+            );
+        }
+    }
+
     // ============ resolve_iteration_model tests ============
 
     #[test]
@@ -294,6 +442,80 @@ mod tests {
         assert_eq!(result, Some(SONNET_MODEL.to_string()));
     }
 
+    /// AC: synergy cluster with 3+ overlapping tasks at different tiers.
+    /// Opus in position 1 (not last) still wins.
+    #[test]
+    fn test_resolve_iteration_model_three_plus_tasks_opus_not_last() {
+        let models = vec![
+            Some(SONNET_MODEL.to_string()),
+            Some(OPUS_MODEL.to_string()),
+            Some(HAIKU_MODEL.to_string()),
+            Some(SONNET_MODEL.to_string()),
+        ];
+        let result = resolve_iteration_model(&models);
+        assert_eq!(result, Some(OPUS_MODEL.to_string()));
+    }
+
+    /// AC: partial file overlap—some tasks have models, some are None.
+    /// Only the non-None entries participate in tier selection.
+    #[test]
+    fn test_resolve_iteration_model_partial_overlap_with_none() {
+        let models = vec![
+            None,
+            Some(HAIKU_MODEL.to_string()),
+            None,
+            Some(SONNET_MODEL.to_string()),
+            None,
+        ];
+        let result = resolve_iteration_model(&models);
+        assert_eq!(
+            result,
+            Some(SONNET_MODEL.to_string()),
+            "sonnet should win among partial-overlap cluster"
+        );
+    }
+
+    /// 3+ tasks all at the same tier—should return one of them.
+    #[test]
+    fn test_resolve_iteration_model_all_same_tier() {
+        let models = vec![
+            Some(HAIKU_MODEL.to_string()),
+            Some(HAIKU_MODEL.to_string()),
+            Some(HAIKU_MODEL.to_string()),
+        ];
+        let result = resolve_iteration_model(&models);
+        assert_eq!(result, Some(HAIKU_MODEL.to_string()));
+    }
+
+    /// Mix of known tiers and unknown model strings.
+    /// Unknown strings are ModelTier::Default (lowest), so the known tier wins.
+    #[test]
+    fn test_resolve_iteration_model_unknown_mixed_with_known() {
+        let models = vec![
+            Some("gpt-4-turbo".to_string()),
+            Some(HAIKU_MODEL.to_string()),
+            Some("llama-3".to_string()),
+        ];
+        let result = resolve_iteration_model(&models);
+        assert_eq!(
+            result,
+            Some(HAIKU_MODEL.to_string()),
+            "known tier (haiku) should beat unknown tiers"
+        );
+    }
+
+    /// All entries are unknown model strings—one of them should be returned.
+    #[test]
+    fn test_resolve_iteration_model_all_unknown() {
+        let models = vec![Some("gpt-4".to_string()), Some("llama-3".to_string())];
+        let result = resolve_iteration_model(&models);
+        // All are ModelTier::Default; max_by_key picks the last tied element
+        assert!(
+            result.is_some(),
+            "should return some model even if all are unknown tier"
+        );
+    }
+
     // ============ escalate_model tests ============
 
     #[test]
@@ -324,5 +546,56 @@ mod tests {
     fn test_escalate_model_unknown_returns_none() {
         let result = escalate_model(Some("gpt-4"));
         assert_eq!(result, None, "unknown model tier cannot be escalated");
+    }
+
+    /// AC: unknown model string doesn't crash—returns None, not panic.
+    #[test]
+    fn test_escalate_model_various_unknown_strings_no_crash() {
+        assert_eq!(escalate_model(Some("")), None);
+        assert_eq!(escalate_model(Some("  ")), None);
+        assert_eq!(escalate_model(Some("llama-3-70b")), None);
+        assert_eq!(escalate_model(Some("gemini-pro")), None);
+        assert_eq!(
+            escalate_model(Some("totally-unknown-model-xyz")),
+            None,
+            "arbitrary unknown string should safely return None"
+        );
+    }
+
+    /// Escalate with case-variant model strings.
+    #[test]
+    fn test_escalate_model_case_variants() {
+        assert_eq!(
+            escalate_model(Some("HAIKU")),
+            Some(SONNET_MODEL.to_string()),
+            "uppercase HAIKU should escalate to sonnet"
+        );
+        assert_eq!(
+            escalate_model(Some("Sonnet")),
+            Some(OPUS_MODEL.to_string()),
+            "mixed-case Sonnet should escalate to opus"
+        );
+        assert_eq!(
+            escalate_model(Some("OPUS")),
+            Some(OPUS_MODEL.to_string()),
+            "uppercase OPUS should stay at opus ceiling"
+        );
+    }
+
+    /// Double escalation chain: haiku → sonnet → opus.
+    #[test]
+    fn test_escalate_model_double_escalation_chain() {
+        let first = escalate_model(Some(HAIKU_MODEL));
+        assert_eq!(first, Some(SONNET_MODEL.to_string()));
+
+        let second = escalate_model(first.as_deref());
+        assert_eq!(second, Some(OPUS_MODEL.to_string()));
+
+        let third = escalate_model(second.as_deref());
+        assert_eq!(
+            third,
+            Some(OPUS_MODEL.to_string()),
+            "opus is the ceiling; further escalation stays at opus"
+        );
     }
 }
