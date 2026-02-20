@@ -4,6 +4,13 @@ target/
 
 # Task manager runtime (SQLite databases, locks)
 .task-mgr/
+*.db
+
+# External project symlinks
+linked_projects/
+
+# Loop progress log (generated, large)
+tasks/progress.txt
 
 # IDE/Editor
 .idea/
