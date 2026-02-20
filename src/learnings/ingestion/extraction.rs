@@ -26,10 +26,7 @@ pub fn build_extraction_prompt(output: &str, task_id: Option<&str>) -> String {
     };
 
     // Use a unique random delimiter to prevent delimiter injection
-    let delimiter = format!(
-        "===BOUNDARY_{}===",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let delimiter = format!("===BOUNDARY_{}===", &uuid::Uuid::new_v4().to_string()[..8]);
 
     format!(
         r#"You are an expert at extracting structured learnings from software development output.
@@ -194,7 +191,11 @@ struct RawExtractedLearning {
 }
 
 impl RawExtractedLearning {
-    fn into_params(self, task_id: Option<&str>, run_id: Option<&str>) -> Option<RecordLearningParams> {
+    fn into_params(
+        self,
+        task_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Option<RecordLearningParams> {
         // title and content are required
         let title = self.title.filter(|t| !t.is_empty())?;
         let content = self.content.filter(|c| !c.is_empty())?;

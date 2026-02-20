@@ -34,6 +34,12 @@ pub struct PrdUserStory {
     pub batch_with: Vec<String>,
     #[serde(default)]
     pub conflicts_with: Vec<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub difficulty: Option<String>,
+    #[serde(default)]
+    pub escalation_note: Option<String>,
 }
 
 /// JSON structure for the PRD file.
@@ -59,4 +65,6 @@ pub struct PrdFile {
     /// written back to the JSON file for stability across re-imports.
     #[serde(default)]
     pub task_prefix: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
 }

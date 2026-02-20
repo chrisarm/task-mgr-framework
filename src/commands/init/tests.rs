@@ -52,7 +52,16 @@ fn test_init_fresh_database() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    let result = init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert!(result.fresh_import);
     assert_eq!(result.tasks_imported, 2);
@@ -70,10 +79,28 @@ fn test_init_with_force() {
     fs::write(&json_path, create_test_prd()).unwrap();
 
     // First import
-    init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Second import with force should replace
-    let result = init(temp_dir.path(), &[&json_path], true, false, false, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&json_path],
+        true,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert!(result.fresh_import);
     assert_eq!(result.tasks_imported, 2);
@@ -86,10 +113,27 @@ fn test_init_without_force_fails_on_duplicate() {
     fs::write(&json_path, create_test_prd()).unwrap();
 
     // First import
-    init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Second import without force should fail (duplicate tasks)
-    let result = init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
 }
 
@@ -118,10 +162,28 @@ fn test_init_append_mode() {
     fs::write(&path2, json2).unwrap();
 
     // Import first file
-    init(temp_dir.path(), &[&path1], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path1],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Append second file
-    let result = init(temp_dir.path(), &[&path2], false, true, false, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&path2],
+        false,
+        true,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert!(!result.fresh_import);
     assert_eq!(result.tasks_imported, 1);
@@ -152,10 +214,28 @@ fn test_init_append_skips_existing() {
     fs::write(&path2, json2).unwrap();
 
     // Import first
-    init(temp_dir.path(), &[&path1], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path1],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Append should skip existing
-    let result = init(temp_dir.path(), &[&path2], false, true, false, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&path2],
+        false,
+        true,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert_eq!(result.tasks_imported, 0);
     assert_eq!(result.tasks_updated, 0);
@@ -247,7 +327,16 @@ fn test_init_passes_maps_to_done() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Verify status mapping
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -281,7 +370,16 @@ fn test_init_stores_prd_metadata() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let (project, branch): (String, Option<String>) = conn
@@ -314,7 +412,16 @@ fn test_init_stores_acceptance_criteria() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let criteria_json: String = conn
@@ -334,7 +441,15 @@ fn test_init_file_not_found() {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("nonexistent.json");
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
 }
 
@@ -344,7 +459,15 @@ fn test_init_invalid_json() {
     let path = temp_dir.path().join("invalid.json");
     fs::write(&path, "not valid json").unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
 }
 
@@ -375,7 +498,16 @@ fn test_init_stores_relationships() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
     assert_eq!(result.relationships_imported, 4);
 
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -426,10 +558,28 @@ fn test_init_append_update_existing() {
     fs::write(&path2, json2).unwrap();
 
     // Import first
-    init(temp_dir.path(), &[&path1], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path1],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     // Append with update-existing
-    let result = init(temp_dir.path(), &[&path2], false, true, true, false, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&path2],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert_eq!(result.tasks_imported, 0);
     assert_eq!(result.tasks_updated, 1);
@@ -478,7 +628,15 @@ fn test_init_dependency_validation_fails() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("US-NONEXISTENT"));
@@ -537,7 +695,16 @@ fn test_init_append_with_existing_dependency() {
     }"#;
     let path1 = temp_dir.path().join("p1.json");
     fs::write(&path1, json1).unwrap();
-    init(temp_dir.path(), &[&path1], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path1],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let json2 = r#"{
         "project": "test",
@@ -554,7 +721,15 @@ fn test_init_append_with_existing_dependency() {
     let path2 = temp_dir.path().join("p2.json");
     fs::write(&path2, json2).unwrap();
 
-    let result = init(temp_dir.path(), &[&path2], false, true, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path2],
+        false,
+        true,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_ok());
     let result = result.unwrap();
     assert_eq!(result.tasks_imported, 1);
@@ -583,8 +758,26 @@ fn test_init_verifies_both_phases_present() {
     fs::write(&path1, json1).unwrap();
     fs::write(&path2, json2).unwrap();
 
-    init(temp_dir.path(), &[&path1], false, false, false, false, PrefixMode::Disabled).unwrap();
-    init(temp_dir.path(), &[&path2], false, true, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&path1],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+    init(
+        temp_dir.path(),
+        &[&path2],
+        false,
+        true,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let count: i32 = conn
@@ -606,7 +799,16 @@ fn test_init_dry_run_does_not_modify_database() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    let result = init(temp_dir.path(), &[&json_path], false, false, false, true, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        true,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert!(result.dry_run);
     assert_eq!(result.tasks_imported, 2);
@@ -627,7 +829,16 @@ fn test_init_dry_run_with_force_shows_delete_preview() {
     let json_path = temp_dir.path().join("prd.json");
     fs::write(&json_path, create_test_prd()).unwrap();
 
-    init(temp_dir.path(), &[&json_path], false, false, false, false, PrefixMode::Disabled).unwrap();
+    init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let task_count: i32 = conn
@@ -635,7 +846,16 @@ fn test_init_dry_run_with_force_shows_delete_preview() {
         .unwrap();
     assert_eq!(task_count, 2);
 
-    let result = init(temp_dir.path(), &[&json_path], true, false, false, true, PrefixMode::Disabled).unwrap();
+    let result = init(
+        temp_dir.path(),
+        &[&json_path],
+        true,
+        false,
+        false,
+        true,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
 
     assert!(result.dry_run);
     assert!(result.would_delete.is_some());
@@ -669,7 +889,15 @@ fn test_init_dry_run_validates_dependencies() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, true, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        true,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("US-NONEXISTENT"));
@@ -696,7 +924,15 @@ fn test_init_rejects_absolute_paths_in_touches_files() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Unsafe path"));
@@ -724,7 +960,15 @@ fn test_init_rejects_path_traversal_in_touches_files() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Unsafe path"));
@@ -750,7 +994,15 @@ fn test_init_rejects_home_directory_in_touches_files() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("home directory paths"));
@@ -780,7 +1032,15 @@ fn test_init_allows_valid_relative_paths_in_touches_files() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, false, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_ok());
     assert_eq!(result.unwrap().files_imported, 4);
 }
@@ -804,7 +1064,15 @@ fn test_init_dry_run_still_validates_paths() {
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
 
-    let result = init(temp_dir.path(), &[&path], false, false, false, true, PrefixMode::Disabled);
+    let result = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        true,
+        PrefixMode::Disabled,
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Unsafe path"));
@@ -1094,5 +1362,274 @@ fn test_init_prefix_stable_across_reimports() {
     .unwrap();
     let prefix2 = result2.prefix_applied.unwrap();
 
-    assert_eq!(prefix1, prefix2, "Prefix should be stable across re-imports");
+    assert_eq!(
+        prefix1, prefix2,
+        "Prefix should be stable across re-imports"
+    );
+}
+
+// ============================================================================
+// Model selection field tests (parse, import, round-trip)
+// ============================================================================
+
+#[test]
+fn test_parse_prd_user_story_with_model_difficulty_escalation() {
+    let json = r#"{
+        "id": "US-001",
+        "title": "Task with model",
+        "priority": 1,
+        "passes": false,
+        "model": "claude-sonnet-4-6",
+        "difficulty": "high",
+        "escalationNote": "Retried after OOM"
+    }"#;
+
+    let story: super::parse::PrdUserStory = serde_json::from_str(json).unwrap();
+
+    assert_eq!(story.model, Some("claude-sonnet-4-6".to_string()));
+    assert_eq!(story.difficulty, Some("high".to_string()));
+    assert_eq!(story.escalation_note, Some("Retried after OOM".to_string()));
+}
+
+#[test]
+fn test_parse_prd_backward_compat_without_model_fields() {
+    let json = r#"{
+        "id": "US-001",
+        "title": "Legacy task",
+        "priority": 1,
+        "passes": false
+    }"#;
+
+    let story: super::parse::PrdUserStory = serde_json::from_str(json).unwrap();
+
+    assert_eq!(story.model, None, "model should default to None");
+    assert_eq!(story.difficulty, None, "difficulty should default to None");
+    assert_eq!(
+        story.escalation_note, None,
+        "escalation_note should default to None"
+    );
+}
+
+/// Known-bad discriminator: escalationNote must use camelCase in JSON.
+/// A naive snake_case key ("escalation_note") should NOT deserialize into the field.
+#[test]
+fn test_parse_escalation_note_requires_camel_case() {
+    // This JSON uses snake_case "escalation_note" — should NOT match
+    let json = r#"{
+        "id": "US-001",
+        "title": "Task",
+        "priority": 1,
+        "passes": false,
+        "escalation_note": "This should not parse"
+    }"#;
+
+    let story: super::parse::PrdUserStory = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        story.escalation_note, None,
+        "snake_case escalation_note must NOT deserialize — only camelCase escalationNote works"
+    );
+}
+
+/// Positive test: camelCase escalationNote DOES work.
+#[test]
+fn test_parse_escalation_note_camel_case_works() {
+    let json = r#"{
+        "id": "US-001",
+        "title": "Task",
+        "priority": 1,
+        "passes": false,
+        "escalationNote": "This should parse"
+    }"#;
+
+    let story: super::parse::PrdUserStory = serde_json::from_str(json).unwrap();
+    assert_eq!(story.escalation_note, Some("This should parse".to_string()));
+}
+
+#[test]
+fn test_parse_prd_file_with_default_model() {
+    let json = r#"{
+        "project": "test",
+        "defaultModel": "claude-haiku-4-5-20251001",
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+
+    let prd: super::parse::PrdFile = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        prd.default_model,
+        Some("claude-haiku-4-5-20251001".to_string())
+    );
+}
+
+#[test]
+fn test_parse_prd_file_backward_compat_without_default_model() {
+    let json = r#"{
+        "project": "test",
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+
+    let prd: super::parse::PrdFile = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        prd.default_model, None,
+        "default_model should default to None"
+    );
+}
+
+#[test]
+fn test_insert_task_with_model_difficulty_escalation_note() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "userStories": [
+            {
+                "id": "US-001",
+                "title": "Model task",
+                "priority": 1,
+                "passes": false,
+                "model": "claude-opus-4-6",
+                "difficulty": "high",
+                "escalationNote": "Bumped from sonnet after failure"
+            }
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let (model, difficulty, escalation_note): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT model, difficulty, escalation_note FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(model, Some("claude-opus-4-6".to_string()));
+    assert_eq!(difficulty, Some("high".to_string()));
+    assert_eq!(
+        escalation_note,
+        Some("Bumped from sonnet after failure".to_string())
+    );
+}
+
+#[test]
+fn test_insert_task_without_model_fields_stores_null() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "userStories": [
+            {"id": "US-001", "title": "Plain task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let (model, difficulty, escalation_note): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT model, difficulty, escalation_note FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(model, None);
+    assert_eq!(difficulty, None);
+    assert_eq!(escalation_note, None);
+}
+
+#[test]
+fn test_insert_prd_metadata_with_default_model() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "model-test",
+        "defaultModel": "claude-sonnet-4-6",
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let default_model: Option<String> = conn
+        .query_row(
+            "SELECT default_model FROM prd_metadata WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(default_model, Some("claude-sonnet-4-6".to_string()));
+}
+
+#[test]
+fn test_insert_prd_metadata_without_default_model() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "no-model",
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let default_model: Option<String> = conn
+        .query_row(
+            "SELECT default_model FROM prd_metadata WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(default_model, None);
 }

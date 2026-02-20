@@ -113,10 +113,7 @@ pub fn extract_learnings_from_output(
                 learning_ids.push(result.learning_id);
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to record extracted learning: {}",
-                    e
-                );
+                eprintln!("Warning: failed to record extracted learning: {}", e);
             }
         }
     }

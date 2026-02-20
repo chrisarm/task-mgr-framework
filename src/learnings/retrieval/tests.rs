@@ -9,9 +9,7 @@ use crate::models::{Confidence, LearningOutcome};
 
 use super::fts5::{escape_fts5_query, is_fts5_available};
 use super::patterns::{extract_task_prefix, file_matches_pattern};
-use super::{
-    CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery,
-};
+use super::{CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery};
 
 fn setup_db() -> (TempDir, Connection) {
     let temp_dir = TempDir::new().unwrap();
@@ -381,7 +379,11 @@ fn test_like_escape_metacharacters() {
         ..Default::default()
     };
     let results = backend.retrieve(&conn, &query).unwrap();
-    assert_eq!(results.len(), 1, "% should match only the row containing literal %");
+    assert_eq!(
+        results.len(),
+        1,
+        "% should match only the row containing literal %"
+    );
     assert_eq!(results[0].learning.title, "50% discount applied");
 
     // Searching for literal "_" should match nothing (no titles contain _)
@@ -454,10 +456,7 @@ fn test_extract_task_prefix() {
 
 #[test]
 fn test_extract_task_prefix_uuid_prefixed() {
-    assert_eq!(
-        extract_task_prefix("f424ade5-PA-FEAT-003"),
-        "PA-FEAT-003"
-    );
+    assert_eq!(extract_task_prefix("f424ade5-PA-FEAT-003"), "PA-FEAT-003");
     assert_eq!(extract_task_prefix("abcdef01-US-001"), "US-001");
     assert_eq!(extract_task_prefix("00000000-FIX-42"), "FIX-42");
 }

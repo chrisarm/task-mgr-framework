@@ -317,6 +317,8 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
+    // Migrate down from version 6 to version 5 (reverts model selection fields)
+    migrate_down(&mut conn).unwrap();
     // Migrate down from version 5 to version 4 (reverts task_prefix)
     migrate_down(&mut conn).unwrap();
     // Migrate down from version 4 to version 3 (reverts external_git_repo)
@@ -347,4 +349,169 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
     // Verify schema version is now 2
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(version, 2);
+}
+
+// ========== Migration v6 Tests (Model Selection Fields) ==========
+
+#[test]
+fn test_migration_v6_adds_model_columns_to_tasks() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    // Verify model, difficulty, escalation_note columns exist on tasks
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('tasks') WHERE name IN ('model', 'difficulty', 'escalation_note')")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    assert!(
+        columns.contains(&"model".to_string()),
+        "tasks.model column missing"
+    );
+    assert!(
+        columns.contains(&"difficulty".to_string()),
+        "tasks.difficulty column missing"
+    );
+    assert!(
+        columns.contains(&"escalation_note".to_string()),
+        "tasks.escalation_note column missing"
+    );
+}
+
+#[test]
+fn test_migration_v6_adds_default_model_to_prd_metadata() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    // Verify default_model column exists on prd_metadata
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('prd_metadata') WHERE name = 'default_model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(exists, "prd_metadata.default_model column missing");
+}
+
+#[test]
+fn test_migration_v6_schema_version_is_6() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(version, 6);
+}
+
+#[test]
+fn test_migration_v6_new_columns_default_to_null() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    // Insert a task before v6 migration
+    // Run migrations up to v5 first
+    for _ in 0..5 {
+        migrate_up(&mut conn).unwrap();
+    }
+
+    conn.execute(
+        "INSERT INTO tasks (id, title, status) VALUES ('US-001', 'Test Task', 'todo')",
+        [],
+    )
+    .unwrap();
+
+    // Now apply v6
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 6);
+
+    // Verify existing task has NULL for new columns
+    let (model, difficulty, escalation_note): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT model, difficulty, escalation_note FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(model, None, "model should default to NULL");
+    assert_eq!(difficulty, None, "difficulty should default to NULL");
+    assert_eq!(
+        escalation_note, None,
+        "escalation_note should default to NULL"
+    );
+}
+
+#[test]
+fn test_migration_v6_down_reverts_to_v5() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 6);
+
+    // Migrate down from v6
+    migrate_down(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(
+        version, 5,
+        "schema_version should revert to 5 after v6 down"
+    );
+}
+
+#[test]
+fn test_migration_v6_columns_writable_after_migration() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    // Insert a task with model selection fields
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, model, difficulty, escalation_note) VALUES ('US-001', 'Test', 'todo', 'claude-sonnet-4-6', 'high', 'Previous attempt failed')",
+        [],
+    )
+    .unwrap();
+
+    // Verify values are stored and retrievable
+    let (model, difficulty, escalation_note): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT model, difficulty, escalation_note FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(model, Some("claude-sonnet-4-6".to_string()));
+    assert_eq!(difficulty, Some("high".to_string()));
+    assert_eq!(escalation_note, Some("Previous attempt failed".to_string()));
+}
+
+#[test]
+fn test_migration_v6_default_model_writable_on_prd_metadata() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    // Insert prd_metadata with default_model
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, default_model) VALUES (1, 'test', 'claude-haiku-4-5-20251001')",
+        [],
+    )
+    .unwrap();
+
+    let default_model: Option<String> = conn
+        .query_row(
+            "SELECT default_model FROM prd_metadata WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(default_model, Some("claude-haiku-4-5-20251001".to_string()));
 }

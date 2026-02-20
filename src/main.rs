@@ -684,11 +684,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             let conn = open_connection(&cli.dir)?;
 
             let output = std::fs::read_to_string(&from_output).map_err(|e| {
-                TaskMgrError::io_error(
-                    from_output.display().to_string(),
-                    "reading output file",
-                    e,
-                )
+                TaskMgrError::io_error(from_output.display().to_string(), "reading output file", e)
             })?;
 
             let result = task_mgr::learnings::ingestion::extract_learnings_from_output(
