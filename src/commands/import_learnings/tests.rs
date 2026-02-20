@@ -5,6 +5,7 @@ use std::fs;
 use tempfile::TempDir;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use rstest::rstest;
 
 use super::{
     compute_dedup_key, format_text, import_learnings, parse_learnings, ImportLearningsResult,
@@ -12,6 +13,7 @@ use super::{
 use crate::db::migrations;
 use crate::db::open_connection;
 use crate::db::schema;
+use crate::error::TaskMgrError;
 use crate::models::{Confidence, LearningExport, LearningOutcome, ProgressExport};
 
 /// Set up a test database with schema and migrations.
@@ -623,4 +625,483 @@ fn test_format_text_no_stats_line_when_zero_imported() {
     // No stats line when nothing was imported and not resetting
     assert!(!text.contains("preserved"));
     assert!(!text.contains("reset"));
+}
+
+// --- AC1: Error test: invalid JSON returns meaningful error ---
+
+#[test]
+fn test_import_invalid_json_returns_meaningful_error() {
+    let (dir, _conn) = setup_test_db();
+    let import_file = dir.path().join("bad.json");
+    fs::write(&import_file, "not json {{{").unwrap();
+
+    let err = import_learnings(dir.path(), &import_file, false).unwrap_err();
+    let msg = err.to_string();
+    // Error message should mention the format expectation, not be opaque
+    assert!(
+        msg.contains("JSON format") || msg.contains("unrecognized"),
+        "Error should indicate JSON format issue, got: {msg}"
+    );
+}
+
+// --- AC2: Error test: nonexistent file returns IoError ---
+
+#[test]
+fn test_import_nonexistent_file_returns_io_error() {
+    let (dir, _conn) = setup_test_db();
+    let missing = dir.path().join("does_not_exist.json");
+
+    let err = import_learnings(dir.path(), &missing, false).unwrap_err();
+    assert!(
+        matches!(err, TaskMgrError::IoErrorWithContext { .. }),
+        "Expected IoErrorWithContext, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does_not_exist.json"),
+        "Error should mention the file path, got: {msg}"
+    );
+}
+
+// --- AC3: Parameterized LearningOutcome round-trip ---
+
+#[rstest]
+#[case(LearningOutcome::Pattern, "pattern")]
+#[case(LearningOutcome::Failure, "failure")]
+#[case(LearningOutcome::Workaround, "workaround")]
+#[case(LearningOutcome::Success, "success")]
+fn test_outcome_roundtrip(#[case] outcome: LearningOutcome, #[case] expected_db: &str) {
+    let (dir, _conn) = setup_test_db();
+
+    let mut learning = LearningExport::new(outcome, "Outcome Test", "Content");
+    learning.title = format!("Outcome {expected_db}");
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    import_learnings(dir.path(), &import_file, false).unwrap();
+
+    let conn = open_connection(dir.path()).unwrap();
+    let db_outcome: String = conn
+        .query_row(
+            "SELECT outcome FROM learnings WHERE title = ?1",
+            rusqlite::params![format!("Outcome {expected_db}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(db_outcome, expected_db);
+}
+
+// --- AC4: Parameterized Confidence round-trip ---
+
+#[rstest]
+#[case(Confidence::High, "high")]
+#[case(Confidence::Medium, "medium")]
+#[case(Confidence::Low, "low")]
+fn test_confidence_roundtrip(#[case] confidence: Confidence, #[case] expected_db: &str) {
+    let (dir, _conn) = setup_test_db();
+
+    let mut learning = make_learning("Confidence Test", "Content");
+    learning.confidence = confidence;
+    learning.title = format!("Confidence {expected_db}");
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    import_learnings(dir.path(), &import_file, false).unwrap();
+
+    let conn = open_connection(dir.path()).unwrap();
+    let db_confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM learnings WHERE title = ?1",
+            rusqlite::params![format!("Confidence {expected_db}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(db_confidence, expected_db);
+}
+
+// --- AC6: Boundary: all optional fields None ---
+
+#[test]
+fn test_import_learning_all_optional_fields_none() {
+    let (dir, _conn) = setup_test_db();
+
+    // make_learning creates minimal learning with all optionals None
+    let learning = make_learning("Minimal", "Only required fields");
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    assert_eq!(result.learnings_imported, 1);
+
+    let conn = open_connection(dir.path()).unwrap();
+    let (root_cause, solution, applies_files, applies_tasks, applies_errors): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT root_cause, solution, applies_to_files, applies_to_task_types, \
+             applies_to_errors FROM learnings WHERE title = ?1",
+            rusqlite::params!["Minimal"],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    assert!(root_cause.is_none(), "root_cause should be None");
+    assert!(solution.is_none(), "solution should be None");
+    assert!(applies_files.is_none(), "applies_to_files should be None");
+    assert!(
+        applies_tasks.is_none(),
+        "applies_to_task_types should be None"
+    );
+    assert!(applies_errors.is_none(), "applies_to_errors should be None");
+}
+
+// --- AC7: Boundary: all optional fields populated ---
+
+#[test]
+fn test_import_learning_all_optional_fields_populated() {
+    let (dir, _conn) = setup_test_db();
+
+    let mut learning = make_learning("Maximal", "All fields set");
+    learning.outcome = LearningOutcome::Workaround;
+    learning.confidence = Confidence::Low;
+    learning.root_cause = Some("The root cause".to_string());
+    learning.solution = Some("The solution".to_string());
+    learning.applies_to_files = Some(vec!["src/*.rs".to_string(), "tests/**/*.rs".to_string()]);
+    learning.applies_to_task_types = Some(vec!["FIX-".to_string(), "US-".to_string()]);
+    learning.applies_to_errors = Some(vec!["E0277".to_string(), "E0308".to_string()]);
+    learning.tags = vec![
+        "rust".to_string(),
+        "testing".to_string(),
+        "edge".to_string(),
+    ];
+    learning.times_shown = 42;
+    learning.times_applied = 7;
+    learning.last_shown_at = Some(fixed_datetime("2026-02-10 14:30:00"));
+    learning.last_applied_at = Some(fixed_datetime("2026-02-09 09:15:00"));
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    assert_eq!(result.learnings_imported, 1);
+    assert_eq!(result.tags_imported, 3);
+
+    let conn = open_connection(dir.path()).unwrap();
+
+    // Verify all fields in DB
+    let (outcome, confidence, root_cause, solution): (String, String, String, String) = conn
+        .query_row(
+            "SELECT outcome, confidence, root_cause, solution FROM learnings WHERE title = ?1",
+            rusqlite::params!["Maximal"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "workaround");
+    assert_eq!(confidence, "low");
+    assert_eq!(root_cause, "The root cause");
+    assert_eq!(solution, "The solution");
+
+    // Verify JSON array fields
+    let (files_json, tasks_json, errors_json): (String, String, String) = conn
+        .query_row(
+            "SELECT applies_to_files, applies_to_task_types, applies_to_errors \
+             FROM learnings WHERE title = ?1",
+            rusqlite::params!["Maximal"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let files: Vec<String> = serde_json::from_str(&files_json).unwrap();
+    let tasks: Vec<String> = serde_json::from_str(&tasks_json).unwrap();
+    let errors: Vec<String> = serde_json::from_str(&errors_json).unwrap();
+    assert_eq!(files, vec!["src/*.rs", "tests/**/*.rs"]);
+    assert_eq!(tasks, vec!["FIX-", "US-"]);
+    assert_eq!(errors, vec!["E0277", "E0308"]);
+
+    // Verify tags
+    let tag_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learning_tags lt JOIN learnings l ON lt.learning_id = l.id \
+             WHERE l.title = ?1",
+            rusqlite::params!["Maximal"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tag_count, 3);
+
+    // Verify preserved stats
+    let (shown, applied, last_shown, last_applied): (i32, i32, String, String) = conn
+        .query_row(
+            "SELECT times_shown, times_applied, last_shown_at, last_applied_at \
+             FROM learnings WHERE title = ?1",
+            rusqlite::params!["Maximal"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(shown, 42);
+    assert_eq!(applied, 7);
+    assert_eq!(last_shown, "2026-02-10 14:30:00");
+    assert_eq!(last_applied, "2026-02-09 09:15:00");
+}
+
+// --- AC8: Round-trip: export learnings, import to fresh DB, compare field-by-field ---
+
+/// Read a learning back from DB as a struct for round-trip comparison.
+/// Uses SQL directly to avoid dependency on export module.
+fn read_learning_from_db(conn: &rusqlite::Connection, title: &str) -> LearningExport {
+    let (
+        outcome_str,
+        confidence_str,
+        content,
+        root_cause,
+        solution,
+        files_json,
+        tasks_json,
+        errors_json,
+        times_shown,
+        times_applied,
+        last_shown,
+        last_applied,
+    ): (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i32,
+        i32,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT outcome, confidence, content, root_cause, solution, \
+             applies_to_files, applies_to_task_types, applies_to_errors, \
+             times_shown, times_applied, last_shown_at, last_applied_at \
+             FROM learnings WHERE title = ?1",
+            rusqlite::params![title],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM learnings WHERE title = ?1",
+            rusqlite::params![title],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // Load tags
+    let mut stmt = conn
+        .prepare("SELECT tag FROM learning_tags WHERE learning_id = ?1 ORDER BY tag")
+        .unwrap();
+    let tags: Vec<String> = stmt
+        .query_map(rusqlite::params![id], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let outcome = std::str::FromStr::from_str(&outcome_str).unwrap();
+    let confidence = std::str::FromStr::from_str(&confidence_str).unwrap();
+    let applies_to_files: Option<Vec<String>> =
+        files_json.and_then(|s| serde_json::from_str(&s).ok());
+    let applies_to_task_types: Option<Vec<String>> =
+        tasks_json.and_then(|s| serde_json::from_str(&s).ok());
+    let applies_to_errors: Option<Vec<String>> =
+        errors_json.and_then(|s| serde_json::from_str(&s).ok());
+    let last_shown_at = last_shown.map(|s| {
+        let naive = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").unwrap();
+        DateTime::from_naive_utc_and_offset(naive, Utc)
+    });
+    let last_applied_at = last_applied.map(|s| {
+        let naive = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").unwrap();
+        DateTime::from_naive_utc_and_offset(naive, Utc)
+    });
+
+    let mut export = LearningExport::new(outcome, title, content);
+    export.confidence = confidence;
+    export.root_cause = root_cause;
+    export.solution = solution;
+    export.applies_to_files = applies_to_files;
+    export.applies_to_task_types = applies_to_task_types;
+    export.applies_to_errors = applies_to_errors;
+    export.times_shown = times_shown;
+    export.times_applied = times_applied;
+    export.last_shown_at = last_shown_at;
+    export.last_applied_at = last_applied_at;
+    export.tags = tags;
+    export
+}
+
+#[test]
+fn test_roundtrip_export_import_field_by_field() {
+    // 1. Import to source DB
+    let (src_dir, _conn) = setup_test_db();
+
+    let mut learning = make_learning("Round Trip", "Round-trip fidelity test");
+    learning.outcome = LearningOutcome::Workaround;
+    learning.confidence = Confidence::High;
+    learning.root_cause = Some("RC".to_string());
+    learning.solution = Some("SOL".to_string());
+    learning.applies_to_files = Some(vec!["src/lib.rs".to_string()]);
+    learning.applies_to_task_types = Some(vec!["TEST-".to_string()]);
+    learning.applies_to_errors = Some(vec!["E0001".to_string()]);
+    learning.tags = vec!["roundtrip".to_string()];
+    learning.times_shown = 15;
+    learning.times_applied = 3;
+    learning.last_shown_at = Some(fixed_datetime("2026-02-01 12:00:00"));
+    learning.last_applied_at = Some(fixed_datetime("2026-01-31 18:00:00"));
+
+    let original = learning.clone();
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = src_dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    import_learnings(src_dir.path(), &import_file, false).unwrap();
+
+    // 2. Read back from source DB and serialize to JSON (simulates export)
+    let src_conn = open_connection(src_dir.path()).unwrap();
+    let exported = read_learning_from_db(&src_conn, "Round Trip");
+    let exported_json = serde_json::to_string_pretty(&[&exported]).unwrap();
+    drop(src_conn);
+
+    // 3. Import serialized data to fresh DB
+    let (dst_dir, _conn2) = setup_test_db();
+    let export_file = dst_dir.path().join("exported.json");
+    fs::write(&export_file, &exported_json).unwrap();
+    import_learnings(dst_dir.path(), &export_file, false).unwrap();
+
+    // 4. Read back from destination DB and compare field-by-field
+    let dst_conn = open_connection(dst_dir.path()).unwrap();
+    let reimported = read_learning_from_db(&dst_conn, "Round Trip");
+
+    // Field-by-field comparison against original input
+    assert_eq!(reimported.outcome, original.outcome, "outcome mismatch");
+    assert_eq!(reimported.title, original.title, "title mismatch");
+    assert_eq!(reimported.content, original.content, "content mismatch");
+    assert_eq!(
+        reimported.root_cause, original.root_cause,
+        "root_cause mismatch"
+    );
+    assert_eq!(reimported.solution, original.solution, "solution mismatch");
+    assert_eq!(
+        reimported.applies_to_files, original.applies_to_files,
+        "applies_to_files mismatch"
+    );
+    assert_eq!(
+        reimported.applies_to_task_types, original.applies_to_task_types,
+        "applies_to_task_types mismatch"
+    );
+    assert_eq!(
+        reimported.applies_to_errors, original.applies_to_errors,
+        "applies_to_errors mismatch"
+    );
+    assert_eq!(
+        reimported.confidence, original.confidence,
+        "confidence mismatch"
+    );
+    assert_eq!(reimported.tags, original.tags, "tags mismatch");
+    assert_eq!(
+        reimported.times_shown, original.times_shown,
+        "times_shown mismatch"
+    );
+    assert_eq!(
+        reimported.times_applied, original.times_applied,
+        "times_applied mismatch"
+    );
+    assert_eq!(
+        reimported.last_shown_at, original.last_shown_at,
+        "last_shown_at mismatch"
+    );
+    assert_eq!(
+        reimported.last_applied_at, original.last_applied_at,
+        "last_applied_at mismatch"
+    );
+}
+
+// --- AC9: Stats round-trip with export/import and reset_stats=false ---
+
+#[test]
+fn test_stats_roundtrip_via_export_import() {
+    let (dir, _conn) = setup_test_db();
+
+    // Import learning with stats
+    let mut learning = make_learning("Stats RT", "Stats round-trip test");
+    learning.times_shown = 20;
+    learning.times_applied = 8;
+    learning.last_shown_at = Some(fixed_datetime("2026-02-15 10:00:00"));
+    learning.last_applied_at = Some(fixed_datetime("2026-02-14 16:00:00"));
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+    import_learnings(dir.path(), &import_file, false).unwrap();
+
+    // Read back, serialize, then import to fresh DB (simulates export→import round-trip)
+    let conn = open_connection(dir.path()).unwrap();
+    let exported = read_learning_from_db(&conn, "Stats RT");
+    let exported_json = serde_json::to_string_pretty(&[&exported]).unwrap();
+    drop(conn);
+
+    // Import to fresh DB with reset_stats=false
+    let (dir2, _conn2) = setup_test_db();
+    let export_file = dir2.path().join("exported.json");
+    fs::write(&export_file, &exported_json).unwrap();
+    let result = import_learnings(dir2.path(), &export_file, false).unwrap();
+    assert!(!result.stats_reset);
+
+    // Verify stats match original
+    let conn2 = open_connection(dir2.path()).unwrap();
+    let reimported = read_learning_from_db(&conn2, "Stats RT");
+    assert_eq!(reimported.times_shown, 20);
+    assert_eq!(reimported.times_applied, 8);
+    assert_eq!(
+        reimported.last_shown_at,
+        Some(fixed_datetime("2026-02-15 10:00:00"))
+    );
+    assert_eq!(
+        reimported.last_applied_at,
+        Some(fixed_datetime("2026-02-14 16:00:00"))
+    );
 }
