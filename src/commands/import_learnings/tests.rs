@@ -358,6 +358,32 @@ fn test_import_does_not_carry_run_id() {
     assert!(run_id.is_none());
 }
 
+#[test]
+fn test_import_does_not_carry_task_id() {
+    let (dir, _conn) = setup_test_db();
+
+    let mut learning = make_learning("No TaskID", "Content");
+    learning.task_id = Some("old-task-123".to_string());
+
+    let learnings = vec![learning];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let import_file = dir.path().join("import.json");
+    fs::write(&import_file, &json).unwrap();
+
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
+
+    // Verify task_id is NULL in DB (not carried over to avoid FK violations)
+    let conn = open_connection(dir.path()).unwrap();
+    let task_id: Option<String> = conn
+        .query_row(
+            "SELECT task_id FROM learnings WHERE title = ?1",
+            rusqlite::params!["No TaskID"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(task_id.is_none());
+}
+
 // --- format_text tests ---
 
 #[test]
