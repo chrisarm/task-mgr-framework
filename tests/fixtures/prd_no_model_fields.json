@@ -1,0 +1,41 @@
+{
+  "branchName": "feature/no-model",
+  "description": "PRD with no model fields at all - backward compatibility test.",
+  "project": "no-model-project",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "AC-1"
+      ],
+      "dependsOn": [],
+      "description": "Legacy task without model fields.",
+      "id": "NM-001",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Legacy task one",
+      "touchesFiles": [
+        "src/legacy.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "AC-2"
+      ],
+      "dependsOn": [
+        "NM-001"
+      ],
+      "description": "Another legacy task.",
+      "id": "NM-002",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Legacy task two",
+      "touchesFiles": []
+    }
+  ]
+}
