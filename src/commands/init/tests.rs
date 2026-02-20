@@ -1446,24 +1446,21 @@ fn test_parse_escalation_note_camel_case_works() {
 }
 
 #[test]
-fn test_parse_prd_file_with_default_model() {
+fn test_parse_prd_file_with_model() {
     let json = r#"{
         "project": "test",
-        "defaultModel": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5-20251001",
         "userStories": [
             {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
         ]
     }"#;
 
     let prd: super::parse::PrdFile = serde_json::from_str(json).unwrap();
-    assert_eq!(
-        prd.default_model,
-        Some("claude-haiku-4-5-20251001".to_string())
-    );
+    assert_eq!(prd.model, Some("claude-haiku-4-5-20251001".to_string()));
 }
 
 #[test]
-fn test_parse_prd_file_backward_compat_without_default_model() {
+fn test_parse_prd_file_backward_compat_without_model() {
     let json = r#"{
         "project": "test",
         "userStories": [
@@ -1472,10 +1469,7 @@ fn test_parse_prd_file_backward_compat_without_default_model() {
     }"#;
 
     let prd: super::parse::PrdFile = serde_json::from_str(json).unwrap();
-    assert_eq!(
-        prd.default_model, None,
-        "default_model should default to None"
-    );
+    assert_eq!(prd.model, None, "model should default to None");
 }
 
 #[test]
@@ -1564,11 +1558,11 @@ fn test_insert_task_without_model_fields_stores_null() {
 }
 
 #[test]
-fn test_insert_prd_metadata_with_default_model() {
+fn test_insert_prd_metadata_with_model() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
         "project": "model-test",
-        "defaultModel": "claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
         "userStories": [
             {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
         ]

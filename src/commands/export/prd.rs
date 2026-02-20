@@ -73,7 +73,7 @@ pub struct ExportedPrd {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_guidelines: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_model: Option<String>,
+    pub model: Option<String>,
     pub user_stories: Vec<ExportedUserStory>,
 }
 

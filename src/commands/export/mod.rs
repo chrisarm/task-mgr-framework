@@ -92,7 +92,7 @@ pub fn export(
         priority_philosophy: metadata.priority_philosophy,
         global_acceptance_criteria: metadata.global_acceptance_criteria,
         review_guidelines: metadata.review_guidelines,
-        default_model: metadata.default_model,
+        model: metadata.default_model,
         user_stories: tasks,
     };
 

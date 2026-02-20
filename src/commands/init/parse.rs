@@ -66,5 +66,5 @@ pub struct PrdFile {
     #[serde(default)]
     pub task_prefix: Option<String>,
     #[serde(default)]
-    pub default_model: Option<String>,
+    pub model: Option<String>,
 }

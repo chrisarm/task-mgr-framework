@@ -301,7 +301,7 @@ pub fn init(
                 user_stories: Vec::new(), // We'll collect stories separately
                 external_git_repo: prd.external_git_repo.clone(),
                 task_prefix: resolved_prefix.clone().or(prd.task_prefix.clone()),
-                default_model: prd.default_model.clone(),
+                model: prd.model.clone(),
             });
         }
 

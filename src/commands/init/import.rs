@@ -109,7 +109,7 @@ pub fn insert_prd_metadata(
             raw_json,
             prd.external_git_repo,
             prd.task_prefix,
-            prd.default_model,
+            prd.model,
         ],
     )?;
 

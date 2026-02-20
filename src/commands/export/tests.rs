@@ -447,7 +447,7 @@ fn test_round_trip_preserves_model_fields() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
         "project": "round-trip-test",
-        "defaultModel": "claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
         "userStories": [
             {
                 "id": "US-001",
@@ -490,11 +490,11 @@ fn test_round_trip_preserves_model_fields() {
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
 
-    // Verify PRD-level default_model preserved
+    // Verify PRD-level model preserved
     assert_eq!(
-        exported.default_model,
+        exported.model,
         Some("claude-sonnet-4-6".to_string()),
-        "default_model should survive round-trip"
+        "model should survive round-trip"
     );
 
     // Verify US-001 model fields preserved
@@ -573,7 +573,7 @@ fn test_export_preserves_model_fields_in_json_format() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
         "project": "json-format-test",
-        "defaultModel": "claude-haiku-4-5-20251001",
+        "model": "claude-haiku-4-5-20251001",
         "userStories": [
             {
                 "id": "US-001",
@@ -611,7 +611,7 @@ fn test_export_preserves_model_fields_in_json_format() {
         "exported JSON should use camelCase escalationNote"
     );
     assert!(
-        exported_json.contains("\"defaultModel\""),
-        "exported JSON should use camelCase defaultModel"
+        exported_json.contains("\"model\""),
+        "exported JSON should contain model field"
     );
 }
