@@ -7,13 +7,19 @@ use tempfile::TempDir;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rstest::rstest;
 
+use clap::CommandFactory;
+
 use super::{
     compute_dedup_key, format_text, import_learnings, parse_learnings, ImportLearningsResult,
 };
+use crate::cli::Cli;
+use crate::commands::export::export as export_cmd;
+use crate::commands::init::{init, PrefixMode};
 use crate::db::migrations;
 use crate::db::open_connection;
 use crate::db::schema;
 use crate::error::TaskMgrError;
+use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{Confidence, LearningExport, LearningOutcome, ProgressExport};
 
 /// Set up a test database with schema and migrations.
@@ -1059,7 +1065,7 @@ fn test_roundtrip_export_import_field_by_field() {
     );
 }
 
-// --- AC9: Stats round-trip with export/import and reset_stats=false ---
+// --- AC9: Stats round-trip via export/import with reset_stats=false ---
 
 #[test]
 fn test_stats_roundtrip_via_export_import() {
@@ -1103,5 +1109,266 @@ fn test_stats_roundtrip_via_export_import() {
     assert_eq!(
         reimported.last_applied_at,
         Some(fixed_datetime("2026-02-14 16:00:00"))
+    );
+}
+
+// --- INT-001: E2E integration tests ---
+
+/// Create a minimal PRD JSON file for E2E tests.
+fn create_minimal_prd(dir: &std::path::Path) -> std::path::PathBuf {
+    let prd = r#"{
+  "project": "e2e-test",
+  "branchName": "test/e2e",
+  "description": "E2E integration test PRD",
+  "userStories": [
+    {
+      "id": "T-001",
+      "title": "Test task",
+      "description": "A task for E2E testing",
+      "acceptanceCriteria": ["Test passes"],
+      "priority": 1,
+      "passes": false
+    }
+  ]
+}"#;
+    let path = dir.join("prd.json");
+    fs::write(&path, prd).unwrap();
+    path
+}
+
+/// E2E test: init PRD → record learning → export --learnings-file → import to fresh DB → verify field-by-field.
+#[test]
+fn test_e2e_init_learn_export_import_roundtrip() {
+    // 1. Set up source: init PRD + record a learning with all fields
+    let src_dir = TempDir::new().unwrap();
+    let prd_path = create_minimal_prd(src_dir.path());
+
+    init(
+        src_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // 2. Record a learning with all fields populated (simulates `learn` command)
+    let conn = open_connection(src_dir.path()).unwrap();
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Workaround,
+        title: "E2E Round-Trip Learning".to_string(),
+        content: "This learning tests the full export-import pipeline".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: Some("The root cause of the issue".to_string()),
+        solution: Some("The applied solution".to_string()),
+        applies_to_files: Some(vec!["src/**/*.rs".to_string(), "tests/*.rs".to_string()]),
+        applies_to_task_types: Some(vec!["FIX-".to_string(), "US-".to_string()]),
+        applies_to_errors: Some(vec!["E0277".to_string()]),
+        tags: Some(vec!["e2e".to_string(), "roundtrip".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Manually set stats to simulate bandit usage (record_learning starts at 0)
+    conn.execute(
+        "UPDATE learnings SET times_shown = 25, times_applied = 12, \
+         last_shown_at = '2026-02-10 14:30:00', last_applied_at = '2026-02-09 09:15:00' \
+         WHERE title = 'E2E Round-Trip Learning'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // 3. Export with --learnings-file (simulates `export --learnings-file`)
+    let export_json = src_dir.path().join("export.json");
+    let learnings_file = src_dir.path().join("learnings.json");
+    let export_result =
+        export_cmd(src_dir.path(), &export_json, false, Some(&learnings_file)).unwrap();
+    assert_eq!(export_result.learnings_exported, Some(1));
+
+    // 4. Import to fresh DB (simulates `import-learnings --from-json`)
+    let (dst_dir, dst_conn) = setup_test_db();
+    drop(dst_conn); // Release connection before import_learnings opens its own
+    let import_result = import_learnings(dst_dir.path(), &learnings_file, false).unwrap();
+    assert_eq!(import_result.learnings_imported, 1);
+    assert_eq!(import_result.learnings_skipped, 0);
+    assert!(!import_result.stats_reset);
+
+    // 5. Verify field-by-field match
+    let dst_conn = open_connection(dst_dir.path()).unwrap();
+    let imported = read_learning_from_db(&dst_conn, "E2E Round-Trip Learning");
+
+    assert_eq!(imported.outcome, LearningOutcome::Workaround, "outcome");
+    assert_eq!(imported.title, "E2E Round-Trip Learning", "title");
+    assert_eq!(
+        imported.content, "This learning tests the full export-import pipeline",
+        "content"
+    );
+    assert_eq!(imported.confidence, Confidence::High, "confidence");
+    assert_eq!(
+        imported.root_cause,
+        Some("The root cause of the issue".to_string()),
+        "root_cause"
+    );
+    assert_eq!(
+        imported.solution,
+        Some("The applied solution".to_string()),
+        "solution"
+    );
+    assert_eq!(
+        imported.applies_to_files,
+        Some(vec!["src/**/*.rs".to_string(), "tests/*.rs".to_string()]),
+        "applies_to_files"
+    );
+    assert_eq!(
+        imported.applies_to_task_types,
+        Some(vec!["FIX-".to_string(), "US-".to_string()]),
+        "applies_to_task_types"
+    );
+    assert_eq!(
+        imported.applies_to_errors,
+        Some(vec!["E0277".to_string()]),
+        "applies_to_errors"
+    );
+    assert_eq!(
+        imported.tags,
+        vec!["e2e".to_string(), "roundtrip".to_string()],
+        "tags"
+    );
+    // Stats should be preserved (reset_stats=false)
+    assert_eq!(imported.times_shown, 25, "times_shown");
+    assert_eq!(imported.times_applied, 12, "times_applied");
+    assert_eq!(
+        imported.last_shown_at,
+        Some(fixed_datetime("2026-02-10 14:30:00")),
+        "last_shown_at"
+    );
+    assert_eq!(
+        imported.last_applied_at,
+        Some(fixed_datetime("2026-02-09 09:15:00")),
+        "last_applied_at"
+    );
+}
+
+/// E2E test: same flow with --reset-stats → verify stats are zeroed but fields preserved.
+#[test]
+fn test_e2e_export_import_roundtrip_with_reset_stats() {
+    // 1. Set up source: init PRD + record a learning with stats
+    let src_dir = TempDir::new().unwrap();
+    let prd_path = create_minimal_prd(src_dir.path());
+
+    init(
+        src_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(src_dir.path()).unwrap();
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Success,
+        title: "Stats Reset Learning".to_string(),
+        content: "Verify stats are zeroed on import with --reset-stats".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: Some("A solution".to_string()),
+        applies_to_files: Some(vec!["*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["reset".to_string()]),
+        confidence: Confidence::Medium,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Set non-zero stats
+    conn.execute(
+        "UPDATE learnings SET times_shown = 50, times_applied = 20, \
+         last_shown_at = '2026-01-20 08:00:00', last_applied_at = '2026-01-19 16:00:00' \
+         WHERE title = 'Stats Reset Learning'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // 2. Export
+    let export_json = src_dir.path().join("export.json");
+    let learnings_file = src_dir.path().join("learnings.json");
+    export_cmd(src_dir.path(), &export_json, false, Some(&learnings_file)).unwrap();
+
+    // 3. Import with --reset-stats to fresh DB
+    let (dst_dir, dst_conn) = setup_test_db();
+    drop(dst_conn);
+    let import_result = import_learnings(dst_dir.path(), &learnings_file, true).unwrap();
+    assert_eq!(import_result.learnings_imported, 1);
+    assert!(import_result.stats_reset);
+
+    // 4. Verify non-stat fields are preserved
+    let dst_conn = open_connection(dst_dir.path()).unwrap();
+    let imported = read_learning_from_db(&dst_conn, "Stats Reset Learning");
+
+    assert_eq!(imported.outcome, LearningOutcome::Success, "outcome");
+    assert_eq!(
+        imported.content, "Verify stats are zeroed on import with --reset-stats",
+        "content"
+    );
+    assert_eq!(imported.confidence, Confidence::Medium, "confidence");
+    assert_eq!(
+        imported.solution,
+        Some("A solution".to_string()),
+        "solution"
+    );
+    assert_eq!(
+        imported.applies_to_files,
+        Some(vec!["*.rs".to_string()]),
+        "applies_to_files"
+    );
+    assert_eq!(imported.tags, vec!["reset".to_string()], "tags");
+
+    // Stats should be zeroed
+    assert_eq!(imported.times_shown, 0, "times_shown should be 0");
+    assert_eq!(imported.times_applied, 0, "times_applied should be 0");
+    assert!(
+        imported.last_shown_at.is_none(),
+        "last_shown_at should be None"
+    );
+    assert!(
+        imported.last_applied_at.is_none(),
+        "last_applied_at should be None"
+    );
+}
+
+/// CLI verification: import-learnings --help does not contain 'learnings-only'.
+#[test]
+fn test_cli_help_does_not_contain_learnings_only() {
+    let cmd = Cli::command();
+    let subcmd = cmd
+        .find_subcommand("import-learnings")
+        .expect("import-learnings subcommand should exist");
+
+    // Verify no argument has the name 'learnings-only'
+    for arg in subcmd.get_arguments() {
+        if let Some(long) = arg.get_long() {
+            assert_ne!(
+                long, "learnings-only",
+                "import-learnings should not have --learnings-only arg"
+            );
+        }
+    }
+
+    // Also verify help text doesn't mention it
+    let mut help_buf = Vec::new();
+    subcmd.clone().write_help(&mut help_buf).unwrap();
+    let help_text = String::from_utf8(help_buf).unwrap();
+    assert!(
+        !help_text.contains("learnings-only"),
+        "import-learnings --help should not mention 'learnings-only', got:\n{help_text}"
     );
 }
