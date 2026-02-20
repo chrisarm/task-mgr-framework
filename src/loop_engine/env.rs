@@ -1713,11 +1713,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "blocks on stdin read — requires interactive terminal"]
     fn test_ensure_branch_interactive_mode_declined_returns_error() {
-        // In interactive mode (yes_mode=false), if we can't read stdin (e.g., in tests),
-        // the prompt_user_yn call will fail. This verifies the error path is hit.
-        // Note: We can't easily mock stdin, but we can verify the code path doesn't panic
-        // and returns an appropriate error for non-matching branches.
+        // In interactive mode (yes_mode=false), prompt_user_yn reads from stdin,
+        // which blocks indefinitely in non-interactive test environments.
         let tmp = setup_git_repo();
 
         // Create a branch so there's something to switch to
