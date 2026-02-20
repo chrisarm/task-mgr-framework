@@ -12,6 +12,7 @@ pub mod display;
 pub mod engine;
 pub mod env;
 pub mod feedback;
+pub mod model;
 pub mod monitor;
 pub mod oauth;
 pub mod progress;
