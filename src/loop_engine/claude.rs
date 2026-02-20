@@ -272,6 +272,7 @@ fn watchdog_loop(_child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // --- AC: ClaudeResult struct has expected fields ---
 
@@ -743,6 +744,167 @@ mod tests {
         assert!(
             output.contains("--model claude-opus-4-6"),
             "Must have --model flag, got: '{}'",
+            output
+        );
+    }
+
+    // --- TEST-001: Comprehensive tests for spawn_claude model flag ---
+    //
+    // Parameterized coverage, flag interaction, and robustness beyond TEST-INIT-001.
+
+    /// AC: Parameterized tests for multiple model strings (opus, sonnet, haiku, custom).
+    /// Verifies each model string produces correct --model <name> before -p.
+    #[rstest]
+    #[case("claude-opus-4-6")]
+    #[case("claude-sonnet-4-6")]
+    #[case("claude-haiku-4-5-20251001")]
+    #[case("my-custom-model")]
+    fn test_spawn_claude_model_variants(#[case] model: &str) {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test prompt", None, None, Some(model));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        let res = result.expect("echo should succeed");
+        let output = res.output.trim();
+
+        // --model <name> present
+        let expected = format!("--model {}", model);
+        assert!(
+            output.contains(&expected),
+            "Output should contain '{}', got: '{}'",
+            expected,
+            output
+        );
+
+        // --model before -p
+        let model_pos = output.find("--model").expect("--model should be in output");
+        let p_pos = output.find(" -p ").expect("-p should be in output");
+        assert!(
+            model_pos < p_pos,
+            "--model (pos {}) must appear before -p (pos {}) for model '{}', output: '{}'",
+            model_pos,
+            p_pos,
+            model,
+            output
+        );
+    }
+
+    /// AC: Model strings with hyphens, underscores, and dots pass through correctly.
+    #[rstest]
+    #[case("model-with-hyphens")]
+    #[case("model_with_underscores")]
+    #[case("model.with.dots")]
+    #[case("model-with_mixed.chars-v2")]
+    fn test_spawn_claude_model_special_chars(#[case] model: &str) {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test prompt", None, None, Some(model));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        let res = result.expect("echo should succeed");
+        let output = res.output.trim();
+
+        let expected = format!("--model {}", model);
+        assert!(
+            output.contains(&expected),
+            "Model '{}' should pass through verbatim, got: '{}'",
+            model,
+            output
+        );
+    }
+
+    /// AC: --model does not interfere with --dangerously-skip-permissions or --print flags.
+    /// Verifies exact ordering: --print --dangerously-skip-permissions --model <m> -p <prompt>
+    #[rstest]
+    #[case(Some("claude-sonnet-4-6"))]
+    #[case(None)]
+    fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("my prompt", None, None, model);
+        std::env::remove_var("CLAUDE_BINARY");
+
+        let res = result.expect("echo should succeed");
+        let output = res.output.trim();
+
+        // --print always first
+        assert!(
+            output.starts_with("--print"),
+            "--print should be first arg, got: '{}'",
+            output
+        );
+
+        // --dangerously-skip-permissions always present after --print
+        let print_pos = output.find("--print").unwrap();
+        let dsp_pos = output
+            .find("--dangerously-skip-permissions")
+            .expect("--dangerously-skip-permissions must be present");
+        assert!(
+            dsp_pos > print_pos,
+            "--dangerously-skip-permissions should follow --print"
+        );
+
+        // -p always present and prompt follows
+        let p_pos = output.find(" -p ").expect("-p must be present");
+        assert!(
+            output[p_pos..].contains("my prompt"),
+            "Prompt should follow -p flag, got: '{}'",
+            output
+        );
+
+        // If model is present, it must be between --dangerously-skip-permissions and -p
+        if let Some(m) = model {
+            let model_pos = output
+                .find("--model")
+                .expect("--model must be present when model is Some");
+            assert!(
+                model_pos > dsp_pos && model_pos < p_pos,
+                "--model (pos {}) must be between --dangerously-skip-permissions (pos {}) and -p (pos {}), got: '{}'",
+                model_pos,
+                dsp_pos,
+                p_pos,
+                output
+            );
+            assert!(
+                output.contains(&format!("--model {}", m)),
+                "Model value should be correct"
+            );
+        }
+    }
+
+    /// AC: None model produces identical args to pre-Phase-2 behavior.
+    /// Exact string comparison to verify no extra args are added.
+    #[test]
+    fn test_spawn_claude_none_model_identical_to_pre_phase2() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("my prompt text", None, None, None);
+        std::env::remove_var("CLAUDE_BINARY");
+
+        let res = result.expect("echo should succeed");
+        let output = res.output.trim();
+
+        // Pre-Phase-2 behavior: exactly these args, no more
+        assert_eq!(
+            output, "--print --dangerously-skip-permissions -p my prompt text",
+            "None model must produce identical args to pre-Phase-2 behavior"
+        );
+    }
+
+    /// Edge case: whitespace-only model string treated as None.
+    #[rstest]
+    #[case("   ")]
+    #[case("\t")]
+    #[case(" \t ")]
+    fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test prompt", None, None, Some(model));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        let res = result.expect("echo should succeed");
+        let output = res.output.trim();
+
+        assert!(
+            !output.contains("--model"),
+            "Whitespace-only model '{}' should be treated as None, got: '{}'",
+            model.escape_debug(),
             output
         );
     }
