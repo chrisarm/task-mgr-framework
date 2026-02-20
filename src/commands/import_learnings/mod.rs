@@ -60,10 +60,13 @@ pub fn import_learnings(
 
     let learnings = parse_learnings(&content)?;
 
-    let conn = open_connection(dir)?;
+    let mut conn = open_connection(dir)?;
 
-    // Build set of existing learning keys for deduplication
-    let existing_keys = load_existing_keys(&conn)?;
+    // Load existing keys BEFORE conn.transaction() to avoid mutable borrow conflict
+    let mut seen = load_existing_keys(&conn)?;
+
+    // Wrap all inserts in a transaction for atomicity
+    let tx = conn.transaction()?;
 
     let mut imported = 0;
     let mut skipped = 0;
@@ -72,16 +75,19 @@ pub fn import_learnings(
     for learning in &learnings {
         let key = compute_dedup_key(&learning.title, &learning.content);
 
-        if existing_keys.contains(&key) {
+        // seen.insert() returns false if key already present (existing DB entry or within-batch dup)
+        if !seen.insert(key) {
             skipped += 1;
             continue;
         }
 
         let params = learning_to_params(learning);
-        let result = record_learning(&conn, params)?;
+        let result = record_learning(&tx, params)?;
         imported += 1;
         tags_imported += result.tags_added;
     }
+
+    tx.commit()?;
 
     Ok(ImportLearningsResult {
         source_file: from_file.display().to_string(),
