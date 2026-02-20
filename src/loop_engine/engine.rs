@@ -350,6 +350,19 @@ pub fn run_iteration(
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
 
+    // Step 6.5: If signal arrived during Claude execution, stop immediately.
+    // Without this, post-processing (learning extraction, feedback, inter-iteration
+    // delay) runs before the signal is checked at the next iteration boundary.
+    if signal_flag.is_signaled() {
+        return Ok(IterationResult {
+            outcome: IterationOutcome::Empty,
+            task_id: Some(task_id),
+            files_modified: task_files,
+            should_stop: true,
+            output: claude_result.output,
+        });
+    }
+
     // Step 7: Analyze output
     let claude_output = claude_result.output;
     let outcome = detection::analyze_output(&claude_output, claude_result.exit_code, project_root);
@@ -398,7 +411,7 @@ pub fn run_iteration(
     }
 
     // Step 9: Update trackers based on outcome
-    let should_stop = update_trackers(ctx, &outcome);
+    let mut should_stop = update_trackers(ctx, &outcome);
 
     // Step 10: Handle reorder
     if let IterationOutcome::Reorder(ref requested_task_id) = outcome {
@@ -412,9 +425,17 @@ pub fn run_iteration(
     // Step 11: Update last_files for next iteration scoring
     ctx.last_files = task_files.clone();
 
-    // Step 12: Inter-iteration delay (skip if stopping)
-    if !should_stop && !inter_iteration_delay.is_zero() {
-        thread::sleep(inter_iteration_delay);
+    // Step 12: Inter-iteration delay (skip if stopping or signaled)
+    if !should_stop && !inter_iteration_delay.is_zero() && !signal_flag.is_signaled() {
+        // Sleep in short intervals so we can respond to Ctrl+C promptly
+        let deadline = std::time::Instant::now() + inter_iteration_delay;
+        while std::time::Instant::now() < deadline {
+            if signal_flag.is_signaled() {
+                should_stop = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
     }
 
     Ok(IterationResult {
@@ -806,6 +827,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 break;
             }
         };
+
+        // Early exit on signal — skip all post-processing (git checks,
+        // reconciliation, etc.) to respond to Ctrl+C immediately.
+        if signal_flag.is_signaled() {
+            exit_code = 130;
+            exit_reason = "signal received".to_string();
+            break;
+        }
 
         // Log progress
         progress::log_iteration(

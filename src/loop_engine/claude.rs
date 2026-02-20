@@ -97,6 +97,20 @@ pub fn spawn_claude(
     // Extract PID before starting watchdog — no race condition
     let child_pid = child.id();
 
+    // Reclaim foreground process group so Ctrl+C delivers SIGINT to us.
+    // Claude's pre_exec setpgid(0,0) puts it in its own group, but Claude
+    // Code (Node.js) may call tcsetpgrp() during init to become the
+    // foreground group. Without this, SIGINT from Ctrl+C goes to Claude's
+    // group and task-mgr's signal handler never fires.
+    #[cfg(unix)]
+    {
+        unsafe {
+            let our_pgid = libc::getpgrp();
+            // stderr is inherited (connected to terminal); stdin=null, stdout=piped
+            libc::tcsetpgrp(libc::STDERR_FILENO, our_pgid);
+        }
+    }
+
     // Start watchdog thread if signal handling is requested
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let watchdog_handle = signal_flag.map(|flag| {
