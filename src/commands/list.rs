@@ -494,6 +494,9 @@ mod tests {
             error_count: 0,
             blocked_at_iteration: None,
             skipped_at_iteration: None,
+            model: None,
+            difficulty: None,
+            escalation_note: None,
         };
 
         let summary = TaskSummary::from(&task);
