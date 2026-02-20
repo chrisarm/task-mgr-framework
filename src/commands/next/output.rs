@@ -280,11 +280,7 @@ pub fn format_next_text(result: &NextResult) -> String {
                         learning.confidence
                     ));
                     if let Some(ref content) = learning.content {
-                        let preview = if content.len() > 80 {
-                            format!("{}...", &content[..80])
-                        } else {
-                            content.clone()
-                        };
+                        let preview = crate::commands::truncate_str(content, 80);
                         output.push_str(&format!("     {}\n", preview));
                     }
                 }

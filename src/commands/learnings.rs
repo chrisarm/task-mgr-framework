@@ -159,11 +159,7 @@ pub fn format_text(result: &LearningsListResult) -> String {
     // Table rows
     for learning in &result.learnings {
         // Truncate title if too long
-        let title = if learning.title.len() > 40 {
-            format!("{}...", &learning.title[..37])
-        } else {
-            learning.title.clone()
-        };
+        let title = super::truncate_str(&learning.title, 37);
 
         output.push_str(&format!(
             "{:>4}  {:<40}  {:<10}  {:<8}  {:>5}  {:>7}\n",

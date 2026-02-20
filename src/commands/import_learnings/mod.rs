@@ -150,8 +150,8 @@ fn learning_to_params(learning: &LearningExport) -> RecordLearningParams {
         outcome: learning.outcome,
         title: learning.title.clone(),
         content: learning.content.clone(),
-        task_id: learning.task_id.clone(),
-        run_id: None, // Don't carry over run_id to avoid FK violations
+        task_id: None, // Don't carry over task_id to avoid FK violations
+        run_id: None,  // Don't carry over run_id to avoid FK violations
         root_cause: learning.root_cause.clone(),
         solution: learning.solution.clone(),
         applies_to_files: learning.applies_to_files.clone(),

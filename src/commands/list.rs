@@ -184,11 +184,7 @@ pub fn format_text(result: &ListResult) -> String {
 
     // Task rows
     for task in &result.tasks {
-        let title_display = if task.title.len() > 40 {
-            format!("{}...", &task.title[..37])
-        } else {
-            task.title.clone()
-        };
+        let title_display = super::truncate_str(&task.title, 37);
 
         output.push_str(&format!(
             "{:<12} {:<12} {:>5}  {}\n",

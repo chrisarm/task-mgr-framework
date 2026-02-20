@@ -158,11 +158,7 @@ pub fn format_text(result: &RecallCmdResult) -> String {
         output.push_str(&format!("   Confidence: {}\n", learning.confidence));
 
         // Show content (truncated)
-        let content_preview = if learning.content.len() > 100 {
-            format!("{}...", &learning.content[..100])
-        } else {
-            learning.content.clone()
-        };
+        let content_preview = super::truncate_str(&learning.content, 100);
         output.push_str(&format!("   {}\n", content_preview));
 
         // Show applicability

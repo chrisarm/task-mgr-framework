@@ -341,11 +341,7 @@ pub fn format_detail_text(result: &RunDetailResult) -> String {
 
     for task in &result.tasks {
         // Truncate title if too long
-        let title = if task.title.len() > 38 {
-            format!("{}...", &task.title[..35])
-        } else {
-            task.title.clone()
-        };
+        let title = super::truncate_str(&task.title, 35);
 
         output.push_str(&format!(
             "{:>4}  {:<12}  {:<9}  {:<40}\n",
