@@ -139,6 +139,12 @@ pub struct IterationContext {
     pub reorder_hint: Option<String>,
     /// Count of consecutive reorders
     pub reorder_count: u32,
+    /// Task ID from the previous iteration. Loop-thread-local — no concurrency concern.
+    /// Used by crash escalation logic (FEAT-007) to detect same-task consecutive crashes.
+    pub last_task_id: Option<String>,
+    /// Whether the previous iteration crashed. Loop-thread-local — no concurrency concern.
+    /// Used by crash escalation logic (FEAT-007) to trigger model escalation.
+    pub last_was_crash: bool,
 }
 
 impl IterationContext {
@@ -152,6 +158,8 @@ impl IterationContext {
             stale_tracker: StaleTracker::default(),
             reorder_hint: None,
             reorder_count: 0,
+            last_task_id: None,
+            last_was_crash: false,
         }
     }
 }
@@ -1792,6 +1800,8 @@ mod tests {
         assert!(ctx.session_guidance.is_empty());
         assert!(ctx.reorder_hint.is_none());
         assert_eq!(ctx.reorder_count, 0);
+        assert!(ctx.last_task_id.is_none());
+        assert!(!ctx.last_was_crash);
     }
 
     // --- IterationResult tests ---
