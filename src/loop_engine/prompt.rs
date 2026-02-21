@@ -2654,6 +2654,96 @@ pub enum ApiError {
         );
     }
 
+    // ===== TEST-002: Comprehensive model resolution tests =====
+
+    /// AC: Synergy partner with None model and prd_default=haiku → selected task's model wins.
+    #[test]
+    fn test_resolved_model_synergy_none_model_with_prd_default() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task has sonnet model
+        insert_task(&conn, "MOD-020", "Sonnet task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-020'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        // Synergy partner has no model (None) — will resolve via prd_default=haiku
+        insert_task(&conn, "SYN-020", "No-model partner", "todo", 10);
+        insert_relationship(&conn, "MOD-020", "SYN-020", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.default_model = Some(HAIKU_MODEL);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(SONNET_MODEL.to_string()),
+            "Selected task's sonnet should win over partner's haiku (via prd_default)"
+        );
+    }
+
+    /// AC: No model, difficulty=medium, prd_default=sonnet → resolved is sonnet.
+    #[test]
+    fn test_resolved_model_medium_difficulty_uses_prd_default() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-021", "Medium task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'medium' WHERE id = 'MOD-021'",
+            [],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.default_model = Some(SONNET_MODEL);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(SONNET_MODEL.to_string()),
+            "Medium difficulty should NOT escalate to opus; should fall through to prd_default"
+        );
+    }
+
+    /// AC: All synergy partners have None model → falls back to prd_default.
+    #[test]
+    fn test_resolved_model_all_synergy_none_falls_to_prd_default() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task has no model
+        insert_task(&conn, "MOD-022", "No-model task", "todo", 5);
+
+        // Two synergy partners with no model
+        insert_task(&conn, "SYN-022A", "Partner A", "todo", 10);
+        insert_task(&conn, "SYN-022B", "Partner B", "in_progress", 15);
+        insert_relationship(&conn, "MOD-022", "SYN-022A", "synergyWith");
+        insert_relationship(&conn, "MOD-022", "SYN-022B", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.default_model = Some(HAIKU_MODEL);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(HAIKU_MODEL.to_string()),
+            "All partners with None model should fall back to prd_default"
+        );
+    }
+
     // ===== TEST-INIT-003: Escalation template loading =====
     //
     // TDD tests for load_escalation_template() and its integration into build_prompt().

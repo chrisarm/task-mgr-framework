@@ -894,8 +894,8 @@
       ],
       "priority": 28,
       "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Build on TEST-INIT-002. Focus on complex multi-task synergy scenarios and the full fallback chain. May reveal implementation gaps → create IMPL-FIX tasks if needed.",
+      "passes": true,
+      "notes": "Added 3 comprehensive tests: synergy partner with None model + prd_default, medium difficulty falls to prd_default, all synergy None falls to prd_default. Total 13 model resolution tests covering all tier precedence combinations and synergy topologies.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
