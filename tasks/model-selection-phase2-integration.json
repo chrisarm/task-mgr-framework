@@ -119,7 +119,7 @@
       ],
       "priority": 2,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Mechanical change. The SELECT at line 147 lists: id, title, description, priority, status, notes, acceptance_criteria, review_scope, severity, source_review, model, difficulty, escalation_note. Map each row.get(N) to the corresponding column name. Also check load_prd_metadata for the same pattern.",
       "modifiesBehavior": false,
       "touchesFiles": [
