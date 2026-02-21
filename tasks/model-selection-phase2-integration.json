@@ -169,7 +169,7 @@
       ],
       "priority": 4,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "TDD: Write these tests first. Use CLAUDE_BINARY=echo to capture args in output. spawn_claude currently has 3 params — tests define the expected 4-param signature: (prompt, signal_flag, working_dir, model: Option<&str>). Tests should verify exact arg ordering, not just presence.",
       "modifiesBehavior": false,
       "touchesFiles": [
