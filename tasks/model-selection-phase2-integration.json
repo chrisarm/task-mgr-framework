@@ -596,7 +596,7 @@
       ],
       "priority": 11,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "This task only adds the fields and initializes them. The actual escalation CHECK and the post-iteration field UPDATES are done in FEAT-007 which orchestrates the full flow. Adding the fields separately keeps FEAT-007 focused on wiring logic.",
       "modifiesBehavior": false,
       "touchesFiles": [
