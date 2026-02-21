@@ -646,7 +646,7 @@
       ],
       "priority": 12,
       "estimatedEffort": "high",
-      "passes": false,
+      "passes": true,
       "notes": "This is the final orchestration task that wires FEAT-001 through FEAT-006 together. This task OWNS the PrdMetadata struct change AND the read_prd_metadata() query update — do these FIRST, then wire through IterationParams, then orchestration. Crash escalation timing: AFTER build_prompt resolves base model, BEFORE spawn_claude. Import model::escalate_model and model::model_tier from loop_engine::model. For the None model crash case: effective_model = Some(OPUS_MODEL.to_string()) — don't call escalate_model(None) which returns None. For early-exit return points (signal, rate-limit, etc.), set effective_model: None. Match on IterationOutcome::Crash(_) to detect crash outcomes for ctx.last_was_crash.",
       "modifiesBehavior": true,
       "touchesFiles": [
