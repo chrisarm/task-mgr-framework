@@ -61,8 +61,8 @@ pub struct PrdFile {
     #[serde(default)]
     pub external_git_repo: Option<String>,
     /// Prefix applied to all task IDs during import to prevent cross-phase collisions.
-    /// If absent and `--no-prefix` is not set, a short UUID is auto-generated and
-    /// written back to the JSON file for stability across re-imports.
+    /// If absent and `--no-prefix` is not set, a deterministic hash is generated from
+    /// the branch name and filename, then written back to the JSON file for stability.
     #[serde(default)]
     pub task_prefix: Option<String>,
     /// Path to the PRD markdown file (e.g. `prd-model-selection.md`).

@@ -53,7 +53,8 @@ pub use parse::{PrdFile, PrdUserStory};
 /// Controls how task ID prefixing behaves during import.
 #[derive(Debug, Clone)]
 pub enum PrefixMode {
-    /// Use JSON `taskPrefix` field, or auto-generate a short UUID if absent.
+    /// Use JSON `taskPrefix` field, or auto-generate a deterministic hash if absent.
+    /// The hash is derived from `md5(branchName + ":" + filename)[..8]`.
     /// Auto-generated prefixes are written back to the JSON file for stability.
     Auto,
     /// Use this explicit prefix (overrides JSON field).
@@ -125,10 +126,20 @@ fn write_prefix_to_json(json_path: &Path, prefix: &str) -> TaskMgrResult<()> {
     Ok(())
 }
 
-/// Generate a short prefix from a UUID v4 (first 8 hex chars).
-fn generate_prefix() -> String {
-    let uuid = uuid::Uuid::new_v4();
-    uuid.to_string()[..8].to_string()
+/// Generate a deterministic 8-char hex prefix from branch name and filename.
+///
+/// Formula: `md5(branch_name + ":" + filename)[..8]`
+///
+/// When `branch_name` is `None` or empty, the hash input is `":" + filename`,
+/// which is still deterministic per-file.
+fn generate_prefix(branch_name: Option<&str>, filename: &str) -> String {
+    let branch = match branch_name {
+        Some(b) if !b.is_empty() => b,
+        _ => "",
+    };
+    let input = format!("{}:{}", branch, filename);
+    let digest = md5::compute(input.as_bytes());
+    format!("{:x}", digest)[..8].to_string()
 }
 
 use import::{
@@ -234,7 +245,12 @@ pub fn init(
                     if let Some(ref p) = prd.task_prefix {
                         Some(p.clone())
                     } else {
-                        let generated = generate_prefix();
+                        let filename = json_path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or("unknown.json");
+                        let generated =
+                            generate_prefix(prd.branch_name.as_deref(), filename);
                         if !dry_run {
                             write_prefix_to_json(json_path, &generated)?;
                         }
