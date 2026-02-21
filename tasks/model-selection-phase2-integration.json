@@ -94,7 +94,7 @@
       ],
       "priority": 2,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Simple string replacement. The function at prompt.rs:394 uses text.len() (byte count) and floor_char_boundary() for safe slicing. The message should accurately describe what's being measured. Find all test assertions with 'truncated to' and update them.",
       "modifiesBehavior": false,
       "touchesFiles": [
