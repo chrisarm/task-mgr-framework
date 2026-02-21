@@ -258,6 +258,7 @@ pub fn run_iteration(
         base_prompt_path,
         steering_path,
         verbose,
+        default_model: None, // TODO(FEAT-007): Thread from PrdMetadata
     };
 
     let prompt_result = match prompt::build_prompt(&prompt_params)? {

@@ -40,6 +40,12 @@ pub struct PromptResult {
     pub task_files: Vec<String>,
     /// Learning IDs that were shown in this prompt (for feedback loop)
     pub shown_learning_ids: Vec<i64>,
+    /// Resolved model for this iteration (None = use CLI default).
+    ///
+    /// Populated by model resolution: task_model > difficulty='high' > prd_default > None,
+    /// then elevated to the highest tier across the synergyWith cluster.
+    /// Some("") is normalized to None — consumers never see empty strings.
+    pub resolved_model: Option<String>,
 }
 
 /// Parameters for building a prompt.
@@ -66,6 +72,8 @@ pub struct BuildPromptParams<'a> {
     pub steering_path: Option<&'a Path>,
     /// Enable verbose output
     pub verbose: bool,
+    /// Default model from PRD metadata (threaded from engine, not queried here).
+    pub default_model: Option<&'a str>,
 }
 
 /// Build a prompt for the current iteration.
@@ -175,6 +183,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         task_id: task_output.id.clone(),
         task_files: task_output.files.clone(),
         shown_learning_ids,
+        resolved_model: None, // TODO(FEAT-004): Wire model resolution
     }))
 }
 
@@ -403,6 +412,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::commands::next::output::*;
+    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{
         insert_relationship, insert_run, insert_run_task, insert_task, insert_task_file,
         insert_task_full, insert_test_learning, setup_test_db,
@@ -449,6 +459,7 @@ mod tests {
             base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         }
     }
 
@@ -612,6 +623,7 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             task_files: vec!["src/lib.rs".to_string()],
             shown_learning_ids: vec![1, 2, 3],
+            resolved_model: None,
         };
 
         assert_eq!(result.task_id, "FEAT-001");
@@ -666,6 +678,7 @@ mod tests {
             base_prompt_path: &base_prompt_path,
             steering_path: Some(&steering_path),
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -1031,6 +1044,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -1145,6 +1159,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -1188,6 +1203,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: Some(&steering_path),
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -2073,6 +2089,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -2122,6 +2139,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         };
 
         let result = build_prompt(&params)
@@ -2163,6 +2181,7 @@ pub enum ApiError {
             base_prompt_path: &base_prompt_path,
             steering_path: None,
             verbose: false,
+            default_model: None,
         };
 
         // next::next uses dir for DB access — task should be found
@@ -2173,6 +2192,333 @@ pub enum ApiError {
         assert_eq!(
             result.task_id, "DB-001",
             "Task selection should use dir for DB, not project_root"
+        );
+    }
+
+    // ===== TEST-INIT-002: Model resolution in build_prompt =====
+    //
+    // TDD tests defining expected behavior for PromptResult.resolved_model.
+    // Tests marked #[ignore] will pass once FEAT-004 implements model resolution.
+
+    /// AC1: Task with explicit model='claude-opus-4-6' → resolved_model is Some('claude-opus-4-6').
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_explicit_model_on_task() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-001", "Task with explicit model", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-001'",
+            params![OPUS_MODEL],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "Explicit model on task should flow through to resolved_model"
+        );
+    }
+
+    /// AC2: Task with difficulty='high' and no explicit model → resolved_model is opus.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_difficulty_high_forces_opus() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-002", "High-difficulty task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'MOD-002'",
+            [],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "difficulty='high' with no explicit model should resolve to opus"
+        );
+    }
+
+    /// AC3: Task with no model, no difficulty, prd_default=haiku → resolved_model is haiku.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_prd_default_fallback() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-003", "Task with prd default", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let mut params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        params.default_model = Some(HAIKU_MODEL);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(HAIKU_MODEL.to_string()),
+            "No model/difficulty should fall back to prd_default"
+        );
+    }
+
+    /// AC4: Task with synergyWith partner that has higher-tier model → resolved_model is higher.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_synergy_partner_higher_tier() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task has haiku model
+        insert_task(&conn, "MOD-004", "Selected task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-004'",
+            params![HAIKU_MODEL],
+        )
+        .unwrap();
+
+        // Synergy partner has sonnet model and is pending (todo)
+        insert_task(&conn, "SYN-004", "Synergy partner", "todo", 10);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-004'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        // Establish synergyWith relationship
+        insert_relationship(&conn, "MOD-004", "SYN-004", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(SONNET_MODEL.to_string()),
+            "Synergy partner with higher-tier model should elevate resolved_model"
+        );
+    }
+
+    /// AC5: No default_model in prd_metadata → resolved_model falls back to None.
+    /// This test runs against the stub (resolved_model: None) and validates
+    /// the expected behavior when no model information is available.
+    #[test]
+    fn test_resolved_model_no_defaults_returns_none() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Task with no model, no difficulty
+        insert_task(&conn, "MOD-005", "Plain task", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        // default_model is None (no prd default)
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model, None,
+            "No model info at any level should resolve to None"
+        );
+    }
+
+    /// AC6 (known-bad discriminator): Synergy partner with opus model overrides
+    /// selected task's haiku. Rejects implementations that ignore synergy.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_synergy_opus_overrides_task_haiku() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task explicitly set to haiku
+        insert_task(&conn, "MOD-006", "Haiku task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-006'",
+            params![HAIKU_MODEL],
+        )
+        .unwrap();
+
+        // Synergy partner set to opus and is in_progress (active)
+        insert_task(&conn, "SYN-006", "Opus partner", "in_progress", 10);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-006'",
+            params![OPUS_MODEL],
+        )
+        .unwrap();
+
+        // Establish synergyWith relationship
+        insert_relationship(&conn, "MOD-006", "SYN-006", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "Synergy partner with opus MUST override selected task's haiku — \
+             synergy cluster model = max tier across all members"
+        );
+    }
+
+    // --- Edge case tests for model resolution ---
+
+    /// Edge case: Task with empty string model → normalized to None, not Some("").
+    /// Invariant: resolved_model is never Some("").
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_empty_string_normalized_to_none() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-007", "Empty model task", "todo", 5);
+        conn.execute("UPDATE tasks SET model = '' WHERE id = 'MOD-007'", [])
+            .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model, None,
+            "Empty string model must be normalized to None, never Some('')"
+        );
+    }
+
+    /// Edge case: Multiple synergy partners with different tiers → highest tier wins.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_multi_partner_highest_wins() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task has no model
+        insert_task(&conn, "MOD-008", "No-model task", "todo", 5);
+
+        // Synergy partners: haiku, opus, sonnet
+        insert_task(&conn, "SYN-008A", "Haiku partner", "todo", 10);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-008A'",
+            params![HAIKU_MODEL],
+        )
+        .unwrap();
+
+        insert_task(&conn, "SYN-008B", "Opus partner", "todo", 15);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-008B'",
+            params![OPUS_MODEL],
+        )
+        .unwrap();
+
+        insert_task(&conn, "SYN-008C", "Sonnet partner", "todo", 20);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-008C'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        insert_relationship(&conn, "MOD-008", "SYN-008A", "synergyWith");
+        insert_relationship(&conn, "MOD-008", "SYN-008B", "synergyWith");
+        insert_relationship(&conn, "MOD-008", "SYN-008C", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(OPUS_MODEL.to_string()),
+            "Among multiple synergy partners, opus (highest tier) must win"
+        );
+    }
+
+    /// Edge case: All synergy tasks are done → cluster is just the selected task.
+    /// Done synergy partners should be excluded from model resolution.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_done_synergy_partners_excluded() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Selected task has haiku model
+        insert_task(&conn, "MOD-009", "Haiku task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-009'",
+            params![HAIKU_MODEL],
+        )
+        .unwrap();
+
+        // Synergy partner has opus but is DONE — should not elevate
+        insert_task(&conn, "SYN-009", "Done opus partner", "done", 10);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-009'",
+            params![OPUS_MODEL],
+        )
+        .unwrap();
+
+        insert_relationship(&conn, "MOD-009", "SYN-009", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(HAIKU_MODEL.to_string()),
+            "Done synergy partners should be excluded; cluster is just the selected task"
+        );
+    }
+
+    /// Edge case: No synergyWith partners → resolved_model is just the selected task's model.
+    #[test]
+    #[ignore] // FEAT-004: model resolution not yet wired
+    fn test_resolved_model_no_synergy_partners() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "MOD-010", "Solo task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-010'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        assert_eq!(
+            result.resolved_model,
+            Some(SONNET_MODEL.to_string()),
+            "Task with no synergy partners should resolve to its own model"
         );
     }
 }
