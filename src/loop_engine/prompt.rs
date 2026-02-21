@@ -170,6 +170,23 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         ));
     }
 
+    // Model resolution: resolve synergy cluster model from task + synergyWith partners
+    // (must happen before escalation injection to determine tier)
+    let resolved_model = resolve_synergy_cluster_model(
+        params.conn,
+        &task_output.id,
+        task_output.model.as_deref(),
+        task_output.difficulty.as_deref(),
+        params.default_model,
+    );
+
+    // Section: Escalation policy (skip only for Opus tier)
+    append_escalation_policy(
+        &mut prompt,
+        params.base_prompt_path,
+        resolved_model.as_deref(),
+    );
+
     // Section: Reorder instruction
     prompt.push_str(
         "If you have a strong reason to work on a different eligible task, \
@@ -178,15 +195,6 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
 
     // Section: Base prompt template
     append_base_prompt(&mut prompt, params.base_prompt_path);
-
-    // Model resolution: resolve synergy cluster model from task + synergyWith partners
-    let resolved_model = resolve_synergy_cluster_model(
-        params.conn,
-        &task_output.id,
-        task_output.model.as_deref(),
-        task_output.difficulty.as_deref(),
-        params.default_model,
-    );
 
     Ok(Some(PromptResult {
         prompt,
@@ -425,6 +433,28 @@ pub fn load_escalation_template(base_prompt_path: &Path) -> Option<String> {
             );
             None
         }
+    }
+}
+
+/// Append the escalation policy section to the prompt when the resolved model is not Opus.
+///
+/// Loads the template from `base_prompt_path.parent()/scripts/escalation-policy.md`.
+/// Injects for all non-Opus tiers (including Default/None) per architect decision.
+/// When the template file is missing, the section is silently omitted.
+fn append_escalation_policy(
+    prompt: &mut String,
+    base_prompt_path: &Path,
+    resolved_model: Option<&str>,
+) {
+    // Opus tier already has maximum capability — no escalation needed
+    if model::model_tier(resolved_model) == model::ModelTier::Opus {
+        return;
+    }
+
+    if let Some(contents) = load_escalation_template(base_prompt_path) {
+        prompt.push_str("## Model Escalation Policy\n\n");
+        prompt.push_str(&contents);
+        prompt.push_str("\n\n---\n\n");
     }
 }
 
@@ -2628,7 +2658,7 @@ pub enum ApiError {
     //
     // TDD tests for load_escalation_template() and its integration into build_prompt().
     // Unit tests for load_escalation_template run against the real implementation.
-    // Integration tests through build_prompt are #[ignore] until FEAT-005 wires injection.
+    // Integration tests through build_prompt verify escalation template injection.
 
     /// Helper: create escalation template file under base_prompt_path's parent/scripts/.
     fn create_escalation_template(base_prompt_dir: &Path, content: &str) -> std::path::PathBuf {
@@ -2744,7 +2774,7 @@ pub enum ApiError {
     // --- AC3: Escalation section injected when resolved_model is haiku ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_injected_for_haiku() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2778,7 +2808,7 @@ pub enum ApiError {
     // --- AC3 continued: Escalation section injected when resolved_model is sonnet ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_injected_for_sonnet() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2808,7 +2838,7 @@ pub enum ApiError {
     // --- AC4: Escalation section injected when resolved_model is None (Default tier) ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_injected_for_default_none() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2835,7 +2865,7 @@ pub enum ApiError {
     // --- AC5: Escalation section NOT injected when resolved_model is opus ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_not_injected_for_opus() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2870,7 +2900,7 @@ pub enum ApiError {
     // --- AC6: Known-bad discriminator: template content BEFORE reorder instruction ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_before_reorder_instruction() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2912,7 +2942,7 @@ pub enum ApiError {
     // --- Edge case: escalation template missing + non-opus model → section silently omitted ---
 
     #[test]
-    #[ignore] // FEAT-005: escalation template injection not yet wired
+
     fn test_escalation_section_missing_template_silently_omitted() {
         let (temp_dir, conn) = setup_test_db();
 
