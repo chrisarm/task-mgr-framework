@@ -48,8 +48,8 @@ pub fn model_tier(model: Option<&str>) -> ModelTier {
 /// Resolve which model a single task should use.
 ///
 /// Precedence (highest to lowest):
-/// 1. `task_model` — explicit model set on the task
-/// 2. `difficulty == "high"` → `OPUS_MODEL`
+/// 1. `task_model` — explicit model set on the task (empty/whitespace-only normalized to `None`)
+/// 2. `difficulty == "high"` (case-insensitive) → `OPUS_MODEL`
 /// 3. `prd_default` — default model from the PRD metadata
 /// 4. `None` — no model preference
 pub fn resolve_task_model(
@@ -57,11 +57,11 @@ pub fn resolve_task_model(
     difficulty: Option<&str>,
     prd_default: Option<&str>,
 ) -> Option<String> {
-    if let Some(m) = task_model {
+    if let Some(m) = task_model.filter(|m| !m.trim().is_empty()) {
         return Some(m.to_string());
     }
 
-    if difficulty == Some("high") {
+    if difficulty.is_some_and(|d| d.eq_ignore_ascii_case("high")) {
         return Some(OPUS_MODEL.to_string());
     }
 
@@ -263,14 +263,14 @@ mod tests {
         );
     }
 
-    /// AC: empty string task_model is Some(""), a valid override—not treated as None.
+    /// AC: empty string task_model normalizes to None, falling through to difficulty/prd_default.
     #[test]
-    fn test_resolve_task_model_empty_string_is_valid_override() {
+    fn test_resolve_task_model_empty_string_falls_through() {
         let result = resolve_task_model(Some(""), Some("high"), Some(SONNET_MODEL));
         assert_eq!(
             result,
-            Some(String::new()),
-            "empty string task_model is Some, should override difficulty and prd_default"
+            Some(OPUS_MODEL.to_string()),
+            "empty string task_model should normalize to None, falling through to high difficulty"
         );
     }
 
@@ -278,9 +278,8 @@ mod tests {
     fn test_resolve_task_model_empty_string_without_fallbacks() {
         let result = resolve_task_model(Some(""), None, None);
         assert_eq!(
-            result,
-            Some(String::new()),
-            "empty string task_model should still be returned"
+            result, None,
+            "empty string task_model should normalize to None with no fallbacks"
         );
     }
 
@@ -361,6 +360,25 @@ mod tests {
             (
                 Some(OPUS_MODEL),
                 Some("low"),
+                Some(HAIKU_MODEL),
+                Some(OPUS_MODEL),
+            ),
+            // Row 15: empty-string task_model falls through to high difficulty
+            (Some(""), Some("high"), None, Some(OPUS_MODEL)),
+            // Row 16: whitespace-only task_model falls through to prd_default
+            (Some("  "), None, Some(SONNET_MODEL), Some(SONNET_MODEL)),
+            // Row 17: empty-string task_model with no fallbacks returns None
+            (Some(""), None, None, None),
+            // Row 18: case-variant "High" triggers opus escalation
+            (None, Some("High"), None, Some(OPUS_MODEL)),
+            // Row 19: case-variant "HIGH" triggers opus escalation
+            (None, Some("HIGH"), None, Some(OPUS_MODEL)),
+            // Row 20: case-variant "hIgH" triggers opus escalation
+            (None, Some("hIgH"), None, Some(OPUS_MODEL)),
+            // Row 21: whitespace-only task_model with "HIGH" difficulty
+            (
+                Some("\t"),
+                Some("HIGH"),
                 Some(HAIKU_MODEL),
                 Some(OPUS_MODEL),
             ),
