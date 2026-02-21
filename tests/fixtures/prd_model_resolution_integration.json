@@ -1,0 +1,49 @@
+{
+  "branchName": "feature/model-integration",
+  "description": "PRD for model resolution integration tests.",
+  "project": "model-integration-project",
+  "model": "claude-haiku-4-5-20251001",
+  "userStories": [
+    {
+      "acceptanceCriteria": ["AC-1"],
+      "dependsOn": [],
+      "description": "High-difficulty task with no explicit model.",
+      "difficulty": "high",
+      "id": "MR-001",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "High difficulty task",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": ["AC-2"],
+      "dependsOn": [],
+      "description": "Task with explicit opus model.",
+      "id": "MR-002",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "priority": 2,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Explicit opus task",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": ["AC-3"],
+      "dependsOn": [],
+      "description": "Task with no model, no difficulty.",
+      "id": "MR-003",
+      "passes": false,
+      "priority": 3,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Default model task",
+      "touchesFiles": []
+    }
+  ]
+}

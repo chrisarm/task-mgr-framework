@@ -1079,8 +1079,8 @@
       ],
       "priority": 55,
       "estimatedEffort": "high",
-      "passes": false,
-      "notes": "These tests exercise the full pipeline end-to-end. Import/init a test PRD with model fields, run one or more iterations with CLAUDE_BINARY=echo, and verify the model flows correctly through to the subprocess args and prompt content. Reference existing integration tests in tests/ directory for patterns. Covers US-P2-006 from Phase 1 PRD: end-to-end integration test with mixed models.",
+      "passes": true,
+      "notes": "Created tests/model_resolution_integration.rs with 6 e2e tests: high difficulty → opus, explicit model override, no model → None, escalation template presence/absence, iteration header display, progress log model field. Uses PRD fixture init → DB → build_prompt pipeline.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/engine.rs",
