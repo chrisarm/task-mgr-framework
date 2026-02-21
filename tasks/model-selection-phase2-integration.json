@@ -407,7 +407,7 @@
       ],
       "priority": 8,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Guard empty strings: if let Some(m) = model { if !m.trim().is_empty() { cmd.args(['--model', m]); } }. Build args dynamically: start with ['--print', '--dangerously-skip-permissions'], optionally add ['--model', m], then add ['-p', prompt]. The args must be built BEFORE calling cmd.args() on line 58. Three call sites to update: engine.rs:349, learnings/ingestion/mod.rs:70, and existing tests that call spawn_claude directly.",
       "modifiesBehavior": false,
       "touchesFiles": [
