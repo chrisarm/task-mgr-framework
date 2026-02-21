@@ -938,9 +938,12 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         // Check git for task completion: if recent commit contains task ID, mark done
         if let Some(ref task_id) = result.task_id {
             if !matches!(result.outcome, IterationOutcome::Empty) {
-                if let Some(commit_hash) =
-                    check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref(), run_config.config.git_scan_depth)
-                {
+                if let Some(commit_hash) = check_git_for_task_completion(
+                    &working_root,
+                    task_id,
+                    task_prefix.as_deref(),
+                    run_config.config.git_scan_depth,
+                ) {
                     // Mark task done in DB
                     let task_ids = [task_id.clone()];
                     match complete_cmd::complete(

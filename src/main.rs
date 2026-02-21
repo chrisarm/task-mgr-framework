@@ -660,11 +660,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
 
         Commands::ImportLearnings {
             from_json,
-            learnings_only,
             reset_stats,
         } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
-            let result = import_learnings(&cli.dir, &from_json, learnings_only, reset_stats)?;
+            let result = import_learnings(&cli.dir, &from_json, reset_stats)?;
             output_result(&result, cli.format);
             Ok(())
         }

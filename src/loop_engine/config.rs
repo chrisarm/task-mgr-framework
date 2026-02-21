@@ -94,8 +94,7 @@ impl LoopConfig {
             hours: defaults.hours,
             verbose: defaults.verbose,
             use_worktrees: defaults.use_worktrees,
-            git_scan_depth: parse_env("LOOP_GIT_SCAN_DEPTH")
-                .unwrap_or(defaults.git_scan_depth),
+            git_scan_depth: parse_env("LOOP_GIT_SCAN_DEPTH").unwrap_or(defaults.git_scan_depth),
             external_git_scan_depth: parse_env("LOOP_EXTERNAL_GIT_SCAN_DEPTH")
                 .unwrap_or(defaults.external_git_scan_depth),
         }

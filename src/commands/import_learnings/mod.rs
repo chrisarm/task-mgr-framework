@@ -2,7 +2,7 @@
 //!
 //! Parses `ProgressExport` format (from `task-mgr export --with-progress`)
 //! or a standalone `Vec<LearningExport>` array. Deduplicates by title+content
-//! hash. Supports `--learnings-only` and `--reset-stats` flags.
+//! hash. Supports `--reset-stats` flag.
 
 #[cfg(test)]
 mod tests;
@@ -36,8 +36,6 @@ pub struct ImportLearningsResult {
     pub tags_imported: usize,
     /// Whether stats were reset on import
     pub stats_reset: bool,
-    /// Whether only learnings were imported (no run history)
-    pub learnings_only: bool,
 }
 
 /// Import learnings from a JSON file.
@@ -50,12 +48,10 @@ pub struct ImportLearningsResult {
 ///
 /// * `dir` - Directory containing the database
 /// * `from_file` - Path to the JSON file to import
-/// * `learnings_only` - If true, skip run history import
 /// * `reset_stats` - If true, zero out bandit statistics on imported learnings
 pub fn import_learnings(
     dir: &Path,
     from_file: &Path,
-    learnings_only: bool,
     reset_stats: bool,
 ) -> TaskMgrResult<ImportLearningsResult> {
     // Read and parse the input file
@@ -106,7 +102,6 @@ pub fn import_learnings(
         learnings_skipped: skipped,
         tags_imported,
         stats_reset: reset_stats,
-        learnings_only,
     })
 }
 

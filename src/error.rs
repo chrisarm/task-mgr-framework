@@ -87,9 +87,7 @@ pub enum TaskMgrError {
     },
 
     /// Task cannot be completed because its dependencies are not satisfied.
-    #[error(
-        "Cannot complete task '{task_id}': unsatisfied dependencies: {unsatisfied}\n\n{hint}"
-    )]
+    #[error("Cannot complete task '{task_id}': unsatisfied dependencies: {unsatisfied}\n\n{hint}")]
     DependencyNotSatisfied {
         /// Task identifier
         task_id: String,

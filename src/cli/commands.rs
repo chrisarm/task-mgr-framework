@@ -703,9 +703,6 @@ EXAMPLES:
     # Import learnings from a progress.json file
     task-mgr import-learnings --from-json progress.json
 
-    # Import only learnings (skip run history)
-    task-mgr import-learnings --from-json progress.json --learnings-only
-
     # Import and reset bandit statistics
     task-mgr import-learnings --from-json learnings.json --reset-stats
 "
@@ -714,10 +711,6 @@ EXAMPLES:
         /// Path to the JSON file to import (progress.json or learnings array)
         #[arg(long = "from-json", required = true)]
         from_json: PathBuf,
-
-        /// Only import learnings, skip run history
-        #[arg(long = "learnings-only", default_value_t = false)]
-        learnings_only: bool,
 
         /// Reset bandit statistics (times_shown, times_applied) on import
         #[arg(long = "reset-stats", default_value_t = false)]

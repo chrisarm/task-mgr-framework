@@ -135,7 +135,7 @@ fn get_unsatisfied_deps(conn: &Connection, task_id: &str) -> TaskMgrResult<Vec<S
             .ok();
         match status.as_deref() {
             Some("done") | Some("irrelevant") => {} // satisfied
-            _ => unsatisfied.push(dep_id.clone()),   // not done, missing, or other status
+            _ => unsatisfied.push(dep_id.clone()),  // not done, missing, or other status
         }
     }
 
