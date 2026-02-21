@@ -550,7 +550,7 @@
       ],
       "priority": 10,
       "estimatedEffort": "medium",
-      "passes": false,
+      "passes": true,
       "notes": "Template is loaded fresh each iteration (not cached) to allow hot-editing. The model_tier() function from model.rs determines the tier. Inject position: after section 9 (non-code completion instruction) and before section 11 (reorder instruction) per PRD appendix ordering. Use eprintln! for missing-file warning. Key decision: include escalation for Default/None tier (CLI default could be sonnet, policy is informational). Note: PRD Public Contracts lists this as append_escalation_policy — the implementing agent may name the helper load_escalation_template or similar, either is acceptable as long as the contract (load file, check tier, inject content) is met.",
       "modifiesBehavior": false,
       "touchesFiles": [
