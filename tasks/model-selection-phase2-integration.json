@@ -317,7 +317,7 @@
       ],
       "priority": 6,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "TDD: Tests define the escalation check logic for engine.rs. Key architect decision: crash with None model assumes SONNET_MODEL baseline and escalates to OPUS_MODEL (not a no-op). Escalation is independent of CrashTracker backoff logic — they operate separately. Test without spawning real processes.",
       "modifiesBehavior": false,
       "touchesFiles": [
