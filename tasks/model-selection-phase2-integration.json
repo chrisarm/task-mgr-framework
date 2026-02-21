@@ -812,8 +812,8 @@
       "estimatedEffort": "low",
       "model": "claude-opus-4-6",
       "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Gate before comprehensive testing phase. All fixes applied, implementation complete, code reviewed and refactored, fully wired in. This milestone dynamically depends on any CODE-FIX-xxx, WIRE-FIX-xxx, or REFACTOR-1-xxx tasks spawned by reviews.",
+      "passes": true,
+      "notes": "All criteria verified: cargo fmt/check/clippy/test pass clean, no dead code, all dependencies complete, no REFACTOR-1-xxx tasks created (code is clean).",
       "modifiesBehavior": false,
       "touchesFiles": [],
       "dependsOn": [
