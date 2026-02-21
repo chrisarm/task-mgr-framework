@@ -657,7 +657,9 @@ mod tests {
             .find("--model")
             .expect("--model should be present in output");
         // Use " -p " to avoid matching the "-p" inside "--print"
-        let prompt_pos = output.find(" -p ").expect("-p flag should be present in output");
+        let prompt_pos = output
+            .find(" -p ")
+            .expect("-p flag should be present in output");
         assert!(
             model_pos < prompt_pos,
             "--model (at {}) must appear BEFORE -p (at {}), got: '{}'",

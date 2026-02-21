@@ -1698,6 +1698,26 @@ fn hash_file(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Check whether crash recovery should escalate the model for this iteration.
+///
+/// Returns `Some(escalated_model)` when BOTH conditions are met:
+/// 1. The current task is the same as the previous iteration's task
+/// 2. The previous iteration crashed (`last_was_crash`)
+///
+/// When `resolved_model` is `None`, assumes `SONNET_MODEL` baseline
+/// and escalates to `OPUS_MODEL` (architect decision: None crash → opus).
+///
+/// Escalation is independent of `CrashTracker` backoff logic.
+// TODO(FEAT-007): Implement escalation logic
+pub fn check_crash_escalation(
+    _last_task_id: Option<&str>,
+    _current_task_id: &str,
+    _last_was_crash: bool,
+    _resolved_model: Option<&str>,
+) -> Option<String> {
+    None
+}
+
 /// Update crash and stale trackers based on iteration outcome.
 /// Returns true if the loop should stop.
 fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bool {
@@ -1739,6 +1759,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
     // --- IterationContext tests ---
 
@@ -2922,5 +2943,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(done_status, "done", "Done task should be unaffected");
+    }
+
+    // --- check_crash_escalation tests ---
+    //
+    // Active tests validate the no-escalation paths (pass against stub).
+    // #[ignore] tests define expected FEAT-007 behavior.
+
+    /// First iteration: no previous task context, no crash — no escalation.
+    #[test]
+    fn test_crash_escalation_first_iteration_no_crash() {
+        let result = check_crash_escalation(None, "FEAT-001", false, Some(SONNET_MODEL));
+        assert_eq!(
+            result, None,
+            "first iteration without crash must not escalate"
+        );
+    }
+
+    /// First iteration with crash: no previous task to compare — no escalation.
+    /// Edge case: last_task_id=None means we can't determine same-task.
+    #[test]
+    fn test_crash_escalation_first_iteration_with_crash() {
+        let result = check_crash_escalation(None, "FEAT-001", true, Some(SONNET_MODEL));
+        assert_eq!(
+            result, None,
+            "first iteration crash has no previous task context, cannot escalate"
+        );
+    }
+
+    /// Same task but no crash — no escalation.
+    #[test]
+    fn test_crash_escalation_same_task_no_crash() {
+        let result =
+            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        assert_eq!(result, None, "same task without crash must not escalate");
+    }
+
+    /// Different task with crash — no escalation (crash on a different task
+    /// does not carry forward).
+    #[test]
+    fn test_crash_escalation_different_task_with_crash() {
+        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        assert_eq!(
+            result, None,
+            "crash on different task must not escalate for new task"
+        );
+    }
+
+    /// AC: same task + crash + haiku model → escalate to sonnet.
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_haiku_to_sonnet() {
+        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        assert_eq!(
+            result,
+            Some(SONNET_MODEL.to_string()),
+            "haiku crash on same task must escalate to sonnet"
+        );
+    }
+
+    /// AC: same task + crash + sonnet model → escalate to opus.
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_sonnet_to_opus() {
+        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "sonnet crash on same task must escalate to opus"
+        );
+    }
+
+    /// AC: same task + crash + already opus → stays opus (ceiling, no panic).
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_opus_ceiling() {
+        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(OPUS_MODEL));
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "opus crash on same task must stay at opus ceiling"
+        );
+    }
+
+    /// AC: resolved_model=None + crash → treated as SONNET_MODEL baseline,
+    /// escalated to OPUS_MODEL. Architect decision: None crash assumes sonnet
+    /// baseline and escalates to opus (not a no-op).
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_none_model_to_opus() {
+        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, None);
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "None model crash must assume sonnet baseline and escalate to opus"
+        );
+    }
+
+    /// Known-bad discriminator: escalation requires BOTH same task AND crash.
+    /// An implementation that checks only one condition would pass one assertion
+    /// but fail the other.
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_requires_both_conditions() {
+        // Only same task (no crash) — must NOT escalate
+        let no_crash =
+            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        assert_eq!(no_crash, None, "same task without crash must NOT escalate");
+
+        // Only crash (different task) — must NOT escalate
+        let diff_task =
+            check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        assert_eq!(diff_task, None, "crash on different task must NOT escalate");
+
+        // BOTH conditions — MUST escalate
+        let both = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        assert_eq!(
+            both,
+            Some(OPUS_MODEL.to_string()),
+            "same task + crash MUST escalate"
+        );
+    }
+
+    /// Edge case: multiple consecutive crashes on same task follow the ladder:
+    /// haiku → sonnet → opus → opus (ceiling).
+    #[test]
+    #[ignore] // Requires FEAT-007 implementation
+    fn test_crash_escalation_consecutive_ladder() {
+        // First crash: haiku → sonnet
+        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        assert_eq!(
+            first,
+            Some(SONNET_MODEL.to_string()),
+            "first crash: haiku → sonnet"
+        );
+
+        // Second crash: feed escalated model back in (sonnet → opus)
+        let second = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, first.as_deref());
+        assert_eq!(
+            second,
+            Some(OPUS_MODEL.to_string()),
+            "second crash: sonnet → opus"
+        );
+
+        // Third crash: opus → opus (ceiling)
+        let third = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, second.as_deref());
+        assert_eq!(
+            third,
+            Some(OPUS_MODEL.to_string()),
+            "third crash: opus stays at ceiling"
+        );
     }
 }
