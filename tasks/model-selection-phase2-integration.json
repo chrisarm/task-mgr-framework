@@ -211,7 +211,7 @@
       ],
       "priority": 5,
       "estimatedEffort": "medium",
-      "passes": false,
+      "passes": true,
       "notes": "TDD: Tests define expected behavior for PromptResult.resolved_model and BuildPromptParams.default_model. Synergy cluster uses explicit synergyWith relationships from task_relationships table (NOT file overlap). Use insert_relationship() from test_utils.rs to set up synergyWith relationships. Query pattern: SELECT t.model, t.difficulty FROM tasks t INNER JOIN task_relationships tr ON tr.related_id = t.id WHERE tr.task_id = ? AND tr.rel_type = 'synergyWith' AND t.status IN ('todo', 'in_progress').",
       "modifiesBehavior": false,
       "touchesFiles": [
