@@ -1237,7 +1237,14 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
         .query_row(
             "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get("branch_name")?,
+                    row.get("external_git_repo")?,
+                    row.get("task_prefix")?,
+                    row.get("default_model")?,
+                ))
+            },
         )
         .unwrap_or((None, None, None, None));
 

@@ -510,8 +510,8 @@ fn get_synergy_partner_models(
     };
 
     let rows = match stmt.query_map([task_id], |row| {
-        let partner_model: Option<String> = row.get(0)?;
-        let partner_difficulty: Option<String> = row.get(1)?;
+        let partner_model: Option<String> = row.get("model")?;
+        let partner_difficulty: Option<String> = row.get("difficulty")?;
         Ok(model::resolve_task_model(
             partner_model.as_deref(),
             partner_difficulty.as_deref(),
