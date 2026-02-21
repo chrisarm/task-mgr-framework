@@ -346,8 +346,12 @@ pub fn run_iteration(
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
     let monitor_handle = monitor::start_monitor(project_root);
-    let claude_result =
-        claude::spawn_claude(&prompt_result.prompt, Some(signal_flag), Some(project_root));
+    let claude_result = claude::spawn_claude(
+        &prompt_result.prompt,
+        Some(signal_flag),
+        Some(project_root),
+        None,
+    );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
 

@@ -29,6 +29,7 @@ pub struct ClaudeResult {
 /// Spawn Claude with the given prompt and collect its output.
 ///
 /// The subprocess runs `<binary> --print --dangerously-skip-permissions -p <prompt>`.
+/// When `model` is `Some(m)` and non-empty, `--model m` is inserted before `-p`.
 /// The binary defaults to `claude` but can be overridden via the `CLAUDE_BINARY`
 /// environment variable (useful for testing with mock scripts).
 ///
@@ -52,7 +53,10 @@ pub fn spawn_claude(
     prompt: &str,
     signal_flag: Option<&SignalFlag>,
     working_dir: Option<&Path>,
+    model: Option<&str>,
 ) -> TaskMgrResult<ClaudeResult> {
+    // TODO(FEAT-002): Use `model` to insert --model flag before -p
+    let _ = model;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = Command::new(&binary);
     cmd.args(["--print", "--dangerously-skip-permissions", "-p", prompt])
@@ -380,7 +384,7 @@ mod tests {
     fn test_spawn_without_signal_flag() {
         // spawn_claude with None should behave like before
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None);
+        let result = spawn_claude("hello", None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -393,7 +397,7 @@ mod tests {
         // spawn_claude with a SignalFlag that is NOT signaled should work normally
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("test output", Some(&flag), None);
+        let result = spawn_claude("test output", Some(&flag), None, None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -513,7 +517,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // "60" is the argument to sleep — it will run for 60s unless killed
-        let result = spawn_claude("60", Some(&flag), None);
+        let result = spawn_claude("60", Some(&flag), None, None);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -542,7 +546,7 @@ mod tests {
         // If the child exits normally, the watchdog should stop cleanly
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("quick exit", Some(&flag), None);
+        let result = spawn_claude("quick exit", Some(&flag), None, None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -551,5 +555,144 @@ mod tests {
         assert!(res.output.contains("quick exit"));
         // Flag should NOT be signaled
         assert!(!flag.is_signaled());
+    }
+
+    // --- TEST-INIT-001: Tests for --model flag on spawn_claude ---
+    //
+    // TDD: These tests define the expected 4-parameter signature and behavior
+    // for FEAT-002. Active tests validate stub behavior (model=None unchanged).
+    // #[ignore] tests define expected behavior once --model insertion is implemented.
+
+    /// Active: model=None → no --model flag, standard flags present.
+    /// Validates backward compatibility: None model produces args identical to
+    /// pre-model behavior.
+    #[test]
+    fn test_spawn_model_none_no_model_flag() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test_prompt", None, None, None);
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(
+            result.is_ok(),
+            "spawn_claude should succeed: {:?}",
+            result.err()
+        );
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        // model=None must NOT produce --model flag
+        assert!(
+            !output.contains("--model"),
+            "model=None should not include --model flag, got: '{}'",
+            output
+        );
+
+        // Standard flags must always be present
+        assert!(
+            output.contains("--print"),
+            "Must always have --print, got: '{}'",
+            output
+        );
+        assert!(
+            output.contains("--dangerously-skip-permissions"),
+            "Must always have --dangerously-skip-permissions, got: '{}'",
+            output
+        );
+    }
+
+    /// Ignored (FEAT-002): model=Some("claude-opus-4-6") → --model flag present
+    /// with correct value in echoed args.
+    #[test]
+    #[ignore]
+    fn test_spawn_model_some_opus_includes_model_flag() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        assert!(
+            output.contains("--model claude-opus-4-6"),
+            "model=Some('claude-opus-4-6') should include --model flag, got: '{}'",
+            output
+        );
+    }
+
+    /// Ignored (FEAT-002): model=Some("") → treated as None, no --model flag.
+    /// Guards against naively passing --model '' to the Claude CLI.
+    #[test]
+    #[ignore]
+    fn test_spawn_model_empty_string_treated_as_none() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test_prompt", None, None, Some(""));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        assert!(
+            !output.contains("--model"),
+            "model=Some('') should be treated as None — no --model flag, got: '{}'",
+            output
+        );
+    }
+
+    /// Ignored (FEAT-002): Known-bad discriminator — --model must appear BEFORE -p.
+    /// Rejects implementations that append --model after the prompt flag.
+    #[test]
+    #[ignore]
+    fn test_spawn_model_flag_appears_before_prompt_flag() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        let model_pos = output
+            .find("--model")
+            .expect("--model should be present in output");
+        let prompt_pos = output.find("-p").expect("-p should be present in output");
+        assert!(
+            model_pos < prompt_pos,
+            "--model (at {}) must appear BEFORE -p (at {}), got: '{}'",
+            model_pos,
+            prompt_pos,
+            output
+        );
+    }
+
+    /// Ignored (FEAT-002): --print and --dangerously-skip-permissions must be
+    /// present regardless of model value.
+    #[test]
+    #[ignore]
+    fn test_spawn_model_some_preserves_required_flags() {
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        assert!(
+            output.contains("--print"),
+            "Must always have --print even with model, got: '{}'",
+            output
+        );
+        assert!(
+            output.contains("--dangerously-skip-permissions"),
+            "Must always have --dangerously-skip-permissions even with model, got: '{}'",
+            output
+        );
+        assert!(
+            output.contains("--model claude-opus-4-6"),
+            "Must have --model flag, got: '{}'",
+            output
+        );
     }
 }
