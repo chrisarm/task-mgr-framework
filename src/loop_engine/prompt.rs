@@ -3029,6 +3029,129 @@ pub enum ApiError {
         );
     }
 
+    // ===== TEST-003: Comprehensive escalation template tests =====
+
+    /// AC: Large template content (>5KB) loads and injects correctly.
+    #[test]
+    fn test_escalation_large_template_loads_correctly() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_prompt_path = temp_dir.path().join("prompt.md");
+        fs::write(&base_prompt_path, "base prompt").unwrap();
+
+        let large_content = "x".repeat(6000);
+        create_escalation_template(temp_dir.path(), &large_content);
+
+        let result = load_escalation_template(&base_prompt_path);
+        assert_eq!(
+            result.as_ref().map(|s| s.len()),
+            Some(6000),
+            "Large template (>5KB) should load fully without truncation"
+        );
+    }
+
+    /// AC: Template with markdown headers doesn't interfere with prompt structure.
+    #[test]
+    fn test_escalation_template_markdown_headers_no_interference() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "ESC-030", "Sonnet task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'ESC-030'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        let template_content =
+            "# Escalation Policy\n\n## When to Escalate\n\n### Step 1\n\nDo this.\n";
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        create_escalation_template(temp_dir.path(), template_content);
+
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Template headers should appear within the escalation section
+        assert!(result.prompt.contains("## When to Escalate"));
+        assert!(result.prompt.contains("### Step 1"));
+        // The prompt structure sections should still be present
+        assert!(result.prompt.contains("## Current Task"));
+        assert!(result.prompt.contains("<reorder>"));
+    }
+
+    /// AC: base_prompt_path in different directory → template resolves from correct parent.
+    #[test]
+    fn test_escalation_template_different_parent_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let subdir = temp_dir.path().join("config").join("prompts");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let base_prompt_path = subdir.join("prompt.md");
+        fs::write(&base_prompt_path, "base prompt").unwrap();
+
+        // Template must be under subdir/scripts/, not temp_dir/scripts/
+        let scripts_dir = subdir.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(
+            scripts_dir.join("escalation-policy.md"),
+            "Nested template content",
+        )
+        .unwrap();
+
+        let result = load_escalation_template(&base_prompt_path);
+        assert_eq!(
+            result,
+            Some("Nested template content".to_string()),
+            "Template should resolve relative to base_prompt_path's parent, not cwd"
+        );
+    }
+
+    /// AC: Switching from non-opus to opus model → template disappears.
+    /// Verifies by contrast: sonnet task has template, opus task does not.
+    #[test]
+    fn test_escalation_template_disappears_for_opus() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Sonnet task — should have escalation
+        insert_task(&conn, "ESC-031", "Sonnet task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'ESC-031'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        let template_content = "ESCALATION_MARKER_CHECK";
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        create_escalation_template(temp_dir.path(), template_content);
+
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let sonnet_result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+        assert!(
+            sonnet_result.prompt.contains("ESCALATION_MARKER_CHECK"),
+            "Sonnet should have escalation template"
+        );
+
+        // Now mark sonnet task done, add opus task
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = 'ESC-031'", [])
+            .unwrap();
+        insert_task(&conn, "ESC-032", "Opus task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'ESC-032'",
+            params![OPUS_MODEL],
+        )
+        .unwrap();
+
+        let opus_result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+        assert!(
+            !opus_result.prompt.contains("ESCALATION_MARKER_CHECK"),
+            "Opus should NOT have escalation template — template disappears when tier is Opus"
+        );
+    }
+
     // --- Edge case: escalation template missing + non-opus model → section silently omitted ---
 
     #[test]

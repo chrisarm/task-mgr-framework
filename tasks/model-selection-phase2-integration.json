@@ -934,8 +934,8 @@
       ],
       "priority": 30,
       "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Build on TEST-INIT-003. Focus on file system edge cases and hot-edit scenarios. Use temp directories for isolation.",
+      "passes": true,
+      "notes": "Added 4 comprehensive tests: large template (>5KB), markdown headers no interference, different parent directory resolution, sonnet-to-opus contrast (template disappears). Total 18 escalation tests.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
