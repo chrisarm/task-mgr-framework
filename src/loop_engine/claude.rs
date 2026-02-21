@@ -55,11 +55,19 @@ pub fn spawn_claude(
     working_dir: Option<&Path>,
     model: Option<&str>,
 ) -> TaskMgrResult<ClaudeResult> {
-    // TODO(FEAT-002): Use `model` to insert --model flag before -p
-    let _ = model;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
+    let mut args: Vec<&str> = vec!["--print", "--dangerously-skip-permissions"];
+    if let Some(m) = model {
+        if !m.trim().is_empty() {
+            args.push("--model");
+            args.push(m);
+        }
+    }
+    args.push("-p");
+    args.push(prompt);
+
     let mut cmd = Command::new(&binary);
-    cmd.args(["--print", "--dangerously-skip-permissions", "-p", prompt])
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -557,11 +565,7 @@ mod tests {
         assert!(!flag.is_signaled());
     }
 
-    // --- TEST-INIT-001: Tests for --model flag on spawn_claude ---
-    //
-    // TDD: These tests define the expected 4-parameter signature and behavior
-    // for FEAT-002. Active tests validate stub behavior (model=None unchanged).
-    // #[ignore] tests define expected behavior once --model insertion is implemented.
+    // --- Tests for --model flag on spawn_claude ---
 
     /// Active: model=None → no --model flag, standard flags present.
     /// Validates backward compatibility: None model produces args identical to
@@ -600,10 +604,8 @@ mod tests {
         );
     }
 
-    /// Ignored (FEAT-002): model=Some("claude-opus-4-6") → --model flag present
-    /// with correct value in echoed args.
+    /// model=Some("claude-opus-4-6") → --model flag present with correct value in echoed args.
     #[test]
-    #[ignore]
     fn test_spawn_model_some_opus_includes_model_flag() {
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
@@ -620,10 +622,9 @@ mod tests {
         );
     }
 
-    /// Ignored (FEAT-002): model=Some("") → treated as None, no --model flag.
+    /// model=Some("") → treated as None, no --model flag.
     /// Guards against naively passing --model '' to the Claude CLI.
     #[test]
-    #[ignore]
     fn test_spawn_model_empty_string_treated_as_none() {
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some(""));
@@ -640,10 +641,9 @@ mod tests {
         );
     }
 
-    /// Ignored (FEAT-002): Known-bad discriminator — --model must appear BEFORE -p.
+    /// Known-bad discriminator — --model must appear BEFORE -p.
     /// Rejects implementations that append --model after the prompt flag.
     #[test]
-    #[ignore]
     fn test_spawn_model_flag_appears_before_prompt_flag() {
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
@@ -656,7 +656,8 @@ mod tests {
         let model_pos = output
             .find("--model")
             .expect("--model should be present in output");
-        let prompt_pos = output.find("-p").expect("-p should be present in output");
+        // Use " -p " to avoid matching the "-p" inside "--print"
+        let prompt_pos = output.find(" -p ").expect("-p flag should be present in output");
         assert!(
             model_pos < prompt_pos,
             "--model (at {}) must appear BEFORE -p (at {}), got: '{}'",
@@ -666,10 +667,8 @@ mod tests {
         );
     }
 
-    /// Ignored (FEAT-002): --print and --dangerously-skip-permissions must be
-    /// present regardless of model value.
+    /// --print and --dangerously-skip-permissions must be present regardless of model value.
     #[test]
-    #[ignore]
     fn test_spawn_model_some_preserves_required_flags() {
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
