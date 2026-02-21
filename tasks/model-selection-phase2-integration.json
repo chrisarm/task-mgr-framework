@@ -747,7 +747,7 @@
       ],
       "priority": 14,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Mechanical fix matching FIX-A03 pattern. The SELECT clauses already name the columns explicitly, so named access matches 1:1. Two sites, 6 total row.get() calls to update.",
       "modifiesBehavior": false,
       "touchesFiles": [
@@ -775,8 +775,8 @@
       "priority": 17,
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "Key areas: 1) build_prompt() was ~105 lines and grew with model resolution + escalation — may need extraction. 2) run_iteration() orchestration additions should be clean. 3) resolve_synergy_cluster_model should be independently testable. For each issue: add REFACTOR-1-xxx (priority 18-19) to JSON and MILESTONE-1 dependsOn.",
+      "passes": true,
+      "notes": "Review complete. All Phase 2 code additions are clean: 6 new functions all under 30 lines, no DRY violations, no tight coupling, good extensibility via IterationParams/BuildPromptParams. Pre-existing function lengths (build_prompt ~110, run_iteration ~340, spawn_claude ~120) noted but Phase 2 additions are proportionally small and well-placed. No REFACTOR-1-xxx tasks needed.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/model.rs",
