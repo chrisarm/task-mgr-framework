@@ -113,13 +113,13 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
            FROM prd_metadata WHERE id = 1"#,
         [],
         |row| {
-            let project: String = row.get(0)?;
-            let branch_name: Option<String> = row.get(1)?;
-            let description: Option<String> = row.get(2)?;
-            let priority_str: Option<String> = row.get(3)?;
-            let global_str: Option<String> = row.get(4)?;
-            let review_str: Option<String> = row.get(5)?;
-            let default_model: Option<String> = row.get(6)?;
+            let project: String = row.get("project")?;
+            let branch_name: Option<String> = row.get("branch_name")?;
+            let description: Option<String> = row.get("description")?;
+            let priority_str: Option<String> = row.get("priority_philosophy")?;
+            let global_str: Option<String> = row.get("global_acceptance_criteria")?;
+            let review_str: Option<String> = row.get("review_guidelines")?;
+            let default_model: Option<String> = row.get("default_model")?;
 
             // Parse JSON strings back to Values
             let priority_philosophy = priority_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -151,19 +151,19 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
     )?;
 
     let task_rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let title: String = row.get(1)?;
-        let description: Option<String> = row.get(2)?;
-        let priority: i32 = row.get(3)?;
-        let status_str: String = row.get(4)?;
-        let notes: Option<String> = row.get(5)?;
-        let acceptance_criteria_str: Option<String> = row.get(6)?;
-        let review_scope_str: Option<String> = row.get(7)?;
-        let severity: Option<String> = row.get(8)?;
-        let source_review: Option<String> = row.get(9)?;
-        let model: Option<String> = row.get(10)?;
-        let difficulty: Option<String> = row.get(11)?;
-        let escalation_note: Option<String> = row.get(12)?;
+        let id: String = row.get("id")?;
+        let title: String = row.get("title")?;
+        let description: Option<String> = row.get("description")?;
+        let priority: i32 = row.get("priority")?;
+        let status_str: String = row.get("status")?;
+        let notes: Option<String> = row.get("notes")?;
+        let acceptance_criteria_str: Option<String> = row.get("acceptance_criteria")?;
+        let review_scope_str: Option<String> = row.get("review_scope")?;
+        let severity: Option<String> = row.get("severity")?;
+        let source_review: Option<String> = row.get("source_review")?;
+        let model: Option<String> = row.get("model")?;
+        let difficulty: Option<String> = row.get("difficulty")?;
+        let escalation_note: Option<String> = row.get("escalation_note")?;
 
         Ok((
             id,
