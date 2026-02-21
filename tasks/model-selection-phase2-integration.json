@@ -853,8 +853,8 @@
       ],
       "priority": 25,
       "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Build on TEST-INIT-001. Focus on robustness and parameterized coverage. Use CLAUDE_BINARY=echo approach. Consider #[rstest] for parameterized tests if available.",
+      "passes": true,
+      "notes": "Added parameterized test for 5 model strings (opus/sonnet/haiku/custom-hyphen/underscore-dot) and whitespace-only test. All 7 model-specific tests now cover: None, Some(opus), Some(''), ordering, flag preservation, parameterized strings, whitespace.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/claude.rs"
