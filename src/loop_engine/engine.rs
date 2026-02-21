@@ -1664,7 +1664,9 @@ fn reconcile_external_git_completions(
         return 0;
     }
 
-    let commit_lines_upper = output.to_uppercase();
+    // Per-commit processing: split into individual lines instead of bulk string
+    // to prevent cross-commit substring collisions.
+    let commit_lines: Vec<String> = output.lines().map(|l| l.to_uppercase()).collect();
 
     // Query all incomplete task IDs
     let mut stmt =
@@ -1689,22 +1691,22 @@ fn reconcile_external_git_completions(
     for task_id in &task_ids {
         let task_id_upper = task_id.to_uppercase();
         let base_id_upper = strip_task_prefix(task_id, task_prefix).to_uppercase();
-        if commit_lines_upper.contains(&task_id_upper)
-            || (task_id_upper != base_id_upper && commit_lines_upper.contains(&base_id_upper))
-        {
-            // Mark as done
+        let matched = commit_lines.iter().any(|line| {
+            contains_task_id(line, &task_id_upper)
+                || (task_id_upper != base_id_upper
+                    && contains_task_id(line, &base_id_upper))
+        });
+        if matched {
+            // Mark as done — force=false so dependency gating applies
             let ids = [task_id.clone()];
             if let Err(e) = complete_cmd::complete(
                 conn,
                 &ids,
                 Some(run_id),
                 None, // no specific commit hash from oneline
-                true, // force: allow any status → done
+                false,
             ) {
-                // Likely already done or invalid transition — skip silently
-                if run_id.is_empty() {
-                    eprintln!("Warning: reconciliation failed for {}: {}", task_id, e);
-                }
+                eprintln!("Reconciliation skipped for {}: {}", task_id, e);
                 continue;
             }
 
@@ -1725,6 +1727,37 @@ fn reconcile_external_git_completions(
     }
 
     reconciled
+}
+
+/// Check if `text` contains `task_id` at valid word boundaries.
+/// Characters before/after the match must NOT be alphanumeric or hyphen.
+/// Prevents "P9-FEAT-001" from matching "FEAT-001" and "FEAT-00" from matching inside "FEAT-001".
+fn contains_task_id(text: &str, task_id: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(task_id) {
+        let abs_pos = start + pos;
+        let end_pos = abs_pos + task_id.len();
+
+        let valid_start = if abs_pos == 0 {
+            true
+        } else {
+            let prev = text.as_bytes()[abs_pos - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'-'
+        };
+
+        let valid_end = if end_pos >= text.len() {
+            true
+        } else {
+            let next = text.as_bytes()[end_pos];
+            !next.is_ascii_alphanumeric() && next != b'-'
+        };
+
+        if valid_start && valid_end {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
 }
 
 /// Check recent git commits for the task ID.
@@ -1774,8 +1807,9 @@ fn check_git_for_task_completion(
         }
 
         let message_upper = message.to_uppercase();
-        if message_upper.contains(&task_id_upper)
-            || (task_id_upper != base_id_upper && message_upper.contains(&base_id_upper))
+        if contains_task_id(&message_upper, &task_id_upper)
+            || (task_id_upper != base_id_upper
+                && contains_task_id(&message_upper, &base_id_upper))
         {
             return Some(hash.to_string());
         }
@@ -2278,10 +2312,10 @@ mod tests {
     fn test_reconcile_finds_completed_tasks_in_external_repo() {
         let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
 
-        // Insert tasks
+        // Insert tasks — FEAT-001 is in_progress (eligible for reconciliation with force=false)
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
-             ('FEAT-001', 'Task 1', 'todo', 1),
+             ('FEAT-001', 'Task 1', 'in_progress', 1),
              ('FEAT-002', 'Task 2', 'in_progress', 2),
              ('FEAT-003', 'Task 3', 'done', 3);",
         )
@@ -2321,7 +2355,7 @@ mod tests {
             50,
         );
 
-        // Should find FEAT-001 (todo → done), skip FEAT-003 (already done)
+        // Should find FEAT-001 (in_progress → done), skip FEAT-003 (already done)
         // FEAT-002 is in_progress but not in commits
         assert_eq!(count, 1);
 
@@ -2347,7 +2381,7 @@ mod tests {
 
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
-             ('SEC-H005', 'Security task', 'todo', 1);",
+             ('SEC-H005', 'Security task', 'in_progress', 1);",
         )
         .unwrap();
 
@@ -2628,9 +2662,9 @@ mod tests {
 
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
-             ('P3-FEAT-001', 'Task 1', 'todo', 1),
-             ('P3-FEAT-002', 'Task 2', 'todo', 2),
-             ('P3-FEAT-003', 'Task 3', 'todo', 3);",
+             ('P3-FEAT-001', 'Task 1', 'in_progress', 1),
+             ('P3-FEAT-002', 'Task 2', 'in_progress', 2),
+             ('P3-FEAT-003', 'Task 3', 'in_progress', 3);",
         )
         .unwrap();
 
@@ -2682,11 +2716,11 @@ mod tests {
         // filters `status NOT IN ('done', 'irrelevant')`.
         let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
 
-        // FEAT-001 already done (as if git detection marked it), FEAT-002 still todo
+        // FEAT-001 already done (as if git detection marked it), FEAT-002 in_progress
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
              ('FEAT-001', 'Task 1', 'done', 1),
-             ('FEAT-002', 'Task 2', 'todo', 2);",
+             ('FEAT-002', 'Task 2', 'in_progress', 2);",
         )
         .unwrap();
 
@@ -2789,7 +2823,7 @@ mod tests {
 
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
-             ('aeb10a1f-FIX-001', 'Fix bug', 'todo', 1);",
+             ('aeb10a1f-FIX-001', 'Fix bug', 'in_progress', 1);",
         )
         .unwrap();
 
@@ -2849,7 +2883,7 @@ mod tests {
 
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, priority) VALUES
-             ('aeb10a1f-FIX-001', 'Fix bug', 'todo', 1);",
+             ('aeb10a1f-FIX-001', 'Fix bug', 'in_progress', 1);",
         )
         .unwrap();
 
@@ -3278,6 +3312,320 @@ mod tests {
             third,
             Some(OPUS_MODEL.to_string()),
             "third crash: opus stays at ceiling"
+        );
+    }
+
+    // ======================================================================
+    // contains_task_id() unit tests — boundary-aware matching
+    // ======================================================================
+
+    #[test]
+    fn test_contains_task_id_blocks_hyphen_prefix() {
+        // "P9-FEAT-001" must NOT match "FEAT-001" — hyphen precedes
+        assert!(
+            !contains_task_id("P9-FEAT-001", "FEAT-001"),
+            "Hyphen-prefixed ID should not match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_blocks_numeric_suffix() {
+        // "FEAT-001" must NOT match "FEAT-00" — digit follows
+        assert!(
+            !contains_task_id("FEAT-001", "FEAT-00"),
+            "Partial ID with trailing digit should not match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_allows_space_prefix() {
+        assert!(
+            contains_task_id("feat: FEAT-001 done", "FEAT-001"),
+            "Space-separated ID should match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_allows_bracket_prefix() {
+        assert!(
+            contains_task_id("[FEAT-001]", "FEAT-001"),
+            "Bracket-delimited ID should match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_allows_start_of_string() {
+        assert!(
+            contains_task_id("FEAT-001 desc", "FEAT-001"),
+            "ID at start of string should match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_allows_end_of_string() {
+        assert!(
+            contains_task_id("completed FEAT-001", "FEAT-001"),
+            "ID at end of string should match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_exact_match() {
+        assert!(
+            contains_task_id("FEAT-001", "FEAT-001"),
+            "Exact match should succeed"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_blocks_alpha_prefix() {
+        // "XFEAT-001" must NOT match "FEAT-001"
+        assert!(
+            !contains_task_id("XFEAT-001", "FEAT-001"),
+            "Alpha-prefixed ID should not match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_blocks_alpha_suffix() {
+        // "FEAT-001A" must NOT match "FEAT-001"
+        assert!(
+            !contains_task_id("FEAT-001A", "FEAT-001"),
+            "Alpha-suffixed ID should not match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_allows_colon_delimiter() {
+        assert!(
+            contains_task_id("fix:FEAT-001:done", "FEAT-001"),
+            "Colon-delimited ID should match"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_no_match() {
+        assert!(
+            !contains_task_id("nothing here", "FEAT-001"),
+            "Unrelated text should not match"
+        );
+    }
+
+    // ======================================================================
+    // Integration: cross-PRD prefix collision isolation
+    // ======================================================================
+
+    #[test]
+    fn test_reconciliation_does_not_match_different_prd_prefix() {
+        // Scenario: external repo has P9-MILESTONE-FINAL commits.
+        // DB has acdfb313-MILESTONE-FINAL tasks (from telnyx PRD).
+        // Reconciliation must NOT falsely complete them.
+        let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('acdfb313-MILESTONE-FINAL', 'Telnyx milestone', 'in_progress', 1);",
+        )
+        .unwrap();
+
+        let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
+        // P9 commit that contains MILESTONE-FINAL as a substring
+        git_commit(ext_repo.path(), "feat: P9-MILESTONE-FINAL Phase 9 done");
+
+        let prd_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = prd_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"test","userStories":[
+                {"id":"MILESTONE-FINAL","title":"Telnyx milestone","passes":false,"priority":1}
+            ]}"#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
+            [],
+        )
+        .unwrap();
+
+        let count = reconcile_external_git_completions(
+            ext_repo.path(),
+            &mut conn,
+            "run-1",
+            &prd_path,
+            Some("acdfb313"),
+            50,
+        );
+
+        assert_eq!(
+            count, 0,
+            "P9-MILESTONE-FINAL must NOT match MILESTONE-FINAL (cross-PRD prefix collision)"
+        );
+
+        // Verify task is still in_progress
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'acdfb313-MILESTONE-FINAL'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "in_progress");
+    }
+
+    #[test]
+    fn test_reconciliation_respects_dependencies() {
+        // Verify force=false gates on deps: task with unsatisfied dep should not reconcile.
+        let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('FEAT-001', 'Prereq task', 'in_progress', 1),
+             ('FEAT-002', 'Dependent task', 'in_progress', 2);",
+        )
+        .unwrap();
+
+        // FEAT-002 depends on FEAT-001
+        conn.execute(
+            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES ('FEAT-002', 'FEAT-001', 'dependsOn')",
+            [],
+        )
+        .unwrap();
+
+        let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
+        // Both tasks appear in commits
+        git_commit(ext_repo.path(), "feat: FEAT-001 done");
+        git_commit(ext_repo.path(), "feat: FEAT-002 done");
+
+        let prd_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = prd_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"test","userStories":[
+                {"id":"FEAT-001","title":"Prereq","passes":false,"priority":1},
+                {"id":"FEAT-002","title":"Dependent","passes":false,"priority":2}
+            ]}"#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
+            [],
+        )
+        .unwrap();
+
+        let count = reconcile_external_git_completions(
+            ext_repo.path(),
+            &mut conn,
+            "run-1",
+            &prd_path,
+            None,
+            50,
+        );
+
+        // FEAT-001 should reconcile (no deps).
+        // FEAT-002 depends on FEAT-001 — but since reconciliation processes
+        // tasks in arbitrary order, FEAT-001 may or may not be completed first.
+        // The key invariant: if FEAT-002 is attempted before FEAT-001 is done,
+        // force=false will block it due to unsatisfied dependency.
+        // If FEAT-001 happens first, FEAT-002 may succeed.
+        // Either way, at minimum 1 task reconciles (FEAT-001).
+        assert!(
+            count >= 1,
+            "At least FEAT-001 (no deps) should reconcile"
+        );
+
+        // Verify FEAT-001 is done
+        let status1: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'FEAT-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status1, "done", "FEAT-001 should be completed");
+    }
+
+    #[test]
+    fn test_reconciliation_todo_tasks_not_auto_completed() {
+        // Verify force=false means todo tasks are NOT auto-completed.
+        // This is the correct conservative behavior.
+        let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('FEAT-001', 'Todo task', 'todo', 1);",
+        )
+        .unwrap();
+
+        let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
+        git_commit(ext_repo.path(), "feat: FEAT-001 done");
+
+        let prd_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = prd_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"test","userStories":[
+                {"id":"FEAT-001","title":"Todo task","passes":false,"priority":1}
+            ]}"#,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
+            [],
+        )
+        .unwrap();
+
+        let count = reconcile_external_git_completions(
+            ext_repo.path(),
+            &mut conn,
+            "run-1",
+            &prd_path,
+            None,
+            50,
+        );
+
+        assert_eq!(
+            count, 0,
+            "Todo tasks should not be auto-completed (force=false requires in_progress)"
+        );
+
+        // Verify task is still todo
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'FEAT-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn test_check_git_blocks_cross_prd_prefix() {
+        // check_git_for_task_completion should not match P9-FEAT-001 for FEAT-001
+        let repo = crate::loop_engine::test_utils::setup_git_repo();
+        git_commit(repo.path(), "feat: P9-FEAT-001 Phase 9 complete");
+
+        let result = check_git_for_task_completion(repo.path(), "FEAT-001", None, 7);
+        assert!(
+            result.is_none(),
+            "P9-FEAT-001 must not match FEAT-001 in git detection"
+        );
+    }
+
+    #[test]
+    fn test_contains_task_id_blocks_longer_numeric_id() {
+        // "FEAT-0010" must NOT match "FEAT-001" — digit follows the match
+        assert!(
+            !contains_task_id("FEAT-0010", "FEAT-001"),
+            "FEAT-0010 should not match FEAT-001 (trailing digit)"
+        );
+        // And the reverse: "FEAT-001" must NOT match "FEAT-0010"
+        assert!(
+            !contains_task_id("FEAT-001", "FEAT-0010"),
+            "FEAT-001 should not match FEAT-0010 (not a substring)"
         );
     }
 }
