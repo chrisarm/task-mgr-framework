@@ -364,7 +364,7 @@
       ],
       "priority": 7,
       "estimatedEffort": "medium",
-      "passes": false,
+      "passes": true,
       "notes": "Mechanical refactor. The compiler will catch any field mismatches. The struct definition should be placed near the top of engine.rs alongside UsageParams. All field accesses inside run_iteration change from bare names to params.field_name. The run_loop call site constructs the struct before the iteration loop. FEAT-007 will later add default_model: Option<&'a str> to this struct.",
       "modifiesBehavior": false,
       "touchesFiles": [

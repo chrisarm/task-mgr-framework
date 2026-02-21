@@ -68,6 +68,46 @@ impl UsageParams {
     }
 }
 
+/// Parameters for a single iteration of the agent loop.
+///
+/// Groups the 16 read-only parameters that `run_iteration()` needs,
+/// keeping the mutable `IterationContext` as a separate argument.
+/// FEAT-007 will later add `default_model: Option<&'a str>`.
+pub struct IterationParams<'a> {
+    /// Database connection
+    pub conn: &'a Connection,
+    /// Database directory (--dir flag, for task selection queries)
+    pub db_dir: &'a Path,
+    /// Git repository root (for source scanning, monitoring)
+    pub project_root: &'a Path,
+    /// Tasks directory (for signal files)
+    pub tasks_dir: &'a Path,
+    /// Current iteration number (1-based)
+    pub iteration: u32,
+    /// Maximum number of iterations
+    pub max_iterations: u32,
+    /// Current run ID
+    pub run_id: &'a str,
+    /// Path to base prompt.md file
+    pub base_prompt_path: &'a Path,
+    /// Optional path to steering.md
+    pub steering_path: Option<&'a Path>,
+    /// Delay between iterations
+    pub inter_iteration_delay: Duration,
+    /// Shared signal flag for SIGINT/SIGTERM
+    pub signal_flag: &'a SignalFlag,
+    /// Total elapsed seconds since loop start
+    pub elapsed_secs: u64,
+    /// Enable verbose output
+    pub verbose: bool,
+    /// Usage API monitoring parameters
+    pub usage_params: &'a UsageParams,
+    /// Optional path to PRD JSON file
+    pub prd_path: Option<&'a Path>,
+    /// Optional task prefix for ID normalization
+    pub task_prefix: Option<&'a str>,
+}
+
 /// Result of a single iteration.
 #[derive(Debug)]
 pub struct IterationResult {
@@ -119,47 +159,12 @@ impl IterationContext {
 /// Run a single iteration of the agent loop.
 ///
 /// Returns `IterationResult` describing the outcome and whether to stop.
-///
-/// # Arguments
-///
-/// * `ctx` - Mutable iteration context carrying state between iterations
-/// * `conn` - Database connection
-/// * `db_dir` - Database directory (--dir flag, for task selection queries)
-/// * `project_root` - Git repository root (for source scanning, monitoring)
-/// * `tasks_dir` - Tasks directory (for signal files)
-/// * `iteration` - Current iteration number (1-based)
-/// * `max_iterations` - Maximum number of iterations
-/// * `run_id` - Current run ID
-/// * `base_prompt_path` - Path to base prompt.md file
-/// * `steering_path` - Optional path to steering.md
-/// * `inter_iteration_delay` - Delay between iterations
-/// * `signal_flag` - Shared signal flag for SIGINT/SIGTERM
-/// * `elapsed_secs` - Total elapsed seconds since loop start
-/// * `verbose` - Enable verbose output
-/// * `usage_params` - Usage API monitoring parameters
-// TODO: Refactor run_iteration parameters into an IterationParams struct
-#[allow(clippy::too_many_arguments)]
 pub fn run_iteration(
     ctx: &mut IterationContext,
-    conn: &Connection,
-    db_dir: &Path,
-    project_root: &Path,
-    tasks_dir: &Path,
-    iteration: u32,
-    max_iterations: u32,
-    run_id: &str,
-    base_prompt_path: &Path,
-    steering_path: Option<&Path>,
-    inter_iteration_delay: Duration,
-    signal_flag: &SignalFlag,
-    elapsed_secs: u64,
-    verbose: bool,
-    usage_params: &UsageParams,
-    prd_path: Option<&Path>,
-    task_prefix: Option<&str>,
+    params: &IterationParams,
 ) -> TaskMgrResult<IterationResult> {
     // Step 0: Check for SIGINT/SIGTERM
-    if signal_flag.is_signaled() {
+    if params.signal_flag.is_signaled() {
         eprintln!("Signal received, stopping loop...");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -171,7 +176,7 @@ pub fn run_iteration(
     }
 
     // Step 1: Check file-based signals
-    if signals::check_stop_signal(tasks_dir) {
+    if signals::check_stop_signal(params.tasks_dir) {
         eprintln!("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -182,16 +187,20 @@ pub fn run_iteration(
         });
     }
 
-    if signals::check_pause_signal(tasks_dir) {
-        signals::handle_pause(tasks_dir, iteration, &mut ctx.session_guidance);
+    if signals::check_pause_signal(params.tasks_dir) {
+        signals::handle_pause(
+            params.tasks_dir,
+            params.iteration,
+            &mut ctx.session_guidance,
+        );
     }
 
     // Step 1.5: Pre-iteration usage check
-    if usage_params.enabled {
+    if params.usage_params.enabled {
         let check_result = usage::check_and_wait(
-            usage_params.threshold,
-            tasks_dir,
-            usage_params.fallback_wait,
+            params.usage_params.threshold,
+            params.tasks_dir,
+            params.usage_params.fallback_wait,
         );
         match check_result {
             UsageCheckResult::StopSignaled => {
@@ -247,17 +256,17 @@ pub fn run_iteration(
     // Step 4: Build prompt (selects and claims task)
     let session_guidance_text = ctx.session_guidance.format_for_prompt();
     let prompt_params = BuildPromptParams {
-        dir: db_dir,
-        project_root,
-        conn,
+        dir: params.db_dir,
+        project_root: params.project_root,
+        conn: params.conn,
         after_files: &ctx.last_files,
-        run_id: Some(run_id),
-        iteration,
+        run_id: Some(params.run_id),
+        iteration: params.iteration,
         reorder_hint: effective_reorder_hint.as_deref(),
         session_guidance: &session_guidance_text,
-        base_prompt_path,
-        steering_path,
-        verbose,
+        base_prompt_path: params.base_prompt_path,
+        steering_path: params.steering_path,
+        verbose: params.verbose,
         default_model: None, // TODO(FEAT-007): Thread from PrdMetadata
     };
 
@@ -265,7 +274,8 @@ pub fn run_iteration(
         Some(result) => result,
         None => {
             // No eligible task found — check if truly all done or just temporarily unavailable
-            let remaining: i64 = conn
+            let remaining: i64 = params
+                .conn
                 .query_row(
                     "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
                     [],
@@ -288,11 +298,11 @@ pub fn run_iteration(
             //
             // First, reconcile any tasks that have passes: true in the PRD.
             // These were completed but the DB status was never updated.
-            if let Some(prd) = prd_path {
-                reconcile_passes_with_db(conn, prd, task_prefix);
+            if let Some(prd) = params.prd_path {
+                reconcile_passes_with_db(params.conn, prd, params.task_prefix);
             }
 
-            let recovered = conn
+            let recovered = params.conn
                 .execute(
                     "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
                     [],
@@ -342,14 +352,19 @@ pub fn run_iteration(
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
     // Step 5: Print iteration header
-    display::print_iteration_header(iteration, max_iterations, &task_id, elapsed_secs);
+    display::print_iteration_header(
+        params.iteration,
+        params.max_iterations,
+        &task_id,
+        params.elapsed_secs,
+    );
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
-    let monitor_handle = monitor::start_monitor(project_root);
+    let monitor_handle = monitor::start_monitor(params.project_root);
     let claude_result = claude::spawn_claude(
         &prompt_result.prompt,
-        Some(signal_flag),
-        Some(project_root),
+        Some(params.signal_flag),
+        Some(params.project_root),
         None,
     );
     monitor::stop_monitor(monitor_handle);
@@ -358,7 +373,7 @@ pub fn run_iteration(
     // Step 6.5: If signal arrived during Claude execution, stop immediately.
     // Without this, post-processing (learning extraction, feedback, inter-iteration
     // delay) runs before the signal is checked at the next iteration boundary.
-    if signal_flag.is_signaled() {
+    if params.signal_flag.is_signaled() {
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
             task_id: Some(task_id),
@@ -370,15 +385,16 @@ pub fn run_iteration(
 
     // Step 7: Analyze output
     let claude_output = claude_result.output;
-    let outcome = detection::analyze_output(&claude_output, claude_result.exit_code, project_root);
+    let outcome =
+        detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
 
     // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
-    if outcome == IterationOutcome::RateLimit && usage_params.enabled {
+    if outcome == IterationOutcome::RateLimit && params.usage_params.enabled {
         eprintln!("Rate limit detected in output, checking usage API...");
         let check_result = usage::check_and_wait(
-            usage_params.threshold,
-            tasks_dir,
-            usage_params.fallback_wait,
+            params.usage_params.threshold,
+            params.tasks_dir,
+            params.usage_params.fallback_wait,
         );
         if check_result == UsageCheckResult::StopSignaled {
             return Ok(IterationResult {
@@ -394,10 +410,10 @@ pub fn run_iteration(
     // Step 7.7: Extract learnings from output (best-effort, opt-out via env var)
     if !crate::learnings::ingestion::is_extraction_disabled() && !claude_output.is_empty() {
         match crate::learnings::ingestion::extract_learnings_from_output(
-            conn,
+            params.conn,
             &claude_output,
             Some(&task_id),
-            Some(run_id),
+            Some(params.run_id),
         ) {
             Ok(r) if r.learnings_extracted > 0 => {
                 eprintln!(
@@ -411,7 +427,8 @@ pub fn run_iteration(
     }
 
     // Step 8: Record learning feedback
-    if let Err(e) = feedback::record_iteration_feedback(conn, &shown_learning_ids, &outcome) {
+    if let Err(e) = feedback::record_iteration_feedback(params.conn, &shown_learning_ids, &outcome)
+    {
         eprintln!("Warning: failed to record iteration feedback: {}", e);
     }
 
@@ -431,11 +448,12 @@ pub fn run_iteration(
     ctx.last_files = task_files.clone();
 
     // Step 12: Inter-iteration delay (skip if stopping or signaled)
-    if !should_stop && !inter_iteration_delay.is_zero() && !signal_flag.is_signaled() {
+    if !should_stop && !params.inter_iteration_delay.is_zero() && !params.signal_flag.is_signaled()
+    {
         // Sleep in short intervals so we can respond to Ctrl+C promptly
-        let deadline = std::time::Instant::now() + inter_iteration_delay;
+        let deadline = std::time::Instant::now() + params.inter_iteration_delay;
         while std::time::Instant::now() < deadline {
-            if signal_flag.is_signaled() {
+            if params.signal_flag.is_signaled() {
                 should_stop = true;
                 break;
             }
@@ -805,25 +823,26 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
         let elapsed = start_time.elapsed().as_secs();
 
-        let mut result = match run_iteration(
-            &mut ctx,
-            &conn,
-            &run_config.db_dir,
-            &working_root,
-            &paths.tasks_dir,
+        let iteration_params = IterationParams {
+            conn: &conn,
+            db_dir: &run_config.db_dir,
+            project_root: &working_root,
+            tasks_dir: &paths.tasks_dir,
             iteration,
             max_iterations,
-            &run_id,
-            &paths.prompt_file,
-            steering,
+            run_id: &run_id,
+            base_prompt_path: &paths.prompt_file,
+            steering_path: steering,
             inter_iteration_delay,
-            &signal_flag,
-            elapsed,
-            run_config.config.verbose,
-            &usage_params,
-            Some(run_config.prd_file.as_path()),
-            task_prefix.as_deref(),
-        ) {
+            signal_flag: &signal_flag,
+            elapsed_secs: elapsed,
+            verbose: run_config.config.verbose,
+            usage_params: &usage_params,
+            prd_path: Some(run_config.prd_file.as_path()),
+            task_prefix: task_prefix.as_deref(),
+        };
+
+        let mut result = match run_iteration(&mut ctx, &iteration_params) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Iteration error: {}", e);
