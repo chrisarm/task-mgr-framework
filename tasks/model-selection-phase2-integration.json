@@ -703,8 +703,8 @@
       "priority": 13,
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "For each issue found: 1) Add a CODE-FIX-xxx or WIRE-FIX-xxx task to the JSON (priority 14-16), 2) Add to MILESTONE-1 dependsOn array, 3) Commit JSON changes. Mark CODE-REVIEW-1 as passes:true once review complete and tasks created. If no issues, mark passes:true with note.",
+      "passes": true,
+      "notes": "Review complete. Found 1 issue: positional column access in engine.rs read_prd_metadata and prompt.rs get_synergy_partner_models (both added/modified in Phase 2). Created CODE-FIX-001. All other criteria pass: no unwrap() in prod, errors propagated with context, no injection vulnerabilities, quality dimensions met, edge cases covered, all integration wiring verified, no dead code warnings.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/model.rs",
@@ -729,6 +729,33 @@
         "FEAT-005",
         "FEAT-006",
         "FEAT-007"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": []
+    },
+    {
+      "id": "CODE-FIX-001",
+      "title": "Use named columns in engine.rs read_prd_metadata and prompt.rs get_synergy_partner_models",
+      "description": "Two SQL query sites in Phase 2 code use positional row.get(N)? instead of named row.get('column_name')?, violating the pattern established by FIX-A03. Fix: (1) engine.rs read_prd_metadata row.get(0..3) → row.get('branch_name'), row.get('external_git_repo'), row.get('task_prefix'), row.get('default_model'). (2) prompt.rs get_synergy_partner_models row.get(0), row.get(1) → row.get('model'), row.get('difficulty').",
+      "acceptanceCriteria": [
+        "engine.rs read_prd_metadata: row.get(0)? through row.get(3)? changed to row.get('branch_name')?, row.get('external_git_repo')?, row.get('task_prefix')?, row.get('default_model')?",
+        "prompt.rs get_synergy_partner_models: row.get(0)? changed to row.get('model')?, row.get(1)? changed to row.get('difficulty')?",
+        "Column names match the SELECT clause exactly",
+        "All existing tests pass without changes",
+        "cargo clippy clean"
+      ],
+      "priority": 14,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Mechanical fix matching FIX-A03 pattern. The SELECT clauses already name the columns explicitly, so named access matches 1:1. Two sites, 6 total row.get() calls to update.",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prompt.rs"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
       ],
       "synergyWith": [],
       "batchWith": [],
@@ -806,6 +833,7 @@
         "FEAT-006",
         "FEAT-007",
         "CODE-REVIEW-1",
+        "CODE-FIX-001",
         "REFACTOR-REVIEW-1"
       ],
       "synergyWith": [],
