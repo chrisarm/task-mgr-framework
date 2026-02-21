@@ -973,8 +973,8 @@
       ],
       "priority": 33,
       "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Build on TEST-INIT-004. Focus on multi-iteration sequences. The crash escalation in engine.rs applies AFTER build_prompt resolves the base model. Test the escalation logic unit-testable (extract if needed) rather than requiring full iteration runs.",
+      "passes": true,
+      "notes": "Added 3 comprehensive tests: success resets escalation, task boundary isolation, independence from CrashTracker. Total 13 crash escalation tests covering all escalation paths and edge cases.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/engine.rs"

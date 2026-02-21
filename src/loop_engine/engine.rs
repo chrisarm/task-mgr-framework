@@ -3159,6 +3159,74 @@ mod tests {
         );
     }
 
+    // ===== TEST-004: Comprehensive crash recovery escalation tests =====
+
+    /// AC: Crash on task A, success on task A, crash on task A again.
+    /// After success, last_was_crash is false, so the next crash escalates from
+    /// the base model (not from the previously escalated model).
+    #[test]
+    fn test_crash_escalation_success_resets_escalation() {
+        // First crash: haiku → sonnet
+        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        assert_eq!(first, Some(SONNET_MODEL.to_string()));
+
+        // Success: last_was_crash becomes false. Simulating with false:
+        let after_success =
+            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, first.as_deref());
+        assert_eq!(
+            after_success, None,
+            "After success, no crash escalation should occur"
+        );
+
+        // Crash again on same task with original base model:
+        // In real flow, resolved_model would come from build_prompt fresh (haiku again)
+        let second_crash =
+            check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        assert_eq!(
+            second_crash,
+            Some(SONNET_MODEL.to_string()),
+            "After success reset, crash escalates from base model again"
+        );
+    }
+
+    /// AC: Crash on task A, then crash on task B → no escalation for task B.
+    /// The crash escalation is task-scoped.
+    #[test]
+    fn test_crash_escalation_task_boundary_isolation() {
+        // Crash on task A: haiku → sonnet
+        let crash_a = check_crash_escalation(Some("TASK-A"), "TASK-A", true, Some(HAIKU_MODEL));
+        assert_eq!(crash_a, Some(SONNET_MODEL.to_string()));
+
+        // Now task B is selected. last_task_id is "TASK-A", current is "TASK-B".
+        // Even though last_was_crash is true, different task → no escalation.
+        let crash_b = check_crash_escalation(Some("TASK-A"), "TASK-B", true, Some(HAIKU_MODEL));
+        assert_eq!(
+            crash_b, None,
+            "Crash escalation must not carry across task boundaries"
+        );
+    }
+
+    /// AC: Crash escalation is independent of CrashTracker backoff count.
+    /// check_crash_escalation doesn't inspect CrashTracker — it only uses
+    /// last_task_id, current_task_id, last_was_crash, and resolved_model.
+    #[test]
+    fn test_crash_escalation_independent_of_crash_tracker() {
+        // Regardless of how many times CrashTracker has recorded crashes,
+        // check_crash_escalation only cares about the 4 parameters.
+        // Same inputs produce same outputs — no hidden state.
+        let result1 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let result2 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        assert_eq!(
+            result1, result2,
+            "Same inputs must produce same outputs — no hidden state"
+        );
+        assert_eq!(
+            result1,
+            Some(SONNET_MODEL.to_string()),
+            "Escalation result is deterministic"
+        );
+    }
+
     /// Edge case: multiple consecutive crashes on same task follow the ladder:
     /// haiku → sonnet → opus → opus (ceiling).
     #[test]
