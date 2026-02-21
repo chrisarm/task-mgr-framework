@@ -64,7 +64,9 @@
         "src/loop_engine/model.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FIX-A04"],
+      "synergyWith": [
+        "FIX-A04"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
@@ -147,7 +149,9 @@
         "src/commands/init/parse.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FIX-A01"],
+      "synergyWith": [
+        "FIX-A01"
+      ],
       "batchWith": [],
       "conflictsWith": []
     },
@@ -219,7 +223,9 @@
         "src/loop_engine/test_utils.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["TEST-INIT-003"],
+      "synergyWith": [
+        "TEST-INIT-003"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "edgeCases": [
@@ -260,14 +266,16 @@
       ],
       "priority": 5,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "TDD: Template path resolved from base_prompt_path's parent directory: base_prompt_path.parent()/scripts/escalation-policy.md. Use temp directories for test isolation. Key decision: escalation policy is included for ALL non-Opus tiers, including Default/None. This was an architect review decision — the CLI default could be sonnet, and the policy content is informational and safe for opus.",
       "modifiesBehavior": false,
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["TEST-INIT-002"],
+      "synergyWith": [
+        "TEST-INIT-002"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "edgeCases": [
@@ -407,7 +415,9 @@
         "src/loop_engine/engine.rs",
         "src/learnings/ingestion/mod.rs"
       ],
-      "dependsOn": ["TEST-INIT-001"],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -498,8 +508,12 @@
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
       ],
-      "dependsOn": ["TEST-INIT-002"],
-      "synergyWith": ["FEAT-005"],
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "synergyWith": [
+        "FEAT-005"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
@@ -543,8 +557,13 @@
         "src/loop_engine/prompt.rs",
         "tasks/scripts/escalation-policy.md"
       ],
-      "dependsOn": ["TEST-INIT-003", "FEAT-004"],
-      "synergyWith": ["FEAT-004"],
+      "dependsOn": [
+        "TEST-INIT-003",
+        "FEAT-004"
+      ],
+      "synergyWith": [
+        "FEAT-004"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
@@ -583,7 +602,9 @@
       "touchesFiles": [
         "src/loop_engine/engine.rs"
       ],
-      "dependsOn": ["TEST-INIT-004"],
+      "dependsOn": [
+        "TEST-INIT-004"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -738,7 +759,9 @@
         "src/loop_engine/engine.rs",
         "src/loop_engine/progress.rs"
       ],
-      "dependsOn": ["CODE-REVIEW-1"],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": []
@@ -808,15 +831,21 @@
       "touchesFiles": [
         "src/loop_engine/claude.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-002"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "synergyWith": [
+        "TEST-002"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
         "correctness": [
           "All model string variants produce correct CLI args"
         ],
-        "performance": ["N/A"],
+        "performance": [
+          "N/A"
+        ],
         "style": [
           "Use parameterized test patterns for model string variants"
         ]
@@ -843,8 +872,12 @@
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-003"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "synergyWith": [
+        "TEST-003"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
@@ -852,7 +885,9 @@
           "All tier precedence combinations verified",
           "Synergy cluster resolution correct for all topology shapes"
         ],
-        "performance": ["N/A"],
+        "performance": [
+          "N/A"
+        ],
         "style": [
           "Use test helpers to reduce setup boilerplate"
         ]
@@ -877,8 +912,12 @@
       "touchesFiles": [
         "src/loop_engine/prompt.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-002"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "synergyWith": [
+        "TEST-002"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "qualityDimensions": {
@@ -912,7 +951,9 @@
       "touchesFiles": [
         "src/loop_engine/engine.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -922,7 +963,9 @@
           "Independence from CrashTracker verified",
           "None baseline assumption produces opus"
         ],
-        "performance": ["N/A"],
+        "performance": [
+          "N/A"
+        ],
         "style": [
           "Test names clearly describe the multi-step scenario"
         ]
@@ -1015,7 +1058,9 @@
         "src/loop_engine/engine.rs",
         "tests/"
       ],
-      "dependsOn": ["MILESTONE-2"],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -1057,7 +1102,9 @@
         "src/loop_engine/engine.rs",
         "src/loop_engine/progress.rs"
       ],
-      "dependsOn": ["INT-001"],
+      "dependsOn": [
+        "INT-001"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": []
