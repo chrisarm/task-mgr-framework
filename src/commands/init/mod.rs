@@ -305,19 +305,22 @@ pub fn init(
         }
 
         // Track JSON file + PRD for prd_files registration
-        json_file_registrations.push((json_path.to_path_buf(), PrdFile {
-            project: prd.project.clone(),
-            branch_name: None,
-            description: None,
-            priority_philosophy: None,
-            global_acceptance_criteria: None,
-            review_guidelines: None,
-            user_stories: Vec::new(),
-            external_git_repo: None,
-            task_prefix: None,
-            prd_file: prd.prd_file.clone(),
-            model: None,
-        }));
+        json_file_registrations.push((
+            json_path.to_path_buf(),
+            PrdFile {
+                project: prd.project.clone(),
+                branch_name: None,
+                description: None,
+                priority_philosophy: None,
+                global_acceptance_criteria: None,
+                review_guidelines: None,
+                user_stories: Vec::new(),
+                external_git_repo: None,
+                task_prefix: None,
+                prd_file: prd.prd_file.clone(),
+                model: None,
+            },
+        ));
 
         // Collect new stories (with prefix applied)
         for story in prd.user_stories {

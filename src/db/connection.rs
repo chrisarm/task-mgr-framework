@@ -46,8 +46,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::TaskMgrResult;
 use super::schema::create_schema;
+use crate::TaskMgrResult;
 
 /// Opens a SQLite connection with appropriate pragmas set for reliability and performance.
 ///

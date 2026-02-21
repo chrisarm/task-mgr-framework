@@ -264,11 +264,7 @@ pub fn delete_task_relationships(conn: &Connection, task_id: &str) -> TaskMgrRes
 }
 
 /// Insert a PRD file record into the prd_files table.
-pub fn insert_prd_file(
-    conn: &Connection,
-    file_path: &str,
-    file_type: &str,
-) -> TaskMgrResult<()> {
+pub fn insert_prd_file(conn: &Connection, file_path: &str, file_type: &str) -> TaskMgrResult<()> {
     conn.execute(
         "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, ?)",
         [file_path, file_type],
