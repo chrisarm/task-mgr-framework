@@ -45,19 +45,36 @@ pub fn print_session_banner(
     eprintln!("╚══════════════════════════════════════════════╝\n");
 }
 
+/// Format an iteration header as a string (for testability).
+pub fn format_iteration_header(
+    iteration: u32,
+    max_iterations: u32,
+    task_id: &str,
+    elapsed_secs: u64,
+    model: Option<&str>,
+) -> String {
+    let model_display = model.unwrap_or("(default)");
+    format!(
+        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {} ═══ Elapsed: {} ═══",
+        iteration,
+        max_iterations,
+        task_id,
+        model_display,
+        format_duration(elapsed_secs)
+    )
+}
+
 /// Print an iteration header to stderr.
 pub fn print_iteration_header(
     iteration: u32,
     max_iterations: u32,
     task_id: &str,
     elapsed_secs: u64,
+    model: Option<&str>,
 ) {
     eprintln!(
-        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Elapsed: {} ═══",
-        iteration,
-        max_iterations,
-        task_id,
-        format_duration(elapsed_secs)
+        "{}",
+        format_iteration_header(iteration, max_iterations, task_id, elapsed_secs, model)
     );
 }
 
@@ -161,7 +178,25 @@ mod tests {
 
     #[test]
     fn test_print_iteration_header_no_panic() {
-        print_iteration_header(3, 10, "FEAT-001", 125);
+        print_iteration_header(3, 10, "FEAT-001", 125, None);
+    }
+
+    #[test]
+    fn test_format_iteration_header_with_none_model() {
+        let header = format_iteration_header(3, 10, "FEAT-001", 125, None);
+        assert!(header.contains("Iteration 3/10"));
+        assert!(header.contains("Task: FEAT-001"));
+        assert!(header.contains("Model: (default)"));
+        assert!(header.contains("Elapsed: 2m 5s"));
+    }
+
+    #[test]
+    fn test_format_iteration_header_with_some_model() {
+        let header = format_iteration_header(1, 5, "TEST-002", 60, Some("claude-sonnet-4-6"));
+        assert!(header.contains("Iteration 1/5"));
+        assert!(header.contains("Task: TEST-002"));
+        assert!(header.contains("Model: claude-sonnet-4-6"));
+        assert!(header.contains("Elapsed: 1m 0s"));
     }
 
     #[test]

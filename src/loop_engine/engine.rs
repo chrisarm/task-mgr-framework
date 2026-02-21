@@ -357,6 +357,7 @@ pub fn run_iteration(
         params.max_iterations,
         &task_id,
         params.elapsed_secs,
+        None,
     );
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
@@ -867,6 +868,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             result.task_id.as_deref(),
             &result.outcome,
             &result.files_modified,
+            None,
         );
 
         // Track last claimed task for cleanup on exit

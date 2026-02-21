@@ -30,6 +30,7 @@ pub fn log_iteration(
     task_id: Option<&str>,
     outcome: &IterationOutcome,
     files: &[String],
+    model: Option<&str>,
 ) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let task = task_id.unwrap_or("(none)");
@@ -39,10 +40,11 @@ pub fn log_iteration(
     } else {
         files.join(", ")
     };
+    let model_display = model.unwrap_or("(default)");
 
     let entry = format!(
-        "\n## {} - Iteration {}\n- Task: {}\n- Outcome: {}\n- Files: {}\n---\n",
-        timestamp, iteration, task, outcome_str, files_str
+        "\n## {} - Iteration {}\n- Task: {}\n- Model: {}\n- Outcome: {}\n- Files: {}\n---\n",
+        timestamp, iteration, task, model_display, outcome_str, files_str
     );
 
     match OpenOptions::new()
@@ -102,6 +104,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &["src/lib.rs".to_string()],
+            None,
         );
 
         assert!(progress_path.exists());
@@ -127,6 +130,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
         );
         log_iteration(
             &progress_path,
@@ -134,6 +138,7 @@ mod tests {
             Some("FEAT-002"),
             &IterationOutcome::Blocked,
             &[],
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -147,7 +152,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(&progress_path, 1, None, &IterationOutcome::Empty, &[]);
+        log_iteration(&progress_path, 1, None, &IterationOutcome::Empty, &[], None);
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("(none)"));
@@ -164,6 +169,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -181,6 +187,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &["src/a.rs".to_string(), "src/b.rs".to_string()],
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -196,7 +203,44 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
         );
+    }
+
+    #[test]
+    fn test_log_iteration_with_none_model_shows_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        log_iteration(
+            &progress_path,
+            1,
+            Some("FEAT-001"),
+            &IterationOutcome::Completed,
+            &[],
+            None,
+        );
+
+        let content = fs::read_to_string(&progress_path).unwrap();
+        assert!(content.contains("- Model: (default)"));
+    }
+
+    #[test]
+    fn test_log_iteration_with_some_model_shows_model_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        log_iteration(
+            &progress_path,
+            1,
+            Some("FEAT-001"),
+            &IterationOutcome::Completed,
+            &[],
+            Some("claude-sonnet-4-6"),
+        );
+
+        let content = fs::read_to_string(&progress_path).unwrap();
+        assert!(content.contains("- Model: claude-sonnet-4-6"));
     }
 
     // --- format_outcome tests ---
