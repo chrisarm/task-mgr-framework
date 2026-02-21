@@ -33,6 +33,7 @@ use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::env;
 use crate::loop_engine::feedback;
+use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
 use crate::loop_engine::progress;
@@ -70,9 +71,8 @@ impl UsageParams {
 
 /// Parameters for a single iteration of the agent loop.
 ///
-/// Groups the 16 read-only parameters that `run_iteration()` needs,
+/// Groups the read-only parameters that `run_iteration()` needs,
 /// keeping the mutable `IterationContext` as a separate argument.
-/// FEAT-007 will later add `default_model: Option<&'a str>`.
 pub struct IterationParams<'a> {
     /// Database connection
     pub conn: &'a Connection,
@@ -106,6 +106,8 @@ pub struct IterationParams<'a> {
     pub prd_path: Option<&'a Path>,
     /// Optional task prefix for ID normalization
     pub task_prefix: Option<&'a str>,
+    /// Default model from PRD metadata (threaded from run_loop via PrdMetadata).
+    pub default_model: Option<&'a str>,
 }
 
 /// Result of a single iteration.
@@ -121,6 +123,9 @@ pub struct IterationResult {
     pub should_stop: bool,
     /// Claude's stdout output (for output-based completion detection)
     pub output: String,
+    /// Effective model used for this iteration (post-crash-escalation).
+    /// None for early exits (signal, rate-limit, etc.).
+    pub effective_model: Option<String>,
 }
 
 /// Mutable context carried between iterations.
@@ -180,6 +185,7 @@ pub fn run_iteration(
             files_modified: vec![],
             should_stop: true,
             output: String::new(),
+            effective_model: None,
         });
     }
 
@@ -192,6 +198,7 @@ pub fn run_iteration(
             files_modified: vec![],
             should_stop: true,
             output: String::new(),
+            effective_model: None,
         });
     }
 
@@ -219,6 +226,7 @@ pub fn run_iteration(
                     files_modified: vec![],
                     should_stop: true,
                     output: String::new(),
+                    effective_model: None,
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -246,6 +254,7 @@ pub fn run_iteration(
             files_modified: vec![],
             should_stop: true,
             output: String::new(),
+            effective_model: None,
         });
     }
 
@@ -275,7 +284,7 @@ pub fn run_iteration(
         base_prompt_path: params.base_prompt_path,
         steering_path: params.steering_path,
         verbose: params.verbose,
-        default_model: None, // TODO(FEAT-007): Thread from PrdMetadata
+        default_model: params.default_model,
     };
 
     let prompt_result = match prompt::build_prompt(&prompt_params)? {
@@ -298,6 +307,7 @@ pub fn run_iteration(
                     files_modified: vec![],
                     should_stop: true,
                     output: String::new(),
+                    effective_model: None,
                 });
             }
 
@@ -336,6 +346,7 @@ pub fn run_iteration(
                             files_modified: vec![],
                             should_stop: false,
                             output: String::new(),
+                            effective_model: None,
                         });
                     }
                 }
@@ -350,6 +361,7 @@ pub fn run_iteration(
                     files_modified: vec![],
                     should_stop: false,
                     output: String::new(),
+                    effective_model: None,
                 });
             }
         }
@@ -359,13 +371,31 @@ pub fn run_iteration(
     let task_files = prompt_result.task_files.clone();
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
-    // Step 5: Print iteration header
+    // Step 4.5: Apply crash escalation (after model resolution, before spawn)
+    let effective_model = {
+        let resolved = prompt_result.resolved_model.as_deref();
+        match check_crash_escalation(
+            ctx.last_task_id.as_deref(),
+            &task_id,
+            ctx.last_was_crash,
+            resolved,
+        ) {
+            Some(escalated) => {
+                let old = resolved.unwrap_or("(default)");
+                eprintln!("Crash escalation: {} → {}", old, escalated);
+                Some(escalated)
+            }
+            None => prompt_result.resolved_model,
+        }
+    };
+
+    // Step 5: Print iteration header (with post-escalation effective_model)
     display::print_iteration_header(
         params.iteration,
         params.max_iterations,
         &task_id,
         params.elapsed_secs,
-        None,
+        effective_model.as_deref(),
     );
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
@@ -374,7 +404,7 @@ pub fn run_iteration(
         &prompt_result.prompt,
         Some(params.signal_flag),
         Some(params.project_root),
-        None,
+        effective_model.as_deref(),
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
@@ -389,6 +419,7 @@ pub fn run_iteration(
             files_modified: task_files,
             should_stop: true,
             output: claude_result.output,
+            effective_model: None,
         });
     }
 
@@ -412,6 +443,7 @@ pub fn run_iteration(
                 files_modified: task_files,
                 should_stop: true,
                 output: String::new(),
+                effective_model: None,
             });
         }
     }
@@ -456,6 +488,10 @@ pub fn run_iteration(
     // Step 11: Update last_files for next iteration scoring
     ctx.last_files = task_files.clone();
 
+    // Step 11.5: Update crash escalation context for next iteration
+    ctx.last_task_id = Some(task_id.clone());
+    ctx.last_was_crash = matches!(outcome, IterationOutcome::Crash(_));
+
     // Step 12: Inter-iteration delay (skip if stopping or signaled)
     if !should_stop && !params.inter_iteration_delay.is_zero() && !params.signal_flag.is_signaled()
     {
@@ -476,6 +512,7 @@ pub fn run_iteration(
         files_modified: task_files,
         should_stop,
         output: claude_output,
+        effective_model,
     })
 }
 
@@ -654,6 +691,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let branch_name = prd_metadata.branch_name;
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
+    let default_model = prd_metadata.default_model;
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
     // This catches tasks completed in a previous run where the DB status was never
@@ -849,6 +887,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             usage_params: &usage_params,
             prd_path: Some(run_config.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
+            default_model: default_model.as_deref(),
         };
 
         let mut result = match run_iteration(&mut ctx, &iteration_params) {
@@ -876,7 +915,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             result.task_id.as_deref(),
             &result.outcome,
             &result.files_modified,
-            None,
+            result.effective_model.as_deref(),
         );
 
         // Track last claimed task for cleanup on exit
@@ -1182,21 +1221,25 @@ struct PrdMetadata {
     task_count: usize,
     external_git_repo: Option<String>,
     task_prefix: Option<String>,
+    /// Default model for all tasks in this PRD. Read from `prd_metadata.default_model`.
+    default_model: Option<String>,
 }
 
-/// Read branch name, task count, external_git_repo, and task_prefix from prd_metadata and tasks tables.
+/// Read branch name, task count, external_git_repo, task_prefix, and default_model
+/// from prd_metadata and tasks tables.
 fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
-    let (branch_name, external_git_repo, task_prefix): (
+    let (branch_name, external_git_repo, task_prefix, default_model): (
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
     ) = conn
         .query_row(
-            "SELECT branch_name, external_git_repo, task_prefix FROM prd_metadata WHERE id = 1",
+            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
 
     let task_count: usize = conn
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
@@ -1208,6 +1251,7 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
         task_count,
         external_git_repo,
         task_prefix,
+        default_model,
     })
 }
 
@@ -1739,12 +1783,23 @@ fn hash_file(path: &Path) -> String {
 /// Escalation is independent of `CrashTracker` backoff logic.
 // TODO(FEAT-007): Implement escalation logic
 pub fn check_crash_escalation(
-    _last_task_id: Option<&str>,
-    _current_task_id: &str,
-    _last_was_crash: bool,
-    _resolved_model: Option<&str>,
+    last_task_id: Option<&str>,
+    current_task_id: &str,
+    last_was_crash: bool,
+    resolved_model: Option<&str>,
 ) -> Option<String> {
-    None
+    // Escalation requires BOTH same task AND previous crash
+    if !last_was_crash {
+        return None;
+    }
+    if last_task_id != Some(current_task_id) {
+        return None;
+    }
+    // None model: assume sonnet baseline, escalate to opus
+    match resolved_model {
+        None => Some(model::OPUS_MODEL.to_string()),
+        Some(m) => model::escalate_model(Some(m)),
+    }
 }
 
 /// Update crash and stale trackers based on iteration outcome.
@@ -1814,6 +1869,7 @@ mod tests {
             files_modified: vec!["src/lib.rs".to_string()],
             should_stop: false,
             output: String::new(),
+            effective_model: None,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);
@@ -2979,7 +3035,7 @@ mod tests {
     // --- check_crash_escalation tests ---
     //
     // Active tests validate the no-escalation paths (pass against stub).
-    // #[ignore] tests define expected FEAT-007 behavior.
+    // Tests below verify FEAT-007 crash escalation behavior.
 
     /// First iteration: no previous task context, no crash — no escalation.
     #[test]
@@ -3023,7 +3079,7 @@ mod tests {
 
     /// AC: same task + crash + haiku model → escalate to sonnet.
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_haiku_to_sonnet() {
         let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
         assert_eq!(
@@ -3035,7 +3091,7 @@ mod tests {
 
     /// AC: same task + crash + sonnet model → escalate to opus.
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_sonnet_to_opus() {
         let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
         assert_eq!(
@@ -3047,7 +3103,7 @@ mod tests {
 
     /// AC: same task + crash + already opus → stays opus (ceiling, no panic).
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_opus_ceiling() {
         let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(OPUS_MODEL));
         assert_eq!(
@@ -3061,7 +3117,7 @@ mod tests {
     /// escalated to OPUS_MODEL. Architect decision: None crash assumes sonnet
     /// baseline and escalates to opus (not a no-op).
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_none_model_to_opus() {
         let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, None);
         assert_eq!(
@@ -3075,7 +3131,7 @@ mod tests {
     /// An implementation that checks only one condition would pass one assertion
     /// but fail the other.
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_requires_both_conditions() {
         // Only same task (no crash) — must NOT escalate
         let no_crash =
@@ -3099,7 +3155,7 @@ mod tests {
     /// Edge case: multiple consecutive crashes on same task follow the ladder:
     /// haiku → sonnet → opus → opus (ceiling).
     #[test]
-    #[ignore] // Requires FEAT-007 implementation
+
     fn test_crash_escalation_consecutive_ladder() {
         // First crash: haiku → sonnet
         let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));

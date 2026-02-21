@@ -249,8 +249,7 @@ pub fn init(
                             .file_name()
                             .and_then(|f| f.to_str())
                             .unwrap_or("unknown.json");
-                        let generated =
-                            generate_prefix(prd.branch_name.as_deref(), filename);
+                        let generated = generate_prefix(prd.branch_name.as_deref(), filename);
                         if !dry_run {
                             write_prefix_to_json(json_path, &generated)?;
                         }

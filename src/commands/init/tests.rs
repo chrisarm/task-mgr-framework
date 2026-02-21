@@ -1643,14 +1643,20 @@ fn test_generate_prefix_deterministic() {
 fn test_generate_prefix_different_branches_differ() {
     let p1 = super::generate_prefix(Some("feat/branch-a"), "prd.json");
     let p2 = super::generate_prefix(Some("feat/branch-b"), "prd.json");
-    assert_ne!(p1, p2, "Different branches should produce different prefixes");
+    assert_ne!(
+        p1, p2,
+        "Different branches should produce different prefixes"
+    );
 }
 
 #[test]
 fn test_generate_prefix_different_filenames_differ() {
     let p1 = super::generate_prefix(Some("main"), "phase1.json");
     let p2 = super::generate_prefix(Some("main"), "phase2.json");
-    assert_ne!(p1, p2, "Different filenames should produce different prefixes");
+    assert_ne!(
+        p1, p2,
+        "Different filenames should produce different prefixes"
+    );
 }
 
 #[test]
