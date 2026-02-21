@@ -410,7 +410,7 @@ fn test_import_deduplicates_within_batch() {
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    let result = import_learnings(dir.path(), &import_file, true, false).unwrap();
     assert_eq!(result.learnings_imported, 2);
     assert_eq!(result.learnings_skipped, 1);
 
@@ -431,7 +431,7 @@ fn test_import_atomicity_all_or_nothing() {
     let json = serde_json::to_string_pretty(&learnings).unwrap();
     let import_file = dir.path().join("first.json");
     fs::write(&import_file, &json).unwrap();
-    import_learnings(dir.path(), &import_file, false).unwrap();
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
 
     // Count learnings before attempted import
     let conn = open_connection(dir.path()).unwrap();
@@ -452,7 +452,7 @@ fn test_import_atomicity_all_or_nothing() {
     let import_file2 = dir.path().join("second.json");
     fs::write(&import_file2, &json).unwrap();
 
-    let result = import_learnings(dir.path(), &import_file2, false).unwrap();
+    let result = import_learnings(dir.path(), &import_file2, true, false).unwrap();
     assert_eq!(result.learnings_imported, 2);
 
     // Verify all 3 learnings (1 existing + 2 new) are in DB
@@ -538,7 +538,7 @@ fn test_import_preserves_stats_when_no_reset() {
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    let result = import_learnings(dir.path(), &import_file, true, false).unwrap();
     assert_eq!(result.learnings_imported, 1);
     assert!(!result.stats_reset);
 
@@ -573,7 +573,7 @@ fn test_import_preserves_stats_with_none_datetimes() {
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    import_learnings(dir.path(), &import_file, false).unwrap();
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
 
     let conn = open_connection(dir.path()).unwrap();
     let (shown, applied, last_shown, last_applied): (i32, i32, Option<String>, Option<String>) =
@@ -598,6 +598,7 @@ fn test_format_text_stats_preserved() {
         learnings_skipped: 0,
         tags_imported: 0,
         stats_reset: false,
+        learnings_only: true,
     };
     let text = format_text(&result);
     assert!(text.contains("preserved from export"));
@@ -612,6 +613,7 @@ fn test_format_text_stats_reset() {
         learnings_skipped: 0,
         tags_imported: 0,
         stats_reset: true,
+        learnings_only: true,
     };
     let text = format_text(&result);
     assert!(text.contains("reset to zero"));
@@ -626,6 +628,7 @@ fn test_format_text_no_stats_line_when_zero_imported() {
         learnings_skipped: 5,
         tags_imported: 0,
         stats_reset: false,
+        learnings_only: true,
     };
     let text = format_text(&result);
     // No stats line when nothing was imported and not resetting
@@ -641,7 +644,7 @@ fn test_import_invalid_json_returns_meaningful_error() {
     let import_file = dir.path().join("bad.json");
     fs::write(&import_file, "not json {{{").unwrap();
 
-    let err = import_learnings(dir.path(), &import_file, false).unwrap_err();
+    let err = import_learnings(dir.path(), &import_file, true, false).unwrap_err();
     let msg = err.to_string();
     // Error message should mention the format expectation, not be opaque
     assert!(
@@ -657,7 +660,7 @@ fn test_import_nonexistent_file_returns_io_error() {
     let (dir, _conn) = setup_test_db();
     let missing = dir.path().join("does_not_exist.json");
 
-    let err = import_learnings(dir.path(), &missing, false).unwrap_err();
+    let err = import_learnings(dir.path(), &missing, true, false).unwrap_err();
     assert!(
         matches!(err, TaskMgrError::IoErrorWithContext { .. }),
         "Expected IoErrorWithContext, got: {err:?}"
@@ -687,7 +690,7 @@ fn test_outcome_roundtrip(#[case] outcome: LearningOutcome, #[case] expected_db:
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    import_learnings(dir.path(), &import_file, false).unwrap();
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
 
     let conn = open_connection(dir.path()).unwrap();
     let db_outcome: String = conn
@@ -718,7 +721,7 @@ fn test_confidence_roundtrip(#[case] confidence: Confidence, #[case] expected_db
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    import_learnings(dir.path(), &import_file, false).unwrap();
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
 
     let conn = open_connection(dir.path()).unwrap();
     let db_confidence: String = conn
@@ -744,7 +747,7 @@ fn test_import_learning_all_optional_fields_none() {
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    let result = import_learnings(dir.path(), &import_file, true, false).unwrap();
     assert_eq!(result.learnings_imported, 1);
 
     let conn = open_connection(dir.path()).unwrap();
@@ -810,7 +813,7 @@ fn test_import_learning_all_optional_fields_populated() {
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    let result = import_learnings(dir.path(), &import_file, false).unwrap();
+    let result = import_learnings(dir.path(), &import_file, true, false).unwrap();
     assert_eq!(result.learnings_imported, 1);
     assert_eq!(result.tags_imported, 3);
 
@@ -1003,7 +1006,7 @@ fn test_roundtrip_export_import_field_by_field() {
     let import_file = src_dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
 
-    import_learnings(src_dir.path(), &import_file, false).unwrap();
+    import_learnings(src_dir.path(), &import_file, true, false).unwrap();
 
     // 2. Read back from source DB and serialize to JSON (simulates export)
     let src_conn = open_connection(src_dir.path()).unwrap();
@@ -1015,7 +1018,7 @@ fn test_roundtrip_export_import_field_by_field() {
     let (dst_dir, _conn2) = setup_test_db();
     let export_file = dst_dir.path().join("exported.json");
     fs::write(&export_file, &exported_json).unwrap();
-    import_learnings(dst_dir.path(), &export_file, false).unwrap();
+    import_learnings(dst_dir.path(), &export_file, true, false).unwrap();
 
     // 4. Read back from destination DB and compare field-by-field
     let dst_conn = open_connection(dst_dir.path()).unwrap();
@@ -1082,7 +1085,7 @@ fn test_stats_roundtrip_via_export_import() {
     let json = serde_json::to_string_pretty(&learnings).unwrap();
     let import_file = dir.path().join("import.json");
     fs::write(&import_file, &json).unwrap();
-    import_learnings(dir.path(), &import_file, false).unwrap();
+    import_learnings(dir.path(), &import_file, true, false).unwrap();
 
     // Read back, serialize, then import to fresh DB (simulates export→import round-trip)
     let conn = open_connection(dir.path()).unwrap();
@@ -1094,7 +1097,7 @@ fn test_stats_roundtrip_via_export_import() {
     let (dir2, _conn2) = setup_test_db();
     let export_file = dir2.path().join("exported.json");
     fs::write(&export_file, &exported_json).unwrap();
-    let result = import_learnings(dir2.path(), &export_file, false).unwrap();
+    let result = import_learnings(dir2.path(), &export_file, true, false).unwrap();
     assert!(!result.stats_reset);
 
     // Verify stats match original
@@ -1192,7 +1195,7 @@ fn test_e2e_init_learn_export_import_roundtrip() {
     // 4. Import to fresh DB (simulates `import-learnings --from-json`)
     let (dst_dir, dst_conn) = setup_test_db();
     drop(dst_conn); // Release connection before import_learnings opens its own
-    let import_result = import_learnings(dst_dir.path(), &learnings_file, false).unwrap();
+    let import_result = import_learnings(dst_dir.path(), &learnings_file, true, false).unwrap();
     assert_eq!(import_result.learnings_imported, 1);
     assert_eq!(import_result.learnings_skipped, 0);
     assert!(!import_result.stats_reset);
@@ -1306,7 +1309,7 @@ fn test_e2e_export_import_roundtrip_with_reset_stats() {
     // 3. Import with --reset-stats to fresh DB
     let (dst_dir, dst_conn) = setup_test_db();
     drop(dst_conn);
-    let import_result = import_learnings(dst_dir.path(), &learnings_file, true).unwrap();
+    let import_result = import_learnings(dst_dir.path(), &learnings_file, true, true).unwrap();
     assert_eq!(import_result.learnings_imported, 1);
     assert!(import_result.stats_reset);
 
@@ -1345,30 +1348,4 @@ fn test_e2e_export_import_roundtrip_with_reset_stats() {
     );
 }
 
-/// CLI verification: import-learnings --help does not contain 'learnings-only'.
-#[test]
-fn test_cli_help_does_not_contain_learnings_only() {
-    let cmd = Cli::command();
-    let subcmd = cmd
-        .find_subcommand("import-learnings")
-        .expect("import-learnings subcommand should exist");
-
-    // Verify no argument has the name 'learnings-only'
-    for arg in subcmd.get_arguments() {
-        if let Some(long) = arg.get_long() {
-            assert_ne!(
-                long, "learnings-only",
-                "import-learnings should not have --learnings-only arg"
-            );
-        }
-    }
-
-    // Also verify help text doesn't mention it
-    let mut help_buf = Vec::new();
-    subcmd.clone().write_help(&mut help_buf).unwrap();
-    let help_text = String::from_utf8(help_buf).unwrap();
-    assert!(
-        !help_text.contains("learnings-only"),
-        "import-learnings --help should not mention 'learnings-only', got:\n{help_text}"
-    );
-}
+// NOTE: test_cli_help_does_not_contain_learnings_only removed — main still has the flag.
