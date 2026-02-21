@@ -384,14 +384,14 @@ fn append_base_prompt(prompt: &mut String, base_prompt_path: &Path) {
     }
 }
 
-/// Truncate a string to fit within a character budget.
+/// Truncate a string to fit within a byte budget.
 fn truncate_to_budget(text: &str, budget: usize) -> String {
     if text.len() <= budget {
         text.to_string()
     } else {
         let safe_end = text.floor_char_boundary(budget);
         let truncated = &text[..safe_end];
-        format!("{}...\n[truncated to {} chars]", truncated, budget)
+        format!("{}...\n[truncated to {} bytes]", truncated, budget)
     }
 }
 
@@ -466,7 +466,7 @@ mod tests {
         let text = "a".repeat(5000);
         let result = truncate_to_budget(&text, 100);
         assert!(result.len() < 200);
-        assert!(result.contains("[truncated to 100 chars]"));
+        assert!(result.contains("[truncated to 100 bytes]"));
     }
 
     #[test]
@@ -1787,7 +1787,7 @@ pub enum ApiError {
     fn test_truncate_to_budget_zero() {
         let result = truncate_to_budget("hello", 0);
         assert!(
-            result.contains("[truncated to 0 chars]"),
+            result.contains("[truncated to 0 bytes]"),
             "Zero budget should truncate"
         );
     }
@@ -1796,7 +1796,7 @@ pub enum ApiError {
     fn test_truncate_to_budget_one_char() {
         let result = truncate_to_budget("hello", 1);
         assert!(result.starts_with('h'));
-        assert!(result.contains("[truncated to 1 chars]"));
+        assert!(result.contains("[truncated to 1 bytes]"));
     }
 
     #[test]
@@ -1812,11 +1812,11 @@ pub enum ApiError {
         assert_eq!(text.len(), 5); // 5 bytes
                                    // Budget 4 falls after 'f' but before 'é' starts — safe
         let result = truncate_to_budget(text, 4);
-        assert!(result.contains("[truncated to 4 chars]"));
+        assert!(result.contains("[truncated to 4 bytes]"));
         assert!(result.starts_with("caf"));
         // Budget 3 falls mid-way — would panic with naive slicing if é started at byte 3
         let result = truncate_to_budget(text, 3);
-        assert!(result.contains("[truncated to 3 chars]"));
+        assert!(result.contains("[truncated to 3 bytes]"));
     }
 
     #[test]
@@ -1826,7 +1826,7 @@ pub enum ApiError {
         assert_eq!(text.len(), 16); // 4 emoji × 4 bytes
                                     // Budget 5 falls mid-second emoji (byte 5 is inside 🍔)
         let result = truncate_to_budget(text, 5);
-        assert!(result.contains("[truncated to 5 chars]"));
+        assert!(result.contains("[truncated to 5 bytes]"));
         // Should contain only first emoji (4 bytes), not a partial second
         assert!(result.starts_with("🍕"));
         assert!(!result.starts_with("🍕🍔"));
@@ -1839,7 +1839,7 @@ pub enum ApiError {
         assert_eq!(text.len(), 12); // 4 chars × 3 bytes
                                     // Budget 4 falls mid-second character (byte 4 is inside 好)
         let result = truncate_to_budget(text, 4);
-        assert!(result.contains("[truncated to 4 chars]"));
+        assert!(result.contains("[truncated to 4 bytes]"));
         assert!(result.starts_with("你"));
     }
 
@@ -1850,7 +1850,7 @@ pub enum ApiError {
         assert_eq!(text.len(), 13);
         // Budget 7 = just past the space, before 世 starts (byte 6 is space, 7 is mid-世)
         let result = truncate_to_budget(text, 7);
-        assert!(result.contains("[truncated to 7 chars]"));
+        assert!(result.contains("[truncated to 7 bytes]"));
         assert!(result.starts_with("hello "));
     }
 
