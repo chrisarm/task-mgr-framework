@@ -456,7 +456,7 @@
       ],
       "priority": 8,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Two simple parameter additions. For display.rs: add model param to print_iteration_header, add it to the eprintln format string. Consider adding format_iteration_header() -> String for testability with print_iteration_header as thin wrapper. For progress.rs: add model param to log_iteration, add a '- Model: {}' line to the entry format. Update all 7 existing progress tests to pass None as the new last param. FEAT-007 will later change the None to the post-escalation effective_model — the model parameter receives the effective (post-crash-escalation) model, not the pre-escalation resolved_model.",
       "modifiesBehavior": false,
       "touchesFiles": [
