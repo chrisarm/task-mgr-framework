@@ -69,6 +69,8 @@ pub struct PrdFile {
     /// Stored in `prd_files` for archive file discovery.
     #[serde(default)]
     pub prd_file: Option<String>,
+    /// Default model for all tasks in this PRD. Maps to `prd_metadata.default_model`
+    /// in the database after import.
     #[serde(default)]
     pub model: Option<String>,
 }

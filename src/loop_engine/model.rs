@@ -78,6 +78,9 @@ pub fn resolve_task_model(
 /// When multiple tasks run in the same iteration (synergy cluster),
 /// the highest-tier model wins so that all tasks get adequate capability.
 ///
+/// Note: `max_by_key` returns the **last** element when tiers are tied,
+/// so the model from the last task in the slice wins among equal tiers.
+///
 /// Returns `None` if the slice is empty or all entries are `None`.
 pub fn resolve_iteration_model(task_models: &[Option<String>]) -> Option<String> {
     task_models
