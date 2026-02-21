@@ -1187,7 +1187,7 @@ fn test_init_auto_prefix_from_json_field() {
 }
 
 #[test]
-fn test_init_auto_prefix_generates_uuid_when_absent() {
+fn test_init_auto_prefix_generates_hash_when_absent() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
         "project": "test",
@@ -1626,4 +1626,90 @@ fn test_insert_prd_metadata_without_default_model() {
         .unwrap();
 
     assert_eq!(default_model, None);
+}
+
+// --- Deterministic prefix generation tests ---
+
+#[test]
+fn test_generate_prefix_deterministic() {
+    let p1 = super::generate_prefix(Some("feat/my-branch"), "prd.json");
+    let p2 = super::generate_prefix(Some("feat/my-branch"), "prd.json");
+    assert_eq!(p1, p2, "Same inputs must produce same prefix");
+    assert_eq!(p1.len(), 8);
+    assert!(p1.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn test_generate_prefix_different_branches_differ() {
+    let p1 = super::generate_prefix(Some("feat/branch-a"), "prd.json");
+    let p2 = super::generate_prefix(Some("feat/branch-b"), "prd.json");
+    assert_ne!(p1, p2, "Different branches should produce different prefixes");
+}
+
+#[test]
+fn test_generate_prefix_different_filenames_differ() {
+    let p1 = super::generate_prefix(Some("main"), "phase1.json");
+    let p2 = super::generate_prefix(Some("main"), "phase2.json");
+    assert_ne!(p1, p2, "Different filenames should produce different prefixes");
+}
+
+#[test]
+fn test_generate_prefix_none_branch_equals_empty_branch() {
+    let p1 = super::generate_prefix(None, "prd.json");
+    let p2 = super::generate_prefix(Some(""), "prd.json");
+    assert_eq!(p1, p2, "None and empty branch should be equivalent");
+    assert_eq!(p1.len(), 8);
+}
+
+#[test]
+fn test_generate_prefix_known_values() {
+    // Pinned: echo -n "feat/test:prd.json" | md5sum | cut -c1-8
+    let p = super::generate_prefix(Some("feat/test"), "prd.json");
+    assert_eq!(p, "34c5194b");
+
+    // Pinned: echo -n ":prd.json" | md5sum | cut -c1-8
+    let p_no_branch = super::generate_prefix(None, "prd.json");
+    assert_eq!(p_no_branch, "f8676724");
+}
+
+#[test]
+fn test_init_auto_prefix_dry_run_deterministic() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "branchName": "feat/dry",
+        "userStories": [
+            {"id": "US-001", "title": "Task 1", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    let r1 = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        true,
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    // Dry-run doesn't write back, so second call also generates
+    let r2 = init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        true,
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    assert_eq!(
+        r1.prefix_applied, r2.prefix_applied,
+        "Dry-run should produce deterministic prefix"
+    );
 }
