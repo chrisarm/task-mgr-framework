@@ -22,6 +22,7 @@ use crate::commands::next::output::{LearningSummaryOutput, NextResult};
 use crate::error::TaskMgrResult;
 use crate::learnings::bandit;
 use crate::loop_engine::context;
+use crate::loop_engine::model;
 
 /// Total character budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
@@ -178,12 +179,21 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // Section: Base prompt template
     append_base_prompt(&mut prompt, params.base_prompt_path);
 
+    // Model resolution: resolve synergy cluster model from task + synergyWith partners
+    let resolved_model = resolve_synergy_cluster_model(
+        params.conn,
+        &task_output.id,
+        task_output.model.as_deref(),
+        task_output.difficulty.as_deref(),
+        params.default_model,
+    );
+
     Ok(Some(PromptResult {
         prompt,
         task_id: task_output.id.clone(),
         task_files: task_output.files.clone(),
         shown_learning_ids,
-        resolved_model: None, // TODO(FEAT-004): Wire model resolution
+        resolved_model,
     }))
 }
 
@@ -416,6 +426,73 @@ pub fn load_escalation_template(base_prompt_path: &Path) -> Option<String> {
             None
         }
     }
+}
+
+/// Resolve the model for a synergy cluster (the selected task + its pending synergyWith partners).
+///
+/// 1. Resolves the primary task's model via `model::resolve_task_model()`.
+/// 2. Queries pending (todo/in_progress) synergyWith partners' model and difficulty.
+/// 3. Resolves each partner via `model::resolve_task_model()`.
+/// 4. Combines all resolved models via `model::resolve_iteration_model()` (highest tier wins).
+/// 5. Normalizes `Some("")` to `None`.
+///
+/// When no synergyWith partners exist, the cluster is just the selected task.
+pub fn resolve_synergy_cluster_model(
+    conn: &Connection,
+    task_id: &str,
+    task_model: Option<&str>,
+    task_difficulty: Option<&str>,
+    default_model: Option<&str>,
+) -> Option<String> {
+    // Resolve the primary task's model
+    let primary_model = model::resolve_task_model(task_model, task_difficulty, default_model);
+
+    // Query pending synergyWith partners' model and difficulty
+    let synergy_models = get_synergy_partner_models(conn, task_id, default_model);
+
+    // Combine: primary task + all synergy partners
+    let mut all_models = vec![primary_model];
+    all_models.extend(synergy_models);
+
+    // Select highest tier across the cluster
+    let resolved = model::resolve_iteration_model(&all_models);
+
+    // Normalize Some("") to None
+    resolved.filter(|m| !m.trim().is_empty())
+}
+
+/// Query pending synergyWith partners and resolve each one's model.
+fn get_synergy_partner_models(
+    conn: &Connection,
+    task_id: &str,
+    default_model: Option<&str>,
+) -> Vec<Option<String>> {
+    let mut stmt = match conn.prepare(
+        "SELECT t.model, t.difficulty
+         FROM tasks t
+         INNER JOIN task_relationships tr ON tr.related_id = t.id
+         WHERE tr.task_id = ?1
+           AND tr.rel_type = 'synergyWith'
+           AND t.status IN ('todo', 'in_progress')",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match stmt.query_map([task_id], |row| {
+        let partner_model: Option<String> = row.get(0)?;
+        let partner_difficulty: Option<String> = row.get(1)?;
+        Ok(model::resolve_task_model(
+            partner_model.as_deref(),
+            partner_difficulty.as_deref(),
+            default_model,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.filter_map(|r| r.ok()).collect()
 }
 
 /// Truncate a string to fit within a byte budget.
@@ -2227,7 +2304,7 @@ pub enum ApiError {
 
     /// AC1: Task with explicit model='claude-opus-4-6' → resolved_model is Some('claude-opus-4-6').
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_explicit_model_on_task() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2254,7 +2331,7 @@ pub enum ApiError {
 
     /// AC2: Task with difficulty='high' and no explicit model → resolved_model is opus.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_difficulty_high_forces_opus() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2281,7 +2358,7 @@ pub enum ApiError {
 
     /// AC3: Task with no model, no difficulty, prd_default=haiku → resolved_model is haiku.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_prd_default_fallback() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2304,7 +2381,7 @@ pub enum ApiError {
 
     /// AC4: Task with synergyWith partner that has higher-tier model → resolved_model is higher.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_synergy_partner_higher_tier() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2368,7 +2445,7 @@ pub enum ApiError {
     /// AC6 (known-bad discriminator): Synergy partner with opus model overrides
     /// selected task's haiku. Rejects implementations that ignore synergy.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_synergy_opus_overrides_task_haiku() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2411,7 +2488,7 @@ pub enum ApiError {
     /// Edge case: Task with empty string model → normalized to None, not Some("").
     /// Invariant: resolved_model is never Some("").
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_empty_string_normalized_to_none() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2434,7 +2511,7 @@ pub enum ApiError {
 
     /// Edge case: Multiple synergy partners with different tiers → highest tier wins.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_multi_partner_highest_wins() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2484,7 +2561,7 @@ pub enum ApiError {
     /// Edge case: All synergy tasks are done → cluster is just the selected task.
     /// Done synergy partners should be excluded from model resolution.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_done_synergy_partners_excluded() {
         let (temp_dir, conn) = setup_test_db();
 
@@ -2522,7 +2599,7 @@ pub enum ApiError {
 
     /// Edge case: No synergyWith partners → resolved_model is just the selected task's model.
     #[test]
-    #[ignore] // FEAT-004: model resolution not yet wired
+
     fn test_resolved_model_no_synergy_partners() {
         let (temp_dir, conn) = setup_test_db();
 
