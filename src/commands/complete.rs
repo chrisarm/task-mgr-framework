@@ -112,6 +112,66 @@ pub fn complete(
     })
 }
 
+/// Returns unsatisfied dependency IDs for a task.
+///
+/// Queries `task_relationships` for `dependsOn` entries, then checks if each
+/// dependency is `done` or `irrelevant`. Returns only the IDs that are NOT
+/// in a terminal state.
+fn get_unsatisfied_deps(conn: &Connection, task_id: &str) -> TaskMgrResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT related_id FROM task_relationships WHERE task_id = ? AND rel_type = 'dependsOn'",
+    )?;
+    let dep_ids: Vec<String> = stmt
+        .query_map([task_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut unsatisfied = Vec::new();
+    for dep_id in &dep_ids {
+        let status: Option<String> = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?", [dep_id], |row| {
+                row.get(0)
+            })
+            .ok();
+        match status.as_deref() {
+            Some("done") | Some("irrelevant") => {} // satisfied
+            _ => unsatisfied.push(dep_id.clone()),   // not done, missing, or other status
+        }
+    }
+
+    Ok(unsatisfied)
+}
+
+/// Check whether all `dependsOn` dependencies for a task are satisfied.
+///
+/// Returns `true` if the task has no dependencies, or all dependencies are
+/// `done` or `irrelevant`. **Fail-closed**: returns `false` on query errors.
+pub fn are_dependencies_satisfied(conn: &Connection, task_id: &str) -> bool {
+    match get_unsatisfied_deps(conn, task_id) {
+        Ok(unsatisfied) => unsatisfied.is_empty(),
+        Err(e) => {
+            eprintln!(
+                "Warning: dependency check failed for task {}, assuming unsatisfied: {}",
+                task_id, e
+            );
+            false
+        }
+    }
+}
+
+/// Gate task completion on dependency satisfaction.
+///
+/// Returns `Ok(())` if all dependencies are met, or `Err(DependencyNotSatisfied)`
+/// with the list of unsatisfied dependency IDs.
+fn check_dependencies_satisfied(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
+    let unsatisfied = get_unsatisfied_deps(conn, task_id)?;
+    if unsatisfied.is_empty() {
+        Ok(())
+    } else {
+        Err(TaskMgrError::dependency_not_satisfied(task_id, unsatisfied))
+    }
+}
+
 /// Complete a single task.
 fn complete_single_task(
     conn: &Connection,
@@ -133,6 +193,11 @@ fn complete_single_task(
 
     // Check if already done
     let was_already_done = previous_status == TaskStatus::Done;
+
+    // Gate on dependency satisfaction (skip if already done or forcing)
+    if !was_already_done && !force {
+        check_dependencies_satisfied(conn, task_id)?;
+    }
 
     // Validate status transition
     let can_transition = previous_status.can_transition_to(TaskStatus::Done);
@@ -677,5 +742,118 @@ mod tests {
         assert!(duration.is_some());
         let d = duration.unwrap();
         assert!((59..=65).contains(&d), "Duration was {} seconds", d);
+    }
+
+    // --- Dependency gating tests ---
+
+    fn insert_relationship(conn: &Connection, task_id: &str, related_id: &str, rel_type: &str) {
+        conn.execute(
+            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES (?, ?, ?)",
+            rusqlite::params![task_id, related_id, rel_type],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_complete_blocked_by_unsatisfied_dependency() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "DEP-001", "todo");
+        insert_test_task(&conn, "TASK-001", "in_progress");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        let result = complete(&mut conn, &["TASK-001".to_string()], None, None, false);
+        assert!(result.is_err());
+        match result {
+            Err(TaskMgrError::DependencyNotSatisfied {
+                task_id,
+                unsatisfied,
+                ..
+            }) => {
+                assert_eq!(task_id, "TASK-001");
+                assert!(unsatisfied.contains("DEP-001"));
+            }
+            other => panic!("Expected DependencyNotSatisfied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_complete_succeeds_when_dependencies_satisfied() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "DEP-001", "done");
+        insert_test_task(&conn, "TASK-001", "in_progress");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        let result = complete(&mut conn, &["TASK-001".to_string()], None, None, false);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().completed_count, 1);
+    }
+
+    #[test]
+    fn test_complete_force_bypasses_dependency_check() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "DEP-001", "todo");
+        insert_test_task(&conn, "TASK-001", "in_progress");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        let result = complete(&mut conn, &["TASK-001".to_string()], None, None, true);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().completed_count, 1);
+    }
+
+    #[test]
+    fn test_complete_no_dependencies_succeeds() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "TASK-001", "in_progress");
+
+        let result = complete(&mut conn, &["TASK-001".to_string()], None, None, false);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().completed_count, 1);
+    }
+
+    #[test]
+    fn test_complete_dependency_on_irrelevant_task_succeeds() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "DEP-001", "irrelevant");
+        insert_test_task(&conn, "TASK-001", "in_progress");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+
+        let result = complete(&mut conn, &["TASK-001".to_string()], None, None, false);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().completed_count, 1);
+    }
+
+    #[test]
+    fn test_are_dependencies_satisfied_returns_correct_bool() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "DEP-001", "todo");
+        insert_test_task(&conn, "DEP-002", "done");
+        insert_test_task(&conn, "TASK-001", "in_progress");
+        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
+        insert_relationship(&conn, "TASK-001", "DEP-002", "dependsOn");
+
+        // DEP-001 is still todo, so not satisfied
+        assert!(!are_dependencies_satisfied(&conn, "TASK-001"));
+
+        // No deps → satisfied
+        assert!(are_dependencies_satisfied(&conn, "DEP-001"));
+    }
+
+    #[test]
+    fn test_complete_circular_dependency_with_force_bypasses() {
+        let (_dir, mut conn) = setup_test_db();
+        insert_test_task(&conn, "A", "in_progress");
+        insert_test_task(&conn, "B", "in_progress");
+        insert_relationship(&conn, "A", "B", "dependsOn");
+        insert_relationship(&conn, "B", "A", "dependsOn");
+
+        // Without force, both should fail
+        let result_a = complete(&mut conn, &["A".to_string()], None, None, false);
+        assert!(result_a.is_err());
+
+        // With force, both complete
+        let result_a = complete(&mut conn, &["A".to_string()], None, None, true);
+        assert!(result_a.is_ok());
+        let result_b = complete(&mut conn, &["B".to_string()], None, None, true);
+        assert!(result_b.is_ok());
     }
 }

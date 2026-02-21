@@ -788,6 +788,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             &run_id,
             &paths.prd_file,
             task_prefix.as_deref(),
+            run_config.config.external_git_scan_depth,
         );
         if count > 0 {
             eprintln!(
@@ -938,7 +939,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         if let Some(ref task_id) = result.task_id {
             if !matches!(result.outcome, IterationOutcome::Empty) {
                 if let Some(commit_hash) =
-                    check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref())
+                    check_git_for_task_completion(&working_root, task_id, task_prefix.as_deref(), run_config.config.git_scan_depth)
                 {
                     // Mark task done in DB
                     let task_ids = [task_id.clone()];
@@ -1074,6 +1075,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                     &run_id,
                     &paths.prd_file,
                     task_prefix.as_deref(),
+                    run_config.config.external_git_scan_depth,
                 );
                 if count > 0 {
                     tasks_completed += count as u32;
@@ -1510,6 +1512,13 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
     for task_id in &candidate_ids {
         let base_id = strip_task_prefix(task_id, task_prefix);
         if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
+            if !complete_cmd::are_dependencies_satisfied(conn, task_id) {
+                eprintln!(
+                    "Skipping reconciliation of task {} — dependencies not yet satisfied",
+                    task_id
+                );
+                continue;
+            }
             if let Ok(1) = conn.execute(
                 "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
                 [task_id.as_str()],
@@ -1609,6 +1618,7 @@ fn reconcile_external_git_completions(
     run_id: &str,
     prd_path: &Path,
     task_prefix: Option<&str>,
+    scan_depth: usize,
 ) -> usize {
     use std::process::Command;
 
@@ -1621,9 +1631,10 @@ fn reconcile_external_git_completions(
         return 0;
     }
 
-    // Get recent commits from external repo (50 should cover recent work)
+    // Get recent commits from external repo
+    let depth_arg = format!("-{}", scan_depth);
     let output = match Command::new("git")
-        .args(["log", "--oneline", "-50"])
+        .args(["log", "--oneline", &depth_arg])
         .current_dir(external_repo)
         .output()
     {
@@ -1716,20 +1727,22 @@ fn reconcile_external_git_completions(
 /// Check recent git commits for the task ID.
 ///
 /// Returns the commit hash if found, None otherwise.
-/// Checks the last 5 commits (subject + body) to handle multi-commit iterations
-/// where the task ID may appear in an earlier commit.
+/// Checks the last `scan_depth` commits (subject + body) to handle multi-commit
+/// iterations where the task ID may appear in an earlier commit.
 /// Also tries the base ID (prefix stripped) as a fallback.
 fn check_git_for_task_completion(
     project_root: &Path,
     task_id: &str,
     task_prefix: Option<&str>,
+    scan_depth: usize,
 ) -> Option<String> {
     use std::process::Command;
 
-    // Get the last 5 commits: hash + full message (subject + body).
+    // Get recent commits: hash + full message (subject + body).
     // Use a record separator to split multi-line commit messages.
+    let depth_arg = format!("-{}", scan_depth);
     let output = Command::new("git")
-        .args(["log", "-5", "--format=%H%x00%B%x00"])
+        .args(["log", &depth_arg, "--format=%H%x00%B%x00"])
         .current_dir(project_root)
         .output()
         .ok()?;
@@ -2033,7 +2046,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: [SEC-H005] Add feature");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
         assert!(result.is_some(), "Should find task ID in commit message");
     }
 
@@ -2042,7 +2055,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: SEC-h005 lowercase");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
         assert!(result.is_some(), "Should find task ID case-insensitively");
     }
 
@@ -2051,7 +2064,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: unrelated commit");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
         assert!(
             result.is_none(),
             "Should return None when task ID not in commit"
@@ -2063,7 +2076,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: TASK-001 test");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.len(), 40, "Should return full commit hash");
@@ -2081,7 +2094,7 @@ mod tests {
         git_commit(temp_dir.path(), "fix: adjust config formatting");
         git_commit(temp_dir.path(), "chore: update lockfile");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
         assert!(
             result.is_some(),
             "Should find task ID in earlier commit (not just HEAD)"
@@ -2103,7 +2116,7 @@ mod tests {
             .output()
             .expect("create commit with body");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
         assert!(result.is_some(), "Should find task ID in commit body");
     }
 
@@ -2253,6 +2266,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
         assert_eq!(count, 0);
     }
@@ -2301,6 +2315,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
 
         // Should find FEAT-001 (todo → done), skip FEAT-003 (already done)
@@ -2358,6 +2373,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
 
         assert_eq!(count, 1, "Should match case-insensitively");
@@ -2392,6 +2408,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
 
         assert_eq!(
@@ -2567,7 +2584,7 @@ mod tests {
         let repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(repo.path(), "feat: P3-FEAT-001 Implement CallSupervisor");
 
-        let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", None);
+        let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", None, 7);
         assert!(
             result.is_some(),
             "Git detection should return Some for matching commit — loop increments counter by 1"
@@ -2646,6 +2663,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
 
         assert_eq!(
@@ -2696,6 +2714,7 @@ mod tests {
             "run-1",
             &prd_path,
             None,
+            50,
         );
 
         assert_eq!(
@@ -2796,6 +2815,7 @@ mod tests {
             "run-1",
             &prd_path,
             Some("aeb10a1f"),
+            50,
         );
 
         assert_eq!(
@@ -2855,6 +2875,7 @@ mod tests {
             "run-1",
             &prd_path,
             Some("aeb10a1f"),
+            50,
         );
 
         assert_eq!(count, 1, "Should match full prefixed ID in commit");
@@ -2886,7 +2907,7 @@ mod tests {
         git_commit(repo.path(), "feat: FIX-001 implement feature");
 
         let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"));
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"), 7);
         assert!(result.is_some(), "Should match base ID FIX-001 in commit");
     }
 

@@ -28,6 +28,16 @@ pub struct LoopConfig {
     /// instead of checking out the branch directly. This avoids "would be
     /// overwritten" errors when there are uncommitted changes.
     pub use_worktrees: bool,
+    /// Number of recent commits to scan for task completion within the loop.
+    ///
+    /// A tight window (default 7) prevents stale commits from falsely completing
+    /// tasks in the current iteration.
+    pub git_scan_depth: usize,
+    /// Number of recent commits to scan in external repo reconciliation.
+    ///
+    /// A broader window (default 50) ensures legitimate external completions
+    /// aren't missed across prior runs.
+    pub external_git_scan_depth: usize,
 }
 
 impl Default for LoopConfig {
@@ -43,6 +53,8 @@ impl Default for LoopConfig {
             hours: None,
             verbose: false,
             use_worktrees: true,
+            git_scan_depth: 7,
+            external_git_scan_depth: 50,
         }
     }
 }
@@ -59,6 +71,8 @@ impl LoopConfig {
     /// - `LOOP_ITERATION_DELAY_SECS` → `iteration_delay_secs` (u64)
     /// - `LOOP_USAGE_FALLBACK_WAIT` → `usage_fallback_wait` (u64)
     /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes")
+    /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
+    /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
     ///
     /// Invalid values are silently ignored (defaults used).
     pub fn from_env() -> Self {
@@ -80,6 +94,10 @@ impl LoopConfig {
             hours: defaults.hours,
             verbose: defaults.verbose,
             use_worktrees: defaults.use_worktrees,
+            git_scan_depth: parse_env("LOOP_GIT_SCAN_DEPTH")
+                .unwrap_or(defaults.git_scan_depth),
+            external_git_scan_depth: parse_env("LOOP_EXTERNAL_GIT_SCAN_DEPTH")
+                .unwrap_or(defaults.external_git_scan_depth),
         }
     }
 }
@@ -234,6 +252,26 @@ mod tests {
     fn test_loop_config_default_use_worktrees_true() {
         let config = LoopConfig::default();
         assert!(config.use_worktrees, "use_worktrees should default to true");
+    }
+
+    #[test]
+    fn test_loop_config_default_git_scan_depth() {
+        let config = LoopConfig::default();
+        assert!(
+            (1..=20).contains(&config.git_scan_depth),
+            "git_scan_depth default {} should be in sane local range 1..=20",
+            config.git_scan_depth
+        );
+    }
+
+    #[test]
+    fn test_loop_config_default_external_git_scan_depth() {
+        let config = LoopConfig::default();
+        assert!(
+            (10..=200).contains(&config.external_git_scan_depth),
+            "external_git_scan_depth default {} should be in sane external range 10..=200",
+            config.external_git_scan_depth
+        );
     }
 
     // --- auto_max_iterations ---

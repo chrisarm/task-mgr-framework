@@ -86,6 +86,19 @@ pub enum TaskMgrError {
         actual: String,
     },
 
+    /// Task cannot be completed because its dependencies are not satisfied.
+    #[error(
+        "Cannot complete task '{task_id}': unsatisfied dependencies: {unsatisfied}\n\n{hint}"
+    )]
+    DependencyNotSatisfied {
+        /// Task identifier
+        task_id: String,
+        /// Comma-separated list of unsatisfied dependency IDs
+        unsatisfied: String,
+        /// Actionable hint for resolving the issue
+        hint: String,
+    },
+
     /// Invalid status transition attempted.
     #[error(
         "Invalid transition for task '{task_id}': cannot go from '{from}' to '{to}'.\n\n{hint}"
@@ -235,6 +248,25 @@ impl TaskMgrError {
             from: from.into(),
             to: to.into(),
             hint: hint.into(),
+        }
+    }
+
+    /// Creates a DependencyNotSatisfied error for task completion gating.
+    #[must_use]
+    pub fn dependency_not_satisfied(
+        task_id: impl Into<String>,
+        unsatisfied_ids: Vec<String>,
+    ) -> Self {
+        let task_id = task_id.into();
+        let unsatisfied = unsatisfied_ids.join(", ");
+        let hint = format!(
+            "Complete these dependencies first, or use --force to override: {}",
+            unsatisfied
+        );
+        TaskMgrError::DependencyNotSatisfied {
+            task_id,
+            unsatisfied,
+            hint,
         }
     }
 
