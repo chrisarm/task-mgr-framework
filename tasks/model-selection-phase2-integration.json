@@ -502,7 +502,7 @@
       ],
       "priority": 9,
       "estimatedEffort": "medium",
-      "passes": false,
+      "passes": true,
       "notes": "Synergy cluster uses explicit synergyWith relationships from task_relationships table (NOT file overlap). SQL: SELECT t.model, t.difficulty FROM tasks t INNER JOIN task_relationships tr ON tr.related_id = t.id WHERE tr.task_id = ?1 AND tr.rel_type = 'synergyWith' AND t.status IN ('todo', 'in_progress'). The default_model is threaded via BuildPromptParams — not queried inside build_prompt. This was an architect decision to maintain DI and testability. Use insert_relationship() from test_utils.rs for test setup. IMPORTANT interface note: The existing resolve_iteration_model() from Phase 1 was built for file-overlap synergy clusters. This task changes the synergy source to explicit synergyWith relationships per architect decision #5. Create a new resolve_synergy_cluster_model() that collects resolved models from synergyWith partners and calls resolve_iteration_model() with pre-filtered synergy data. The PRD Public Contracts list get_synergy_task_models as a helper — the implementing agent may name this differently but must provide the same capability.",
       "modifiesBehavior": false,
       "touchesFiles": [
