@@ -139,7 +139,7 @@
       ],
       "priority": 3,
       "estimatedEffort": "low",
-      "passes": false,
+      "passes": true,
       "notes": "Pure documentation. resolve_iteration_model is in model.rs around line 82. PrdFile is in commands/init/parse.rs. Both need a brief doc comment explaining behavior that isn't obvious from the code alone.",
       "modifiesBehavior": false,
       "touchesFiles": [
