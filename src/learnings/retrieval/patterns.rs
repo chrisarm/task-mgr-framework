@@ -404,10 +404,11 @@ pub(crate) fn file_matches_pattern(file_path: &str, pattern: &str) -> bool {
     }
 
     // For last part, must match at end if pattern doesn't end with *
-    if !parts.is_empty() && !pattern.ends_with('*') {
-        let last_part = parts.last().unwrap();
-        if !last_part.is_empty() && !file_lower.ends_with(last_part) {
-            return false;
+    if !pattern.ends_with('*') {
+        if let Some(last_part) = parts.last() {
+            if !last_part.is_empty() && !file_lower.ends_with(last_part) {
+                return false;
+            }
         }
     }
 

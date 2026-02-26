@@ -102,10 +102,11 @@ pub fn extract_learnings_from_output(
         }
     };
 
-    // Enrich with task context (best-effort: unenriched params used on error)
+    // Enrich with task context (best-effort: fall back to unenriched params on error)
+    let unenriched = params_list.clone();
     let params_list = enrich_extracted_params(conn, params_list, task_id).unwrap_or_else(|e| {
         eprintln!("Warning: learning enrichment failed: {}", e);
-        Vec::new()
+        unenriched
     });
 
     // Record each extracted learning, skipping duplicates
@@ -249,14 +250,12 @@ mod tests {
         }
     }
 
-    // ─── TDD: LLM extraction auto-populate tests (B2/FR-004) ─────────────────
-    // All tests marked #[ignore] define expected enrichment behavior.
-    // One active test verifies the no-task-id no-op (current stub behavior).
+    // ─── Tests for LLM extraction auto-populate (B2/FR-004) ──────────────────
+    // FEAT-003 implemented: all enrichment tests are active.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Active (not #[ignore]): when task_id is None, enrich_extracted_params
-    /// returns params unchanged without error. This is both the stub behavior
-    /// and the correct final behavior for the no-task-id case.
+    /// When task_id is None, enrich_extracted_params returns params unchanged
+    /// without error.
     #[test]
     fn test_enrich_no_task_id_returns_params_unchanged_no_error() {
         let (_dir, conn) = setup_db();

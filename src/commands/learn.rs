@@ -396,13 +396,12 @@ mod tests {
         assert_eq!(cli_confidence_to_model(CliConfidence::Low), Confidence::Low);
     }
 
-    // ─── TDD: Auto-populate tests (FEAT-002) ─────────────────────────────────
-    // All tests below are #[ignore] until FEAT-002 implements auto-populate.
-    // They define expected behavior: when task_id is provided without explicit
-    // --files/--task-types, learn() should auto-fill from task context.
+    // ─── Tests for auto-populate on learn command (FEAT-002) ─────────────────
+    // FEAT-002 implemented: all tests are active.
+    // When task_id is provided without explicit --files/--task-types,
+    // learn() auto-fills from task context via resolve_task_context().
 
-    /// Active regression test: without task_id, no auto-populate occurs.
-    /// Verifies current behavior is preserved after FEAT-002 implementation.
+    /// Regression test: without task_id, no auto-populate occurs.
     #[test]
     fn test_learn_without_task_id_does_not_auto_populate() {
         let (_dir, conn) = setup_db();
