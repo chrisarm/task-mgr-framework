@@ -18,6 +18,20 @@ const FILE_MATCH_SCORE: i32 = 10;
 const TYPE_MATCH_SCORE: i32 = 5;
 /// Points awarded for error pattern match.
 const ERROR_MATCH_SCORE: i32 = 2;
+/// Points awarded for semantic tag-to-path context match.
+const TAG_CONTEXT_MATCH_SCORE: i32 = 3;
+
+/// Tags that are source/meta or generic category tags and must never trigger tag-path scoring.
+const EXCLUDED_TAGS: &[&str] = &[
+    "long-term",
+    "raw",
+    "rust-patterns",
+    "python-patterns",
+    "architecture-patterns",
+    "database-sql",
+    "testing-patterns",
+    "general",
+];
 
 /// Pattern matching backend for task-based recall.
 ///
@@ -43,8 +57,11 @@ impl RetrievalBackend for PatternsBackend {
 
         let candidates = load_learnings_with_applicability(conn)?;
 
-        // Batch-load tags if tags filter is present (single query vs. O(N))
-        let tags_map = if query.tags.as_ref().is_some_and(|t| !t.is_empty()) {
+        // Batch-load tags when a tags filter is present OR task_files is non-empty
+        // (single query vs. O(N); tag scoring requires task_files to be set)
+        let needs_tags = query.tags.as_ref().is_some_and(|t| !t.is_empty())
+            || !query.task_files.is_empty();
+        let tags_map = if needs_tags {
             let ids: Vec<i64> = candidates.iter().filter_map(|l| l.id).collect();
             batch_get_learning_tags(conn, &ids)?
         } else {
@@ -88,6 +105,19 @@ impl RetrievalBackend for PatternsBackend {
                 {
                     score += ERROR_MATCH_SCORE;
                     reasons.push("error pattern match".to_string());
+                }
+            }
+
+            // Tag context matching (only fires when task_files is non-empty)
+            if !query.task_files.is_empty() {
+                let learning_id = learning.id.unwrap_or(0);
+                let learning_tags = tags_map.get(&learning_id).map(Vec::as_slice).unwrap_or(&[]);
+                if learning_tags
+                    .iter()
+                    .any(|tag| tag_matches_task_files(tag, &query.task_files))
+                {
+                    score += TAG_CONTEXT_MATCH_SCORE;
+                    reasons.push("tag context match".to_string());
                 }
             }
 
@@ -215,14 +245,15 @@ fn load_learnings_with_applicability(conn: &Connection) -> TaskMgrResult<Vec<Lea
     let mut stmt = conn.prepare(
         r#"
         SELECT
-            id, created_at, task_id, run_id, outcome, title, content,
-            root_cause, solution,
-            applies_to_files, applies_to_task_types, applies_to_errors,
-            confidence, times_shown, times_applied, last_shown_at, last_applied_at
-        FROM learnings
-        WHERE applies_to_files IS NOT NULL
-           OR applies_to_task_types IS NOT NULL
-           OR applies_to_errors IS NOT NULL
+            l.id, l.created_at, l.task_id, l.run_id, l.outcome, l.title, l.content,
+            l.root_cause, l.solution,
+            l.applies_to_files, l.applies_to_task_types, l.applies_to_errors,
+            l.confidence, l.times_shown, l.times_applied, l.last_shown_at, l.last_applied_at
+        FROM learnings l
+        WHERE l.applies_to_files IS NOT NULL
+           OR l.applies_to_task_types IS NOT NULL
+           OR l.applies_to_errors IS NOT NULL
+           OR EXISTS (SELECT 1 FROM learning_tags lt WHERE lt.learning_id = l.id)
         "#,
     )?;
 
@@ -265,6 +296,33 @@ fn batch_get_learning_tags(
         map.entry(id).or_default().push(tag);
     }
     Ok(map)
+}
+
+/// Maps a tag keyword (a single hyphen-separated token) to a path prefix, if any.
+fn tag_keyword_to_path_prefix(keyword: &str) -> Option<&'static str> {
+    match keyword {
+        "workflow" => Some("workflow/"),
+        "ses" | "email" => Some("ses/"),
+        "pto" => Some("date/"),
+        "embedding" => Some("kb/"),
+        "consumer" => Some("consumer/"),
+        _ => None,
+    }
+}
+
+/// Returns true if a tag semantically maps to any of the given task file paths.
+///
+/// Tags in [`EXCLUDED_TAGS`] never trigger scoring.  For all other tags, the tag
+/// is split on `-` and each token is checked against [`tag_keyword_to_path_prefix`].
+/// If any task file path contains the mapped prefix the tag is considered a match.
+fn tag_matches_task_files(tag: &str, task_files: &[String]) -> bool {
+    if EXCLUDED_TAGS.contains(&tag) {
+        return false;
+    }
+    tag.split('-').any(|keyword| {
+        tag_keyword_to_path_prefix(keyword)
+            .is_some_and(|prefix| task_files.iter().any(|f| f.contains(prefix)))
+    })
 }
 
 /// Checks if a file path matches a pattern.

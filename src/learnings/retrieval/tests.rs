@@ -478,7 +478,6 @@ fn create_tagged_learning(conn: &Connection, title: &str, tags: Vec<&str>) -> i6
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_tag_context_workflow_detour_phase3_matches_workflow_path() {
     // Happy path: semantic tag maps to workflow path → TAG_CONTEXT_MATCH_SCORE = 3
     let (_dir, conn) = setup_db();
@@ -508,7 +507,6 @@ fn test_tag_context_workflow_detour_phase3_matches_workflow_path() {
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_excluded_source_tag_long_term_scores_zero() {
     // Edge case: 'long-term' is a source/meta tag — must never trigger tag scoring.
     // Even with task files present, this learning should not appear in results.
@@ -530,7 +528,6 @@ fn test_excluded_source_tag_long_term_scores_zero() {
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_excluded_source_tag_raw_scores_zero() {
     // Edge case: 'raw' is a source tag — must never trigger tag scoring.
     let (_dir, conn) = setup_db();
@@ -551,7 +548,6 @@ fn test_excluded_source_tag_raw_scores_zero() {
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_file_match_and_tag_match_scores_stack() {
     // Edge case: FILE_MATCH_SCORE (10) + TAG_CONTEXT_MATCH_SCORE (3) = 13.
     // Learning has both a matching applies_to_files glob AND a semantic tag.
@@ -588,7 +584,6 @@ fn test_file_match_and_tag_match_scores_stack() {
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_excluded_category_tag_rust_patterns_scores_zero() {
     // Edge case: 'rust-patterns' is a category tag — must never trigger tag scoring.
     let (_dir, conn) = setup_db();
@@ -609,7 +604,6 @@ fn test_excluded_category_tag_rust_patterns_scores_zero() {
 }
 
 #[test]
-#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
 fn test_tag_workflow_detour_does_not_match_tools_path() {
     // Known-bad discriminator: 'workflow-detour' maps to workflow/ paths, not tools/.
     let (_dir, conn) = setup_db();
