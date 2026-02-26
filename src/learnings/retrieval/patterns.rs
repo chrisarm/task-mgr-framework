@@ -49,16 +49,12 @@ impl RetrievalBackend for PatternsBackend {
         conn: &Connection,
         query: &RetrievalQuery,
     ) -> TaskMgrResult<Vec<ScoredLearning>> {
-        // Patterns backend needs task context to work
         if query.task_files.is_empty() && query.task_prefix.is_none() && query.task_error.is_none()
         {
             return Ok(Vec::new());
         }
 
         let candidates = load_learnings_with_applicability(conn)?;
-
-        // Batch-load tags when a tags filter is present OR task_files is non-empty
-        // (single query vs. O(N); tag scoring requires task_files to be set)
         let needs_tags =
             query.tags.as_ref().is_some_and(|t| !t.is_empty()) || !query.task_files.is_empty();
         let tags_map = if needs_tags {
@@ -69,78 +65,13 @@ impl RetrievalBackend for PatternsBackend {
         };
 
         let mut scored: Vec<ScoredLearning> = Vec::new();
-
         for learning in candidates {
-            let mut score = 0i32;
-            let mut reasons = Vec::new();
-
-            // File pattern matching
-            if let Some(ref patterns) = learning.applies_to_files {
-                for file in &query.task_files {
-                    if patterns.iter().any(|p| file_matches_pattern(file, p)) {
-                        score += FILE_MATCH_SCORE;
-                        reasons.push("file pattern match".to_string());
-                        break;
-                    }
-                }
+            if !passes_query_filters(&learning, query, &tags_map) {
+                continue;
             }
-
-            // Task type prefix matching
-            if let Some(ref prefixes) = learning.applies_to_task_types {
-                if let Some(ref task_prefix) = query.task_prefix {
-                    if prefixes.iter().any(|p| task_prefix.starts_with(p)) {
-                        score += TYPE_MATCH_SCORE;
-                        reasons.push("task type match".to_string());
-                    }
-                }
-            }
-
-            // Error pattern matching
-            if let (Some(ref task_error), Some(ref error_patterns)) =
-                (&query.task_error, &learning.applies_to_errors)
-            {
-                if error_patterns
-                    .iter()
-                    .any(|p| task_error.to_lowercase().contains(&p.to_lowercase()))
-                {
-                    score += ERROR_MATCH_SCORE;
-                    reasons.push("error pattern match".to_string());
-                }
-            }
-
-            // Tag context matching (only fires when task_files is non-empty)
-            if !query.task_files.is_empty() {
-                let learning_id = learning.id.unwrap_or(0);
-                let learning_tags = tags_map.get(&learning_id).map(Vec::as_slice).unwrap_or(&[]);
-                if learning_tags
-                    .iter()
-                    .any(|tag| tag_matches_task_files(tag, &query.task_files))
-                {
-                    score += TAG_CONTEXT_MATCH_SCORE;
-                    reasons.push("tag context match".to_string());
-                }
-            }
-
-            // Apply outcome filter if provided
-            if let Some(ref outcome_filter) = query.outcome {
-                if learning.outcome != *outcome_filter {
-                    continue;
-                }
-            }
-
-            // Apply tags filter if provided (uses batch-loaded tags)
-            if let Some(ref tags_filter) = query.tags {
-                if !tags_filter.is_empty() {
-                    let learning_tags = tags_map
-                        .get(&learning.id.unwrap_or(0))
-                        .cloned()
-                        .unwrap_or_default();
-                    if !tags_filter.iter().any(|t| learning_tags.contains(t)) {
-                        continue;
-                    }
-                }
-            }
-
+            let learning_id = learning.id.unwrap_or(0);
+            let learning_tags = tags_map.get(&learning_id).map(Vec::as_slice).unwrap_or(&[]);
+            let (score, reasons) = compute_score(&learning, query, learning_tags);
             if score > 0 {
                 scored.push(ScoredLearning {
                     learning,
@@ -154,7 +85,6 @@ impl RetrievalBackend for PatternsBackend {
             }
         }
 
-        // Sort by score DESC, then by last_applied_at DESC
         scored.sort_by(|a, b| {
             b.relevance_score
                 .partial_cmp(&a.relevance_score)
@@ -166,12 +96,115 @@ impl RetrievalBackend for PatternsBackend {
                     )
                 })
         });
-
-        // Truncate to limit
         scored.truncate(query.limit);
-
         Ok(scored)
     }
+}
+
+/// Returns the score delta and reason label if the learning's file patterns match
+/// any of the task files.
+fn file_pattern_score(learning: &Learning, task_files: &[String]) -> (i32, Option<&'static str>) {
+    if let Some(ref patterns) = learning.applies_to_files {
+        for file in task_files {
+            if patterns.iter().any(|p| file_matches_pattern(file, p)) {
+                return (FILE_MATCH_SCORE, Some("file pattern match"));
+            }
+        }
+    }
+    (0, None)
+}
+
+/// Returns the score delta and reason label if the learning's task-type prefixes
+/// match the query's task prefix.
+fn type_prefix_score(
+    learning: &Learning,
+    task_prefix: Option<&str>,
+) -> (i32, Option<&'static str>) {
+    if let (Some(ref prefixes), Some(tp)) = (&learning.applies_to_task_types, task_prefix) {
+        if prefixes.iter().any(|p| tp.starts_with(p)) {
+            return (TYPE_MATCH_SCORE, Some("task type match"));
+        }
+    }
+    (0, None)
+}
+
+/// Returns the score delta and reason label if the learning's error patterns
+/// match the query's task error.
+fn error_pattern_score(
+    learning: &Learning,
+    task_error: Option<&str>,
+) -> (i32, Option<&'static str>) {
+    if let (Some(te), Some(ref patterns)) = (task_error, &learning.applies_to_errors) {
+        if patterns
+            .iter()
+            .any(|p| te.to_lowercase().contains(&p.to_lowercase()))
+        {
+            return (ERROR_MATCH_SCORE, Some("error pattern match"));
+        }
+    }
+    (0, None)
+}
+
+/// Returns the score delta and reason label if any of the learning's tags
+/// semantically map to the task's file paths. Only fires when `task_files` is
+/// non-empty.
+fn tag_context_score(
+    learning_tags: &[String],
+    task_files: &[String],
+) -> (i32, Option<&'static str>) {
+    if !task_files.is_empty()
+        && learning_tags
+            .iter()
+            .any(|tag| tag_matches_task_files(tag, task_files))
+    {
+        return (TAG_CONTEXT_MATCH_SCORE, Some("tag context match"));
+    }
+    (0, None)
+}
+
+/// Aggregates all four scoring dimensions into a total score and reason list.
+fn compute_score<'a>(
+    learning: &'a Learning,
+    query: &'a RetrievalQuery,
+    learning_tags: &'a [String],
+) -> (i32, Vec<&'static str>) {
+    let mut score = 0i32;
+    let mut reasons: Vec<&'static str> = Vec::new();
+    for (delta, reason) in [
+        file_pattern_score(learning, &query.task_files),
+        type_prefix_score(learning, query.task_prefix.as_deref()),
+        error_pattern_score(learning, query.task_error.as_deref()),
+        tag_context_score(learning_tags, &query.task_files),
+    ] {
+        score += delta;
+        if let Some(r) = reason {
+            reasons.push(r);
+        }
+    }
+    (score, reasons)
+}
+
+/// Returns `true` if the learning passes the outcome and tags filters on the query.
+fn passes_query_filters(
+    learning: &Learning,
+    query: &RetrievalQuery,
+    tags_map: &HashMap<i64, Vec<String>>,
+) -> bool {
+    if let Some(ref outcome_filter) = query.outcome {
+        if learning.outcome != *outcome_filter {
+            return false;
+        }
+    }
+    if let Some(ref tags_filter) = query.tags {
+        if !tags_filter.is_empty() {
+            let id = learning.id.unwrap_or(0);
+            let learning_tags = tags_map.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            if !tags_filter.iter().any(|t| learning_tags.contains(t)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Resolve task context from the database for a given task ID.
