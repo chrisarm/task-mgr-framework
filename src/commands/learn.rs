@@ -759,6 +759,92 @@ mod tests {
         );
     }
 
+    /// AC #1: resolve_task_context() failure (e.g., missing table) does NOT prevent
+    /// learning creation. Graceful degradation: files/types fall back to explicit params.
+    #[test]
+    fn test_learn_resolve_task_context_failure_graceful_degradation() {
+        let (_dir, conn) = setup_db();
+        // Insert task so FK constraint on learnings.task_id is satisfied
+        conn.execute(
+            "INSERT INTO tasks (id, title) VALUES ('FEAT-003', 'Test task')",
+            [],
+        )
+        .unwrap();
+        // Drop task_files table — causes resolve_task_context to return Err
+        conn.execute("DROP TABLE IF EXISTS task_files", []).unwrap();
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Graceful degradation".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,      // no explicit files
+            task_types: None, // no explicit task types
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        // Even though resolve_task_context errors (missing table),
+        // learn() must still create the learning without panic.
+        let result = learn(&conn, params);
+        assert!(
+            result.is_ok(),
+            "Learning creation must succeed even when resolve_task_context fails, got: {:?}",
+            result.err()
+        );
+        let res = result.unwrap();
+        // With no explicit values and context failure, both fields should be NULL
+        assert!(
+            get_applies_to_files(&conn, res.learning_id).is_none(),
+            "applies_to_files should be NULL when graceful degradation path taken"
+        );
+        assert!(
+            get_applies_to_task_types(&conn, res.learning_id).is_none(),
+            "applies_to_task_types should be NULL when graceful degradation path taken"
+        );
+    }
+
+    /// AC #5: Task with files but non-standard task_id prefix still populates
+    /// applies_to_files. File enrichment is independent of type-prefix extraction.
+    #[test]
+    fn test_learn_task_with_files_no_standard_prefix_still_populates_files() {
+        let (_dir, conn) = setup_db();
+        // Use a non-standard task ID that doesn't follow FEAT-/FIX-/etc. convention
+        insert_task_with_files(&conn, "custom-task-id", &["src/custom_module.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Non-standard prefix task".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("custom-task-id".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let files_json = get_applies_to_files(&conn, result.learning_id);
+
+        // Files should be populated regardless of whether the prefix is standard
+        assert!(
+            files_json.is_some(),
+            "applies_to_files should be populated even when task_id has non-standard format"
+        );
+        assert!(
+            files_json.unwrap().contains("src/custom_module.rs"),
+            "Task files should be auto-populated independently of type-prefix extraction"
+        );
+    }
+
     /// Known-bad discriminator: learn() with task_id='FEAT-003' must use the
     /// actual task_files from the DB, not any hardcoded or default value.
     /// A stub that always returns ["src/main.rs"] will cause this test to fail.
