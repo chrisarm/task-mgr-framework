@@ -1254,7 +1254,11 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
         .unwrap_or((None, None, None, None));
 
     let task_count: usize = conn
-        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
         .map(|c| c as usize)
         .unwrap_or(0);
 
