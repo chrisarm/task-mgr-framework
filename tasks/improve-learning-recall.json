@@ -124,7 +124,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write in src/learnings/ingestion/ test module. The extraction pipeline already has tests \u2014 extend them. extract_learnings_from_output() already receives task_id; tests should verify the enrichment step.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "synergyWith": [
         "TEST-INIT-001"
@@ -218,7 +218,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write in src/learnings/retrieval/tests.rs or a new test module. Use setup_db_with_fts5() pattern. Must test migration path (v7\u2192v8) not just fresh schema. FTS5 tokenizes hyphens: 'workflow-detour' becomes tokens 'workflow' and 'detour' \u2014 verify search works for both. Tags with hyphens like 'pto-workflow-ux-fixes-v2' tokenize into separate FTS5 tokens.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "synergyWith": [],
       "title": "Initial tests for FTS5 tag indexing (schema v8 migration)",
@@ -377,7 +377,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": true,
       "notes": "Modify src/learnings/ingestion/mod.rs. After parse_extraction_response() returns Vec<RecordLearningParams>, iterate and enrich each with resolve_task_context() if task_id is provided. Call resolve_task_context() once, share result across all extracted learnings. Dependency on FEAT-002: if resolve_task_context() is already pub(crate), FEAT-003 can proceed independently; the dependency exists because FEAT-002 may need to adjust its visibility.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -479,7 +479,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": true,
       "notes": "Modify src/learnings/retrieval/patterns.rs. Use batch_get_learning_tags() (already exists) to load tags for candidate learnings. Add tag scoring after existing file/type/error scoring. Tag-to-path mapping is initially hardcoded. batch_get_learning_tags is already called when tag filters are present \u2014 extend to always call when task_files is present.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -549,7 +549,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": true,
       "notes": "Follow v3.rs migration pattern for FTS5. The migration must be transactional. Drop existing learnings_fts and triggers, recreate with 3 columns. FTS5 external content mode (content=learnings) means triggers must handle the delete-then-insert pattern for updates. Fts5Backend already falls back to LIKE if FTS5 unavailable \u2014 safe during rebuild window. tags_text stores space-separated tags: 'workflow-detour-phase3 long-term rust-patterns'. No code changes needed in fts5.rs \u2014 BM25 scoring automatically includes new column.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": {
         "correctness": [
@@ -640,7 +640,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON. If no issues, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "title": "Review implementation for refactoring opportunities",
@@ -650,6 +650,58 @@
         "src/learnings/retrieval/patterns.rs",
         "src/db/migrations/v8.rs"
       ]
+    },
+    {
+      "id": "REFACTOR-1-001",
+      "title": "Extract shared type_prefix_from() to eliminate DRY violation",
+      "description": "type_prefix_from() is duplicated identically in commands/learn.rs:164-170 and learnings/ingestion/mod.rs:193-199. Extract to a pub(crate) function in learnings/retrieval/patterns.rs (which already houses related extract_task_prefix()) and update both callers.",
+      "priority": 18,
+      "passes": false,
+      "estimatedEffort": "low",
+      "modifiesBehavior": false,
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [
+        "REFACTOR-1-002"
+      ],
+      "conflictsWith": [],
+      "touchesFiles": [
+        "src/commands/learn.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/learnings/retrieval/patterns.rs"
+      ],
+      "acceptanceCriteria": [
+        "type_prefix_from() exists in exactly one location (patterns.rs) as pub(crate)",
+        "learn.rs and ingestion/mod.rs import and call the shared function",
+        "All existing tests pass unchanged",
+        "No dead code warnings"
+      ],
+      "notes": "Low risk: pure function, no behavior change, existing tests cover both call sites."
+    },
+    {
+      "id": "REFACTOR-1-002",
+      "title": "Extract scoring helpers from PatternsBackend::retrieve()",
+      "description": "PatternsBackend::retrieve() is ~123 lines \u2014 well over the 30-line guideline. Extract the four scoring sections (file match, type match, error match, tag context match) into individual helper methods on PatternsBackend or as free functions. This improves testability and readability.",
+      "priority": 19,
+      "passes": false,
+      "estimatedEffort": "medium",
+      "modifiesBehavior": false,
+      "dependsOn": [],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "touchesFiles": [
+        "src/learnings/retrieval/patterns.rs"
+      ],
+      "acceptanceCriteria": [
+        "retrieve() body is under 50 lines (delegates to scoring helpers)",
+        "Each scoring helper is a standalone function under 30 lines",
+        "All existing retrieval tests pass unchanged",
+        "No dead code warnings"
+      ],
+      "notes": "The four scoring sections are: file_pattern_score(), type_prefix_score(), error_pattern_score(), tag_context_score(). Each takes a learning + relevant query fields and returns (score_delta, optional_reason)."
     },
     {
       "acceptanceCriteria": [
@@ -676,7 +728,9 @@
         "FEAT-005",
         "FEAT-006",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
       "description": "Gate checkpoint: all initial tests pass, implementation complete, code reviewed, refactored, and fully integrated.",
       "estimatedEffort": "low",
