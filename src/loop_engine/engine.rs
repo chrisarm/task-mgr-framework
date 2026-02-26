@@ -1697,8 +1697,7 @@ fn reconcile_external_git_completions(
         let base_id_upper = strip_task_prefix(task_id, task_prefix).to_uppercase();
         let matched = commit_lines.iter().any(|line| {
             contains_task_id(line, &task_id_upper)
-                || (task_id_upper != base_id_upper
-                    && contains_task_id(line, &base_id_upper))
+                || (task_id_upper != base_id_upper && contains_task_id(line, &base_id_upper))
         });
         if matched {
             // Mark as done — force=false so dependency gating applies
@@ -1812,8 +1811,7 @@ fn check_git_for_task_completion(
 
         let message_upper = message.to_uppercase();
         if contains_task_id(&message_upper, &task_id_upper)
-            || (task_id_upper != base_id_upper
-                && contains_task_id(&message_upper, &base_id_upper))
+            || (task_id_upper != base_id_upper && contains_task_id(&message_upper, &base_id_upper))
         {
             return Some(hash.to_string());
         }
@@ -3534,10 +3532,7 @@ mod tests {
         // force=false will block it due to unsatisfied dependency.
         // If FEAT-001 happens first, FEAT-002 may succeed.
         // Either way, at minimum 1 task reconciles (FEAT-001).
-        assert!(
-            count >= 1,
-            "At least FEAT-001 (no deps) should reconcile"
-        );
+        assert!(count >= 1, "At least FEAT-001 (no deps) should reconcile");
 
         // Verify FEAT-001 is done
         let status1: String = conn

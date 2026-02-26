@@ -13,6 +13,7 @@ mod v4;
 mod v5;
 mod v6;
 mod v7;
+mod v8;
 
 #[cfg(test)]
 mod tests;
@@ -22,7 +23,7 @@ use rusqlite::{Connection, Transaction};
 use crate::TaskMgrResult;
 
 /// Current schema version - increment when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// A single migration with up and down SQL
 pub struct Migration {
@@ -46,6 +47,7 @@ pub static MIGRATIONS: &[&Migration] = &[
     &v5::MIGRATION,
     &v6::MIGRATION,
     &v7::MIGRATION,
+    &v8::MIGRATION,
 ];
 
 /// Get the current schema version from the database.

@@ -1346,8 +1346,5 @@ fn test_cli_help_does_not_contain_learnings_only() {
     let has_flag = subcmd
         .get_arguments()
         .any(|a| a.get_long() == Some("learnings-only"));
-    assert!(
-        !has_flag,
-        "CLI should not have --learnings-only flag"
-    );
+    assert!(!has_flag, "CLI should not have --learnings-only flag");
 }

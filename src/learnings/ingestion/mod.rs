@@ -14,7 +14,8 @@ pub mod extraction;
 
 use rusqlite::Connection;
 
-use crate::learnings::crud::record_learning;
+use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
 use crate::models::LearningOutcome;
 use crate::TaskMgrResult;
@@ -28,6 +29,15 @@ pub struct ExtractionResult {
     pub learnings_extracted: usize,
     /// Database IDs of the created learnings
     pub learning_ids: Vec<i64>,
+}
+
+impl ExtractionResult {
+    fn empty() -> Self {
+        Self {
+            learnings_extracted: 0,
+            learning_ids: Vec::new(),
+        }
+    }
 }
 
 /// Returns true if extraction is disabled via environment variable.
@@ -57,10 +67,7 @@ pub fn extract_learnings_from_output(
     run_id: Option<&str>,
 ) -> TaskMgrResult<ExtractionResult> {
     if output.trim().is_empty() {
-        return Ok(ExtractionResult {
-            learnings_extracted: 0,
-            learning_ids: Vec::new(),
-        });
+        return Ok(ExtractionResult::empty());
     }
 
     // Build extraction prompt
@@ -71,10 +78,7 @@ pub fn extract_learnings_from_output(
         Ok(result) => result,
         Err(e) => {
             eprintln!("Warning: learning extraction spawn failed: {}", e);
-            return Ok(ExtractionResult {
-                learnings_extracted: 0,
-                learning_ids: Vec::new(),
-            });
+            return Ok(ExtractionResult::empty());
         }
     };
 
@@ -83,10 +87,7 @@ pub fn extract_learnings_from_output(
             "Warning: learning extraction Claude exited with code {}",
             claude_result.exit_code
         );
-        return Ok(ExtractionResult {
-            learnings_extracted: 0,
-            learning_ids: Vec::new(),
-        });
+        return Ok(ExtractionResult::empty());
     }
 
     // Parse the extraction response
@@ -94,12 +95,16 @@ pub fn extract_learnings_from_output(
         Ok(list) => list,
         Err(e) => {
             eprintln!("Warning: learning extraction parse failed: {}", e);
-            return Ok(ExtractionResult {
-                learnings_extracted: 0,
-                learning_ids: Vec::new(),
-            });
+            return Ok(ExtractionResult::empty());
         }
     };
+
+    // Enrich with task context (best-effort: fall back to unenriched params on error)
+    let unenriched = params_list.clone();
+    let params_list = enrich_extracted_params(conn, params_list, task_id).unwrap_or_else(|e| {
+        eprintln!("Warning: learning enrichment failed: {}", e);
+        unenriched
+    });
 
     // Record each extracted learning, skipping duplicates
     let mut learning_ids = Vec::new();
@@ -124,6 +129,59 @@ pub fn extract_learnings_from_output(
     })
 }
 
+/// Enriches extracted learning params with task context when applicability is missing.
+///
+/// After LLM extraction, learnings may have no applicability metadata. This function:
+/// - Fills `applies_to_files` from the task's `task_files` in the DB (when empty)
+/// - Fills `applies_to_task_types` with the type prefix derived from `task_id` (when empty)
+///
+/// LLM-provided values are preserved (not overwritten).
+/// If `task_id` is `None`, params are returned unchanged without error.
+pub(crate) fn enrich_extracted_params(
+    conn: &Connection,
+    params: Vec<RecordLearningParams>,
+    task_id: Option<&str>,
+) -> TaskMgrResult<Vec<RecordLearningParams>> {
+    let task_id = match task_id {
+        Some(id) => id,
+        None => return Ok(params),
+    };
+
+    // Resolve task context once, shared across all extracted learnings.
+    // Graceful degradation: if context lookup fails, return params unchanged.
+    let (task_files, task_prefix, _task_error) = match resolve_task_context(conn, task_id) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!(
+                "Warning: task context lookup failed during enrichment: {}",
+                e
+            );
+            return Ok(params);
+        }
+    };
+
+    let type_prefix = task_prefix.as_deref().map(type_prefix_from);
+
+    let enriched = params
+        .into_iter()
+        .map(|mut p| {
+            // Preserve LLM-provided applies_to_files; fill from task context only when absent.
+            if p.applies_to_files.is_none() && !task_files.is_empty() {
+                p.applies_to_files = Some(task_files.clone());
+            }
+            // Preserve LLM-provided applies_to_task_types; derive from task prefix only when absent.
+            if p.applies_to_task_types.is_none() {
+                if let Some(ref prefix) = type_prefix {
+                    p.applies_to_task_types = Some(vec![prefix.clone()]);
+                }
+            }
+            p
+        })
+        .collect();
+
+    Ok(enriched)
+}
+
 /// Checks whether a learning with the same outcome and title already exists.
 fn learning_exists(
     conn: &Connection,
@@ -136,4 +194,207 @@ fn learning_exists(
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrich_extracted_params;
+    use crate::learnings::crud::RecordLearningParams;
+    use crate::learnings::test_helpers::{insert_task_with_files, setup_db};
+    use crate::models::{Confidence, LearningOutcome};
+
+    /// Creates a RecordLearningParams with all applicability fields empty.
+    fn make_minimal_params(title: &str) -> RecordLearningParams {
+        RecordLearningParams {
+            outcome: LearningOutcome::Pattern,
+            title: title.to_string(),
+            content: "Test content".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::Medium,
+        }
+    }
+
+    // ─── Tests for LLM extraction auto-populate (B2/FR-004) ──────────────────
+    // FEAT-003 implemented: all enrichment tests are active.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// When task_id is None, enrich_extracted_params returns params unchanged
+    /// without error.
+    #[test]
+    fn test_enrich_no_task_id_returns_params_unchanged_no_error() {
+        let (_dir, conn) = setup_db();
+
+        let params = vec![make_minimal_params("No task id")];
+        let result = enrich_extracted_params(&conn, params, None).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "No task id");
+        assert!(
+            result[0].applies_to_files.is_none(),
+            "applies_to_files should remain None when no task_id"
+        );
+        assert!(
+            result[0].applies_to_task_types.is_none(),
+            "applies_to_task_types should remain None when no task_id"
+        );
+    }
+
+    /// Happy path: extracted learning with no files gets task_files from context.
+    #[test]
+    fn test_enrich_populates_files_from_task_context() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(
+            &conn,
+            "FEAT-003",
+            &["src/learnings/ingestion/mod.rs", "src/lib.rs"],
+        );
+
+        let params = vec![make_minimal_params("No files learning")];
+        let enriched = enrich_extracted_params(&conn, params, Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 1);
+        let files = enriched[0]
+            .applies_to_files
+            .as_ref()
+            .expect("applies_to_files should be populated from task context");
+        assert!(
+            files.contains(&"src/learnings/ingestion/mod.rs".to_string()),
+            "Expected task file 'src/learnings/ingestion/mod.rs', got: {:?}",
+            files
+        );
+        assert!(
+            files.contains(&"src/lib.rs".to_string()),
+            "Expected task file 'src/lib.rs', got: {:?}",
+            files
+        );
+    }
+
+    /// Happy path: extracted learning with no task_types gets type prefix from task_id.
+    #[test]
+    fn test_enrich_populates_task_types_from_task_prefix() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &[]);
+
+        let params = vec![make_minimal_params("No task types learning")];
+        let enriched = enrich_extracted_params(&conn, params, Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 1);
+        let types = enriched[0]
+            .applies_to_task_types
+            .as_ref()
+            .expect("applies_to_task_types should be populated from task_id prefix");
+        assert!(
+            types.iter().any(|t| t == "FEAT-"),
+            "Expected type prefix 'FEAT-' derived from 'FEAT-003', got: {:?}",
+            types
+        );
+        // Must be the prefix form, not the full task ID
+        assert!(
+            !types.iter().any(|t| t == "FEAT-003"),
+            "Should store the type prefix 'FEAT-', not the full task id 'FEAT-003', got: {:?}",
+            types
+        );
+    }
+
+    /// Edge case: LLM-provided applies_to_files are preserved (not overwritten by task context).
+    #[test]
+    fn test_enrich_preserves_llm_provided_applies_to_files() {
+        let (_dir, conn) = setup_db();
+        // Task has different files from LLM-provided ones
+        insert_task_with_files(&conn, "FEAT-003", &["src/task_file.rs"]);
+
+        let mut params = make_minimal_params("LLM-provided files");
+        params.applies_to_files = Some(vec!["src/llm_provided_file.rs".to_string()]);
+
+        let enriched = enrich_extracted_params(&conn, vec![params], Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 1);
+        let files = enriched[0]
+            .applies_to_files
+            .as_ref()
+            .expect("applies_to_files should still be set");
+        assert!(
+            files.contains(&"src/llm_provided_file.rs".to_string()),
+            "LLM-provided file should be preserved, got: {:?}",
+            files
+        );
+        assert!(
+            !files.contains(&"src/task_file.rs".to_string()),
+            "Task file should NOT overwrite LLM-provided files, got: {:?}",
+            files
+        );
+    }
+
+    /// Comprehensive: multiple learnings in a single extraction batch all receive
+    /// the same task context (files and task type prefix) independently.
+    #[test]
+    fn test_enrich_multiple_params_all_get_same_task_context() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &["src/feat.rs", "src/lib.rs"]);
+
+        let params = vec![
+            make_minimal_params("First learning"),
+            make_minimal_params("Second learning"),
+            make_minimal_params("Third learning"),
+        ];
+        let enriched = enrich_extracted_params(&conn, params, Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 3, "All 3 params should be returned");
+        for (i, p) in enriched.iter().enumerate() {
+            let files = p
+                .applies_to_files
+                .as_ref()
+                .unwrap_or_else(|| panic!("Learning {i} should have applies_to_files"));
+            assert!(
+                files.contains(&"src/feat.rs".to_string()),
+                "Learning {i} should have 'src/feat.rs', got: {:?}",
+                files
+            );
+            let types = p
+                .applies_to_task_types
+                .as_ref()
+                .unwrap_or_else(|| panic!("Learning {i} should have applies_to_task_types"));
+            assert!(
+                types.iter().any(|t| t == "FEAT-"),
+                "Learning {i} should have 'FEAT-' type, got: {:?}",
+                types
+            );
+        }
+    }
+
+    /// Known-bad discriminator: enrichment must use actual task_files from DB,
+    /// not any hardcoded or default values. A stub returning ["src/main.rs"]
+    /// will cause this test to fail.
+    #[test]
+    fn test_enrich_discriminator_uses_actual_db_files_not_hardcoded() {
+        let (_dir, conn) = setup_db();
+        // Use a file name that is distinctly NOT a common default like "src/main.rs"
+        insert_task_with_files(&conn, "FEAT-003", &["src/ingestion_unique_9f3a2b.rs"]);
+
+        let params = vec![make_minimal_params("Discriminator test")];
+        let enriched = enrich_extracted_params(&conn, params, Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 1);
+        let files = enriched[0]
+            .applies_to_files
+            .as_ref()
+            .expect("applies_to_files should be populated for task with files");
+        assert!(
+            files.contains(&"src/ingestion_unique_9f3a2b.rs".to_string()),
+            "Must contain FEAT-003's actual file from DB, got: {:?}",
+            files
+        );
+        assert!(
+            !files.contains(&"src/main.rs".to_string()),
+            "Must NOT contain hardcoded 'src/main.rs'; query the DB, got: {:?}",
+            files
+        );
+    }
 }

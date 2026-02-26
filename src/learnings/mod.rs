@@ -14,6 +14,8 @@ pub mod crud;
 pub mod ingestion;
 pub mod recall;
 pub mod retrieval;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 
 pub use bandit::{
     calculate_ucb_score, get_total_window_shows, get_window_stats, rank_learnings_by_ucb,

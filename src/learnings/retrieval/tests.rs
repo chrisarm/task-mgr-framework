@@ -443,6 +443,506 @@ fn test_composite_preserves_insertion_order() {
     assert_eq!(results[2].learning.title, "Old");
 }
 
+// ========== PatternsBackend Tag-Aware Retrieval Tests (B3/FR-005) ==========
+// Tests are #[ignore] — they define expected behavior before implementation.
+// TAG_CONTEXT_MATCH_SCORE = 3 (additive, less than TYPE_MATCH_SCORE = 5).
+//
+// Tag-to-path semantic mapping (implementation will define full table):
+//   "workflow-detour*"  → matches paths containing "workflow/"
+//   "ses" / "email"     → matches paths containing "ses/"
+//   "consumer"          → matches paths containing "consumer/"
+//
+// Excluded (never trigger tag-path scoring):
+//   Source tags: "long-term", "raw"
+//   Category tags: "rust-patterns", "python-patterns", "architecture-patterns",
+//                  "database-sql", "testing-patterns", "general"
+
+/// Creates a learning with tags but no applies_to_* metadata.
+/// Used to test tag-only learnings (no file/type/error applicability).
+fn create_tagged_learning(conn: &Connection, title: &str, tags: Vec<&str>) -> i64 {
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: title.to_string(),
+        content: "Tag-aware retrieval test content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(tags.into_iter().map(str::to_string).collect()),
+        confidence: Confidence::High,
+    };
+    record_learning(conn, params).unwrap().learning_id
+}
+
+#[test]
+fn test_tag_context_workflow_detour_phase3_matches_workflow_path() {
+    // Happy path: semantic tag maps to workflow path → TAG_CONTEXT_MATCH_SCORE = 3
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(
+        &conn,
+        "Workflow detour pattern",
+        vec!["workflow-detour-phase3"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "tag-only learning must be found via semantic tag"
+    );
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE must be 3"
+    );
+}
+
+#[test]
+fn test_excluded_source_tag_long_term_scores_zero() {
+    // Edge case: 'long-term' is a source/meta tag — must never trigger tag scoring.
+    // Even with task files present, this learning should not appear in results.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Long-term insight", vec!["long-term"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded source tag 'long-term' must not contribute tag score"
+    );
+}
+
+#[test]
+fn test_excluded_source_tag_raw_scores_zero() {
+    // Edge case: 'raw' is a source tag — must never trigger tag scoring.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Raw observation", vec!["raw"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/any/path.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded source tag 'raw' must not contribute tag score"
+    );
+}
+
+#[test]
+fn test_file_match_and_tag_match_scores_stack() {
+    // Edge case: FILE_MATCH_SCORE (10) + TAG_CONTEXT_MATCH_SCORE (3) = 13.
+    // Learning has both a matching applies_to_files glob AND a semantic tag.
+    let (_dir, conn) = setup_db();
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Stacked scoring learning".to_string(),
+        content: "File pattern + semantic tag both match".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["**/workflow/**".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["workflow-detour-phase3".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].relevance_score, 13.0,
+        "FILE_MATCH_SCORE (10) + TAG_CONTEXT_MATCH_SCORE (3) must stack to 13"
+    );
+}
+
+#[test]
+fn test_excluded_category_tag_rust_patterns_scores_zero() {
+    // Edge case: 'rust-patterns' is a category tag — must never trigger tag scoring.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Rust error handling pattern", vec!["rust-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded category tag 'rust-patterns' must not contribute tag score"
+    );
+}
+
+#[test]
+fn test_tag_workflow_detour_does_not_match_tools_path() {
+    // Known-bad discriminator: 'workflow-detour' maps to workflow/ paths, not tools/.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Workflow detour note", vec!["workflow-detour"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        // tools/ path — NOT under workflow/, so tag should not match
+        task_files: vec!["service/src/tools/some_tool.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "tag 'workflow-detour' must not match service/src/tools/ (wrong path)"
+    );
+}
+
+#[test]
+fn test_no_tag_context_match_without_task_files() {
+    // Invariant: PatternsBackend returns empty when task context is absent.
+    // Tag scoring must not fire without task_files — matches existing early-exit.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(
+        &conn,
+        "Tagged no-context learning",
+        vec!["workflow-detour-phase3"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        // No task_files, no task_prefix, no task_error
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "PatternsBackend must return empty when no task context is present"
+    );
+}
+
+// ========== TEST-002: Comprehensive tag-aware retrieval tests ==========
+
+#[test]
+fn test_tag_ses_matches_ses_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "SES email insight", vec!["ses-email-limits"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/ses/message_sender.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "ses tag should match ses/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_email_matches_ses_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Email delivery note", vec!["email-delivery"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/ses/delivery.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "email tag should match ses/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_pto_matches_date_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "PTO balance fix", vec!["pto-accrual"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/date/pto_calculator.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "pto tag should match date/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_embedding_matches_kb_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Embedding indexing note", vec!["embedding-routing"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/kb/embedding_store.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "embedding tag should match kb/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_consumer_matches_consumer_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Consumer handler note", vec!["consumer-routing"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/consumer/handler.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "consumer tag should match consumer/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_excluded_tag_python_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Python pattern note", vec!["python-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'python-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_architecture_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Architecture insight", vec!["architecture-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'architecture-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_database_sql_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "SQL pattern", vec!["database-sql"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'database-sql' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_testing_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Testing insight", vec!["testing-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'testing-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_general_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "General note", vec!["general"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'general' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_multiple_matching_tags_counted_once_not_double_scored() {
+    // A learning with two tags that both map to workflow/ should score 3 once, not 6.
+    let (_dir, conn) = setup_db();
+    // Both "workflow-detour-phase3" and "workflow-engine" have "workflow" token → "workflow/"
+    create_tagged_learning(
+        &conn,
+        "Double workflow learning",
+        vec!["workflow-detour-phase3", "workflow-engine-fix"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "learning should be found exactly once");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "Multiple matching tags must not double-score: expected 3 (once), got {}",
+        results[0].relevance_score
+    );
+}
+
+#[test]
+fn test_combined_scoring_file_type_tag_error_sums_to_20() {
+    // Combined: FILE_MATCH_SCORE(10) + TYPE_MATCH_SCORE(5) + TAG_CONTEXT_MATCH_SCORE(3) + ERROR_MATCH_SCORE(2) = 20
+    let (_dir, conn) = setup_db();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Failure,
+        title: "Full-score learning".to_string(),
+        content: "serde_json parse error at root".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["**/workflow/**".to_string()]),
+        applies_to_task_types: Some(vec!["FEAT-".to_string()]),
+        applies_to_errors: Some(vec!["serde_json".to_string()]),
+        tags: Some(vec!["workflow-detour-phase3".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        task_prefix: Some("FEAT-003".to_string()),
+        task_error: Some("serde_json error".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].relevance_score, 20.0,
+        "file(10) + type(5) + tag(3) + error(2) = 20, got {}",
+        results[0].relevance_score
+    );
+}
+
+#[test]
+fn test_tag_match_visible_through_composite_backend() {
+    // Tag-aware retrieval through CompositeBackend: tag match produces a result
+    // that survives UCB reranking and deduplication.
+    let (_dir, conn) = setup_db_with_fts5();
+    // Tagged learning with no applies_to_* metadata — only visible via tag scoring
+    create_tagged_learning(&conn, "Tag-only composite test", vec!["workflow-detour"]);
+
+    let backend = CompositeBackend::default_backends();
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "tag-scored learning must survive composite backend"
+    );
+    assert_eq!(
+        results[0].learning.title, "Tag-only composite test",
+        "should be the tag-scored learning"
+    );
+    assert!(
+        results[0].relevance_score >= 3.0,
+        "tag score should be at least 3.0 (TAG_CONTEXT_MATCH_SCORE)"
+    );
+}
+
 // ========== Utility Tests (moved from recall/tests.rs) ==========
 
 #[test]
@@ -517,4 +1017,182 @@ fn test_is_fts5_available_without_migration() {
 fn test_is_fts5_available_after_migration() {
     let (_temp_dir, conn) = setup_db_with_fts5();
     assert!(is_fts5_available(&conn));
+}
+
+// ========== FTS5 Tag Search Tests (v8/B4/FR-007) ==========
+//
+// These tests are #[ignore] — they define the contract for the FTS5 tag indexing
+// implementation in migration v8. They verify that the Fts5Backend can find
+// learnings by tag content after the v8 migration.
+//
+// FTS5 tokenization: the ascii tokenizer splits on '-', so tag
+// `chrono-date-handling` yields tokens `chrono`, `date`, `handling`.
+// Searching for `chrono` or `workflow` matches via tags_text column.
+
+#[test]
+fn test_fts5_backend_searches_by_tag() {
+    // Happy path: FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
+    // even when title and content don't contain 'chrono'
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Temporal handling note".to_string(),
+        content: "Time zone offsets behave unexpectedly".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["chrono-date-handling".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("chrono".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "Fts5Backend must find learning tagged 'chrono-date-handling' when searching 'chrono'"
+    );
+    assert_eq!(results[0].learning.title, "Temporal handling note");
+}
+
+#[test]
+fn test_fts5_backend_tag_search_hyphenated_token_workflow() {
+    // Happy path: FTS5 tokenizes 'pto-workflow-ux-fixes-v2' → tokens include 'workflow'.
+    // Searching 'workflow' returns this learning even though title/content lack the word.
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Sprint deviation note".to_string(),
+        content: "Detour taken during planning session".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Control: unrelated learning with no 'workflow' anywhere
+    create_test_learning(
+        &conn,
+        "Unrelated observation",
+        "Something completely different",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("workflow".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    // Known-bad discriminator: exactly 1 result (the tagged one), not the control
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS5 must return exactly the learning tagged 'pto-workflow-ux-fixes-v2', not the control"
+    );
+    assert_eq!(results[0].learning.title, "Sprint deviation note");
+}
+
+#[test]
+fn test_fts5_backend_pto_token_finds_hyphenated_tag() {
+    // AC6: FTS5 search for 'pto' finds learning tagged 'pto-workflow-ux-fixes-v2'.
+    // Ascii tokenizer splits hyphens: 'pto-workflow-ux-fixes-v2' → 'pto', 'workflow', ...
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Leave balance adjustment".to_string(),
+        content: "Accrual calculation was off by one day".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Control: unrelated learning (must not contain 'pto' anywhere)
+    create_test_learning(
+        &conn,
+        "Unrelated note",
+        "Nothing relevant in this one",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("pto".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS5 search for 'pto' must find learning tagged 'pto-workflow-ux-fixes-v2'"
+    );
+    assert_eq!(results[0].learning.title, "Leave balance adjustment");
+}
+
+#[test]
+fn test_fts5_backend_tag_search_no_false_positives() {
+    // Discriminator: searching a rare token that only appears in tags must not
+    // return learnings whose tags don't contain it.
+    let (_dir, conn) = setup_db_with_fts5();
+
+    // Learning tagged with something unrelated to 'chrono'
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Database note".to_string(),
+        content: "SQLite connection pooling".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["database-sql".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("chrono".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "FTS5 must not return a learning tagged 'database-sql' when searching 'chrono'"
+    );
 }
