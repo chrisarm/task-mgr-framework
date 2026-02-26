@@ -1030,7 +1030,6 @@ fn test_is_fts5_available_after_migration() {
 // Searching for `chrono` or `workflow` matches via tags_text column.
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_fts5_backend_searches_by_tag() {
     // Happy path: FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
     // even when title and content don't contain 'chrono'
@@ -1069,7 +1068,6 @@ fn test_fts5_backend_searches_by_tag() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_fts5_backend_tag_search_hyphenated_token_workflow() {
     // Happy path: FTS5 tokenizes 'pto-workflow-ux-fixes-v2' → tokens include 'workflow'.
     // Searching 'workflow' returns this learning even though title/content lack the word.
@@ -1117,7 +1115,6 @@ fn test_fts5_backend_tag_search_hyphenated_token_workflow() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_fts5_backend_tag_search_no_false_positives() {
     // Discriminator: searching a rare token that only appears in tags must not
     // return learnings whose tags don't contain it.
