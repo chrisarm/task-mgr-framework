@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
+use crate::learnings::retrieval::patterns::resolve_task_context;
 use crate::learnings::{record_learning, RecordLearningParams, RecordLearningResult};
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
@@ -100,6 +101,41 @@ fn cli_confidence_to_model(confidence: CliConfidence) -> Confidence {
 /// - Task ID doesn't exist (foreign key violation)
 /// - Run ID doesn't exist (foreign key violation)
 pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResult> {
+    // Auto-populate applies_to_files and applies_to_task_types from task context
+    // when task_id is provided and --files/--task-types are not explicitly set.
+    let (effective_files, effective_task_types) = if let Some(ref task_id) = params.task_id {
+        let files_are_explicit = params.files.as_ref().is_some_and(|f| !f.is_empty());
+        let types_are_explicit = params.task_types.as_ref().is_some_and(|t| !t.is_empty());
+
+        match resolve_task_context(conn, task_id) {
+            Ok((task_files, task_prefix, _task_error)) => {
+                let files = if files_are_explicit {
+                    params.files.clone()
+                } else if task_files.is_empty() {
+                    None
+                } else {
+                    Some(task_files)
+                };
+
+                let types = if types_are_explicit {
+                    params.task_types.clone()
+                } else {
+                    task_prefix.map(|p| vec![type_prefix_from(&p)])
+                };
+
+                (files, types)
+            }
+            // Graceful degradation: context lookup failed, use explicit values only.
+            Err(_) => (
+                params.files.clone().filter(|f| !f.is_empty()),
+                params.task_types.clone().filter(|t| !t.is_empty()),
+            ),
+        }
+    } else {
+        // No task_id — no auto-populate.
+        (params.files.clone(), params.task_types.clone())
+    };
+
     let record_params = RecordLearningParams {
         outcome: cli_outcome_to_model(params.outcome),
         title: params.title,
@@ -108,8 +144,8 @@ pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResul
         run_id: params.run_id,
         root_cause: params.root_cause,
         solution: params.solution,
-        applies_to_files: params.files,
-        applies_to_task_types: params.task_types,
+        applies_to_files: effective_files,
+        applies_to_task_types: effective_task_types,
         applies_to_errors: params.errors,
         tags: params.tags,
         confidence: cli_confidence_to_model(params.confidence),
@@ -117,6 +153,20 @@ pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResul
 
     let result = record_learning(conn, record_params)?;
     Ok(LearnResult::from(result))
+}
+
+/// Extracts the task type prefix from a task prefix string.
+///
+/// Returns everything up to and including the first `-`. This allows learnings
+/// to match all tasks of the same type via `starts_with()` scoring.
+///
+/// E.g., `"FEAT-003"` → `"FEAT-"`, `"US-001"` → `"US-"`.
+fn type_prefix_from(task_prefix: &str) -> String {
+    if let Some(pos) = task_prefix.find('-') {
+        task_prefix[..=pos].to_string()
+    } else {
+        task_prefix.to_string()
+    }
 }
 
 /// Formats the learn result for text output.
@@ -401,7 +451,6 @@ mod tests {
     /// Happy path: learn() with task_id auto-populates applies_to_files
     /// from the task's associated files in the task_files table.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_auto_populates_files_from_task_files() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &["src/commands/learn.rs", "src/lib.rs"]);
@@ -442,7 +491,6 @@ mod tests {
     /// Happy path: learn() with task_id auto-populates applies_to_task_types
     /// with the type prefix extracted from the task ID (e.g., "FEAT-" from "FEAT-003").
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_auto_populates_task_types_from_prefix() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &[]);
@@ -480,7 +528,6 @@ mod tests {
 
     /// Edge case: explicit --files flag overrides auto-population from task context.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_explicit_files_override_auto_populate() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &["src/other.rs"]);
@@ -516,7 +563,6 @@ mod tests {
 
     /// Edge case: explicit --task-types flag overrides auto-population from task prefix.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_explicit_task_types_override_auto_populate() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &[]);
@@ -557,7 +603,6 @@ mod tests {
     /// Edge case: task with no task_files skips file auto-populate,
     /// but still auto-populates task type prefix.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_no_task_files_still_populates_task_type() {
         let (_dir, conn) = setup_db();
         // Task exists but has no associated files
@@ -602,7 +647,6 @@ mod tests {
     /// Edge case: empty files vec Some([]) is treated the same as None —
     /// auto-populate still runs, and NULL is stored rather than an empty JSON array.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_empty_files_vec_treated_as_null_for_auto_populate() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &["src/feat.rs"]);
@@ -646,7 +690,6 @@ mod tests {
     /// actual task_files from the DB, not any hardcoded or default value.
     /// A stub that always returns ["src/main.rs"] will cause this test to fail.
     #[test]
-    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
     fn test_learn_discriminator_uses_actual_db_files_not_hardcoded() {
         let (_dir, conn) = setup_db();
         // Use a file that is distinctly NOT "src/main.rs"
