@@ -170,31 +170,7 @@ pub fn format_text(result: &LearnResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
-    use tempfile::TempDir;
-
-    fn setup_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    /// Inserts a task and associates file paths with it in task_files.
-    fn insert_task_with_files(conn: &Connection, task_id: &str, files: &[&str]) {
-        conn.execute(
-            "INSERT INTO tasks (id, title) VALUES (?1, 'Test Task')",
-            [task_id],
-        )
-        .unwrap();
-        for file in files {
-            conn.execute(
-                "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
-                rusqlite::params![task_id, file],
-            )
-            .unwrap();
-        }
-    }
+    use crate::learnings::test_helpers::{insert_task_with_files, setup_db};
 
     /// Reads applies_to_files (raw JSON text) for a learning from the DB.
     fn get_applies_to_files(conn: &Connection, learning_id: i64) -> Option<String> {

@@ -31,6 +31,15 @@ pub struct ExtractionResult {
     pub learning_ids: Vec<i64>,
 }
 
+impl ExtractionResult {
+    fn empty() -> Self {
+        Self {
+            learnings_extracted: 0,
+            learning_ids: Vec::new(),
+        }
+    }
+}
+
 /// Returns true if extraction is disabled via environment variable.
 pub fn is_extraction_disabled() -> bool {
     std::env::var("TASK_MGR_NO_EXTRACT_LEARNINGS")
@@ -58,10 +67,7 @@ pub fn extract_learnings_from_output(
     run_id: Option<&str>,
 ) -> TaskMgrResult<ExtractionResult> {
     if output.trim().is_empty() {
-        return Ok(ExtractionResult {
-            learnings_extracted: 0,
-            learning_ids: Vec::new(),
-        });
+        return Ok(ExtractionResult::empty());
     }
 
     // Build extraction prompt
@@ -72,10 +78,7 @@ pub fn extract_learnings_from_output(
         Ok(result) => result,
         Err(e) => {
             eprintln!("Warning: learning extraction spawn failed: {}", e);
-            return Ok(ExtractionResult {
-                learnings_extracted: 0,
-                learning_ids: Vec::new(),
-            });
+            return Ok(ExtractionResult::empty());
         }
     };
 
@@ -84,10 +87,7 @@ pub fn extract_learnings_from_output(
             "Warning: learning extraction Claude exited with code {}",
             claude_result.exit_code
         );
-        return Ok(ExtractionResult {
-            learnings_extracted: 0,
-            learning_ids: Vec::new(),
-        });
+        return Ok(ExtractionResult::empty());
     }
 
     // Parse the extraction response
@@ -95,10 +95,7 @@ pub fn extract_learnings_from_output(
         Ok(list) => list,
         Err(e) => {
             eprintln!("Warning: learning extraction parse failed: {}", e);
-            return Ok(ExtractionResult {
-                learnings_extracted: 0,
-                learning_ids: Vec::new(),
-            });
+            return Ok(ExtractionResult::empty());
         }
     };
 
@@ -201,36 +198,10 @@ fn learning_exists(
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
-    use tempfile::TempDir;
-
     use super::enrich_extracted_params;
-    use crate::db::{create_schema, open_connection};
     use crate::learnings::crud::RecordLearningParams;
+    use crate::learnings::test_helpers::{insert_task_with_files, setup_db};
     use crate::models::{Confidence, LearningOutcome};
-
-    fn setup_db() -> (TempDir, Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    /// Inserts a task and associates file paths with it in task_files.
-    fn insert_task_with_files(conn: &Connection, task_id: &str, files: &[&str]) {
-        conn.execute(
-            "INSERT INTO tasks (id, title) VALUES (?1, 'Test Task')",
-            [task_id],
-        )
-        .unwrap();
-        for file in files {
-            conn.execute(
-                "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
-                rusqlite::params![task_id, file],
-            )
-            .unwrap();
-        }
-    }
 
     /// Creates a RecordLearningParams with all applicability fields empty.
     fn make_minimal_params(title: &str) -> RecordLearningParams {
