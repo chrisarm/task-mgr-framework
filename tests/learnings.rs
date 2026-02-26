@@ -995,3 +995,199 @@ fn test_recall_empty_database() {
     assert_eq!(result.count, 0);
     assert!(result.learnings.is_empty());
 }
+
+// =============================================================================
+// INT-001: Integration tests for enriched learning recall (FEAT-002/003/005)
+// =============================================================================
+
+/// E2E: create task → learn with task_id (auto-populate) → PatternsBackend recall
+/// with for-task context → verify auto-populated fields contributed to scoring.
+#[test]
+fn test_e2e_learn_auto_populate_then_recall_for_task() {
+    use task_mgr::cli::enums::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
+    use task_mgr::commands::learn::{learn, LearnParams};
+    use task_mgr::learnings::{PatternsBackend, RetrievalBackend, RetrievalQuery};
+
+    let (_temp_dir, conn) = setup_db();
+
+    // Create task with associated files in the DB
+    conn.execute(
+        "INSERT INTO tasks (id, title) VALUES ('FEAT-003', 'Integration Test Task')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES ('FEAT-003', 'src/integration.rs')",
+        [],
+    )
+    .unwrap();
+
+    // learn() with task_id — auto-populate kicks in
+    let learn_result = learn(
+        &conn,
+        LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Auto-populated integration learning".to_string(),
+            content: "End-to-end pipeline test".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,      // auto-populate from task context
+            task_types: None, // auto-populate from task ID prefix
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::High,
+        },
+    )
+    .unwrap();
+    assert!(learn_result.learning_id > 0);
+
+    // Recall with PatternsBackend using the same task context
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["src/integration.rs".to_string()],
+        task_prefix: Some("FEAT-003".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "auto-populated learning must be found by task context"
+    );
+    // Should score at least FILE_MATCH(10) + TYPE_MATCH(5) = 15
+    assert!(
+        results[0].relevance_score >= 15.0,
+        "auto-populate must contribute both file and type match scores, got: {}",
+        results[0].relevance_score
+    );
+}
+
+/// E2E: create learning with tags → FTS5 search by tag keyword → verify learning found.
+#[test]
+fn test_e2e_learning_with_tag_found_by_fts5_tag_keyword_search() {
+    use task_mgr::learnings::{Fts5Backend, RetrievalBackend, RetrievalQuery};
+
+    let (_temp_dir, conn) = setup_db_with_migrations();
+
+    // Create learning tagged with 'workflow-engine-fix'
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "FTS5 tag integration test".to_string(),
+        content: "This learning has no workflow keyword in title or content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["workflow-engine-fix".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // FTS5 search for 'workflow' — FTS5 tokenizes 'workflow-engine-fix' to include 'workflow' token
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("workflow".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        !results.is_empty(),
+        "FTS5 must find learning by tag token 'workflow'"
+    );
+    assert_eq!(
+        results[0].learning.title, "FTS5 tag integration test",
+        "correct learning returned via tag token search"
+    );
+}
+
+/// E2E: PatternsBackend scoring — file match (10) + tag match (3) = 13.
+#[test]
+fn test_e2e_patterns_backend_file_and_tag_score_stack() {
+    use task_mgr::learnings::{PatternsBackend, RetrievalBackend, RetrievalQuery};
+
+    let (_temp_dir, conn) = setup_db();
+
+    // Create learning with file pattern AND a workflow tag
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Stacked score integration test".to_string(),
+        content: "Workflow engine pattern".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["**/workflow/**".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["workflow-detour-phase3".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].relevance_score, 13.0,
+        "file_match(10) + tag_match(3) = 13, got {}",
+        results[0].relevance_score
+    );
+}
+
+/// E2E: CompositeBackend merges FTS5 and PatternsBackend results with tag scoring.
+#[test]
+fn test_e2e_composite_backend_merges_fts5_and_patterns_with_tags() {
+    use task_mgr::learnings::{CompositeBackend, RetrievalBackend, RetrievalQuery};
+
+    let (_temp_dir, conn) = setup_db_with_migrations();
+
+    // Tag-only learning (visible to PatternsBackend via tag scoring, FTS5 via token search)
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Composite integration tag test".to_string(),
+        content: "This has no workflow keyword in title or content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["workflow-detour".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = CompositeBackend::default_backends();
+    let query = RetrievalQuery {
+        // Both FTS5 text search and PatternsBackend tag scoring should find this
+        text: Some("workflow".to_string()),
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        !results.is_empty(),
+        "CompositeBackend must find tag-only learning via merged results"
+    );
+    assert_eq!(
+        results[0].learning.title, "Composite integration tag test",
+        "correct learning returned by composite backend"
+    );
+}
