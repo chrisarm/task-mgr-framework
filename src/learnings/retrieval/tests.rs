@@ -649,6 +649,300 @@ fn test_no_tag_context_match_without_task_files() {
     );
 }
 
+// ========== TEST-002: Comprehensive tag-aware retrieval tests ==========
+
+#[test]
+fn test_tag_ses_matches_ses_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "SES email insight", vec!["ses-email-limits"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/ses/message_sender.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "ses tag should match ses/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_email_matches_ses_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Email delivery note", vec!["email-delivery"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/ses/delivery.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "email tag should match ses/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_pto_matches_date_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "PTO balance fix", vec!["pto-accrual"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/date/pto_calculator.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "pto tag should match date/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_embedding_matches_kb_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Embedding indexing note", vec!["embedding-routing"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/kb/embedding_store.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "embedding tag should match kb/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_tag_consumer_matches_consumer_path() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Consumer handler note", vec!["consumer-routing"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/consumer/handler.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "consumer tag should match consumer/ path");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE = 3"
+    );
+}
+
+#[test]
+fn test_excluded_tag_python_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Python pattern note", vec!["python-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'python-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_architecture_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Architecture insight", vec!["architecture-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'architecture-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_database_sql_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "SQL pattern", vec!["database-sql"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'database-sql' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_testing_patterns_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Testing insight", vec!["testing-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'testing-patterns' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_excluded_tag_general_scores_zero() {
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "General note", vec!["general"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded tag 'general' must not trigger scoring"
+    );
+}
+
+#[test]
+fn test_multiple_matching_tags_counted_once_not_double_scored() {
+    // A learning with two tags that both map to workflow/ should score 3 once, not 6.
+    let (_dir, conn) = setup_db();
+    // Both "workflow-detour-phase3" and "workflow-engine" have "workflow" token → "workflow/"
+    create_tagged_learning(
+        &conn,
+        "Double workflow learning",
+        vec!["workflow-detour-phase3", "workflow-engine-fix"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1, "learning should be found exactly once");
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "Multiple matching tags must not double-score: expected 3 (once), got {}",
+        results[0].relevance_score
+    );
+}
+
+#[test]
+fn test_combined_scoring_file_type_tag_error_sums_to_20() {
+    // Combined: FILE_MATCH_SCORE(10) + TYPE_MATCH_SCORE(5) + TAG_CONTEXT_MATCH_SCORE(3) + ERROR_MATCH_SCORE(2) = 20
+    let (_dir, conn) = setup_db();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Failure,
+        title: "Full-score learning".to_string(),
+        content: "serde_json parse error at root".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["**/workflow/**".to_string()]),
+        applies_to_task_types: Some(vec!["FEAT-".to_string()]),
+        applies_to_errors: Some(vec!["serde_json".to_string()]),
+        tags: Some(vec!["workflow-detour-phase3".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        task_prefix: Some("FEAT-003".to_string()),
+        task_error: Some("serde_json error".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].relevance_score, 20.0,
+        "file(10) + type(5) + tag(3) + error(2) = 20, got {}",
+        results[0].relevance_score
+    );
+}
+
+#[test]
+fn test_tag_match_visible_through_composite_backend() {
+    // Tag-aware retrieval through CompositeBackend: tag match produces a result
+    // that survives UCB reranking and deduplication.
+    let (_dir, conn) = setup_db_with_fts5();
+    // Tagged learning with no applies_to_* metadata — only visible via tag scoring
+    create_tagged_learning(&conn, "Tag-only composite test", vec!["workflow-detour"]);
+
+    let backend = CompositeBackend::default_backends();
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "tag-scored learning must survive composite backend"
+    );
+    assert_eq!(
+        results[0].learning.title, "Tag-only composite test",
+        "should be the tag-scored learning"
+    );
+    assert!(
+        results[0].relevance_score >= 3.0,
+        "tag score should be at least 3.0 (TAG_CONTEXT_MATCH_SCORE)"
+    );
+}
+
 // ========== Utility Tests (moved from recall/tests.rs) ==========
 
 #[test]
