@@ -1115,6 +1115,52 @@ fn test_fts5_backend_tag_search_hyphenated_token_workflow() {
 }
 
 #[test]
+fn test_fts5_backend_pto_token_finds_hyphenated_tag() {
+    // AC6: FTS5 search for 'pto' finds learning tagged 'pto-workflow-ux-fixes-v2'.
+    // Ascii tokenizer splits hyphens: 'pto-workflow-ux-fixes-v2' → 'pto', 'workflow', ...
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Leave balance adjustment".to_string(),
+        content: "Accrual calculation was off by one day".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Control: unrelated learning (must not contain 'pto' anywhere)
+    create_test_learning(
+        &conn,
+        "Unrelated note",
+        "Nothing relevant in this one",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("pto".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS5 search for 'pto' must find learning tagged 'pto-workflow-ux-fixes-v2'"
+    );
+    assert_eq!(results[0].learning.title, "Leave balance adjustment");
+}
+
+#[test]
 fn test_fts5_backend_tag_search_no_false_positives() {
     // Discriminator: searching a rare token that only appears in tags must not
     // return learnings whose tags don't contain it.

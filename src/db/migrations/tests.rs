@@ -875,3 +875,324 @@ fn test_migration_v8_workflow_tag_found_when_title_content_lack_keyword() {
         "FTS5 search for 'workflow' must find exactly the learning tagged 'pto-workflow-ux-fixes-v2'"
     );
 }
+
+// ========== TEST-003: Comprehensive FTS5 tag indexing migration tests ==========
+
+#[test]
+fn test_migration_v8_pto_token_finds_hyphenated_tag() {
+    // AC6: searching 'pto' finds learning tagged 'pto-workflow-ux-fixes-v2'.
+    // FTS5 ascii tokenizer splits hyphens: 'pto-workflow-ux-fixes-v2' → tokens
+    // 'pto', 'workflow', 'ux', 'fixes', 'v2'.
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Title and content deliberately lack 'pto'
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Leave balance adjustment".to_string(),
+        content: "Accrual calculation was off by one day".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"pto\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        count, 1,
+        "FTS5 search for 'pto' must find learning tagged 'pto-workflow-ux-fixes-v2'"
+    );
+}
+
+#[test]
+fn test_migration_v8_fts5_table_has_tags_text_column() {
+    // AC2: fresh database FTS5 table includes tags_text as a searchable column.
+    // We verify by inserting directly into learnings_fts with 3 columns.
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // If FTS5 only has 2 columns (title, content), this INSERT will fail
+    let result = conn.execute(
+        "INSERT INTO learnings_fts(rowid, title, content, tags_text) VALUES (9999, 'test', 'test', 'test-tag')",
+        [],
+    );
+    assert!(
+        result.is_ok(),
+        "FTS5 table must accept 3 columns (title, content, tags_text): {:?}",
+        result.err()
+    );
+
+    // Clean up
+    conn.execute(
+        "INSERT INTO learnings_fts(learnings_fts, rowid, title, content, tags_text) VALUES ('delete', 9999, 'test', 'test', 'test-tag')",
+        [],
+    ).unwrap();
+}
+
+#[test]
+fn test_migration_v8_creates_learning_tags_sync_triggers() {
+    // Verify learning_tags_ai and learning_tags_ad triggers exist after v8 migration.
+    // These keep tags_text in sync when learning_tags rows are added or removed.
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    let triggers: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'learning_tags_%'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    assert!(
+        triggers.contains(&"learning_tags_ai".to_string()),
+        "learning_tags_ai trigger must exist after v8 migration"
+    );
+    assert!(
+        triggers.contains(&"learning_tags_ad".to_string()),
+        "learning_tags_ad trigger must exist after v8 migration"
+    );
+}
+
+#[test]
+fn test_migration_v8_down_reverts_to_v7() {
+    // Verify v8 down migration specifically reverts to v7 (not further).
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 8);
+
+    migrate_down(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(version, 7, "v8 down should revert to v7");
+
+    // learning_tags sync triggers must be gone
+    let tag_triggers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'learning_tags_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tag_triggers, 0,
+        "learning_tags triggers must be removed after v8 down"
+    );
+
+    // FTS5 should still exist (restored as 2-column by down migration)
+    let fts_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='learnings_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        fts_exists,
+        "FTS5 table should still exist after v8 down (restored as 2-column)"
+    );
+}
+
+#[test]
+fn test_migration_v8_preserves_existing_title_content_search() {
+    // Invariant: existing FTS5 queries on title/content return same results after v8 migration.
+    // Pre-v8 data must not be lost when FTS5 table is rebuilt with 3 columns.
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+
+    // Apply v1–v7 (includes FTS5 setup in v3)
+    for _ in 0..7 {
+        migrate_up(&mut conn).unwrap();
+    }
+
+    // Create a learning with searchable title/content before v8
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Failure,
+        title: "SQLite locking deadlock".to_string(),
+        content: "Concurrent writers caused WAL checkpoint stall".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Verify searchable before v8
+    let count_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"deadlock\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_before, 1, "learning must be searchable before v8");
+
+    // Apply v8 migration
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 8);
+
+    // Same search must still work after v8
+    let count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"deadlock\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count_after, 1,
+        "existing title/content must remain searchable after v8 migration"
+    );
+}
+
+#[test]
+fn test_migration_v8_multiple_tags_stored_space_separated() {
+    // Edge case: learning with multiple tags has space-separated tags_text.
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Multi-tag learning".to_string(),
+        content: "Has several tags".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec![
+            "workflow-detour-phase3".to_string(),
+            "long-term".to_string(),
+            "rust-patterns".to_string(),
+        ]),
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+
+    let tags_text: String = conn
+        .query_row(
+            "SELECT tags_text FROM learnings WHERE id = ?1",
+            [result.learning_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // tags_text must contain all three tags, space-separated
+    assert!(
+        tags_text.contains("workflow-detour-phase3"),
+        "tags_text must contain first tag, got: {}",
+        tags_text
+    );
+    assert!(
+        tags_text.contains("long-term"),
+        "tags_text must contain second tag, got: {}",
+        tags_text
+    );
+    assert!(
+        tags_text.contains("rust-patterns"),
+        "tags_text must contain third tag, got: {}",
+        tags_text
+    );
+
+    // Each tag should be findable via FTS5
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"detour\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "FTS5 must find learning via token from first tag");
+
+    let count2: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"rust\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count2, 1,
+        "FTS5 must find learning via token from third tag"
+    );
+}
+
+#[test]
+fn test_migration_v8_fts5_rebuild_succeeds() {
+    // Edge case from TEST-INIT-004: FTS5 rebuild command must succeed after migration.
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Add some data first
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Rebuild test learning".to_string(),
+        content: "Testing FTS5 rebuild command".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["rebuild-test".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // FTS5 rebuild must succeed without SQLITE_CORRUPT_VTAB
+    let result = conn.execute(
+        "INSERT INTO learnings_fts(learnings_fts) VALUES('rebuild')",
+        [],
+    );
+    assert!(
+        result.is_ok(),
+        "FTS5 rebuild must succeed after v8 migration: {:?}",
+        result.err()
+    );
+
+    // Data must still be searchable after rebuild
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"rebuild\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "data must be searchable after FTS5 rebuild");
+}
