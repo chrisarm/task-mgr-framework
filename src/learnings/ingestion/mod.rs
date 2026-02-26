@@ -332,6 +332,43 @@ mod tests {
         );
     }
 
+    /// Comprehensive: multiple learnings in a single extraction batch all receive
+    /// the same task context (files and task type prefix) independently.
+    #[test]
+    fn test_enrich_multiple_params_all_get_same_task_context() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &["src/feat.rs", "src/lib.rs"]);
+
+        let params = vec![
+            make_minimal_params("First learning"),
+            make_minimal_params("Second learning"),
+            make_minimal_params("Third learning"),
+        ];
+        let enriched = enrich_extracted_params(&conn, params, Some("FEAT-003")).unwrap();
+
+        assert_eq!(enriched.len(), 3, "All 3 params should be returned");
+        for (i, p) in enriched.iter().enumerate() {
+            let files = p
+                .applies_to_files
+                .as_ref()
+                .unwrap_or_else(|| panic!("Learning {i} should have applies_to_files"));
+            assert!(
+                files.contains(&"src/feat.rs".to_string()),
+                "Learning {i} should have 'src/feat.rs', got: {:?}",
+                files
+            );
+            let types = p
+                .applies_to_task_types
+                .as_ref()
+                .unwrap_or_else(|| panic!("Learning {i} should have applies_to_task_types"));
+            assert!(
+                types.iter().any(|t| t == "FEAT-"),
+                "Learning {i} should have 'FEAT-' type, got: {:?}",
+                types
+            );
+        }
+    }
+
     /// Known-bad discriminator: enrichment must use actual task_files from DB,
     /// not any hardcoded or default values. A stub returning ["src/main.rs"]
     /// will cause this test to fail.

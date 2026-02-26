@@ -647,6 +647,118 @@ mod tests {
         );
     }
 
+    /// Error path: when task_id references a non-existent task, learn() returns
+    /// a FK constraint error. The auto-populate step itself (resolve_task_context)
+    /// succeeds with empty files, but the record_learning insert fails due to the
+    /// foreign key constraint between learnings.task_id and tasks.id.
+    #[test]
+    fn test_learn_task_not_in_db_returns_fk_error() {
+        let (_dir, conn) = setup_db();
+        // Intentionally do NOT insert the task — expect FK error from record_learning
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Non-existent task".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-999".to_string()), // not in DB
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        // FK constraint: learnings.task_id must reference tasks.id
+        let result = learn(&conn, params);
+        assert!(
+            result.is_err(),
+            "learn() should fail with FK violation when task_id not in DB"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FOREIGN KEY"),
+            "Error should mention FOREIGN KEY constraint, got: {err_msg}"
+        );
+    }
+
+    /// Comprehensive: UUID-prefixed task IDs strip the prefix when deriving
+    /// applies_to_task_types. "f424ade5-FEAT-003" → type prefix "FEAT-".
+    #[test]
+    fn test_learn_uuid_prefixed_task_id_derives_type_prefix() {
+        let (_dir, conn) = setup_db();
+        let uuid_task_id = "f424ade5-FEAT-003";
+        insert_task_with_files(&conn, uuid_task_id, &["src/feat.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "UUID-prefixed task".to_string(),
+            content: "Content".to_string(),
+            task_id: Some(uuid_task_id.to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let types_json = get_applies_to_task_types(&conn, result.learning_id)
+            .expect("applies_to_task_types should be populated");
+
+        // UUID prefix stripped → "FEAT-003" → type prefix "FEAT-"
+        assert!(
+            types_json.contains("\"FEAT-\""),
+            "Expected type prefix 'FEAT-' after stripping UUID prefix, got: {types_json}"
+        );
+        assert!(
+            !types_json.contains("f424ade5"),
+            "UUID prefix should NOT appear in stored type, got: {types_json}"
+        );
+    }
+
+    /// Boundary: empty string task_id is treated as Some(""), which auto-populate
+    /// processes (resolve_task_context returns empty files). The record_learning call
+    /// fails with FK error since "" is not a valid task id in the tasks table.
+    /// This test verifies no panic occurs — only a clean error.
+    #[test]
+    fn test_learn_empty_string_task_id_returns_fk_error() {
+        let (_dir, conn) = setup_db();
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Empty task_id".to_string(),
+            content: "Content".to_string(),
+            task_id: Some(String::new()), // empty string — not a valid task id
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        // No panic — clean error from FK constraint
+        let result = learn(&conn, params);
+        assert!(
+            result.is_err(),
+            "Empty task_id should return FK error, not panic"
+        );
+        // Error should be a FK violation, not an index-out-of-bounds or slice error
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FOREIGN KEY"),
+            "Error should be FK violation, got: {err_msg}"
+        );
+    }
+
     /// Known-bad discriminator: learn() with task_id='FEAT-003' must use the
     /// actual task_files from the DB, not any hardcoded or default value.
     /// A stub that always returns ["src/main.rs"] will cause this test to fail.
