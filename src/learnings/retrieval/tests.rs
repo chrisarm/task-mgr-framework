@@ -443,6 +443,218 @@ fn test_composite_preserves_insertion_order() {
     assert_eq!(results[2].learning.title, "Old");
 }
 
+// ========== PatternsBackend Tag-Aware Retrieval Tests (B3/FR-005) ==========
+// Tests are #[ignore] — they define expected behavior before implementation.
+// TAG_CONTEXT_MATCH_SCORE = 3 (additive, less than TYPE_MATCH_SCORE = 5).
+//
+// Tag-to-path semantic mapping (implementation will define full table):
+//   "workflow-detour*"  → matches paths containing "workflow/"
+//   "ses" / "email"     → matches paths containing "ses/"
+//   "consumer"          → matches paths containing "consumer/"
+//
+// Excluded (never trigger tag-path scoring):
+//   Source tags: "long-term", "raw"
+//   Category tags: "rust-patterns", "python-patterns", "architecture-patterns",
+//                  "database-sql", "testing-patterns", "general"
+
+/// Creates a learning with tags but no applies_to_* metadata.
+/// Used to test tag-only learnings (no file/type/error applicability).
+fn create_tagged_learning(conn: &Connection, title: &str, tags: Vec<&str>) -> i64 {
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: title.to_string(),
+        content: "Tag-aware retrieval test content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(tags.into_iter().map(str::to_string).collect()),
+        confidence: Confidence::High,
+    };
+    record_learning(conn, params).unwrap().learning_id
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_tag_context_workflow_detour_phase3_matches_workflow_path() {
+    // Happy path: semantic tag maps to workflow path → TAG_CONTEXT_MATCH_SCORE = 3
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(
+        &conn,
+        "Workflow detour pattern",
+        vec!["workflow-detour-phase3"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "tag-only learning must be found via semantic tag"
+    );
+    assert_eq!(
+        results[0].relevance_score, 3.0,
+        "TAG_CONTEXT_MATCH_SCORE must be 3"
+    );
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_excluded_source_tag_long_term_scores_zero() {
+    // Edge case: 'long-term' is a source/meta tag — must never trigger tag scoring.
+    // Even with task files present, this learning should not appear in results.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Long-term insight", vec!["long-term"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded source tag 'long-term' must not contribute tag score"
+    );
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_excluded_source_tag_raw_scores_zero() {
+    // Edge case: 'raw' is a source tag — must never trigger tag scoring.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Raw observation", vec!["raw"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/any/path.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded source tag 'raw' must not contribute tag score"
+    );
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_file_match_and_tag_match_scores_stack() {
+    // Edge case: FILE_MATCH_SCORE (10) + TAG_CONTEXT_MATCH_SCORE (3) = 13.
+    // Learning has both a matching applies_to_files glob AND a semantic tag.
+    let (_dir, conn) = setup_db();
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Stacked scoring learning".to_string(),
+        content: "File pattern + semantic tag both match".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["**/workflow/**".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["workflow-detour-phase3".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].relevance_score, 13.0,
+        "FILE_MATCH_SCORE (10) + TAG_CONTEXT_MATCH_SCORE (3) must stack to 13"
+    );
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_excluded_category_tag_rust_patterns_scores_zero() {
+    // Edge case: 'rust-patterns' is a category tag — must never trigger tag scoring.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Rust error handling pattern", vec!["rust-patterns"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["service/src/agent/workflow/engine.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "excluded category tag 'rust-patterns' must not contribute tag score"
+    );
+}
+
+#[test]
+#[ignore = "pending tag-to-path implementation (B3/FR-005)"]
+fn test_tag_workflow_detour_does_not_match_tools_path() {
+    // Known-bad discriminator: 'workflow-detour' maps to workflow/ paths, not tools/.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(&conn, "Workflow detour note", vec!["workflow-detour"]);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        // tools/ path — NOT under workflow/, so tag should not match
+        task_files: vec!["service/src/tools/some_tool.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "tag 'workflow-detour' must not match service/src/tools/ (wrong path)"
+    );
+}
+
+#[test]
+fn test_no_tag_context_match_without_task_files() {
+    // Invariant: PatternsBackend returns empty when task context is absent.
+    // Tag scoring must not fire without task_files — matches existing early-exit.
+    let (_dir, conn) = setup_db();
+    create_tagged_learning(
+        &conn,
+        "Tagged no-context learning",
+        vec!["workflow-detour-phase3"],
+    );
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        // No task_files, no task_prefix, no task_error
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "PatternsBackend must return empty when no task context is present"
+    );
+}
+
 // ========== Utility Tests (moved from recall/tests.rs) ==========
 
 #[test]
