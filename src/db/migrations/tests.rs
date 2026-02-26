@@ -548,7 +548,6 @@ fn test_migration_v8_schema_version_is_8() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_adds_tags_text_column() {
     let (_temp_dir, mut conn) = setup_db();
 
@@ -568,7 +567,6 @@ fn test_migration_v8_adds_tags_text_column() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_populates_tags_text_from_existing_tags() {
     // Happy path: tags_text column populated from existing learning_tags (migration path v7→v8)
     use crate::learnings::crud::{record_learning, RecordLearningParams};
@@ -623,7 +621,6 @@ fn test_migration_v8_populates_tags_text_from_existing_tags() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_learning_with_no_tags_has_empty_tags_text() {
     // Edge case: learning with no tags has empty tags_text (not NULL, not garbage)
     use crate::learnings::crud::{record_learning, RecordLearningParams};
@@ -670,7 +667,6 @@ fn test_migration_v8_learning_with_no_tags_has_empty_tags_text() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_fts5_searches_tags_text() {
     // Happy path: after migration, FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
     // FTS5 ascii tokenizer splits on '-': 'chrono-date-handling' → tokens 'chrono', 'date', 'handling'
@@ -712,7 +708,6 @@ fn test_migration_v8_fts5_searches_tags_text() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_tag_add_updates_tags_text_and_fts5() {
     // Edge case: inserting a new row into learning_tags triggers tags_text update
     use crate::learnings::crud::{
@@ -768,7 +763,6 @@ fn test_migration_v8_tag_add_updates_tags_text_and_fts5() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_tag_remove_updates_tags_text_and_fts5() {
     // Edge case: deleting a row from learning_tags triggers tags_text update
     use crate::learnings::crud::{
@@ -824,7 +818,6 @@ fn test_migration_v8_tag_remove_updates_tags_text_and_fts5() {
 }
 
 #[test]
-#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
 fn test_migration_v8_workflow_tag_found_when_title_content_lack_keyword() {
     // Known-bad discriminator: FTS5 search for 'workflow' returns tag-matched result
     // even when title and content don't contain the word 'workflow'
