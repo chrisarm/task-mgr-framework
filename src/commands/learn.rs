@@ -144,6 +144,42 @@ mod tests {
         (temp_dir, conn)
     }
 
+    /// Inserts a task and associates file paths with it in task_files.
+    fn insert_task_with_files(conn: &Connection, task_id: &str, files: &[&str]) {
+        conn.execute(
+            "INSERT INTO tasks (id, title) VALUES (?1, 'Test Task')",
+            [task_id],
+        )
+        .unwrap();
+        for file in files {
+            conn.execute(
+                "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
+                rusqlite::params![task_id, file],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Reads applies_to_files (raw JSON text) for a learning from the DB.
+    fn get_applies_to_files(conn: &Connection, learning_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT applies_to_files FROM learnings WHERE id = ?1",
+            [learning_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Reads applies_to_task_types (raw JSON text) for a learning from the DB.
+    fn get_applies_to_task_types(conn: &Connection, learning_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT applies_to_task_types FROM learnings WHERE id = ?1",
+            [learning_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_learn_minimal() {
         let (_temp_dir, conn) = setup_db();
@@ -322,5 +358,326 @@ mod tests {
             Confidence::Medium
         );
         assert_eq!(cli_confidence_to_model(CliConfidence::Low), Confidence::Low);
+    }
+
+    // ─── TDD: Auto-populate tests (FEAT-002) ─────────────────────────────────
+    // All tests below are #[ignore] until FEAT-002 implements auto-populate.
+    // They define expected behavior: when task_id is provided without explicit
+    // --files/--task-types, learn() should auto-fill from task context.
+
+    /// Active regression test: without task_id, no auto-populate occurs.
+    /// Verifies current behavior is preserved after FEAT-002 implementation.
+    #[test]
+    fn test_learn_without_task_id_does_not_auto_populate() {
+        let (_dir, conn) = setup_db();
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "No auto-populate".to_string(),
+            content: "Content".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+
+        assert!(
+            get_applies_to_files(&conn, result.learning_id).is_none(),
+            "applies_to_files should be NULL when no task_id provided"
+        );
+        assert!(
+            get_applies_to_task_types(&conn, result.learning_id).is_none(),
+            "applies_to_task_types should be NULL when no task_id provided"
+        );
+    }
+
+    /// Happy path: learn() with task_id auto-populates applies_to_files
+    /// from the task's associated files in the task_files table.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_auto_populates_files_from_task_files() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &["src/commands/learn.rs", "src/lib.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Auto-populate files".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None, // no explicit --files
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let files_json = get_applies_to_files(&conn, result.learning_id);
+
+        assert!(
+            files_json.is_some(),
+            "applies_to_files should be populated when task_id is provided"
+        );
+        let files_json = files_json.unwrap();
+        assert!(
+            files_json.contains("src/commands/learn.rs"),
+            "Expected task file 'src/commands/learn.rs' in applies_to_files, got: {files_json}"
+        );
+        assert!(
+            files_json.contains("src/lib.rs"),
+            "Expected task file 'src/lib.rs' in applies_to_files, got: {files_json}"
+        );
+    }
+
+    /// Happy path: learn() with task_id auto-populates applies_to_task_types
+    /// with the type prefix extracted from the task ID (e.g., "FEAT-" from "FEAT-003").
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_auto_populates_task_types_from_prefix() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &[]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Auto-populate task types".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None, // no explicit --task-types
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let types_json = get_applies_to_task_types(&conn, result.learning_id);
+
+        assert!(
+            types_json.is_some(),
+            "applies_to_task_types should be populated when task_id is provided"
+        );
+        // The stored value should contain "FEAT-" as a type prefix, not the full task ID "FEAT-003".
+        // This ensures future FEAT-xxx tasks will match via starts_with() scoring.
+        let types_json = types_json.unwrap();
+        assert!(
+            types_json.contains("\"FEAT-\""),
+            "Expected type prefix 'FEAT-' in applies_to_task_types, got: {types_json}"
+        );
+    }
+
+    /// Edge case: explicit --files flag overrides auto-population from task context.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_explicit_files_override_auto_populate() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &["src/other.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Explicit files override".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: Some(vec!["src/explicit.rs".to_string()]),
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let files_json = get_applies_to_files(&conn, result.learning_id)
+            .expect("applies_to_files should be set");
+
+        assert!(
+            files_json.contains("src/explicit.rs"),
+            "Explicit file should be stored, got: {files_json}"
+        );
+        assert!(
+            !files_json.contains("src/other.rs"),
+            "Task file should NOT override explicit files, got: {files_json}"
+        );
+    }
+
+    /// Edge case: explicit --task-types flag overrides auto-population from task prefix.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_explicit_task_types_override_auto_populate() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &[]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Explicit task types override".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let types_json = get_applies_to_task_types(&conn, result.learning_id)
+            .expect("applies_to_task_types should be set");
+
+        assert!(
+            types_json.contains("\"US-\""),
+            "Explicit type 'US-' should be stored, got: {types_json}"
+        );
+        assert!(
+            types_json.contains("\"FIX-\""),
+            "Explicit type 'FIX-' should be stored, got: {types_json}"
+        );
+        assert!(
+            !types_json.contains("FEAT-"),
+            "Auto-derived 'FEAT-' should NOT appear when types are explicit, got: {types_json}"
+        );
+    }
+
+    /// Edge case: task with no task_files skips file auto-populate,
+    /// but still auto-populates task type prefix.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_no_task_files_still_populates_task_type() {
+        let (_dir, conn) = setup_db();
+        // Task exists but has no associated files
+        conn.execute(
+            "INSERT INTO tasks (id, title) VALUES ('FEAT-003', 'Task with no files')",
+            [],
+        )
+        .unwrap();
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "No task files".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+
+        assert!(
+            get_applies_to_files(&conn, result.learning_id).is_none(),
+            "applies_to_files should be NULL when task has no associated files"
+        );
+        let types_json = get_applies_to_task_types(&conn, result.learning_id);
+        assert!(
+            types_json.is_some(),
+            "applies_to_task_types should still be populated even with no task files"
+        );
+        assert!(
+            types_json.unwrap().contains("\"FEAT-\""),
+            "Type prefix 'FEAT-' should be derived from task ID even when no files exist"
+        );
+    }
+
+    /// Edge case: empty files vec Some([]) is treated the same as None —
+    /// auto-populate still runs, and NULL is stored rather than an empty JSON array.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_empty_files_vec_treated_as_null_for_auto_populate() {
+        let (_dir, conn) = setup_db();
+        insert_task_with_files(&conn, "FEAT-003", &["src/feat.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Empty files vec".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: Some(vec![]), // empty — treated same as None
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let files_json = get_applies_to_files(&conn, result.learning_id);
+
+        // Auto-populate should have run (treating [] as not-explicitly-set),
+        // so we get the task's actual files, not an empty array.
+        assert!(
+            files_json.is_some(),
+            "Auto-populate should run when files=Some([]) (treated as None)"
+        );
+        let files_json = files_json.unwrap();
+        assert!(
+            files_json.contains("src/feat.rs"),
+            "Task file 'src/feat.rs' should be auto-populated, got: {files_json}"
+        );
+        assert!(
+            files_json != "[]",
+            "Empty JSON array should not be stored; auto-populate should have filled it"
+        );
+    }
+
+    /// Known-bad discriminator: learn() with task_id='FEAT-003' must use the
+    /// actual task_files from the DB, not any hardcoded or default value.
+    /// A stub that always returns ["src/main.rs"] will cause this test to fail.
+    #[test]
+    #[ignore = "TDD: expected to fail until FEAT-002 implements auto-populate"]
+    fn test_learn_discriminator_uses_actual_db_files_not_hardcoded() {
+        let (_dir, conn) = setup_db();
+        // Use a file that is distinctly NOT "src/main.rs"
+        insert_task_with_files(&conn, "FEAT-003", &["src/commands/feat003_unique_file.rs"]);
+
+        let params = LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: "Discriminator test".to_string(),
+            content: "Content".to_string(),
+            task_id: Some("FEAT-003".to_string()),
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+        };
+
+        let result = learn(&conn, params).unwrap();
+        let files_json = get_applies_to_files(&conn, result.learning_id)
+            .expect("applies_to_files should be populated for task with files");
+
+        assert!(
+            files_json.contains("src/commands/feat003_unique_file.rs"),
+            "Should contain FEAT-003's actual file from DB, got: {files_json}"
+        );
+        assert!(
+            !files_json.contains("src/main.rs"),
+            "Should NOT contain hardcoded 'src/main.rs'; implementation must query the DB, got: {files_json}"
+        );
     }
 }
