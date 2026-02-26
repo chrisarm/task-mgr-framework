@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
-use crate::learnings::retrieval::patterns::resolve_task_context;
+use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::learnings::{record_learning, RecordLearningParams, RecordLearningResult};
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
@@ -153,20 +153,6 @@ pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResul
 
     let result = record_learning(conn, record_params)?;
     Ok(LearnResult::from(result))
-}
-
-/// Extracts the task type prefix from a task prefix string.
-///
-/// Returns everything up to and including the first `-`. This allows learnings
-/// to match all tasks of the same type via `starts_with()` scoring.
-///
-/// E.g., `"FEAT-003"` → `"FEAT-"`, `"US-001"` → `"US-"`.
-fn type_prefix_from(task_prefix: &str) -> String {
-    if let Some(pos) = task_prefix.find('-') {
-        task_prefix[..=pos].to_string()
-    } else {
-        task_prefix.to_string()
-    }
 }
 
 /// Formats the learn result for text output.

@@ -15,7 +15,7 @@ pub mod extraction;
 use rusqlite::Connection;
 
 use crate::learnings::crud::{record_learning, RecordLearningParams};
-use crate::learnings::retrieval::patterns::resolve_task_context;
+use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
 use crate::models::LearningOutcome;
 use crate::TaskMgrResult;
@@ -182,20 +182,6 @@ pub(crate) fn enrich_extracted_params(
         .collect();
 
     Ok(enriched)
-}
-
-/// Extracts the task type prefix from a task prefix string.
-///
-/// Returns everything up to and including the first `-`. Mirrors the same
-/// helper in `commands/learn.rs`.
-///
-/// E.g., `"FEAT-003"` → `"FEAT-"`, `"US-001"` → `"US-"`.
-fn type_prefix_from(task_prefix: &str) -> String {
-    if let Some(pos) = task_prefix.find('-') {
-        task_prefix[..=pos].to_string()
-    } else {
-        task_prefix.to_string()
-    }
 }
 
 /// Checks whether a learning with the same outcome and title already exists.

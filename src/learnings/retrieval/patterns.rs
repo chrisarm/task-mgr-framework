@@ -59,8 +59,8 @@ impl RetrievalBackend for PatternsBackend {
 
         // Batch-load tags when a tags filter is present OR task_files is non-empty
         // (single query vs. O(N); tag scoring requires task_files to be set)
-        let needs_tags = query.tags.as_ref().is_some_and(|t| !t.is_empty())
-            || !query.task_files.is_empty();
+        let needs_tags =
+            query.tags.as_ref().is_some_and(|t| !t.is_empty()) || !query.task_files.is_empty();
         let tags_map = if needs_tags {
             let ids: Vec<i64> = candidates.iter().filter_map(|l| l.id).collect();
             batch_get_learning_tags(conn, &ids)?
@@ -238,6 +238,20 @@ fn strip_uuid_prefix(task_id: &str) -> &str {
 /// E.g., `"f424ade5-PA-FEAT-003"` → `"PA-FEAT-003"`, `"US-001"` → `"US-001"`.
 pub(crate) fn extract_task_prefix(task_id: &str) -> String {
     strip_uuid_prefix(task_id).to_string()
+}
+
+/// Extracts the task type prefix from a task prefix string.
+///
+/// Returns everything up to and including the first `-`. This allows learnings
+/// to match all tasks of the same type via `starts_with()` scoring.
+///
+/// E.g., `"FEAT-003"` → `"FEAT-"`, `"US-001"` → `"US-"`.
+pub(crate) fn type_prefix_from(task_prefix: &str) -> String {
+    if let Some(pos) = task_prefix.find('-') {
+        task_prefix[..=pos].to_string()
+    } else {
+        task_prefix.to_string()
+    }
 }
 
 /// Loads learnings that have applicability metadata.
