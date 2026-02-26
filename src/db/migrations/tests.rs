@@ -317,6 +317,8 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
+    // Migrate down from version 8 to version 7 (reverts FTS5 tag indexing stub)
+    migrate_down(&mut conn).unwrap();
     // Migrate down from version 7 to version 6 (reverts model selection fields)
     migrate_down(&mut conn).unwrap();
     // Migrate down from version 6 to version 5 (reverts prd_files)
@@ -407,7 +409,10 @@ fn test_migration_v7_adds_default_model_to_prd_metadata() {
 fn test_migration_v7_schema_version_is_7() {
     let (_temp_dir, mut conn) = setup_db();
 
-    run_migrations(&mut conn).unwrap();
+    // Apply exactly 7 migrations (v1–v7), not all (would include v8+)
+    for _ in 0..7 {
+        migrate_up(&mut conn).unwrap();
+    }
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(version, 7);
@@ -454,7 +459,10 @@ fn test_migration_v7_new_columns_default_to_null() {
 fn test_migration_v7_down_reverts_to_v6() {
     let (_temp_dir, mut conn) = setup_db();
 
-    run_migrations(&mut conn).unwrap();
+    // Apply exactly 7 migrations (v1–v7), not all (would include v8+)
+    for _ in 0..7 {
+        migrate_up(&mut conn).unwrap();
+    }
     assert_eq!(get_schema_version(&conn).unwrap(), 7);
 
     // Migrate down from v7
@@ -516,4 +524,361 @@ fn test_migration_v7_default_model_writable_on_prd_metadata() {
         .unwrap();
 
     assert_eq!(default_model, Some("claude-haiku-4-5-20251001".to_string()));
+}
+
+// ========== Migration v8 Tests (FTS5 Tag Indexing) ==========
+//
+// All behavior tests are #[ignore] — they define the implementation contract
+// for FEAT task B4/FR-007. The active test verifies the stub registers correctly.
+//
+// Key FTS5 tokenization note: the default `ascii` tokenizer splits on `-`,
+// so tag `chrono-date-handling` becomes FTS5 tokens `chrono`, `date`, `handling`.
+
+#[test]
+fn test_migration_v8_schema_version_is_8() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(
+        version, 8,
+        "schema_version should be 8 after all migrations"
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_adds_tags_text_column() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    run_migrations(&mut conn).unwrap();
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('learnings') WHERE name = 'tags_text'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        exists,
+        "learnings.tags_text column must exist after v8 migration"
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_populates_tags_text_from_existing_tags() {
+    // Happy path: tags_text column populated from existing learning_tags (migration path v7→v8)
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+
+    // Apply migrations v1 through v7 only
+    for _ in 0..7 {
+        migrate_up(&mut conn).unwrap();
+    }
+    assert_eq!(get_schema_version(&conn).unwrap(), 7);
+
+    // Create a learning with tag 'chrono-date-handling' BEFORE v8 migration
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Date parsing behavior".to_string(),
+        content: "Time handling requires careful consideration".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["chrono-date-handling".to_string()]),
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+
+    // Now apply v8
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 8);
+
+    // tags_text must be populated from the existing learning_tags row
+    let tags_text: Option<String> = conn
+        .query_row(
+            "SELECT tags_text FROM learnings WHERE id = ?1",
+            [result.learning_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        tags_text.is_some(),
+        "tags_text must be populated after v8 migration for learning with tags"
+    );
+    assert!(
+        tags_text.unwrap().contains("chrono"),
+        "tags_text must contain 'chrono' derived from tag 'chrono-date-handling'"
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_learning_with_no_tags_has_empty_tags_text() {
+    // Edge case: learning with no tags has empty tags_text (not NULL, not garbage)
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+
+    for _ in 0..7 {
+        migrate_up(&mut conn).unwrap();
+    }
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "No tags learning".to_string(),
+        content: "Content without tags".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 8);
+
+    let tags_text: Option<String> = conn
+        .query_row(
+            "SELECT tags_text FROM learnings WHERE id = ?1",
+            [result.learning_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        tags_text.as_deref().unwrap_or("").is_empty(),
+        "learning with no tags must have empty tags_text after v8 migration, got: {:?}",
+        tags_text
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_fts5_searches_tags_text() {
+    // Happy path: after migration, FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
+    // FTS5 ascii tokenizer splits on '-': 'chrono-date-handling' → tokens 'chrono', 'date', 'handling'
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Title and content do NOT contain 'chrono' — match must come from tags_text only
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Temporal handling note".to_string(),
+        content: "Time zone offsets behave unexpectedly".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["chrono-date-handling".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"chrono\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        count, 1,
+        "FTS5 search for 'chrono' must find learning tagged 'chrono-date-handling' via tags_text"
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_tag_add_updates_tags_text_and_fts5() {
+    // Edge case: inserting a new row into learning_tags triggers tags_text update
+    use crate::learnings::crud::{
+        edit_learning, record_learning, EditLearningParams, RecordLearningParams,
+    };
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Create a learning with NO tags initially
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Process note".to_string(),
+        content: "General observation".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+
+    // Add a tag containing 'workflow'
+    edit_learning(
+        &conn,
+        result.learning_id,
+        EditLearningParams {
+            add_tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // tags_text must now reflect the new tag
+    let tags_text: Option<String> = conn
+        .query_row(
+            "SELECT tags_text FROM learnings WHERE id = ?1",
+            [result.learning_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        tags_text.as_deref().unwrap_or("").contains("workflow"),
+        "tags_text must contain 'workflow' after adding tag 'pto-workflow-ux-fixes-v2', got: {:?}",
+        tags_text
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_tag_remove_updates_tags_text_and_fts5() {
+    // Edge case: deleting a row from learning_tags triggers tags_text update
+    use crate::learnings::crud::{
+        edit_learning, record_learning, EditLearningParams, RecordLearningParams,
+    };
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Create a learning WITH a tag
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Chrono feature note".to_string(),
+        content: "Date handling observation".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["chrono-date-handling".to_string()]),
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+
+    // Remove the tag
+    edit_learning(
+        &conn,
+        result.learning_id,
+        EditLearningParams {
+            remove_tags: Some(vec!["chrono-date-handling".to_string()]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // tags_text must now be empty (no remaining tags)
+    let tags_text: Option<String> = conn
+        .query_row(
+            "SELECT tags_text FROM learnings WHERE id = ?1",
+            [result.learning_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(
+        tags_text.as_deref().unwrap_or("").is_empty(),
+        "tags_text must be empty after removing all tags, got: {:?}",
+        tags_text
+    );
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_migration_v8_workflow_tag_found_when_title_content_lack_keyword() {
+    // Known-bad discriminator: FTS5 search for 'workflow' returns tag-matched result
+    // even when title and content don't contain the word 'workflow'
+    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    // Title and content are deliberate non-matches for 'workflow'
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Sprint deviation note".to_string(),
+        content: "Detour taken during planning session".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Control: unrelated learning with no 'workflow' anywhere
+    let control = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Unrelated observation".to_string(),
+        content: "Nothing to do with the keyword".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    record_learning(&conn, control).unwrap();
+
+    // FTS5 search for 'workflow' must find exactly the tagged learning, not the control
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"workflow\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        count, 1,
+        "FTS5 search for 'workflow' must find exactly the learning tagged 'pto-workflow-ux-fixes-v2'"
+    );
 }

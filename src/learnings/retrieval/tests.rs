@@ -730,3 +730,138 @@ fn test_is_fts5_available_after_migration() {
     let (_temp_dir, conn) = setup_db_with_fts5();
     assert!(is_fts5_available(&conn));
 }
+
+// ========== FTS5 Tag Search Tests (v8/B4/FR-007) ==========
+//
+// These tests are #[ignore] — they define the contract for the FTS5 tag indexing
+// implementation in migration v8. They verify that the Fts5Backend can find
+// learnings by tag content after the v8 migration.
+//
+// FTS5 tokenization: the ascii tokenizer splits on '-', so tag
+// `chrono-date-handling` yields tokens `chrono`, `date`, `handling`.
+// Searching for `chrono` or `workflow` matches via tags_text column.
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_fts5_backend_searches_by_tag() {
+    // Happy path: FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
+    // even when title and content don't contain 'chrono'
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Temporal handling note".to_string(),
+        content: "Time zone offsets behave unexpectedly".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["chrono-date-handling".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("chrono".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert_eq!(
+        results.len(),
+        1,
+        "Fts5Backend must find learning tagged 'chrono-date-handling' when searching 'chrono'"
+    );
+    assert_eq!(results[0].learning.title, "Temporal handling note");
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_fts5_backend_tag_search_hyphenated_token_workflow() {
+    // Happy path: FTS5 tokenizes 'pto-workflow-ux-fixes-v2' → tokens include 'workflow'.
+    // Searching 'workflow' returns this learning even though title/content lack the word.
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Sprint deviation note".to_string(),
+        content: "Detour taken during planning session".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["pto-workflow-ux-fixes-v2".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // Control: unrelated learning with no 'workflow' anywhere
+    create_test_learning(
+        &conn,
+        "Unrelated observation",
+        "Something completely different",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("workflow".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    // Known-bad discriminator: exactly 1 result (the tagged one), not the control
+    assert_eq!(
+        results.len(),
+        1,
+        "FTS5 must return exactly the learning tagged 'pto-workflow-ux-fixes-v2', not the control"
+    );
+    assert_eq!(results[0].learning.title, "Sprint deviation note");
+}
+
+#[test]
+#[ignore = "pending v8 FTS5 tag indexing implementation (B4/FR-007)"]
+fn test_fts5_backend_tag_search_no_false_positives() {
+    // Discriminator: searching a rare token that only appears in tags must not
+    // return learnings whose tags don't contain it.
+    let (_dir, conn) = setup_db_with_fts5();
+
+    // Learning tagged with something unrelated to 'chrono'
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Database note".to_string(),
+        content: "SQLite connection pooling".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: Some(vec!["database-sql".to_string()]),
+        confidence: crate::models::Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("chrono".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "FTS5 must not return a learning tagged 'database-sql' when searching 'chrono'"
+    );
+}
