@@ -15,6 +15,7 @@ pub mod extraction;
 use rusqlite::Connection;
 
 use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::retrieval::patterns::resolve_task_context;
 use crate::loop_engine::claude;
 use crate::models::LearningOutcome;
 use crate::TaskMgrResult;
@@ -101,6 +102,12 @@ pub fn extract_learnings_from_output(
         }
     };
 
+    // Enrich with task context (best-effort: unenriched params used on error)
+    let params_list = enrich_extracted_params(conn, params_list, task_id).unwrap_or_else(|e| {
+        eprintln!("Warning: learning enrichment failed: {}", e);
+        Vec::new()
+    });
+
     // Record each extracted learning, skipping duplicates
     let mut learning_ids = Vec::new();
     for params in params_list {
@@ -132,17 +139,63 @@ pub fn extract_learnings_from_output(
 ///
 /// LLM-provided values are preserved (not overwritten).
 /// If `task_id` is `None`, params are returned unchanged without error.
-///
-/// TODO(B2/FR-004): Implement this enrichment step and call it inside
-/// `extract_learnings_from_output()` after `parse_extraction_response()`.
-#[allow(dead_code)] // Stub — wired up in B2/FR-004 implementation
 pub(crate) fn enrich_extracted_params(
-    _conn: &Connection,
+    conn: &Connection,
     params: Vec<RecordLearningParams>,
-    _task_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> TaskMgrResult<Vec<RecordLearningParams>> {
-    // Stub: returns params unchanged. Full implementation in B2/FR-004.
-    Ok(params)
+    let task_id = match task_id {
+        Some(id) => id,
+        None => return Ok(params),
+    };
+
+    // Resolve task context once, shared across all extracted learnings.
+    // Graceful degradation: if context lookup fails, return params unchanged.
+    let (task_files, task_prefix, _task_error) = match resolve_task_context(conn, task_id) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!(
+                "Warning: task context lookup failed during enrichment: {}",
+                e
+            );
+            return Ok(params);
+        }
+    };
+
+    let type_prefix = task_prefix.as_deref().map(type_prefix_from);
+
+    let enriched = params
+        .into_iter()
+        .map(|mut p| {
+            // Preserve LLM-provided applies_to_files; fill from task context only when absent.
+            if p.applies_to_files.is_none() && !task_files.is_empty() {
+                p.applies_to_files = Some(task_files.clone());
+            }
+            // Preserve LLM-provided applies_to_task_types; derive from task prefix only when absent.
+            if p.applies_to_task_types.is_none() {
+                if let Some(ref prefix) = type_prefix {
+                    p.applies_to_task_types = Some(vec![prefix.clone()]);
+                }
+            }
+            p
+        })
+        .collect();
+
+    Ok(enriched)
+}
+
+/// Extracts the task type prefix from a task prefix string.
+///
+/// Returns everything up to and including the first `-`. Mirrors the same
+/// helper in `commands/learn.rs`.
+///
+/// E.g., `"FEAT-003"` → `"FEAT-"`, `"US-001"` → `"US-"`.
+fn type_prefix_from(task_prefix: &str) -> String {
+    if let Some(pos) = task_prefix.find('-') {
+        task_prefix[..=pos].to_string()
+    } else {
+        task_prefix.to_string()
+    }
 }
 
 /// Checks whether a learning with the same outcome and title already exists.
@@ -239,7 +292,6 @@ mod tests {
 
     /// Happy path: extracted learning with no files gets task_files from context.
     #[test]
-    #[ignore = "B2/FR-004: enrich_extracted_params enrichment not yet implemented"]
     fn test_enrich_populates_files_from_task_context() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(
@@ -270,7 +322,6 @@ mod tests {
 
     /// Happy path: extracted learning with no task_types gets type prefix from task_id.
     #[test]
-    #[ignore = "B2/FR-004: enrich_extracted_params enrichment not yet implemented"]
     fn test_enrich_populates_task_types_from_task_prefix() {
         let (_dir, conn) = setup_db();
         insert_task_with_files(&conn, "FEAT-003", &[]);
@@ -298,7 +349,6 @@ mod tests {
 
     /// Edge case: LLM-provided applies_to_files are preserved (not overwritten by task context).
     #[test]
-    #[ignore = "B2/FR-004: enrich_extracted_params enrichment not yet implemented"]
     fn test_enrich_preserves_llm_provided_applies_to_files() {
         let (_dir, conn) = setup_db();
         // Task has different files from LLM-provided ones
@@ -330,7 +380,6 @@ mod tests {
     /// not any hardcoded or default values. A stub returning ["src/main.rs"]
     /// will cause this test to fail.
     #[test]
-    #[ignore = "B2/FR-004: enrich_extracted_params enrichment not yet implemented"]
     fn test_enrich_discriminator_uses_actual_db_files_not_hardcoded() {
         let (_dir, conn) = setup_db();
         // Use a file name that is distinctly NOT a common default like "src/main.rs"
