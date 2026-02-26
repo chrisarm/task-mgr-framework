@@ -259,7 +259,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": true,
       "notes": "This task runs in external-ref repo, NOT task-mgr. The SQLite DB is at .task-mgr/tasks.db. Use sqlite3 CLI to run. Tag-to-prefix mapping: workflow-*/pto-*/ses-*/embedding-*/terminal-* \u2192 FEAT-; failure/workaround outcomes additionally get FIX-. Also derive from long-term sub-category tags: rust-patterns \u2192 FEAT-, FIX-; testing-patterns \u2192 all types. Error patterns must be high-specificity: SQLITE_BUSY, panicked at, char boundary, unwrap(), timeout, connection refused, serde_json, 404, rate limit, TLS \u2014 NOT generic words like 'error' or 'failed'.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -419,7 +419,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "This task runs in external-ref repo, NOT task-mgr. Modify tasks/parse_learnings.py. The make_learning() function needs an applies_to_task_types parameter. The parser already extracts tags from branch names \u2014 extend to derive task type prefixes. Also add category-to-type mapping for long-term learnings.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -606,7 +606,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Use rust-code-reviewer agent if available. For each issue: 1) Add CODE-FIX-xxx or WIRE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. Mark passes:true once review complete and all tasks added.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "synergyWith": [],
       "title": "Review implementation for quality, security, and integration wiring",
@@ -652,56 +652,56 @@
       ]
     },
     {
-      "id": "REFACTOR-1-001",
-      "title": "Extract shared type_prefix_from() to eliminate DRY violation",
-      "description": "type_prefix_from() is duplicated identically in commands/learn.rs:164-170 and learnings/ingestion/mod.rs:193-199. Extract to a pub(crate) function in learnings/retrieval/patterns.rs (which already houses related extract_task_prefix()) and update both callers.",
-      "priority": 18,
-      "passes": false,
-      "estimatedEffort": "low",
-      "modifiesBehavior": false,
-      "dependsOn": [],
-      "synergyWith": [],
-      "batchWith": [
-        "REFACTOR-1-002"
-      ],
-      "conflictsWith": [],
-      "touchesFiles": [
-        "src/commands/learn.rs",
-        "src/learnings/ingestion/mod.rs",
-        "src/learnings/retrieval/patterns.rs"
-      ],
       "acceptanceCriteria": [
         "type_prefix_from() exists in exactly one location (patterns.rs) as pub(crate)",
         "learn.rs and ingestion/mod.rs import and call the shared function",
         "All existing tests pass unchanged",
         "No dead code warnings"
       ],
-      "notes": "Low risk: pure function, no behavior change, existing tests cover both call sites."
+      "batchWith": [
+        "REFACTOR-1-002"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "type_prefix_from() is duplicated identically in commands/learn.rs:164-170 and learnings/ingestion/mod.rs:193-199. Extract to a pub(crate) function in learnings/retrieval/patterns.rs (which already houses related extract_task_prefix()) and update both callers.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-001",
+      "modifiesBehavior": false,
+      "notes": "Low risk: pure function, no behavior change, existing tests cover both call sites.",
+      "passes": true,
+      "priority": 18,
+      "synergyWith": [],
+      "title": "Extract shared type_prefix_from() to eliminate DRY violation",
+      "touchesFiles": [
+        "src/commands/learn.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/learnings/retrieval/patterns.rs"
+      ]
     },
     {
-      "id": "REFACTOR-1-002",
-      "title": "Extract scoring helpers from PatternsBackend::retrieve()",
-      "description": "PatternsBackend::retrieve() is ~123 lines \u2014 well over the 30-line guideline. Extract the four scoring sections (file match, type match, error match, tag context match) into individual helper methods on PatternsBackend or as free functions. This improves testability and readability.",
-      "priority": 19,
-      "passes": false,
-      "estimatedEffort": "medium",
-      "modifiesBehavior": false,
-      "dependsOn": [],
-      "synergyWith": [
-        "REFACTOR-1-001"
-      ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "touchesFiles": [
-        "src/learnings/retrieval/patterns.rs"
-      ],
       "acceptanceCriteria": [
         "retrieve() body is under 50 lines (delegates to scoring helpers)",
         "Each scoring helper is a standalone function under 30 lines",
         "All existing retrieval tests pass unchanged",
         "No dead code warnings"
       ],
-      "notes": "The four scoring sections are: file_pattern_score(), type_prefix_score(), error_pattern_score(), tag_context_score(). Each takes a learning + relevant query fields and returns (score_delta, optional_reason)."
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "PatternsBackend::retrieve() is ~123 lines \u2014 well over the 30-line guideline. Extract the four scoring sections (file match, type match, error match, tag context match) into individual helper methods on PatternsBackend or as free functions. This improves testability and readability.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-1-002",
+      "modifiesBehavior": false,
+      "notes": "The four scoring sections are: file_pattern_score(), type_prefix_score(), error_pattern_score(), tag_context_score(). Each takes a learning + relevant query fields and returns (score_delta, optional_reason).",
+      "passes": true,
+      "priority": 19,
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
+      "title": "Extract scoring helpers from PatternsBackend::retrieve()",
+      "touchesFiles": [
+        "src/learnings/retrieval/patterns.rs"
+      ]
     },
     {
       "acceptanceCriteria": [
@@ -738,7 +738,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in. Gate before comprehensive testing phase.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -765,7 +765,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Comprehensive tests extending TEST-INIT-001 and TEST-INIT-002. Focus on error paths and unusual task ID formats. Use #[rstest] for parameterized tests across different task ID formats.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "synergyWith": [
         "TEST-002"
@@ -796,7 +796,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "Test all branches of the tag-to-path mapping. Verify scoring math is correct when combined with file + type + error + tag. Use #[rstest] for parameterized tests across all 5 mappings.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "synergyWith": [
         "TEST-001"
@@ -828,7 +828,7 @@
       "id": "TEST-003",
       "modifiesBehavior": false,
       "notes": "Test both migration path and fresh creation path. Verify triggers fire correctly on tag add/remove. Test FTS5 search quality with tag content. Hyphens tokenize in FTS5 so 'workflow-detour' becomes 'workflow' and 'detour'.",
-      "passes": false,
+      "passes": true,
       "priority": 30,
       "synergyWith": [],
       "title": "Comprehensive tests for FTS5 tag indexing migration",
@@ -946,7 +946,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "Write in tests/learnings.rs integration test file. Use setup_db_with_fts5() to ensure migrations run. Test the full learn\u2192recall pipeline with enrichment.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration test: end-to-end recall with enriched learnings",
