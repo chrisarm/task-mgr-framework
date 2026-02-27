@@ -186,16 +186,33 @@ pub fn init(
     // Run pending migrations (e.g. v4 adds external_git_repo column)
     crate::db::run_migrations(&mut conn)?;
 
+    // Pre-read the first JSON file to extract the task prefix for scoped force-delete.
+    // This is done before the main parsing loop so the prefix is available when
+    // drop_existing_data / get_delete_preview are called.
+    let force_prefix: Option<String> = if force {
+        json_files
+            .first()
+            .and_then(|p| std::fs::read_to_string(p.as_ref()).ok())
+            .and_then(|c| serde_json::from_str::<PrdFile>(&c).ok())
+            .and_then(|prd| match &prefix_mode {
+                PrefixMode::Disabled => None,
+                PrefixMode::Explicit(p) => Some(p.clone()),
+                PrefixMode::Auto => prd.task_prefix,
+            })
+    } else {
+        None
+    };
+
     // For dry-run with force, collect what would be deleted
     let would_delete = if dry_run && force {
-        Some(get_delete_preview(&conn)?)
+        Some(get_delete_preview(&conn, force_prefix.as_deref())?)
     } else {
         None
     };
 
     // Handle force flag - drop existing data (skip in dry-run mode)
     if force && !dry_run {
-        drop_existing_data(&conn)?;
+        drop_existing_data(&conn, force_prefix.as_deref())?;
     }
 
     // Check if this is a fresh import

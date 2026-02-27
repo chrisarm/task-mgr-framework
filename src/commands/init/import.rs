@@ -35,20 +35,14 @@ pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskM
                 "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
                 [&pattern],
             )?;
-            conn.execute(
-                "DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'",
-                [&pattern],
-            )?;
+            conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
             // prd_files must be removed before prd_metadata (FK ordering)
             conn.execute(
                 "DELETE FROM prd_files WHERE prd_id = \
                  (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
                 [prefix],
             )?;
-            conn.execute(
-                "DELETE FROM prd_metadata WHERE task_prefix = ?",
-                [prefix],
-            )?;
+            conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
         }
         None => {
             // Global wipe — preserve nothing (legacy behavior).
@@ -119,8 +113,7 @@ pub fn get_delete_preview(
                 })?;
             let learnings: usize =
                 conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
-            let runs: usize =
-                conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+            let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
             Ok(DryRunDeletePreview {
                 tasks,
                 files,

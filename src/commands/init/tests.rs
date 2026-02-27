@@ -1735,7 +1735,7 @@ fn test_init_auto_prefix_dry_run_deterministic() {
 mod scoped_import_tests {
     use tempfile::TempDir;
 
-    use crate::commands::init::import::{insert_prd_file, insert_prd_metadata};
+    use crate::commands::init::import::{drop_existing_data, insert_prd_file, insert_prd_metadata};
     use crate::commands::init::parse::PrdFile;
     use crate::db::open_connection;
 
@@ -1843,126 +1843,141 @@ mod scoped_import_tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "RED-PHASE: drop_existing_data must accept prefix: Option<&str>. \
-                With Some(prefix), only tasks whose id starts with '<prefix>-' are deleted. \
-                Requires new function signature: drop_existing_data(conn, prefix: Option<&str>)."]
     fn test_drop_existing_data_scoped_deletes_only_prefix_tasks() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs drop_existing_data(conn, prefix: Option<&str>). \
-             Setup: insert tasks P1-US-001 and P2-US-001. \
-             Act: drop_existing_data(&conn, Some('P1')). \
-             Assert: P1-US-001 deleted, P2-US-001 still present."
-        );
-        // Intended:
-        //   conn.execute("INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
-        //       VALUES ('P1-US-001','T1','todo',1,'[]')", []).unwrap();
-        //   conn.execute("INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
-        //       VALUES ('P2-US-001','T2','todo',1,'[]')", []).unwrap();
-        //   drop_existing_data(&conn, Some("P1")).unwrap();
-        //   let p1: i64 = conn.query_row(
-        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| r.get(0)).unwrap();
-        //   let p2: i64 = conn.query_row(
-        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(p1, 0, "P1 tasks must be deleted");
-        //   assert_eq!(p2, 1, "P2 tasks must be preserved");
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+             VALUES ('P1-US-001','T1','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+             VALUES ('P2-US-001','T2','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let p1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let p2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(p1, 0, "P1 tasks must be deleted");
+        assert_eq!(p2, 1, "P2 tasks must be preserved");
     }
 
     /// Known-bad discriminator: after inserting P1 and P2 tasks, a scoped
     /// force-delete of P1 must leave all P2 tasks intact.
     #[test]
-    #[ignore = "RED-PHASE: known-bad discriminator — scoped --force on P1 must not touch P2. \
-                Requires drop_existing_data(conn, Some('P1')) support."]
     fn test_cross_prd_force_delete_leaves_other_prd_intact() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs drop_existing_data(conn, Some('P1')). \
-             Setup: insert P1-US-001 and P2-US-001 (and P2-US-002 with a relationship). \
-             Act: drop_existing_data(&conn, Some('P1')). \
-             Assert: P2 tasks, task_files, and task_relationships all survive."
-        );
-        // Intended:
-        //   // Insert P1 task with file + relationship
-        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
-        //       VALUES ('P1-US-001','P1T','todo',10,'[]')", []).unwrap();
-        //   conn.execute("INSERT INTO task_files (task_id,file_path) VALUES ('P1-US-001','a.rs')", []).unwrap();
-        //   // Insert P2 tasks with relationship
-        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
-        //       VALUES ('P2-US-001','P2T1','todo',10,'[]')", []).unwrap();
-        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
-        //       VALUES ('P2-US-002','P2T2','todo',20,'[]')", []).unwrap();
-        //   conn.execute("INSERT INTO task_relationships (task_id,related_id,rel_type) \
-        //       VALUES ('P2-US-002','P2-US-001','dependsOn')", []).unwrap();
-        //   drop_existing_data(&conn, Some("P1")).unwrap();
-        //   let p2_count: i64 = conn.query_row(
-        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
-        //   let p2_rel: i64 = conn.query_row(
-        //       "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(p2_count, 2, "both P2 tasks must survive scoped P1 delete");
-        //   assert_eq!(p2_rel, 1, "P2 relationships must survive");
+        // Insert P1 task with file
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P1-US-001','P1T','todo',10,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_files (task_id,file_path) VALUES ('P1-US-001','a.rs')",
+            [],
+        )
+        .unwrap();
+        // Insert P2 tasks with relationship
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-001','P2T1','todo',10,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-002','P2T2','todo',20,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_relationships (task_id,related_id,rel_type) \
+             VALUES ('P2-US-002','P2-US-001','dependsOn')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let p2_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let p2_rel: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE 'P2-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p2_count, 2, "both P2 tasks must survive scoped P1 delete");
+        assert_eq!(p2_rel, 1, "P2 relationships must survive");
     }
 
     #[test]
-    #[ignore = "RED-PHASE: drop_existing_data(conn, None) must preserve legacy all-wipe behavior. \
-                Requires new signature: drop_existing_data(conn, prefix: Option<&str>)."]
     fn test_drop_existing_data_none_prefix_wipes_everything() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs drop_existing_data(conn, prefix: Option<&str>). \
-             With None, must delete ALL tasks from all PRDs (same as current behavior). \
-             Assert: SELECT COUNT(*) FROM tasks = 0 after drop with None prefix."
-        );
-        // Intended:
-        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
-        //       VALUES ('P1-US-001','T1','todo',1,'[]')", []).unwrap();
-        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
-        //       VALUES ('P2-US-001','T2','todo',1,'[]')", []).unwrap();
-        //   drop_existing_data(&conn, None).unwrap();
-        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(count, 0, "None-prefix drop must wipe all tasks");
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P1-US-001','T1','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-001','T2','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, None).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "None-prefix drop must wipe all tasks");
     }
 
     #[test]
-    #[ignore = "RED-PHASE: scoped drop_existing_data must NOT delete learnings. \
-                Learnings are not PRD-scoped and must survive a scoped --force. \
-                Requires drop_existing_data(conn, prefix: Option<&str>)."]
     fn test_drop_existing_data_scoped_preserves_learnings() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs drop_existing_data(conn, Some('P1')). \
-             Setup: insert a learning directly. \
-             Act: drop_existing_data(&conn, Some('P1')). \
-             Assert: SELECT COUNT(*) FROM learnings still equals the pre-delete count."
-        );
-        // Intended:
-        //   conn.execute(
-        //       "INSERT INTO learnings (title, content, outcome, confidence) \
-        //        VALUES ('test learning', 'content', 'success', 'high')",
-        //       [],
-        //   ).unwrap();
-        //   drop_existing_data(&conn, Some("P1")).unwrap();
-        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(count, 1, "learnings must not be deleted by scoped --force");
+        conn.execute(
+            "INSERT INTO learnings (title, content, outcome, confidence) \
+             VALUES ('test learning', 'content', 'success', 'high')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "learnings must not be deleted by scoped --force");
     }
 
     #[test]
-    #[ignore = "RED-PHASE: scoped drop_existing_data must only delete the matching prd_metadata row. \
-                After deleting P1, the P2 prd_metadata row must remain. \
-                Requires migration v9 (multi-row prd_metadata) + new drop_existing_data signature."]
     fn test_drop_existing_data_scoped_preserves_other_prd_metadata() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs migration v9 + drop_existing_data(conn, Some('P1')). \
-             Setup: insert prd_metadata rows for P1 and P2 (requires multi-row support from v9). \
-             Act: drop_existing_data(&conn, Some('P1')). \
-             Assert: P2 prd_metadata row still exists."
-        );
-        // Intended (after migration v9):
-        //   conn.execute("INSERT INTO prd_metadata (id,project,task_prefix) VALUES (1,'proj-one','P1')", []).unwrap();
-        //   conn.execute("INSERT INTO prd_metadata (id,project,task_prefix) VALUES (2,'proj-two','P2')", []).unwrap();
-        //   drop_existing_data(&conn, Some("P1")).unwrap();
-        //   let count: i64 = conn.query_row(
-        //       "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix='P2'", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(count, 1, "P2 prd_metadata must survive scoped P1 delete");
+        let prd1 = make_prd("proj-one", Some("P1"));
+        let prd2 = make_prd("proj-two", Some("P2"));
+        insert_prd_metadata(&conn, &prd1, None).unwrap();
+        insert_prd_metadata(&conn, &prd2, None).unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix='P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "P2 prd_metadata must survive scoped P1 delete");
     }
 }
