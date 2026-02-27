@@ -29,8 +29,18 @@ const ESCAPE_CHAR: char = '\\';
 /// | `\`       | `\\`       |
 ///
 /// All other characters are passed through unchanged.
-pub fn escape_like(_s: &str) -> String {
-    todo!("Implement in FEAT-001")
+pub fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push(ESCAPE_CHAR);
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Build a `WHERE` clause and LIKE pattern for filtering tasks by PRD prefix.
@@ -41,16 +51,28 @@ pub fn escape_like(_s: &str) -> String {
 /// The prefix is passed through [`escape_like`] before embedding in the
 /// pattern so that literal `%`, `_`, and `\` characters in the prefix are
 /// matched exactly rather than acting as LIKE wildcards.
-pub fn prefix_where(_prefix: Option<&str>) -> (String, Option<String>) {
-    todo!("Implement in FEAT-001")
+pub fn prefix_where(prefix: Option<&str>) -> (String, Option<String>) {
+    match prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", escape_like(p));
+            ("WHERE id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    }
 }
 
 /// Build an `AND` clause and LIKE pattern for filtering tasks by PRD prefix.
 ///
 /// Identical to [`prefix_where`] but uses `AND` instead of `WHERE`, suitable
 /// for appending to a query that already has a `WHERE` clause.
-pub fn prefix_and(_prefix: Option<&str>) -> (String, Option<String>) {
-    todo!("Implement in FEAT-001")
+pub fn prefix_and(prefix: Option<&str>) -> (String, Option<String>) {
+    match prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", escape_like(p));
+            ("AND id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    }
 }
 
 /// Validate that a prefix string contains only safe characters.
@@ -64,14 +86,20 @@ pub fn prefix_and(_prefix: Option<&str>) -> (String, Option<String>) {
 /// # Errors
 ///
 /// Returns `Err(String)` with a human-readable reason if the prefix is invalid.
-pub fn validate_prefix(_prefix: &str) -> Result<(), String> {
-    todo!("Implement in FEAT-001")
+pub fn validate_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Err("prefix must not be empty".to_string());
+    }
+    for ch in prefix.chars() {
+        if !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-') {
+            return Err(format!(
+                "prefix contains invalid character {:?}; only [a-zA-Z0-9.-] are allowed",
+                ch
+            ));
+        }
+    }
+    Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Escape char constant (unused until FEAT-001 — suppress dead-code lint here)
-// ---------------------------------------------------------------------------
-const _: char = ESCAPE_CHAR;
 
 #[cfg(test)]
 mod tests {
