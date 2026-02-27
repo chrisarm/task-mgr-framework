@@ -92,27 +92,50 @@ impl SessionGuidance {
     }
 }
 
-/// Check if a `.stop` file exists in the tasks directory.
+/// Check if a stop signal exists for the given session.
 ///
-/// When `prefix` is `Some(p)`, also checks for a session-specific `.stop-{p}` file.
-/// (Full per-session scoping implemented in SS-FEAT-010; currently ignores prefix.)
-pub fn check_stop_signal(tasks_dir: &Path, _prefix: Option<&str>) -> bool {
+/// When `prefix` is `Some(p)`, checks `.stop-{p}` first (fast path), then falls back
+/// to the global `.stop` file. When `prefix` is `None`, checks only `.stop`.
+pub fn check_stop_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
+    if let Some(p) = prefix {
+        if tasks_dir.join(format!("{STOP_FILE}-{p}")).exists() {
+            return true;
+        }
+    }
     tasks_dir.join(STOP_FILE).exists()
 }
 
-/// Check if a `.pause` file exists in the tasks directory.
+/// Check if a pause signal exists for the given session.
 ///
-/// When `prefix` is `Some(p)`, also checks for a session-specific `.pause-{p}` file.
-/// (Full per-session scoping implemented in SS-FEAT-010; currently ignores prefix.)
-pub fn check_pause_signal(tasks_dir: &Path, _prefix: Option<&str>) -> bool {
+/// When `prefix` is `Some(p)`, checks `.pause-{p}` first (fast path), then falls back
+/// to the global `.pause` file. When `prefix` is `None`, checks only `.pause`.
+pub fn check_pause_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
+    if let Some(p) = prefix {
+        if tasks_dir.join(format!("{PAUSE_FILE}-{p}")).exists() {
+            return true;
+        }
+    }
     tasks_dir.join(PAUSE_FILE).exists()
 }
 
 /// Clean up signal files for a specific session prefix.
 ///
-/// Stub implementation for SS-FEAT-010 — currently delegates to `cleanup_signal_files`.
-pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, _prefix: Option<&str>) {
-    cleanup_signal_files(tasks_dir);
+/// When `prefix` is `Some(p)`: removes only `.stop-{p}` and `.pause-{p}`.
+/// When `prefix` is `None`: removes global `.stop` and `.pause`.
+/// Never removes other sessions' signal files.
+pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
+    let (stop, pause) = match prefix {
+        Some(p) => (format!("{STOP_FILE}-{p}"), format!("{PAUSE_FILE}-{p}")),
+        None => (STOP_FILE.to_string(), PAUSE_FILE.to_string()),
+    };
+    for filename in &[stop, pause] {
+        let path = tasks_dir.join(filename);
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("Warning: could not remove {}: {}", path.display(), e);
+            }
+        }
+    }
 }
 
 /// Handle a pause signal: display banner, read multi-line stdin, accumulate guidance.
@@ -126,6 +149,7 @@ pub fn handle_pause(
     tasks_dir: &Path,
     iteration: u32,
     session_guidance: &mut SessionGuidance,
+    prefix: Option<&str>,
 ) -> bool {
     eprintln!("\n╔══════════════════════════════════════════╗");
     eprintln!("║          PAUSED (iteration {:<4})         ║", iteration);
@@ -145,8 +169,12 @@ pub fn handle_pause(
         }
     }
 
-    // Delete the .pause file
-    let pause_path = tasks_dir.join(PAUSE_FILE);
+    // Delete the session-specific or global .pause file
+    let pause_filename = match prefix {
+        Some(p) => format!("{PAUSE_FILE}-{p}"),
+        None => PAUSE_FILE.to_string(),
+    };
+    let pause_path = tasks_dir.join(&pause_filename);
     if pause_path.exists() {
         let _ = fs::remove_file(&pause_path);
     }
@@ -245,13 +273,25 @@ fn cleanup_deadline_files(tasks_dir: &Path) {
 }
 
 /// Get the path where a stop file should be created.
-pub fn stop_file_path(tasks_dir: &Path) -> PathBuf {
-    tasks_dir.join(STOP_FILE)
+///
+/// When `prefix` is `Some(p)`, returns the session-specific `.stop-{p}` path.
+/// When `prefix` is `None`, returns the global `.stop` path.
+pub fn stop_file_path(tasks_dir: &Path, prefix: Option<&str>) -> PathBuf {
+    match prefix {
+        Some(p) => tasks_dir.join(format!("{STOP_FILE}-{p}")),
+        None => tasks_dir.join(STOP_FILE),
+    }
 }
 
 /// Get the path where a pause file should be created.
-pub fn pause_file_path(tasks_dir: &Path) -> PathBuf {
-    tasks_dir.join(PAUSE_FILE)
+///
+/// When `prefix` is `Some(p)`, returns the session-specific `.pause-{p}` path.
+/// When `prefix` is `None`, returns the global `.pause` path.
+pub fn pause_file_path(tasks_dir: &Path, prefix: Option<&str>) -> PathBuf {
+    match prefix {
+        Some(p) => tasks_dir.join(format!("{PAUSE_FILE}-{p}")),
+        None => tasks_dir.join(PAUSE_FILE),
+    }
 }
 
 #[cfg(test)]
@@ -541,14 +581,26 @@ mod tests {
 
     #[test]
     fn test_stop_file_path() {
-        let path = stop_file_path(Path::new("/project/tasks"));
+        let path = stop_file_path(Path::new("/project/tasks"), None);
         assert_eq!(path, PathBuf::from("/project/tasks/.stop"));
     }
 
     #[test]
+    fn test_stop_file_path_with_prefix() {
+        let path = stop_file_path(Path::new("/project/tasks"), Some("P1"));
+        assert_eq!(path, PathBuf::from("/project/tasks/.stop-P1"));
+    }
+
+    #[test]
     fn test_pause_file_path() {
-        let path = pause_file_path(Path::new("/project/tasks"));
+        let path = pause_file_path(Path::new("/project/tasks"), None);
         assert_eq!(path, PathBuf::from("/project/tasks/.pause"));
+    }
+
+    #[test]
+    fn test_pause_file_path_with_prefix() {
+        let path = pause_file_path(Path::new("/project/tasks"), Some("P1"));
+        assert_eq!(path, PathBuf::from("/project/tasks/.pause-P1"));
     }
 
     // --- Per-session (prefix-scoped) signal file tests ---

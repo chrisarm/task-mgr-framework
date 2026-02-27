@@ -192,7 +192,7 @@ pub fn run_iteration(
     }
 
     // Step 1: Check file-based signals
-    if signals::check_stop_signal(params.tasks_dir, None) {
+    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
         eprintln!("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -204,11 +204,12 @@ pub fn run_iteration(
         });
     }
 
-    if signals::check_pause_signal(params.tasks_dir, None) {
+    if signals::check_pause_signal(params.tasks_dir, params.task_prefix) {
         signals::handle_pause(
             params.tasks_dir,
             params.iteration,
             &mut ctx.session_guidance,
+            params.task_prefix,
         );
     }
 
@@ -298,11 +299,10 @@ pub fn run_iteration(
             let rem_sql = format!(
                 "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {rem_pfx_clause}"
             );
-            let rem_params: Vec<&dyn rusqlite::types::ToSql> =
-                match &rem_pfx_param {
-                    Some(p) => vec![p],
-                    None => vec![],
-                };
+            let rem_params: Vec<&dyn rusqlite::types::ToSql> = match &rem_pfx_param {
+                Some(p) => vec![p],
+                None => vec![],
+            };
             let remaining: i64 = params
                 .conn
                 .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
@@ -332,11 +332,10 @@ pub fn run_iteration(
             let mid_recovery_sql = format!(
                 "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {mid_pfx_clause}"
             );
-            let mid_params: Vec<&dyn rusqlite::types::ToSql> =
-                match &mid_pfx_param {
-                    Some(p) => vec![p],
-                    None => vec![],
-                };
+            let mid_params: Vec<&dyn rusqlite::types::ToSql> = match &mid_pfx_param {
+                Some(p) => vec![p],
+                None => vec![],
+            };
             let recovered = params
                 .conn
                 .execute(&mid_recovery_sql, mid_params.as_slice())
@@ -658,12 +657,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         Ok(guard) => guard,
         Err(e) => {
             match &pre_lock_prefix {
-                Some(p) => eprintln!(
-                    "Error: another loop is already running for PRD prefix {p}. {e}"
-                ),
-                None => eprintln!(
-                    "Error: another loop is already running on this database. {e}"
-                ),
+                Some(p) => {
+                    eprintln!("Error: another loop is already running for PRD prefix {p}. {e}")
+                }
+                None => eprintln!("Error: another loop is already running on this database. {e}"),
             }
             return 1;
         }
@@ -752,11 +749,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let recovery_sql = format!(
         "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
     );
-    let recovery_params: Vec<&dyn rusqlite::types::ToSql> =
-        match &recovery_pfx_param {
-            Some(p) => vec![p as &dyn rusqlite::types::ToSql],
-            None => vec![],
-        };
+    let recovery_params: Vec<&dyn rusqlite::types::ToSql> = match &recovery_pfx_param {
+        Some(p) => vec![p as &dyn rusqlite::types::ToSql],
+        None => vec![],
+    };
     match conn.execute(&recovery_sql, recovery_params.as_slice()) {
         Ok(count) if count > 0 => {
             eprintln!(
@@ -1310,7 +1306,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
     // Step 21: Cleanup
     deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
-    signals::cleanup_signal_files(&paths.tasks_dir);
+    signals::cleanup_signal_files_for_prefix(&paths.tasks_dir, task_prefix.as_deref());
 
     // Step 22: Print final banner
     let total_elapsed = start_time.elapsed().as_secs();
@@ -1384,9 +1380,7 @@ fn read_prd_metadata(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrRes
         None => vec![],
     };
     let task_count: usize = conn
-        .query_row(&tc_sql, tc_params.as_slice(), |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(&tc_sql, tc_params.as_slice(), |row| row.get::<_, i64>(0))
         .map(|c| c as usize)
         .unwrap_or(0);
 
@@ -1608,9 +1602,8 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
 
     // Get all todo/in_progress task IDs from the DB, scoped to this PRD's prefix.
     let (rpdb_pfx_clause, rpdb_pfx_param) = prefix_and(task_prefix);
-    let rpdb_sql = format!(
-        "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') {rpdb_pfx_clause}"
-    );
+    let rpdb_sql =
+        format!("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') {rpdb_pfx_clause}");
     let mut stmt = match conn.prepare(&rpdb_sql) {
         Ok(s) => s,
         Err(_) => return,
@@ -1622,7 +1615,10 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
     let candidate_ids: Vec<String> = stmt
         .query_map(rpdb_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
         .unwrap_or_default();
 
     if candidate_ids.is_empty() {
@@ -1759,7 +1755,10 @@ fn scan_output_for_completed_tasks(
     let task_ids: Vec<String> = stmt
         .query_map(soct_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
         .unwrap_or_default();
 
     for task_id in task_ids {
@@ -1851,7 +1850,10 @@ fn reconcile_external_git_completions(
     let task_ids: Vec<String> = stmt
         .query_map(regc_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
         .unwrap_or_default();
 
     drop(stmt);
