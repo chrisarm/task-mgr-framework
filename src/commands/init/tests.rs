@@ -1719,3 +1719,271 @@ fn test_init_auto_prefix_dry_run_deterministic() {
         "Dry-run should produce deterministic prefix"
     );
 }
+
+// ============================================================================
+// SS-SS-TEST-INIT-004: TDD tests for upsert-by-task_prefix and scoped
+// drop_existing_data() — RED PHASE (written before implementation).
+//
+// All tests below are #[ignore]d pending:
+//   1. Migration v9 (removal of CHECK(id=1) singleton from prd_metadata)
+//   2. insert_prd_metadata returning TaskMgrResult<i64> and upserting by task_prefix
+//   3. insert_prd_file accepting a prd_id: i64 parameter
+//   4. drop_existing_data accepting prefix: Option<&str>
+// ============================================================================
+
+#[cfg(test)]
+mod scoped_import_tests {
+    use tempfile::TempDir;
+
+    // These imports will be needed after the implementation lands:
+    //   use crate::commands::init::import::{drop_existing_data, insert_prd_file, insert_prd_metadata};
+    use crate::commands::init::parse::PrdFile;
+    use crate::db::open_connection;
+
+    /// Create a migrated in-memory database (all migrations including v9).
+    fn setup_migrated_db() -> (TempDir, rusqlite::Connection) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
+        crate::db::run_migrations(&mut conn).unwrap();
+        (temp_dir, conn)
+    }
+
+    /// Build a minimal PrdFile for testing.
+    fn make_prd(project: &str, task_prefix: Option<&str>) -> PrdFile {
+        PrdFile {
+            project: project.to_string(),
+            branch_name: Some("main".to_string()),
+            description: None,
+            priority_philosophy: None,
+            global_acceptance_criteria: None,
+            review_guidelines: None,
+            user_stories: vec![],
+            external_git_repo: None,
+            task_prefix: task_prefix.map(|s| s.to_string()),
+            prd_file: None,
+            model: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_prd_metadata: upsert by task_prefix, returns i64
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "RED-PHASE: insert_prd_metadata must return TaskMgrResult<i64> (new row id). \
+                Also requires migration v9 to remove CHECK(id=1) singleton constraint. \
+                Un-ignore after SS-FEAT changes the return type."]
+    fn test_insert_prd_metadata_new_prefix_returns_id() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd = make_prd("project-one", Some("P1"));
+        // After implementation: returns the newly inserted row's id.
+        todo!(
+            "needs insert_prd_metadata(conn, prd, raw_json) -> TaskMgrResult<i64> \
+             and migration v9 (CHECK(id=1) removed)"
+        );
+        // Intended assertions (fill in after signature change):
+        //   let id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        //   assert!(id > 0, "returned id must be positive");
+        //   let count: i64 = conn
+        //       .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+        //       .unwrap();
+        //   assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[ignore = "RED-PHASE: insert_prd_metadata must upsert by task_prefix. \
+                Calling it twice with the same prefix must update (not duplicate) the row. \
+                Requires migration v9 UNIQUE(task_prefix) constraint + ON CONFLICT upsert."]
+    fn test_insert_prd_metadata_upsert_existing_prefix() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs insert_prd_metadata to upsert via ON CONFLICT(task_prefix) DO UPDATE. \
+             After two calls with prefix='P1': SELECT COUNT(*) FROM prd_metadata must equal 1, \
+             and SELECT project FROM prd_metadata WHERE task_prefix='P1' must be the second value."
+        );
+        // Intended:
+        //   let prd1 = make_prd("project-original", Some("P1"));
+        //   let prd2 = make_prd("project-updated", Some("P1"));
+        //   insert_prd_metadata(&conn, &prd1, None).unwrap();
+        //   insert_prd_metadata(&conn, &prd2, None).unwrap();
+        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(count, 1, "upsert must not create a duplicate row");
+        //   let project: String = conn
+        //       .query_row("SELECT project FROM prd_metadata WHERE task_prefix='P1'", [], |r| r.get(0))
+        //       .unwrap();
+        //   assert_eq!(project, "project-updated");
+    }
+
+    #[test]
+    #[ignore = "RED-PHASE: two distinct prefixes must produce two separate prd_metadata rows. \
+                Requires migration v9 (multi-row support) and insert_prd_metadata returning i64."]
+    fn test_insert_prd_metadata_two_different_prefixes_creates_two_rows() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs migration v9 and updated insert_prd_metadata. \
+             After inserting P1 and P2 PRDs, SELECT COUNT(*) FROM prd_metadata must equal 2."
+        );
+        // Intended:
+        //   let prd1 = make_prd("project-one", Some("P1"));
+        //   let prd2 = make_prd("project-two", Some("P2"));
+        //   let id1 = insert_prd_metadata(&conn, &prd1, None).unwrap();
+        //   let id2 = insert_prd_metadata(&conn, &prd2, None).unwrap();
+        //   assert_ne!(id1, id2, "distinct prefixes must yield distinct row ids");
+        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_prd_file: dynamic prd_id parameter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "RED-PHASE: insert_prd_file must accept prd_id: i64 instead of hardcoding 1. \
+                Current signature: insert_prd_file(conn, file_path, file_type). \
+                Required signature: insert_prd_file(conn, prd_id: i64, file_path, file_type). \
+                Un-ignore after SS-FEAT changes the signature."]
+    fn test_insert_prd_file_uses_dynamic_prd_id() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs insert_prd_file(conn, prd_id: i64, file_path: &str, file_type: &str). \
+             After impl: insert_prd_file(&conn, 42, 'tasks/prd.json', 'task_list') must insert \
+             a row with prd_id=42, not prd_id=1."
+        );
+        // Intended:
+        //   // First insert a prd_metadata row with a known id (e.g. via direct SQL or insert_prd_metadata)
+        //   conn.execute("INSERT INTO prd_metadata (id, project) VALUES (42, 'proj')", []).unwrap();
+        //   insert_prd_file(&conn, 42, "tasks/prd.json", "task_list").unwrap();
+        //   let prd_id: i64 = conn
+        //       .query_row("SELECT prd_id FROM prd_files WHERE file_path='tasks/prd.json'", [], |r| r.get(0))
+        //       .unwrap();
+        //   assert_eq!(prd_id, 42, "prd_id must match the value passed in, not hardcoded 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_existing_data: scoped prefix filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "RED-PHASE: drop_existing_data must accept prefix: Option<&str>. \
+                With Some(prefix), only tasks whose id starts with '<prefix>-' are deleted. \
+                Requires new function signature: drop_existing_data(conn, prefix: Option<&str>)."]
+    fn test_drop_existing_data_scoped_deletes_only_prefix_tasks() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs drop_existing_data(conn, prefix: Option<&str>). \
+             Setup: insert tasks P1-US-001 and P2-US-001. \
+             Act: drop_existing_data(&conn, Some('P1')). \
+             Assert: P1-US-001 deleted, P2-US-001 still present."
+        );
+        // Intended:
+        //   conn.execute("INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+        //       VALUES ('P1-US-001','T1','todo',1,'[]')", []).unwrap();
+        //   conn.execute("INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+        //       VALUES ('P2-US-001','T2','todo',1,'[]')", []).unwrap();
+        //   drop_existing_data(&conn, Some("P1")).unwrap();
+        //   let p1: i64 = conn.query_row(
+        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| r.get(0)).unwrap();
+        //   let p2: i64 = conn.query_row(
+        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(p1, 0, "P1 tasks must be deleted");
+        //   assert_eq!(p2, 1, "P2 tasks must be preserved");
+    }
+
+    /// Known-bad discriminator: after inserting P1 and P2 tasks, a scoped
+    /// force-delete of P1 must leave all P2 tasks intact.
+    #[test]
+    #[ignore = "RED-PHASE: known-bad discriminator — scoped --force on P1 must not touch P2. \
+                Requires drop_existing_data(conn, Some('P1')) support."]
+    fn test_cross_prd_force_delete_leaves_other_prd_intact() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs drop_existing_data(conn, Some('P1')). \
+             Setup: insert P1-US-001 and P2-US-001 (and P2-US-002 with a relationship). \
+             Act: drop_existing_data(&conn, Some('P1')). \
+             Assert: P2 tasks, task_files, and task_relationships all survive."
+        );
+        // Intended:
+        //   // Insert P1 task with file + relationship
+        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+        //       VALUES ('P1-US-001','P1T','todo',10,'[]')", []).unwrap();
+        //   conn.execute("INSERT INTO task_files (task_id,file_path) VALUES ('P1-US-001','a.rs')", []).unwrap();
+        //   // Insert P2 tasks with relationship
+        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+        //       VALUES ('P2-US-001','P2T1','todo',10,'[]')", []).unwrap();
+        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+        //       VALUES ('P2-US-002','P2T2','todo',20,'[]')", []).unwrap();
+        //   conn.execute("INSERT INTO task_relationships (task_id,related_id,rel_type) \
+        //       VALUES ('P2-US-002','P2-US-001','dependsOn')", []).unwrap();
+        //   drop_existing_data(&conn, Some("P1")).unwrap();
+        //   let p2_count: i64 = conn.query_row(
+        //       "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
+        //   let p2_rel: i64 = conn.query_row(
+        //       "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE 'P2-%'", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(p2_count, 2, "both P2 tasks must survive scoped P1 delete");
+        //   assert_eq!(p2_rel, 1, "P2 relationships must survive");
+    }
+
+    #[test]
+    #[ignore = "RED-PHASE: drop_existing_data(conn, None) must preserve legacy all-wipe behavior. \
+                Requires new signature: drop_existing_data(conn, prefix: Option<&str>)."]
+    fn test_drop_existing_data_none_prefix_wipes_everything() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs drop_existing_data(conn, prefix: Option<&str>). \
+             With None, must delete ALL tasks from all PRDs (same as current behavior). \
+             Assert: SELECT COUNT(*) FROM tasks = 0 after drop with None prefix."
+        );
+        // Intended:
+        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+        //       VALUES ('P1-US-001','T1','todo',1,'[]')", []).unwrap();
+        //   conn.execute("INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+        //       VALUES ('P2-US-001','T2','todo',1,'[]')", []).unwrap();
+        //   drop_existing_data(&conn, None).unwrap();
+        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(count, 0, "None-prefix drop must wipe all tasks");
+    }
+
+    #[test]
+    #[ignore = "RED-PHASE: scoped drop_existing_data must NOT delete learnings. \
+                Learnings are not PRD-scoped and must survive a scoped --force. \
+                Requires drop_existing_data(conn, prefix: Option<&str>)."]
+    fn test_drop_existing_data_scoped_preserves_learnings() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs drop_existing_data(conn, Some('P1')). \
+             Setup: insert a learning directly. \
+             Act: drop_existing_data(&conn, Some('P1')). \
+             Assert: SELECT COUNT(*) FROM learnings still equals the pre-delete count."
+        );
+        // Intended:
+        //   conn.execute(
+        //       "INSERT INTO learnings (title, content, outcome, confidence) \
+        //        VALUES ('test learning', 'content', 'success', 'high')",
+        //       [],
+        //   ).unwrap();
+        //   drop_existing_data(&conn, Some("P1")).unwrap();
+        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(count, 1, "learnings must not be deleted by scoped --force");
+    }
+
+    #[test]
+    #[ignore = "RED-PHASE: scoped drop_existing_data must only delete the matching prd_metadata row. \
+                After deleting P1, the P2 prd_metadata row must remain. \
+                Requires migration v9 (multi-row prd_metadata) + new drop_existing_data signature."]
+    fn test_drop_existing_data_scoped_preserves_other_prd_metadata() {
+        let (_dir, conn) = setup_migrated_db();
+        todo!(
+            "needs migration v9 + drop_existing_data(conn, Some('P1')). \
+             Setup: insert prd_metadata rows for P1 and P2 (requires multi-row support from v9). \
+             Act: drop_existing_data(&conn, Some('P1')). \
+             Assert: P2 prd_metadata row still exists."
+        );
+        // Intended (after migration v9):
+        //   conn.execute("INSERT INTO prd_metadata (id,project,task_prefix) VALUES (1,'proj-one','P1')", []).unwrap();
+        //   conn.execute("INSERT INTO prd_metadata (id,project,task_prefix) VALUES (2,'proj-two','P2')", []).unwrap();
+        //   drop_existing_data(&conn, Some("P1")).unwrap();
+        //   let count: i64 = conn.query_row(
+        //       "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix='P2'", [], |r| r.get(0)).unwrap();
+        //   assert_eq!(count, 1, "P2 prd_metadata must survive scoped P1 delete");
+    }
+}
