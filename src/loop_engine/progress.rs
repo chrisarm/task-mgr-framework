@@ -3,7 +3,7 @@
 //! Appends structured progress entries to a progress.txt file after each iteration.
 //! This provides a persistent, human-readable log across loop sessions.
 
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -81,6 +81,58 @@ pub fn format_outcome(outcome: &IterationOutcome) -> String {
         IterationOutcome::Reorder(task_id) => format!("Reorder ({})", task_id),
         IterationOutcome::Stale => "Stale".to_string(),
         IterationOutcome::Empty => "Empty".to_string(),
+        IterationOutcome::PromptOverflow => "PromptOverflow".to_string(),
+    }
+}
+
+/// Maximum number of progress entries to keep after rotation.
+const MAX_PROGRESS_ENTRIES: usize = 20;
+
+/// Rotate the progress file to keep only the last `MAX_PROGRESS_ENTRIES` entries.
+///
+/// Reads the file, splits on `---` delimiters, keeps the last N entries, and writes back.
+/// Errors are logged to stderr but never crash the loop.
+pub fn rotate_progress(progress_path: &Path) {
+    let content = match fs::read_to_string(progress_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read progress file for rotation {}: {}",
+                progress_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    if content.trim().is_empty() {
+        return;
+    }
+
+    // Split on "---" delimiter lines. Each entry ends with "---\n".
+    // We split on "\n---\n" to separate entries, filtering out empty trailing parts.
+    let entries: Vec<&str> = content
+        .split("\n---\n")
+        .filter(|e| !e.trim().is_empty())
+        .collect();
+
+    if entries.len() <= MAX_PROGRESS_ENTRIES {
+        return;
+    }
+
+    // Keep last MAX_PROGRESS_ENTRIES entries, rejoin with the delimiter
+    let start = entries.len() - MAX_PROGRESS_ENTRIES;
+    let kept: Vec<&str> = entries[start..].to_vec();
+    let mut rotated = kept.join("\n---\n");
+    rotated.push_str("\n---\n");
+
+    if let Err(e) = fs::write(progress_path, rotated) {
+        eprintln!(
+            "Warning: could not write rotated progress file {}: {}",
+            progress_path.display(),
+            e
+        );
     }
 }
 
@@ -88,7 +140,6 @@ pub fn format_outcome(outcome: &IterationOutcome) -> String {
 mod tests {
     use super::*;
     use crate::loop_engine::config::CrashType;
-    use std::fs;
     use tempfile::TempDir;
 
     // --- log_iteration tests ---
@@ -282,5 +333,114 @@ mod tests {
     #[test]
     fn test_format_outcome_empty() {
         assert_eq!(format_outcome(&IterationOutcome::Empty), "Empty");
+    }
+
+    #[test]
+    fn test_format_outcome_prompt_overflow() {
+        assert_eq!(
+            format_outcome(&IterationOutcome::PromptOverflow),
+            "PromptOverflow"
+        );
+    }
+
+    // --- rotate_progress tests ---
+
+    /// Helper to build a progress file with N entries separated by `---` delimiters.
+    fn build_progress_entries(n: usize) -> String {
+        let mut content = String::new();
+        for i in 1..=n {
+            content.push_str(&format!(
+                "\n## 2026-01-01 00:00:00 UTC - Iteration {}\n- Task: TASK-{:03}\n- Model: (default)\n- Outcome: Completed\n- Files: (none)\n---\n",
+                i, i
+            ));
+        }
+        content
+    }
+
+    #[test]
+    fn test_rotate_progress_no_file_does_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("nonexistent_progress.txt");
+
+        // Should not panic when file doesn't exist
+        rotate_progress(&progress_path);
+        assert!(!progress_path.exists());
+    }
+
+    #[test]
+    fn test_rotate_progress_under_limit_no_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+        let content = build_progress_entries(10);
+        fs::write(&progress_path, &content).unwrap();
+
+        rotate_progress(&progress_path);
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert_eq!(after, content, "Under-limit file should not be modified");
+    }
+
+    #[test]
+    fn test_rotate_progress_over_limit_keeps_last_n() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+        let content = build_progress_entries(30);
+        fs::write(&progress_path, &content).unwrap();
+
+        rotate_progress(&progress_path);
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+
+        // Should keep last 20 entries (iterations 11-30)
+        assert!(
+            !after.contains("TASK-001"),
+            "Oldest entry should be rotated out"
+        );
+        assert!(
+            !after.contains("TASK-010"),
+            "Entry 10 should be rotated out"
+        );
+        assert!(
+            after.contains("TASK-011") || after.contains("TASK-012"),
+            "Entries around the boundary should be kept"
+        );
+        assert!(after.contains("TASK-030"), "Latest entry should be kept");
+
+        // Count entries by counting "---" delimiters
+        let entry_count = after.matches("\n---\n").count();
+        assert!(
+            entry_count <= MAX_PROGRESS_ENTRIES,
+            "Should have at most {} entries, found {}",
+            MAX_PROGRESS_ENTRIES,
+            entry_count
+        );
+    }
+
+    #[test]
+    fn test_rotate_progress_exact_limit_no_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+        let content = build_progress_entries(20);
+        fs::write(&progress_path, &content).unwrap();
+
+        rotate_progress(&progress_path);
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert_eq!(
+            after, content,
+            "Exact-limit file should not be modified"
+        );
+    }
+
+    #[test]
+    fn test_rotate_progress_empty_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+        fs::write(&progress_path, "").unwrap();
+
+        rotate_progress(&progress_path);
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert_eq!(after, "", "Empty file should remain empty");
     }
 }
