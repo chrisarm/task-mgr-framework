@@ -8,52 +8,128 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::db::prefix::escape_like;
 use crate::models::TaskStatus;
 use crate::TaskMgrResult;
 
 use super::output::DryRunDeletePreview;
 use super::parse::{PrdFile, PrdUserStory};
 
-/// Drop all existing data from the database.
-pub fn drop_existing_data(conn: &Connection) -> TaskMgrResult<()> {
-    // Drop in correct order due to foreign keys
-    conn.execute("DELETE FROM learning_tags", [])?;
-    conn.execute("DELETE FROM learnings", [])?;
-    conn.execute("DELETE FROM run_tasks", [])?;
-    conn.execute("DELETE FROM runs", [])?;
-    conn.execute("DELETE FROM task_relationships", [])?;
-    conn.execute("DELETE FROM task_files", [])?;
-    conn.execute("DELETE FROM tasks", [])?;
-    // prd_files may not exist in pre-v6 databases
-    let _ = conn.execute("DELETE FROM prd_files", []);
-    conn.execute("DELETE FROM prd_metadata", [])?;
-    // Reset global_state but don't delete the row
-    conn.execute(
-        "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL",
-        [],
-    )?;
+/// Drop existing data from the database.
+///
+/// When `task_prefix` is `Some(prefix)`, only data belonging to that PRD prefix
+/// is deleted (tasks, relationships, files, and the matching prd_metadata row).
+/// Learnings, runs, and other PRDs are preserved.
+///
+/// When `task_prefix` is `None`, all data is wiped (legacy global-force behavior).
+pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<()> {
+    match task_prefix {
+        Some(prefix) => {
+            let pattern = format!("{}-%", escape_like(prefix));
+            // Delete child tables before parent (FK ordering)
+            conn.execute(
+                "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+            )?;
+            conn.execute(
+                "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+            )?;
+            conn.execute(
+                "DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                [&pattern],
+            )?;
+            // prd_files must be removed before prd_metadata (FK ordering)
+            conn.execute(
+                "DELETE FROM prd_files WHERE prd_id = \
+                 (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
+                [prefix],
+            )?;
+            conn.execute(
+                "DELETE FROM prd_metadata WHERE task_prefix = ?",
+                [prefix],
+            )?;
+        }
+        None => {
+            // Global wipe — preserve nothing (legacy behavior).
+            // Drop in correct order due to foreign keys.
+            conn.execute("DELETE FROM learning_tags", [])?;
+            conn.execute("DELETE FROM learnings", [])?;
+            conn.execute("DELETE FROM run_tasks", [])?;
+            conn.execute("DELETE FROM runs", [])?;
+            conn.execute("DELETE FROM task_relationships", [])?;
+            conn.execute("DELETE FROM task_files", [])?;
+            conn.execute("DELETE FROM tasks", [])?;
+            // prd_files may not exist in pre-v6 databases
+            let _ = conn.execute("DELETE FROM prd_files", []);
+            conn.execute("DELETE FROM prd_metadata", [])?;
+            // Reset global_state but don't delete the row
+            conn.execute(
+                "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL",
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
 /// Get a preview of what would be deleted in dry-run mode with --force.
-pub fn get_delete_preview(conn: &Connection) -> TaskMgrResult<DryRunDeletePreview> {
-    let tasks: usize = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
-    let files: usize = conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
-    let relationships: usize =
-        conn.query_row("SELECT COUNT(*) FROM task_relationships", [], |row| {
-            row.get(0)
-        })?;
-    let learnings: usize =
-        conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
-    let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
-
-    Ok(DryRunDeletePreview {
-        tasks,
-        files,
-        relationships,
-        learnings,
-        runs,
-    })
+///
+/// When `task_prefix` is `Some`, counts only rows belonging to that prefix.
+/// Learnings and runs are always reported as 0 in scoped mode (they are never deleted).
+/// When `task_prefix` is `None`, counts all rows (global wipe preview).
+pub fn get_delete_preview(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<DryRunDeletePreview> {
+    match task_prefix {
+        Some(prefix) => {
+            let pattern = format!("{}-%", escape_like(prefix));
+            let tasks: usize = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            let files: usize = conn.query_row(
+                "SELECT COUNT(*) FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            let relationships: usize = conn.query_row(
+                "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            Ok(DryRunDeletePreview {
+                tasks,
+                files,
+                relationships,
+                learnings: 0,
+                runs: 0,
+            })
+        }
+        None => {
+            let tasks: usize =
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+            let files: usize =
+                conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
+            let relationships: usize =
+                conn.query_row("SELECT COUNT(*) FROM task_relationships", [], |row| {
+                    row.get(0)
+                })?;
+            let learnings: usize =
+                conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+            let runs: usize =
+                conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+            Ok(DryRunDeletePreview {
+                tasks,
+                files,
+                relationships,
+                learnings,
+                runs,
+            })
+        }
+    }
 }
 
 /// Check if the database is fresh (no tasks).

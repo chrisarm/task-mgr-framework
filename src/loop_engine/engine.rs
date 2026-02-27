@@ -23,6 +23,7 @@ use rusqlite::Connection;
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
 use crate::db::LockGuard;
+use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
 use crate::loop_engine::calibrate;
 use crate::loop_engine::claude;
@@ -42,7 +43,6 @@ use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::models::RunStatus;
-use crate::error::TaskMgrError;
 use crate::TaskMgrResult;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
@@ -350,7 +350,11 @@ pub fn run_iteration(
                             effective_model: None,
                         });
                     }
-                    Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+                    Err(TaskMgrError::PromptOverflow {
+                        critical_size,
+                        budget,
+                        task_id,
+                    }) => {
                         return Ok(prompt_overflow_result(critical_size, budget, task_id));
                     }
                     Err(e) => return Err(e),
@@ -370,7 +374,11 @@ pub fn run_iteration(
                 });
             }
         }
-        Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+        Err(TaskMgrError::PromptOverflow {
+            critical_size,
+            budget,
+            task_id,
+        }) => {
             return Ok(prompt_overflow_result(critical_size, budget, task_id));
         }
         Err(e) => return Err(e),
@@ -1180,8 +1188,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;
-                    exit_reason =
-                        "prompt overflow — critical sections exceed budget".to_string();
+                    exit_reason = "prompt overflow — critical sections exceed budget".to_string();
                 }
                 _ => {
                     exit_code = 1;
