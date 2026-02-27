@@ -745,7 +745,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     }
 
     // Step 7: Read PRD metadata for branch name, task count, and external repo
-    let prd_metadata = match read_prd_metadata(&conn) {
+    let prd_metadata = match read_prd_metadata(&conn, early_task_prefix.as_deref()) {
         Ok(meta) => meta,
         Err(e) => {
             eprintln!("Error reading PRD metadata: {}", e);
@@ -1308,15 +1308,32 @@ struct PrdMetadata {
 
 /// Read branch name, task count, external_git_repo, task_prefix, and default_model
 /// from prd_metadata and tasks tables.
-fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
+///
+/// When `task_prefix` is provided, queries `WHERE task_prefix = ?` to select the
+/// matching PRD row. Falls back to `LIMIT 1 ORDER BY id ASC` when no prefix is given.
+fn read_prd_metadata(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<PrdMetadata> {
     let (branch_name, external_git_repo, task_prefix, default_model): (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = conn
-        .query_row(
-            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE id = 1",
+    ) = if let Some(prefix) = task_prefix {
+        conn.query_row(
+            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE task_prefix = ?1",
+            rusqlite::params![prefix],
+            |row| {
+                Ok((
+                    row.get("branch_name")?,
+                    row.get("external_git_repo")?,
+                    row.get("task_prefix")?,
+                    row.get("default_model")?,
+                ))
+            },
+        )
+        .unwrap_or((None, None, None, None))
+    } else {
+        conn.query_row(
+            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata ORDER BY id ASC LIMIT 1",
             [],
             |row| {
                 Ok((
@@ -1327,7 +1344,8 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
                 ))
             },
         )
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None))
+    };
 
     let (tc_pfx_clause, tc_pfx_param) = prefix_and(task_prefix.as_deref());
     let tc_sql = format!(

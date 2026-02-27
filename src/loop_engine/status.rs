@@ -11,6 +11,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::db::open_connection;
+use crate::db::prefix::{prefix_and, prefix_where};
 use crate::TaskMgrResult;
 
 use super::DEADLINE_FILE_PREFIX;
@@ -108,7 +109,7 @@ pub fn show_status(
     // Extract task prefix from PRD JSON for filtering
     let task_prefix = prd_file.and_then(read_task_prefix_from_prd);
 
-    let project = query_project_info(&conn)?;
+    let project = query_project_info(&conn, task_prefix.as_deref())?;
     let tasks = query_dashboard_task_counts(&conn, task_prefix.as_deref())?;
 
     let completion_percentage = if tasks.total > 0 {
@@ -144,18 +145,38 @@ fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
 }
 
 /// Query project metadata from prd_metadata table.
-fn query_project_info(conn: &Connection) -> TaskMgrResult<Option<ProjectInfo>> {
-    let result = conn.query_row(
-        "SELECT project, branch_name, description FROM prd_metadata WHERE id = 1",
-        [],
-        |row| {
-            Ok(ProjectInfo {
-                name: row.get(0)?,
-                branch: row.get(1)?,
-                description: row.get(2)?,
-            })
-        },
-    );
+///
+/// When `task_prefix` is provided, queries `WHERE task_prefix = ?` to select the
+/// matching PRD row. Falls back to `LIMIT 1 ORDER BY id ASC` when no prefix is given.
+fn query_project_info(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<Option<ProjectInfo>> {
+    let result = if let Some(prefix) = task_prefix {
+        conn.query_row(
+            "SELECT project, branch_name, description FROM prd_metadata WHERE task_prefix = ?1",
+            rusqlite::params![prefix],
+            |row| {
+                Ok(ProjectInfo {
+                    name: row.get(0)?,
+                    branch: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            },
+        )
+    } else {
+        conn.query_row(
+            "SELECT project, branch_name, description FROM prd_metadata ORDER BY id ASC LIMIT 1",
+            [],
+            |row| {
+                Ok(ProjectInfo {
+                    name: row.get(0)?,
+                    branch: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            },
+        )
+    };
 
     match result {
         Ok(info) => Ok(Some(info)),
@@ -171,7 +192,7 @@ fn query_dashboard_task_counts(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<DashboardTaskCounts> {
-    let (where_clause, like_pattern) = prefix_filter(task_prefix);
+    let (where_clause, like_pattern) = prefix_where(task_prefix);
 
     let sql = format!(
         r#"
@@ -225,22 +246,16 @@ fn query_pending_tasks(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<PendingTask>> {
-    let (where_extra, like_pattern) = prefix_filter(task_prefix);
+    let (and_clause, like_pattern) = prefix_and(task_prefix);
 
     let sql = format!(
         r#"
         SELECT id, title, priority, status
         FROM tasks
         WHERE status IN ('todo', 'in_progress', 'blocked')
-        {and_extra}
+        {and_clause}
         ORDER BY priority ASC, id ASC
         "#,
-        and_extra = if where_extra.is_empty() {
-            String::new()
-        } else {
-            // prefix_filter returns "WHERE id LIKE ?", convert to AND
-            where_extra.replacen("WHERE", "AND", 1)
-        },
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -269,16 +284,6 @@ fn query_pending_tasks(
     Ok(tasks)
 }
 
-/// Build a WHERE clause and LIKE pattern for filtering tasks by prefix.
-///
-/// Returns `("WHERE id LIKE ?", Some("prefix-%"))` when a prefix is given,
-/// or `("", None)` when no filtering is needed.
-fn prefix_filter(task_prefix: Option<&str>) -> (String, Option<String>) {
-    match task_prefix {
-        Some(prefix) => ("WHERE id LIKE ?".to_string(), Some(format!("{}-%", prefix))),
-        None => (String::new(), None),
-    }
-}
 
 /// Read deadline info from .deadline-* files in the tasks directory.
 ///
@@ -904,7 +909,7 @@ mod tests {
     #[test]
     fn test_query_project_info_no_metadata() {
         let (_temp_dir, conn) = setup_test_db();
-        let result = query_project_info(&conn).unwrap();
+        let result = query_project_info(&conn, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -912,7 +917,7 @@ mod tests {
     fn test_query_project_info_with_metadata() {
         let (_temp_dir, conn) = setup_test_db();
         insert_prd_metadata(&conn, "test-proj", Some("develop"), None);
-        let result = query_project_info(&conn).unwrap();
+        let result = query_project_info(&conn, None).unwrap();
         let info = result.unwrap();
         assert_eq!(info.name, "test-proj");
         assert_eq!(info.branch.unwrap(), "develop");
