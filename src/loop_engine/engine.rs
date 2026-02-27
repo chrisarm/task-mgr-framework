@@ -191,7 +191,7 @@ pub fn run_iteration(
     }
 
     // Step 1: Check file-based signals
-    if signals::check_stop_signal(params.tasks_dir) {
+    if signals::check_stop_signal(params.tasks_dir, None) {
         eprintln!("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -203,7 +203,7 @@ pub fn run_iteration(
         });
     }
 
-    if signals::check_pause_signal(params.tasks_dir) {
+    if signals::check_pause_signal(params.tasks_dir, None) {
         signals::handle_pause(
             params.tasks_dir,
             params.iteration,
@@ -286,6 +286,7 @@ pub fn run_iteration(
         steering_path: params.steering_path,
         verbose: params.verbose,
         default_model: params.default_model,
+        task_prefix: params.task_prefix,
     };
 
     let prompt_result = match prompt::build_prompt(&prompt_params) {
@@ -675,8 +676,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     if run_config.config.verbose {
         let canonical = run_config.db_dir.join("tasks.db");
         eprintln!("[verbose] Database path: {}", canonical.display());
-        eprintln!("[verbose] Source root:   {}", run_config.source_root.display());
-        eprintln!("[verbose] Working root:  {}", run_config.working_root.display());
+        eprintln!(
+            "[verbose] Source root:   {}",
+            run_config.source_root.display()
+        );
+        eprintln!(
+            "[verbose] Working root:  {}",
+            run_config.working_root.display()
+        );
     }
 
     // Step 6.5: Run any pending migrations (e.g. v4 adds external_git_repo column)
@@ -3733,13 +3740,15 @@ mod tests {
         // All three should be done
         for id in &["A", "B", "C"] {
             let status: String = conn
-                .query_row(
-                    "SELECT status FROM tasks WHERE id = ?",
-                    [id],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT status FROM tasks WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })
                 .unwrap();
-            assert_eq!(status, "done", "Task {} should be done after reconciliation", id);
+            assert_eq!(
+                status, "done",
+                "Task {} should be done after reconciliation",
+                id
+            );
         }
     }
 

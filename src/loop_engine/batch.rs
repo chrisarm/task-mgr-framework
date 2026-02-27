@@ -185,7 +185,7 @@ pub async fn run_batch(
 
     for (i, (prd_file, prompt_file)) in pairs.iter().enumerate() {
         // Check .stop signal between PRDs
-        if i > 0 && signals::check_stop_signal(&tasks_dir) {
+        if i > 0 && signals::check_stop_signal(&tasks_dir, None) {
             eprintln!("Stop signal detected, skipping remaining PRDs");
             let remaining = pairs.len() - i;
             for (remaining_prd, _) in &pairs[i..] {
@@ -493,9 +493,9 @@ mod tests {
     fn test_stop_signal_detected_between_prds() {
         // Verify that check_stop_signal works with .stop file
         let temp_dir = TempDir::new().expect("create temp dir");
-        assert!(!signals::check_stop_signal(temp_dir.path()));
+        assert!(!signals::check_stop_signal(temp_dir.path(), None));
 
         fs::write(temp_dir.path().join(STOP_FILE), "").expect("create stop");
-        assert!(signals::check_stop_signal(temp_dir.path()));
+        assert!(signals::check_stop_signal(temp_dir.path(), None));
     }
 }

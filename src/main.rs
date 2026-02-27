@@ -137,7 +137,14 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             }
 
             let files = after_files.unwrap_or_default();
-            let result = next(&cli.dir, &files, claim, run_id.as_deref(), cli.verbose)?;
+            let result = next(
+                &cli.dir,
+                &files,
+                claim,
+                run_id.as_deref(),
+                cli.verbose,
+                None,
+            )?;
 
             if cli.verbose {
                 eprint!("{}", format_next_verbose(&result));

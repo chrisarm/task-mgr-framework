@@ -93,13 +93,26 @@ impl SessionGuidance {
 }
 
 /// Check if a `.stop` file exists in the tasks directory.
-pub fn check_stop_signal(tasks_dir: &Path) -> bool {
+///
+/// When `prefix` is `Some(p)`, also checks for a session-specific `.stop-{p}` file.
+/// (Full per-session scoping implemented in SS-FEAT-010; currently ignores prefix.)
+pub fn check_stop_signal(tasks_dir: &Path, _prefix: Option<&str>) -> bool {
     tasks_dir.join(STOP_FILE).exists()
 }
 
 /// Check if a `.pause` file exists in the tasks directory.
-pub fn check_pause_signal(tasks_dir: &Path) -> bool {
+///
+/// When `prefix` is `Some(p)`, also checks for a session-specific `.pause-{p}` file.
+/// (Full per-session scoping implemented in SS-FEAT-010; currently ignores prefix.)
+pub fn check_pause_signal(tasks_dir: &Path, _prefix: Option<&str>) -> bool {
     tasks_dir.join(PAUSE_FILE).exists()
+}
+
+/// Clean up signal files for a specific session prefix.
+///
+/// Stub implementation for SS-FEAT-010 — currently delegates to `cleanup_signal_files`.
+pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, _prefix: Option<&str>) {
+    cleanup_signal_files(tasks_dir);
 }
 
 /// Handle a pause signal: display banner, read multi-line stdin, accumulate guidance.
@@ -382,34 +395,34 @@ mod tests {
     #[test]
     fn test_check_stop_signal_returns_false_when_no_file() {
         let temp_dir = TempDir::new().unwrap();
-        assert!(!check_stop_signal(temp_dir.path()));
+        assert!(!check_stop_signal(temp_dir.path(), None));
     }
 
     #[test]
     fn test_check_stop_signal_returns_true_when_file_exists() {
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
-        assert!(check_stop_signal(temp_dir.path()));
+        assert!(check_stop_signal(temp_dir.path(), None));
     }
 
     #[test]
     fn test_check_stop_signal_returns_true_with_content() {
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join(STOP_FILE), "reason: done for now").unwrap();
-        assert!(check_stop_signal(temp_dir.path()));
+        assert!(check_stop_signal(temp_dir.path(), None));
     }
 
     #[test]
     fn test_check_pause_signal_returns_false_when_no_file() {
         let temp_dir = TempDir::new().unwrap();
-        assert!(!check_pause_signal(temp_dir.path()));
+        assert!(!check_pause_signal(temp_dir.path(), None));
     }
 
     #[test]
     fn test_check_pause_signal_returns_true_when_file_exists() {
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join(PAUSE_FILE), "").unwrap();
-        assert!(check_pause_signal(temp_dir.path()));
+        assert!(check_pause_signal(temp_dir.path(), None));
     }
 
     // --- SignalFlag tests ---

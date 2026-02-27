@@ -89,6 +89,8 @@ pub struct BuildPromptParams<'a> {
     pub verbose: bool,
     /// Default model from PRD metadata (threaded from engine, not queried here).
     pub default_model: Option<&'a str>,
+    /// Optional PRD task prefix for scoping task selection to a specific PRD.
+    pub task_prefix: Option<&'a str>,
 }
 
 /// Build a prompt for the current iteration.
@@ -110,6 +112,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         true,
         params.run_id,
         params.verbose,
+        params.task_prefix,
     )?;
 
     let task_output = match next_result.task {
@@ -742,6 +745,7 @@ mod tests {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         }
     }
 
@@ -962,6 +966,7 @@ mod tests {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -1328,6 +1333,7 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -1443,6 +1449,7 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -1487,6 +1494,7 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -2373,6 +2381,7 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -2423,6 +2432,7 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -2465,6 +2475,7 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         // next::next uses dir for DB access — task should be found
@@ -3526,6 +3537,7 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -3612,6 +3624,7 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)
@@ -3711,6 +3724,7 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            task_prefix: None,
         };
 
         let result = build_prompt(&params)

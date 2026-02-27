@@ -91,6 +91,7 @@ fn test_e2e_high_difficulty_resolves_to_opus() {
         steering_path: None,
         verbose: false,
         default_model: default_model.as_deref(),
+        task_prefix: None,
     };
 
     let result = build_prompt(&params)
@@ -140,6 +141,7 @@ fn test_e2e_explicit_model_overrides_default() {
         steering_path: None,
         verbose: false,
         default_model: default_model.as_deref(),
+        task_prefix: None,
     };
 
     let result = build_prompt(&params)
@@ -191,6 +193,7 @@ fn test_e2e_no_model_fields_resolves_to_none() {
         steering_path: None,
         verbose: false,
         default_model: None,
+        task_prefix: None,
     };
 
     let result = build_prompt(&params)
@@ -235,6 +238,7 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         steering_path: None,
         verbose: false,
         default_model: default_model.as_deref(),
+        task_prefix: None,
     };
 
     let result = build_prompt(&params)

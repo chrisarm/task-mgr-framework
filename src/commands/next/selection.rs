@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::db::prefix::{escape_like, prefix_and};
 use crate::loop_engine::calibrate;
 use crate::models::Task;
 use crate::TaskMgrResult;
@@ -108,21 +109,22 @@ pub fn select_next_task(
     conn: &Connection,
     after_files: &[String],
     recently_completed: &[String],
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<SelectionResult> {
     // Get IDs of tasks that are done or irrelevant (satisfy dependencies)
-    let completed_ids = get_completed_task_ids(conn)?;
+    let completed_ids = get_completed_task_ids(conn, task_prefix)?;
 
     // Get all todo tasks
-    let todo_tasks = get_todo_tasks(conn)?;
+    let todo_tasks = get_todo_tasks(conn, task_prefix)?;
 
     // Get all relationships
-    let dependencies = get_relationships_by_type(conn, "dependsOn")?;
-    let synergies = get_relationships_by_type(conn, "synergyWith")?;
-    let conflicts = get_relationships_by_type(conn, "conflictsWith")?;
-    let batches = get_relationships_by_type(conn, "batchWith")?;
+    let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
+    let synergies = get_relationships_by_type(conn, "synergyWith", task_prefix)?;
+    let conflicts = get_relationships_by_type(conn, "conflictsWith", task_prefix)?;
+    let batches = get_relationships_by_type(conn, "batchWith", task_prefix)?;
 
     // Get task files
-    let task_files = get_all_task_files(conn)?;
+    let task_files = get_all_task_files(conn, task_prefix)?;
 
     // Filter to eligible tasks (all dependencies satisfied)
     let eligible_tasks: Vec<Task> = todo_tasks
@@ -261,36 +263,47 @@ pub fn select_next_task(
 }
 
 /// Get IDs of tasks that are done or irrelevant (can satisfy dependencies).
-fn get_completed_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE status IN ('done', 'irrelevant')")?;
-    let ids: Result<HashSet<String>, rusqlite::Error> =
-        stmt.query_map([], |row| row.get(0))?.collect();
+fn get_completed_task_ids(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<HashSet<String>> {
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql =
+        format!("SELECT id FROM tasks WHERE status IN ('done', 'irrelevant') {prefix_clause}");
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Result<HashSet<String>, rusqlite::Error> = if let Some(pattern) = prefix_param {
+        stmt.query_map([pattern], |row| row.get(0))?.collect()
+    } else {
+        stmt.query_map([], |row| row.get(0))?.collect()
+    };
     Ok(ids?)
 }
 
 /// Get all tasks with status='todo'.
-fn get_todo_tasks(conn: &Connection) -> TaskMgrResult<Vec<Task>> {
-    let mut stmt = conn.prepare(
+fn get_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<Vec<Task>> {
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql = format!(
         "SELECT id, title, description, priority, status, notes, \
          acceptance_criteria, review_scope, severity, source_review, \
          created_at, updated_at, started_at, completed_at, \
          last_error, error_count, \
          blocked_at_iteration, skipped_at_iteration, \
          model, difficulty, escalation_note \
-         FROM tasks WHERE status = 'todo' ORDER BY priority ASC",
-    )?;
+         FROM tasks WHERE status = 'todo' {prefix_clause} ORDER BY priority ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let tasks: Result<Vec<Task>, rusqlite::Error> = stmt
-        .query_map([], |row| {
-            Task::try_from(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })
-        })?
-        .collect();
+    let map_err = |e: crate::TaskMgrError| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    };
+
+    let tasks: Result<Vec<Task>, rusqlite::Error> = if let Some(pattern) = prefix_param {
+        stmt.query_map([pattern], |row| Task::try_from(row).map_err(map_err))?
+            .collect()
+    } else {
+        stmt.query_map([], |row| Task::try_from(row).map_err(map_err))?
+            .collect()
+    };
 
     Ok(tasks?)
 }
@@ -299,15 +312,32 @@ fn get_todo_tasks(conn: &Connection) -> TaskMgrResult<Vec<Task>> {
 fn get_relationships_by_type(
     conn: &Connection,
     rel_type: &str,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<HashMap<String, Vec<String>>> {
-    let mut stmt =
-        conn.prepare("SELECT task_id, related_id FROM task_relationships WHERE rel_type = ?")?;
+    // task_relationships uses task_id (not id), so we build the AND clause manually
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", escape_like(p));
+            ("AND task_id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
+        "SELECT task_id, related_id FROM task_relationships WHERE rel_type = ? {prefix_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows: Result<Vec<(String, String)>, rusqlite::Error> = stmt
-        .query_map([rel_type], |row| {
+    let rows: Result<Vec<(String, String)>, rusqlite::Error> = if let Some(pattern) = prefix_param {
+        stmt.query_map(rusqlite::params![rel_type, pattern], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect();
+        .collect()
+    } else {
+        stmt.query_map([rel_type], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect()
+    };
 
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (task_id, related_id) in rows? {
@@ -318,14 +348,35 @@ fn get_relationships_by_type(
 }
 
 /// Get all task files, grouped by task_id.
-fn get_all_task_files(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare("SELECT task_id, file_path FROM task_files")?;
+fn get_all_task_files(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<HashMap<String, Vec<String>>> {
+    // task_files uses task_id (not id), so we build the WHERE clause manually
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", escape_like(p));
+            (
+                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
+                Some(pattern),
+            )
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!("SELECT task_id, file_path FROM task_files {prefix_clause}");
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows: Result<Vec<(String, String)>, rusqlite::Error> = stmt
-        .query_map([], |row| {
+    let rows: Result<Vec<(String, String)>, rusqlite::Error> = if let Some(pattern) = prefix_param {
+        stmt.query_map([pattern], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect();
+        .collect()
+    } else {
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect()
+    };
 
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (task_id, file_path) in rows? {
