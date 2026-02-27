@@ -101,7 +101,7 @@ pub fn doctor(
     // Check for tasks approaching decay (warning only, 8 iterations before decay)
     const DECAY_WARNING_THRESHOLD: i64 = 8;
     let decay_warnings_list = if decay_threshold > 0 {
-        find_decay_warnings(conn, decay_threshold, DECAY_WARNING_THRESHOLD)?
+        find_decay_warnings(conn, decay_threshold, DECAY_WARNING_THRESHOLD, None)?
     } else {
         Vec::new()
     };

@@ -1221,7 +1221,7 @@ mod decay_tests {
         .unwrap();
 
         // With threshold 0, nothing should decay
-        let decayed = apply_decay(&conn, 0, false).unwrap();
+        let decayed = apply_decay(&conn, 0, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still blocked
@@ -1253,7 +1253,7 @@ mod decay_tests {
         .unwrap();
 
         // Should decay the task
-        let decayed = apply_decay(&conn, 32, false).unwrap();
+        let decayed = apply_decay(&conn, 32, false, None).unwrap();
         assert_eq!(decayed.len(), 1);
         assert_eq!(decayed[0].0, "US-001");
         assert_eq!(decayed[0].1, "blocked");
@@ -1297,7 +1297,7 @@ mod decay_tests {
         .unwrap();
 
         // Should decay the task
-        let decayed = apply_decay(&conn, 32, false).unwrap();
+        let decayed = apply_decay(&conn, 32, false, None).unwrap();
         assert_eq!(decayed.len(), 1);
         assert_eq!(decayed[0].0, "US-002");
         assert_eq!(decayed[0].1, "skipped");
@@ -1324,7 +1324,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let decayed = apply_decay(&conn, 32, false).unwrap();
+        let decayed = apply_decay(&conn, 32, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still irrelevant
@@ -1355,7 +1355,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let decayed = apply_decay(&conn, 32, false).unwrap();
+        let decayed = apply_decay(&conn, 32, false, None).unwrap();
         assert!(decayed.is_empty());
 
         // Verify task is still blocked
@@ -1384,7 +1384,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        apply_decay(&conn, 32, false).unwrap();
+        apply_decay(&conn, 32, false, None).unwrap();
 
         // Verify notes contain audit message
         let notes: String = conn
@@ -1415,7 +1415,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let warnings = find_decay_warnings(&conn, 32, 8).unwrap();
+        let warnings = find_decay_warnings(&conn, 32, 8, None).unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].task_id, "US-006");
         assert_eq!(warnings[0].iterations_until_decay, 4);
@@ -1441,7 +1441,7 @@ mod decay_tests {
         )
         .unwrap();
 
-        let warnings = find_decay_warnings(&conn, 32, 8).unwrap();
+        let warnings = find_decay_warnings(&conn, 32, 8, None).unwrap();
         // 40 - 30 = 10 iterations since blocked
         // Would decay at 30 + 32 = 62
         // Warning window is 62 - 8 = 54 to 62

@@ -17,6 +17,7 @@
 
 use rusqlite::Connection;
 
+use crate::db::prefix::prefix_and;
 use crate::TaskMgrResult;
 
 /// Apply automatic decay to blocked/skipped tasks that have exceeded the threshold.
@@ -29,6 +30,7 @@ use crate::TaskMgrResult;
 /// * `conn` - Database connection
 /// * `threshold` - Number of iterations after which a blocked/skipped task decays
 /// * `verbose` - If true, log verbose information to stderr
+/// * `task_prefix` - If Some, only decay tasks whose IDs match the prefix (e.g. `"P1"`)
 ///
 /// # Returns
 ///
@@ -37,6 +39,7 @@ pub fn apply_decay(
     conn: &Connection,
     threshold: i64,
     verbose: bool,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<(String, String)>> {
     if threshold <= 0 {
         return Ok(Vec::new());
@@ -61,7 +64,8 @@ pub fn apply_decay(
     // Find tasks that need to decay:
     // - blocked tasks where (current_iteration - blocked_at_iteration) >= threshold
     // - skipped tasks where (current_iteration - skipped_at_iteration) >= threshold
-    let mut stmt = conn.prepare(
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql = format!(
         r#"
         SELECT id, status, blocked_at_iteration, skipped_at_iteration
         FROM tasks
@@ -72,16 +76,26 @@ pub fn apply_decay(
             (status = 'skipped' AND skipped_at_iteration IS NOT NULL
              AND (?1 - skipped_at_iteration) >= ?2)
         )
+        {prefix_clause}
         ORDER BY id
-        "#,
-    )?;
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let tasks_to_decay: Vec<(String, String)> = stmt
-        .query_map([current_iteration, threshold], |row| {
+    let tasks_to_decay: Vec<(String, String)> = if let Some(pattern) = prefix_param {
+        stmt.query_map(
+            rusqlite::params![current_iteration, threshold, pattern],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        stmt.query_map([current_iteration, threshold], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .filter_map(|r| r.ok())
-        .collect();
+        .collect()
+    };
 
     if tasks_to_decay.is_empty() {
         return Ok(Vec::new());
@@ -135,6 +149,7 @@ pub fn apply_decay(
 /// * `conn` - Database connection
 /// * `decay_threshold` - The decay threshold in iterations
 /// * `warning_threshold` - Number of iterations before decay to start warning
+/// * `task_prefix` - If Some, only warn for tasks whose IDs match the prefix (e.g. `"P1"`)
 ///
 /// # Returns
 ///
@@ -143,6 +158,7 @@ pub fn find_decay_warnings(
     conn: &Connection,
     decay_threshold: i64,
     warning_threshold: i64,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<DecayWarning>> {
     if decay_threshold <= 0 {
         return Ok(Vec::new());
@@ -158,7 +174,8 @@ pub fn find_decay_warnings(
         .unwrap_or(0);
 
     // Find tasks approaching decay (but not yet decayed)
-    let mut stmt = conn.prepare(
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql = format!(
         r#"
         SELECT id, title, status, blocked_at_iteration, skipped_at_iteration
         FROM tasks
@@ -171,39 +188,56 @@ pub fn find_decay_warnings(
              AND (?1 - skipped_at_iteration) >= (?2 - ?3)
              AND (?1 - skipped_at_iteration) < ?2)
         )
+        {prefix_clause}
         ORDER BY id
-        "#,
-    )?;
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let warnings: Vec<DecayWarning> = stmt
-        .query_map(
-            [current_iteration, decay_threshold, warning_threshold],
-            |row| {
-                let status: String = row.get(2)?;
-                let blocked_at: Option<i64> = row.get(3)?;
-                let skipped_at: Option<i64> = row.get(4)?;
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<DecayWarning> {
+        let status: String = row.get(2)?;
+        let blocked_at: Option<i64> = row.get(3)?;
+        let skipped_at: Option<i64> = row.get(4)?;
 
-                let at_iteration = match status.as_str() {
-                    "blocked" => blocked_at.unwrap_or(0),
-                    "skipped" => skipped_at.unwrap_or(0),
-                    _ => 0,
-                };
+        let at_iteration = match status.as_str() {
+            "blocked" => blocked_at.unwrap_or(0),
+            "skipped" => skipped_at.unwrap_or(0),
+            _ => 0,
+        };
 
-                let iterations_since = current_iteration - at_iteration;
-                let iterations_until_decay = decay_threshold - iterations_since;
+        let iterations_since = current_iteration - at_iteration;
+        let iterations_until_decay = decay_threshold - iterations_since;
 
-                Ok(DecayWarning {
-                    task_id: row.get(0)?,
-                    task_title: row.get(1)?,
-                    status,
-                    at_iteration,
-                    iterations_since,
-                    iterations_until_decay,
-                })
-            },
+        Ok(DecayWarning {
+            task_id: row.get(0)?,
+            task_title: row.get(1)?,
+            status,
+            at_iteration,
+            iterations_since,
+            iterations_until_decay,
+        })
+    };
+
+    let warnings: Vec<DecayWarning> = if let Some(pattern) = prefix_param {
+        stmt.query_map(
+            rusqlite::params![
+                current_iteration,
+                decay_threshold,
+                warning_threshold,
+                pattern
+            ],
+            map_row,
         )?
         .filter_map(|r| r.ok())
-        .collect();
+        .collect()
+    } else {
+        stmt.query_map(
+            [current_iteration, decay_threshold, warning_threshold],
+            map_row,
+        )?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
 
     Ok(warnings)
 }

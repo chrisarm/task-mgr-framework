@@ -123,8 +123,12 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
 
             if decay_threshold > 0 {
                 let conn = open_connection(&cli.dir)?;
-                let decayed =
-                    task_mgr::commands::next::apply_decay(&conn, decay_threshold, cli.verbose)?;
+                let decayed = task_mgr::commands::next::apply_decay(
+                    &conn,
+                    decay_threshold,
+                    cli.verbose,
+                    None,
+                )?;
                 if !decayed.is_empty() && cli.verbose {
                     eprintln!(
                         "[verbose] Decayed {} blocked/skipped task(s) back to todo",
