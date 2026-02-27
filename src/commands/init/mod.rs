@@ -421,15 +421,17 @@ pub fn init(
     // Wrap all data imports in a transaction for atomicity
     let tx = conn.transaction()?;
 
-    // Insert PRD metadata
-    if let Some(metadata) = prd_metadata {
-        insert_prd_metadata(&tx, &metadata, raw_json.as_deref())?;
-    }
+    // Insert PRD metadata and get the upserted row id for prd_files linking
+    let prd_id = if let Some(metadata) = prd_metadata {
+        insert_prd_metadata(&tx, &metadata, raw_json.as_deref())?
+    } else {
+        1 // fallback: no metadata parsed (shouldn't happen in practice)
+    };
 
     // Register PRD files for archive discovery
     let tasks_dir = dir.join("tasks");
     for (json_path, prd_for_reg) in &json_file_registrations {
-        register_prd_files(&tx, json_path, prd_for_reg, &tasks_dir)?;
+        register_prd_files(&tx, prd_id, json_path, prd_for_reg, &tasks_dir)?;
     }
 
     // Import new tasks

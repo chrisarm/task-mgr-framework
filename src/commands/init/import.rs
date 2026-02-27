@@ -73,12 +73,17 @@ pub fn get_existing_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>
     Ok(result)
 }
 
-/// Insert PRD metadata into the database.
+/// Insert or update PRD metadata keyed by `task_prefix`.
+///
+/// Uses `ON CONFLICT(task_prefix) DO UPDATE` so calling this twice with the
+/// same prefix updates the existing row rather than creating a duplicate.
+///
+/// Returns the row id of the upserted row (new or existing).
 pub fn insert_prd_metadata(
     conn: &Connection,
     prd: &PrdFile,
     raw_json: Option<&str>,
-) -> TaskMgrResult<()> {
+) -> TaskMgrResult<i64> {
     let priority_philosophy = prd
         .priority_philosophy
         .as_ref()
@@ -95,13 +100,23 @@ pub fn insert_prd_metadata(
         .map(serde_json::to_string)
         .transpose()?;
 
-    // Use INSERT OR REPLACE to handle the singleton constraint
     conn.execute(
-        r#"INSERT OR REPLACE INTO prd_metadata
-           (id, project, branch_name, description, priority_philosophy,
+        r#"INSERT INTO prd_metadata
+           (project, branch_name, description, priority_philosophy,
             global_acceptance_criteria, review_guidelines, raw_json,
             external_git_repo, task_prefix, default_model, updated_at)
-           VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(task_prefix) DO UPDATE SET
+               project = excluded.project,
+               branch_name = excluded.branch_name,
+               description = excluded.description,
+               priority_philosophy = excluded.priority_philosophy,
+               global_acceptance_criteria = excluded.global_acceptance_criteria,
+               review_guidelines = excluded.review_guidelines,
+               raw_json = excluded.raw_json,
+               external_git_repo = excluded.external_git_repo,
+               default_model = excluded.default_model,
+               updated_at = excluded.updated_at"#,
         rusqlite::params![
             prd.project,
             prd.branch_name,
@@ -116,7 +131,7 @@ pub fn insert_prd_metadata(
         ],
     )?;
 
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 /// Insert a task into the database.
@@ -264,10 +279,15 @@ pub fn delete_task_relationships(conn: &Connection, task_id: &str) -> TaskMgrRes
 }
 
 /// Insert a PRD file record into the prd_files table.
-pub fn insert_prd_file(conn: &Connection, file_path: &str, file_type: &str) -> TaskMgrResult<()> {
+pub fn insert_prd_file(
+    conn: &Connection,
+    prd_id: i64,
+    file_path: &str,
+    file_type: &str,
+) -> TaskMgrResult<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, ?)",
-        [file_path, file_type],
+        "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, ?)",
+        rusqlite::params![prd_id, file_path, file_type],
     )?;
     Ok(())
 }
@@ -282,6 +302,7 @@ pub fn insert_prd_file(conn: &Connection, file_path: &str, file_type: &str) -> T
 /// All paths are stored relative to the tasks directory.
 pub fn register_prd_files(
     conn: &Connection,
+    prd_id: i64,
     json_path: &Path,
     prd: &PrdFile,
     tasks_dir: &Path,
@@ -291,7 +312,7 @@ pub fn register_prd_files(
         .strip_prefix(tasks_dir)
         .unwrap_or(json_path)
         .to_string_lossy();
-    insert_prd_file(conn, &json_relative, "task_list")?;
+    insert_prd_file(conn, prd_id, &json_relative, "task_list")?;
 
     // Derive prompt file path: <stem>-prompt.md
     if let Some(stem) = json_path.file_stem() {
@@ -302,13 +323,13 @@ pub fn register_prd_files(
                 .strip_prefix(tasks_dir)
                 .unwrap_or(&prompt_path)
                 .to_string_lossy();
-            insert_prd_file(conn, &prompt_relative, "prompt")?;
+            insert_prd_file(conn, prd_id, &prompt_relative, "prompt")?;
         }
     }
 
     // Store PRD markdown file if specified
     if let Some(ref prd_file) = prd.prd_file {
-        insert_prd_file(conn, prd_file, "prd")?;
+        insert_prd_file(conn, prd_id, prd_file, "prd")?;
     }
 
     Ok(())

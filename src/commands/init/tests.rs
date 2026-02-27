@@ -1735,8 +1735,7 @@ fn test_init_auto_prefix_dry_run_deterministic() {
 mod scoped_import_tests {
     use tempfile::TempDir;
 
-    // These imports will be needed after the implementation lands:
-    //   use crate::commands::init::import::{drop_existing_data, insert_prd_file, insert_prd_metadata};
+    use crate::commands::init::import::{insert_prd_file, insert_prd_metadata};
     use crate::commands::init::parse::PrdFile;
     use crate::db::open_connection;
 
@@ -1770,67 +1769,50 @@ mod scoped_import_tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "RED-PHASE: insert_prd_metadata must return TaskMgrResult<i64> (new row id). \
-                Also requires migration v9 to remove CHECK(id=1) singleton constraint. \
-                Un-ignore after SS-FEAT changes the return type."]
     fn test_insert_prd_metadata_new_prefix_returns_id() {
         let (_dir, conn) = setup_migrated_db();
         let prd = make_prd("project-one", Some("P1"));
-        // After implementation: returns the newly inserted row's id.
-        todo!(
-            "needs insert_prd_metadata(conn, prd, raw_json) -> TaskMgrResult<i64> \
-             and migration v9 (CHECK(id=1) removed)"
-        );
-        // Intended assertions (fill in after signature change):
-        //   let id = insert_prd_metadata(&conn, &prd, None).unwrap();
-        //   assert!(id > 0, "returned id must be positive");
-        //   let count: i64 = conn
-        //       .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
-        //       .unwrap();
-        //   assert_eq!(count, 1);
+        let id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        assert!(id > 0, "returned id must be positive");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
-    #[ignore = "RED-PHASE: insert_prd_metadata must upsert by task_prefix. \
-                Calling it twice with the same prefix must update (not duplicate) the row. \
-                Requires migration v9 UNIQUE(task_prefix) constraint + ON CONFLICT upsert."]
     fn test_insert_prd_metadata_upsert_existing_prefix() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs insert_prd_metadata to upsert via ON CONFLICT(task_prefix) DO UPDATE. \
-             After two calls with prefix='P1': SELECT COUNT(*) FROM prd_metadata must equal 1, \
-             and SELECT project FROM prd_metadata WHERE task_prefix='P1' must be the second value."
-        );
-        // Intended:
-        //   let prd1 = make_prd("project-original", Some("P1"));
-        //   let prd2 = make_prd("project-updated", Some("P1"));
-        //   insert_prd_metadata(&conn, &prd1, None).unwrap();
-        //   insert_prd_metadata(&conn, &prd2, None).unwrap();
-        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(count, 1, "upsert must not create a duplicate row");
-        //   let project: String = conn
-        //       .query_row("SELECT project FROM prd_metadata WHERE task_prefix='P1'", [], |r| r.get(0))
-        //       .unwrap();
-        //   assert_eq!(project, "project-updated");
+        let prd1 = make_prd("project-original", Some("P1"));
+        let prd2 = make_prd("project-updated", Some("P1"));
+        insert_prd_metadata(&conn, &prd1, None).unwrap();
+        insert_prd_metadata(&conn, &prd2, None).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert must not create a duplicate row");
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM prd_metadata WHERE task_prefix='P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "project-updated");
     }
 
     #[test]
-    #[ignore = "RED-PHASE: two distinct prefixes must produce two separate prd_metadata rows. \
-                Requires migration v9 (multi-row support) and insert_prd_metadata returning i64."]
     fn test_insert_prd_metadata_two_different_prefixes_creates_two_rows() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs migration v9 and updated insert_prd_metadata. \
-             After inserting P1 and P2 PRDs, SELECT COUNT(*) FROM prd_metadata must equal 2."
-        );
-        // Intended:
-        //   let prd1 = make_prd("project-one", Some("P1"));
-        //   let prd2 = make_prd("project-two", Some("P2"));
-        //   let id1 = insert_prd_metadata(&conn, &prd1, None).unwrap();
-        //   let id2 = insert_prd_metadata(&conn, &prd2, None).unwrap();
-        //   assert_ne!(id1, id2, "distinct prefixes must yield distinct row ids");
-        //   let count: i64 = conn.query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0)).unwrap();
-        //   assert_eq!(count, 2);
+        let prd1 = make_prd("project-one", Some("P1"));
+        let prd2 = make_prd("project-two", Some("P2"));
+        let id1 = insert_prd_metadata(&conn, &prd1, None).unwrap();
+        let id2 = insert_prd_metadata(&conn, &prd2, None).unwrap();
+        assert_ne!(id1, id2, "distinct prefixes must yield distinct row ids");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     // -----------------------------------------------------------------------
@@ -1838,25 +1820,22 @@ mod scoped_import_tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "RED-PHASE: insert_prd_file must accept prd_id: i64 instead of hardcoding 1. \
-                Current signature: insert_prd_file(conn, file_path, file_type). \
-                Required signature: insert_prd_file(conn, prd_id: i64, file_path, file_type). \
-                Un-ignore after SS-FEAT changes the signature."]
     fn test_insert_prd_file_uses_dynamic_prd_id() {
         let (_dir, conn) = setup_migrated_db();
-        todo!(
-            "needs insert_prd_file(conn, prd_id: i64, file_path: &str, file_type: &str). \
-             After impl: insert_prd_file(&conn, 42, 'tasks/prd.json', 'task_list') must insert \
-             a row with prd_id=42, not prd_id=1."
+        let prd = make_prd("proj", Some("PX"));
+        let prd_id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        insert_prd_file(&conn, prd_id, "tasks/prd.json", "task_list").unwrap();
+        let stored_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path='tasks/prd.json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_prd_id, prd_id,
+            "prd_id must match the value passed in, not hardcoded 1"
         );
-        // Intended:
-        //   // First insert a prd_metadata row with a known id (e.g. via direct SQL or insert_prd_metadata)
-        //   conn.execute("INSERT INTO prd_metadata (id, project) VALUES (42, 'proj')", []).unwrap();
-        //   insert_prd_file(&conn, 42, "tasks/prd.json", "task_list").unwrap();
-        //   let prd_id: i64 = conn
-        //       .query_row("SELECT prd_id FROM prd_files WHERE file_path='tasks/prd.json'", [], |r| r.get(0))
-        //       .unwrap();
-        //   assert_eq!(prd_id, 42, "prd_id must match the value passed in, not hardcoded 1");
     }
 
     // -----------------------------------------------------------------------
