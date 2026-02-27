@@ -114,6 +114,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             claim,
             run_id,
             decay_threshold,
+            prefix,
         } => {
             let _lock = if claim || decay_threshold > 0 {
                 Some(LockGuard::acquire(&cli.dir)?)
@@ -147,7 +148,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 claim,
                 run_id.as_deref(),
                 cli.verbose,
-                None,
+                prefix.as_deref(),
             )?;
 
             if cli.verbose {

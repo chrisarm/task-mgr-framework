@@ -273,11 +273,13 @@ fn test_next_no_flags() {
             claim,
             run_id,
             decay_threshold,
+            prefix,
         } => {
             assert!(after_files.is_none());
             assert!(!claim);
             assert!(run_id.is_none());
             assert_eq!(decay_threshold, 32);
+            assert!(prefix.is_none());
         }
         _ => panic!("Expected Next command"),
     }
@@ -314,6 +316,17 @@ fn test_next_with_run_id() {
     match cli.command {
         Commands::Next { run_id, .. } => {
             assert_eq!(run_id, Some("abc-123".to_string()));
+        }
+        _ => panic!("Expected Next command"),
+    }
+}
+
+#[test]
+fn test_next_with_prefix() {
+    let cli = Cli::parse_from(["task-mgr", "next", "--prefix", "P1"]);
+    match cli.command {
+        Commands::Next { prefix, .. } => {
+            assert_eq!(prefix, Some("P1".to_string()));
         }
         _ => panic!("Expected Next command"),
     }
