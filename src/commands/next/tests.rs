@@ -384,6 +384,213 @@ mod selection_tests {
     }
 }
 
+/// Tests for prefix-scoped task selection (TDD: written before implementation).
+///
+/// Tests marked `#[ignore]` require `select_next_task` to accept an
+/// `Option<&str>` task_prefix parameter (SS-FEAT: prefix-scoped queries).
+/// They will be un-ignored once that parameter exists.
+///
+/// The cross-PRD isolation test runs immediately and currently FAILS (red phase),
+/// proving isolation is needed.
+#[cfg(test)]
+mod prefix_selection_tests {
+    use super::test_helpers::{
+        insert_test_relationship, insert_test_task, insert_test_task_file, setup_test_db,
+    };
+    use crate::commands::next::selection::select_next_task;
+
+    // -------------------------------------------------------------------------
+    // Backwards-compatibility: None prefix returns ALL tasks (existing behaviour)
+    // This test must PASS now and continue to pass after the prefix param lands.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_select_next_task_none_prefix_returns_all() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 10);
+        insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 20);
+
+        // Without prefix filtering both tasks are candidates; lowest priority wins.
+        let result = select_next_task(&conn, &[], &[]).unwrap();
+        assert!(result.task.is_some());
+        assert_eq!(result.eligible_count, 2, "None-prefix must see all tasks");
+        assert_eq!(result.task.unwrap().task.id, "P1-US-001");
+    }
+
+    // -------------------------------------------------------------------------
+    // Known-bad discriminator: cross-PRD isolation is currently BROKEN.
+    //
+    // When two PRDs share a task ID suffix (P1-US-001 and P2-US-001) and we
+    // want only P1 tasks, the current implementation returns both.  This test
+    // documents the failure and must be fixed by the prefix-scoping feature.
+    //
+    // Once select_next_task accepts task_prefix this test should be replaced by
+    // `test_cross_prd_isolation_with_prefix` below.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "RED-PHASE: documents that cross-PRD isolation is not yet implemented \
+                (select_next_task has no prefix param). Un-ignore and adapt after \
+                SS-FEAT adds task_prefix: Option<&str> to select_next_task."]
+    fn test_cross_prd_isolation_currently_broken() {
+        let (_dir, conn) = setup_test_db();
+        // Two PRDs, same local ID suffix.
+        insert_test_task(&conn, "P1-US-001", "P1 Task A", "todo", 10);
+        insert_test_task(&conn, "P2-US-001", "P2 Task A", "todo", 20);
+        insert_test_task(&conn, "P2-US-002", "P2 Task B", "todo", 5);
+
+        // When scoped to P1 only P1-US-001 should be eligible.
+        // TODO: replace `select_next_task(&conn, &[], &[])` with
+        //       `select_next_task(&conn, &[], &[], Some("P1"))` once the param exists.
+        todo!(
+            "needs select_next_task(task_prefix: Option<&str>) — \
+             tracked as SS-FEAT prefix-scoped queries"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Prefix-scoped select_next_task
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs select_next_task to accept task_prefix: Option<&str> param"]
+    fn test_select_next_task_prefix_p1_only() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 10);
+        insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 5); // higher priority but wrong PRD
+
+        // TODO: call select_next_task(&conn, &[], &[], Some("P1")) once available.
+        // Expected: only P1-US-001 is eligible (P2-US-001 excluded by prefix).
+        todo!("needs select_next_task(task_prefix: Option<&str>)");
+    }
+
+    #[test]
+    #[ignore = "TODO: needs select_next_task to accept task_prefix: Option<&str> param"]
+    fn test_select_next_task_prefix_p2_only() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 5); // higher priority but wrong PRD
+        insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 10);
+
+        // TODO: call select_next_task(&conn, &[], &[], Some("P2")) once available.
+        // Expected: only P2-US-001 is eligible.
+        todo!("needs select_next_task(task_prefix: Option<&str>)");
+    }
+
+    // -------------------------------------------------------------------------
+    // get_completed_task_ids with prefix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs get_completed_task_ids(prefix: Option<&str>) or tested \
+                indirectly via select_next_task(task_prefix)"]
+    fn test_get_completed_task_ids_with_prefix() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Done", "done", 1);
+        insert_test_task(&conn, "P2-US-001", "P2 Done", "done", 1);
+        insert_test_task(&conn, "P1-US-002", "P1 Blocked", "todo", 2);
+        // P1-US-002 depends on P1-US-001.  With P1 prefix the dependency is
+        // satisfied; with P2 prefix P1-US-001 is invisible so the dep is unsatisfied.
+        //
+        // TODO: call select_next_task(&conn, &[], &[], Some("P1")) and assert
+        //       P1-US-002 is eligible (dependency satisfied within P1 scope).
+        todo!("needs prefix-scoped get_completed_task_ids via select_next_task");
+    }
+
+    // -------------------------------------------------------------------------
+    // get_todo_tasks with prefix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs get_todo_tasks(prefix: Option<&str>) or tested via \
+                select_next_task(task_prefix)"]
+    fn test_get_todo_tasks_with_prefix() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Todo", "todo", 10);
+        insert_test_task(&conn, "P2-US-001", "P2 Todo", "todo", 10);
+
+        // TODO: call select_next_task(&conn, &[], &[], Some("P1")) and assert
+        //       eligible_count == 1, selected task is P1-US-001.
+        todo!("needs prefix-scoped get_todo_tasks via select_next_task");
+    }
+
+    // -------------------------------------------------------------------------
+    // get_relationships_by_type with prefix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs get_relationships_by_type(prefix) or tested via \
+                select_next_task(task_prefix)"]
+    fn test_get_relationships_by_type_with_prefix() {
+        let (_dir, conn) = setup_test_db();
+        // P1 tasks with a dependency chain.
+        insert_test_task(&conn, "P1-US-001", "P1 Prereq", "done", 1);
+        insert_test_task(&conn, "P1-US-002", "P1 Dependent", "todo", 2);
+        insert_test_relationship(&conn, "P1-US-002", "P1-US-001", "dependsOn");
+        // P2 tasks with the same local IDs — must NOT bleed into P1 scope.
+        insert_test_task(&conn, "P2-US-001", "P2 Prereq", "todo", 1); // NOT done
+        insert_test_task(&conn, "P2-US-002", "P2 Dependent", "todo", 2);
+        insert_test_relationship(&conn, "P2-US-002", "P2-US-001", "dependsOn");
+
+        // TODO: With prefix "P1":
+        //   - P1-US-002's dependency (P1-US-001) is done → eligible
+        //   - P2-* tasks are invisible
+        // Call select_next_task(&conn, &[], &[], Some("P1")) and assert
+        //   selected == "P1-US-002", eligible_count == 1.
+        todo!("needs prefix-scoped get_relationships_by_type via select_next_task");
+    }
+
+    // -------------------------------------------------------------------------
+    // get_all_task_files with prefix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs get_all_task_files(prefix) or tested via \
+                select_next_task(task_prefix)"]
+    fn test_get_all_task_files_with_prefix() {
+        let (_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 10);
+        insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 10);
+        insert_test_task_file(&conn, "P1-US-001", "src/p1/mod.rs");
+        insert_test_task_file(&conn, "P2-US-001", "src/p2/mod.rs");
+
+        // TODO: With prefix "P1" and after_files=["src/p1/mod.rs"]:
+        //   Only P1-US-001 gets a file-overlap bonus; P2-US-001 is not even
+        //   a candidate so its files must not appear.
+        // Call select_next_task(&conn, &["src/p1/mod.rs".to_string()], &[], Some("P1"))
+        // and assert selected == "P1-US-001" with file_score > 0.
+        todo!("needs prefix-scoped get_all_task_files via select_next_task");
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-PRD isolation discriminator (the canonical correctness test)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "TODO: needs select_next_task(task_prefix: Option<&str>) — \
+                this is the primary correctness test for the feature"]
+    fn test_cross_prd_isolation_with_prefix() {
+        let (_dir, conn) = setup_test_db();
+
+        // P1 PRD: one todo task.
+        insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 10);
+        // P2 PRD: tasks with higher priority AND same suffix — must stay invisible to P1.
+        insert_test_task(&conn, "P2-US-001", "P2 Task Same Suffix", "todo", 1);
+        insert_test_task(&conn, "P2-US-002", "P2 Task", "todo", 2);
+
+        // TODO: replace todo!() with:
+        //
+        //   let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        //   assert_eq!(result.eligible_count, 1, "P1 scope must exclude P2 tasks");
+        //   assert_eq!(result.task.unwrap().task.id, "P1-US-001");
+        //
+        //   // Symmetry check: P2 scope must exclude P1-US-001
+        //   let result2 = select_next_task(&conn, &[], &[], Some("P2")).unwrap();
+        //   assert_eq!(result2.eligible_count, 2);
+        //   assert_eq!(result2.task.unwrap().task.id, "P2-US-001");
+        todo!("needs select_next_task(task_prefix: Option<&str>)");
+    }
+}
+
 #[cfg(test)]
 mod next_command_tests {
     use super::test_helpers::{insert_test_relationship, insert_test_task, setup_test_db};
