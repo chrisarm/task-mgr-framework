@@ -664,6 +664,13 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         }
     };
 
+    if run_config.config.verbose {
+        let canonical = run_config.db_dir.join("tasks.db");
+        eprintln!("[verbose] Database path: {}", canonical.display());
+        eprintln!("[verbose] Source root:   {}", run_config.source_root.display());
+        eprintln!("[verbose] Working root:  {}", run_config.working_root.display());
+    }
+
     // Step 6.5: Run any pending migrations (e.g. v4 adds external_git_repo column)
     if let Err(e) = crate::db::run_migrations(&mut conn) {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
@@ -950,6 +957,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         // Check git for task completion: if recent commit contains task ID, mark done
         if let Some(ref task_id) = result.task_id {
             if !matches!(result.outcome, IterationOutcome::Empty) {
+                let mut task_marked_done_this_iteration = false;
                 if let Some(commit_hash) = check_git_for_task_completion(
                     &working_root,
                     task_id,
@@ -968,6 +976,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                         Ok(_) => {
                             last_claimed_task = None;
                             tasks_completed += 1;
+                            task_marked_done_this_iteration = true;
 
                             // Override outcome so stale tracker resets — task was actually completed
                             result.outcome = IterationOutcome::Completed;
@@ -1020,6 +1029,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                                 // Clear tracker if the claimed task was completed via output scan
                                 if result.task_id.as_deref() == Some(completed_id.as_str()) {
                                     last_claimed_task = None;
+                                    task_marked_done_this_iteration = true;
                                 }
 
                                 tasks_completed += 1;
@@ -1056,7 +1066,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
                 // Final fallback: Claude reports the task as "already complete" without committing.
                 // This catches tasks completed in a prior run where the DB was never updated.
-                if !matches!(result.outcome, IterationOutcome::Completed)
+                // Use task_marked_done_this_iteration (not outcome) to avoid skipping when
+                // <promise>COMPLETE</promise> set outcome to Completed but no prior path marked the task done.
+                if !task_marked_done_this_iteration
                     && detection::is_task_reported_already_complete(
                         &result.output,
                         task_id,
@@ -1532,26 +1544,43 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
         .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
         .collect();
 
-    // For each non-done task, check if its base ID (prefix-stripped) has passes: true
-    for task_id in &candidate_ids {
-        let base_id = strip_task_prefix(task_id, task_prefix);
-        if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
-            if !complete_cmd::are_dependencies_satisfied(conn, task_id) {
-                eprintln!(
-                    "Skipping reconciliation of task {} — dependencies not yet satisfied",
-                    task_id
-                );
+    // Loop until convergence: marking a task done may unblock dependents that also have
+    // passes: true. A single pass can miss them if checked before their dependency.
+    loop {
+        let mut updated_count = 0;
+        for task_id in &candidate_ids {
+            // Re-check status — may have been marked done in a previous pass
+            let still_open: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id = ? AND status IN ('todo', 'in_progress')",
+                    [task_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+            if !still_open {
                 continue;
             }
-            if let Ok(1) = conn.execute(
-                "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
-                [task_id.as_str()],
-            ) {
-                eprintln!(
-                    "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
-                    task_id
-                );
+
+            let base_id = strip_task_prefix(task_id, task_prefix);
+            if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
+                if !complete_cmd::are_dependencies_satisfied(conn, task_id) {
+                    continue;
+                }
+                if let Ok(1) = conn.execute(
+                    "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
+                    [task_id.as_str()],
+                ) {
+                    eprintln!(
+                        "Reconciled task {} as done (passes: true in PRD but was not done in DB)",
+                        task_id
+                    );
+                    updated_count += 1;
+                }
             }
+        }
+        if updated_count == 0 {
+            break;
         }
     }
 }
@@ -3650,6 +3679,61 @@ mod tests {
             result.is_none(),
             "P9-FEAT-001 must not match FEAT-001 in git detection"
         );
+    }
+
+    #[test]
+    fn test_reconcile_passes_resolves_dependency_chains() {
+        use crate::db::{create_schema, open_connection};
+        use std::io::Write;
+
+        // Set up DB with A → B → C dependency chain, all todo
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let conn = open_connection(temp_dir.path()).unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert tasks in reverse order (C, B, A) to stress ordering
+        for (id, status) in &[("C", "todo"), ("B", "todo"), ("A", "todo")] {
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, priority) VALUES (?, 'Test', ?, 10)",
+                rusqlite::params![id, status],
+            )
+            .unwrap();
+        }
+        // B depends on A, C depends on B
+        conn.execute(
+            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES ('B', 'A', 'dependsOn')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_relationships (task_id, related_id, rel_type) VALUES ('C', 'B', 'dependsOn')",
+            [],
+        ).unwrap();
+
+        // Write PRD JSON with all three tasks having passes: true
+        let prd_path = temp_dir.path().join("prd.json");
+        let mut f = std::fs::File::create(&prd_path).unwrap();
+        f.write_all(
+            br#"{"userStories":[
+                {"id":"A","passes":true},
+                {"id":"B","passes":true},
+                {"id":"C","passes":true}
+            ]}"#,
+        )
+        .unwrap();
+
+        reconcile_passes_with_db(&conn, &prd_path, None);
+
+        // All three should be done
+        for id in &["A", "B", "C"] {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "done", "Task {} should be done after reconciliation", id);
+        }
     }
 
     #[test]

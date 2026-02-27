@@ -594,8 +594,17 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             config.verbose = verbose || cli.verbose;
             config.use_worktrees = !no_worktree;
 
+            // Anchor db_dir to source_root so worktrees don't create a separate DB.
+            // If the user passed an absolute --dir, respect it; otherwise resolve
+            // the relative default (".task-mgr") against the project root.
+            let db_dir = if cli.dir.is_relative() {
+                project_root.join(&cli.dir)
+            } else {
+                cli.dir.clone()
+            };
+
             let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
-                db_dir: cli.dir.clone(),
+                db_dir,
                 source_root: project_root.clone(),
                 working_root: project_root, // May be updated by run_loop if using worktrees
                 prd_file,
