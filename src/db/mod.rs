@@ -8,6 +8,7 @@
 pub mod connection;
 pub mod lock;
 pub mod migrations;
+pub mod prefix;
 pub mod schema;
 
 pub use connection::open_connection;
