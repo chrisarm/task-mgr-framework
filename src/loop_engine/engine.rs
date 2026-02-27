@@ -22,6 +22,7 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
+use crate::db::prefix::prefix_and;
 use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
@@ -293,13 +294,18 @@ pub fn run_iteration(
         Ok(Some(result)) => result,
         Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
+            let (rem_pfx_clause, rem_pfx_param) = prefix_and(params.task_prefix);
+            let rem_sql = format!(
+                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {rem_pfx_clause}"
+            );
+            let rem_params: Vec<&dyn rusqlite::types::ToSql> =
+                match &rem_pfx_param {
+                    Some(p) => vec![p],
+                    None => vec![],
+                };
             let remaining: i64 = params
                 .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
                 .unwrap_or(0);
             if remaining == 0 {
                 eprintln!("All tasks complete!");
@@ -322,11 +328,18 @@ pub fn run_iteration(
                 reconcile_passes_with_db(params.conn, prd, params.task_prefix);
             }
 
-            let recovered = params.conn
-                .execute(
-                    "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
-                    [],
-                )
+            let (mid_pfx_clause, mid_pfx_param) = prefix_and(params.task_prefix);
+            let mid_recovery_sql = format!(
+                "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {mid_pfx_clause}"
+            );
+            let mid_params: Vec<&dyn rusqlite::types::ToSql> =
+                match &mid_pfx_param {
+                    Some(p) => vec![p],
+                    None => vec![],
+                };
+            let recovered = params
+                .conn
+                .execute(&mid_recovery_sql, mid_params.as_slice())
                 .unwrap_or(0);
 
             if recovered > 0 {
@@ -691,12 +704,32 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
     }
 
+    // Step 6.55: Read task prefix from PRD JSON before initial recovery so the
+    // recovery query can be scoped to this PRD's tasks only.
+    let early_task_prefix: Option<String> = {
+        std::fs::read_to_string(&run_config.prd_file)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| {
+                v.get("taskPrefix")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    };
+
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
     // Safe because we hold the exclusive loop lock — no other loop can be running.
-    match conn.execute(
-        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
-        [],
-    ) {
+    // Scoped by prefix so concurrent loops on different PRDs don't reset each other.
+    let (recovery_pfx_clause, recovery_pfx_param) = prefix_and(early_task_prefix.as_deref());
+    let recovery_sql = format!(
+        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
+    );
+    let recovery_params: Vec<&dyn rusqlite::types::ToSql> =
+        match &recovery_pfx_param {
+            Some(p) => vec![p as &dyn rusqlite::types::ToSql],
+            None => vec![],
+        };
+    match conn.execute(&recovery_sql, recovery_params.as_slice()) {
         Ok(count) if count > 0 => {
             eprintln!(
                 "Recovered {} stale in_progress task(s) from previous run",
@@ -1296,12 +1329,18 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
         )
         .unwrap_or((None, None, None, None));
 
+    let (tc_pfx_clause, tc_pfx_param) = prefix_and(task_prefix.as_deref());
+    let tc_sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {tc_pfx_clause}"
+    );
+    let tc_params: Vec<&dyn rusqlite::types::ToSql> = match &tc_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
     let task_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row(&tc_sql, tc_params.as_slice(), |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c as usize)
         .unwrap_or(0);
 
@@ -1521,16 +1560,23 @@ fn mark_task_done(
 fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Option<&str>) {
     use std::fs;
 
-    // Get all todo/in_progress task IDs from the DB
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')") {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+    // Get all todo/in_progress task IDs from the DB, scoped to this PRD's prefix.
+    let (rpdb_pfx_clause, rpdb_pfx_param) = prefix_and(task_prefix);
+    let rpdb_sql = format!(
+        "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') {rpdb_pfx_clause}"
+    );
+    let mut stmt = match conn.prepare(&rpdb_sql) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let rpdb_params: Vec<&dyn rusqlite::types::ToSql> = match &rpdb_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
     let candidate_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
+        .query_map(rpdb_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
         .unwrap_or_default();
 
     if candidate_ids.is_empty() {
@@ -1650,17 +1696,24 @@ fn scan_output_for_completed_tasks(
 ) -> Vec<String> {
     let mut completed = Vec::new();
 
-    // Query all non-done task IDs
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
-            Ok(s) => s,
-            Err(_) => return completed,
-        };
+    // Query all non-done task IDs, scoped to this PRD's prefix.
+    let (soct_pfx_clause, soct_pfx_param) = prefix_and(task_prefix);
+    let soct_sql = format!(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {soct_pfx_clause}"
+    );
+    let mut stmt = match conn.prepare(&soct_sql) {
+        Ok(s) => s,
+        Err(_) => return completed,
+    };
 
+    let soct_params: Vec<&dyn rusqlite::types::ToSql> = match &soct_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
     let task_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
+        .query_map(soct_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
         .unwrap_or_default();
 
     for task_id in task_ids {
@@ -1732,20 +1785,27 @@ fn reconcile_external_git_completions(
     // to prevent cross-commit substring collisions.
     let commit_lines: Vec<String> = output.lines().map(|l| l.to_uppercase()).collect();
 
-    // Query all incomplete task IDs
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-                return 0;
-            }
-        };
+    // Query all incomplete task IDs, scoped to this PRD's prefix.
+    let (regc_pfx_clause, regc_pfx_param) = prefix_and(task_prefix);
+    let regc_sql = format!(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {regc_pfx_clause}"
+    );
+    let mut stmt = match conn.prepare(&regc_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+            return 0;
+        }
+    };
 
+    let regc_params: Vec<&dyn rusqlite::types::ToSql> = match &regc_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
     let task_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
+        .query_map(regc_params.as_slice(), |row| row.get(0))
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .map(|rows| rows.filter_map(|r: rusqlite::Result<String>| r.ok()).collect())
         .unwrap_or_default();
 
     drop(stmt);
