@@ -22,7 +22,7 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
-use crate::db::prefix::prefix_and;
+use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
@@ -630,13 +630,41 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     // Must be before any DB mutations (init, migrations, recovery).
     // Separate from tasks.db.lock (short-lived per-command) so read-only commands
     // like `status` and `stats` are not blocked.
-    let _loop_lock = match LockGuard::acquire_named(&run_config.db_dir, "loop.lock") {
+    //
+    // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
+    // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
+    // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
+    let pre_lock_prefix: Option<String> = std::fs::read_to_string(&run_config.prd_file)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| {
+            v.get("taskPrefix")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .and_then(|p| {
+            // Only use prefix if it is safe for filenames
+            if validate_prefix(&p).is_ok() {
+                Some(p)
+            } else {
+                None
+            }
+        });
+    let lock_name = match &pre_lock_prefix {
+        Some(p) => format!("loop-{p}.lock"),
+        None => "loop.lock".to_string(),
+    };
+    let _loop_lock = match LockGuard::acquire_named(&run_config.db_dir, &lock_name) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!(
-                "Error: another loop is already running on this database. {}",
-                e
-            );
+            match &pre_lock_prefix {
+                Some(p) => eprintln!(
+                    "Error: another loop is already running for PRD prefix {p}. {e}"
+                ),
+                None => eprintln!(
+                    "Error: another loop is already running on this database. {e}"
+                ),
+            }
             return 1;
         }
     };
