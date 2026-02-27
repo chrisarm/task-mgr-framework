@@ -537,4 +537,176 @@ mod tests {
         let path = pause_file_path(Path::new("/project/tasks"));
         assert_eq!(path, PathBuf::from("/project/tasks/.pause"));
     }
+
+    // --- Per-session (prefix-scoped) signal file tests ---
+    //
+    // These tests define the expected behavior after prefix support is added to
+    // check_stop_signal and check_pause_signal. They will fail to compile until
+    // the functions accept `prefix: Option<&str>` as a second parameter.
+
+    #[test]
+    fn test_check_stop_signal_prefix_matches_session_specific_file() {
+        // .stop-P1 exists → prefix "P1" triggers stop
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+
+        assert!(check_stop_signal(temp_dir.path(), Some("P1")));
+    }
+
+    #[test]
+    fn test_check_stop_signal_prefix_no_match_other_session_file() {
+        // .stop-P1 exists → prefix "P2" must NOT trigger stop (known-bad discriminator)
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+
+        assert!(!check_stop_signal(temp_dir.path(), Some("P2")));
+    }
+
+    #[test]
+    fn test_check_stop_signal_global_fallback_triggers_for_prefixed_session() {
+        // Global .stop exists → any prefixed session (P1, P2) must trigger stop
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
+
+        assert!(check_stop_signal(temp_dir.path(), Some("P1")));
+        assert!(check_stop_signal(temp_dir.path(), Some("P2")));
+    }
+
+    #[test]
+    fn test_check_stop_signal_global_fallback_triggers_for_no_prefix() {
+        // Global .stop exists → session with no prefix must also trigger
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
+
+        assert!(check_stop_signal(temp_dir.path(), None));
+    }
+
+    #[test]
+    fn test_check_stop_signal_no_file_no_trigger_with_prefix() {
+        // No signal files at all → must not trigger for any prefix
+        let temp_dir = TempDir::new().unwrap();
+
+        assert!(!check_stop_signal(temp_dir.path(), Some("P1")));
+        assert!(!check_stop_signal(temp_dir.path(), None));
+    }
+
+    #[test]
+    fn test_check_stop_signal_session_specific_does_not_trigger_for_none_prefix() {
+        // .stop-P1 exists but no global .stop → session with no prefix must NOT trigger
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+
+        assert!(!check_stop_signal(temp_dir.path(), None));
+    }
+
+    #[test]
+    fn test_check_stop_signal_prefix_file_takes_priority_over_global() {
+        // Both .stop-P1 and global .stop exist → P1 prefix still triggers (via session file)
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+        fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
+
+        assert!(check_stop_signal(temp_dir.path(), Some("P1")));
+    }
+
+    #[test]
+    fn test_check_pause_signal_prefix_matches_session_specific_file() {
+        // .pause-P1 exists → prefix "P1" triggers pause
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".pause-P1"), "").unwrap();
+
+        assert!(check_pause_signal(temp_dir.path(), Some("P1")));
+    }
+
+    #[test]
+    fn test_check_pause_signal_prefix_no_match_other_session_file() {
+        // .pause-P1 exists → prefix "P2" must NOT trigger pause
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".pause-P1"), "").unwrap();
+
+        assert!(!check_pause_signal(temp_dir.path(), Some("P2")));
+    }
+
+    #[test]
+    fn test_check_pause_signal_global_fallback_triggers_for_prefixed_session() {
+        // Global .pause exists → any prefixed session (P1, P2) must trigger pause
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(PAUSE_FILE), "").unwrap();
+
+        assert!(check_pause_signal(temp_dir.path(), Some("P1")));
+        assert!(check_pause_signal(temp_dir.path(), Some("P2")));
+    }
+
+    #[test]
+    fn test_check_pause_signal_global_fallback_triggers_for_no_prefix() {
+        // Global .pause exists → session with no prefix must also trigger
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(PAUSE_FILE), "").unwrap();
+
+        assert!(check_pause_signal(temp_dir.path(), None));
+    }
+
+    #[test]
+    fn test_check_pause_signal_no_file_no_trigger() {
+        // No signal files → must not trigger for any prefix
+        let temp_dir = TempDir::new().unwrap();
+
+        assert!(!check_pause_signal(temp_dir.path(), Some("P1")));
+        assert!(!check_pause_signal(temp_dir.path(), None));
+    }
+
+    #[test]
+    fn test_check_pause_signal_session_specific_does_not_trigger_for_none_prefix() {
+        // .pause-P1 exists but no global .pause → session with no prefix must NOT trigger
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".pause-P1"), "").unwrap();
+
+        assert!(!check_pause_signal(temp_dir.path(), None));
+    }
+
+    // --- Prefix-scoped cleanup tests ---
+
+    #[test]
+    fn test_cleanup_signal_files_prefix_removes_only_session_specific_files() {
+        // cleanup with prefix "P1" removes .stop-P1 and .pause-P1, not global or P2 files
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+        fs::write(temp_dir.path().join(".pause-P1"), "").unwrap();
+        fs::write(temp_dir.path().join(".stop-P2"), "").unwrap();
+        fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
+        fs::write(temp_dir.path().join(PAUSE_FILE), "").unwrap();
+
+        cleanup_signal_files_for_prefix(temp_dir.path(), Some("P1"));
+
+        // Session-specific P1 files removed
+        assert!(!temp_dir.path().join(".stop-P1").exists());
+        assert!(!temp_dir.path().join(".pause-P1").exists());
+        // Other session and global files preserved
+        assert!(temp_dir.path().join(".stop-P2").exists());
+        assert!(temp_dir.path().join(STOP_FILE).exists());
+        assert!(temp_dir.path().join(PAUSE_FILE).exists());
+    }
+
+    #[test]
+    fn test_cleanup_signal_files_no_prefix_removes_global_files_only() {
+        // cleanup with no prefix removes global .stop and .pause, not session-specific
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
+        fs::write(temp_dir.path().join(PAUSE_FILE), "").unwrap();
+        fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
+
+        cleanup_signal_files_for_prefix(temp_dir.path(), None);
+
+        assert!(!temp_dir.path().join(STOP_FILE).exists());
+        assert!(!temp_dir.path().join(PAUSE_FILE).exists());
+        // Session-specific file preserved
+        assert!(temp_dir.path().join(".stop-P1").exists());
+    }
+
+    #[test]
+    fn test_cleanup_signal_files_prefix_handles_nonexistent_files_gracefully() {
+        // cleanup with a prefix when no matching files exist must not panic
+        let temp_dir = TempDir::new().unwrap();
+        cleanup_signal_files_for_prefix(temp_dir.path(), Some("P1"));
+    }
 }
