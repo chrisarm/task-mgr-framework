@@ -1149,6 +1149,213 @@ fn test_migration_v8_multiple_tags_stored_space_separated() {
     );
 }
 
+// ========== Migration v9 Tests (prd_metadata singleton removal) ==========
+//
+// v9 removes CHECK(id=1) from prd_metadata (requires table recreation in SQLite),
+// adds UNIQUE constraint on task_prefix, and enables AUTOINCREMENT for new rows.
+// The down migration restores the singleton constraint and copies back the first row.
+
+/// Apply migrations up to exactly v8 (for v9 test setup).
+fn migrate_to_v8(conn: &mut Connection) {
+    for _ in 0..8 {
+        migrate_up(conn).unwrap();
+    }
+    assert_eq!(get_schema_version(conn).unwrap(), 8);
+}
+
+#[test]
+fn test_migration_v9_schema_version_is_9() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    // Apply all migrations — v9 is now the latest
+    run_migrations(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(
+        version, 9,
+        "schema_version should be 9 after all migrations"
+    );
+}
+
+#[test]
+fn test_migration_v9_up_preserves_existing_prd_metadata_row() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+
+    // Insert a prd_metadata row at id=1 with a task_prefix (v5 added that column)
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'my-prd', 'SS')",
+        [],
+    )
+    .unwrap();
+
+    // Apply v9
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    // The existing row must still be present with original data
+    let (project, task_prefix): (String, Option<String>) = conn
+        .query_row(
+            "SELECT project, task_prefix FROM prd_metadata WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(project, "my-prd");
+    assert_eq!(task_prefix, Some("SS".to_string()));
+}
+
+#[test]
+fn test_migration_v9_allows_inserting_second_row() {
+    // Known-bad discriminator: inserting id=2 must succeed after v9 migration.
+    // This would fail with SQLITE_CONSTRAINT if CHECK(id=1) were still present.
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'prd-one', 'P1')",
+        [],
+    )
+    .unwrap();
+
+    // Apply v9
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    // Must succeed — CHECK(id=1) is gone
+    let result = conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (2, 'prd-two', 'P2')",
+        [],
+    );
+    assert!(
+        result.is_ok(),
+        "Inserting id=2 must succeed after v9 migration (CHECK(id=1) removed): {:?}",
+        result.err()
+    );
+
+    // Both rows must be readable
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "Both prd_metadata rows must exist after insert");
+}
+
+#[test]
+fn test_migration_v9_task_prefix_unique_constraint() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'prd-one', 'SS')",
+        [],
+    )
+    .unwrap();
+
+    // Inserting a second row with the same task_prefix must fail
+    let result = conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (2, 'prd-two', 'SS')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "Duplicate task_prefix must be rejected by UNIQUE constraint"
+    );
+}
+
+#[test]
+fn test_migration_v9_null_task_prefix_not_unique_constrained() {
+    // NULL task_prefix is allowed for multiple rows (SQLite: UNIQUE allows multiple NULLs)
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'prd-one', NULL)",
+        [],
+    )
+    .unwrap();
+
+    let result = conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (2, 'prd-two', NULL)",
+        [],
+    );
+    assert!(
+        result.is_ok(),
+        "Multiple rows with NULL task_prefix must be allowed (SQLite UNIQUE semantics): {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_migration_v9_down_reverts_to_v8() {
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+
+    // Insert a row before applying v9
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'my-prd', 'SS')",
+        [],
+    )
+    .unwrap();
+
+    // Apply v9
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    // Add a second row (only possible after v9)
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (2, 'other-prd', 'P2')",
+        [],
+    )
+    .unwrap();
+
+    // Migrate down to v8
+    migrate_down(&mut conn).unwrap();
+
+    let version = get_schema_version(&conn).unwrap();
+    assert_eq!(version, 8, "schema_version must revert to 8 after v9 down");
+}
+
+#[test]
+fn test_migration_v9_down_restores_singleton_constraint() {
+    // After down migration, CHECK(id=1) must be restored so id=2 inserts fail again.
+    let (_temp_dir, mut conn) = setup_db();
+
+    migrate_to_v8(&mut conn);
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    // Insert row 1
+    conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (1, 'my-prd', 'SS')",
+        [],
+    )
+    .unwrap();
+
+    // Migrate back down
+    migrate_down(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 8);
+
+    // After down migration, id=2 insert must fail (CHECK(id=1) restored)
+    let result = conn.execute(
+        "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (2, 'other-prd', 'P2')",
+        [],
+    );
+    assert!(
+        result.is_err(),
+        "Inserting id=2 must fail after v9 down migration (CHECK(id=1) restored)"
+    );
+}
+
 #[test]
 fn test_migration_v8_fts5_rebuild_succeeds() {
     // Edge case from TEST-INIT-004: FTS5 rebuild command must succeed after migration.
