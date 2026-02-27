@@ -1301,7 +1301,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
     // Step 20: Recalibrate weights if completed
     if final_run_status == RunStatus::Completed {
-        on_run_completed(&conn);
+        on_run_completed(&conn, task_prefix.as_deref());
     }
 
     // Step 21: Cleanup
@@ -1431,8 +1431,8 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
 ///
 /// Analyzes historical task outcomes and adjusts the scoring weights used by
 /// `select_next_task()`. Errors are logged but do not propagate (best-effort).
-pub fn on_run_completed(conn: &Connection) {
-    match calibrate::recalibrate_weights(conn) {
+pub fn on_run_completed(conn: &Connection, task_prefix: Option<&str>) {
+    match calibrate::recalibrate_weights(conn, task_prefix) {
         Ok(weights) => {
             let defaults = calibrate::SelectionWeights::default();
             if weights != defaults {
@@ -2402,7 +2402,7 @@ mod tests {
         let (_temp_dir, conn) = setup_test_db();
 
         // Should not panic even with no data
-        on_run_completed(&conn);
+        on_run_completed(&conn, None);
     }
 
     // --- record_session_guidance tests ---

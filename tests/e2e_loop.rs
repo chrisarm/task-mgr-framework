@@ -759,7 +759,7 @@ fn test_full_feedback_loop_lifecycle() {
     }
 
     // Step 9: Recalibrate weights (simulates what engine does at end)
-    let weights = task_mgr::loop_engine::calibrate::recalibrate_weights(&conn).unwrap();
+    let weights = task_mgr::loop_engine::calibrate::recalibrate_weights(&conn, None).unwrap();
     // With only 3 completed tasks (below 10 threshold), defaults returned
     // but the function still executes without error
     assert_eq!(
