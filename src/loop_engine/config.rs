@@ -164,6 +164,8 @@ pub enum IterationOutcome {
     Stale,
     /// Claude produced no output (empty response with exit 0)
     Empty,
+    /// Prompt critical sections exceed the total character budget
+    PromptOverflow,
 }
 
 /// Calculate the maximum number of iterations for a given task count.

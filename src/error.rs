@@ -112,6 +112,17 @@ pub enum TaskMgrError {
         hint: String,
     },
 
+    /// Prompt critical sections exceed the total character budget.
+    #[error("Prompt critical sections ({critical_size} bytes) exceed budget ({budget} bytes) for task {task_id}. Reduce base prompt.md size or split the task.")]
+    PromptOverflow {
+        /// Total size of all critical sections in bytes
+        critical_size: usize,
+        /// Total prompt character budget
+        budget: usize,
+        /// Task ID being built
+        task_id: String,
+    },
+
     /// Unsafe path detected (potential path traversal attack).
     #[error("Unsafe path in {context}: '{path}' - {reason}")]
     UnsafePath {

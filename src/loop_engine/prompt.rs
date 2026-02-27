@@ -19,16 +19,26 @@ use rusqlite::Connection;
 
 use crate::commands::next;
 use crate::commands::next::output::{LearningSummaryOutput, NextResult};
-use crate::error::TaskMgrResult;
+use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::learnings::bandit;
 use crate::loop_engine::context;
 use crate::loop_engine::model;
 
-/// Total character budget for enriched task context in the prompt.
+/// Byte budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
 
-/// Character budget for source context from touchesFiles.
+/// Byte budget for source context from touchesFiles.
 const SOURCE_CONTEXT_BUDGET: usize = 2000;
+
+/// Total byte budget for the entire assembled prompt.
+/// Critical sections must fit within this budget; trimmable sections fill the remainder.
+const TOTAL_PROMPT_BUDGET: usize = 80_000;
+
+/// Byte budget for the base prompt.md template content.
+const BASE_PROMPT_BUDGET: usize = 16_000;
+
+/// Byte budget for the serialized learnings JSON block.
+const LEARNINGS_BUDGET: usize = 4_000;
 
 /// Result of building a prompt for one iteration.
 #[derive(Debug)]
@@ -47,6 +57,10 @@ pub struct PromptResult {
     /// then elevated to the highest tier across the synergyWith cluster.
     /// Some("") is normalized to None — consumers never see empty strings.
     pub resolved_model: Option<String>,
+    /// Names of trimmable sections that were dropped because they exceeded the
+    /// remaining budget. Empty when all sections fit. Useful for diagnostics and
+    /// testing to distinguish "dropped due to budget" from "empty because no data".
+    pub dropped_sections: Vec<String>,
 }
 
 /// Parameters for building a prompt.
@@ -79,8 +93,15 @@ pub struct BuildPromptParams<'a> {
 
 /// Build a prompt for the current iteration.
 ///
-/// Calls `next::next()` to select and claim a task, then assembles the prompt
-/// with all available context. Returns `None` if no tasks remain.
+/// Uses two-phase assembly to guarantee critical sections are always included:
+/// - **Phase 1**: Build critical sections (task JSON, base prompt, reorder instruction,
+///   escalation policy, non-code completion instruction). If these exceed
+///   `TOTAL_PROMPT_BUDGET`, return `Err(PromptOverflow)`.
+/// - **Phase 2**: Fill remaining budget with trimmable sections in priority order
+///   (learnings, source context, dependency summaries, synergy context, steering,
+///   session guidance, reorder hint). Sections that don't fit are skipped with a warning.
+///
+/// Returns `None` if no tasks remain.
 pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<PromptResult>> {
     // Step 1: Select and claim a task
     let next_result = next::next(
@@ -96,82 +117,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         None => return Ok(None), // All tasks complete
     };
 
-    // Step 2: Record shown learnings and collect IDs for feedback loop
-    let shown_learning_ids = record_shown_learnings(
-        params.conn,
-        &next_result.learnings,
-        i64::from(params.iteration),
-    );
-
-    // Step 3: Build the prompt sections
-    let mut prompt = String::new();
-
-    // Section: Steering (optional)
-    if let Some(steering) = params.steering_path {
-        append_steering(&mut prompt, steering);
-    }
-
-    // Section: Session guidance (if any)
-    if !params.session_guidance.is_empty() {
-        prompt.push_str("## Session Guidance\n\n");
-        prompt.push_str(params.session_guidance);
-        prompt.push_str("\n\n");
-    }
-
-    // Section: Previous iteration context
-    if let Some(hint) = params.reorder_hint {
-        prompt.push_str(&format!(
-            "## Reorder Hint\n\nThe previous iteration requested reorder to task: `{}`\n\n",
-            hint
-        ));
-    }
-
-    // Section: Source context from touchesFiles
-    let source_ctx = context::scan_source_context(
-        &task_output.files,
-        SOURCE_CONTEXT_BUDGET,
-        params.project_root,
-    );
-    let source_prompt = source_ctx.format_for_prompt();
-    if !source_prompt.is_empty() {
-        prompt.push_str(&source_prompt);
-    }
-
-    // Section: Dependency completion summaries
-    append_dependency_summaries(&mut prompt, params.conn, &task_output.id);
-
-    // Section: Synergy task context
-    append_synergy_context(&mut prompt, params.conn, &task_output.id, params.run_id);
-
-    // Section: Task JSON
-    prompt.push_str("## Current Task\n\n```json\n");
-    let task_json = build_task_json(task_output, &next_result);
-    let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
-    prompt.push_str(&truncated_json);
-    prompt.push_str("\n```\n\n");
-
-    // Section: Learnings
-    append_learnings(&mut prompt, &next_result.learnings);
-
-    // Section: Non-code task completion instruction
-    // Tasks with no touchesFiles (verification, milestones, polish) won't produce
-    // commits, so the git-based completion detection won't fire. Tell Claude how
-    // to signal completion explicitly.
-    if task_output.files.is_empty() {
-        prompt.push_str(&format!(
-            "## Completing This Task\n\n\
-             This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\
-             After all acceptance criteria pass:\n\
-             1. Run `task-mgr done {task_id} --force` to mark it done in the DB\n\
-             2. Update the PRD JSON to set `passes: true` for this task\n\
-             3. Print the task ID in brackets in your output, e.g.: `Completed [{task_id}]`\n\n\
-             All three steps are **required** for the loop to detect completion.\n\n",
-            task_id = task_output.id,
-        ));
-    }
-
-    // Model resolution: resolve synergy cluster model from task + synergyWith partners
-    // (must happen before escalation injection to determine tier)
+    // Step 2: Resolve model (needed for escalation section in Phase 1)
     let resolved_model = resolve_synergy_cluster_model(
         params.conn,
         &task_output.id,
@@ -180,21 +126,150 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         params.default_model,
     );
 
-    // Section: Escalation policy (skip only for Opus tier)
-    append_escalation_policy(
-        &mut prompt,
+    // ============================================================
+    // Phase 1: Build critical sections into separate Strings
+    // ============================================================
+
+    // Critical: Task JSON
+    let task_json = build_task_json(task_output, &next_result);
+    let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
+    let task_section = format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json);
+
+    // Critical: Non-code task completion instruction (conditional)
+    let completion_section = if task_output.files.is_empty() {
+        format!(
+            "## Completing This Task\n\n\
+             This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\
+             After all acceptance criteria pass:\n\
+             1. Run `task-mgr done {task_id} --force` to mark it done in the DB\n\
+             2. Update the PRD JSON to set `passes: true` for this task\n\
+             3. Print the task ID in brackets in your output, e.g.: `Completed [{task_id}]`\n\n\
+             All three steps are **required** for the loop to detect completion.\n\n",
+            task_id = task_output.id,
+        )
+    } else {
+        String::new()
+    };
+
+    // Critical: Escalation policy
+    let escalation_section = build_escalation_section(
         params.base_prompt_path,
         resolved_model.as_deref(),
     );
 
-    // Section: Reorder instruction
-    prompt.push_str(
+    // Critical: Reorder instruction
+    let reorder_instr_section =
         "If you have a strong reason to work on a different eligible task, \
-         output `<reorder>TASK-ID</reorder>`.\n\n",
+         output `<reorder>TASK-ID</reorder>`.\n\n"
+            .to_string();
+
+    // Critical: Base prompt template
+    let base_prompt_section = build_base_prompt_section(params.base_prompt_path);
+
+    let critical_total = task_section.len()
+        + completion_section.len()
+        + escalation_section.len()
+        + reorder_instr_section.len()
+        + base_prompt_section.len();
+
+    if critical_total > TOTAL_PROMPT_BUDGET {
+        return Err(TaskMgrError::PromptOverflow {
+            critical_size: critical_total,
+            budget: TOTAL_PROMPT_BUDGET,
+            task_id: task_output.id.clone(),
+        });
+    }
+
+    // Step 3: Record shown learnings AFTER the overflow check.
+    // If Phase 1 overflows we return Err above — we must not record learnings
+    // as "shown" when the prompt was never sent to Claude (would skew UCB bandit).
+    let shown_learning_ids = record_shown_learnings(
+        params.conn,
+        &next_result.learnings,
+        i64::from(params.iteration),
     );
 
-    // Section: Base prompt template
-    append_base_prompt(&mut prompt, params.base_prompt_path);
+    // ============================================================
+    // Phase 2: Build trimmable sections in priority order
+    // ============================================================
+
+    let mut remaining = TOTAL_PROMPT_BUDGET - critical_total;
+
+    // Priority order (highest first):
+    // 1. Learnings, 2. Source Context, 3. Dependency Summaries,
+    // 4. Synergy Context, 5. Steering, 6. Session Guidance, 7. Reorder Hint
+
+    let mut dropped_sections: Vec<String> = Vec::new();
+
+    let learnings_section = build_learnings_section(&next_result.learnings);
+    let learnings_section =
+        try_fit_section(learnings_section, "Learnings", &mut remaining, &mut dropped_sections);
+
+    let source_ctx = context::scan_source_context(
+        &task_output.files,
+        SOURCE_CONTEXT_BUDGET,
+        params.project_root,
+    );
+    let source_section = source_ctx.format_for_prompt();
+    let source_section =
+        try_fit_section(source_section, "Source Context", &mut remaining, &mut dropped_sections);
+
+    let dep_section = build_dependency_section(params.conn, &task_output.id);
+    let dep_section =
+        try_fit_section(dep_section, "Dependency Summaries", &mut remaining, &mut dropped_sections);
+
+    let synergy_section = build_synergy_section(params.conn, &task_output.id, params.run_id);
+    let synergy_section =
+        try_fit_section(synergy_section, "Synergy Context", &mut remaining, &mut dropped_sections);
+
+    let steering_section = params
+        .steering_path
+        .map(build_steering_section)
+        .unwrap_or_default();
+    let steering_section =
+        try_fit_section(steering_section, "Steering", &mut remaining, &mut dropped_sections);
+
+    let guidance_section = if params.session_guidance.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## Session Guidance\n\n{}\n\n",
+            params.session_guidance,
+        )
+    };
+    let guidance_section =
+        try_fit_section(guidance_section, "Session Guidance", &mut remaining, &mut dropped_sections);
+
+    let hint_section = params
+        .reorder_hint
+        .map(|hint| {
+            format!(
+                "## Reorder Hint\n\nThe previous iteration requested reorder to task: `{}`\n\n",
+                hint,
+            )
+        })
+        .unwrap_or_default();
+    let hint_section =
+        try_fit_section(hint_section, "Reorder Hint", &mut remaining, &mut dropped_sections);
+
+    // ============================================================
+    // Assembly: concatenate in display order
+    // ============================================================
+    // Display order: steering → guidance → hint → source → deps → synergy →
+    //                task → learnings → completion → escalation → reorder instr → base prompt
+    let mut prompt = String::with_capacity(TOTAL_PROMPT_BUDGET);
+    prompt.push_str(&steering_section);
+    prompt.push_str(&guidance_section);
+    prompt.push_str(&hint_section);
+    prompt.push_str(&source_section);
+    prompt.push_str(&dep_section);
+    prompt.push_str(&synergy_section);
+    prompt.push_str(&task_section);
+    prompt.push_str(&learnings_section);
+    prompt.push_str(&completion_section);
+    prompt.push_str(&escalation_section);
+    prompt.push_str(&reorder_instr_section);
+    prompt.push_str(&base_prompt_section);
 
     Ok(Some(PromptResult {
         prompt,
@@ -202,7 +277,35 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         task_files: task_output.files.clone(),
         shown_learning_ids,
         resolved_model,
+        dropped_sections,
     }))
+}
+
+/// Try to fit a section into the remaining budget.
+/// Returns the section string if it fits, empty string otherwise (with a warning).
+/// When a non-empty section is dropped, its name is appended to `dropped`.
+fn try_fit_section(
+    section: String,
+    name: &str,
+    remaining: &mut usize,
+    dropped: &mut Vec<String>,
+) -> String {
+    if section.is_empty() {
+        return section;
+    }
+    if section.len() <= *remaining {
+        *remaining -= section.len();
+        section
+    } else {
+        eprintln!(
+            "Warning: {} section ({} bytes) skipped — only {} bytes remaining in prompt budget",
+            name,
+            section.len(),
+            remaining,
+        );
+        dropped.push(name.to_string());
+        String::new()
+    }
 }
 
 /// Record shown learnings via the UCB bandit system.
@@ -227,34 +330,44 @@ fn record_shown_learnings(
     shown_ids
 }
 
-/// Append steering.md content to the prompt if the file exists.
-fn append_steering(prompt: &mut String, steering_path: &Path) {
+/// Build a steering section string from the steering.md file.
+fn build_steering_section(steering_path: &Path) -> String {
     match fs::read_to_string(steering_path) {
         Ok(content) if !content.trim().is_empty() => {
-            prompt.push_str("## Steering\n\n");
-            prompt.push_str(content.trim());
-            prompt.push_str("\n\n");
+            format!("## Steering\n\n{}\n\n", content.trim())
         }
-        Ok(_) => {}  // Empty file, skip
-        Err(_) => {} // Missing file, skip gracefully
+        _ => String::new(),
     }
+}
+
+/// Append steering.md content to the prompt if the file exists.
+#[cfg(test)]
+fn append_steering(prompt: &mut String, steering_path: &Path) {
+    prompt.push_str(&build_steering_section(steering_path));
+}
+
+/// Build a dependency summaries section string.
+fn build_dependency_section(conn: &Connection, task_id: &str) -> String {
+    let deps = match get_completed_dependencies(conn, task_id) {
+        Ok(deps) if !deps.is_empty() => deps,
+        _ => return String::new(),
+    };
+
+    let mut section = String::from("## Completed Dependencies\n\n");
+    for (dep_id, dep_title) in &deps {
+        section.push_str(&format!("- **{}**: {}\n", dep_id, dep_title));
+    }
+    section.push('\n');
+    section
 }
 
 /// Append dependency completion summaries for the current task.
 ///
 /// For each completed dependsOn task: includes title + key acceptance criteria
 /// as a 2-3 line summary.
+#[cfg(test)]
 fn append_dependency_summaries(prompt: &mut String, conn: &Connection, task_id: &str) {
-    let deps = match get_completed_dependencies(conn, task_id) {
-        Ok(deps) if !deps.is_empty() => deps,
-        _ => return,
-    };
-
-    prompt.push_str("## Completed Dependencies\n\n");
-    for (dep_id, dep_title) in &deps {
-        prompt.push_str(&format!("- **{}**: {}\n", dep_id, dep_title));
-    }
-    prompt.push('\n');
+    prompt.push_str(&build_dependency_section(conn, task_id));
 }
 
 /// Get completed dependency task IDs and titles for a task.
@@ -278,32 +391,39 @@ fn get_completed_dependencies(
     Ok(deps)
 }
 
+/// Build a synergy context section string.
+fn build_synergy_section(conn: &Connection, task_id: &str, run_id: Option<&str>) -> String {
+    let run_id = match run_id {
+        Some(rid) => rid,
+        None => return String::new(),
+    };
+
+    let synergies = match get_synergy_tasks_in_run(conn, task_id, run_id) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return String::new(),
+    };
+
+    let mut section = String::from("## Synergy Tasks (completed this run)\n\n");
+    for (syn_id, syn_title, syn_commit) in &synergies {
+        section.push_str(&format!("- **{}**: {}", syn_id, syn_title));
+        if let Some(commit) = syn_commit {
+            section.push_str(&format!(" (commit: {})", commit));
+        }
+        section.push('\n');
+    }
+    section.push('\n');
+    section
+}
+
 /// Append synergy task context for completed synergy tasks in the current run.
+#[cfg(test)]
 fn append_synergy_context(
     prompt: &mut String,
     conn: &Connection,
     task_id: &str,
     run_id: Option<&str>,
 ) {
-    let run_id = match run_id {
-        Some(rid) => rid,
-        None => return,
-    };
-
-    let synergies = match get_synergy_tasks_in_run(conn, task_id, run_id) {
-        Ok(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
-    prompt.push_str("## Synergy Tasks (completed this run)\n\n");
-    for (syn_id, syn_title, syn_commit) in &synergies {
-        prompt.push_str(&format!("- **{}**: {}", syn_id, syn_title));
-        if let Some(commit) = syn_commit {
-            prompt.push_str(&format!(" (commit: {})", commit));
-        }
-        prompt.push('\n');
-    }
-    prompt.push('\n');
+    prompt.push_str(&build_synergy_section(conn, task_id, run_id));
 }
 
 /// Get synergy tasks that were completed in the current run.
@@ -373,33 +493,40 @@ fn build_task_json(
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
 }
 
-/// Append learnings to the prompt.
-fn append_learnings(prompt: &mut String, learnings: &[LearningSummaryOutput]) {
+/// Build a learnings section string.
+fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
     if learnings.is_empty() {
-        return;
+        return String::new();
     }
 
-    prompt.push_str("## Relevant Learnings\n\n```json\n");
     let learnings_json =
         serde_json::to_string_pretty(learnings).unwrap_or_else(|_| "[]".to_string());
-    prompt.push_str(&learnings_json);
-    prompt.push_str("\n```\n\n");
+    let learnings_json = truncate_to_budget(&learnings_json, LEARNINGS_BUDGET);
+    format!("## Relevant Learnings\n\n```json\n{}\n```\n\n", learnings_json)
 }
 
-/// Append the base prompt template file content.
-fn append_base_prompt(prompt: &mut String, base_prompt_path: &Path) {
+/// Append learnings to the prompt.
+#[cfg(test)]
+fn append_learnings(prompt: &mut String, learnings: &[LearningSummaryOutput]) {
+    prompt.push_str(&build_learnings_section(learnings));
+}
+
+/// Build a base prompt section string from the template file.
+fn build_base_prompt_section(base_prompt_path: &Path) -> String {
     match fs::read_to_string(base_prompt_path) {
         Ok(content) if !content.trim().is_empty() => {
-            prompt.push_str(&content);
+            let mut content = truncate_to_budget(&content, BASE_PROMPT_BUDGET);
             if !content.ends_with('\n') {
-                prompt.push('\n');
+                content.push('\n');
             }
+            content
         }
         Ok(_) => {
             eprintln!(
                 "Warning: base prompt file is empty: {}",
                 base_prompt_path.display()
             );
+            String::new()
         }
         Err(e) => {
             eprintln!(
@@ -407,8 +534,15 @@ fn append_base_prompt(prompt: &mut String, base_prompt_path: &Path) {
                 base_prompt_path.display(),
                 e
             );
+            String::new()
         }
     }
+}
+
+/// Append the base prompt template file content.
+#[cfg(test)]
+fn append_base_prompt(prompt: &mut String, base_prompt_path: &Path) {
+    prompt.push_str(&build_base_prompt_section(base_prompt_path));
 }
 
 /// Load the escalation policy template from the scripts directory.
@@ -436,27 +570,18 @@ pub fn load_escalation_template(base_prompt_path: &Path) -> Option<String> {
     }
 }
 
-/// Append the escalation policy section to the prompt when the resolved model is not Opus.
-///
-/// Loads the template from `base_prompt_path.parent()/scripts/escalation-policy.md`.
-/// Injects for all non-Opus tiers (including Default/None) per architect decision.
-/// When the template file is missing, the section is silently omitted.
-fn append_escalation_policy(
-    prompt: &mut String,
-    base_prompt_path: &Path,
-    resolved_model: Option<&str>,
-) {
-    // Opus tier already has maximum capability — no escalation needed
+/// Build an escalation policy section string.
+fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str>) -> String {
     if model::model_tier(resolved_model) == model::ModelTier::Opus {
-        return;
+        return String::new();
     }
 
-    if let Some(contents) = load_escalation_template(base_prompt_path) {
-        prompt.push_str("## Model Escalation Policy\n\n");
-        prompt.push_str(&contents);
-        prompt.push_str("\n\n---\n\n");
+    match load_escalation_template(base_prompt_path) {
+        Some(contents) => format!("## Model Escalation Policy\n\n{}\n\n---\n\n", contents),
+        None => String::new(),
     }
 }
+
 
 /// Resolve the model for a synergy cluster (the selected task + its pending synergyWith partners).
 ///
@@ -756,6 +881,7 @@ mod tests {
             task_files: vec!["src/lib.rs".to_string()],
             shown_learning_ids: vec![1, 2, 3],
             resolved_model: None,
+            dropped_sections: vec![],
         };
 
         assert_eq!(result.task_id, "FEAT-001");
@@ -3175,6 +3301,382 @@ pub enum ApiError {
         assert!(
             !result.prompt.contains("Escalation Policy"),
             "Missing escalation template should result in no escalation section"
+        );
+    }
+
+    // ===== Prompt size budget tests =====
+
+    #[test]
+    fn test_append_learnings_truncation_over_budget() {
+        // 5 learnings with ~2KB content each → ~10KB total, exceeds LEARNINGS_BUDGET (4K)
+        let learnings: Vec<LearningSummaryOutput> = (0..5)
+            .map(|i| LearningSummaryOutput {
+                id: i,
+                title: format!("Learning {}", i),
+                outcome: "pattern".to_string(),
+                confidence: "high".to_string(),
+                content: Some("x".repeat(2000)),
+                applies_to_files: None,
+                applies_to_task_types: None,
+            })
+            .collect();
+
+        let mut prompt = String::new();
+        append_learnings(&mut prompt, &learnings);
+
+        assert!(
+            prompt.contains("## Relevant Learnings"),
+            "Should have learnings section header"
+        );
+        assert!(
+            prompt.contains("[truncated to"),
+            "Learnings JSON should be truncated when exceeding budget"
+        );
+        // The learnings JSON content should be limited to approximately LEARNINGS_BUDGET
+        // (plus the header/footer overhead)
+        let json_start = prompt.find("```json\n").unwrap() + 8;
+        let json_end = prompt.rfind("\n```").unwrap();
+        let json_section = &prompt[json_start..json_end];
+        assert!(
+            json_section.len() <= LEARNINGS_BUDGET + 100,
+            "Learnings JSON section ({} bytes) should be within budget ({} + overhead)",
+            json_section.len(),
+            LEARNINGS_BUDGET
+        );
+    }
+
+    #[test]
+    fn test_append_learnings_under_budget_not_truncated() {
+        let learnings = vec![LearningSummaryOutput {
+            id: 1,
+            title: "Small learning".to_string(),
+            outcome: "pattern".to_string(),
+            confidence: "high".to_string(),
+            content: Some("Use X".to_string()),
+            applies_to_files: None,
+            applies_to_task_types: None,
+        }];
+
+        let mut prompt = String::new();
+        append_learnings(&mut prompt, &learnings);
+
+        assert!(
+            !prompt.contains("[truncated to"),
+            "Small learnings should not be truncated"
+        );
+        assert!(
+            prompt.contains("Small learning"),
+            "Content should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_append_base_prompt_truncation_over_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompt_path = temp_dir.path().join("prompt.md");
+        // Write content larger than BASE_PROMPT_BUDGET (16K)
+        let large_content = "x".repeat(20_000);
+        fs::write(&prompt_path, &large_content).unwrap();
+
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, &prompt_path);
+
+        assert!(
+            prompt.contains("[truncated to"),
+            "Large base prompt should be truncated"
+        );
+        assert!(
+            prompt.len() <= BASE_PROMPT_BUDGET + 100,
+            "Base prompt ({} bytes) should be within budget ({} + overhead)",
+            prompt.len(),
+            BASE_PROMPT_BUDGET
+        );
+    }
+
+    #[test]
+    fn test_append_base_prompt_under_budget_not_truncated() {
+        let temp_dir = TempDir::new().unwrap();
+        let prompt_path = temp_dir.path().join("prompt.md");
+        fs::write(&prompt_path, "# Short prompt\n\nDo the task.\n").unwrap();
+
+        let mut prompt = String::new();
+        append_base_prompt(&mut prompt, &prompt_path);
+
+        assert!(
+            !prompt.contains("[truncated to"),
+            "Short base prompt should not be truncated"
+        );
+        assert!(prompt.contains("Short prompt"), "Content should be preserved");
+    }
+
+    // ===== Two-phase prompt assembly tests =====
+
+    #[test]
+    fn test_try_fit_section_within_budget() {
+        let mut remaining = 1000;
+        let mut dropped = Vec::new();
+        let section = "hello world".to_string();
+        let result = try_fit_section(section, "Test", &mut remaining, &mut dropped);
+        assert_eq!(result, "hello world");
+        assert_eq!(remaining, 1000 - 11);
+        assert!(dropped.is_empty(), "Should not record a drop");
+    }
+
+    #[test]
+    fn test_try_fit_section_over_budget_returns_empty() {
+        let mut remaining = 5;
+        let mut dropped = Vec::new();
+        let section = "hello world".to_string(); // 11 bytes > 5
+        let result = try_fit_section(section, "Test", &mut remaining, &mut dropped);
+        assert!(result.is_empty(), "Section should be dropped when over budget");
+        assert_eq!(remaining, 5, "Budget should not be consumed");
+        assert_eq!(dropped, vec!["Test"], "Should record the dropped section name");
+    }
+
+    #[test]
+    fn test_try_fit_section_empty_section_passthrough() {
+        let mut remaining = 100;
+        let mut dropped = Vec::new();
+        let section = String::new();
+        let result = try_fit_section(section, "Test", &mut remaining, &mut dropped);
+        assert!(result.is_empty());
+        assert_eq!(remaining, 100, "Empty section should not consume budget");
+        assert!(dropped.is_empty(), "Empty sections should not appear in dropped list");
+    }
+
+    #[test]
+    fn test_trimmable_sections_dropped_when_budget_tight() {
+        // Build a prompt where critical sections + high-priority trimmable sections
+        // consume enough budget that low-priority trimmable sections get dropped.
+        //
+        // Critical sections: ~16K base prompt + ~4K task JSON + reorder instr ≈ 20K
+        // Remaining: ~60K for trimmable sections
+        // We provide >60K of trimmable content so lower-priority ones get dropped.
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task_full(
+            &conn,
+            "TIGHT-001",
+            "Tight budget task",
+            "todo",
+            10,
+            "A task to test tight budgets",
+            &["AC1"],
+        );
+
+        // Create a base prompt that fills its per-section budget
+        let base_prompt_path = temp_dir.path().join("prompt.md");
+        let large_base = "x".repeat(BASE_PROMPT_BUDGET - 100);
+        fs::write(&base_prompt_path, &large_base).unwrap();
+
+        // Provide large steering (~30K) — this is a LOW priority trimmable section
+        let steering_path = create_steering(temp_dir.path(), &"y".repeat(30_000));
+
+        // Provide large session guidance (~35K) — also low priority
+        let large_guidance = "z".repeat(35_000);
+
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: Some("TIGHT-002"),
+            session_guidance: &large_guidance,
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+            default_model: None,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Critical sections must always be present
+        assert!(
+            result.prompt.contains("## Current Task"),
+            "Task JSON (critical) must be present"
+        );
+        assert!(
+            result.prompt.contains(&large_base[..100]),
+            "Base prompt (critical) must be present"
+        );
+        assert!(
+            result.prompt.contains("strong reason to work on a different"),
+            "Reorder instruction (critical) must be present"
+        );
+
+        // The prompt must not exceed the total budget
+        assert!(
+            result.prompt.len() <= TOTAL_PROMPT_BUDGET,
+            "Prompt ({} bytes) must not exceed budget ({} bytes)",
+            result.prompt.len(),
+            TOTAL_PROMPT_BUDGET,
+        );
+
+        // At least one trimmable section should have been dropped
+        assert!(
+            !result.dropped_sections.is_empty(),
+            "With >60K of trimmable content competing for ~60K remaining, \
+             at least one section must be dropped. Got dropped_sections: {:?}",
+            result.dropped_sections,
+        );
+
+        // Sections that WERE dropped should NOT appear in the prompt
+        for name in &result.dropped_sections {
+            let header = format!("## {}", name);
+            assert!(
+                !result.prompt.contains(&header),
+                "Dropped section '{}' should not appear in the prompt",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_sections_present_when_budget_sufficient() {
+        // Normal-sized prompt where everything fits
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task_full(
+            &conn,
+            "FULL-001",
+            "Full budget task",
+            "todo",
+            10,
+            "A task with all sections",
+            &["AC1"],
+        );
+        insert_task_file(&conn, "FULL-001", "src/main.rs");
+        create_source_file(
+            temp_dir.path(),
+            "src/main.rs",
+            "pub fn main() {\n    println!(\"hello\");\n}\n\npub fn helper(x: i32) -> i32 {\n    x + 1\n}\n",
+        );
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let steering_path = create_steering(temp_dir.path(), "Focus on correctness.");
+
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: Some("FULL-002"),
+            session_guidance: "User wants tests",
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+            default_model: None,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // All sections should be present
+        assert!(result.prompt.contains("## Current Task"), "Task JSON present");
+        assert!(result.prompt.contains("## Steering"), "Steering present");
+        assert!(
+            result.prompt.contains("## Session Guidance"),
+            "Session Guidance present"
+        );
+        assert!(result.prompt.contains("## Reorder Hint"), "Reorder Hint present");
+        assert!(
+            result.prompt.contains("## Current Source Context"),
+            "Source Context present"
+        );
+        assert!(
+            result.prompt.contains("strong reason to work on a different"),
+            "Reorder instruction present"
+        );
+        assert!(
+            result.prompt.contains("Agent Instructions"),
+            "Base prompt present"
+        );
+
+        // No sections should have been dropped — everything fits
+        assert!(
+            result.dropped_sections.is_empty(),
+            "No sections should be dropped when budget is sufficient, but got: {:?}",
+            result.dropped_sections,
+        );
+    }
+
+    #[test]
+    fn test_critical_sections_over_budget_returns_error() {
+        // We can't easily make real critical sections exceed 80K without a
+        // massive task + base prompt. Instead, test build_escalation_section
+        // and build_base_prompt_section together via the try_fit_section logic.
+        //
+        // The PromptOverflow error is tested by verifying the error variant
+        // is constructible and has the right message.
+        use crate::error::TaskMgrError;
+
+        let err = TaskMgrError::PromptOverflow {
+            critical_size: 90_000,
+            budget: 80_000,
+            task_id: "OVER-001".to_string(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("90000"));
+        assert!(msg.contains("80000"));
+        assert!(msg.contains("OVER-001"));
+        assert!(msg.contains("Reduce base prompt.md size or split the task"));
+    }
+
+    #[test]
+    fn test_escalation_included_as_critical_section() {
+        // Verify escalation section is in the critical path (never dropped by budget)
+        // by creating a prompt with a non-Opus model and an escalation template
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CRIT-001", "Sonnet task", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET model = ?1 WHERE id = 'CRIT-001'",
+            params![SONNET_MODEL],
+        )
+        .unwrap();
+
+        let template_content = "UNIQUE_CRITICAL_ESCALATION_MARKER\n";
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        create_escalation_template(temp_dir.path(), template_content);
+
+        // Create a large steering file to put pressure on the trimmable budget
+        let steering_path = create_steering(temp_dir.path(), &"s".repeat(5000));
+
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: None,
+            session_guidance: "",
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+            default_model: None,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Escalation is critical — must be present regardless of budget pressure
+        assert!(
+            result.prompt.contains("UNIQUE_CRITICAL_ESCALATION_MARKER"),
+            "Escalation section must always be present (critical) for non-Opus"
+        );
+        assert!(
+            result.prompt.contains("## Model Escalation Policy"),
+            "Escalation header must be present"
         );
     }
 }

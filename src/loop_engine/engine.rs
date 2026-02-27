@@ -42,6 +42,7 @@ use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::models::RunStatus;
+use crate::error::TaskMgrError;
 use crate::TaskMgrResult;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
@@ -287,9 +288,9 @@ pub fn run_iteration(
         default_model: params.default_model,
     };
 
-    let prompt_result = match prompt::build_prompt(&prompt_params)? {
-        Some(result) => result,
-        None => {
+    let prompt_result = match prompt::build_prompt(&prompt_params) {
+        Ok(Some(result)) => result,
+        Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
             let remaining: i64 = params
                 .conn
@@ -333,9 +334,9 @@ pub fn run_iteration(
                     recovered
                 );
                 // Retry build_prompt once with the same params
-                match prompt::build_prompt(&prompt_params)? {
-                    Some(result) => result,
-                    None => {
+                match prompt::build_prompt(&prompt_params) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
                         eprintln!(
                             "No eligible tasks after recovery ({} remaining). Treating as stale.",
                             remaining
@@ -349,6 +350,10 @@ pub fn run_iteration(
                             effective_model: None,
                         });
                     }
+                    Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+                        return Ok(prompt_overflow_result(critical_size, budget, task_id));
+                    }
+                    Err(e) => return Err(e),
                 }
             } else {
                 eprintln!(
@@ -365,6 +370,10 @@ pub fn run_iteration(
                 });
             }
         }
+        Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+            return Ok(prompt_overflow_result(critical_size, budget, task_id));
+        }
+        Err(e) => return Err(e),
     };
 
     let task_id = prompt_result.task_id.clone();
@@ -837,6 +846,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let mut exit_reason = String::from("max iterations reached");
     let mut final_run_status = RunStatus::Aborted;
 
+    // Rotate progress file before starting iterations to bound context size
+    progress::rotate_progress(&paths.progress_file);
+
     for iteration in 1..=max_iterations {
         // Pre-iteration: refresh OAuth token if usage checking enabled
         if usage_params.enabled {
@@ -1165,6 +1177,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                     // Stop signal file or other empty exit
                     exit_code = 0;
                     exit_reason = "stop signal".to_string();
+                }
+                IterationOutcome::PromptOverflow => {
+                    exit_code = 3;
+                    exit_reason =
+                        "prompt overflow — critical sections exceed budget".to_string();
                 }
                 _ => {
                     exit_code = 1;
@@ -1861,6 +1878,23 @@ pub fn check_crash_escalation(
     }
 }
 
+/// Build an `IterationResult` for a prompt overflow, logging the error to stderr.
+fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) -> IterationResult {
+    eprintln!(
+        "FATAL: Prompt critical sections ({} bytes) exceed budget ({} bytes) for task {}. \
+         Reduce base prompt.md size or split the task.",
+        critical_size, budget, task_id,
+    );
+    IterationResult {
+        outcome: IterationOutcome::PromptOverflow,
+        task_id: Some(task_id),
+        files_modified: vec![],
+        should_stop: true,
+        output: String::new(),
+        effective_model: None,
+    }
+}
+
 /// Update crash and stale trackers based on iteration outcome.
 /// Returns true if the loop should stop.
 fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bool {
@@ -1895,6 +1929,10 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
         IterationOutcome::Empty => {
             ctx.crash_tracker.record_crash();
             ctx.crash_tracker.should_abort()
+        }
+        IterationOutcome::PromptOverflow => {
+            // Fatal — loop will stop via should_stop
+            false
         }
     }
 }
