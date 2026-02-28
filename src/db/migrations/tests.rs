@@ -317,6 +317,8 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
+    // Migrate down from version 9 to version 8 (reverts prd_metadata singleton removal)
+    migrate_down(&mut conn).unwrap();
     // Migrate down from version 8 to version 7 (reverts FTS5 tag indexing stub)
     migrate_down(&mut conn).unwrap();
     // Migrate down from version 7 to version 6 (reverts model selection fields)
@@ -542,8 +544,8 @@ fn test_migration_v8_schema_version_is_8() {
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(
-        version, 8,
-        "schema_version should be 8 after all migrations"
+        version, 9,
+        "schema_version should be 9 after all migrations"
     );
 }
 
@@ -979,6 +981,9 @@ fn test_migration_v8_down_reverts_to_v7() {
     // Verify v8 down migration specifically reverts to v7 (not further).
     let (_temp_dir, mut conn) = setup_db();
     run_migrations(&mut conn).unwrap();
+    // Current latest is v9; first migrate down to v8
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+    migrate_down(&mut conn).unwrap();
     assert_eq!(get_schema_version(&conn).unwrap(), 8);
 
     migrate_down(&mut conn).unwrap();
