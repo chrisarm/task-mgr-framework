@@ -1457,7 +1457,7 @@
       "id": "SS-INT-001",
       "modifiesBehavior": false,
       "notes": "This is the most comprehensive test \u2014 exercises the full lifecycle. Create actual PRD JSON fixtures (minimal) for P1 and P2, import them, run selection, force-reinit, and verify everything. Include a backwards-compat test with a prefixless PRD.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "qualityDimensions": {
         "correctness": [
