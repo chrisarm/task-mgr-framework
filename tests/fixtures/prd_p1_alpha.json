@@ -1,0 +1,32 @@
+{
+  "branchName": "feat/p1-alpha",
+  "description": "PRD Alpha for multi-PRD isolation testing.",
+  "project": "alpha-project",
+  "taskPrefix": "P1",
+  "userStories": [
+    {
+      "acceptanceCriteria": ["Task A1 done"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Alpha task 1",
+      "id": "TASK-001",
+      "passes": false,
+      "priority": 10,
+      "status": "todo",
+      "title": "Alpha Task 1"
+    },
+    {
+      "acceptanceCriteria": ["Task A2 done"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": ["TASK-001"],
+      "description": "Alpha task 2",
+      "id": "TASK-002",
+      "passes": false,
+      "priority": 20,
+      "status": "todo",
+      "title": "Alpha Task 2"
+    }
+  ]
+}
