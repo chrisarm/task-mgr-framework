@@ -1,0 +1,235 @@
+
+## 2026-02-27 - SS-SS-TEST-INIT-001
+- Created `src/db/prefix.rs` with todo!() stubs + 29 TDD tests
+- Added `pub mod prefix;` to `src/db/mod.rs`
+- All 29 tests compile and fail (expected — stubs not yet implemented)
+- 1854 pre-existing tests still pass
+- **Key decisions:**
+  - `validate_prefix` returns `Result<(), String>` (self-contained utility)
+  - `_` (underscore) is REJECTED by validate_prefix despite `[a-zA-Z0-9._-]` regex in AC — conflict resolved in favour of AC#7/AC#8 (underscore is a LIKE wildcard)
+  - ESCAPE character is `\` → SQL clause: `WHERE id LIKE ? ESCAPE '\'` (Rust literal: `"WHERE id LIKE ? ESCAPE '\\'"`)
+  - Discriminator AC#9 ("P1-extra-US-001" not matched) interpreted as: pattern must use dash separator `P1-%` not bare `P1%` to prevent false positives on prefixes like `P10`; full ambiguity with sub-prefixes like `P1-extra` is a known limitation
+- **Learnings:** `todo!()` stubs satisfy Rust type system, compile clean, and panic at test runtime — correct TDD initial state
+---
+
+## 2026-02-27 - SS-SS-TEST-INIT-003A
+- Added prefix_selection_tests mod to src/commands/next/tests.rs
+- 9 tests total: 1 passes immediately (None prefix backwards compat), 8 #[ignore]d
+- All ignore messages include clear TODO explaining what API change is needed
+- Cross-PRD isolation discriminator documented as RED-PHASE
+- Files changed: src/commands/next/tests.rs (+207 lines)
+- **Learnings:** todo!() inside #[ignore] tests is the correct Rust TDD pattern for
+  future-API stubs — compiles clean, skipped by default, clear error when run with --ignored
+---
+
+## 2026-02-27 - SS-SS-TEST-INIT-003B
+- Added TDD red-phase tests for per-session signal file behavior in signals.rs
+- Tests cover: prefix-scoped check_stop_signal, check_pause_signal (prefix + global fallback)
+- Tests cover: cleanup_signal_files_for_prefix (session isolation, P1 vs P2, no cross-contamination)
+- Known-bad discriminator test: .stop-P1 must NOT trigger for prefix P2
+- All 3 new functions tested: check_stop_signal(dir, prefix), check_pause_signal(dir, prefix), cleanup_signal_files_for_prefix(dir, prefix)
+- cargo test fails (expected red phase), cargo fmt --check passes
+- **Learnings:** cargo check passes for test code even with wrong arity — must run cargo test to confirm red phase
+---
+
+## 2026-02-27 - SS-SS-TEST-INIT-004
+- Added `scoped_import_tests` module to `src/commands/init/tests.rs` (+268 lines)
+- 9 TDD red-phase tests, all `#[ignore]`d pending implementation
+- Tests cover: insert_prd_metadata returns i64, upsert on same prefix, two prefixes = two rows,
+  insert_prd_file uses dynamic prd_id, drop_existing_data scoped prefix deletion,
+  cross-PRD discriminator (P1 delete leaves P2 intact), None-prefix wipes all,
+  learnings preserved by scoped --force, P2 prd_metadata row preserved after P1 delete
+- cargo check + clippy pass cleanly; only pre-existing signals.rs red-phase errors in cargo test
+- All intended assertions documented in comments for implementer
+- **Learnings:** unused-import warnings from `#[ignore]+todo!()` tests — comment out the import,
+  leave it in a comment near the top of the module for the implementer to uncomment
+---
+
+## 2026-02-27 - SS-SS-FEAT-004
+- Changed `drop_existing_data(conn)` → `drop_existing_data(conn, task_prefix: Option<&str>)`
+- Changed `get_delete_preview(conn)` → `get_delete_preview(conn, task_prefix: Option<&str>)`
+- Scoped DELETE: task_relationships → task_files → tasks (FK order), then prd_files → prd_metadata
+- Learnings preserved in scoped mode; global wipe (None) unchanged
+- mod.rs: pre-reads first JSON to extract prefix before main parsing loop, passes to both functions
+- Implemented 5 RED-PHASE test stubs (all #[ignore] removed)
+- Pre-existing compile errors in signals.rs (RED-PHASE stubs) are unrelated to this task
+- **Learnings:** Use `escape_like()` directly (not `prefix_and()`/`prefix_where()`) when column name differs from `id` (e.g. `task_id`)
+---
+
+## 2026-02-27 - SS-SS-FEAT-005
+- Added `task_prefix: Option<&str>` to `select_next_task()` in selection.rs
+- Updated all 4 helper queries with prefix filtering:
+  - `get_completed_task_ids`: `AND id LIKE ? ESCAPE '\\'` (tasks table, id column)
+  - `get_todo_tasks`: `AND id LIKE ? ESCAPE '\\'` (tasks table, id column)
+  - `get_relationships_by_type`: `AND task_id LIKE ? ESCAPE '\\'` (task_relationships, task_id column)
+  - `get_all_task_files`: `WHERE task_id LIKE ? ESCAPE '\\'` (task_files, task_id column)
+- Added `task_prefix: Option<&str>` to `next()` in mod.rs
+- Added `task_prefix` field to `BuildPromptParams` in prompt.rs; threaded from engine
+- Updated all callers: main.rs, engine.rs, and all test files
+- Added minimal stubs for signal prefix functions to unblock TDD test compilation
+- All 9 SS-TEST-INIT-003A prefix_selection_tests pass
+- **Learnings:**
+  - `prefix_and()`/`prefix_where()` from db::prefix use `id` column name — hand-roll for tables using `task_id` column
+  - Signal TDD tests (SS-FEAT-010) caused compile errors in test build; add stubs to make compile succeed in red-phase
+---
+
+## 2026-02-27 - SS-SS-FEAT-005B
+- Added `task_prefix: Option<&str>` to `apply_decay` and `find_decay_warnings` in `src/commands/next/decay.rs`
+- Used `prefix_and()` from `crate::db::prefix` to append `AND id LIKE ? ESCAPE '\'` to both SELECT queries when prefix is Some
+- Updated callers: `src/main.rs` and `src/commands/doctor/mod.rs` to pass `None` (no prefix in current call sites)
+- Updated all existing tests in `tests.rs` to pass `None` as prefix
+- All 55 `commands::next` tests pass; 6 pre-existing failures in migrations/signals are unrelated
+- **Learnings:** Pattern: `prefix_and()` returns `("", None)` for None, so we branch on `Option<String>` for param binding. Use `rusqlite::params![]` for the Some branch, bare array `[]` for None.
+---
+
+## 2026-02-27 - SS-FEAT-006
+- Verified all wiring was already completed in FEAT-005/005B
+- BuildPromptParams.task_prefix → next::next() threaded in prompt.rs:115
+- IterationParams.task_prefix → BuildPromptParams.task_prefix in engine.rs:289
+- run_loop() reads task_prefix from PrdMetadata and sets on IterationParams at engine.rs:924
+- apply_decay() signature accepts task_prefix (added in FEAT-005B)
+- cargo check passes with no warnings
+- No code changes required; all acceptance criteria satisfied by prior commits
+---
+
+## 2026-02-27 - SS-FEAT-007A
+- Scoped all engine.rs task queries by prefix using db::prefix::prefix_and()
+- Read task prefix from PRD JSON (early_task_prefix) BEFORE initial recovery at step 6.55
+- Scoped: initial recovery UPDATE, run_iteration remaining count, mid-loop recovery UPDATE, read_prd_metadata task_count, reconcile_passes_with_db SELECT, scan_output_for_completed_tasks SELECT, reconcile_external_git_completions SELECT
+- **Learnings:** Use `match &option_string { Some(p) => vec![p as &dyn ToSql], None => vec![] }` not `.as_deref()` to avoid lifetime issues with dynamic param vecs in rusqlite
+---
+
+## 2026-02-27 - SS-SS-CODE-REVIEW-1
+- **Scope**: Reviewed all in-scope files for quality, security, integration wiring, and prefix-scoping
+- **unwrap() audit**: No unwrap() in production code paths across all 11 reviewed files. All unwrap() calls are in #[cfg(test)] modules only.
+- **LIKE escaping**: All prefix queries use `escape_like()` (via `prefix_and()`/`prefix_where()` or hand-rolled for `task_id` column). ESCAPE clause present in all patterns.
+- **Prefix validation before filenames**: engine.rs:646 calls `validate_prefix()` before using prefix in lock filenames and signal filenames. Invalid prefixes fall back to global lock.
+- **Prefix-scoped query audit (in-scope files)**:
+  - `src/db/prefix.rs` — utility module, no direct queries ✓
+  - `src/db/migrations/v9.rs` — migration code, queries prd_metadata for schema migration (acceptable) ✓
+  - `src/commands/init/import.rs` — drop_existing_data scoped by prefix (FEAT-004) ✓
+  - `src/commands/next/selection.rs` — all 4 helpers scoped (FEAT-005) ✓
+  - `src/commands/next/mod.rs` — threads prefix through ✓
+  - `src/commands/next/decay.rs` — both queries scoped (FEAT-005B) ✓
+  - `src/loop_engine/engine.rs` — all 7+ queries scoped (FEAT-007A) ✓
+  - `src/loop_engine/prompt.rs` — no direct queries, passes prefix to next() ✓
+  - `src/loop_engine/signals.rs` — file-based, no DB queries, prefix-scoped filenames ✓
+  - `src/loop_engine/status.rs` — all 3 queries scoped (FEAT-008) ✓
+  - `src/loop_engine/calibrate.rs` — queries scoped (FEAT-007B) ✓
+- **Out-of-scope unscoped queries** (pre-existing, NOT part of this PR's feature set):
+  - `src/loop_engine/archive.rs` — 12 unscoped queries (archive operates globally by design)
+  - `src/commands/reset.rs` — 2 unscoped queries (reset operates globally)
+  - `src/commands/export/prd.rs` — 3 unscoped queries (export operates globally)
+  - `src/commands/export/progress.rs` — 1 unscoped query (stats global)
+  - These should be addressed in a future PR if prefix-scoped archive/reset/export is needed
+- **Integration wiring**: All new code exported from parent modules. All callers updated. No dead code warnings from cargo clippy.
+- **Quality dimensions**: Code is idiomatic Rust, uses proper error propagation, no unnecessary abstractions.
+- **Verdict: NO CODE-FIX tasks needed.** All in-scope code passes review criteria.
+---
+
+## 2026-02-27 - a9e3b742-REFACTOR-REVIEW-2
+- **Scope**: Review test code for duplication, helper extraction, and clarity across 5 loop_engine files
+- **Approach**: Automated search for duplicated patterns + manual review of test structure
+
+### Findings
+
+**1. `git_commit()` helper duplicated in engine.rs (LOW)**
+- `engine.rs:2264` defines `git_commit(dir, msg)` locally in test module
+- Should be moved to `test_utils.rs` alongside `setup_git_repo()`
+- Only used in engine.rs currently, but extracting keeps helpers consolidated
+- → **REFACTOR-2-001** (priority 40)
+
+**2. 23× `UPDATE tasks SET model` workaround in prompt.rs (MEDIUM)**
+- `insert_task()` and `insert_task_full()` in test_utils.rs don't support model/difficulty/escalation_note columns
+- prompt.rs tests work around this with raw SQL UPDATEs after insert (23 occurrences)
+- Fix: Add `insert_task_with_model(conn, id, title, status, priority, model, difficulty, escalation_note)` to test_utils.rs
+- This would reduce ~70 lines of boilerplate across prompt.rs tests
+- → **REFACTOR-2-002** (priority 41)
+
+**3. No other actionable duplication found**
+- display.rs: 14 pure unit tests, no setup duplication
+- progress.rs: 19 tests, local `build_progress_entries()` helper is appropriate (only used there)
+- claude.rs: ENV_MUTEX pattern is necessary for test isolation, spawn helpers are well-factored
+- prompt.rs: `create_base_prompt()`, `create_steering()`, `build_params()` are prompt-specific, not shared
+
+**4. Test names: PASS**
+- All test names clearly describe what is tested (e.g., `test_resolved_model_difficulty_high_forces_opus`)
+- Consistent naming convention across all 5 files
+
+**NOTE**: scoped-sessions.json not found on filesystem — REFACTOR-2-xxx tasks documented here only.
+---
+
+## 2026-02-28 - SS-SS-CODE-REVIEW-1 (Re-review)
+- **Trigger**: Re-ran comprehensive query audit with automated grep across entire src/
+- **Previous review corrections**:
+  - prompt.rs line 115 was incorrectly described as "no direct queries" — it has 3 query functions (get_completed_dependencies, get_synergy_context, resolve_partner_models). However, all 3 filter by specific task_id parameter, so they are implicitly prefix-scoped through the caller's prefix-scoped task selection. No fix needed.
+  - calibrate.rs line 118 was marked "queries scoped (FEAT-007B)" but `get_relationship_counts()` at line 307-318 was MISSED. This function queries ALL task_relationships without prefix filtering.
+
+### Finding: calibrate.rs:get_relationship_counts() missing prefix scope
+
+- **File**: `src/loop_engine/calibrate.rs:307-318`
+- **Severity**: LOW (output implicitly correct, but fetches excess data)
+- **Details**: `get_relationship_counts(conn, rel_type)` queries all task_relationships grouped by task_id. Called from `recalibrate_weights()` which has `task_prefix` available (already passes it to `get_task_file_counts` at line 257). The resulting HashMap is joined against prefix-scoped `task_first_try`, so the output weights are correct — but unnecessary rows from other prefixes are fetched and discarded.
+- **Fix**: Add `task_prefix: Option<&str>` parameter, apply `AND task_id LIKE ? ESCAPE '\\'` when prefix is Some. Pattern matches `get_task_file_counts()` which was already fixed.
+- **→ CODE-FIX-001** (priority 20): Scope `get_relationship_counts()` by prefix
+
+### Other checks (all PASS)
+- unwrap() audit: PASS (zero in production code)
+- LIKE escaping: PASS (all queries use ESCAPE clause)
+- Prefix validation before filenames: PASS
+- Integration wiring: PASS (cargo check + clippy = zero warnings)
+- **scoped-sessions.json still missing** — CODE-FIX-001 documented here only
+
+### Verdict: 1 LOW-severity issue found (CODE-FIX-001)
+---
+
+## 2026-02-28 - a9e3b742-REFACTOR-REVIEW-2
+**Review test code for refactoring opportunities across 5 loop_engine files**
+
+### Issues Found (9 total)
+
+#### REFACTOR-2-001 (Priority 40) — Remove duplicate tests in claude.rs
+- `test_spawn_model_parameterized_model_strings` duplicates rstest `test_spawn_claude_model_variants`
+- `test_spawn_model_whitespace_only_treated_as_none` duplicates rstest `test_spawn_claude_whitespace_only_model_treated_as_none`
+- **Fix**: Delete the 2 manual-loop tests (~50 lines)
+
+#### REFACTOR-2-002 (Priority 40) — Extract `spawn_claude_echo` helper in claude.rs
+- CLAUDE_BINARY=echo + ENV_MUTEX guard pattern repeated 9+ times
+- **Fix**: Single helper: `fn spawn_claude_echo(prompt, signal, model) -> Result<ClaudeResult>`
+
+#### REFACTOR-2-003 (Priority 41) — Use `insert_task` helper consistently in engine.rs
+- 12+ inline `execute_batch` SQL insertions instead of using existing `test_utils::insert_task`
+- **Fix**: Replace with `insert_task()` calls; already imported in prompt.rs
+
+#### REFACTOR-2-004 (Priority 41) — Extract `setup_prd_and_run` helper in engine.rs
+- TempDir + prd.json write + runs INSERT repeated 5+ times in reconciliation tests
+- **Fix**: Single helper returning `(TempDir, PathBuf)`
+
+#### REFACTOR-2-005 (Priority 42) — Consolidate `build_prompt` test preamble in prompt.rs
+- `setup_test_db` + `insert_task` + `create_base_prompt` + `build_params` repeated 10+ times
+- **Fix**: `fn build_prompt_with_single_task(id, title) -> (TempDir, Connection, PromptResult)`
+
+#### REFACTOR-2-006 (Priority 42) — Use existing model-field helpers in prompt.rs
+- `test_build_task_json_basic` and `test_build_task_json_minimal_fields` hand-construct full NextTaskOutput/NextResult (~30 lines each) instead of using `task_output_with_model_fields`/`empty_next_result` helpers added later
+- **Fix**: Refactor to use existing helpers
+
+#### REFACTOR-2-007 (Priority 43) — Extract `temp_progress_path` helper in progress.rs
+- `TempDir::new() + .join("progress.txt")` repeated 9 times
+- **Fix**: `fn temp_progress_path() -> (TempDir, PathBuf)`
+
+#### REFACTOR-2-008 (Priority 43) — Hoist `setup_test_db` import in engine.rs
+- Import scattered inline at individual test functions instead of module-level
+- **Fix**: Single `use` at top of test module (matches prompt.rs pattern)
+
+#### REFACTOR-2-009 (Priority 44) — Improve weak test names
+- `test_print_session_banner_no_panic` — "no panic" is weakest possible assertion
+- `test_on_run_completed_no_panic_on_empty_db` — same pattern
+- `test_spawn_captures_multiline_output` — vague "captures"
+- **Fix**: Rename to describe expected behavior, not absence of crashes
+
+### Summary
+- 9 issues found across all 5 files
+- No test correctness bugs — all issues are duplication/clarity
+- **NOTE**: scoped-sessions.json still missing — tasks documented here only
+- **Learnings**: rstest parameterized tests superseded manual-loop variants but old ones weren't cleaned up; engine.rs tests diverged from prompt.rs test patterns (inline SQL vs helpers)
+---
