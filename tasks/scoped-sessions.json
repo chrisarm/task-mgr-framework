@@ -1497,7 +1497,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final opportunity to improve code before merge. For each issue found: add a REFACTOR-3-xxx task (priority 66-80), add it to MILESTONE-FINAL dependsOn, commit JSON changes.",
-      "passes": false,
+      "passes": true,
       "priority": 65,
       "qualityDimensions": {
         "correctness": [
@@ -1567,7 +1567,8 @@
       "conflictsWith": [],
       "dependsOn": [
         "SS-VERIFY-001",
-        "SS-REFACTOR-REVIEW-3"
+        "SS-REFACTOR-REVIEW-3",
+        "SS-REFACTOR-3-001"
       ],
       "description": "Final gate \u2014 all tests pass, all reviews complete, code is clean and ready for merge to main.",
       "estimatedEffort": "low",
@@ -1581,6 +1582,37 @@
       "timeoutSecs": 1800,
       "title": "Milestone Final: Ready for merge",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "read_task_prefix_from_prd is pub and lives in a shared location (status.rs or a new helper)",
+        "engine.rs lines 636-643 and 734-742 replaced with calls to the shared function",
+        "All existing tests pass",
+        "No new warnings from cargo clippy"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "SS-REFACTOR-REVIEW-3"
+      ],
+      "description": "read_task_prefix_from_prd logic (parse PRD JSON for taskPrefix field) is duplicated 3 times: once as a private fn in status.rs:139, and twice inline in engine.rs (lines 636-643, 734-742). Extract to a single pub fn and reuse.",
+      "estimatedEffort": "low",
+      "id": "SS-REFACTOR-3-001",
+      "modifiesBehavior": false,
+      "notes": "Make status.rs::read_task_prefix_from_prd pub, then replace the two inline copies in engine.rs with calls to it.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": {
+        "correctness": ["All existing tests pass", "Behavior unchanged"],
+        "performance": ["Best effort"],
+        "style": ["DRY: single source of truth for taskPrefix parsing"]
+      },
+      "synergyWith": [],
+      "title": "Deduplicate read_task_prefix_from_prd across engine.rs and status.rs",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/status.rs"
+      ]
     }
   ],
   "version": "1.0"

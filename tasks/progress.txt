@@ -1,4 +1,12 @@
 
+## 2026-02-28 - SS-REFACTOR-REVIEW-3
+- Reviewed all 11 files: prefix.rs, v9.rs, import.rs, selection.rs, next/mod.rs, decay.rs, engine.rs, prompt.rs, signals.rs, status.rs, calibrate.rs
+- **1 issue found**: `read_task_prefix_from_prd` logic (parse PRD JSON for taskPrefix) duplicated 3 times — private fn in status.rs:139, inline in engine.rs:636-643 and engine.rs:734-742
+- Created REFACTOR-3-001 (priority 70) to deduplicate, added to MILESTONE-FINAL dependsOn
+- **No other issues**: All functions under 30 lines or justified. No new coupling issues. Existing REFACTOR-1-001 (column-parameterized prefix helper) still open and covers the remaining DRY violation
+- **Learnings:** The `run_iteration` early-return boilerplate (4 identical IterationResult constructs) is minor duplication but extracting a helper adds indirection for little gain
+---
+
 ## 2026-02-28 - SS-REFACTOR-REVIEW-2
 - Reviewed all 6 test files for duplication, helper extraction, naming clarity, and brittleness
 - **No issues found**: New test code reuses existing helpers (next/tests.rs uses test_helpers mod, signals.rs uses simple TempDir)
@@ -299,4 +307,11 @@
 - Tests cover: initial recovery (P1 only, None=all), remaining count (P1 only, None=all), reconcile_passes_with_db (P1 only, None=all), scan_output_for_completed_tasks (P1 only, None=all, done excluded)
 - All 1954 lib tests pass; fmt/check/clippy clean
 - **Learnings:** Testing private functions (reconcile_passes_with_db, scan_output_for_completed_tasks) works because tests use `use super::*;` in the same file's test module
+---
+
+## 2026-02-28 - SS-INT-001
+- Created `tests/multi_prd_lifecycle.rs` with 7 integration tests
+- Created fixtures `prd_p1_alpha.json` and `prd_p2_beta.json` (bare IDs, PrefixMode::Auto prepends prefix)
+- Tests cover: dual-PRD prd_metadata rows, scoped task counts, prefix-scoped select_next_task, scoped force-reinit preserving P2+learnings, .stop signal prefix/fallback, independent per-prefix locks, single-PRD backwards compat
+- **Learnings:** PrefixMode::Auto prepends taskPrefix to bare IDs — don't pre-prefix IDs in fixtures; ScoredTask wraps the Task struct, access via `.task.id`
 ---
