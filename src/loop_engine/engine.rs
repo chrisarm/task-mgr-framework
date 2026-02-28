@@ -3873,4 +3873,325 @@ mod tests {
             "FEAT-001 should not match FEAT-0010 (not a substring)"
         );
     }
+
+    // =====================================================================
+    // Prefix-scoped engine query tests (SS-SS-TEST-001)
+    //
+    // Each test sets up two PRDs (P1-*, P2-*) in the same DB and verifies
+    // that engine queries respect prefix boundaries.
+    // =====================================================================
+
+    /// Helper: insert P1 and P2 tasks into the test DB.
+    ///
+    /// P1 tasks: P1-TASK-001 (in_progress), P1-TASK-002 (todo), P1-TASK-003 (done)
+    /// P2 tasks: P2-TASK-001 (in_progress), P2-TASK-002 (todo)
+    fn insert_dual_prd_tasks(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority, started_at) VALUES
+             ('P1-TASK-001', 'P1 stale task',   'in_progress', 1, datetime('now', '-1 hour')),
+             ('P1-TASK-002', 'P1 todo task',     'todo',        2, NULL),
+             ('P1-TASK-003', 'P1 done task',     'done',        3, NULL),
+             ('P2-TASK-001', 'P2 stale task',    'in_progress', 1, datetime('now', '-1 hour')),
+             ('P2-TASK-002', 'P2 todo task',     'todo',        2, NULL);",
+        )
+        .unwrap();
+    }
+
+    // --- Initial recovery scoping ---
+
+    #[test]
+    fn test_initial_recovery_resets_only_p1_in_progress() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // Simulate initial recovery with P1 prefix (as done in run_loop)
+        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
+        let sql = format!(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let count = conn.execute(&sql, params.as_slice()).unwrap();
+
+        assert_eq!(count, 1, "Should reset only P1's in_progress task");
+
+        // P1-TASK-001 should now be todo
+        let p1_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1_status, "todo");
+
+        // P2-TASK-001 must still be in_progress — untouched by P1 recovery
+        let p2_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P2-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_status, "in_progress",
+            "P2 task must not be affected by P1 recovery"
+        );
+    }
+
+    #[test]
+    fn test_initial_recovery_none_prefix_resets_all_in_progress() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // None prefix → no WHERE clause addition → resets all in_progress
+        let (pfx_clause, pfx_param) = prefix_and(None);
+        let sql = format!(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let count = conn.execute(&sql, params.as_slice()).unwrap();
+
+        assert_eq!(
+            count, 2,
+            "None prefix should reset all in_progress tasks (backwards compat)"
+        );
+    }
+
+    // --- Remaining count scoping ---
+
+    #[test]
+    fn test_remaining_count_scoped_to_p1() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // Count remaining (not done/irrelevant) for P1 only
+        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
+        let sql = format!(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let remaining: i64 = conn
+            .query_row(&sql, params.as_slice(), |row| row.get(0))
+            .unwrap();
+
+        // P1 has in_progress + todo = 2 remaining (P1-TASK-003 is done)
+        assert_eq!(remaining, 2, "P1 remaining should be 2 (not counting P2)");
+    }
+
+    #[test]
+    fn test_remaining_count_none_prefix_counts_all() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        let (pfx_clause, pfx_param) = prefix_and(None);
+        let sql = format!(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let remaining: i64 = conn
+            .query_row(&sql, params.as_slice(), |row| row.get(0))
+            .unwrap();
+
+        // 4 tasks total (P1: 2 + P2: 2), done is excluded
+        assert_eq!(remaining, 4, "None prefix should count all remaining tasks");
+    }
+
+    // --- reconcile_passes_with_db scoping ---
+
+    #[test]
+    fn test_reconcile_passes_with_db_only_marks_p1_tasks_done() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        // P1: both in_progress and todo; P2: one todo
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 in_progress', 'in_progress', 1),
+             ('P1-TASK-002', 'P1 todo',        'todo',        2),
+             ('P2-TASK-001', 'P2 todo',         'todo',        1);",
+        )
+        .unwrap();
+
+        // PRD JSON where P1-TASK-001 has passes: true (using base ID TASK-001)
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("prd.json");
+        let prd_json = serde_json::json!({
+            "userStories": [
+                {"id": "TASK-001", "passes": true},
+                {"id": "TASK-002", "passes": false}
+            ]
+        });
+        std::fs::write(&prd_path, prd_json.to_string()).unwrap();
+
+        reconcile_passes_with_db(&conn, &prd_path, Some("P1"));
+
+        // P1-TASK-001 (base id TASK-001, passes: true) should be done
+        let p1_001_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p1_001_status, "done",
+            "P1-TASK-001 should be reconciled to done"
+        );
+
+        // P1-TASK-002 (passes: false) should remain todo
+        let p1_002_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-002'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1_002_status, "todo", "P1-TASK-002 should remain todo");
+
+        // P2-TASK-001 must NOT be touched (different prefix)
+        let p2_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P2-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_status, "todo",
+            "P2-TASK-001 must not be affected by P1 reconciliation"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_passes_with_db_none_prefix_marks_all_matching() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('TASK-001', 'Task 1', 'in_progress', 1),
+             ('TASK-002', 'Task 2', 'todo',        2);",
+        )
+        .unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("prd.json");
+        let prd_json = serde_json::json!({
+            "userStories": [
+                {"id": "TASK-001", "passes": true},
+                {"id": "TASK-002", "passes": false}
+            ]
+        });
+        std::fs::write(&prd_path, prd_json.to_string()).unwrap();
+
+        reconcile_passes_with_db(&conn, &prd_path, None);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "done",
+            "None prefix should reconcile matching tasks"
+        );
+    }
+
+    // --- scan_output_for_completed_tasks scoping ---
+
+    #[test]
+    fn test_scan_output_scoped_to_p1_only() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 task', 'todo', 1),
+             ('P2-TASK-001', 'P2 task', 'todo', 1);",
+        )
+        .unwrap();
+
+        // Output mentions both task IDs in bracket format
+        let output = "Completed [P1-TASK-001] and [P2-TASK-001]";
+
+        let completed = scan_output_for_completed_tasks(output, &conn, Some("P1"));
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-001".to_string()],
+            "Only P1 task should be detected when prefix is P1"
+        );
+    }
+
+    #[test]
+    fn test_scan_output_none_prefix_matches_all() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 task', 'todo', 1),
+             ('P2-TASK-001', 'P2 task', 'todo', 1);",
+        )
+        .unwrap();
+
+        let output = "Completed [P1-TASK-001] and [P2-TASK-001]";
+        let mut completed = scan_output_for_completed_tasks(output, &conn, None);
+        completed.sort();
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-001".to_string(), "P2-TASK-001".to_string()],
+            "None prefix should match all task IDs in output"
+        );
+    }
+
+    #[test]
+    fn test_scan_output_excludes_done_tasks() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 done',  'done', 1),
+             ('P1-TASK-002', 'P1 todo',  'todo', 2);",
+        )
+        .unwrap();
+
+        // Both are mentioned in output but done tasks should not appear
+        let output = "Completed [P1-TASK-001] and [P1-TASK-002]";
+        let completed = scan_output_for_completed_tasks(output, &conn, Some("P1"));
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-002".to_string()],
+            "Done tasks should not appear in scan results"
+        );
+    }
 }
