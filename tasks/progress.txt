@@ -1,4 +1,14 @@
 
+## 2026-02-28 - SS-SS-REFACTOR-REVIEW-1
+- Reviewed 6 files for DRY violations, complexity, coupling, and maintainability
+- **1 issue found**: prefix.rs hardcodes `id` column, forcing 4 call sites (selection.rs×2, import.rs×2) to manually rebuild escape_like + LIKE + ESCAPE patterns
+- Created REFACTOR-1-001 (priority 24) to extract column-parameterized prefix helper
+- Added REFACTOR-1-001 to MILESTONE-1 dependsOn
+- **No issues found for**: tight coupling, signals.rs, status.rs, engine.rs
+- **Functions over 30 lines**: drop_existing_data, get_delete_preview, insert_prd_metadata, select_next_task, format_text — all justified by structural complexity (branching, SQL, display)
+- **Learnings:** The if/else pattern for optional param binding is repeated ~6 times but extracting it would add indirection without clarity gain — acceptable duplication
+---
+
 ## 2026-02-27 - SS-SS-TEST-INIT-001
 - Created `src/db/prefix.rs` with todo!() stubs + 29 TDD tests
 - Added `pub mod prefix;` to `src/db/mod.rs`

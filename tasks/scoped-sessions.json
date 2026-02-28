@@ -1073,7 +1073,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: add a REFACTOR-1-xxx task (priority 24-25), add it to MILESTONE-1 dependsOn, commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "passes": true,
       "priority": 23,
       "qualityDimensions": {
         "correctness": [
@@ -1095,6 +1095,46 @@
         "src/loop_engine/engine.rs",
         "src/loop_engine/signals.rs",
         "src/loop_engine/status.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "prefix.rs exports prefix_and_col(column, prefix) or equivalent parameterized helper",
+        "selection.rs get_relationships_by_type and get_all_task_files use the new helper instead of inline escape_like + format",
+        "import.rs drop_existing_data and get_delete_preview use the new helper instead of inline escape_like + format",
+        "All existing tests pass unchanged",
+        "No new inline LIKE pattern construction outside prefix.rs"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "SS-REFACTOR-REVIEW-1"
+      ],
+      "description": "Add a column-parameterized prefix helper to prefix.rs (e.g. prefix_and_col) so that callers filtering on task_id (not id) don't need to manually rebuild escape_like + LIKE + ESCAPE patterns. Currently 4 call sites in selection.rs and import.rs duplicate this logic.",
+      "estimatedEffort": "low",
+      "id": "SS-REFACTOR-1-001",
+      "modifiesBehavior": false,
+      "notes": "The existing prefix_where/prefix_and hardcode column 'id'. Add variants that accept a column name parameter. Update the 4 manual call sites. Keep existing prefix_where/prefix_and as convenience wrappers.",
+      "passes": false,
+      "priority": 24,
+      "qualityDimensions": {
+        "correctness": [
+          "All existing tests pass",
+          "New helper produces identical SQL to current inline code"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "DRY: no inline LIKE pattern construction outside prefix.rs"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Extract column-parameterized prefix helper to eliminate DRY violations",
+      "touchesFiles": [
+        "src/db/prefix.rs",
+        "src/commands/init/import.rs",
+        "src/commands/next/selection.rs"
       ]
     },
     {
@@ -1130,7 +1170,8 @@
         "SS-FEAT-010",
         "SS-FEAT-011",
         "SS-CODE-REVIEW-1",
-        "SS-REFACTOR-REVIEW-1"
+        "SS-REFACTOR-REVIEW-1",
+        "SS-REFACTOR-1-001"
       ],
       "description": "Gate before comprehensive testing. Verify all initial tests pass, all implementation tasks complete, code review and refactor review done.",
       "estimatedEffort": "medium",
