@@ -233,3 +233,44 @@
 - **NOTE**: scoped-sessions.json still missing — tasks documented here only
 - **Learnings**: rstest parameterized tests superseded manual-loop variants but old ones weren't cleaned up; engine.rs tests diverged from prompt.rs test patterns (inline SQL vs helpers)
 ---
+
+## 2026-02-28 - SS-SS-CODE-REVIEW-1
+**Review: Quality, Security, and Integration Wiring**
+
+### Methodology
+- Grepped all `FROM tasks`, `FROM task_relationships`, `FROM task_files` across entire src/ (194 matches)
+- Reviewed all 11 files listed in task scope
+- Checked unwrap() usage, LIKE escape correctness, prefix validation, module exports
+
+### Issues Found
+
+#### CODE-FIX-001 (Priority 20) — calibrate.rs `get_relationship_counts` not prefix-scoped
+- **File**: `src/loop_engine/calibrate.rs:307-318`
+- **Problem**: `get_relationship_counts()` queries ALL `task_relationships` without prefix filtering. Called from `load_task_outcomes()` (line 260-261) which accepts `task_prefix` but doesn't pass it through.
+- **Impact**: Cross-PRD data in calibration weights — synergy/conflict counts include wrong PRD's data
+- **Fix**: Add `task_prefix: Option<&str>` param, build `WHERE task_id LIKE ? ESCAPE '\\'` clause manually (same pattern as `get_task_file_counts`)
+
+#### CODE-FIX-002 (Priority 21) — calibrate.rs `load_task_outcomes` run_tasks query not prefix-scoped
+- **File**: `src/loop_engine/calibrate.rs:225-229`
+- **Problem**: Queries ALL `run_tasks` without prefix filtering. Includes task outcomes from other PRDs.
+- **Impact**: Inaccurate calibration — weights skewed by other PRD's task history
+- **Fix**: Add prefix filtering to run_tasks query via JOIN or WHERE on task_id
+
+### Verified OK (No Issues)
+- **prefix.rs**: escape_like, prefix_where, prefix_and, validate_prefix — all correct, escape char properly used
+- **v9.rs**: Migration correct, UNIQUE constraint on task_prefix, proper down migration
+- **import.rs**: All delete/count queries use LIKE with ESCAPE, properly prefix-scoped
+- **selection.rs**: All 4 query helpers (get_completed_task_ids, get_todo_tasks, get_relationships_by_type, get_all_task_files) properly prefix-scoped
+- **decay.rs**: Both apply_decay and find_decay_warnings properly prefix-scoped via prefix_and
+- **engine.rs**: All 6 task queries use pfx_clause variables, properly scoped
+- **status.rs**: All 3 queries (dashboard counts, pending tasks, project info) properly prefix-scoped
+- **prompt.rs**: Queries use specific task_id JOINs — implicitly scoped by the already-prefix-filtered task
+- **signals.rs**: Prefix used in filenames; validated upstream in engine.rs via validate_prefix()
+- **No unwrap() in production code** — only unwrap_or() defaults and expect() with messages
+- **Module exports complete** — `pub mod prefix` in db/mod.rs, all functions pub
+
+### NOTE
+- scoped-sessions.json still missing — CODE-FIX tasks documented here only
+- 2 issues found, both in calibrate.rs (same file, related pattern)
+- **Learnings**: When a function accepts task_prefix and calls sub-functions, verify the sub-functions also propagate the prefix. calibrate.rs had partial scoping — `count_completed_tasks` and `get_task_file_counts` were scoped but `get_relationship_counts` was missed.
+---
