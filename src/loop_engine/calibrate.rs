@@ -257,8 +257,8 @@ fn load_task_outcomes(
     let file_counts = get_task_file_counts(conn, task_prefix)?;
 
     // Load synergy/conflict counts per task
-    let synergy_counts = get_relationship_counts(conn, "synergyWith")?;
-    let conflict_counts = get_relationship_counts(conn, "conflictsWith")?;
+    let synergy_counts = get_relationship_counts(conn, "synergyWith", task_prefix)?;
+    let conflict_counts = get_relationship_counts(conn, "conflictsWith", task_prefix)?;
 
     // Build outcome records
     let outcomes: Vec<TaskOutcome> = task_first_try
@@ -303,17 +303,33 @@ fn get_task_file_counts(
     Ok(rows?.into_iter().collect())
 }
 
-/// Get the count of relationships of a given type per task.
+/// Get the count of relationships of a given type per task, optionally filtered by prefix.
 fn get_relationship_counts(
     conn: &Connection,
     rel_type: &str,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<std::collections::HashMap<String, i32>> {
-    let mut stmt = conn.prepare(
-        "SELECT task_id, COUNT(*) FROM task_relationships WHERE rel_type = ? GROUP BY task_id",
-    )?;
-    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = stmt
-        .query_map([rel_type], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect();
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            ("AND task_id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
+        "SELECT task_id, COUNT(*) FROM task_relationships WHERE rel_type = ? {prefix_clause} GROUP BY task_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![rel_type, p], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect(),
+        None => stmt
+            .query_map([rel_type], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect(),
+    };
     Ok(rows?.into_iter().collect())
 }
 
