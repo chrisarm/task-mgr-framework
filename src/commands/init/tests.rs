@@ -1981,3 +1981,330 @@ mod scoped_import_tests {
         assert_eq!(count, 1, "P2 prd_metadata must survive scoped P1 delete");
     }
 }
+
+// ============================================================================
+// SS-SS-TEST-003: Full init() flow tests for multi-PRD import, upsert, and
+// scoped --force behavior.
+// ============================================================================
+
+mod multi_prd_import_tests {
+    use crate::commands::init::{init, PrefixMode};
+    use crate::db::open_connection;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_prd_json(task_prefix: &str, task_id: &str) -> String {
+        format!(
+            r#"{{
+                "project": "test-{task_prefix}",
+                "taskPrefix": "{task_prefix}",
+                "userStories": [
+                    {{"id": "{task_id}", "title": "Task {task_id}", "priority": 1, "passes": false}}
+                ]
+            }}"#
+        )
+    }
+
+    // AC 1: Import P1 then P2 — both prd_metadata rows must exist, and each
+    // prd_files row must link to the correct prd_id for its PRD.
+    #[test]
+    fn test_import_p1_then_p2_both_metadata_rows_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true, // append
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "importing two PRDs must create two prd_metadata rows"
+        );
+
+        let p1_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM prd_metadata WHERE task_prefix = 'P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let p2_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(p1_exists, "prd_metadata row for P1 must exist");
+        assert!(p2_exists, "prd_metadata row for P2 must exist");
+    }
+
+    // AC 1 (continued): prd_files for each PRD must link to the correct prd_id.
+    #[test]
+    fn test_import_p1_then_p2_prd_files_correct_associations() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+
+        // Retrieve the prd_id for each PRD
+        let p1_id: i64 = conn
+            .query_row(
+                "SELECT id FROM prd_metadata WHERE task_prefix = 'P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let p2_id: i64 = conn
+            .query_row(
+                "SELECT id FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(p1_id, p2_id, "each PRD must have a distinct prd_id");
+
+        // prd_files for p1.json must link to p1_id only
+        // file_path is stored as the full path (or relative to tasks/) — use LIKE for portability
+        let p1_file_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path LIKE '%p1.json' AND file_type = 'task_list'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p1_file_prd_id, p1_id,
+            "p1.json prd_files row must link to P1's prd_id"
+        );
+
+        // prd_files for p2.json must link to p2_id only
+        let p2_file_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path LIKE '%p2.json' AND file_type = 'task_list'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_file_prd_id, p2_id,
+            "p2.json prd_files row must link to P2's prd_id"
+        );
+    }
+
+    // AC 2: Import P1 twice (with --force on second import).
+    // The prd_metadata row must be updated (not duplicated), and prd_files must
+    // not be doubled.
+    #[test]
+    fn test_import_p1_twice_metadata_not_duplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        // Re-import with --force (scoped to P1)
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "re-importing P1 with --force must not duplicate prd_metadata"
+        );
+    }
+
+    #[test]
+    fn test_import_p1_twice_prd_files_not_duplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |r| r.get(0))
+            .unwrap();
+
+        // Re-import with --force
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "re-importing P1 with --force must not duplicate prd_files entries"
+        );
+    }
+
+    // AC 3: After importing P1 and P2, --force P1 must delete only P1's data.
+    // P2 tasks, relationships, and prd_metadata must survive.
+    #[test]
+    fn test_force_p1_deletes_only_p1_leaves_p2_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        // Import both PRDs
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true, // append
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        // Force re-import P1 only
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+
+        // P2 task must still exist
+        let p2_task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            p2_task_count, 1,
+            "P2 task must survive scoped --force of P1"
+        );
+
+        // P2 prd_metadata must still exist
+        let p2_meta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_meta_count, 1,
+            "P2 prd_metadata must survive scoped --force of P1"
+        );
+
+        // P1 task must be re-imported (force deleted then re-inserted)
+        let p1_task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            p1_task_count, 1,
+            "P1 task must be re-imported after --force"
+        );
+    }
+}
