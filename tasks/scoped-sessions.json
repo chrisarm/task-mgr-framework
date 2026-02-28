@@ -1380,8 +1380,8 @@
       "id": "SS-REFACTOR-REVIEW-2",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "notes": "For each issue found: add a REFACTOR-2-xxx task (priority 43-47), add it to MILESTONE-2 dependsOn, commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "notes": "No refactoring needed. New test code reuses existing helpers, names are descriptive, no brittle tests. Pre-existing duplication (status.rs local helpers vs test_utils.rs) predates this feature and is out of scope.",
+      "passes": true,
       "priority": 42,
       "qualityDimensions": {
         "correctness": [

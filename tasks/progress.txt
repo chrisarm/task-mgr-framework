@@ -1,4 +1,13 @@
 
+## 2026-02-28 - SS-REFACTOR-REVIEW-2
+- Reviewed all 6 test files for duplication, helper extraction, naming clarity, and brittleness
+- **No issues found**: New test code reuses existing helpers (next/tests.rs uses test_helpers mod, signals.rs uses simple TempDir)
+- Test names are descriptive and behavior-focused throughout
+- Pre-existing duplication (status.rs local setup_test_db vs loop_engine/test_utils.rs) predates this feature — out of scope
+- **No REFACTOR-2-xxx tasks created**
+- **Learnings:** Per-module test helpers in Rust are idiomatic; extracting to shared modules only worthwhile when signatures match exactly
+---
+
 ## 2026-02-28 - SS-SS-REFACTOR-REVIEW-1
 - Reviewed 6 files for DRY violations, complexity, coupling, and maintainability
 - **1 issue found**: prefix.rs hardcodes `id` column, forcing 4 call sites (selection.rs×2, import.rs×2) to manually rebuild escape_like + LIKE + ESCAPE patterns
