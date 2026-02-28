@@ -222,21 +222,44 @@ fn load_task_outcomes(
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<TaskOutcome>> {
     // Get task attempt history: for each task, count attempts and check if first was successful
-    let mut stmt = conn.prepare(
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            (
+                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
+                Some(pattern),
+            )
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
         "SELECT task_id, status, iteration \
          FROM run_tasks \
-         ORDER BY task_id, iteration ASC",
-    )?;
+         {prefix_clause}\
+         ORDER BY task_id, iteration ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows: Result<Vec<(String, String, i64)>, rusqlite::Error> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect();
+    let rows: Result<Vec<(String, String, i64)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![p], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect(),
+        None => stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect(),
+    };
     let rows = rows?;
 
     if rows.is_empty() {
