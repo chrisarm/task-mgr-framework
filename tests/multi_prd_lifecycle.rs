@@ -201,7 +201,10 @@ fn test_force_reinit_p1_preserves_p2_and_learnings() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(p2_count, 2, "P2 tasks should be untouched by P1 force-reinit");
+    assert_eq!(
+        p2_count, 2,
+        "P2 tasks should be untouched by P1 force-reinit"
+    );
 
     // Learning must still exist
     let learning_exists: bool = conn
@@ -274,8 +277,8 @@ fn test_per_prefix_locks_are_independent() {
     let temp_dir = TempDir::new().unwrap();
 
     // Acquire P1 lock
-    let guard1 = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock")
-        .expect("Should acquire P1 lock");
+    let guard1 =
+        LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock").expect("Should acquire P1 lock");
 
     // P2 lock is independent — should succeed while P1 is held
     let guard2 = LockGuard::acquire_named(temp_dir.path(), "loop-P2.lock")
