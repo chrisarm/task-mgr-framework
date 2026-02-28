@@ -284,3 +284,10 @@
 - 2 issues found, both in calibrate.rs (same file, related pattern)
 - **Learnings**: When a function accepts task_prefix and calls sub-functions, verify the sub-functions also propagate the prefix. calibrate.rs had partial scoping — `count_completed_tasks` and `get_task_file_counts` were scoped but `get_relationship_counts` was missed.
 ---
+
+## 2026-02-28 - SS-TEST-001
+- Added 9 prefix-scoped engine query tests to src/loop_engine/engine.rs
+- Tests cover: initial recovery (P1 only, None=all), remaining count (P1 only, None=all), reconcile_passes_with_db (P1 only, None=all), scan_output_for_completed_tasks (P1 only, None=all, done excluded)
+- All 1954 lib tests pass; fmt/check/clippy clean
+- **Learnings:** Testing private functions (reconcile_passes_with_db, scan_output_for_completed_tasks) works because tests use `use super::*;` in the same file's test module
+---
