@@ -1449,3 +1449,334 @@ mod decay_tests {
         assert!(warnings.is_empty());
     }
 }
+
+/// Tests for task selection with a mixed-PRD database (SS-SS-TEST-004).
+///
+/// These tests verify that all selection behaviors (scoring, dependency checking,
+/// synergy, conflict, batch grouping, decay) correctly respect prefix boundaries
+/// when a task_prefix is set.
+#[cfg(test)]
+mod mixed_prd_selection_tests {
+    use super::test_helpers::{insert_test_relationship, insert_test_task_file, setup_test_db};
+    use crate::commands::next::decay::{apply_decay, find_decay_warnings};
+    use crate::commands::next::selection::select_next_task;
+
+    // ---------------------------------------------------------------------------
+    // Fixture helpers
+    // ---------------------------------------------------------------------------
+
+    /// Insert a minimal task with a given ID prefix, e.g. "P1-US-001" or "P2-US-001".
+    fn insert_prd_task(conn: &rusqlite::Connection, id: &str, status: &str, priority: i32) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
+            rusqlite::params![id, format!("Task {id}"), status, priority],
+        )
+        .unwrap();
+    }
+
+    /// Build a rich fixture with P1 and P2 tasks sharing the same DB.
+    ///
+    /// P1 tasks:
+    ///   P1-US-001  todo  priority=10  (synergy with P1-US-003; batch with P2-US-003)
+    ///   P1-US-002  todo  priority=20  (depends on P1-US-003 which is done)
+    ///   P1-US-003  done  priority=30
+    ///   P1-US-004  todo  priority=10  (depends on P1-US-005 todo → blocked; also depends on P2-US-002 done)
+    ///   P1-US-005  todo  priority=50  (conflict with P1-US-003)
+    ///   P1-US-006  blocked
+    ///   P1-US-007  skipped
+    ///
+    /// P2 tasks:
+    ///   P2-US-001  todo  priority=1   (highest — wins when no prefix)
+    ///   P2-US-002  done  priority=5
+    ///   P2-US-003  todo  priority=50  (cross-PRD synergy: synergyWith P1-US-001)
+    fn setup_mixed_prd_db() -> (tempfile::TempDir, rusqlite::Connection) {
+        let (tmp, conn) = setup_test_db();
+
+        // P1 tasks
+        insert_prd_task(&conn, "P1-US-001", "todo", 10);
+        insert_prd_task(&conn, "P1-US-002", "todo", 20);
+        insert_prd_task(&conn, "P1-US-003", "done", 30);
+        insert_prd_task(&conn, "P1-US-004", "todo", 10);
+        insert_prd_task(&conn, "P1-US-005", "todo", 50);
+        insert_prd_task(&conn, "P1-US-006", "blocked", 15);
+        insert_prd_task(&conn, "P1-US-007", "skipped", 20);
+
+        // P2 tasks
+        insert_prd_task(&conn, "P2-US-001", "todo", 1);
+        insert_prd_task(&conn, "P2-US-002", "done", 5);
+        insert_prd_task(&conn, "P2-US-003", "todo", 50);
+
+        // Intra-P1 relationships
+        insert_test_relationship(&conn, "P1-US-002", "P1-US-003", "dependsOn");
+        insert_test_relationship(&conn, "P1-US-001", "P1-US-003", "synergyWith");
+        insert_test_relationship(&conn, "P1-US-005", "P1-US-003", "conflictsWith");
+        insert_test_relationship(&conn, "P1-US-004", "P1-US-005", "dependsOn");
+
+        // Cross-PRD: P1-US-004 also depends on P2-US-002 (done) — must be ignored when prefix=P1
+        insert_test_relationship(&conn, "P1-US-004", "P2-US-002", "dependsOn");
+
+        // Cross-PRD batch: P1-US-001 batchWith P2-US-003
+        insert_test_relationship(&conn, "P1-US-001", "P2-US-003", "batchWith");
+
+        // Cross-PRD synergy: P2-US-003 synergyWith P1-US-001
+        insert_test_relationship(&conn, "P2-US-003", "P1-US-001", "synergyWith");
+
+        // Files
+        insert_test_task_file(&conn, "P1-US-001", "src/p1/main.rs");
+        insert_test_task_file(&conn, "P1-US-002", "src/p1/util.rs");
+        insert_test_task_file(&conn, "P2-US-001", "src/p2/main.rs");
+
+        (tmp, conn)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scoring: prefix filters P2 tasks out
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_prefix_filters_p2_tasks_from_selection() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let task = result.task.expect("should select a P1 task");
+        assert!(
+            task.task.id.starts_with("P1-"),
+            "expected P1 task, got {}",
+            task.task.id
+        );
+    }
+
+    /// P1-US-001 has file overlap; P2-OVERLAP would also match but must be excluded by prefix.
+    #[test]
+    fn test_file_overlap_score_respects_prefix() {
+        let (_tmp, conn) = setup_test_db();
+
+        insert_prd_task(&conn, "P1-HIGH-OVERLAP", "todo", 20);
+        insert_prd_task(&conn, "P1-LOW-OVERLAP", "todo", 20);
+        insert_test_task_file(&conn, "P1-HIGH-OVERLAP", "src/foo.rs");
+
+        insert_prd_task(&conn, "P2-OVERLAP", "todo", 20);
+        insert_test_task_file(&conn, "P2-OVERLAP", "src/foo.rs");
+
+        let after_files = vec!["src/foo.rs".to_string()];
+        let result = select_next_task(&conn, &after_files, &[], Some("P1")).unwrap();
+        let task = result.task.expect("should select a task");
+        assert_eq!(task.task.id, "P1-HIGH-OVERLAP");
+        assert!(task.score_breakdown.file_overlap_count > 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Dependency: cross-PRD deps are ignored when prefix is set
+    // ---------------------------------------------------------------------------
+
+    /// P1-US-004 depends on P1-US-005 (todo, unmet) AND P2-US-002 (done, out of scope).
+    /// When prefix=P1, only intra-P1 deps are checked: P1-US-005 is unmet → P1-US-004 blocked.
+    #[test]
+    fn test_cross_prd_dep_ignored_for_prefix_session() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let task = result.task.expect("should have eligible P1 tasks");
+        assert_ne!(
+            task.task.id, "P1-US-004",
+            "P1-US-004 must be blocked by its P1 dep on P1-US-005"
+        );
+    }
+
+    /// Without prefix (None), P2-US-001 wins (priority=1).
+    #[test]
+    fn test_no_prefix_all_tasks_eligible() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let task = result.task.expect("should select a task");
+        assert_eq!(task.task.id, "P2-US-001");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Synergy: intra-PRD synergy works; cross-PRD synergy is not loaded
+    // ---------------------------------------------------------------------------
+
+    /// P1-US-001 synergyWith P1-US-003 (recently completed) → synergy bonus.
+    #[test]
+    fn test_synergy_only_boosts_p1_tasks_in_p1_session() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let recently_completed = vec!["P1-US-003".to_string()];
+        let result = select_next_task(&conn, &[], &recently_completed, Some("P1")).unwrap();
+        let task = result.task.expect("should select a task");
+
+        assert_eq!(task.task.id, "P1-US-001");
+        assert!(
+            task.score_breakdown.synergy_score > 0,
+            "P1-US-001 should get synergy bonus from P1-US-003"
+        );
+    }
+
+    /// In a P2 session, P2-US-003 has synergyWith P1-US-001.
+    /// But the synergy relationships loaded are scoped to P2- task_ids, and the
+    /// recently_completed ID "P1-US-001" is outside P2 scope — no boost expected.
+    /// P2-US-001 (priority=1) wins by priority regardless.
+    #[test]
+    fn test_cross_prd_synergy_not_applied_in_p2_session() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let recently_completed = vec!["P1-US-001".to_string()];
+        let result = select_next_task(&conn, &[], &recently_completed, Some("P2")).unwrap();
+        let task = result.task.expect("should select a P2 task");
+
+        assert!(task.task.id.starts_with("P2-"), "should select a P2 task");
+        // P2-US-001 wins by priority=1
+        assert_eq!(task.task.id, "P2-US-001");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Batch: cross-PRD batchWith targets are excluded
+    // ---------------------------------------------------------------------------
+
+    /// P1-US-001 batchWith P2-US-003. When prefix=P1, batch_tasks must not include P2-US-003.
+    #[test]
+    fn test_cross_prd_batch_ignored_in_p1_session() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        assert!(
+            !result.batch_tasks.contains(&"P2-US-003".to_string()),
+            "cross-PRD batch target must not appear in batch_tasks; got: {:?}",
+            result.batch_tasks
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Decay: only P1-prefixed tasks are decayed in a P1 session
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_decay_only_affects_p1_tasks() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        insert_prd_task(&conn, "P2-US-BLOCKED", "blocked", 99);
+
+        conn.execute(
+            "UPDATE tasks SET blocked_at_iteration = 0 WHERE id IN ('P1-US-006', 'P2-US-BLOCKED')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET skipped_at_iteration = 0 WHERE id = 'P1-US-007'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE global_state SET iteration_counter = 10 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let decayed = apply_decay(&conn, 5, false, Some("P1")).unwrap();
+        let decayed_ids: Vec<&str> = decayed.iter().map(|(id, _)| id.as_str()).collect();
+
+        assert!(decayed_ids.contains(&"P1-US-006"), "P1-US-006 should decay");
+        assert!(decayed_ids.contains(&"P1-US-007"), "P1-US-007 should decay");
+        assert!(
+            !decayed_ids.contains(&"P2-US-BLOCKED"),
+            "P2 task must not be decayed in a P1 session; decayed: {decayed_ids:?}"
+        );
+
+        let p1_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'P1-US-006'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(p1_status, "todo");
+
+        let p2_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P2-US-BLOCKED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p2_status, "blocked", "P2 task must remain blocked");
+    }
+
+    #[test]
+    fn test_decay_warnings_scoped_to_prefix() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        insert_prd_task(&conn, "P2-US-WARN", "blocked", 99);
+
+        conn.execute(
+            "UPDATE tasks SET blocked_at_iteration = 0 WHERE id IN ('P1-US-006', 'P2-US-WARN')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE global_state SET iteration_counter = 8 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // threshold=10, warning=5 → warning zone is iterations 5..10 since blocking
+        // Both tasks blocked at 0, current=8 → 8 iterations since → in warning zone
+        let warnings = find_decay_warnings(&conn, 10, 5, Some("P1")).unwrap();
+        let warned_ids: Vec<&str> = warnings.iter().map(|w| w.task_id.as_str()).collect();
+
+        assert!(
+            warned_ids.contains(&"P1-US-006"),
+            "P1-US-006 should appear in warnings"
+        );
+        assert!(
+            !warned_ids.contains(&"P2-US-WARN"),
+            "P2 task must not appear in P1 warnings"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Backwards compatibility
+    // ---------------------------------------------------------------------------
+
+    /// Single-PRD DB with no prefix: behavior identical to prefix set to that PRD.
+    #[test]
+    fn test_single_prd_no_prefix_identical_to_prefix() {
+        let (_tmp, conn) = setup_test_db();
+
+        insert_prd_task(&conn, "P1-US-010", "todo", 10);
+        insert_prd_task(&conn, "P1-US-020", "todo", 20);
+        insert_prd_task(&conn, "P1-US-030", "done", 30);
+        insert_test_relationship(&conn, "P1-US-020", "P1-US-030", "dependsOn");
+
+        let result_no_prefix = select_next_task(&conn, &[], &[], None).unwrap();
+        let result_with_prefix = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+
+        assert_eq!(
+            result_no_prefix.task.unwrap().task.id,
+            result_with_prefix.task.unwrap().task.id,
+            "single-PRD DB: None and Some(prefix) must select the same task"
+        );
+    }
+
+    /// Eligible count is scoped to the prefix; P1 + P2 counts = all-tasks count.
+    #[test]
+    fn test_eligible_count_respects_prefix() {
+        let (_tmp, conn) = setup_mixed_prd_db();
+
+        let count_p1 = select_next_task(&conn, &[], &[], Some("P1"))
+            .unwrap()
+            .eligible_count;
+        let count_p2 = select_next_task(&conn, &[], &[], Some("P2"))
+            .unwrap()
+            .eligible_count;
+        let count_all = select_next_task(&conn, &[], &[], None)
+            .unwrap()
+            .eligible_count;
+
+        assert!(count_p1 < count_all, "P1 scope < all-scope");
+        assert!(count_p2 < count_all, "P2 scope < all-scope");
+        assert_eq!(
+            count_p1 + count_p2,
+            count_all,
+            "P1 + P2 eligible counts must equal all-tasks count"
+        );
+    }
+}

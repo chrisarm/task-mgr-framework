@@ -231,8 +231,20 @@ pub fn select_next_task(
 
     match top_task {
         Some(task) => {
-            // Find eligible batch tasks (batchWith targets that are also todo)
-            let batch_tasks = get_eligible_batch_tasks(conn, &task.batch_with)?;
+            // Find eligible batch tasks (batchWith targets that are also todo).
+            // When a prefix is set, only consider batch targets within the same PRD.
+            let scoped_batch_with: Vec<String> = match task_prefix {
+                Some(p) => {
+                    let required_prefix = format!("{p}-");
+                    task.batch_with
+                        .iter()
+                        .filter(|id| id.starts_with(&required_prefix))
+                        .cloned()
+                        .collect()
+                }
+                None => task.batch_with.clone(),
+            };
+            let batch_tasks = get_eligible_batch_tasks(conn, &scoped_batch_with)?;
 
             let selection_reason = format!(
                 "Selected task {} with score {} (priority: {}, file_overlap: {}, synergy: {}, conflict: {})",
