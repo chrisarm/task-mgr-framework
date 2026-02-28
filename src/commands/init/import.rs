@@ -8,7 +8,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::db::prefix::escape_like;
+use crate::db::prefix::make_like_pattern;
 use crate::models::TaskStatus;
 use crate::TaskMgrResult;
 
@@ -25,7 +25,7 @@ use super::parse::{PrdFile, PrdUserStory};
 pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<()> {
     match task_prefix {
         Some(prefix) => {
-            let pattern = format!("{}-%", escape_like(prefix));
+            let pattern = make_like_pattern(prefix);
             // Delete child tables before parent (FK ordering)
             conn.execute(
                 "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
@@ -78,7 +78,7 @@ pub fn get_delete_preview(
 ) -> TaskMgrResult<DryRunDeletePreview> {
     match task_prefix {
         Some(prefix) => {
-            let pattern = format!("{}-%", escape_like(prefix));
+            let pattern = make_like_pattern(prefix);
             let tasks: usize = conn.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
                 [&pattern],

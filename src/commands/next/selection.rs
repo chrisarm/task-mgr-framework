@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::db::prefix::{escape_like, prefix_and};
+use crate::db::prefix::{prefix_and, prefix_and_col, prefix_where_col};
 use crate::loop_engine::calibrate;
 use crate::models::Task;
 use crate::TaskMgrResult;
@@ -326,14 +326,7 @@ fn get_relationships_by_type(
     rel_type: &str,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<HashMap<String, Vec<String>>> {
-    // task_relationships uses task_id (not id), so we build the AND clause manually
-    let (prefix_clause, prefix_param) = match task_prefix {
-        Some(p) => {
-            let pattern = format!("{}-%", escape_like(p));
-            ("AND task_id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
-        }
-        None => (String::new(), None),
-    };
+    let (prefix_clause, prefix_param) = prefix_and_col("task_id", task_prefix);
     let sql = format!(
         "SELECT task_id, related_id FROM task_relationships WHERE rel_type = ? {prefix_clause}"
     );
@@ -364,17 +357,7 @@ fn get_all_task_files(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<HashMap<String, Vec<String>>> {
-    // task_files uses task_id (not id), so we build the WHERE clause manually
-    let (prefix_clause, prefix_param) = match task_prefix {
-        Some(p) => {
-            let pattern = format!("{}-%", escape_like(p));
-            (
-                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
-                Some(pattern),
-            )
-        }
-        None => (String::new(), None),
-    };
+    let (prefix_clause, prefix_param) = prefix_where_col("task_id", task_prefix);
     let sql = format!("SELECT task_id, file_path FROM task_files {prefix_clause}");
     let mut stmt = conn.prepare(&sql)?;
 

@@ -136,7 +136,7 @@ pub fn show_status(
 }
 
 /// Read the `taskPrefix` field from a PRD JSON file.
-fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
+pub fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
     let content = fs::read_to_string(prd_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json.get("taskPrefix")
@@ -283,7 +283,6 @@ fn query_pending_tasks(
 
     Ok(tasks)
 }
-
 
 /// Read deadline info from .deadline-* files in the tasks directory.
 ///

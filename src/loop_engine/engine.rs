@@ -42,6 +42,7 @@ use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
+use crate::loop_engine::status::read_task_prefix_from_prd;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::models::RunStatus;
 use crate::TaskMgrResult;
@@ -633,14 +634,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
     // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
     // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
-    let pre_lock_prefix: Option<String> = std::fs::read_to_string(&run_config.prd_file)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|v| {
-            v.get("taskPrefix")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+    let pre_lock_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file)
         .and_then(|p| {
             // Only use prefix if it is safe for filenames
             if validate_prefix(&p).is_ok() {
@@ -731,16 +725,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
 
     // Step 6.55: Read task prefix from PRD JSON before initial recovery so the
     // recovery query can be scoped to this PRD's tasks only.
-    let early_task_prefix: Option<String> = {
-        std::fs::read_to_string(&run_config.prd_file)
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| {
-                v.get("taskPrefix")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-    };
+    let early_task_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file);
 
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
     // Safe because we hold the exclusive loop lock — no other loop can be running.

@@ -43,36 +43,65 @@ pub fn escape_like(s: &str) -> String {
     out
 }
 
-/// Build a `WHERE` clause and LIKE pattern for filtering tasks by PRD prefix.
+/// Build the LIKE pattern for a prefix: `"{escaped_prefix}-%"`.
 ///
-/// Returns `("WHERE id LIKE ? ESCAPE '\\'", Some("{prefix}-%"))` when a prefix
-/// is supplied, or `("", None)` when `prefix` is `None`.
+/// Use this when you need the raw pattern without a SQL clause fragment,
+/// e.g. when the same pattern is bound to multiple statements.
+pub fn make_like_pattern(prefix: &str) -> String {
+    format!("{}-%", escape_like(prefix))
+}
+
+/// Build a `WHERE {col} LIKE ? ESCAPE '\\'` clause and LIKE pattern.
 ///
-/// The prefix is passed through [`escape_like`] before embedding in the
-/// pattern so that literal `%`, `_`, and `\` characters in the prefix are
-/// matched exactly rather than acting as LIKE wildcards.
-pub fn prefix_where(prefix: Option<&str>) -> (String, Option<String>) {
+/// Returns the clause string and `Some(pattern)` when a prefix is supplied,
+/// or `("", None)` when `prefix` is `None`. The column name is embedded
+/// directly into the SQL fragment — callers are responsible for passing a
+/// trusted column name (not user input).
+pub fn prefix_where_col(col: &str, prefix: Option<&str>) -> (String, Option<String>) {
     match prefix {
         Some(p) => {
-            let pattern = format!("{}-%", escape_like(p));
-            ("WHERE id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+            let pattern = make_like_pattern(p);
+            (
+                format!("WHERE {col} LIKE ? ESCAPE '\\'"),
+                Some(pattern),
+            )
         }
         None => (String::new(), None),
     }
 }
 
-/// Build an `AND` clause and LIKE pattern for filtering tasks by PRD prefix.
+/// Build an `AND {col} LIKE ? ESCAPE '\\'` clause and LIKE pattern.
 ///
-/// Identical to [`prefix_where`] but uses `AND` instead of `WHERE`, suitable
-/// for appending to a query that already has a `WHERE` clause.
-pub fn prefix_and(prefix: Option<&str>) -> (String, Option<String>) {
+/// Identical to [`prefix_where_col`] but uses `AND`, suitable for appending
+/// to a query that already has a `WHERE` clause.
+pub fn prefix_and_col(col: &str, prefix: Option<&str>) -> (String, Option<String>) {
     match prefix {
         Some(p) => {
-            let pattern = format!("{}-%", escape_like(p));
-            ("AND id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+            let pattern = make_like_pattern(p);
+            (
+                format!("AND {col} LIKE ? ESCAPE '\\'"),
+                Some(pattern),
+            )
         }
         None => (String::new(), None),
     }
+}
+
+/// Build a `WHERE` clause and LIKE pattern for filtering tasks by PRD prefix.
+///
+/// Convenience wrapper around [`prefix_where_col`] that uses the `id` column.
+/// Returns `("WHERE id LIKE ? ESCAPE '\\'", Some("{prefix}-%"))` when a prefix
+/// is supplied, or `("", None)` when `prefix` is `None`.
+pub fn prefix_where(prefix: Option<&str>) -> (String, Option<String>) {
+    prefix_where_col("id", prefix)
+}
+
+/// Build an `AND` clause and LIKE pattern for filtering tasks by PRD prefix.
+///
+/// Convenience wrapper around [`prefix_and_col`] that uses the `id` column.
+/// Suitable for appending to a query that already has a `WHERE` clause.
+pub fn prefix_and(prefix: Option<&str>) -> (String, Option<String>) {
+    prefix_and_col("id", prefix)
 }
 
 /// Validate that a prefix string contains only safe characters.
