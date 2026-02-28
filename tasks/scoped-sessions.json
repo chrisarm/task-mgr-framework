@@ -1293,7 +1293,7 @@
       "id": "SS-TEST-003",
       "modifiesBehavior": false,
       "notes": "These tests exercise the full import pipeline with migration. May reveal implementation gaps.",
-      "passes": false,
+      "passes": true,
       "priority": 35,
       "qualityDimensions": {
         "correctness": [
