@@ -1547,7 +1547,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate before merge. Run all quality checks and verify everything passes.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "timeoutSecs": 1800,
