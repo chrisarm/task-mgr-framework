@@ -753,6 +753,15 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let task_prefix = prd_metadata.task_prefix;
     let default_model = prd_metadata.default_model;
 
+    // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
+    // resolve_paths was called at Step 3 with None prefix because metadata wasn't available yet.
+    let mut paths = paths;
+    if let Some(ref pfx) = task_prefix {
+        paths.progress_file = paths
+            .tasks_dir
+            .join(format!("progress-{}.txt", pfx));
+    }
+
     // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
     // This allows lock error messages to show which branch/PRD holds the lock.
     if let Err(e) = loop_lock.write_holder_info_extended(

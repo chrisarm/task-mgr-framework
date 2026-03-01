@@ -610,8 +610,8 @@
       "title": "Wire task_prefix into resolve_paths() for per-PRD progress files",
       "description": "resolve_paths in engine.rs (Step 3) passes None for prefix because task_prefix isn't known yet (comes from PRD metadata at Step 7). Either re-resolve progress_file after metadata is read, or move resolve_paths call after metadata read.",
       "priority": 15,
-      "status": "in_progress",
-      "passes": false,
+      "status": "done",
+      "passes": true,
       "estimatedEffort": "small",
       "modifiesBehavior": false,
       "touchesFiles": [
