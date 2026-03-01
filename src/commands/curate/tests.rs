@@ -486,7 +486,6 @@ fn test_candidates_found_matches_learnings_retired() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretire_sets_retired_at_null() {
     // AC: unretire sets retired_at = NULL on a retired learning
     let (_dir, conn) = setup_db();
@@ -517,7 +516,6 @@ fn test_unretire_sets_retired_at_null() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-002 (filters), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretired_learning_reappears_in_list() {
     // AC: unretired learning reappears in recall/list queries
     let (_dir, conn) = setup_db();
@@ -557,7 +555,6 @@ fn test_unretired_learning_reappears_in_list() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretire_nonexistent_id_returns_error() {
     // AC: unretire on non-existent ID returns appropriate error
     let (_dir, conn) = setup_db();
@@ -577,7 +574,6 @@ fn test_unretire_nonexistent_id_returns_error() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretire_already_active_returns_error() {
     // AC: unretire on already-active learning returns error/no-op (must not silently succeed)
     // Known-bad discriminator: unretiring an already-active learning should not succeed silently
@@ -604,7 +600,6 @@ fn test_unretire_already_active_returns_error() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretire_multiple_ids() {
     // AC: unretire multiple IDs in one call
     let (_dir, conn) = setup_db();
@@ -634,7 +629,6 @@ fn test_unretire_multiple_ids() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-005 (curate_unretire impl)"]
 fn test_unretire_only_modifies_retired_at() {
     // Invariant: unretire must not modify any field other than retired_at
     let (_dir, conn) = setup_db();

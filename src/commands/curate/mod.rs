@@ -107,16 +107,16 @@ fn build_reason(
 ) -> String {
     let c1 = age_days >= min_age_days as f64 && confidence == "low" && times_applied == 0;
     let c2 = times_shown >= min_shows && times_applied == 0;
-    let c3 = times_shown >= min_shows_doubled
-        && (times_applied as f64 / times_shown as f64) < max_rate;
+    let c3 =
+        times_shown >= min_shows_doubled && (times_applied as f64 / times_shown as f64) < max_rate;
 
     match (c1, c2, c3) {
         (true, false, false) => format!(
             "Low-confidence learning not applied in {age_days:.0} days (threshold: {min_age_days})"
         ),
-        (false, true, false) => format!(
-            "Shown {times_shown} times but never applied (threshold: {min_shows})"
-        ),
+        (false, true, false) => {
+            format!("Shown {times_shown} times but never applied (threshold: {min_shows})")
+        }
         (false, false, true) => {
             let rate = (times_applied as f64 / times_shown as f64) * 100.0;
             let max_pct = max_rate * 100.0;
@@ -156,9 +156,8 @@ fn retire_candidates(conn: &Connection, ids: &[i64]) -> TaskMgrResult<usize> {
         .map(|(i, _)| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "UPDATE learnings SET retired_at = datetime('now') WHERE id IN ({placeholders})"
-    );
+    let sql =
+        format!("UPDATE learnings SET retired_at = datetime('now') WHERE id IN ({placeholders})");
 
     let params = rusqlite::params_from_iter(ids.iter());
     let rows_updated = conn.execute(&sql, params)?;
@@ -167,11 +166,46 @@ fn retire_candidates(conn: &Connection, ids: &[i64]) -> TaskMgrResult<usize> {
 
 /// Restores soft-archived learnings by setting retired_at = NULL.
 ///
-/// Returns an error entry for each ID that does not exist or is not retired.
+/// Validates each ID: must exist and must currently be retired.
+/// Processes all IDs in a single transaction; collects per-ID errors without aborting.
 pub fn curate_unretire(conn: &Connection, learning_ids: Vec<i64>) -> TaskMgrResult<UnretireResult> {
-    let _ = conn;
-    let _ = learning_ids;
-    todo!("FEAT-005: implement curate unretire")
+    let mut restored = Vec::new();
+    let mut errors = Vec::new();
+
+    // Validate each ID before opening a transaction
+    for &id in &learning_ids {
+        let result: rusqlite::Result<Option<bool>> = conn.query_row(
+            "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
+            [id],
+            |row| row.get::<_, bool>(0).map(Some),
+        );
+
+        match result {
+            Err(_) | Ok(None) => {
+                errors.push(format!("Learning {id} not found"));
+            }
+            Ok(Some(false)) => {
+                errors.push(format!("Learning {id} is not retired (retired_at IS NULL)"));
+            }
+            Ok(Some(true)) => {
+                restored.push(id);
+            }
+        }
+    }
+
+    if !restored.is_empty() {
+        let placeholders = restored
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE learnings SET retired_at = NULL WHERE id IN ({placeholders})");
+        let params = rusqlite::params_from_iter(restored.iter());
+        conn.execute(&sql, params)?;
+    }
+
+    Ok(UnretireResult { restored, errors })
 }
 
 #[cfg(test)]
