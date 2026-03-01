@@ -496,6 +496,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             remove_tags,
             add_files,
             remove_files,
+            add_task_types,
+            remove_task_types,
+            add_errors,
+            remove_errors,
         } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -516,10 +520,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 remove_tags,
                 add_files,
                 remove_files,
-                add_task_types: None,
-                remove_task_types: None,
-                add_errors: None,
-                remove_errors: None,
+                add_task_types,
+                remove_task_types,
+                add_errors,
+                remove_errors,
             };
 
             let result = edit_learning(&conn, learning_id, params)?;

@@ -117,6 +117,66 @@ pub fn edit_learning(
         updated_fields.push("applies_to_files".to_string());
     }
 
+    // Handle task type modifications
+    let task_types_modified = params.add_task_types.is_some() || params.remove_task_types.is_some();
+    if task_types_modified {
+        let mut current: Vec<String> = learning.applies_to_task_types.unwrap_or_default();
+
+        if let Some(ref remove) = params.remove_task_types {
+            current.retain(|t| !remove.contains(t));
+        }
+
+        if let Some(ref add) = params.add_task_types {
+            for item in add {
+                if !current.contains(item) {
+                    current.push(item.clone());
+                }
+            }
+        }
+
+        let json = if current.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&current).unwrap_or_default())
+        };
+
+        conn.execute(
+            "UPDATE learnings SET applies_to_task_types = ?1 WHERE id = ?2",
+            rusqlite::params![json, learning_id],
+        )?;
+        updated_fields.push("applies_to_task_types".to_string());
+    }
+
+    // Handle error pattern modifications
+    let errors_modified = params.add_errors.is_some() || params.remove_errors.is_some();
+    if errors_modified {
+        let mut current: Vec<String> = learning.applies_to_errors.unwrap_or_default();
+
+        if let Some(ref remove) = params.remove_errors {
+            current.retain(|e| !remove.contains(e));
+        }
+
+        if let Some(ref add) = params.add_errors {
+            for item in add {
+                if !current.contains(item) {
+                    current.push(item.clone());
+                }
+            }
+        }
+
+        let json = if current.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&current).unwrap_or_default())
+        };
+
+        conn.execute(
+            "UPDATE learnings SET applies_to_errors = ?1 WHERE id = ?2",
+            rusqlite::params![json, learning_id],
+        )?;
+        updated_fields.push("applies_to_errors".to_string());
+    }
+
     // Handle tag modifications
     let mut tags_added = 0;
     let mut tags_removed = 0;

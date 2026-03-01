@@ -551,6 +551,22 @@ MATCHING BEHAVIOR:
         /// File patterns to remove (comma-separated)
         #[arg(long = "remove-files", value_delimiter = ',')]
         remove_files: Option<Vec<String>>,
+
+        /// Task type prefixes to add (comma-separated)
+        #[arg(long = "add-task-types", value_delimiter = ',')]
+        add_task_types: Option<Vec<String>>,
+
+        /// Task type prefixes to remove (comma-separated)
+        #[arg(long = "remove-task-types", value_delimiter = ',')]
+        remove_task_types: Option<Vec<String>>,
+
+        /// Error patterns to add (comma-separated)
+        #[arg(long = "add-errors", value_delimiter = ',')]
+        add_errors: Option<Vec<String>>,
+
+        /// Error patterns to remove (comma-separated)
+        #[arg(long = "remove-errors", value_delimiter = ',')]
+        remove_errors: Option<Vec<String>>,
     },
 
     /// Review blocked and skipped tasks

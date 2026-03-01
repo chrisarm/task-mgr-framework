@@ -1562,6 +1562,7 @@ fn test_edit_learning_basic() {
             remove_tags,
             add_files,
             remove_files,
+            ..
         } => {
             assert_eq!(learning_id, 42);
             assert!(title.is_none());
@@ -1738,6 +1739,7 @@ fn test_edit_learning_with_all_options() {
             remove_tags,
             add_files,
             remove_files,
+            ..
         } => {
             assert_eq!(learning_id, 123);
             assert_eq!(title, Some("Updated Title".to_string()));
