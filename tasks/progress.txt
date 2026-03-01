@@ -376,3 +376,27 @@
 - **Findings:** No issues found. Code is clean, well-structured, DRY. Minor placeholder duplication (2 uses) is acceptable per CLAUDE.md anti-premature-abstraction guidance. build_reason has 8 params but is an internal helper; struct wrapping would be over-engineering. Phase 2/3 can extend without modifying Phase 1.
 - **No REFACTOR-3-xxx tasks needed.**
 ---
+
+## 2026-03-01 - ef543206-TEST-INIT-002
+- Added `EnrichCandidate` struct to types.rs
+- Added stub `find_enrichment_candidates` (todo!()) to mod.rs so tests compile
+- Added 9 `#[ignore]` tests to tests.rs covering all acceptance criteria
+- Tests compile clean; all 9 are ignored pending FEAT-003 implementation
+- **Learnings:** Stub function with todo!() + #[ignore] tests is the right pattern for TDD stubs — tests compile and are tracked but don't break CI
+---
+
+## 2026-03-01 - ef543206-CODE-REVIEW-1
+- Reviewed all 9 files for quality, security, and integration wiring
+- **unwrap() audit**: No unwrap() in production code — only in #[cfg(test)] modules. PASS
+- **Error propagation**: Proper `?` throughout, context via `map_err` in main.rs field parsing. PASS
+- **Security: injection protection**: enrich.rs:53 uses UUID-based random delimiter. PASS
+- **Security: ID validation**: enrich.rs:122 validates learning_id against batch_ids. PASS
+- **NULL-only semantics**: proposal_to_edit_params only sets add_* when current field is None. PASS
+- **Integration wiring**: mod.rs exports enrich, handlers.rs has TextFormattable impl, main.rs dispatches. PASS
+- **edit_learning handles task_types/errors**: update.rs:120-178 mirrors files pattern exactly. PASS
+- **Dead code**: cargo check + clippy zero warnings. PASS
+- **Edge case coverage**: TEST-INIT-001 has 10 tests, TEST-INIT-002 has 9 tests — all edge cases covered. PASS
+- **Formatting fix**: cargo fmt --check failed on enrich.rs test helper signature (long line) — fixed with cargo fmt
+- **No CODE-FIX tasks needed** — all acceptance criteria met
+- **Learnings:** unwrap_or_default() on get_learning_tags is acceptable graceful degradation for supplementary LLM prompt data
+---

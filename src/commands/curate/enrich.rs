@@ -437,7 +437,12 @@ fn find_matching_bracket(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn make_proposal(files: &[&str], task_types: &[&str], errors: &[&str], tags: &[&str]) -> EnrichProposal {
+    fn make_proposal(
+        files: &[&str],
+        task_types: &[&str],
+        errors: &[&str],
+        tags: &[&str],
+    ) -> EnrichProposal {
         EnrichProposal {
             learning_id: 1,
             learning_title: "test".to_string(),
@@ -465,7 +470,10 @@ mod tests {
         let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &[]);
         let params = proposal_to_edit_params(Some(&existing), None, None, false, &proposal)
             .expect("should return Some (task_types is NULL)");
-        assert!(params.add_files.is_none(), "add_files must be None when field already exists");
+        assert!(
+            params.add_files.is_none(),
+            "add_files must be None when field already exists"
+        );
         assert_eq!(params.add_task_types, Some(vec!["FEAT-".to_string()]));
     }
 
@@ -491,7 +499,10 @@ mod tests {
             false,
             &proposal,
         );
-        assert!(result.is_none(), "should return None when no NULL fields and no tags");
+        assert!(
+            result.is_none(),
+            "should return None when no NULL fields and no tags"
+        );
     }
 
     #[test]
@@ -511,7 +522,8 @@ mod tests {
         let types = vec!["FEAT-".to_string()];
         let errors = vec!["E0308".to_string()];
         let proposal = make_proposal(&["ignored"], &["ignored"], &["ignored"], &[]);
-        let result = proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), true, &proposal);
+        let result =
+            proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), true, &proposal);
         assert!(result.is_none());
     }
 
@@ -519,7 +531,10 @@ mod tests {
     fn empty_proposal_arrays_on_null_fields_yield_none() {
         let proposal = make_proposal(&[], &[], &[], &[]);
         let result = proposal_to_edit_params(None, None, None, false, &proposal);
-        assert!(result.is_none(), "empty proposals on NULL fields should return None");
+        assert!(
+            result.is_none(),
+            "empty proposals on NULL fields should return None"
+        );
     }
 
     #[test]
