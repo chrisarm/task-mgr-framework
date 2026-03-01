@@ -834,7 +834,7 @@
       "id": "FEAT-010",
       "modifiesBehavior": false,
       "notes": "Group C. Depends on MILESTONE-1 (enhanced lock info for detecting active locks). Queries prd_metadata for distinct prefixes. Uses Phase 1 prefix scoping if available.",
-      "passes": false,
+      "passes": true,
       "priority": 24,
       "qualityDimensions": {
         "correctness": [
