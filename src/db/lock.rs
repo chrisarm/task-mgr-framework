@@ -10,7 +10,7 @@
 use crate::error::{TaskMgrError, TaskMgrResult};
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Identity of the process holding a lock, with optional worktree context.
@@ -129,7 +129,6 @@ impl LockGuard {
                 } else {
                     "Database is locked by another process".to_string()
                 };
-                // Note: FEAT-003 will enrich this message with branch/prefix context
                 Err(TaskMgrError::lock_error(message))
             }
             Err(err) => {
@@ -145,6 +144,7 @@ impl LockGuard {
     /// Writes the current process identity (`{pid}@{hostname}`) to the lockfile.
     fn write_holder_info(&mut self) -> TaskMgrResult<()> {
         self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
         let pid = std::process::id();
         let host = hostname::get()
             .ok()
@@ -165,11 +165,30 @@ impl LockGuard {
     /// Lines for None fields are omitted.
     pub fn write_holder_info_extended(
         &mut self,
-        _branch: Option<&str>,
-        _worktree: Option<&str>,
-        _prefix: Option<&str>,
+        branch: Option<&str>,
+        worktree: Option<&str>,
+        prefix: Option<&str>,
     ) -> TaskMgrResult<()> {
-        todo!("FEAT-003: implement multi-line lock format writing")
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let pid = std::process::id();
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut content = format!("{}@{}", pid, host);
+        if let Some(b) = branch {
+            content.push_str(&format!("\nbranch={}", b));
+        }
+        if let Some(w) = worktree {
+            content.push_str(&format!("\nworktree={}", w));
+        }
+        if let Some(p) = prefix {
+            content.push_str(&format!("\nprefix={}", p));
+        }
+        write!(self.file, "{}", content)?;
+        self.file.sync_all()?;
+        Ok(())
     }
 
     /// Reads holder info from an existing lockfile, if present.
@@ -371,7 +390,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info now returns Option<HolderInfo>"]
     fn test_read_holder_info_returns_none_for_missing_file() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("nonexistent.lock");
@@ -381,7 +399,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info now returns Option<HolderInfo>"]
     fn test_read_holder_info_returns_none_for_empty_file() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("empty.lock");
@@ -393,7 +410,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info now returns Option<HolderInfo>"]
     fn test_read_holder_info_reads_pid_at_hostname() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("valid.lock");
@@ -412,7 +428,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info now returns Option<HolderInfo>"]
     fn test_read_holder_info_handles_whitespace() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("whitespace.lock");
@@ -429,7 +444,6 @@ mod tests {
     // --- HolderInfo / enhanced lock format tests (TDD for FEAT-003) ---
 
     #[test]
-    #[ignore = "FEAT-003: write_holder_info_extended not yet implemented"]
     fn test_write_holder_info_extended_writes_multiline_format() {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
@@ -468,7 +482,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: write_holder_info_extended not yet implemented"]
     fn test_write_holder_info_extended_omits_none_fields() {
         let temp_dir = TempDir::new().unwrap();
         let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
@@ -490,7 +503,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info not yet implemented"]
     fn test_read_holder_info_parses_multiline_format() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("multi.lock");
@@ -510,7 +522,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info not yet implemented"]
     fn test_read_holder_info_falls_back_to_old_format() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("old.lock");
@@ -522,7 +533,10 @@ mod tests {
         assert_eq!(info.pid, 99);
         assert_eq!(info.host, "legacyhost");
         // Must be None, not empty string — this is the known-bad discriminator
-        assert_eq!(info.branch, None, "old format must yield None branch, not \"\"");
+        assert_eq!(
+            info.branch, None,
+            "old format must yield None branch, not \"\""
+        );
         assert_eq!(
             info.worktree, None,
             "old format must yield None worktree, not \"\""
@@ -534,7 +548,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: read_holder_info not yet implemented"]
     fn test_read_holder_info_new_returns_none_for_empty_file() {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("empty.lock");
@@ -546,7 +559,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-003: lock error message enhancement not yet implemented"]
     fn test_lock_error_message_includes_branch_and_prefix() {
         let temp_dir = TempDir::new().unwrap();
 
