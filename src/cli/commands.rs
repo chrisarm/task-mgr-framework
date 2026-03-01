@@ -889,6 +889,49 @@ pub enum CurateAction {
         #[arg(required = true)]
         learning_ids: Vec<i64>,
     },
+
+    /// Enrich learning metadata using LLM analysis
+    #[command(after_help = "\
+EXAMPLES:
+    # Preview enrichment proposals without saving (dry run)
+    task-mgr curate enrich --dry-run
+
+    # Enrich all metadata fields in batches of 20 (default)
+    task-mgr curate enrich
+
+    # Enrich only applies_to_files metadata
+    task-mgr curate enrich --field applies_to_files
+
+    # Enrich only applies_to_task_types metadata
+    task-mgr curate enrich --field applies_to_task_types
+
+    # Enrich only applies_to_errors metadata
+    task-mgr curate enrich --field applies_to_errors
+
+    # Use a smaller batch size
+    task-mgr curate enrich --batch-size 5 --dry-run
+
+FIELD VALUES:
+    applies_to_files       - File glob patterns the learning applies to
+    applies_to_task_types  - Task type prefixes (e.g., FEAT-, FIX-)
+    applies_to_errors      - Error patterns or codes (e.g., E0277)
+
+    Note: tags enrichment is always included and cannot be filtered separately.
+")]
+    Enrich {
+        /// Preview proposals without saving to the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Number of learnings to process per LLM batch
+        #[arg(long = "batch-size", default_value_t = 20)]
+        batch_size: usize,
+
+        /// Restrict enrichment to a specific metadata field.
+        /// Accepted values: applies_to_files, applies_to_task_types, applies_to_errors
+        #[arg(long)]
+        field: Option<String>,
+    },
 }
 
 /// Worktrees subcommand actions

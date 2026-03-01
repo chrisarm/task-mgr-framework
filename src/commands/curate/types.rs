@@ -35,6 +35,88 @@ pub struct UnretireResult {
     pub errors: Vec<String>,
 }
 
+/// Validated field filter for `curate enrich --field`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichFieldFilter {
+    AppliesToFiles,
+    AppliesToTaskTypes,
+    AppliesToErrors,
+}
+
+impl std::str::FromStr for EnrichFieldFilter {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "applies_to_files" => Ok(Self::AppliesToFiles),
+            "applies_to_task_types" => Ok(Self::AppliesToTaskTypes),
+            "applies_to_errors" => Ok(Self::AppliesToErrors),
+            other => Err(format!(
+                "unknown field '{}': expected one of applies_to_files, applies_to_task_types, applies_to_errors",
+                other
+            )),
+        }
+    }
+}
+
+/// Parameters for the `curate enrich` command.
+#[derive(Debug, Clone)]
+pub struct EnrichParams {
+    /// If true, generate proposals but do not write to the database
+    pub dry_run: bool,
+    /// Number of learnings per LLM batch
+    pub batch_size: usize,
+    /// Restrict enrichment to a specific metadata field (None = all fields)
+    pub field_filter: Option<EnrichFieldFilter>,
+}
+
+impl Default for EnrichParams {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            batch_size: 20,
+            field_filter: None,
+        }
+    }
+}
+
+/// A proposed metadata update for a single learning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichProposal {
+    /// ID of the learning being enriched
+    pub learning_id: i64,
+    /// Title of the learning (for human-readable output)
+    pub learning_title: String,
+    /// Proposed file glob patterns
+    pub proposed_files: Vec<String>,
+    /// Proposed task type prefixes
+    pub proposed_task_types: Vec<String>,
+    /// Proposed error patterns
+    pub proposed_errors: Vec<String>,
+    /// Proposed tags
+    pub proposed_tags: Vec<String>,
+}
+
+/// Result of the `curate enrich` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichResult {
+    /// Whether this was a dry run (no DB changes made)
+    pub dry_run: bool,
+    /// Field filter applied, if any
+    pub field_filter: Option<String>,
+    /// Total number of learnings considered for enrichment
+    pub total_candidates: usize,
+    /// Number of LLM batches processed
+    pub batches_processed: usize,
+    /// Number of learnings whose metadata was updated (0 when dry_run=true)
+    pub learnings_enriched: usize,
+    /// Number of LLM call failures encountered
+    pub llm_errors: usize,
+    /// Per-learning enrichment proposals
+    pub proposals: Vec<EnrichProposal>,
+}
+
 /// Parameters for the `curate retire` command.
 #[derive(Debug, Clone)]
 pub struct RetireParams {

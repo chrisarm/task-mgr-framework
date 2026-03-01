@@ -756,6 +756,18 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     let result = curate_unretire(&conn, learning_ids)?;
                     output_result(&result, cli.format);
                 }
+                CurateAction::Enrich {
+                    dry_run: _,
+                    batch_size: _,
+                    field: _,
+                } => {
+                    return Err(TaskMgrError::InvalidState {
+                        resource_type: "CurateAction".to_string(),
+                        id: "enrich".to_string(),
+                        expected: "implemented".to_string(),
+                        actual: "not yet implemented".to_string(),
+                    });
+                }
             }
             Ok(())
         }
