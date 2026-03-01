@@ -39,8 +39,10 @@ pub struct LearningSummary {
 pub struct LearningsListResult {
     /// Number of learnings returned
     pub count: usize,
-    /// Total number of learnings in the database
+    /// Total number of active (non-retired) learnings in the database
     pub total: usize,
+    /// Total number of learnings including retired ones
+    pub total_including_retired: usize,
     /// The learnings (summaries)
     pub learnings: Vec<LearningSummary>,
     /// Whether the result was limited by --recent
@@ -62,12 +64,16 @@ pub fn list_learnings(
     conn: &Connection,
     params: LearningsListParams,
 ) -> TaskMgrResult<LearningsListResult> {
-    // Get total count first
+    // Get active count (non-retired)
     let total: usize = conn.query_row(
         "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
         [],
         |row| row.get(0),
     )?;
+
+    // Get total count including retired
+    let total_including_retired: usize =
+        conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
 
     // Build query with optional LIMIT
     // Use id DESC as secondary sort to ensure deterministic ordering when timestamps are equal
@@ -130,6 +136,7 @@ pub fn list_learnings(
     Ok(LearningsListResult {
         count,
         total,
+        total_including_retired,
         learnings: summaries,
         limited_to: params.recent,
     })
@@ -146,10 +153,23 @@ pub fn format_text(result: &LearningsListResult) -> String {
     }
 
     // Header
+    let retired_count = result.total_including_retired.saturating_sub(result.total);
     if let Some(limit) = result.limited_to {
+        if retired_count > 0 {
+            output.push_str(&format!(
+                "Showing {} of {} active learnings ({} retired) (limited to {} most recent):\n\n",
+                result.count, result.total, retired_count, limit
+            ));
+        } else {
+            output.push_str(&format!(
+                "Showing {} of {} learnings (limited to {} most recent):\n\n",
+                result.count, result.total, limit
+            ));
+        }
+    } else if retired_count > 0 {
         output.push_str(&format!(
-            "Showing {} of {} learnings (limited to {} most recent):\n\n",
-            result.count, result.total, limit
+            "Showing {} of {} active learnings ({} retired):\n\n",
+            result.count, result.total, retired_count
         ));
     } else {
         output.push_str(&format!("Showing {} learnings:\n\n", result.count));
@@ -366,6 +386,7 @@ mod tests {
         let result = LearningsListResult {
             count: 0,
             total: 0,
+            total_including_retired: 0,
             learnings: vec![],
             limited_to: None,
         };
@@ -379,6 +400,7 @@ mod tests {
         let result = LearningsListResult {
             count: 2,
             total: 2,
+            total_including_retired: 2,
             learnings: vec![
                 LearningSummary {
                     id: 1,
@@ -415,6 +437,7 @@ mod tests {
         let result = LearningsListResult {
             count: 5,
             total: 20,
+            total_including_retired: 20,
             learnings: vec![LearningSummary {
                 id: 1,
                 title: "Test".to_string(),
@@ -437,6 +460,7 @@ mod tests {
         let result = LearningsListResult {
             count: 1,
             total: 1,
+            total_including_retired: 1,
             learnings: vec![LearningSummary {
                 id: 1,
                 title: "This is a very long title that should definitely be truncated to fit in the table".to_string(),
@@ -482,6 +506,7 @@ mod tests {
         let result = LearningsListResult {
             count: 1,
             total: 5,
+            total_including_retired: 5,
             learnings: vec![LearningSummary {
                 id: 1,
                 title: "Test".to_string(),
@@ -564,6 +589,100 @@ mod tests {
             "count must also exclude retired learning (expected 1, got {})",
             result.count
         );
+        assert_eq!(
+            result.total_including_retired, 2,
+            "total_including_retired must include retired learning (expected 2, got {})",
+            result.total_including_retired
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_format_text_shows_retired_count_when_nonzero() {
+        let result = LearningsListResult {
+            count: 1,
+            total: 1,
+            total_including_retired: 3,
+            learnings: vec![LearningSummary {
+                id: 1,
+                title: "Active".to_string(),
+                outcome: "pattern".to_string(),
+                confidence: "high".to_string(),
+                created_at: "2026-01-18 12:00:00".to_string(),
+                times_shown: 0,
+                times_applied: 0,
+            }],
+            limited_to: None,
+        };
+
+        let text = format_text(&result);
+        assert!(
+            text.contains("1 of 1 active learnings"),
+            "should show active count"
+        );
+        assert!(text.contains("2 retired"), "should show retired count");
+    }
+
+    #[test]
+    fn test_format_text_no_retired_count_when_zero() {
+        let result = LearningsListResult {
+            count: 2,
+            total: 2,
+            total_including_retired: 2,
+            learnings: vec![
+                LearningSummary {
+                    id: 1,
+                    title: "Test".to_string(),
+                    outcome: "pattern".to_string(),
+                    confidence: "high".to_string(),
+                    created_at: "2026-01-18 12:00:00".to_string(),
+                    times_shown: 0,
+                    times_applied: 0,
+                },
+                LearningSummary {
+                    id: 2,
+                    title: "Test 2".to_string(),
+                    outcome: "failure".to_string(),
+                    confidence: "medium".to_string(),
+                    created_at: "2026-01-18 12:00:00".to_string(),
+                    times_shown: 0,
+                    times_applied: 0,
+                },
+            ],
+            limited_to: None,
+        };
+
+        let text = format_text(&result);
+        assert!(
+            text.contains("Showing 2 learnings"),
+            "no retired info when all active"
+        );
+        assert!(
+            !text.contains("retired"),
+            "should not mention retired when count is 0"
+        );
+    }
+
+    #[test]
+    fn test_list_result_serialization_includes_total_including_retired() {
+        let result = LearningsListResult {
+            count: 1,
+            total: 1,
+            total_including_retired: 3,
+            learnings: vec![LearningSummary {
+                id: 1,
+                title: "Test".to_string(),
+                outcome: "pattern".to_string(),
+                confidence: "medium".to_string(),
+                created_at: "2026-01-18 12:00:00".to_string(),
+                times_shown: 0,
+                times_applied: 0,
+            }],
+            limited_to: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"total_including_retired\":3"));
     }
 
     #[test]
@@ -571,6 +690,7 @@ mod tests {
         let result = LearningsListResult {
             count: 0,
             total: 0,
+            total_including_retired: 0,
             learnings: vec![],
             limited_to: None,
         };
