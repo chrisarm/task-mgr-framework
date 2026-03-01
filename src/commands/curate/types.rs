@@ -170,13 +170,22 @@ pub struct DeduplicateLearningItem {
     pub content: String,
 }
 
-/// Raw LLM response cluster: a list of learning IDs that are semantic duplicates.
+/// Raw LLM response cluster before validation.
 ///
-/// A valid cluster must have at least 2 IDs (otherwise it is not a merge).
-#[derive(Debug, Clone, serde::Deserialize)]
+/// All fields are `Option` because LLM output is untrusted and may omit fields.
+/// Use [`DedupCluster`] for validated, in-memory representation after sanitisation.
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawDedupCluster {
-    /// IDs of learnings in this duplicate cluster
-    pub ids: Vec<i64>,
+    /// IDs of source learnings in this duplicate cluster.
+    pub source_ids: Option<Vec<i64>>,
+    /// LLM-proposed merged title.
+    pub merged_title: Option<String>,
+    /// LLM-proposed merged content.
+    pub merged_content: Option<String>,
+    /// LLM-proposed outcome label (e.g. "pattern", "success").
+    pub merged_outcome: Option<String>,
+    /// Human-readable reason why these learnings are considered duplicates.
+    pub reason: Option<String>,
 }
 
 /// Parameters for the `curate retire` command.
@@ -204,9 +213,6 @@ impl Default for RetireParams {
 }
 
 /// Parameters for the `curate dedup` command.
-///
-/// # Stub
-/// Full definition tracked as FEAT-002.
 #[derive(Debug, Clone)]
 pub struct DedupParams {
     /// If true, identify duplicate clusters but do not merge or retire learnings.
@@ -228,9 +234,6 @@ impl Default for DedupParams {
 }
 
 /// A merged duplicate cluster produced by `curate dedup`.
-///
-/// # Stub
-/// Full definition tracked as FEAT-002.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupCluster {
     /// IDs of source learnings that were merged.
@@ -252,9 +255,6 @@ pub struct DedupCluster {
 }
 
 /// Result of the `curate dedup` command.
-///
-/// # Stub
-/// Full definition tracked as FEAT-002.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupResult {
     /// Whether this was a dry run (no DB changes made).
