@@ -970,7 +970,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add a REFACTOR-2-xxx task to JSON (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON. If no issues, mark passes:true.",
-      "passes": false,
+      "passes": true,
       "priority": 39,
       "synergyWith": [],
       "title": "Review test code for refactoring opportunities",
@@ -979,6 +979,89 @@
         "src/db/lock.rs",
         "src/commands/worktrees.rs",
         "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "id": "REFACTOR-2-001",
+      "title": "Unify git repo init helpers into shared test_utils",
+      "description": "env.rs has 5 inline git-init copies + a local setup_git_repo(); worktrees.rs has init_test_repo(); batch.rs has init_test_repo_for_batch(). All do the same thing. Consolidate into test_utils::init_test_repo() -> (TempDir, PathBuf) and delete duplicates.",
+      "priority": 40,
+      "status": "in_progress",
+      "passes": false,
+      "estimatedEffort": "medium",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/loop_engine/test_utils.rs",
+        "src/loop_engine/env.rs",
+        "src/commands/worktrees.rs",
+        "src/loop_engine/batch.rs"
+      ],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002",
+        "TEST-003"
+      ],
+      "synergyWith": [
+        "REFACTOR-2-002"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "acceptanceCriteria": [
+        "Single init_test_repo() in test_utils.rs returning (TempDir, PathBuf)",
+        "env.rs inline git-init replaced with test_utils call",
+        "worktrees.rs init_test_repo() deleted, uses test_utils",
+        "batch.rs init_test_repo_for_batch() deleted, uses test_utils",
+        "All tests pass"
+      ]
+    },
+    {
+      "id": "REFACTOR-2-002",
+      "title": "Extract worktree test helpers (setup_worktree_env, create_test_worktree)",
+      "description": "worktrees.rs repeats (tmp, repo, db_dir) setup 7x and git worktree creation 4x. Extract setup_worktree_test_env() and create_test_worktree() helpers.",
+      "priority": 41,
+      "status": "in_progress",
+      "passes": false,
+      "estimatedEffort": "small",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/commands/worktrees.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-2-001"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "acceptanceCriteria": [
+        "setup_worktree_test_env() returns (TempDir, PathBuf, PathBuf)",
+        "create_test_worktree() encapsulates git branch + worktree add",
+        "No duplicated setup across worktrees.rs tests",
+        "All tests pass"
+      ]
+    },
+    {
+      "id": "REFACTOR-2-003",
+      "title": "Extract lock test helpers and remove duplicate test",
+      "description": "lock.rs repeats acquire+write_holder_info_extended 6x and (TempDir, lock_path) 8x. Also has duplicate empty-file test (lines 392 and 541). Extract helpers, remove duplicate.",
+      "priority": 42,
+      "status": "in_progress",
+      "passes": false,
+      "estimatedEffort": "small",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/db/lock.rs"
+      ],
+      "dependsOn": [
+        "TEST-002"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "acceptanceCriteria": [
+        "setup_lock_dir() helper extracts (TempDir, PathBuf) pattern",
+        "acquire_with_metadata() helper extracts acquire+write pattern",
+        "Duplicate empty-file test removed",
+        "All tests pass"
       ]
     },
     {
@@ -998,7 +1081,10 @@
         "FEAT-008",
         "FEAT-009",
         "FEAT-010",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
       "description": "All comprehensive tests pass, test code refactored.",
       "estimatedEffort": "low",
