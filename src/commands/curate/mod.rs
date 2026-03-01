@@ -7,9 +7,10 @@ pub mod enrich;
 pub mod output;
 pub mod types;
 
-pub use output::{format_retire_text, format_unretire_text};
+pub use output::{format_enrich_text, format_retire_text, format_unretire_text};
 pub use types::{
-    EnrichCandidate, EnrichParams, RetireParams, RetireResult, RetirementCandidate, UnretireResult,
+    EnrichCandidate, EnrichParams, EnrichResult, RetireParams, RetireResult, RetirementCandidate,
+    UnretireResult,
 };
 
 use rusqlite::Connection;
@@ -225,7 +226,8 @@ pub fn find_enrichment_candidates(
     use types::EnrichFieldFilter;
 
     let sql = match &params.field_filter {
-        None => "
+        None => {
+            "
             SELECT id, title,
                    applies_to_files IS NULL AS missing_files,
                    applies_to_task_types IS NULL AS missing_task_types,
@@ -238,8 +240,10 @@ pub fn find_enrichment_candidates(
                 OR applies_to_errors IS NULL
               )
             ORDER BY id ASC
-        ",
-        Some(EnrichFieldFilter::AppliesToFiles) => "
+        "
+        }
+        Some(EnrichFieldFilter::AppliesToFiles) => {
+            "
             SELECT id, title,
                    applies_to_files IS NULL AS missing_files,
                    applies_to_task_types IS NULL AS missing_task_types,
@@ -248,8 +252,10 @@ pub fn find_enrichment_candidates(
             WHERE retired_at IS NULL
               AND applies_to_files IS NULL
             ORDER BY id ASC
-        ",
-        Some(EnrichFieldFilter::AppliesToTaskTypes) => "
+        "
+        }
+        Some(EnrichFieldFilter::AppliesToTaskTypes) => {
+            "
             SELECT id, title,
                    applies_to_files IS NULL AS missing_files,
                    applies_to_task_types IS NULL AS missing_task_types,
@@ -258,8 +264,10 @@ pub fn find_enrichment_candidates(
             WHERE retired_at IS NULL
               AND applies_to_task_types IS NULL
             ORDER BY id ASC
-        ",
-        Some(EnrichFieldFilter::AppliesToErrors) => "
+        "
+        }
+        Some(EnrichFieldFilter::AppliesToErrors) => {
+            "
             SELECT id, title,
                    applies_to_files IS NULL AS missing_files,
                    applies_to_task_types IS NULL AS missing_task_types,
@@ -268,7 +276,8 @@ pub fn find_enrichment_candidates(
             WHERE retired_at IS NULL
               AND applies_to_errors IS NULL
             ORDER BY id ASC
-        ",
+        "
+        }
     };
 
     let mut stmt = conn.prepare(sql)?;

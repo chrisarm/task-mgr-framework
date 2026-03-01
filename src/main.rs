@@ -733,7 +733,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         }
 
         Commands::Curate { action } => {
-            use task_mgr::commands::curate::{curate_retire, curate_unretire, RetireParams};
+            use task_mgr::commands::curate::{
+                curate_retire, curate_unretire, EnrichParams, RetireParams,
+            };
+            use task_mgr::commands::curate::enrich::curate_enrich;
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
             match action {
@@ -757,16 +760,28 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     output_result(&result, cli.format);
                 }
                 CurateAction::Enrich {
-                    dry_run: _,
-                    batch_size: _,
-                    field: _,
+                    dry_run,
+                    batch_size,
+                    field,
                 } => {
-                    return Err(TaskMgrError::InvalidState {
-                        resource_type: "CurateAction".to_string(),
-                        id: "enrich".to_string(),
-                        expected: "implemented".to_string(),
-                        actual: "not yet implemented".to_string(),
-                    });
+                    let field_filter = field
+                        .map(|s| {
+                            let id = s.clone();
+                            s.parse().map_err(|e: String| TaskMgrError::InvalidState {
+                                resource_type: "curate enrich --field".to_string(),
+                                id,
+                                expected: "applies_to_files, applies_to_task_types, or applies_to_errors".to_string(),
+                                actual: e,
+                            })
+                        })
+                        .transpose()?;
+                    let params = EnrichParams {
+                        dry_run,
+                        batch_size,
+                        field_filter,
+                    };
+                    let result = curate_enrich(&conn, params)?;
+                    output_result(&result, cli.format);
                 }
             }
             Ok(())
