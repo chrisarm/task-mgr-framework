@@ -202,3 +202,71 @@ impl Default for RetireParams {
         }
     }
 }
+
+/// Parameters for the `curate dedup` command.
+///
+/// # Stub
+/// Full definition tracked as FEAT-002.
+#[derive(Debug, Clone)]
+pub struct DedupParams {
+    /// If true, identify duplicate clusters but do not merge or retire learnings.
+    pub dry_run: bool,
+    /// Similarity threshold passed to the LLM as guidance (0.0–1.0).
+    pub threshold: f64,
+    /// Override automatic batch size calculation. None = auto.
+    pub batch_size: Option<usize>,
+}
+
+impl Default for DedupParams {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            threshold: 0.85,
+            batch_size: None,
+        }
+    }
+}
+
+/// A merged duplicate cluster produced by `curate dedup`.
+///
+/// # Stub
+/// Full definition tracked as FEAT-002.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupCluster {
+    /// IDs of source learnings that were merged.
+    pub source_ids: Vec<i64>,
+    /// Titles of source learnings (for display).
+    pub source_titles: Vec<String>,
+    /// Merged title produced by the LLM.
+    pub merged_title: String,
+    /// Merged content produced by the LLM.
+    pub merged_content: String,
+    /// Outcome string for the merged learning.
+    pub merged_outcome: String,
+    /// Confidence string for the merged learning.
+    pub merged_confidence: String,
+    /// Human-readable reason why these learnings are duplicates.
+    pub reason: String,
+    /// DB ID of the newly-created merged learning. None in dry-run mode.
+    pub merged_learning_id: Option<i64>,
+}
+
+/// Result of the `curate dedup` command.
+///
+/// # Stub
+/// Full definition tracked as FEAT-002.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupResult {
+    /// Whether this was a dry run (no DB changes made).
+    pub dry_run: bool,
+    /// Number of duplicate clusters identified by the LLM.
+    pub clusters_found: usize,
+    /// Number of source learnings retired (0 when dry_run=true).
+    pub learnings_merged: usize,
+    /// Number of merged learnings created (0 when dry_run=true).
+    pub learnings_created: usize,
+    /// Number of LLM call failures encountered.
+    pub llm_errors: usize,
+    /// Per-cluster details.
+    pub clusters: Vec<DedupCluster>,
+}

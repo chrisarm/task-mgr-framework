@@ -2599,3 +2599,246 @@ fn test_parse_dedup_response_single_id_cluster_rejected() {
         .any(|c| c.ids.contains(&1) && c.ids.contains(&2));
     assert!(has_valid_pair, "valid 2-ID cluster must be preserved");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-INIT-003: Dedup orchestration — dry-run, re-run idempotency, short-circuit
+//
+// All tests are #[ignore] until FEAT-004 implements curate_dedup().
+// ──────────────────────────────────────────────────────────────────────────────
+
+use super::types::DedupResult;
+use super::{curate_dedup, DedupParams};
+
+/// Returns the number of active (non-retired) learnings in the DB.
+fn count_active_learnings(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("count_active_learnings")
+}
+
+/// Returns the total number of learnings in the DB (active + retired).
+fn count_all_learnings(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .expect("count_all_learnings")
+}
+
+#[test]
+#[ignore = "FEAT-004: curate_dedup not yet implemented"]
+fn test_dedup_zero_active_learnings_returns_empty_result() {
+    // AC: 0 active learnings returns empty DedupResult immediately (no LLM invocation).
+    // An empty DB means there is nothing to deduplicate; the function must short-circuit
+    // without calling the LLM (no CLAUDE_BINARY required for this test).
+    let (_dir, conn) = setup_db();
+
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup empty db");
+
+    assert_eq!(
+        result.clusters_found, 0,
+        "no clusters expected for empty db"
+    );
+    assert_eq!(
+        result.learnings_merged, 0,
+        "no merges expected for empty db"
+    );
+    assert_eq!(
+        result.learnings_created, 0,
+        "no creations expected for empty db"
+    );
+    assert_eq!(result.llm_errors, 0, "no LLM errors expected for empty db");
+    assert!(result.clusters.is_empty(), "clusters vec must be empty");
+}
+
+#[test]
+#[ignore = "FEAT-004: curate_dedup not yet implemented"]
+fn test_dedup_dry_run_makes_no_db_changes() {
+    // AC: dry_run=true returns DedupResult with clusters but no DB changes.
+    // Known-bad discriminator: learning count before and after must be equal.
+    let (_dir, conn) = setup_db();
+
+    // Insert two learnings that are semantically similar (for documentation only —
+    // with a real LLM mock they would form a cluster).
+    insert_learning(
+        &conn,
+        "Use cargo fmt before committing",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    insert_learning(
+        &conn,
+        "Run cargo fmt prior to commit",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    let before_count = count_all_learnings(&conn);
+
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup dry_run=true");
+
+    let after_count = count_all_learnings(&conn);
+
+    // Dry-run must never write to the DB.
+    assert_eq!(
+        before_count, after_count,
+        "dry_run=true must not change total learning count"
+    );
+    assert_eq!(
+        result.learnings_merged, 0,
+        "dry_run must not retire any learnings"
+    );
+    assert_eq!(
+        result.learnings_created, 0,
+        "dry_run must not create merged learnings"
+    );
+    assert!(result.dry_run, "result must reflect dry_run=true");
+
+    // Verify no retired_at was set on existing learnings.
+    let retired_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings WHERE retired_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("retired count query");
+    assert_eq!(
+        retired_count, 0,
+        "dry_run=true must not set retired_at on any learning"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: curate_dedup not yet implemented"]
+fn test_dedup_rerun_excludes_already_retired_learnings() {
+    // AC: after merging cluster A, re-running excludes cluster A's source IDs
+    // (they're retired) — only remaining active learnings are processed.
+    //
+    // Setup: 4 learnings. We manually retire learnings 1 and 2 (simulating a prior
+    // merge). On re-run, curate_dedup should only see learnings 3 and 4.
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning(
+        &conn,
+        "Learning A1",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id2 = insert_learning(
+        &conn,
+        "Learning A2",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let _id3 = insert_learning(
+        &conn,
+        "Learning B1",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let _id4 = insert_learning(
+        &conn,
+        "Learning B2",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    // Simulate prior merge: retire learnings 1 and 2.
+    retire_learning(&conn, id1);
+    retire_learning(&conn, id2);
+
+    // Two active learnings remain.
+    assert_eq!(
+        count_active_learnings(&conn),
+        2,
+        "precondition: 2 active learnings"
+    );
+
+    // With dry_run=true, curate_dedup must only consider the 2 active learnings.
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup re-run");
+
+    // The already-retired learnings must not appear in any cluster's source_ids.
+    for cluster in &result.clusters {
+        assert!(
+            !cluster.source_ids.contains(&id1),
+            "retired learning {} must not appear in dedup clusters",
+            id1
+        );
+        assert!(
+            !cluster.source_ids.contains(&id2),
+            "retired learning {} must not appear in dedup clusters",
+            id2
+        );
+    }
+}
+
+#[test]
+#[ignore = "FEAT-004: curate_dedup not yet implemented — requires LLM stub for per-cluster failure"]
+fn test_dedup_per_cluster_transaction_partial_failure() {
+    // AC: per-cluster transaction — if cluster 2 merge fails, cluster 1 is already committed.
+    //
+    // This test defines expected behavior: each cluster merge is committed independently,
+    // so a failure in cluster 2 does not roll back cluster 1.
+    //
+    // Requires LLM stub (CLAUDE_BINARY) returning 2 clusters and a mechanism to inject
+    // a failure for the second cluster merge (e.g., a corrupted source ID).
+    //
+    // For now the test documents the invariant. Full coverage requires:
+    //   1. An LLM stub returning two clusters
+    //   2. One cluster containing a non-existent ID (forces merge failure)
+    //   3. Verification that the first cluster's merged learning was committed
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning(
+        &conn,
+        "Cluster1 A",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id2 = insert_learning(
+        &conn,
+        "Cluster1 B",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // id3/id4 would belong to cluster 2 (one with a bad ID to force failure)
+    let _id3 = insert_learning(
+        &conn,
+        "Cluster2 A",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    // curate_dedup processes clusters individually; each uses its own transaction.
+    // After a successful cluster-1 merge, cluster-1 source IDs are retired.
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup partial");
+
+    // If cluster 1 merged successfully, its sources are retired.
+    // (This assertion only holds when the LLM stub returns [id1, id2] as cluster 1.)
+    if result.learnings_created >= 1 {
+        assert!(
+            is_retired(&conn, id1),
+            "cluster-1 source id1 must be retired after successful merge"
+        );
+        assert!(
+            is_retired(&conn, id2),
+            "cluster-1 source id2 must be retired after successful merge"
+        );
+    }
+}

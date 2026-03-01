@@ -11,9 +11,9 @@ pub mod types;
 pub use dedup::{build_dedup_prompt, parse_dedup_response};
 pub use output::{format_enrich_text, format_retire_text, format_unretire_text};
 pub use types::{
-    DeduplicateLearningItem, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
-    MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
-    UnretireResult,
+    DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EnrichCandidate, EnrichParams,
+    EnrichResult, MergeClusterParams, MergeClusterResult, RawDedupCluster, RetireParams,
+    RetireResult, RetirementCandidate, UnretireResult,
 };
 
 use rusqlite::Connection;
@@ -319,6 +319,20 @@ pub fn merge_cluster(
     _params: MergeClusterParams,
 ) -> TaskMgrResult<MergeClusterResult> {
     todo!("FEAT-004: implement merge_cluster")
+}
+
+/// Orchestrates the full dedup flow: loads active learnings, batches them,
+/// calls Claude to identify duplicate clusters, and merges each cluster via
+/// `merge_cluster()`.
+///
+/// - When `params.dry_run=true`, clusters are identified but no DB writes occur.
+/// - When there are 0 active learnings, returns an empty `DedupResult` without
+///   invoking the LLM.
+///
+/// # Stub
+/// Not yet implemented — tracked as FEAT-004.
+pub fn curate_dedup(_conn: &Connection, _params: DedupParams) -> TaskMgrResult<DedupResult> {
+    todo!("FEAT-004: implement curate_dedup")
 }
 
 #[cfg(test)]
