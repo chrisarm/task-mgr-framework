@@ -32,17 +32,12 @@ pub fn print_session_banner(
     branch: &str,
     max_iterations: u32,
     deadline_hours: Option<f64>,
+    hints: Option<&SessionBannerHints<'_>>,
 ) {
-    eprintln!("\n╔══════════════════════════════════════════════╗");
-    eprintln!("║         AUTONOMOUS AGENT LOOP START          ║");
-    eprintln!("╠══════════════════════════════════════════════╣");
-    eprintln!("║  PRD: {:<38} ║", truncate_display(prd_file, 38));
-    eprintln!("║  Branch: {:<35} ║", truncate_display(branch, 35));
-    eprintln!("║  Max iterations: {:<27} ║", max_iterations);
-    if let Some(hours) = deadline_hours {
-        eprintln!("║  Deadline: {:<33} ║", format!("{:.1}h", hours));
-    }
-    eprintln!("╚══════════════════════════════════════════════╝\n");
+    eprint!(
+        "{}",
+        format_session_banner(prd_file, branch, max_iterations, deadline_hours, hints)
+    );
 }
 
 /// Operational hints to display in the session start banner.
@@ -69,8 +64,104 @@ pub fn format_session_banner(
     deadline_hours: Option<f64>,
     hints: Option<&SessionBannerHints<'_>>,
 ) -> String {
-    let _ = (prd_file, branch, max_iterations, deadline_hours, hints);
-    todo!("FEAT-004: implement format_session_banner with hints")
+    // Box width: 48 chars total (╔══...══╗), inner content width = 44
+    const WIDTH: usize = 46;
+    const INNER: usize = WIDTH - 2; // 44
+
+    let mut lines = Vec::new();
+
+    let top = format!("╔{}╗", "═".repeat(INNER));
+    let sep = format!("╠{}╣", "═".repeat(INNER));
+    let bot = format!("╚{}╝", "═".repeat(INNER));
+
+    let title = format!(
+        "║{:^width$}║",
+        "AUTONOMOUS AGENT LOOP START",
+        width = INNER
+    );
+
+    lines.push(String::new());
+    lines.push(top);
+    lines.push(title);
+    lines.push(sep.clone());
+
+    // Core fields
+    let prd_width = INNER - "  PRD: ".len();
+    lines.push(format!(
+        "║  PRD: {:<width$}║",
+        truncate_display(prd_file, prd_width),
+        width = prd_width
+    ));
+    let branch_width = INNER - "  Branch: ".len();
+    lines.push(format!(
+        "║  Branch: {:<width$}║",
+        truncate_display(branch, branch_width),
+        width = branch_width
+    ));
+    let iter_width = INNER - "  Max iterations: ".len();
+    lines.push(format!(
+        "║  Max iterations: {:<width$}║",
+        max_iterations,
+        width = iter_width
+    ));
+    if let Some(hours) = deadline_hours {
+        let dl_width = INNER - "  Deadline: ".len();
+        lines.push(format!(
+            "║  Deadline: {:<width$}║",
+            format!("{:.1}h", hours),
+            width = dl_width
+        ));
+    }
+
+    // Hints section
+    if let Some(h) = hints {
+        lines.push(sep.clone());
+
+        // DB path
+        let db_str = h.db_path.display().to_string();
+        let db_width = INNER - "  DB: ".len();
+        lines.push(format!(
+            "║  DB: {:<width$}║",
+            truncate_display(&db_str, db_width),
+            width = db_width
+        ));
+
+        // Stop hint
+        let stop_file = match h.prefix {
+            Some(p) => format!(".stop-{}", p),
+            None => ".stop".to_string(),
+        };
+        let stop_hint = format!("touch {} to stop", stop_file);
+        let stop_width = INNER - "  Stop: ".len();
+        lines.push(format!(
+            "║  Stop: {:<width$}║",
+            truncate_display(&stop_hint, stop_width),
+            width = stop_width
+        ));
+
+        // Pause hint
+        let pause_width = INNER - "  Pause: ".len();
+        lines.push(format!(
+            "║  Pause: {:<width$}║",
+            truncate_display("touch .pause to pause", pause_width),
+            width = pause_width
+        ));
+
+        // Worktree (only when Some)
+        if let Some(wt) = h.worktree_path {
+            let wt_str = wt.display().to_string();
+            let wt_width = INNER - "  Worktree: ".len();
+            lines.push(format!(
+                "║  Worktree: {:<width$}║",
+                truncate_display(&wt_str, wt_width),
+                width = wt_width
+            ));
+        }
+    }
+
+    lines.push(bot);
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 /// Format an iteration header as a string (for testability).
@@ -196,12 +287,12 @@ mod tests {
 
     #[test]
     fn test_print_session_banner_no_panic() {
-        print_session_banner("tasks/prd.json", "main", 10, Some(2.0));
+        print_session_banner("tasks/prd.json", "main", 10, Some(2.0), None);
     }
 
     #[test]
     fn test_print_session_banner_no_deadline() {
-        print_session_banner("tasks/prd.json", "main", 10, None);
+        print_session_banner("tasks/prd.json", "main", 10, None, None);
     }
 
     #[test]
@@ -235,7 +326,6 @@ mod tests {
     // --- TEST-INIT-003: format_session_banner() with hints ---
 
     #[test]
-    #[ignore = "FEAT-004: implement format_session_banner with hints"]
     fn test_format_session_banner_with_all_hints_no_panic() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
@@ -251,7 +341,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-004: implement format_session_banner with hints"]
     fn test_format_session_banner_without_worktree_omits_worktree_line() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
@@ -270,7 +359,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-004: implement format_session_banner with hints"]
     fn test_format_session_banner_with_prefix_uses_stop_prefix_hint() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
@@ -288,7 +376,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-004: implement format_session_banner with hints"]
     fn test_format_session_banner_without_prefix_uses_plain_stop_hint() {
         use std::path::Path;
         let db = Path::new("/tmp/tasks.db");
@@ -312,7 +399,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FEAT-004: implement format_session_banner with hints"]
     fn test_format_session_banner_with_db_path_in_hints() {
         use std::path::Path;
         let db = Path::new("/home/user/.task-mgr/tasks.db");

@@ -869,6 +869,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         branch_display,
         max_iterations,
         run_config.config.hours,
+        None,
     );
 
     // Step 16: Build usage params
