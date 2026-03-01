@@ -1202,7 +1202,7 @@ fn test_enrich_empty_database_returns_empty_vec() {
 // FEAT-005 (parse_enrich_response) are implemented.
 // ──────────────────────────────────────────────────────────────────────────────
 
-use super::enrich::{build_enrich_prompt, parse_enrich_response, EnrichBatchItem};
+use super::enrich::{build_enrich_prompt, curate_enrich, parse_enrich_response, EnrichBatchItem};
 
 /// Returns a minimal batch of two items for prompt/parser tests.
 fn make_batch() -> Vec<EnrichBatchItem> {
@@ -1392,4 +1392,418 @@ fn test_parse_enrich_rejects_hallucinated_id() {
         1,
         "only the valid proposal (id=1) should be returned"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-002: curate_enrich handler and output formatting
+// ──────────────────────────────────────────────────────────────────────────────
+
+use super::output::format_enrich_text;
+use super::types::{EnrichProposal, EnrichResult};
+
+/// Helper: inserts a learning with all three metadata fields set (fully enriched).
+fn insert_fully_enriched_learning(conn: &Connection, title: &str) -> i64 {
+    let id = insert_learning(conn, title, Confidence::High, LearningOutcome::Pattern);
+    set_applies_to_files(conn, id, Some("[\"src/**/*.rs\"]"));
+    set_applies_to_task_types(conn, id, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(conn, id, Some("[\"E0001\"]"));
+    id
+}
+
+/// Helper: constructs an EnrichProposal with the given learning_id and title.
+fn make_enrich_proposal(learning_id: i64, title: &str) -> EnrichProposal {
+    EnrichProposal {
+        learning_id,
+        learning_title: title.to_string(),
+        proposed_files: vec!["src/**/*.rs".to_string()],
+        proposed_task_types: vec!["FEAT-".to_string()],
+        proposed_errors: vec![],
+        proposed_tags: vec![],
+    }
+}
+
+#[test]
+fn test_curate_enrich_zero_candidates_returns_immediately() {
+    // AC: curate_enrich with 0 candidates short-circuits and returns an empty result.
+    // Invariant: no LLM call is made (batches_processed=0, llm_errors=0).
+    let (_dir, conn) = setup_db();
+
+    // Only a fully-enriched learning present — no candidates
+    insert_fully_enriched_learning(&conn, "Fully enriched");
+
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            dry_run: false,
+            batch_size: 20,
+            field_filter: None,
+        },
+    )
+    .expect("curate_enrich with 0 candidates");
+
+    assert_eq!(result.total_candidates, 0, "must report 0 candidates");
+    assert_eq!(result.batches_processed, 0, "no batches processed");
+    assert_eq!(result.learnings_enriched, 0, "nothing enriched");
+    assert_eq!(result.llm_errors, 0, "no LLM errors");
+    assert!(result.proposals.is_empty(), "no proposals");
+}
+
+#[test]
+fn test_curate_enrich_empty_database_zero_candidates() {
+    // Edge: empty DB → 0 candidates, returns immediately without error.
+    let (_dir, conn) = setup_db();
+
+    let result = curate_enrich(&conn, EnrichParams::default()).expect("curate_enrich on empty db");
+
+    assert_eq!(result.total_candidates, 0);
+    assert!(result.proposals.is_empty());
+}
+
+#[test]
+fn test_curate_enrich_rerun_excludes_already_enriched() {
+    // AC: after partial enrichment, re-run only processes learnings with remaining NULL fields.
+    // This tests that find_enrichment_candidates correctly excludes already-enriched learnings
+    // so curate_enrich won't process them again.
+    let (_dir, conn) = setup_db();
+
+    // Learning 1: fully enriched — should be excluded
+    let id_enriched = insert_fully_enriched_learning(&conn, "Already enriched");
+
+    // Learning 2: still missing files — should be found
+    let id_partial = insert_learning(&conn, "Partial", Confidence::High, LearningOutcome::Pattern);
+    set_applies_to_task_types(&conn, id_partial, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(&conn, id_partial, Some("[\"E0001\"]"));
+    // applies_to_files is NULL
+
+    let candidates =
+        find_enrichment_candidates(&conn, &EnrichParams::default()).expect("candidates");
+
+    assert!(
+        candidates.iter().all(|c| c.id != id_enriched),
+        "already-enriched learning must be excluded from candidates"
+    );
+    assert!(
+        candidates.iter().any(|c| c.id == id_partial),
+        "partially-enriched learning with NULL files must remain a candidate"
+    );
+}
+
+#[test]
+fn test_curate_enrich_field_filter_zero_candidates_when_all_have_field() {
+    // AC: --field=applies_to_files with all learnings having applies_to_files set → 0 candidates.
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Has files",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+    // task_types and errors are NULL, but field_filter restricts to files only
+
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            dry_run: false,
+            batch_size: 20,
+            field_filter: Some(EnrichFieldFilter::AppliesToFiles),
+        },
+    )
+    .expect("curate_enrich with field filter");
+
+    assert_eq!(
+        result.total_candidates, 0,
+        "--field=applies_to_files must find 0 candidates when all learnings have files set"
+    );
+    assert_eq!(result.field_filter.as_deref(), Some("applies_to_files"));
+}
+
+#[test]
+fn test_format_enrich_text_dry_run_no_proposals() {
+    // AC: dry-run output with no proposals says "no enrichment candidates found"
+    let result = EnrichResult {
+        dry_run: true,
+        field_filter: None,
+        total_candidates: 0,
+        batches_processed: 0,
+        learnings_enriched: 0,
+        llm_errors: 0,
+        proposals: vec![],
+    };
+    let text = format_enrich_text(&result);
+
+    assert!(
+        text.contains("Dry run"),
+        "dry-run text must say 'Dry run': {text}"
+    );
+    assert!(
+        text.contains("no enrichment candidates found"),
+        "empty dry-run must say 'no enrichment candidates found': {text}"
+    );
+}
+
+#[test]
+fn test_format_enrich_text_dry_run_with_proposals() {
+    // AC: dry-run output lists per-proposal detail (ID, title, proposed metadata).
+    let result = EnrichResult {
+        dry_run: true,
+        field_filter: None,
+        total_candidates: 2,
+        batches_processed: 1,
+        learnings_enriched: 0,
+        llm_errors: 0,
+        proposals: vec![
+            make_enrich_proposal(10, "Test learning A"),
+            make_enrich_proposal(20, "Test learning B"),
+        ],
+    };
+    let text = format_enrich_text(&result);
+
+    assert!(
+        text.contains("Dry run"),
+        "dry-run text must contain 'Dry run': {text}"
+    );
+    assert!(
+        text.contains("no changes made"),
+        "dry-run text must say 'no changes made': {text}"
+    );
+    assert!(
+        text.contains("2"),
+        "dry-run text must include proposal count: {text}"
+    );
+    assert!(
+        text.contains("Test learning A"),
+        "dry-run text must list first proposal title: {text}"
+    );
+    assert!(
+        text.contains("Test learning B"),
+        "dry-run text must list second proposal title: {text}"
+    );
+    // Should include proposed_files since it's non-empty
+    assert!(
+        text.contains("files"),
+        "dry-run text must list proposed files when present: {text}"
+    );
+    assert!(
+        text.contains("task_types"),
+        "dry-run text must list proposed task_types when present: {text}"
+    );
+}
+
+#[test]
+fn test_format_enrich_text_actual_no_candidates() {
+    // AC: non-dry-run with total_candidates=0 says "No enrichment candidates found."
+    let result = EnrichResult {
+        dry_run: false,
+        field_filter: None,
+        total_candidates: 0,
+        batches_processed: 0,
+        learnings_enriched: 0,
+        llm_errors: 0,
+        proposals: vec![],
+    };
+    let text = format_enrich_text(&result);
+
+    assert_eq!(
+        text, "No enrichment candidates found.",
+        "must return exact string for 0 candidates"
+    );
+}
+
+#[test]
+fn test_format_enrich_text_actual_with_results() {
+    // AC: non-dry-run output summarizes enriched count and batch count.
+    let result = EnrichResult {
+        dry_run: false,
+        field_filter: None,
+        total_candidates: 5,
+        batches_processed: 2,
+        learnings_enriched: 4,
+        llm_errors: 0,
+        proposals: vec![],
+    };
+    let text = format_enrich_text(&result);
+
+    assert!(
+        text.contains("Enriched"),
+        "actual output must say 'Enriched': {text}"
+    );
+    assert!(text.contains("4"), "must include enriched count: {text}");
+    assert!(text.contains("2"), "must include batch count: {text}");
+    assert!(
+        !text.contains("error"),
+        "must not mention errors when llm_errors=0: {text}"
+    );
+}
+
+#[test]
+fn test_format_enrich_text_actual_with_llm_errors() {
+    // AC: non-dry-run output includes LLM error count when errors occurred.
+    let result = EnrichResult {
+        dry_run: false,
+        field_filter: None,
+        total_candidates: 10,
+        batches_processed: 2,
+        learnings_enriched: 3,
+        llm_errors: 1,
+        proposals: vec![],
+    };
+    let text = format_enrich_text(&result);
+
+    assert!(text.contains("1"), "must include LLM error count: {text}");
+    assert!(
+        text.to_lowercase().contains("error"),
+        "must mention errors when llm_errors > 0: {text}"
+    );
+}
+
+// LLM-dependent tests: marked #[ignore] until a mock or integration harness is available.
+// These define expected behavior but require spawn_claude to be injectable or stubbed.
+
+#[ignore = "requires LLM stub — curate_enrich calls spawn_claude directly"]
+#[test]
+fn test_enrich_single_batch_when_candidates_lt_batch_size() {
+    // AC: candidates < batch_size processes in a single batch (batches_processed=1).
+    let (_dir, conn) = setup_db();
+    let _ = insert_learning(
+        &conn,
+        "Needs enrich",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            batch_size: 20,
+            dry_run: true,
+            field_filter: None,
+        },
+    )
+    .expect("curate_enrich single batch");
+
+    // Single candidate < batch_size=20 → exactly 1 batch attempted
+    assert_eq!(result.total_candidates, 1);
+    assert_eq!(result.batches_processed, 1);
+}
+
+#[ignore = "requires LLM stub — curate_enrich calls spawn_claude directly"]
+#[test]
+fn test_enrich_multiple_batches_when_candidates_gt_batch_size() {
+    // AC: 3 candidates with batch_size=1 → 3 batches processed.
+    let (_dir, conn) = setup_db();
+    for i in 0..3 {
+        insert_learning(
+            &conn,
+            &format!("Learning {i}"),
+            Confidence::High,
+            LearningOutcome::Pattern,
+        );
+    }
+
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            batch_size: 1,
+            dry_run: true,
+            field_filter: None,
+        },
+    )
+    .expect("curate_enrich multiple batches");
+
+    assert_eq!(result.total_candidates, 3);
+    // With LLM stub returning valid JSON per batch, all 3 batches processed
+    assert_eq!(result.batches_processed, 3);
+}
+
+#[ignore = "requires LLM stub — curate_enrich calls spawn_claude directly"]
+#[test]
+fn test_enrich_dry_run_makes_no_db_changes() {
+    // AC: dry_run=true generates proposals but leaves the database unchanged.
+    let (_dir, conn) = setup_db();
+    let id = insert_learning(
+        &conn,
+        "Needs enrich",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    let result = curate_enrich(
+        &conn,
+        EnrichParams {
+            batch_size: 20,
+            dry_run: true,
+            field_filter: None,
+        },
+    )
+    .expect("curate_enrich dry_run");
+
+    assert!(result.dry_run);
+    assert_eq!(result.learnings_enriched, 0, "dry_run must not enrich");
+
+    // Verify DB unchanged: applies_to_files must still be NULL
+    let files: Option<String> = conn
+        .query_row(
+            "SELECT applies_to_files FROM learnings WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .expect("query applies_to_files");
+    assert!(
+        files.is_none(),
+        "applies_to_files must remain NULL after dry_run"
+    );
+}
+
+#[ignore = "requires LLM stub — curate_enrich calls spawn_claude directly"]
+#[test]
+fn test_enrich_llm_error_for_one_batch_other_batches_succeed() {
+    // AC: when one batch fails (LLM error), other batches still succeed (partial success).
+    // Invariant: llm_errors incremented, batches_processed < total_batches.
+    //
+    // To test this deterministically, spawn_claude would need to fail for one specific batch.
+    // With a stub that alternates success/failure, we'd verify:
+    // - result.llm_errors == 1
+    // - result.batches_processed == total_batches - 1
+    let (_dir, conn) = setup_db();
+    for i in 0..3 {
+        insert_learning(
+            &conn,
+            &format!("Learning {i}"),
+            Confidence::High,
+            LearningOutcome::Pattern,
+        );
+    }
+    // (stub setup would go here)
+    let _result = curate_enrich(
+        &conn,
+        EnrichParams {
+            batch_size: 1,
+            dry_run: false,
+            field_filter: None,
+        },
+    );
+    // assertions depend on stub behavior
+}
+
+#[ignore = "requires LLM stub — curate_enrich calls spawn_claude directly"]
+#[test]
+fn test_enrich_batch_failure_previous_batches_committed_and_durable() {
+    // AC: if a later batch's apply step fails, earlier batch results are already committed.
+    // Invariant: per-batch transactions mean partial progress is durable on failure.
+    //
+    // With a stub: first batch succeeds + commits, second batch fails.
+    // After failure: verify first batch's changes are still in the DB.
+    let (_dir, conn) = setup_db();
+    for i in 0..2 {
+        insert_learning(
+            &conn,
+            &format!("Learning {i}"),
+            Confidence::High,
+            LearningOutcome::Pattern,
+        );
+    }
+    // (stub setup: first batch succeeds, second fails apply_proposals_in_transaction)
+    // assertions depend on stub behavior
 }
