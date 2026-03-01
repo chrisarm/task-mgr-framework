@@ -40,7 +40,7 @@
   "userStories": [
     {
       "acceptanceCriteria": [
-        "Test escape_like: % \u2192 \\%, _ \u2192 \\_, \\ \u2192 \\\\",
+        "Test escape_like: % → \\%, _ → \\_, \\ → \\\\",
         "Test prefix_where with Some('P1') returns (\"WHERE id LIKE ? ESCAPE '\\\\'\", Some(\"P1-%\"))",
         "Test prefix_where with None returns (\"\", None)",
         "Test prefix_and with Some('P1') returns (\"AND id LIKE ? ESCAPE '\\\\'\", Some(\"P1-%\"))",
@@ -61,13 +61,13 @@
         "Prefix containing backslash: 'P\\1' must be escaped to 'P\\\\1'",
         "Empty prefix string should be rejected by validate_prefix",
         "Prefix with only valid chars like 'P1.alpha-2' should pass validation",
-        "Prefix 'P1' vs task 'P1-extra-US-001': LIKE pattern 'P1-%' should match P1-extra-US-001 \u2014 this is by design since task IDs use PREFIX-STORY-NNN format, but test documents the behavior"
+        "Prefix 'P1' vs task 'P1-extra-US-001': LIKE pattern 'P1-%' should match P1-extra-US-001 — this is by design since task IDs use PREFIX-STORY-NNN format, but test documents the behavior"
       ],
       "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Prefix with LIKE wildcards not escaped",
-          "expectedBehavior": "escape_like converts % \u2192 \\%, _ \u2192 \\_, \\ \u2192 \\\\"
+          "expectedBehavior": "escape_like converts % → \\%, _ → \\_, \\ → \\\\"
         },
         {
           "cause": "Prefix with path traversal chars (../../)",
@@ -91,7 +91,7 @@
           "validate_prefix must reject filesystem-unsafe chars"
         ],
         "performance": [
-          "Best effort \u2014 no performance targets"
+          "Best effort — no performance targets"
         ],
         "style": [
           "Follow existing test patterns: use assert_eq! for exact string comparisons"
@@ -148,7 +148,7 @@
       "priority": 2,
       "qualityDimensions": {
         "correctness": [
-          "Migration must preserve all existing data \u2014 no data loss",
+          "Migration must preserve all existing data — no data loss",
           "UNIQUE constraint on task_prefix must be enforced"
         ],
         "performance": [
@@ -173,7 +173,7 @@
         "Test get_todo_tasks with prefix only returns matching tasks",
         "Test get_relationships_by_type with prefix only returns matching relationships",
         "Test get_all_task_files with prefix only returns matching files",
-        "Known-bad discriminator: two PRDs P1 and P2 with same-named tasks (P1-US-001, P2-US-001) must be fully isolated \u2014 P1 selection never sees P2-US-001",
+        "Known-bad discriminator: two PRDs P1 and P2 with same-named tasks (P1-US-001, P2-US-001) must be fully isolated — P1 selection never sees P2-US-001",
         "Test select_next_task with None prefix returns all tasks (backwards compat)",
         "Test file compiles"
       ],
@@ -190,7 +190,7 @@
       "failureModes": [
         {
           "cause": "Prefix filter missing on one helper query",
-          "expectedBehavior": "Cross-PRD task leakage \u2014 test catches with mixed-PRD fixture"
+          "expectedBehavior": "Cross-PRD task leakage — test catches with mixed-PRD fixture"
         }
       ],
       "id": "SS-TEST-INIT-003A",
@@ -228,7 +228,7 @@
         "Test .stop-P1 triggers stop for P1 but NOT for P2",
         "Test global .stop triggers stop for ALL sessions (P1, P2, and None)",
         "Test cleanup_signal_files with prefix only removes session-specific files, not global or other sessions'",
-        "Known-bad discriminator: .stop-P1 exists with prefix P2 \u2192 must NOT trigger stop for P2",
+        "Known-bad discriminator: .stop-P1 exists with prefix P2 → must NOT trigger stop for P2",
         "Test file compiles"
       ],
       "batchWith": [],
@@ -244,7 +244,7 @@
       "failureModes": [
         {
           "cause": "Global signal fallback missing",
-          "expectedBehavior": "Global .stop doesn't work \u2014 test verifies fallback"
+          "expectedBehavior": "Global .stop doesn't work — test verifies fallback"
         },
         {
           "cause": "Cleanup removes other sessions' files",
@@ -267,7 +267,7 @@
           "Global signal must affect ALL sessions"
         ],
         "performance": [
-          "Signal checks should be fast \u2014 just file existence"
+          "Signal checks should be fast — just file existence"
         ],
         "style": [
           "Follow existing signal test patterns in signals.rs"
@@ -308,7 +308,7 @@
       "failureModes": [
         {
           "cause": "Scoped delete misses task_relationships table",
-          "expectedBehavior": "Orphaned relationships \u2014 test checks all 5 tables"
+          "expectedBehavior": "Orphaned relationships — test checks all 5 tables"
         },
         {
           "cause": "Upsert creates duplicate rows",
@@ -365,16 +365,16 @@
       "estimatedEffort": "low",
       "id": "SS-FEAT-001",
       "modifiesBehavior": false,
-      "notes": "This is a leaf dependency \u2014 many other stories depend on it. Keep it simple and focused. The existing prefix_filter() in status.rs will be updated to use this module in a later task.",
+      "notes": "This is a leaf dependency — many other stories depend on it. Keep it simple and focused. The existing prefix_filter() in status.rs will be updated to use this module in a later task.",
       "passes": true,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
-          "LIKE wildcards must be escaped \u2014 unescaped % or _ would match unintended task IDs",
-          "validate_prefix must be strict \u2014 chars outside [a-zA-Z0-9._-] could break lock/signal filenames"
+          "LIKE wildcards must be escaped — unescaped % or _ would match unintended task IDs",
+          "validate_prefix must be strict — chars outside [a-zA-Z0-9._-] could break lock/signal filenames"
         ],
         "performance": [
-          "Best effort \u2014 these are simple string operations"
+          "Best effort — these are simple string operations"
         ],
         "style": [
           "All public functions documented with /// doc comments",
@@ -414,12 +414,12 @@
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
-          "Migration must preserve ALL existing data \u2014 no data loss",
+          "Migration must preserve ALL existing data — no data loss",
           "UNIQUE constraint on task_prefix must be enforced",
           "Down migration must restore singleton constraint"
         ],
         "performance": [
-          "Best effort \u2014 migration runs once"
+          "Best effort — migration runs once"
         ],
         "style": [
           "Follow v8.rs migration pattern exactly",
@@ -429,7 +429,7 @@
       "synergyWith": [
         "SS-FEAT-001"
       ],
-      "title": "Migration v9 \u2014 remove prd_metadata singleton constraint",
+      "title": "Migration v9 — remove prd_metadata singleton constraint",
       "touchesFiles": [
         "src/db/migrations/v9.rs",
         "src/db/migrations/mod.rs"
@@ -462,7 +462,7 @@
         "correctness": [
           "Upsert must not create duplicate rows for same task_prefix",
           "last_insert_rowid() must return correct id after ON CONFLICT DO UPDATE",
-          "All callers must be updated \u2014 no hardcoded prd_id=1 remaining"
+          "All callers must be updated — no hardcoded prd_id=1 remaining"
         ],
         "performance": [
           "Best effort"
@@ -519,7 +519,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix::prefix_and() for LIKE clause generation \u2014 no inline prefix logic"
+          "Use db::prefix::prefix_and() for LIKE clause generation — no inline prefix logic"
         ]
       },
       "synergyWith": [
@@ -560,10 +560,10 @@
           "With prefix None, behavior must be identical to current (backwards compat)"
         ],
         "performance": [
-          "Best effort \u2014 LIKE on TEXT PK is acceptable for hundreds of rows"
+          "Best effort — LIKE on TEXT PK is acceptable for hundreds of rows"
         ],
         "style": [
-          "Use db::prefix::prefix_and() \u2014 no inline LIKE logic",
+          "Use db::prefix::prefix_and() — no inline LIKE logic",
           "Document task_prefix parameter in /// doc comments"
         ]
       },
@@ -593,7 +593,7 @@
       "estimatedEffort": "low",
       "id": "SS-FEAT-005B",
       "modifiesBehavior": true,
-      "notes": "Focused on decay.rs only. apply_decay and find_decay_warnings both query tasks by status \u2014 need prefix filter added to both.",
+      "notes": "Focused on decay.rs only. apply_decay and find_decay_warnings both query tasks by status — need prefix filter added to both.",
       "passes": true,
       "priority": 11,
       "qualityDimensions": {
@@ -605,7 +605,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix::prefix_and() \u2014 no inline LIKE logic"
+          "Use db::prefix::prefix_and() — no inline LIKE logic"
         ]
       },
       "synergyWith": [
@@ -635,7 +635,7 @@
       "estimatedEffort": "medium",
       "id": "SS-FEAT-006",
       "modifiesBehavior": false,
-      "notes": "IterationParams already has a task_prefix field (line 108) but it's not passed through to next::next() via BuildPromptParams. The main work is wiring: IterationParams.task_prefix \u2192 BuildPromptParams.task_prefix \u2192 next::next(). Also need to pass prefix when calling apply_decay().",
+      "notes": "IterationParams already has a task_prefix field (line 108) but it's not passed through to next::next() via BuildPromptParams. The main work is wiring: IterationParams.task_prefix → BuildPromptParams.task_prefix → next::next(). Also need to pass prefix when calling apply_decay().",
       "passes": true,
       "priority": 12,
       "qualityDimensions": {
@@ -643,7 +643,7 @@
           "task_prefix must flow from run_loop to next::next() without being dropped"
         ],
         "performance": [
-          "Best effort \u2014 just parameter threading"
+          "Best effort — just parameter threading"
         ],
         "style": [
           "Document the field with /// doc comment explaining it's for PRD scoping"
@@ -666,7 +666,7 @@
         "reconcile_passes_with_db adds AND id LIKE ? when prefix available",
         "scan_output_for_completed_tasks adds AND id LIKE ? when prefix available",
         "reconcile_external_git_completions adds AND id LIKE ? when prefix available",
-        "Prefix read from PRD JSON BEFORE initial recovery (reorder: read prefix \u2192 lock \u2192 init \u2192 recovery)",
+        "Prefix read from PRD JSON BEFORE initial recovery (reorder: read prefix → lock → init → recovery)",
         "Code compiles with cargo check"
       ],
       "batchWith": [],
@@ -691,7 +691,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix::prefix_and() \u2014 no inline LIKE logic"
+          "Use db::prefix::prefix_and() — no inline LIKE logic"
         ]
       },
       "synergyWith": [
@@ -729,7 +729,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix::prefix_and() \u2014 no inline LIKE logic"
+          "Use db::prefix::prefix_and() — no inline LIKE logic"
         ]
       },
       "synergyWith": [
@@ -772,7 +772,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix module \u2014 remove inline prefix_filter from status.rs"
+          "Use db::prefix module — remove inline prefix_filter from status.rs"
         ]
       },
       "synergyWith": [
@@ -811,13 +811,13 @@
         "correctness": [
           "Lock must be acquired BEFORE init() to prevent race conditions",
           "Prefix must be validated before use in filename",
-          "flock auto-releases on process death \u2014 no stale locks"
+          "flock auto-releases on process death — no stale locks"
         ],
         "performance": [
           "Best effort"
         ],
         "style": [
-          "Use existing LockGuard::acquire_named() \u2014 no new lock implementation"
+          "Use existing LockGuard::acquire_named() — no new lock implementation"
         ]
       },
       "synergyWith": [
@@ -859,7 +859,7 @@
           "Cleanup must NOT remove other sessions' files"
         ],
         "performance": [
-          "Signal checks should be fast \u2014 just file existence checks"
+          "Signal checks should be fast — just file existence checks"
         ],
         "style": [
           "Follow existing signals.rs patterns",
@@ -921,7 +921,7 @@
         "Security: prefix validated before use in filenames",
         "Quality dimensions met: each task's qualityDimensions constraints satisfied",
         "Edge case coverage: each edgeCases entry has a corresponding test",
-        "CRITICAL: Grep for FROM tasks/FROM task_relationships/FROM task_files \u2014 verify ALL queries are prefix-scoped",
+        "CRITICAL: Grep for FROM tasks/FROM task_relationships/FROM task_files — verify ALL queries are prefix-scoped",
         "Integration: all new code exported from parent modules",
         "Integration: all callers of modified functions updated",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
@@ -959,7 +959,7 @@
           "Best effort"
         ],
         "style": [
-          "Use db::prefix module consistently \u2014 no inline LIKE patterns"
+          "Use db::prefix module consistently — no inline LIKE patterns"
         ]
       },
       "synergyWith": [],
@@ -979,18 +979,6 @@
       ]
     },
     {
-      "id": "SS-CODE-FIX-001",
-      "title": "Scope get_relationship_counts() by task_prefix in calibrate.rs",
-      "description": "get_relationship_counts() at calibrate.rs:307 doesn't accept or use task_prefix \u2014 queries ALL task_relationships across PRDs. Must filter by prefix to support concurrent PRD sessions.",
-      "priority": 20,
-      "estimatedEffort": "low",
-      "passes": false,
-      "model": "claude-sonnet-4-6",
-      "modifiesBehavior": true,
-      "notes": "Found by CODE-REVIEW-1. Documented in tasks/progress.txt as CODE-FIX-001.",
-      "touchesFiles": [
-        "src/loop_engine/calibrate.rs"
-      ],
       "acceptanceCriteria": [
         "get_relationship_counts() accepts an optional task_prefix parameter",
         "When prefix is Some, query filters task_relationships by prefix on task_id",
@@ -998,36 +986,36 @@
         "All callers updated to pass prefix",
         "Existing tests still pass"
       ],
-      "dependsOn": [
-        "SS-CODE-REVIEW-1"
-      ],
-      "synergyWith": [
-        "SS-CODE-FIX-002"
-      ],
       "batchWith": [
         "SS-CODE-FIX-002"
       ],
       "conflictsWith": [],
+      "dependsOn": [
+        "SS-CODE-REVIEW-1"
+      ],
+      "description": "get_relationship_counts() at calibrate.rs:307 doesn't accept or use task_prefix — queries ALL task_relationships across PRDs. Must filter by prefix to support concurrent PRD sessions.",
+      "edgeCases": [],
+      "estimatedEffort": "low",
+      "failureModes": [],
+      "id": "SS-CODE-FIX-001",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": true,
+      "notes": "Found by CODE-REVIEW-1. Documented in tasks/progress.txt as CODE-FIX-001.",
+      "passes": true,
+      "priority": 20,
       "qualityDimensions": [
         "correctness",
         "scoping"
       ],
-      "edgeCases": [],
-      "failureModes": []
-    },
-    {
-      "id": "SS-CODE-FIX-002",
-      "title": "Scope load_task_outcomes() by task_prefix in calibrate.rs",
-      "description": "load_task_outcomes() at calibrate.rs:225 queries ALL run_tasks without prefix filtering. Must filter by prefix to support concurrent PRD sessions.",
-      "priority": 21,
-      "estimatedEffort": "low",
-      "passes": false,
-      "model": "claude-sonnet-4-6",
-      "modifiesBehavior": true,
-      "notes": "Found by CODE-REVIEW-1. Documented in tasks/progress.txt as CODE-FIX-002.",
+      "synergyWith": [
+        "SS-CODE-FIX-002"
+      ],
+      "title": "Scope get_relationship_counts() by task_prefix in calibrate.rs",
       "touchesFiles": [
         "src/loop_engine/calibrate.rs"
-      ],
+      ]
+    },
+    {
       "acceptanceCriteria": [
         "load_task_outcomes() accepts an optional task_prefix parameter",
         "When prefix is Some, query filters run_tasks by prefix on task_id",
@@ -1035,26 +1023,38 @@
         "All callers updated to pass prefix",
         "Existing tests still pass"
       ],
-      "dependsOn": [
-        "SS-CODE-REVIEW-1"
-      ],
-      "synergyWith": [
-        "SS-CODE-FIX-001"
-      ],
       "batchWith": [
         "SS-CODE-FIX-001"
       ],
       "conflictsWith": [],
+      "dependsOn": [
+        "SS-CODE-REVIEW-1"
+      ],
+      "description": "load_task_outcomes() at calibrate.rs:225 queries ALL run_tasks without prefix filtering. Must filter by prefix to support concurrent PRD sessions.",
+      "edgeCases": [],
+      "estimatedEffort": "low",
+      "failureModes": [],
+      "id": "SS-CODE-FIX-002",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": true,
+      "notes": "Found by CODE-REVIEW-1. Documented in tasks/progress.txt as CODE-FIX-002.",
+      "passes": true,
+      "priority": 21,
       "qualityDimensions": [
         "correctness",
         "scoping"
       ],
-      "edgeCases": [],
-      "failureModes": []
+      "synergyWith": [
+        "SS-CODE-FIX-001"
+      ],
+      "title": "Scope load_task_outcomes() by task_prefix in calibrate.rs",
+      "touchesFiles": [
+        "src/loop_engine/calibrate.rs"
+      ]
     },
     {
       "acceptanceCriteria": [
-        "No code duplication (DRY principle) \u2014 especially duplicated LIKE query patterns",
+        "No code duplication (DRY principle) — especially duplicated LIKE query patterns",
         "Functions under 30 lines (flag complex ones)",
         "No tight coupling between modules",
         "Code is easy to change and extend",
@@ -1073,7 +1073,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: add a REFACTOR-1-xxx task (priority 24-25), add it to MILESTONE-1 dependsOn, commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "passes": true,
       "priority": 23,
       "qualityDimensions": {
         "correctness": [
@@ -1138,7 +1138,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Run full cargo test suite. If any CODE-FIX-xxx or REFACTOR-1-xxx tasks were spawned by reviews, they must also be complete.",
-      "passes": false,
+      "passes": true,
       "priority": 26,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -1165,7 +1165,7 @@
       "id": "SS-TEST-001",
       "modifiesBehavior": false,
       "notes": "Create test fixtures with two PRDs (P1-*, P2-*) and verify each engine query respects prefix boundaries.",
-      "passes": false,
+      "passes": true,
       "priority": 30,
       "qualityDimensions": {
         "correctness": [
@@ -1195,8 +1195,8 @@
         "Test cleanup with P1 prefix: .stop-P1 removed, .stop-P2 and .stop preserved",
         "Test cleanup with None prefix: .stop and .pause removed (legacy behavior)",
         "Test lock file naming: loop-P1.lock for prefix P1, loop.lock for None",
-        "Test concurrent lock: acquire lock for P1 and P2 concurrently \u2014 both succeed",
-        "Test same-PRD lock: acquire lock for P1 twice \u2014 second fails with clear error message",
+        "Test concurrent lock: acquire lock for P1 and P2 concurrently — both succeed",
+        "Test same-PRD lock: acquire lock for P1 twice — second fails with clear error message",
         "80%+ coverage for signal functions"
       ],
       "batchWith": [],
@@ -1209,7 +1209,7 @@
       "id": "SS-TEST-002",
       "modifiesBehavior": false,
       "notes": "Use tempfile::TempDir for filesystem tests. Create all signal file variants and verify correct behavior for each scenario. For lock tests, use LockGuard::acquire_named() directly.",
-      "passes": false,
+      "passes": true,
       "priority": 33,
       "qualityDimensions": {
         "correctness": [
@@ -1252,7 +1252,7 @@
       "id": "SS-TEST-003",
       "modifiesBehavior": false,
       "notes": "These tests exercise the full import pipeline with migration. May reveal implementation gaps.",
-      "passes": false,
+      "passes": true,
       "priority": 35,
       "qualityDimensions": {
         "correctness": [
@@ -1295,7 +1295,7 @@
       "id": "SS-TEST-004",
       "modifiesBehavior": false,
       "notes": "Create a rich test fixture with P1 and P2 tasks having dependencies, synergies, conflicts, and batch relationships across prefix boundaries.",
-      "passes": false,
+      "passes": true,
       "priority": 38,
       "qualityDimensions": {
         "correctness": [
@@ -1339,7 +1339,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: add a REFACTOR-2-xxx task (priority 43-47), add it to MILESTONE-2 dependsOn, commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "passes": true,
       "priority": 42,
       "qualityDimensions": {
         "correctness": [
@@ -1386,7 +1386,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Run full cargo test suite.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -1414,12 +1414,12 @@
       "estimatedEffort": "high",
       "id": "SS-INT-001",
       "modifiesBehavior": false,
-      "notes": "This is the most comprehensive test \u2014 exercises the full lifecycle. Create actual PRD JSON fixtures (minimal) for P1 and P2, import them, run selection, force-reinit, and verify everything. Include a backwards-compat test with a prefixless PRD.",
-      "passes": false,
+      "notes": "This is the most comprehensive test — exercises the full lifecycle. Create actual PRD JSON fixtures (minimal) for P1 and P2, import them, run selection, force-reinit, and verify everything. Include a backwards-compat test with a prefixless PRD.",
+      "passes": true,
       "priority": 55,
       "qualityDimensions": {
         "correctness": [
-          "Full lifecycle must work: import \u2192 select \u2192 force-reinit \u2192 verify isolation",
+          "Full lifecycle must work: import → select → force-reinit → verify isolation",
           "Backwards compat: single-PRD without prefix must work identically"
         ],
         "performance": [
@@ -1455,7 +1455,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final opportunity to improve code before merge. For each issue found: add a REFACTOR-3-xxx task (priority 66-80), add it to MILESTONE-FINAL dependsOn, commit JSON changes.",
-      "passes": false,
+      "passes": true,
       "priority": 65,
       "qualityDimensions": {
         "correctness": [
@@ -1505,11 +1505,11 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate before merge. Run all quality checks and verify everything passes.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "timeoutSecs": 1800,
-      "title": "Final verification \u2014 all checks pass",
+      "title": "Final verification — all checks pass",
       "touchesFiles": []
     },
     {
@@ -1527,13 +1527,13 @@
         "SS-VERIFY-001",
         "SS-REFACTOR-REVIEW-3"
       ],
-      "description": "Final gate \u2014 all tests pass, all reviews complete, code is clean and ready for merge to main.",
+      "description": "Final gate — all tests pass, all reviews complete, code is clean and ready for merge to main.",
       "estimatedEffort": "low",
       "id": "SS-MILESTONE-FINAL",
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Final milestone. All acceptance criteria from all user stories must be met.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,
