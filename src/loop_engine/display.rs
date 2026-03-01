@@ -45,6 +45,34 @@ pub fn print_session_banner(
     eprintln!("╚══════════════════════════════════════════════╝\n");
 }
 
+/// Operational hints to display in the session start banner.
+///
+/// These guide the user on how to interact with a running loop (e.g. how to
+/// pause it, stop it, where progress is logged, and which worktree is active).
+pub struct SessionBannerHints<'a> {
+    /// Path to the task-mgr database file shown in the banner.
+    pub db_path: &'a std::path::Path,
+    /// Optional task-prefix; when `Some("P1")` the stop-file hint shows `.stop-P1`.
+    pub prefix: Option<&'a str>,
+    /// Optional active worktree path; when `None` the worktree line is omitted.
+    pub worktree_path: Option<&'a std::path::Path>,
+}
+
+/// Format the session start banner as a string (for testability).
+///
+/// Returns a multi-line string containing the banner with operational hints.
+/// Use [`print_session_banner`] for normal output to stderr.
+pub fn format_session_banner(
+    prd_file: &str,
+    branch: &str,
+    max_iterations: u32,
+    deadline_hours: Option<f64>,
+    hints: Option<&SessionBannerHints<'_>>,
+) -> String {
+    let _ = (prd_file, branch, max_iterations, deadline_hours, hints);
+    todo!("FEAT-004: implement format_session_banner with hints")
+}
+
 /// Format an iteration header as a string (for testability).
 pub fn format_iteration_header(
     iteration: u32,
@@ -202,5 +230,102 @@ mod tests {
     #[test]
     fn test_print_final_banner_no_panic() {
         print_final_banner(10, 5, 3600, "all tasks complete");
+    }
+
+    // --- TEST-INIT-003: format_session_banner() with hints ---
+
+    #[test]
+    #[ignore = "FEAT-004: implement format_session_banner with hints"]
+    fn test_format_session_banner_with_all_hints_no_panic() {
+        use std::path::Path;
+        let db = Path::new("/tmp/tasks.db");
+        let wt = Path::new("/tmp/worktrees/feat-branch");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: None,
+            worktree_path: Some(wt),
+        };
+        // Must not panic and must return a non-empty string
+        let banner = format_session_banner("tasks/prd.json", "main", 10, Some(2.0), Some(&hints));
+        assert!(!banner.is_empty(), "banner must be non-empty");
+    }
+
+    #[test]
+    #[ignore = "FEAT-004: implement format_session_banner with hints"]
+    fn test_format_session_banner_without_worktree_omits_worktree_line() {
+        use std::path::Path;
+        let db = Path::new("/tmp/tasks.db");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: None,
+            worktree_path: None,
+        };
+        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        let banner_lower = banner.to_lowercase();
+        assert!(
+            !banner_lower.contains("worktree"),
+            "Banner without worktree_path must not mention 'worktree', got:\n{}",
+            banner
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-004: implement format_session_banner with hints"]
+    fn test_format_session_banner_with_prefix_uses_stop_prefix_hint() {
+        use std::path::Path;
+        let db = Path::new("/tmp/tasks.db");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: Some("P1"),
+            worktree_path: None,
+        };
+        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        assert!(
+            banner.contains(".stop-P1"),
+            "Banner with prefix 'P1' must contain '.stop-P1' in stop-file hint, got:\n{}",
+            banner
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-004: implement format_session_banner with hints"]
+    fn test_format_session_banner_without_prefix_uses_plain_stop_hint() {
+        use std::path::Path;
+        let db = Path::new("/tmp/tasks.db");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: None,
+            worktree_path: None,
+        };
+        let banner = format_session_banner("tasks/prd.json", "main", 5, None, Some(&hints));
+        // Must contain ".stop" but NOT ".stop-" (no prefix suffix)
+        assert!(
+            banner.contains(".stop"),
+            "Banner without prefix must contain '.stop' hint, got:\n{}",
+            banner
+        );
+        assert!(
+            !banner.contains(".stop-"),
+            "Banner without prefix must NOT contain '.stop-<prefix>', got:\n{}",
+            banner
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-004: implement format_session_banner with hints"]
+    fn test_format_session_banner_with_db_path_in_hints() {
+        use std::path::Path;
+        let db = Path::new("/home/user/.task-mgr/tasks.db");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: None,
+            worktree_path: None,
+        };
+        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        assert!(
+            banner.contains("tasks.db"),
+            "Banner must display the DB path hint, got:\n{}",
+            banner
+        );
     }
 }

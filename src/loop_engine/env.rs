@@ -600,7 +600,8 @@ pub struct ResolvedPaths {
 ///
 /// - `prd_file` must exist (error if not found)
 /// - `prompt_file`: if `None`, derived from PRD filename by replacing `.json` with `-prompt.md`
-/// - `progress_file` defaults to `tasks/progress.txt` relative to the project root
+/// - `progress_file` defaults to `tasks/progress.txt`; when `prefix` is `Some("P1")` it becomes
+///   `tasks/progress-P1.txt` (per-PRD progress isolation)
 ///
 /// # Errors
 ///
@@ -609,6 +610,7 @@ pub fn resolve_paths(
     prd_file: &Path,
     prompt_file: Option<&Path>,
     project_dir: &Path,
+    prefix: Option<&str>,
 ) -> TaskMgrResult<ResolvedPaths> {
     // Resolve PRD file to absolute path
     let prd_absolute = if prd_file.is_absolute() {
@@ -667,8 +669,12 @@ pub fn resolve_paths(
         }
     };
 
-    // Resolve progress file
-    let progress_file = project_dir.join("tasks").join("progress.txt");
+    // Resolve progress file — use prefix to isolate per-PRD progress when provided
+    let progress_filename = match prefix {
+        Some(p) => format!("progress-{}.txt", p),
+        None => "progress.txt".to_string(),
+    };
+    let progress_file = project_dir.join("tasks").join(progress_filename);
 
     // Derive tasks directory from PRD location
     let tasks_dir = prd_absolute.parent().unwrap_or(project_dir).to_path_buf();
@@ -775,7 +781,7 @@ mod tests {
         let prd = tmp.path().join("test.json");
         fs::write(&prd, "{}").expect("write prd");
 
-        let resolved = resolve_paths(&prd, None, tmp.path()).expect("resolve paths");
+        let resolved = resolve_paths(&prd, None, tmp.path(), None).expect("resolve paths");
         assert!(resolved.prd_file.is_absolute());
         assert!(resolved.prd_file.exists());
         // Prompt derived from PRD name
@@ -794,7 +800,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let prd = tmp.path().join("nonexistent.json");
 
-        let result = resolve_paths(&prd, None, tmp.path());
+        let result = resolve_paths(&prd, None, tmp.path(), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -812,7 +818,7 @@ mod tests {
         fs::write(&prd, "{}").expect("write prd");
         fs::write(&prompt, "# Prompt").expect("write prompt");
 
-        let resolved = resolve_paths(&prd, Some(&prompt), tmp.path()).expect("resolve paths");
+        let resolved = resolve_paths(&prd, Some(&prompt), tmp.path(), None).expect("resolve paths");
         assert!(resolved.prompt_file.is_absolute());
         assert!(resolved
             .prompt_file
@@ -830,7 +836,7 @@ mod tests {
 
         // Pass relative path
         let relative = Path::new("tasks").join("my-prd.json");
-        let resolved = resolve_paths(&relative, None, tmp.path()).expect("resolve paths");
+        let resolved = resolve_paths(&relative, None, tmp.path(), None).expect("resolve paths");
         assert!(resolved.prd_file.is_absolute());
     }
 
@@ -840,7 +846,7 @@ mod tests {
         let prd = tmp.path().join("test.json");
         fs::write(&prd, "{}").expect("write prd");
 
-        let resolved = resolve_paths(&prd, None, tmp.path()).expect("resolve paths");
+        let resolved = resolve_paths(&prd, None, tmp.path(), None).expect("resolve paths");
         assert!(resolved
             .progress_file
             .to_string_lossy()
@@ -1252,7 +1258,7 @@ mod tests {
 
         // Pass relative PRD path and project_root as project_dir (NOT db_dir)
         let relative_prd = Path::new("tasks").join("my-prd.json");
-        let resolved = resolve_paths(&relative_prd, None, project_root.path())
+        let resolved = resolve_paths(&relative_prd, None, project_root.path(), None)
             .expect("should resolve relative to project_root");
 
         assert!(resolved.prd_file.is_absolute());
@@ -1281,14 +1287,14 @@ mod tests {
         fs::write(&prd, "{}").expect("write prd");
 
         // Resolving with project_root should succeed
-        let resolved = resolve_paths(&prd, None, project_root.path())
+        let resolved = resolve_paths(&prd, None, project_root.path(), None)
             .expect("should find PRD under project_root");
         assert!(resolved.prd_file.exists());
 
         // Resolving same relative path with db_dir should fail
         // (because the PRD doesn't exist under db_dir)
         let relative = Path::new("test.json");
-        let result = resolve_paths(relative, None, db_dir.path());
+        let result = resolve_paths(relative, None, db_dir.path(), None);
         assert!(
             result.is_err(),
             "PRD should NOT be found under db_dir when it only exists under project_root"
@@ -1302,7 +1308,7 @@ mod tests {
         let prd = project_root.path().join("test.json");
         fs::write(&prd, "{}").expect("write prd");
 
-        let resolved = resolve_paths(&prd, None, project_root.path()).expect("resolve paths");
+        let resolved = resolve_paths(&prd, None, project_root.path(), None).expect("resolve paths");
 
         // progress.txt should be under project_root/tasks/progress.txt
         let expected_progress = project_root.path().join("tasks").join("progress.txt");
@@ -1351,7 +1357,7 @@ mod tests {
         fs::write(&prd, "{}").expect("write prd");
 
         // Pass absolute PRD path — project_root shouldn't matter for resolution
-        let resolved = resolve_paths(&prd, None, project_root.path())
+        let resolved = resolve_paths(&prd, None, project_root.path(), None)
             .expect("absolute PRD should resolve regardless of project_root");
 
         assert!(resolved.prd_file.is_absolute());
@@ -1375,7 +1381,7 @@ mod tests {
         fs::write(&prd, r#"{"version":"1.0"}"#).expect("write prd");
 
         let relative = Path::new("tasks").join("sub").join("deep.json");
-        let resolved = resolve_paths(&relative, None, project_root.path())
+        let resolved = resolve_paths(&relative, None, project_root.path(), None)
             .expect("nested relative PRD should resolve");
 
         assert!(resolved.prd_file.is_absolute());
@@ -1409,8 +1415,13 @@ mod tests {
         // Pass relative paths for both PRD and prompt
         let relative_prd = Path::new("tasks").join("test.json");
         let relative_prompt = Path::new("tasks").join("custom-prompt.md");
-        let resolved = resolve_paths(&relative_prd, Some(&relative_prompt), project_root.path())
-            .expect("should resolve both relative paths");
+        let resolved = resolve_paths(
+            &relative_prd,
+            Some(&relative_prompt),
+            project_root.path(),
+            None,
+        )
+        .expect("should resolve both relative paths");
 
         assert!(resolved.prd_file.is_absolute());
         assert!(resolved.prompt_file.is_absolute());
@@ -1432,7 +1443,8 @@ mod tests {
         fs::write(&prd, "{}").expect("write prd");
 
         let relative = Path::new("custom").join("my-prd.json");
-        let resolved = resolve_paths(&relative, None, project_root.path()).expect("resolve paths");
+        let resolved =
+            resolve_paths(&relative, None, project_root.path(), None).expect("resolve paths");
 
         // tasks_dir should be the parent of the PRD file (custom/), not project_root
         assert!(
@@ -1455,20 +1467,20 @@ mod tests {
         fs::write(&prd_path, "{}").expect("write prd");
 
         // Case 1: Absolute PRD + project_root == PRD parent tree → OK
-        let r = resolve_paths(&prd_path, None, root1.path());
+        let r = resolve_paths(&prd_path, None, root1.path(), None);
         assert!(r.is_ok(), "Abs PRD + matching project_root: {:?}", r.err());
 
         // Case 2: Absolute PRD + project_root != PRD parent → OK (absolute is self-contained)
-        let r = resolve_paths(&prd_path, None, root2.path());
+        let r = resolve_paths(&prd_path, None, root2.path(), None);
         assert!(r.is_ok(), "Abs PRD + different project_root: {:?}", r.err());
 
         // Case 3: Relative PRD + correct project_root → OK
         let rel = Path::new("tasks").join("test.json");
-        let r = resolve_paths(&rel, None, root1.path());
+        let r = resolve_paths(&rel, None, root1.path(), None);
         assert!(r.is_ok(), "Rel PRD + correct project_root: {:?}", r.err());
 
         // Case 4: Relative PRD + wrong project_root → FAIL (PRD not under root2)
-        let r = resolve_paths(&rel, None, root2.path());
+        let r = resolve_paths(&rel, None, root2.path(), None);
         assert!(
             r.is_err(),
             "Rel PRD + wrong project_root should fail because PRD doesn't exist there"
@@ -1791,7 +1803,7 @@ mod tests {
         let project_root = tempfile::tempdir().expect("create project root");
         let nonexistent_prd = Path::new("tasks").join("nonexistent.json");
 
-        let result = resolve_paths(&nonexistent_prd, None, project_root.path());
+        let result = resolve_paths(&nonexistent_prd, None, project_root.path(), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
 
@@ -1803,6 +1815,80 @@ mod tests {
             "resolve_paths not-found error should contain 'Hint' or 'project root' \
              for actionable guidance, got: {}",
             err
+        );
+    }
+
+    // --- TEST-INIT-003: resolve_paths() prefix parameter ---
+
+    #[test]
+    fn test_resolve_paths_without_prefix_returns_progress_txt() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let prd = tmp.path().join("test.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let resolved = resolve_paths(&prd, None, tmp.path(), None).expect("resolve paths");
+        assert!(
+            resolved
+                .progress_file
+                .to_string_lossy()
+                .ends_with("progress.txt"),
+            "Without prefix, progress file should be 'progress.txt', got: {:?}",
+            resolved.progress_file
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_with_prefix_returns_prefixed_progress() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let prd = tmp.path().join("test.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let resolved = resolve_paths(&prd, None, tmp.path(), Some("P1")).expect("resolve paths");
+        assert!(
+            resolved
+                .progress_file
+                .to_string_lossy()
+                .ends_with("progress-P1.txt"),
+            "With prefix 'P1', progress file should be 'progress-P1.txt', got: {:?}",
+            resolved.progress_file
+        );
+    }
+
+    /// Known-bad discriminator: prefix must produce different filename than no-prefix
+    #[test]
+    fn test_resolve_paths_prefix_p1_differs_from_no_prefix() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let prd = tmp.path().join("test.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let without_prefix = resolve_paths(&prd, None, tmp.path(), None).expect("no prefix");
+        let with_prefix = resolve_paths(&prd, None, tmp.path(), Some("P1")).expect("with prefix");
+
+        assert_ne!(
+            without_prefix.progress_file, with_prefix.progress_file,
+            "prefix='P1' must produce 'progress-P1.txt', not 'progress.txt'"
+        );
+        assert!(
+            with_prefix
+                .progress_file
+                .to_string_lossy()
+                .contains("progress-P1.txt"),
+            "progress file with P1 prefix must contain 'progress-P1.txt'"
+        );
+        assert!(
+            without_prefix
+                .progress_file
+                .to_string_lossy()
+                .contains("progress.txt"),
+            "progress file without prefix must contain 'progress.txt'"
+        );
+        // The negative: with_prefix must NOT end with plain progress.txt
+        assert!(
+            !with_prefix
+                .progress_file
+                .to_string_lossy()
+                .ends_with("progress.txt"),
+            "With prefix 'P1', file MUST NOT be plain 'progress.txt'"
         );
     }
 

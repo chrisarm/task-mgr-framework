@@ -23,6 +23,7 @@ use rusqlite::Connection;
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
 use crate::db::LockGuard;
+use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
 use crate::loop_engine::calibrate;
 use crate::loop_engine::claude;
@@ -42,7 +43,6 @@ use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::models::RunStatus;
-use crate::error::TaskMgrError;
 use crate::TaskMgrResult;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
@@ -362,7 +362,11 @@ pub fn run_iteration(
                             effective_model: None,
                         });
                     }
-                    Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+                    Err(TaskMgrError::PromptOverflow {
+                        critical_size,
+                        budget,
+                        task_id,
+                    }) => {
                         return Ok(prompt_overflow_result(critical_size, budget, task_id));
                     }
                     Err(e) => return Err(e),
@@ -382,7 +386,11 @@ pub fn run_iteration(
                 });
             }
         }
-        Err(TaskMgrError::PromptOverflow { critical_size, budget, task_id }) => {
+        Err(TaskMgrError::PromptOverflow {
+            critical_size,
+            budget,
+            task_id,
+        }) => {
             return Ok(prompt_overflow_result(critical_size, budget, task_id));
         }
         Err(e) => return Err(e),
@@ -599,6 +607,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         &run_config.prd_file,
         run_config.prompt_file.as_deref(),
         &run_config.source_root,
+        None,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -679,8 +688,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     if run_config.config.verbose {
         let canonical = run_config.db_dir.join("tasks.db");
         eprintln!("[verbose] Database path: {}", canonical.display());
-        eprintln!("[verbose] Source root:   {}", run_config.source_root.display());
-        eprintln!("[verbose] Working root:  {}", run_config.working_root.display());
+        eprintln!(
+            "[verbose] Source root:   {}",
+            run_config.source_root.display()
+        );
+        eprintln!(
+            "[verbose] Working root:  {}",
+            run_config.working_root.display()
+        );
     }
 
     // Step 6.5: Run any pending migrations (e.g. v4 adds external_git_repo column)
@@ -1213,8 +1228,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;
-                    exit_reason =
-                        "prompt overflow — critical sections exceed budget".to_string();
+                    exit_reason = "prompt overflow — critical sections exceed budget".to_string();
                 }
                 _ => {
                     exit_code = 1;
@@ -3810,13 +3824,15 @@ mod tests {
         // All three should be done
         for id in &["A", "B", "C"] {
             let status: String = conn
-                .query_row(
-                    "SELECT status FROM tasks WHERE id = ?",
-                    [id],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT status FROM tasks WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })
                 .unwrap();
-            assert_eq!(status, "done", "Task {} should be done after reconciliation", id);
+            assert_eq!(
+                status, "done",
+                "Task {} should be done after reconciliation",
+                id
+            );
         }
     }
 
