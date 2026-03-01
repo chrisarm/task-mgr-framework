@@ -78,7 +78,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write these tests first. Use existing setup_git_repo() test helper from env.rs. Implementation tasks FEAT-001 and FEAT-002 depend on these.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "synergyWith": [
         "TEST-INIT-002"
@@ -127,7 +127,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write these tests first. Existing lock.rs tests provide patterns. FEAT-003 depends on these.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "synergyWith": [
         "TEST-INIT-001"
@@ -170,7 +170,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write these tests first. Existing display.rs and env.rs test patterns apply. FEAT-004 and FEAT-005 depend on these.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "synergyWith": [],
       "title": "Initial tests for session banner hints and per-PRD progress files",
@@ -196,7 +196,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Group A (standalone). Only modify the error path after line 449 in env.rs where create_result.status.success() is false. Track whether we created the parent dir to know if cleanup is needed.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -238,7 +238,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "Group A (standalone). This function is the foundation for US-P2-001, US-P2-003, US-P2-005. Pattern: follow ensure_worktree() style for git Command usage.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -292,7 +292,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": true,
       "notes": "Group A (standalone). Breaking change to read_holder_info() return type \u2014 update the single caller in acquire_inner() at line 76. First line of new format is always pid@host for old-reader compat.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -332,7 +332,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Group A (standalone). Breaking change to print_session_banner() signature \u2014 only one caller at engine.rs:831. Box width may need to increase for longer hint lines.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -385,7 +385,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": true,
       "notes": "Group A (standalone). Breaking change to resolve_paths() \u2014 update caller in engine.rs. The progress::rotate_progress() call at engine.rs:857 already uses paths.progress_file so it will automatically use the prefixed path.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -424,7 +424,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "Group B. Depends on FEAT-003 (enhanced lock) being complete. The lock is acquired early in run_loop() \u2014 update that call site.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": {
         "correctness": [
@@ -485,7 +485,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": true,
       "notes": "Group B. Depends on FEAT-002 (remove_worktree). Insert cleanup logic after Step 21 in engine.rs (after deadline/signal cleanup, before final banner). The LoopResult return type change affects main.rs and batch.rs.",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": {
         "correctness": [
@@ -631,7 +631,7 @@
       "title": "DRY: Deduplicate pid/host logic in lock.rs write_holder_info methods",
       "description": "write_holder_info() and write_holder_info_extended() duplicate pid/host resolution and file truncation logic. Make write_holder_info delegate to write_holder_info_extended(None, None, None).",
       "priority": 18,
-      "passes": false,
+      "passes": true,
       "status": "pending",
       "estimatedEffort": "low",
       "modifiesBehavior": false,
@@ -657,7 +657,7 @@
       "title": "DRY: Extract cleanup_empty_parent() helper in env.rs",
       "description": "The 'remove empty parent dir' logic appears in both ensure_worktree() (failure path) and remove_worktree(). Extract a shared cleanup_empty_parent(path) helper.",
       "priority": 18,
-      "passes": false,
+      "passes": true,
       "status": "pending",
       "estimatedEffort": "low",
       "modifiesBehavior": false,
