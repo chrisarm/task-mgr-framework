@@ -2382,7 +2382,7 @@ fn make_dedup_items(pairs: &[(i64, &str, &str)]) -> Vec<DeduplicateLearningItem>
 }
 
 #[test]
-#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+
 fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
     // AC: prompt contains a random UUID boundary delimiter (injection protection)
     let items = make_dedup_items(&[(1, "Title A", "Content A"), (2, "Title B", "Content B")]);
@@ -2402,7 +2402,7 @@ fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+
 fn test_dedup_prompt_contains_untrusted_warning() {
     // AC: prompt contains UNTRUSTED warning for learning content
     let items = make_dedup_items(&[(1, "Title", "Content")]);
@@ -2415,7 +2415,7 @@ fn test_dedup_prompt_contains_untrusted_warning() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+
 fn test_dedup_prompt_includes_learning_ids_titles_content() {
     // AC: prompt includes all learning IDs, titles, and content
     let items = make_dedup_items(&[
@@ -2449,7 +2449,7 @@ fn test_dedup_prompt_includes_learning_ids_titles_content() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+
 fn test_dedup_prompt_includes_threshold_value() {
     // AC: prompt includes threshold value as guidance
     let items = make_dedup_items(&[(1, "Title", "Content")]);
@@ -2462,7 +2462,7 @@ fn test_dedup_prompt_includes_threshold_value() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_valid_json() {
     // AC: valid JSON response parses to Vec<RawDedupCluster> correctly
     let response = r#"[{"source_ids": [1, 2, 3]}, {"source_ids": [4, 5]}]"#;
@@ -2471,14 +2471,20 @@ fn test_parse_dedup_response_valid_json() {
     let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
 
     assert_eq!(clusters.len(), 2, "should parse 2 clusters");
-    let c0_ids = clusters[0].source_ids.as_ref().expect("source_ids must be present");
+    let c0_ids = clusters[0]
+        .source_ids
+        .as_ref()
+        .expect("source_ids must be present");
     assert!(c0_ids.contains(&1) && c0_ids.contains(&2) && c0_ids.contains(&3));
-    let c1_ids = clusters[1].source_ids.as_ref().expect("source_ids must be present");
+    let c1_ids = clusters[1]
+        .source_ids
+        .as_ref()
+        .expect("source_ids must be present");
     assert!(c1_ids.contains(&4) && c1_ids.contains(&5));
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_filters_nonexistent_ids() {
     // AC: response with non-existent learning IDs — invalid IDs filtered out, valid clusters preserved
     // Cluster 1: all IDs valid → kept
@@ -2497,7 +2503,10 @@ fn test_parse_dedup_response_filters_nonexistent_ids() {
 
     // Cluster containing hallucinated ID 999 must be filtered out
     let has_invalid = clusters.iter().any(|c| {
-        c.source_ids.as_ref().map(|v| v.contains(&999)).unwrap_or(false)
+        c.source_ids
+            .as_ref()
+            .map(|v| v.contains(&999))
+            .unwrap_or(false)
     });
     assert!(
         !has_invalid,
@@ -2506,7 +2515,7 @@ fn test_parse_dedup_response_filters_nonexistent_ids() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_first_cluster_wins_on_duplicate_id() {
     // AC: response with same learning in multiple clusters — first cluster wins, later skipped
     // Learning ID 2 appears in both clusters; the first cluster should be kept, second skipped.
@@ -2524,7 +2533,10 @@ fn test_parse_dedup_response_first_cluster_wins_on_duplicate_id() {
 
     // Second cluster [2,3] must NOT be present (ID 2 already claimed)
     let second_present = clusters.iter().any(|c| {
-        c.source_ids.as_ref().map(|v| v.contains(&3)).unwrap_or(false)
+        c.source_ids
+            .as_ref()
+            .map(|v| v.contains(&3))
+            .unwrap_or(false)
     });
     assert!(
         !second_present,
@@ -2533,7 +2545,7 @@ fn test_parse_dedup_response_first_cluster_wins_on_duplicate_id() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_non_json_returns_empty() {
     // AC: non-JSON response returns empty clusters (best-effort, no crash)
     let response = "Sorry, I cannot help with that.";
@@ -2548,7 +2560,7 @@ fn test_parse_dedup_response_non_json_returns_empty() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_markdown_wrapped_json() {
     // AC: markdown-wrapped JSON (```json ... ```) is extracted correctly
     let response = "```json\n[{\"source_ids\": [10, 20]}]\n```";
@@ -2561,7 +2573,10 @@ fn test_parse_dedup_response_markdown_wrapped_json() {
         1,
         "should extract 1 cluster from markdown-wrapped JSON"
     );
-    let ids = clusters[0].source_ids.as_ref().expect("source_ids must be present");
+    let ids = clusters[0]
+        .source_ids
+        .as_ref()
+        .expect("source_ids must be present");
     assert!(
         ids.contains(&10) && ids.contains(&20),
         "extracted cluster must contain IDs 10 and 20"
@@ -2569,7 +2584,7 @@ fn test_parse_dedup_response_markdown_wrapped_json() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_empty_array() {
     // AC: empty array response returns 0 clusters
     let response = "[]";
@@ -2585,7 +2600,7 @@ fn test_parse_dedup_response_empty_array() {
 }
 
 #[test]
-#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+
 fn test_parse_dedup_response_single_id_cluster_rejected() {
     // Known-bad discriminator: cluster with only 1 ID is not a merge — must be rejected
     let response = r#"[{"source_ids": [42]}, {"source_ids": [1, 2]}]"#;
@@ -2594,9 +2609,9 @@ fn test_parse_dedup_response_single_id_cluster_rejected() {
     let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
 
     // Single-ID cluster must be filtered out
-    let has_singleton = clusters.iter().any(|c| {
-        c.source_ids.as_deref() == Some(&[42_i64][..])
-    });
+    let has_singleton = clusters
+        .iter()
+        .any(|c| c.source_ids.as_deref() == Some(&[42_i64][..]));
     assert!(
         !has_singleton,
         "cluster with only 1 ID must be rejected (requires at least 2 for a merge)"
