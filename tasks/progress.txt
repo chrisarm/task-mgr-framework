@@ -1,4 +1,13 @@
 
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-3
+- Reviewed all 7 Phase 2 files: enrich.rs, types.rs, output.rs, mod.rs, tests.rs, crud/types.rs, crud/update.rs
+- **Issue 1 (REFACTOR-3-001)**: `extract_json_array` + `find_matching_bracket` duplicated identically (~60 lines) between enrich.rs and extraction.rs. Critical for Phase 3 reuse — extract to shared module.
+- **Issue 2 (REFACTOR-3-002)**: `current_has_tags` param in `proposal_to_edit_params` is unused (suppressed with `let _`). Remove from signature.
+- **Not worth extracting**: find_enrichment_candidates SQL duplication (4 match arms) — each arm is small, readable, and dynamic SQL would add complexity. edit_learning repetitive blocks (3x file/task_type/error) — only 3 uses, helper adds indirection. curate_enrich at 105 lines — well-structured orchestration, splitting would scatter the flow.
+- **Phase 3 reusability**: LLM prompt/parse infrastructure IS reusable after REFACTOR-3-001 extracts the shared JSON parser. build_enrich_prompt pattern (delimiter injection, batch items, JSON response) is a template Phase 3 can follow.
+- **Learnings:** Acknowledged duplication (comment on enrich.rs:369) should become a task, not remain as a comment.
+---
+
 ## 2026-03-01 - adece6fc-REFACTOR-REVIEW-1
 - Reviewed curate/mod.rs, types.rs, output.rs, fts5.rs, patterns.rs for DRY, complexity, coupling
 - **retired_at IS NULL centralization**: NOT worth it — 14 filters use different aliases (l.retired_at vs retired_at) and query patterns (dynamic builders vs static SQL). Tests guard correctness better than abstraction.
@@ -419,4 +428,13 @@
 - Test names are all descriptive and behavior-focused
 - Helpers (insert_learning, insert_fully_enriched_learning, make_batch, make_enrich_proposal) are well-factored
 - **Learnings:** When 3 helpers differ only by column name, a dynamic-column helper would risk SQL injection or need an enum — 3 explicit helpers is the right call
+---
+
+## 2026-03-01 - ef543206-INT-001
+- Added 10 CLI integration tests for curate enrich workflow
+- Created tests/fixtures/fake_claude.sh: bash script that parses `-p` prompt arg, extracts "ID: N" lines, outputs valid enrich JSON
+- Tests: dry-run no-changes, metadata populated, idempotent second run, retired learnings skipped, field filter, edit-learning --add-task-types, edit-learning --add-errors, JSON output, text output, help flags
+- All tests use CLAUDE_BINARY env var to inject fake_claude.sh as LLM mock
+- No DB changes needed; all AC covered without real LLM calls
+- **Learnings:** `CLAUDE_BINARY` env var + assert_cmd's `.env()` is the clean pattern for LLM integration tests — no subprocess mocking complexity
 ---

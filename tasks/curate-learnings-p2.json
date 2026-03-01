@@ -57,13 +57,13 @@
       "priority": 1,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "Follow the existing test pattern in src/learnings/crud/ or add tests alongside existing ones. The add/remove pattern mirrors add_files/remove_files exactly. Tests depend on Phase 1 (migration v8) being merged — the applies_to_task_types and applies_to_errors columns already exist in the schema.",
+      "notes": "Follow the existing test pattern in src/learnings/crud/ or add tests alongside existing ones. The add/remove pattern mirrors add_files/remove_files exactly. Tests depend on Phase 1 (migration v8) being merged \u2014 the applies_to_task_types and applies_to_errors columns already exist in the schema.",
       "edgeCases": [
-        "Add task_types to learning where applies_to_task_types is NULL — should create new JSON array, not crash",
-        "Remove task_type from NULL field — should be no-op, not error",
-        "Add duplicate task_type — should not create duplicate entries in array",
-        "Remove task_type that doesn't exist in array — should be no-op",
-        "Add empty string as task_type — should it be filtered out or allowed? (filter out)"
+        "Add task_types to learning where applies_to_task_types is NULL \u2014 should create new JSON array, not crash",
+        "Remove task_type from NULL field \u2014 should be no-op, not error",
+        "Add duplicate task_type \u2014 should not create duplicate entries in array",
+        "Remove task_type that doesn't exist in array \u2014 should be no-op",
+        "Add empty string as task_type \u2014 should it be filtered out or allowed? (filter out)"
       ],
       "invariants": [
         "edit_learning with only add_task_types set must not modify any other field",
@@ -85,7 +85,9 @@
         "src/learnings/crud/update.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FEAT-001"],
+      "synergyWith": [
+        "FEAT-001"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -110,10 +112,10 @@
       "passes": false,
       "notes": "Use in-memory SQLite with schema+migrations applied (including v8 from Phase 1). Create learnings with various metadata states to test the query. The query should use OR logic when no --field filter is set (any NULL field qualifies), and specific field check when --field is set.",
       "edgeCases": [
-        "All learnings already enriched (all fields populated) — return empty, no LLM call",
-        "Learning with some fields populated and others NULL — only NULL fields need enrichment",
-        "Retired learning with NULL metadata — must be excluded from enrichment candidates",
-        "Learning with empty JSON array '[]' vs NULL — treat '[]' as populated, only NULL needs enrichment"
+        "All learnings already enriched (all fields populated) \u2014 return empty, no LLM call",
+        "Learning with some fields populated and others NULL \u2014 only NULL fields need enrichment",
+        "Retired learning with NULL metadata \u2014 must be excluded from enrichment candidates",
+        "Learning with empty JSON array '[]' vs NULL \u2014 treat '[]' as populated, only NULL needs enrichment"
       ],
       "invariants": [
         "Query never returns retired learnings regardless of metadata state",
@@ -123,14 +125,16 @@
       "failureModes": [
         {
           "cause": "SQL treats empty string '' same as NULL",
-          "expectedBehavior": "Use IS NULL check, not = '' — the columns store JSON or NULL"
+          "expectedBehavior": "Use IS NULL check, not = '' \u2014 the columns store JSON or NULL"
         }
       ],
       "touchesFiles": [
         "src/commands/curate/tests.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FEAT-003"],
+      "synergyWith": [
+        "FEAT-003"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -156,11 +160,11 @@
       "passes": false,
       "notes": "Follow the exact test patterns from src/learnings/ingestion/extraction.rs (test_build_extraction_prompt_*, test_parse_*). The enrich prompt is different from extraction prompt but uses the same security patterns.",
       "edgeCases": [
-        "LLM returns empty array [] — valid, means no enrichment suggestions",
-        "LLM returns metadata for only some learnings in batch — apply what's there, skip rest",
-        "LLM suggests overwriting existing metadata — handler (FEAT-006) filters these out; parser passes raw proposals through",
-        "LLM returns learning ID that doesn't exist in batch — skip that entry with warning",
-        "LLM returns non-array JSON (object instead of array) — graceful degradation to empty"
+        "LLM returns empty array [] \u2014 valid, means no enrichment suggestions",
+        "LLM returns metadata for only some learnings in batch \u2014 apply what's there, skip rest",
+        "LLM suggests overwriting existing metadata \u2014 handler (FEAT-006) filters these out; parser passes raw proposals through",
+        "LLM returns learning ID that doesn't exist in batch \u2014 skip that entry with warning",
+        "LLM returns non-array JSON (object instead of array) \u2014 graceful degradation to empty"
       ],
       "invariants": [
         "Parser never crashes regardless of LLM response content",
@@ -187,7 +191,10 @@
         "src/commands/curate/tests.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FEAT-004", "FEAT-005"],
+      "synergyWith": [
+        "FEAT-004",
+        "FEAT-005"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -210,26 +217,30 @@
       "priority": 6,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "This is a mechanical extension — copy the add_files/remove_files pattern exactly for task_types and errors. The columns applies_to_task_types and applies_to_errors already exist in the schema and store JSON arrays (Option<Vec<String>>). The Learning model struct already has these fields.",
+      "notes": "This is a mechanical extension \u2014 copy the add_files/remove_files pattern exactly for task_types and errors. The columns applies_to_task_types and applies_to_errors already exist in the schema and store JSON arrays (Option<Vec<String>>). The Learning model struct already has these fields.",
       "touchesFiles": [
         "src/learnings/crud/types.rs",
         "src/learnings/crud/update.rs",
         "src/cli/commands.rs",
         "src/main.rs"
       ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["FEAT-002"],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "synergyWith": [
+        "FEAT-002"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
       "qualityDimensions": {
         "correctness": [
-          "Empty vec after add/remove must be stored as NULL, not '[]' — preserves enrich query semantics (IS NULL means needs enrichment)",
+          "Empty vec after add/remove must be stored as NULL, not '[]' \u2014 preserves enrich query semantics (IS NULL means needs enrichment)",
           "Deserialization of NULL column must default to empty vec (unwrap_or_default), not error",
           "New fields must not interfere with existing file/tag operations"
         ],
         "performance": [
-          "Single UPDATE per field group (task_types, errors) — not per-item"
+          "Single UPDATE per field group (task_types, errors) \u2014 not per-item"
         ],
         "style": [
           "Follow exact pattern from applies_to_files handling in update.rs lines 86-118",
@@ -245,8 +256,8 @@
         "CurateAction::Enrich variant in cli/commands.rs with: --dry-run (bool), --batch-size (usize, default 20), --field (optional string)",
         "--field accepts: applies_to_files, applies_to_task_types, applies_to_errors (tags enrichment is always included, not separately filterable)",
         "EnrichParams struct with dry_run, batch_size, field_filter fields in curate types",
-        "EnrichResult struct with: dry_run, field_filter (Option<String>), total_candidates, batches_processed, learnings_enriched, llm_errors, proposals (Vec<EnrichProposal>) — derives Serialize",
-        "EnrichProposal struct with: learning_id, learning_title, proposed_files, proposed_task_types, proposed_errors, proposed_tags — derives Serialize",
+        "EnrichResult struct with: dry_run, field_filter (Option<String>), total_candidates, batches_processed, learnings_enriched, llm_errors, proposals (Vec<EnrichProposal>) \u2014 derives Serialize",
+        "EnrichProposal struct with: learning_id, learning_title, proposed_files, proposed_task_types, proposed_errors, proposed_tags \u2014 derives Serialize",
         "EnrichFieldFilter enum (or Option<String>) for --field validation",
         "task-mgr curate enrich --help shows correct flags and descriptions"
       ],
@@ -259,7 +270,10 @@
         "src/commands/curate/types.rs"
       ],
       "dependsOn": [],
-      "synergyWith": ["FEAT-001", "FEAT-003"],
+      "synergyWith": [
+        "FEAT-001",
+        "FEAT-003"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
@@ -296,14 +310,19 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["FEAT-002", "TEST-INIT-002"],
-      "synergyWith": ["FEAT-004"],
+      "dependsOn": [
+        "FEAT-002",
+        "TEST-INIT-002"
+      ],
+      "synergyWith": [
+        "FEAT-004"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
       "qualityDimensions": {
         "correctness": [
-          "Must filter retired_at IS NULL — otherwise enriching retired learnings wastes LLM calls",
+          "Must filter retired_at IS NULL \u2014 otherwise enriching retired learnings wastes LLM calls",
           "Must use IS NULL (not = '' or = 'null') for metadata field checks",
           "With --field=applies_to_files, must NOT return learnings that already have applies_to_files set"
         ],
@@ -338,15 +357,20 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["TEST-INIT-003"],
-      "synergyWith": ["FEAT-003", "FEAT-005"],
+      "dependsOn": [
+        "TEST-INIT-003"
+      ],
+      "synergyWith": [
+        "FEAT-003",
+        "FEAT-005"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
       "qualityDimensions": {
         "correctness": [
-          "Random delimiter MUST use uuid::Uuid::new_v4() — predictable delimiters enable injection",
-          "Learning content is UNTRUSTED — must be wrapped in delimiters with warning",
+          "Random delimiter MUST use uuid::Uuid::new_v4() \u2014 predictable delimiters enable injection",
+          "Learning content is UNTRUSTED \u2014 must be wrapped in delimiters with warning",
           "Prompt must instruct LLM to only suggest values for NULL fields, never overwrite existing"
         ],
         "performance": [],
@@ -359,7 +383,7 @@
     {
       "id": "FEAT-005",
       "title": "Enrich LLM response parsing with validation and graceful degradation",
-      "description": "Parse the LLM's JSON response containing metadata suggestions. Validate learning IDs against the input batch, handle malformed responses gracefully. Returns raw proposals — the handler (FEAT-006) is responsible for filtering out already-populated fields.",
+      "description": "Parse the LLM's JSON response containing metadata suggestions. Validate learning IDs against the input batch, handle malformed responses gracefully. Returns raw proposals \u2014 the handler (FEAT-006) is responsible for filtering out already-populated fields.",
       "acceptanceCriteria": [
         "parse_enrich_response() accepts raw LLM output string and a set of valid learning IDs",
         "Handles raw JSON array, markdown code block wrapped JSON (same as extraction.rs)",
@@ -376,15 +400,19 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["FEAT-004"],
-      "synergyWith": ["FEAT-004"],
+      "dependsOn": [
+        "FEAT-004"
+      ],
+      "synergyWith": [
+        "FEAT-004"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
       "qualityDimensions": {
         "correctness": [
-          "Hallucinated learning IDs must be rejected — LLM may reference IDs not in the batch",
-          "Parse failure must never crash — return empty Vec with stderr warning",
+          "Hallucinated learning IDs must be rejected \u2014 LLM may reference IDs not in the batch",
+          "Parse failure must never crash \u2014 return empty Vec with stderr warning",
           "Must handle serde_json errors gracefully (malformed JSON, wrong types)"
         ],
         "performance": [],
@@ -405,7 +433,7 @@
         "Returns EditLearningParams with add_errors set ONLY if learning's applies_to_errors is NULL",
         "Returns EditLearningParams with add_tags set from proposal (tags are always additive, not overwriting)",
         "Returns None/empty if no NULL fields match the proposal (nothing to enrich)",
-        "Function is pure (no side effects, no DB access) — unit-testable in isolation"
+        "Function is pure (no side effects, no DB access) \u2014 unit-testable in isolation"
       ],
       "priority": 11,
       "estimatedEffort": "low",
@@ -414,20 +442,25 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["FEAT-001", "FEAT-005"],
-      "synergyWith": ["FEAT-008"],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-005"
+      ],
+      "synergyWith": [
+        "FEAT-008"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
       "qualityDimensions": {
         "correctness": [
-          "Must never overwrite existing metadata — check learning's current state before populating EditLearningParams fields",
+          "Must never overwrite existing metadata \u2014 check learning's current state before populating EditLearningParams fields",
           "NULL means unset (needs enrichment); non-NULL means set (skip, even if empty array '[]')",
-          "Tags are always additive — add_tags set regardless of existing tags"
+          "Tags are always additive \u2014 add_tags set regardless of existing tags"
         ],
         "performance": [],
         "style": [
-          "Pure function with no side effects — takes data in, returns data out",
+          "Pure function with no side effects \u2014 takes data in, returns data out",
           "Use Option types to represent 'nothing to enrich' vs 'has updates'"
         ]
       }
@@ -456,8 +489,15 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["FEAT-001", "FEAT-003", "FEAT-005", "FEAT-006"],
-      "synergyWith": ["FEAT-007"],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-003",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "synergyWith": [
+        "FEAT-007"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false,
@@ -502,7 +542,10 @@
         "src/main.rs",
         "src/commands/curate/mod.rs"
       ],
-      "dependsOn": ["FEAT-002", "FEAT-008"],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-008"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -541,7 +584,7 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "notes": "Critical review. Key security concern: enrich sends learning content to LLM — must verify injection protection. Key correctness concern: enrich must never overwrite existing metadata. For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "notes": "Critical review. Key security concern: enrich sends learning content to LLM \u2014 must verify injection protection. Key correctness concern: enrich must never overwrite existing metadata. For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
       "touchesFiles": [
         "src/learnings/crud/types.rs",
         "src/learnings/crud/update.rs",
@@ -553,7 +596,16 @@
         "src/handlers.rs",
         "src/main.rs"
       ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008"],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -564,7 +616,7 @@
       "title": "Review implementation for refactoring opportunities",
       "description": "Analyze Phase 2 implementation code for DRY violations, complexity, coupling, and maintainability issues. Pay special attention to code shared between extraction.rs and enrich.rs (JSON parsing, prompt patterns).",
       "acceptanceCriteria": [
-        "No code duplication — especially between extraction.rs parsing and enrich parsing",
+        "No code duplication \u2014 especially between extraction.rs parsing and enrich parsing",
         "Functions under 30 lines (flag complex ones, especially curate_enrich handler)",
         "No tight coupling between enrich module and internal query details",
         "Code is easy to extend (Phase 3 dedup will use similar LLM patterns)",
@@ -580,7 +632,9 @@
         "src/learnings/crud/update.rs",
         "src/learnings/ingestion/extraction.rs"
       ],
-      "dependsOn": ["CODE-REVIEW-1"],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -606,7 +660,9 @@
         "src/commands/curate/enrich.rs",
         "src/learnings/ingestion/extraction.rs"
       ],
-      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -626,12 +682,16 @@
       "estimatedEffort": "low",
       "model": "claude-sonnet-4-6",
       "passes": false,
-      "notes": "The function is already partially decomposed (build_batch_items, apply_proposals_in_transaction). The remaining batch loop body could be extracted to process_single_batch(conn, batch_items, dry_run) -> (Vec<EnrichProposal>, usize enriched, usize errors). Note: edit_learning's repetitive field handling (3x identical add/remove/serialize pattern) is pre-existing and intentionally explicit — not worth abstracting for 3 uses.",
+      "notes": "The function is already partially decomposed (build_batch_items, apply_proposals_in_transaction). The remaining batch loop body could be extracted to process_single_batch(conn, batch_items, dry_run) -> (Vec<EnrichProposal>, usize enriched, usize errors). Note: edit_learning's repetitive field handling (3x identical add/remove/serialize pattern) is pre-existing and intentionally explicit \u2014 not worth abstracting for 3 uses.",
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["REFACTOR-REVIEW-1"],
-      "synergyWith": ["REFACTOR-1-001"],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -659,7 +719,23 @@
       "passes": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "REFACTOR-1-001", "REFACTOR-1-002"],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -673,7 +749,7 @@
         "Test: edit_learning with all 4 new fields set simultaneously",
         "Test: add_task_types + remove_task_types in same call (remove first, then add)",
         "Test: add_errors with very long error patterns (stress test)",
-        "Test: round-trip: add task_types → read learning → verify applies_to_task_types populated → remove → verify NULL",
+        "Test: round-trip: add task_types \u2192 read learning \u2192 verify applies_to_task_types populated \u2192 remove \u2192 verify NULL",
         "Test: JSON output of EditLearningResult includes task_types and errors in updated_fields list",
         "Test: edit_learning with only new fields set (no existing fields) works correctly",
         "80%+ coverage for new code in update.rs"
@@ -685,8 +761,12 @@
       "touchesFiles": [
         "src/learnings/crud/update.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-002"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "synergyWith": [
+        "TEST-002"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -716,8 +796,12 @@
         "src/commands/curate/tests.rs",
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-001"],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "synergyWith": [
+        "TEST-001"
+      ],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
@@ -736,12 +820,15 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": true,
-      "notes": "Review complete. No REFACTOR-2-xxx tasks needed. Test helpers are well-factored within scope files. Cross-file duplication (setup_db, retire_learning) is pre-existing and already tracked by Phase 1 REFACTOR-2-001. Three set_applies_to_* helpers are similar but extracting would require dynamic SQL column names — not worth it for 3 uses.",
+      "notes": "Review complete. No REFACTOR-2-xxx tasks needed. Test helpers are well-factored within scope files. Cross-file duplication (setup_db, retire_learning) is pre-existing and already tracked by Phase 1 REFACTOR-2-001. Three set_applies_to_* helpers are similar but extracting would require dynamic SQL column names \u2014 not worth it for 3 uses.",
       "touchesFiles": [
         "src/commands/curate/tests.rs",
         "src/learnings/crud/update.rs"
       ],
-      "dependsOn": ["TEST-001", "TEST-002"],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -765,7 +852,12 @@
       "passes": false,
       "notes": "Full test coverage achieved, test code refactored.",
       "touchesFiles": [],
-      "dependsOn": ["MILESTONE-1", "TEST-001", "TEST-002", "REFACTOR-REVIEW-2"],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "REFACTOR-REVIEW-2"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -776,10 +868,10 @@
       "title": "Integration verification: end-to-end curate enrich workflow",
       "description": "Verify the complete enrich workflow works end-to-end: create learnings with missing metadata, run enrich --dry-run, verify no changes, run enrich, verify metadata populated. Also verify FR-006 works through CLI.",
       "acceptanceCriteria": [
-        "E2E test: create learnings with NULL applies_to_task_types/errors → run curate enrich --dry-run → verify DB unchanged → verify proposals shown",
-        "E2E test: run curate enrich → verify applies_to_task_types/errors populated on candidates",
-        "E2E test: re-run curate enrich → verify 0 candidates (all already enriched)",
-        "E2E test: create mix of retired and active learnings → enrich only processes active",
+        "E2E test: create learnings with NULL applies_to_task_types/errors \u2192 run curate enrich --dry-run \u2192 verify DB unchanged \u2192 verify proposals shown",
+        "E2E test: run curate enrich \u2192 verify applies_to_task_types/errors populated on candidates",
+        "E2E test: re-run curate enrich \u2192 verify 0 candidates (all already enriched)",
+        "E2E test: create mix of retired and active learnings \u2192 enrich only processes active",
         "E2E test: --field=applies_to_files only enriches that field",
         "E2E test: edit-learning --add-task-types FEAT-,FIX- works through CLI",
         "E2E test: edit-learning --add-errors 'timeout' works through CLI",
@@ -793,7 +885,9 @@
       "touchesFiles": [
         "src/commands/curate/tests.rs"
       ],
-      "dependsOn": ["MILESTONE-2"],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -825,7 +919,9 @@
         "src/learnings/crud/types.rs",
         "src/learnings/crud/update.rs"
       ],
-      "dependsOn": ["INT-001"],
+      "dependsOn": [
+        "INT-001"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -851,7 +947,10 @@
       "passes": false,
       "notes": "Run all quality checks. This is the final gate before merge.",
       "touchesFiles": [],
-      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -875,11 +974,67 @@
       "passes": false,
       "notes": "Phase 2 complete. Phase 3 (dedup) can be implemented on top of this.",
       "touchesFiles": [],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3",
+        "REFACTOR-3-001",
+        "REFACTOR-3-002"
+      ],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-3-001",
+      "title": "Extract extract_json_array and find_matching_bracket into shared module",
+      "description": "extract_json_array and find_matching_bracket are duplicated identically between enrich.rs and extraction.rs (~60 lines). Extract to a shared llm_utils module so Phase 3 dedup can reuse without triplication.",
+      "priority": 70,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Critical for Phase 3 reuse. Both enrich.rs:369 and extraction.rs:108 have identical implementations.",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs",
+        "src/learnings/ingestion/extraction.rs"
+      ],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "acceptanceCriteria": [
+        "extract_json_array and find_matching_bracket exist in exactly one location",
+        "Both enrich.rs and extraction.rs import from the shared location",
+        "All existing tests pass",
+        "cargo clippy passes"
+      ]
+    },
+    {
+      "id": "REFACTOR-3-002",
+      "title": "Remove unused current_has_tags parameter from proposal_to_edit_params",
+      "description": "The current_has_tags parameter is passed but immediately suppressed with `let _ = current_has_tags`. Remove from signature and all call sites.",
+      "priority": 72,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Dead code in function signature. Tags are always additive regardless of existing tags.",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/tests.rs"
+      ],
+      "dependsOn": [],
+      "synergyWith": [
+        "REFACTOR-3-001"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "acceptanceCriteria": [
+        "proposal_to_edit_params has 4 parameters (not 5)",
+        "All call sites updated",
+        "All tests pass"
+      ]
     }
   ]
 }
