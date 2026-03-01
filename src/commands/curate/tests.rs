@@ -1300,7 +1300,6 @@ fn test_enrich_prompt_requests_json_with_expected_field_names() {
 }
 
 #[test]
-#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
 fn test_parse_enrich_valid_json_array() {
     // AC: parser returns proposals from a valid JSON array
     let batch_ids = vec![1i64, 2];
@@ -1339,7 +1338,6 @@ fn test_parse_enrich_valid_json_array() {
 }
 
 #[test]
-#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
 fn test_parse_enrich_garbage_response_returns_empty() {
     // AC: parser returns empty vec on non-JSON garbage (no crash)
     let batch_ids = vec![1i64, 2, 3];
@@ -1352,7 +1350,6 @@ fn test_parse_enrich_garbage_response_returns_empty() {
 }
 
 #[test]
-#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
 fn test_parse_enrich_markdown_code_block_json() {
     // AC: parser handles JSON wrapped in markdown code block
     let batch_ids = vec![1i64];
@@ -1375,7 +1372,6 @@ Let me know if you need anything else."#;
 }
 
 #[test]
-#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
 fn test_parse_enrich_rejects_hallucinated_id() {
     // Known-bad discriminator: parser must reject a response that references
     // learning ID 999 when the batch only contains IDs [1, 2, 3].
