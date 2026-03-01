@@ -1223,7 +1223,6 @@ fn make_batch() -> Vec<EnrichBatchItem> {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
 fn test_enrich_prompt_contains_uuid_delimiter() {
     // AC: prompt wraps learning content with a random UUID-based delimiter
     let batch = make_batch();
@@ -1236,7 +1235,6 @@ fn test_enrich_prompt_contains_uuid_delimiter() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
 fn test_enrich_prompt_contains_untrusted_warning() {
     // AC: prompt includes UNTRUSTED warning to guard against prompt injection
     let batch = make_batch();
@@ -1249,7 +1247,6 @@ fn test_enrich_prompt_contains_untrusted_warning() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
 fn test_enrich_prompt_includes_learning_id_title_content_tags() {
     // AC: prompt includes ID, title, content, and existing tags for each batch item
     let batch = make_batch();
@@ -1279,7 +1276,6 @@ fn test_enrich_prompt_includes_learning_id_title_content_tags() {
 }
 
 #[test]
-#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
 fn test_enrich_prompt_requests_json_with_expected_field_names() {
     // AC: prompt requests a JSON response with specific field names
     let batch = make_batch();
