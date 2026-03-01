@@ -469,6 +469,14 @@
 - **Learnings:** 3-way duplication of JSON parsing utils is the single biggest DRY violation in the curation codebase; confidence_rank is a minor but easy win
 ---
 
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-3
+- Final refactoring review of all Phase 3 dedup code: dedup.rs, types.rs, output.rs, tests.rs, mod.rs
+- **No new issues found** requiring REFACTOR-3-xxx tasks
+- Pre-existing issues already tracked: extract_json_array 3× duplication (REFACTOR-1-001), confidence_rank duplication (REFACTOR-1-002), MergeClusterParams boilerplate (REFACTOR-2-002), DEDUP_ENV_MUTEX pattern (REFACTOR-2-003)
+- Functions over 30 lines: merge_cluster (~170), curate_dedup (~217) — orchestration functions, splitting would scatter flow (accepted in REFACTOR-REVIEW-1)
+- Code follows project patterns, clear separation of concerns, no new DRY violations
+---
+
 ## 2026-03-01 - a8e80384-TEST-002
 - Added 8 new tests covering dedup LLM interaction and failure modes
 - Files changed: src/commands/curate/tests.rs
