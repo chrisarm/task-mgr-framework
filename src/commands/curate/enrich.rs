@@ -6,6 +6,7 @@
 //! NOTE: `parse_enrich_response` is a stub deferred to FEAT-005.
 
 use crate::commands::curate::types::EnrichProposal;
+use crate::learnings::EditLearningParams;
 use crate::TaskMgrResult;
 
 /// Raw LLM response object before mapping to `EnrichProposal`.
@@ -135,6 +136,48 @@ pub fn parse_enrich_response(
     Ok(proposals)
 }
 
+/// Converts an `EnrichProposal` to `EditLearningParams`, populating only NULL fields.
+///
+/// Invariants:
+/// - `add_files` is set only when `current_files` is `None` (field is NULL in DB)
+/// - `add_task_types` is set only when `current_task_types` is `None`
+/// - `add_errors` is set only when `current_errors` is `None`
+/// - `add_tags` is always set from the proposal (tags are additive, never overwrite)
+/// - Returns `None` if no NULL fields were matched and no tags were proposed
+pub fn proposal_to_edit_params(
+    current_files: Option<&[String]>,
+    current_task_types: Option<&[String]>,
+    current_errors: Option<&[String]>,
+    current_has_tags: bool,
+    proposal: &EnrichProposal,
+) -> Option<EditLearningParams> {
+    let mut params = EditLearningParams::default();
+
+    if current_files.is_none() && !proposal.proposed_files.is_empty() {
+        params.add_files = Some(proposal.proposed_files.clone());
+    }
+    if current_task_types.is_none() && !proposal.proposed_task_types.is_empty() {
+        params.add_task_types = Some(proposal.proposed_task_types.clone());
+    }
+    if current_errors.is_none() && !proposal.proposed_errors.is_empty() {
+        params.add_errors = Some(proposal.proposed_errors.clone());
+    }
+    // Tags are always additive: set if proposal has tags (regardless of existing tags)
+    if !proposal.proposed_tags.is_empty() {
+        params.add_tags = Some(proposal.proposed_tags.clone());
+    }
+
+    // Suppress the unused variable warning — current_has_tags informs callers
+    // whether to skip tag enrichment; here we always enrich tags additively.
+    let _ = current_has_tags;
+
+    if params.has_updates() {
+        Some(params)
+    } else {
+        None
+    }
+}
+
 /// Finds a JSON array in the response text, handling markdown code blocks.
 /// Mirrors extraction.rs logic (private there, duplicated here).
 fn extract_json_array(text: &str) -> Option<String> {
@@ -201,4 +244,106 @@ fn find_matching_bracket(text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_proposal(files: &[&str], task_types: &[&str], errors: &[&str], tags: &[&str]) -> EnrichProposal {
+        EnrichProposal {
+            learning_id: 1,
+            learning_title: "test".to_string(),
+            proposed_files: files.iter().map(|s| s.to_string()).collect(),
+            proposed_task_types: task_types.iter().map(|s| s.to_string()).collect(),
+            proposed_errors: errors.iter().map(|s| s.to_string()).collect(),
+            proposed_tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn all_null_fields_get_populated() {
+        let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &["E0308"], &["rust"]);
+        let params = proposal_to_edit_params(None, None, None, false, &proposal)
+            .expect("should return Some when all fields are NULL");
+        assert_eq!(params.add_files, Some(vec!["src/**/*.rs".to_string()]));
+        assert_eq!(params.add_task_types, Some(vec!["FEAT-".to_string()]));
+        assert_eq!(params.add_errors, Some(vec!["E0308".to_string()]));
+        assert_eq!(params.add_tags, Some(vec!["rust".to_string()]));
+    }
+
+    #[test]
+    fn existing_files_not_overwritten() {
+        let existing = vec!["**/*.toml".to_string()];
+        let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &[]);
+        let params = proposal_to_edit_params(Some(&existing), None, None, false, &proposal)
+            .expect("should return Some (task_types is NULL)");
+        assert!(params.add_files.is_none(), "add_files must be None when field already exists");
+        assert_eq!(params.add_task_types, Some(vec!["FEAT-".to_string()]));
+    }
+
+    #[test]
+    fn existing_task_types_not_overwritten() {
+        let existing = vec!["FIX-".to_string()];
+        let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &[]);
+        let params = proposal_to_edit_params(None, Some(&existing), None, false, &proposal)
+            .expect("should return Some (files is NULL)");
+        assert!(params.add_task_types.is_none());
+        assert_eq!(params.add_files, Some(vec!["src/**/*.rs".to_string()]));
+    }
+
+    #[test]
+    fn existing_errors_not_overwritten() {
+        let existing_errors = vec!["E0308".to_string()];
+        // All three fields exist, proposal has no tags → None
+        let proposal = make_proposal(&[], &[], &["E0277"], &[]);
+        let result = proposal_to_edit_params(
+            Some(&[]),
+            Some(&[]),
+            Some(&existing_errors),
+            false,
+            &proposal,
+        );
+        assert!(result.is_none(), "should return None when no NULL fields and no tags");
+    }
+
+    #[test]
+    fn tags_always_additive_regardless_of_existing() {
+        let existing_files = vec!["src/**/*.rs".to_string()];
+        let proposal = make_proposal(&["ignored"], &[], &[], &["new-tag"]);
+        // files is Some → add_files not set; but tags should still be set
+        let params = proposal_to_edit_params(Some(&existing_files), None, None, true, &proposal)
+            .expect("should return Some due to tags");
+        assert!(params.add_files.is_none());
+        assert_eq!(params.add_tags, Some(vec!["new-tag".to_string()]));
+    }
+
+    #[test]
+    fn returns_none_when_no_null_fields_match_and_no_tags() {
+        let files = vec!["src/**/*.rs".to_string()];
+        let types = vec!["FEAT-".to_string()];
+        let errors = vec!["E0308".to_string()];
+        let proposal = make_proposal(&["ignored"], &["ignored"], &["ignored"], &[]);
+        let result = proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), true, &proposal);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn empty_proposal_arrays_on_null_fields_yield_none() {
+        let proposal = make_proposal(&[], &[], &[], &[]);
+        let result = proposal_to_edit_params(None, None, None, false, &proposal);
+        assert!(result.is_none(), "empty proposals on NULL fields should return None");
+    }
+
+    #[test]
+    fn pure_deterministic() {
+        let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &["tag"]);
+        let r1 = proposal_to_edit_params(None, None, None, false, &proposal);
+        let r2 = proposal_to_edit_params(None, None, None, false, &proposal);
+        let p1 = r1.unwrap();
+        let p2 = r2.unwrap();
+        assert_eq!(p1.add_files, p2.add_files);
+        assert_eq!(p1.add_task_types, p2.add_task_types);
+        assert_eq!(p1.add_tags, p2.add_tags);
+    }
 }
