@@ -417,7 +417,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
     fn test_retired_excluded_from_ingestion_dedup_learning_exists() {
         // AC: ingestion dedup check (learning_exists) must exclude retired learnings.
         // After retirement, a new learning with the same outcome+title should NOT be

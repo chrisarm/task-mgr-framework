@@ -545,7 +545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
     fn test_retired_excluded_from_list_results() {
         // AC: retired learning excluded from learnings list rows
         let (_temp_dir, conn) = setup_db();
@@ -568,7 +567,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
     fn test_retired_excluded_from_list_total_count() {
         // AC: retired learning excluded from learnings list `total` (SELECT COUNT(*))
         let (_temp_dir, conn) = setup_db();
@@ -597,7 +595,47 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_recent_limit_with_mix_of_active_and_retired() {
+        // AC: learnings list with --recent limit works correctly with mix of active/retired.
+        // The limit applies only to active learnings; retired learnings are excluded entirely.
+        let (_temp_dir, conn) = setup_db();
+
+        // Insert 6 active learnings
+        for i in 1..=6 {
+            create_test_learning(&conn, &format!("Active {}", i), LearningOutcome::Pattern);
+        }
+        // Insert 3 retired learnings
+        for i in 1..=3 {
+            let id =
+                create_test_learning(&conn, &format!("Retired {}", i), LearningOutcome::Success);
+            conn.execute(
+                "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+
+        // --recent 4 should return the 4 most recent ACTIVE learnings, ignoring retired
+        let params = LearningsListParams { recent: Some(4) };
+        let result = list_learnings(&conn, params).unwrap();
+
+        assert_eq!(result.count, 4, "should return 4 active learnings");
+        assert_eq!(result.total, 6, "total active learnings is 6");
+        assert_eq!(
+            result.total_including_retired, 9,
+            "total including retired is 9"
+        );
+        assert_eq!(result.limited_to, Some(4));
+        assert!(
+            result
+                .learnings
+                .iter()
+                .all(|s| !s.title.starts_with("Retired")),
+            "no retired learnings should appear in results"
+        );
+    }
+
+    #[test]
     fn test_format_text_shows_retired_count_when_nonzero() {
         let result = LearningsListResult {
             count: 1,

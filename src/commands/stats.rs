@@ -555,7 +555,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
     fn test_retired_excluded_from_stats_query_learning_counts() {
         // AC: retired learning excluded from stats query_learning_counts
         use crate::learnings::{record_learning, RecordLearningParams};

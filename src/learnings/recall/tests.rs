@@ -747,7 +747,6 @@ fn retire_learning(conn: &Connection, id: i64) {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_bandit_total_window_shows() {
     // AC: retired learning excluded from bandit total_window_shows aggregate
     use crate::learnings::bandit::get_total_window_shows;
@@ -782,7 +781,6 @@ fn test_retired_excluded_from_bandit_total_window_shows() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_recall_text_search() {
     // AC: retired learning excluded from recall text search (LIKE or FTS5 path)
     let (_dir, conn) = setup_db_with_fts5();
@@ -816,7 +814,6 @@ fn test_retired_excluded_from_recall_text_search() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 — get_learning() by ID must still return retired (exempt from filter)"]
 fn test_get_learning_by_id_still_returns_retired() {
     // AC (exempt): get_learning() by ID is NOT subject to retired_at filter
     use crate::learnings::crud::get_learning;
@@ -840,7 +837,6 @@ fn test_get_learning_by_id_still_returns_retired() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 — apply_learning() must still work for retired (exempt from filter)"]
 fn test_apply_learning_works_for_retired() {
     // AC (exempt): apply_learning() by ID is NOT subject to retired_at filter
     use crate::commands::apply_learning::apply_learning;

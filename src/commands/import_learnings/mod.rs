@@ -273,7 +273,6 @@ mod retired_tests {
     }
 
     #[test]
-    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
     fn test_retired_excluded_from_import_dedup_load_existing_keys() {
         // AC: import dedup (load_existing_keys) must exclude retired learnings.
         // After retirement, reimporting the same title+content must succeed

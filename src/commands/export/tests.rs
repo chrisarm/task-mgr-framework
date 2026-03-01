@@ -637,7 +637,6 @@ fn retire_learning_export(conn: &rusqlite::Connection, id: i64) {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_export_load_learnings() {
     // AC: retired learning excluded from export load_learnings query
     use crate::learnings::{record_learning, RecordLearningParams};
@@ -697,7 +696,6 @@ fn test_retired_excluded_from_export_load_learnings() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_export_calculate_statistics() {
     // AC: retired learning excluded from export calculate_statistics outcome counts
     use crate::learnings::{record_learning, RecordLearningParams};

@@ -1201,7 +1201,6 @@ fn retire_learning(conn: &Connection, id: i64) {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_fts5_search() {
     // AC: retired learning excluded from FTS5 search
     let (_dir, conn) = setup_db_with_fts5();
@@ -1235,7 +1234,6 @@ fn test_retired_excluded_from_fts5_search() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_like_fallback() {
     // AC: retired learning excluded from LIKE fallback search (no FTS5 table)
     let (_dir, conn) = setup_db(); // No migrations → no FTS5 → uses LIKE fallback
@@ -1262,7 +1260,6 @@ fn test_retired_excluded_from_like_fallback() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_recency_query() {
     // AC: retired learning excluded from unfiltered recency query (no text, no task context)
     let (_dir, conn) = setup_db_with_fts5();
@@ -1291,7 +1288,6 @@ fn test_retired_excluded_from_recency_query() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_pattern_matching() {
     // AC: retired learning excluded from PatternsBackend pattern-matching retrieval
     let (_dir, conn) = setup_db();
@@ -1327,7 +1323,6 @@ fn test_retired_excluded_from_pattern_matching() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_ucb_fallback_no_task_context() {
     // AC: retired learning excluded from UCB fallback (no-task-context recency variant)
     let (_dir, conn) = setup_db_with_fts5();
@@ -1360,7 +1355,6 @@ fn test_retired_excluded_from_ucb_fallback_no_task_context() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
 fn test_retired_excluded_from_ucb_fallback_with_task_context() {
     // AC: retired learning excluded from UCB fallback (with-task-context exploration variant)
     // Even when task context is provided, retired learnings must not be UCB candidates.
@@ -1393,7 +1387,6 @@ fn test_retired_excluded_from_ucb_fallback_with_task_context() {
 /// This test verifies the pre-FEAT-002 baseline — it passes before implementation
 /// and should be removed/updated after FEAT-002 adds the filters.
 #[test]
-#[ignore = "discriminator: requires FEAT-001 to set retired_at; passes pre-FEAT-002"]
 fn test_discriminator_naive_query_includes_retired() {
     let (_dir, conn) = setup_db_with_fts5();
     let id = create_test_learning(
@@ -1415,6 +1408,48 @@ fn test_discriminator_naive_query_includes_retired() {
     assert_eq!(
         count, 1,
         "without filtering, retired learning IS still in the learnings table"
+    );
+}
+
+/// AC: FTS5 index still contains retired learning content after retirement
+/// (retire does NOT delete from learnings_fts), but retrieval query excludes it.
+/// This verifies that the `retired_at` column approach (vs. deleting from FTS index)
+/// correctly filters at query time without corrupting the FTS index.
+#[test]
+fn test_fts5_index_retains_content_after_retire_but_query_excludes_it() {
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "FTS5 index retention test",
+        "unique retire indexing content qzxw",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    // FTS5 index still contains the content (no trigger removes it on retire)
+    let fts_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"qzxw\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        fts_count, 1,
+        "FTS5 index must still contain retired learning content (retire does not delete from index)"
+    );
+
+    // But retrieval query excludes the retired learning
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("qzxw".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must be excluded from FTS5 retrieval even though it is still in the index"
     );
 }
 
