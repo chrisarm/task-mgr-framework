@@ -374,9 +374,10 @@ pub fn ensure_worktree(
         );
     }
 
-    // Create parent directory for worktrees
+    // Create parent directory for worktrees; track if we created it so we can
+    // remove it on failure (avoids leaving orphan directories behind).
     let worktrees_parent = worktree_path.parent().unwrap_or(&worktree_path);
-    if !worktrees_parent.exists() {
+    let parent_created = if !worktrees_parent.exists() {
         std::fs::create_dir_all(worktrees_parent).map_err(|e| {
             TaskMgrError::io_error(
                 worktrees_parent.display().to_string(),
@@ -384,7 +385,10 @@ pub fn ensure_worktree(
                 e,
             )
         })?;
-    }
+        true
+    } else {
+        false
+    };
 
     // Check if branch exists
     let branch_exists = Command::new("git")
@@ -448,6 +452,22 @@ pub fn ensure_worktree(
 
     if !create_result.status.success() {
         let stderr = String::from_utf8_lossy(&create_result.stderr);
+
+        // Clean up empty parent dir if we just created it (avoids orphan dirs).
+        if parent_created {
+            if let Ok(mut entries) = std::fs::read_dir(worktrees_parent) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(worktrees_parent);
+                }
+            }
+        }
+
+        // Prune any stale worktree entries git may have recorded before failing.
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(project_root)
+            .output();
+
         return Err(TaskMgrError::InvalidState {
             resource_type: "Git worktree".to_string(),
             id: branch_name.to_string(),
@@ -2283,26 +2303,31 @@ detached
     }
 
     #[test]
-    #[ignore = "FEAT-002: ensure_worktree cleanup on failure not yet implemented"]
     fn test_ensure_worktree_cleans_up_empty_parent_on_git_add_failure() {
         // When git worktree add fails after creating the parent dir,
         // ensure_worktree should remove the empty parent dir (not leave orphan dirs).
         //
-        // To trigger git worktree add failure: request a branch that is already
-        // checked out in the main repo (git refuses to add it as a worktree).
+        // To trigger git worktree add failure: use a branch name containing ".."
+        // which git forbids in ref names (ref name rules: no consecutive dots).
         let tmp = setup_git_repo();
 
-        // 'main' is already checked out in tmp — git worktree add for 'main' should fail
-        // The parent dir for the worktree would be created before the git add call.
-        // After failure, that empty parent should be cleaned up.
-        let wt_path = compute_worktree_path(tmp.path(), "main");
+        // "feature/bad..ref" contains ".." which git rejects as an invalid ref name.
+        // The parent dir {repo}-worktrees/ will be created by ensure_worktree
+        // (it won't pre-exist) and must be removed after the git failure.
+        let branch = "feature/bad..ref";
+        let wt_path = compute_worktree_path(tmp.path(), branch);
         let parent = wt_path.parent().expect("has parent").to_path_buf();
 
-        let result = ensure_worktree(tmp.path(), "main", true);
-        // git worktree add for an already-checked-out branch fails
+        // Parent must not exist before the call (so ensure_worktree creates it).
+        assert!(
+            !parent.exists(),
+            "parent dir should not pre-exist before the test"
+        );
+
+        let result = ensure_worktree(tmp.path(), branch, true);
         assert!(
             result.is_err(),
-            "ensure_worktree for already-checked-out branch should fail"
+            "ensure_worktree with invalid git ref name should fail"
         );
 
         // Parent dir must not be left as an orphan
@@ -2314,7 +2339,6 @@ detached
     }
 
     #[test]
-    #[ignore = "FEAT-002: ensure_worktree prune on failure not yet implemented"]
     fn test_ensure_worktree_runs_git_prune_on_partial_failure() {
         // When git worktree add creates a partial entry then fails, ensure_worktree
         // should call `git worktree prune` so stale entries don't accumulate.
@@ -2324,11 +2348,13 @@ detached
         // forced failure, `git worktree list` should not contain stale entries.
         let tmp = setup_git_repo();
 
-        // Simulate partial failure: create the worktree directory manually,
-        // then try to add a worktree at that path. git will fail because the dir exists.
+        // Simulate partial failure: create the worktree directory with content so
+        // git worktree add refuses it (git rejects non-empty target directories).
         let wt_path = compute_worktree_path(tmp.path(), "feature/prune-test");
         let parent = wt_path.parent().expect("has parent");
         fs::create_dir_all(&wt_path).expect("create dir to cause conflict");
+        // Put a file inside so git refuses to use this non-empty directory.
+        fs::write(wt_path.join("dummy.txt"), "block").expect("write dummy file");
 
         let result = ensure_worktree(tmp.path(), "feature/prune-test", true);
         assert!(
