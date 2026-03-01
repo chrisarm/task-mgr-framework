@@ -61,10 +61,7 @@ pub fn prefix_where_col(col: &str, prefix: Option<&str>) -> (String, Option<Stri
     match prefix {
         Some(p) => {
             let pattern = make_like_pattern(p);
-            (
-                format!("WHERE {col} LIKE ? ESCAPE '\\'"),
-                Some(pattern),
-            )
+            (format!("WHERE {col} LIKE ? ESCAPE '\\'"), Some(pattern))
         }
         None => (String::new(), None),
     }
@@ -78,10 +75,7 @@ pub fn prefix_and_col(col: &str, prefix: Option<&str>) -> (String, Option<String
     match prefix {
         Some(p) => {
             let pattern = make_like_pattern(p);
-            (
-                format!("AND {col} LIKE ? ESCAPE '\\'"),
-                Some(pattern),
-            )
+            (format!("AND {col} LIKE ? ESCAPE '\\'"), Some(pattern))
         }
         None => (String::new(), None),
     }

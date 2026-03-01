@@ -7,6 +7,7 @@
 //! - Each migration runs in a transaction for atomicity
 
 mod v1;
+mod v10;
 mod v2;
 mod v3;
 mod v4;
@@ -15,7 +16,6 @@ mod v6;
 mod v7;
 mod v8;
 mod v9;
-mod v10;
 
 #[cfg(test)]
 mod tests;

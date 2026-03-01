@@ -359,10 +359,14 @@ fn test_like_escape_metacharacters() {
     // Run all migrations (for retired_at column), then remove FTS5 to force LIKE path.
     // Must drop triggers before the table to avoid insert failures.
     let (_temp_dir, conn) = setup_db();
-    conn.execute("DROP TRIGGER IF EXISTS learnings_ai", []).unwrap();
-    conn.execute("DROP TRIGGER IF EXISTS learnings_ad", []).unwrap();
-    conn.execute("DROP TRIGGER IF EXISTS learnings_au", []).unwrap();
-    conn.execute("DROP TABLE IF EXISTS learnings_fts", []).unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ai", [])
+        .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ad", [])
+        .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_au", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS learnings_fts", [])
+        .unwrap();
 
     // Insert learnings — one with a literal % in the title
     create_test_learning(
