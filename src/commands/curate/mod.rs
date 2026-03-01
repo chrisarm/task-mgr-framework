@@ -218,13 +218,73 @@ pub fn curate_unretire(conn: &Connection, learning_ids: Vec<i64>) -> TaskMgrResu
 /// - When `params.field_filter` is `Some(field)`, restricts to learnings
 ///   missing only that specific field.
 /// - Returns `Ok(vec![])` when no candidates exist (never errors on empty result).
-///
-/// **NOTE**: This is a stub — implementation deferred to FEAT-003.
 pub fn find_enrichment_candidates(
-    _conn: &Connection,
-    _params: &EnrichParams,
+    conn: &Connection,
+    params: &EnrichParams,
 ) -> crate::TaskMgrResult<Vec<EnrichCandidate>> {
-    todo!("FEAT-003: implement find_enrichment_candidates query")
+    use types::EnrichFieldFilter;
+
+    let sql = match &params.field_filter {
+        None => "
+            SELECT id, title,
+                   applies_to_files IS NULL AS missing_files,
+                   applies_to_task_types IS NULL AS missing_task_types,
+                   applies_to_errors IS NULL AS missing_errors
+            FROM learnings
+            WHERE retired_at IS NULL
+              AND (
+                applies_to_files IS NULL
+                OR applies_to_task_types IS NULL
+                OR applies_to_errors IS NULL
+              )
+            ORDER BY id ASC
+        ",
+        Some(EnrichFieldFilter::AppliesToFiles) => "
+            SELECT id, title,
+                   applies_to_files IS NULL AS missing_files,
+                   applies_to_task_types IS NULL AS missing_task_types,
+                   applies_to_errors IS NULL AS missing_errors
+            FROM learnings
+            WHERE retired_at IS NULL
+              AND applies_to_files IS NULL
+            ORDER BY id ASC
+        ",
+        Some(EnrichFieldFilter::AppliesToTaskTypes) => "
+            SELECT id, title,
+                   applies_to_files IS NULL AS missing_files,
+                   applies_to_task_types IS NULL AS missing_task_types,
+                   applies_to_errors IS NULL AS missing_errors
+            FROM learnings
+            WHERE retired_at IS NULL
+              AND applies_to_task_types IS NULL
+            ORDER BY id ASC
+        ",
+        Some(EnrichFieldFilter::AppliesToErrors) => "
+            SELECT id, title,
+                   applies_to_files IS NULL AS missing_files,
+                   applies_to_task_types IS NULL AS missing_task_types,
+                   applies_to_errors IS NULL AS missing_errors
+            FROM learnings
+            WHERE retired_at IS NULL
+              AND applies_to_errors IS NULL
+            ORDER BY id ASC
+        ",
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let candidates = stmt
+        .query_map([], |row| {
+            Ok(EnrichCandidate {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                missing_files: row.get("missing_files")?,
+                missing_task_types: row.get("missing_task_types")?,
+                missing_errors: row.get("missing_errors")?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(candidates)
 }
 
 #[cfg(test)]

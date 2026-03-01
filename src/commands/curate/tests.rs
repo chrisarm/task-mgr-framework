@@ -978,7 +978,6 @@ fn set_applies_to_errors(conn: &Connection, id: i64, value: Option<&str>) {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_query_returns_learning_with_null_files() {
     // AC: query returns learnings where applies_to_files IS NULL
     let (_dir, conn) = setup_db();
@@ -1002,7 +1001,6 @@ fn test_enrich_query_returns_learning_with_null_files() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_query_returns_learning_with_null_task_types() {
     // AC: query returns learnings where applies_to_task_types IS NULL
     let (_dir, conn) = setup_db();
@@ -1027,7 +1025,6 @@ fn test_enrich_query_returns_learning_with_null_task_types() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_query_returns_learning_with_null_errors() {
     // AC: query returns learnings where applies_to_errors IS NULL
     let (_dir, conn) = setup_db();
@@ -1053,7 +1050,6 @@ fn test_enrich_query_returns_learning_with_null_errors() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_query_excludes_retired_learnings() {
     // AC: query excludes retired learnings (retired_at IS NOT NULL)
     let (_dir, conn) = setup_db();
@@ -1078,7 +1074,6 @@ fn test_enrich_query_excludes_retired_learnings() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_query_excludes_fully_enriched_learnings() {
     // AC: query excludes learnings where all 3 fields are populated
     let (_dir, conn) = setup_db();
@@ -1104,7 +1099,6 @@ fn test_enrich_query_excludes_fully_enriched_learnings() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_field_filter_files_restricts_to_missing_files() {
     // AC: --field=applies_to_files restricts to learnings missing only that field
     let (_dir, conn) = setup_db();
@@ -1133,7 +1127,6 @@ fn test_enrich_field_filter_files_restricts_to_missing_files() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_field_filter_files_known_bad_discriminator() {
     // Known-bad discriminator: --field=applies_to_files must NOT return a learning
     // that has applies_to_files set but applies_to_task_types NULL
@@ -1162,7 +1155,6 @@ fn test_enrich_field_filter_files_known_bad_discriminator() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_zero_candidates_returns_empty_vec() {
     // AC: 0 matching learnings returns empty vec (no error)
     let (_dir, conn) = setup_db();
@@ -1189,7 +1181,6 @@ fn test_enrich_zero_candidates_returns_empty_vec() {
 }
 
 #[test]
-#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
 fn test_enrich_empty_database_returns_empty_vec() {
     // Edge case: 0 learnings in database — return empty vec, no error
     let (_dir, conn) = setup_db();
