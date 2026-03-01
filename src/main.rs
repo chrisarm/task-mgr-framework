@@ -785,6 +785,13 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     let result = curate_enrich(&conn, params)?;
                     output_result(&result, cli.format);
                 }
+                CurateAction::Dedup {
+                    dry_run: _,
+                    threshold: _,
+                    batch_size: _,
+                } => {
+                    todo!("curate dedup: not yet implemented (a8e80384-FEAT-002+)")
+                }
             }
             Ok(())
         }

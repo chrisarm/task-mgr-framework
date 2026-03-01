@@ -890,6 +890,50 @@ pub enum CurateAction {
         learning_ids: Vec<i64>,
     },
 
+    /// Identify and merge duplicate learnings using LLM semantic analysis
+    #[command(after_help = "\
+EXAMPLES:
+    # Preview duplicate clusters without modifying the database
+    task-mgr curate dedup --dry-run
+
+    # Run dedup with default threshold (0.7)
+    task-mgr curate dedup
+
+    # Run with aggressive merging (higher threshold = more merges)
+    task-mgr curate dedup --threshold 0.9
+
+    # Run with conservative merging
+    task-mgr curate dedup --threshold 0.5
+
+    # Use a smaller batch size for LLM calls
+    task-mgr curate dedup --batch-size 10 --dry-run
+
+THRESHOLD:
+    Controls how aggressively the LLM should merge learnings.
+    0.0 = never merge (only exact duplicates)
+    0.7 = merge learnings capturing the same insight (default)
+    1.0 = merge any related learnings
+    Must be between 0.0 and 1.0 (inclusive).
+")]
+    Dedup {
+        /// Preview duplicate clusters without modifying the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Merge aggressiveness: 0.0 (conservative) to 1.0 (aggressive); default 0.7.
+        /// Passed as semantic guidance to the LLM prompt.
+        #[arg(
+            long,
+            default_value_t = 0.7,
+            value_parser = parse_threshold
+        )]
+        threshold: f64,
+
+        /// Maximum number of learnings per LLM call (None = auto)
+        #[arg(long = "batch-size")]
+        batch_size: Option<usize>,
+    },
+
     /// Enrich learning metadata using LLM analysis
     #[command(after_help = "\
 EXAMPLES:
@@ -964,6 +1008,20 @@ pub enum MigrateAction {
 
     /// Apply all pending migrations (default behavior on db open)
     All,
+}
+
+/// Validates that threshold is in [0.0, 1.0].
+fn parse_threshold(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!(
+            "threshold must be between 0.0 and 1.0, got {}",
+            v
+        ));
+    }
+    Ok(v)
 }
 
 /// Run lifecycle actions
