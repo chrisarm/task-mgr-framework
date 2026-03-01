@@ -24,6 +24,7 @@
 
 pub mod apply_learning;
 pub mod complete;
+pub mod curate;
 pub mod doctor;
 pub mod export;
 pub mod fail;
