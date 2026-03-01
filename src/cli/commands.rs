@@ -690,6 +690,9 @@ EXAMPLES:
 
     # Run with max iterations per PRD
     task-mgr batch 'tasks/*.json' 10 --yes
+
+    # Keep worktrees after each PRD (default: auto-remove on success)
+    task-mgr batch 'tasks/*.json' --yes --keep-worktrees
 ")]
     Batch {
         /// Glob pattern to match PRD files
@@ -701,6 +704,14 @@ EXAMPLES:
         /// Auto-confirm all prompts
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Keep worktrees after each PRD completes (never auto-remove)
+        ///
+        /// By default, worktrees are removed on success in --yes mode,
+        /// and the user is prompted in interactive mode.
+        /// This flag skips cleanup entirely.
+        #[arg(long = "keep-worktrees", default_value_t = false)]
+        keep_worktrees: bool,
     },
 
     /// Import learnings from a progress.json or learnings JSON file

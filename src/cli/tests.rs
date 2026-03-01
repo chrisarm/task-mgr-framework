@@ -2356,6 +2356,7 @@ fn test_batch_with_pattern_and_yes() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert!(max_iterations.is_none());
@@ -2373,6 +2374,7 @@ fn test_batch_with_max_iterations() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert_eq!(max_iterations, Some(10));
@@ -2391,6 +2393,7 @@ fn test_batch_minimal() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert!(max_iterations.is_none());
@@ -2404,6 +2407,29 @@ fn test_batch_minimal() {
 fn test_batch_missing_pattern_fails() {
     let result = Cli::try_parse_from(["task-mgr", "batch"]);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_batch_keep_worktrees_flag() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json", "--yes", "--keep-worktrees"]);
+    match cli.command {
+        Commands::Batch { keep_worktrees, yes, .. } => {
+            assert!(keep_worktrees);
+            assert!(yes);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_keep_worktrees_defaults_false() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json"]);
+    match cli.command {
+        Commands::Batch { keep_worktrees, .. } => {
+            assert!(!keep_worktrees);
+        }
+        _ => panic!("Expected Batch command"),
+    }
 }
 
 #[test]

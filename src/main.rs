@@ -650,6 +650,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             pattern,
             max_iterations,
             yes,
+            keep_worktrees,
         } => {
             let project_root = get_project_root()?;
 
@@ -668,6 +669,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     &cli.dir,
                     &project_root,
                     cli.verbose,
+                    keep_worktrees,
                 )
                 .await
             });

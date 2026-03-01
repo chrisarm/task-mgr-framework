@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopRunConfig};
+use crate::loop_engine::env;
 use crate::loop_engine::signals;
 
 /// Result of a batch run.
@@ -115,6 +116,66 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
     Ok(pairs)
 }
 
+/// Offer to clean up a worktree after a PRD run in batch mode.
+///
+/// Policy:
+/// - `keep_worktrees = true` → never remove
+/// - failed PRD (exit_code != 0) → keep regardless of flags (preserve for debugging)
+/// - `yes = true` + success → auto-remove
+/// - `yes = false` (interactive) → prompt user
+/// - Cleanup failure warns but does not affect batch result
+fn cleanup_worktree_after_prd(
+    project_root: &Path,
+    wt_path: &Path,
+    exit_code: i32,
+    yes: bool,
+    keep_worktrees: bool,
+) {
+    if keep_worktrees {
+        return;
+    }
+
+    if exit_code != 0 {
+        // Keep worktrees from failed runs for debugging
+        eprintln!(
+            "Keeping worktree (PRD failed): {}",
+            wt_path.display()
+        );
+        return;
+    }
+
+    let should_remove = if yes {
+        true
+    } else {
+        // Interactive: prompt user
+        eprint!(
+            "Remove worktree '{}'? [y/N] ",
+            wt_path.display()
+        );
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+        } else {
+            false
+        }
+    };
+
+    if should_remove {
+        match env::remove_worktree(project_root, wt_path) {
+            Ok(true) => eprintln!("Removed worktree: {}", wt_path.display()),
+            Ok(false) => eprintln!(
+                "Warning: worktree has uncommitted changes, kept: {}",
+                wt_path.display()
+            ),
+            Err(e) => eprintln!(
+                "Warning: failed to remove worktree '{}': {}",
+                wt_path.display(),
+                e
+            ),
+        }
+    }
+}
+
 /// Run multiple PRDs in sequence.
 ///
 /// 1. Expand glob pattern with natural sort
@@ -132,6 +193,7 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
 /// * `dir` - Database directory (--dir flag)
 /// * `project_root` - Git repository root for git operations and path resolution
 /// * `verbose` - Verbose output
+/// * `keep_worktrees` - Never remove worktrees after PRD completion
 pub async fn run_batch(
     pattern: &str,
     max_iterations: Option<usize>,
@@ -139,6 +201,7 @@ pub async fn run_batch(
     dir: &Path,
     project_root: &Path,
     verbose: bool,
+    keep_worktrees: bool,
 ) -> BatchResult {
     // Step 1: Expand glob
     let prd_files = match expand_glob(pattern) {
@@ -225,6 +288,7 @@ pub async fn run_batch(
 
         let loop_result = engine::run_loop(run_config).await;
         let exit_code = loop_result.exit_code;
+        let worktree_path = loop_result.worktree_path.clone();
 
         results.push(PrdRunResult {
             prd_file: prd_file.clone(),
@@ -236,6 +300,11 @@ pub async fn run_batch(
             succeeded += 1;
         } else {
             failed += 1;
+        }
+
+        // Worktree cleanup after each PRD
+        if let Some(ref wt_path) = worktree_path {
+            cleanup_worktree_after_prd(project_root, wt_path, exit_code, yes, keep_worktrees);
         }
     }
 
