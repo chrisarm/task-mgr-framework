@@ -16,11 +16,12 @@ pub use types::{
     RetireResult, RetirementCandidate, UnretireResult,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
+use crate::loop_engine::claude::spawn_claude;
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
 
@@ -482,11 +483,218 @@ pub fn merge_cluster(
 /// - When `params.dry_run=true`, clusters are identified but no DB writes occur.
 /// - When there are 0 active learnings, returns an empty `DedupResult` without
 ///   invoking the LLM.
-///
-/// # Stub
-/// Not yet implemented — tracked as FEAT-004.
-pub fn curate_dedup(_conn: &Connection, _params: DedupParams) -> TaskMgrResult<DedupResult> {
-    todo!("FEAT-004: implement curate_dedup")
+pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<DedupResult> {
+    // Load all active learnings (id, title, content, confidence).
+    struct LearningRow {
+        id: i64,
+        title: String,
+        content: String,
+        confidence: String,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, confidence
+         FROM learnings
+         WHERE retired_at IS NULL
+         ORDER BY id ASC",
+    )?;
+    let rows: Vec<LearningRow> = stmt
+        .query_map([], |row| {
+            Ok(LearningRow {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                content: row.get("content")?,
+                confidence: row.get("confidence")?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Short-circuit: no active learnings means nothing to dedup.
+    if rows.is_empty() {
+        return Ok(DedupResult {
+            dry_run: params.dry_run,
+            clusters_found: 0,
+            learnings_merged: 0,
+            learnings_created: 0,
+            llm_errors: 0,
+            clusters: Vec::new(),
+        });
+    }
+
+    // Build a map from id -> (title, confidence) for cluster assembly.
+    let id_info: HashMap<i64, (String, String)> = rows
+        .iter()
+        .map(|r| (r.id, (r.title.clone(), r.confidence.clone())))
+        .collect();
+
+    // Build DeduplicateLearningItem list for prompt building.
+    let items: Vec<DeduplicateLearningItem> = rows
+        .iter()
+        .map(|r| DeduplicateLearningItem {
+            id: r.id,
+            title: r.title.clone(),
+            content: r.content.clone(),
+        })
+        .collect();
+
+    // Auto-calculate batch size: single batch if total content < 150K chars,
+    // otherwise ~20 learnings per batch.
+    let batch_size = params.batch_size.unwrap_or_else(|| {
+        let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
+        if total_chars < 150_000 {
+            items.len()
+        } else {
+            20
+        }
+    });
+    // Guard against zero batch_size from caller override.
+    let batch_size = batch_size.max(1);
+
+    let batches: Vec<&[DeduplicateLearningItem]> = items.chunks(batch_size).collect();
+    let total_batches = batches.len();
+
+    // Track IDs merged across batches to handle cross-batch duplicates.
+    let mut merged_ids: HashSet<i64> = HashSet::new();
+
+    let mut all_clusters: Vec<DedupCluster> = Vec::new();
+    let mut llm_errors: usize = 0;
+    let mut learnings_merged: usize = 0;
+    let mut learnings_created: usize = 0;
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        if total_batches > 1 {
+            eprintln!("Processing batch {}/{}...", batch_idx + 1, total_batches);
+        }
+
+        // Filter out already-merged learnings from this batch before sending to LLM.
+        let eligible: Vec<DeduplicateLearningItem> = batch
+            .iter()
+            .filter(|i| !merged_ids.contains(&i.id))
+            .cloned()
+            .collect();
+
+        if eligible.is_empty() {
+            continue;
+        }
+
+        let eligible_ids: Vec<i64> = eligible.iter().map(|i| i.id).collect();
+        let prompt = build_dedup_prompt(&eligible, params.threshold);
+
+        let claude_result = match spawn_claude(&prompt, None, None, None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: spawn_claude failed for batch {}: {}", batch_idx + 1, e);
+                llm_errors += 1;
+                continue;
+            }
+        };
+
+        if claude_result.exit_code != 0 {
+            eprintln!(
+                "Warning: claude exited with code {} for batch {}",
+                claude_result.exit_code,
+                batch_idx + 1
+            );
+            llm_errors += 1;
+            continue;
+        }
+
+        let raw_clusters = match parse_dedup_response(&claude_result.output, &eligible_ids) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: failed to parse dedup response for batch {}: {}", batch_idx + 1, e);
+                llm_errors += 1;
+                continue;
+            }
+        };
+
+        for raw in raw_clusters {
+            let source_ids = match raw.source_ids {
+                Some(ids) if ids.len() >= 2 => ids,
+                _ => continue,
+            };
+
+            // Skip if any source ID was already merged by a prior batch.
+            if source_ids.iter().any(|id| merged_ids.contains(id)) {
+                continue;
+            }
+
+            let merged_title = raw.merged_title.unwrap_or_else(|| "Merged learning".to_string());
+            let merged_content = raw.merged_content.unwrap_or_default();
+            let merged_outcome = raw.merged_outcome.unwrap_or_else(|| "pattern".to_string());
+            let reason = raw.reason.unwrap_or_default();
+
+            let source_titles: Vec<String> = source_ids
+                .iter()
+                .map(|id| {
+                    id_info
+                        .get(id)
+                        .map(|(t, _)| t.clone())
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            // Best confidence among sources: high > medium > low.
+            let confidence_rank = |s: &str| match s {
+                "high" => 2u8,
+                "medium" => 1,
+                _ => 0,
+            };
+            let merged_confidence = source_ids
+                .iter()
+                .filter_map(|id| id_info.get(id).map(|(_, c)| c.as_str()))
+                .max_by_key(|c| confidence_rank(c))
+                .unwrap_or("low")
+                .to_string();
+
+            let merged_learning_id = if params.dry_run {
+                None
+            } else {
+                let merge_params = MergeClusterParams {
+                    source_ids: source_ids.clone(),
+                    merged_title: merged_title.clone(),
+                    merged_content: merged_content.clone(),
+                };
+                match merge_cluster(conn, merge_params) {
+                    Ok(result) => {
+                        learnings_merged += result.retired_source_ids.len();
+                        learnings_created += 1;
+                        Some(result.merged_learning_id)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: merge_cluster failed: {}", e);
+                        continue;
+                    }
+                }
+            };
+
+            // Track merged IDs so subsequent batches skip them.
+            for &id in &source_ids {
+                merged_ids.insert(id);
+            }
+
+            all_clusters.push(DedupCluster {
+                source_ids,
+                source_titles,
+                merged_title,
+                merged_content,
+                merged_outcome,
+                merged_confidence,
+                reason,
+                merged_learning_id,
+            });
+        }
+    }
+
+    let clusters_found = all_clusters.len();
+    Ok(DedupResult {
+        dry_run: params.dry_run,
+        clusters_found,
+        learnings_merged,
+        learnings_created,
+        llm_errors,
+        clusters: all_clusters,
+    })
 }
 
 #[cfg(test)]

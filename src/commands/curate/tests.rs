@@ -2640,7 +2640,6 @@ fn count_all_learnings(conn: &Connection) -> i64 {
 }
 
 #[test]
-#[ignore = "FEAT-004: curate_dedup not yet implemented"]
 fn test_dedup_zero_active_learnings_returns_empty_result() {
     // AC: 0 active learnings returns empty DedupResult immediately (no LLM invocation).
     // An empty DB means there is nothing to deduplicate; the function must short-circuit
@@ -2666,7 +2665,6 @@ fn test_dedup_zero_active_learnings_returns_empty_result() {
 }
 
 #[test]
-#[ignore = "FEAT-004: curate_dedup not yet implemented"]
 fn test_dedup_dry_run_makes_no_db_changes() {
     // AC: dry_run=true returns DedupResult with clusters but no DB changes.
     // Known-bad discriminator: learning count before and after must be equal.
@@ -2730,7 +2728,6 @@ fn test_dedup_dry_run_makes_no_db_changes() {
 }
 
 #[test]
-#[ignore = "FEAT-004: curate_dedup not yet implemented"]
 fn test_dedup_rerun_excludes_already_retired_learnings() {
     // AC: after merging cluster A, re-running excludes cluster A's source IDs
     // (they're retired) — only remaining active learnings are processed.
