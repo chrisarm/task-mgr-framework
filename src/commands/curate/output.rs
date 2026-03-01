@@ -1,6 +1,6 @@
 //! Text output formatting for the `curate` subcommands.
 
-use super::types::{EnrichResult, RetireResult, UnretireResult};
+use super::types::{DedupResult, EnrichResult, RetireResult, UnretireResult};
 
 /// Format `curate retire` output as human-readable text.
 pub fn format_retire_text(result: &RetireResult) -> String {
@@ -71,6 +71,37 @@ pub fn format_enrich_text(result: &EnrichResult) -> String {
         out.push('\n');
         out
     }
+}
+
+/// Format `curate dedup` output as human-readable text.
+pub fn format_dedup_text(result: &DedupResult) -> String {
+    let dry_run_marker = if result.dry_run {
+        " — DRY RUN — no changes made"
+    } else {
+        ""
+    };
+
+    let mut out = format!(
+        "{} cluster(s), {} learning(s) merged, {} created{}\n",
+        result.clusters_found, result.learnings_merged, result.learnings_created, dry_run_marker
+    );
+
+    if result.llm_errors > 0 {
+        out.push_str(&format!("{} LLM error(s) encountered\n", result.llm_errors));
+    }
+
+    for cluster in &result.clusters {
+        out.push_str(&format!("  Cluster: {}\n", cluster.merged_title));
+        out.push_str(&format!("    Reason: {}\n", cluster.reason));
+        for title in &cluster.source_titles {
+            out.push_str(&format!("    - {title}\n"));
+        }
+        if let Some(id) = cluster.merged_learning_id {
+            out.push_str(&format!("    -> merged learning id: {id}\n"));
+        }
+    }
+
+    out
 }
 
 /// Format `curate unretire` output as human-readable text.

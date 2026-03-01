@@ -9,7 +9,7 @@ pub mod output;
 pub mod types;
 
 pub use dedup::{build_dedup_prompt, parse_dedup_response};
-pub use output::{format_enrich_text, format_retire_text, format_unretire_text};
+pub use output::{format_dedup_text, format_enrich_text, format_retire_text, format_unretire_text};
 pub use types::{
     DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EnrichCandidate, EnrichParams,
     EnrichResult, MergeClusterParams, MergeClusterResult, RawDedupCluster, RetireParams,
