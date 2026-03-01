@@ -10,6 +10,18 @@ use std::process::Command;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 
+/// Remove an empty directory if it exists and contains no entries.
+/// Silently ignores errors (best-effort cleanup).
+fn cleanup_empty_dir(path: &Path) {
+    if path.exists() {
+        if let Ok(mut entries) = std::fs::read_dir(path) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(path);
+            }
+        }
+    }
+}
+
 /// Prompt the user with a yes/no question on stderr and read their response from stdin.
 ///
 /// Returns `Ok(true)` if the user answers "y" or "yes" (case-insensitive),
@@ -455,11 +467,7 @@ pub fn ensure_worktree(
 
         // Clean up empty parent dir if we just created it (avoids orphan dirs).
         if parent_created {
-            if let Ok(mut entries) = std::fs::read_dir(worktrees_parent) {
-                if entries.next().is_none() {
-                    let _ = std::fs::remove_dir(worktrees_parent);
-                }
-            }
+            cleanup_empty_dir(worktrees_parent);
         }
 
         // Prune any stale worktree entries git may have recorded before failing.
@@ -536,13 +544,7 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResu
 
     // Remove empty parent dir (the {repo}-worktrees/ container)
     if let Some(parent) = worktree_path.parent() {
-        if parent.exists() {
-            if let Ok(mut entries) = std::fs::read_dir(parent) {
-                if entries.next().is_none() {
-                    let _ = std::fs::remove_dir(parent);
-                }
-            }
-        }
+        cleanup_empty_dir(parent);
     }
 
     Ok(true)

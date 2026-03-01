@@ -143,16 +143,7 @@ impl LockGuard {
 
     /// Writes the current process identity (`{pid}@{hostname}`) to the lockfile.
     fn write_holder_info(&mut self) -> TaskMgrResult<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        let pid = std::process::id();
-        let host = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "unknown".to_string());
-        write!(self.file, "{}@{}", pid, host)?;
-        self.file.sync_all()?;
-        Ok(())
+        self.write_holder_info_extended(None, None, None)
     }
 
     /// Writes extended holder info in multi-line format:
