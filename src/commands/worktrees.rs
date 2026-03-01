@@ -283,3 +283,433 @@ pub fn format_text(result: &WorktreesResult) -> String {
 
     out
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    /// Initialize a temporary git repository with a single commit.
+    fn init_test_repo() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().expect("create temp dir");
+        let repo = tmp.path().to_path_buf();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        fs::write(repo.join("README.md"), "# Test").expect("write README");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git commit");
+        (tmp, repo)
+    }
+
+    /// Write a lock file that claims the given worktree path is locked.
+    fn write_lock_file(lock_path: &Path, worktree_path: &str) {
+        let content = format!(
+            "12345@testhost\nbranch=test\nworktree={}\nprefix=test\n",
+            worktree_path
+        );
+        fs::write(lock_path, content).expect("write lock file");
+    }
+
+    // ── lock_status_for ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lock_status_for_locked() {
+        let wt_path = PathBuf::from("/some/worktree/path");
+        let locked = vec!["/some/worktree/path".to_string()];
+        assert_eq!(lock_status_for(&wt_path, &locked), LockStatus::Locked);
+    }
+
+    #[test]
+    fn test_lock_status_for_unlocked() {
+        let wt_path = PathBuf::from("/some/worktree/path");
+        let locked = vec!["/different/path".to_string()];
+        assert_eq!(lock_status_for(&wt_path, &locked), LockStatus::Unlocked);
+    }
+
+    #[test]
+    fn test_lock_status_for_empty_locked_set() {
+        let wt_path = PathBuf::from("/any/path");
+        assert_eq!(lock_status_for(&wt_path, &[]), LockStatus::Unlocked);
+    }
+
+    // ── locked_worktree_paths ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_locked_worktree_paths_reads_lock_files() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let worktree_path = "/path/to/my/worktree";
+        write_lock_file(&tmp.path().join("loop.lock"), worktree_path);
+
+        let paths = locked_worktree_paths(tmp.path());
+        assert!(
+            paths.contains(&worktree_path.to_string()),
+            "Expected locked path to appear, got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_locked_worktree_paths_ignores_non_lock_files() {
+        let tmp = TempDir::new().expect("create temp dir");
+        fs::write(tmp.path().join("tasks.db"), "db content").expect("write db");
+        let paths = locked_worktree_paths(tmp.path());
+        assert!(paths.is_empty(), "Non-.lock files should be ignored");
+    }
+
+    #[test]
+    fn test_locked_worktree_paths_empty_dir() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let paths = locked_worktree_paths(tmp.path());
+        assert!(paths.is_empty());
+    }
+
+    // ── format_text ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_text_list_shows_branch_path_lock() {
+        let result = WorktreesResult {
+            action: "list".to_string(),
+            worktrees: vec![
+                WorktreeInfo {
+                    path: PathBuf::from("/repo/main"),
+                    branch: Some("main".to_string()),
+                    lock_status: LockStatus::Unlocked,
+                },
+                WorktreeInfo {
+                    path: PathBuf::from("/repo-worktrees/feat"),
+                    branch: Some("feat/cool".to_string()),
+                    lock_status: LockStatus::Locked,
+                },
+            ],
+            message: "2 worktree(s) found".to_string(),
+        };
+
+        let text = format_text(&result);
+        assert!(text.contains("/repo/main"), "should contain main path");
+        assert!(text.contains("main"), "should contain main branch");
+        assert!(
+            text.contains("/repo-worktrees/feat"),
+            "should contain worktree path"
+        );
+        assert!(text.contains("feat/cool"), "should contain worktree branch");
+        assert!(text.contains("LOCKED"), "should show LOCKED status");
+        assert!(text.contains("unlocked"), "should show unlocked status");
+    }
+
+    #[test]
+    fn test_format_text_list_empty() {
+        let result = WorktreesResult {
+            action: "list".to_string(),
+            worktrees: vec![],
+            message: "0 worktree(s) found".to_string(),
+        };
+        let text = format_text(&result);
+        assert!(text.contains("No worktrees found"));
+    }
+
+    #[test]
+    fn test_format_text_list_detached_head() {
+        let result = WorktreesResult {
+            action: "list".to_string(),
+            worktrees: vec![WorktreeInfo {
+                path: PathBuf::from("/repo/main"),
+                branch: None,
+                lock_status: LockStatus::Unlocked,
+            }],
+            message: "1 worktree(s) found".to_string(),
+        };
+        let text = format_text(&result);
+        assert!(
+            text.contains("(detached)"),
+            "detached HEAD should show '(detached)'"
+        );
+    }
+
+    #[test]
+    fn test_format_text_prune_shows_removed() {
+        let result = WorktreesResult {
+            action: "prune".to_string(),
+            worktrees: vec![WorktreeInfo {
+                path: PathBuf::from("/repo-worktrees/old-feat"),
+                branch: Some("old-feat".to_string()),
+                lock_status: LockStatus::Unlocked,
+            }],
+            message: "Pruned 1 worktree(s); skipped 0 (locked or dirty)".to_string(),
+        };
+        let text = format_text(&result);
+        assert!(text.contains("Pruned 1 worktree(s)"));
+        assert!(text.contains("removed:"));
+        assert!(text.contains("old-feat"));
+    }
+
+    #[test]
+    fn test_format_text_remove_shows_message() {
+        let result = WorktreesResult {
+            action: "remove".to_string(),
+            worktrees: vec![WorktreeInfo {
+                path: PathBuf::from("/repo-worktrees/feat"),
+                branch: Some("feat".to_string()),
+                lock_status: LockStatus::Unlocked,
+            }],
+            message: "Removed worktree at /repo-worktrees/feat".to_string(),
+        };
+        let text = format_text(&result);
+        assert!(text.contains("Removed worktree at"));
+    }
+
+    // ── list (git integration) ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_shows_correct_branch_path_lock_status() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let result = list(&db_dir, &repo).expect("list should succeed");
+        assert!(
+            !result.worktrees.is_empty(),
+            "should find at least the main worktree"
+        );
+        assert_eq!(result.action, "list");
+
+        // Main worktree should be present and unlocked
+        let main_wt = &result.worktrees[0];
+        assert!(
+            main_wt.path.exists(),
+            "main worktree path should exist on disk"
+        );
+        assert_eq!(
+            main_wt.lock_status,
+            LockStatus::Unlocked,
+            "main worktree should be unlocked with no lock files"
+        );
+        assert!(
+            main_wt.branch.is_some(),
+            "main worktree should have a branch"
+        );
+    }
+
+    #[test]
+    fn test_list_shows_locked_when_lock_file_present() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        // Write a lock file claiming the repo path is active
+        let repo_str = repo.to_string_lossy().to_string();
+        write_lock_file(&db_dir.join("loop.lock"), &repo_str);
+
+        let result = list(&db_dir, &repo).expect("list should succeed");
+        let main_wt = result.worktrees.iter().find(|w| w.path == repo);
+        assert!(main_wt.is_some(), "should find main worktree by path");
+        assert_eq!(
+            main_wt.unwrap().lock_status,
+            LockStatus::Locked,
+            "should show LOCKED when lock file claims this worktree"
+        );
+    }
+
+    // ── prune (git integration) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_prune_skips_locked_worktrees() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        // Create a second worktree
+        let wt_path = tmp.path().join("feat-wt");
+        Command::new("git")
+            .args(["branch", "feat/test-prune"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/test-prune",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        // Lock the worktree via a lock file
+        let wt_str = wt_path.to_string_lossy().to_string();
+        write_lock_file(&db_dir.join("loop.lock"), &wt_str);
+
+        let result = prune(&db_dir, &repo).expect("prune should succeed");
+
+        // The locked worktree should NOT appear in the removed list
+        let removed_paths: Vec<&PathBuf> = result.worktrees.iter().map(|w| &w.path).collect();
+        assert!(
+            !removed_paths.iter().any(|p| **p == wt_path),
+            "locked worktree should not be pruned, removed: {:?}",
+            removed_paths
+        );
+        // The worktree should still exist on disk
+        assert!(
+            wt_path.exists(),
+            "locked worktree directory should still exist after prune"
+        );
+        assert!(
+            result.message.contains("skipped"),
+            "prune message should mention skipped count: {}",
+            result.message
+        );
+    }
+
+    // ── remove (git integration) ───────────────────────────────────────────────
+
+    #[test]
+    fn test_remove_by_branch_name() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let wt_path = tmp.path().join("remove-branch-wt");
+        Command::new("git")
+            .args(["branch", "feat/remove-test"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/remove-test",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        assert!(wt_path.exists(), "worktree should exist before remove");
+
+        let result = remove(&db_dir, &repo, "feat/remove-test")
+            .expect("remove by branch name should succeed");
+        assert_eq!(result.action, "remove");
+        assert!(
+            result.message.contains("Removed worktree"),
+            "message: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn test_remove_by_path() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let wt_path = tmp.path().join("remove-path-wt");
+        Command::new("git")
+            .args(["branch", "feat/remove-by-path"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/remove-by-path",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        assert!(wt_path.exists(), "worktree should exist before remove");
+
+        let wt_str = wt_path.to_string_lossy().to_string();
+        let result = remove(&db_dir, &repo, &wt_str).expect("remove by path should succeed");
+        assert_eq!(result.action, "remove");
+        assert!(
+            !result.worktrees.is_empty(),
+            "result should contain the removed worktree"
+        );
+    }
+
+    #[test]
+    fn test_remove_locked_worktree_returns_error() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let wt_path = tmp.path().join("locked-wt");
+        Command::new("git")
+            .args(["branch", "feat/locked-remove"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/locked-remove",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        // Lock the worktree
+        let wt_str = wt_path.to_string_lossy().to_string();
+        write_lock_file(&db_dir.join("loop.lock"), &wt_str);
+
+        let result = remove(&db_dir, &repo, "feat/locked-remove");
+        assert!(result.is_err(), "should fail to remove locked worktree");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("active lock"),
+            "error should mention active lock: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_remove_nonexistent_target_returns_error() {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let result = remove(&db_dir, &repo, "nonexistent-branch");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no matching worktree"),
+            "error should say no matching worktree: {}",
+            err
+        );
+    }
+}

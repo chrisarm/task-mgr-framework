@@ -932,6 +932,49 @@ mod tests {
             .contains("progress.txt"),);
     }
 
+    #[test]
+    fn test_resolve_paths_with_prefix_returns_named_progress_file() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let prd = tmp.path().join("test.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let resolved =
+            resolve_paths(&prd, None, tmp.path(), Some("P1")).expect("resolve paths with prefix");
+        let progress = resolved.progress_file.to_string_lossy();
+        assert!(
+            progress.contains("progress-P1.txt"),
+            "Expected progress-P1.txt, got: {}",
+            progress
+        );
+        assert!(
+            !progress.ends_with("progress.txt") || progress.contains("progress-P1.txt"),
+            "Should use prefix-specific filename"
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_different_prefixes_produce_different_files() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let prd = tmp.path().join("test.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let no_prefix = resolve_paths(&prd, None, tmp.path(), None).expect("no prefix");
+        let with_prefix = resolve_paths(&prd, None, tmp.path(), Some("ABC")).expect("with prefix");
+
+        assert_ne!(
+            no_prefix.progress_file, with_prefix.progress_file,
+            "Different prefix should yield different progress files"
+        );
+        assert!(no_prefix
+            .progress_file
+            .to_string_lossy()
+            .ends_with("progress.txt"));
+        assert!(with_prefix
+            .progress_file
+            .to_string_lossy()
+            .ends_with("progress-ABC.txt"));
+    }
+
     // --- ensure_directories ---
 
     #[test]

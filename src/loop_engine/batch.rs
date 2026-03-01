@@ -137,10 +137,7 @@ fn cleanup_worktree_after_prd(
 
     if exit_code != 0 {
         // Keep worktrees from failed runs for debugging
-        eprintln!(
-            "Keeping worktree (PRD failed): {}",
-            wt_path.display()
-        );
+        eprintln!("Keeping worktree (PRD failed): {}", wt_path.display());
         return;
     }
 
@@ -148,10 +145,7 @@ fn cleanup_worktree_after_prd(
         true
     } else {
         // Interactive: prompt user
-        eprint!(
-            "Remove worktree '{}'? [y/N] ",
-            wt_path.display()
-        );
+        eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {
             matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
@@ -567,5 +561,106 @@ mod tests {
 
         fs::write(temp_dir.path().join(STOP_FILE), "").expect("create stop");
         assert!(signals::check_stop_signal(temp_dir.path()));
+    }
+
+    // --- cleanup_worktree_after_prd tests ---
+
+    /// Helper: initialize a temporary git repo with an initial commit.
+    fn init_test_repo_for_batch() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().expect("create temp dir");
+        let repo = tmp.path().to_path_buf();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        fs::write(repo.join("README.md"), "# Test").expect("write README");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git commit");
+        (tmp, repo)
+    }
+
+    #[test]
+    fn test_cleanup_keep_worktrees_flag_preserves_worktree() {
+        // When keep_worktrees=true, cleanup should return immediately without removing anything.
+        let tmp = TempDir::new().expect("create temp dir");
+        let dummy_path = tmp.path().join("worktree");
+        fs::create_dir_all(&dummy_path).expect("create dummy dir");
+
+        // Pass keep_worktrees=true — function should return without touching path
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true);
+
+        assert!(
+            dummy_path.exists(),
+            "worktree dir should still exist when keep_worktrees=true"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_failed_prd_keeps_worktree() {
+        // When exit_code != 0, cleanup should keep the worktree regardless of yes/keep flags.
+        let tmp = TempDir::new().expect("create temp dir");
+        let dummy_path = tmp.path().join("worktree");
+        fs::create_dir_all(&dummy_path).expect("create dummy dir");
+
+        // exit_code=1 → keep worktree for debugging
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false);
+
+        assert!(
+            dummy_path.exists(),
+            "worktree dir should be kept when PRD failed (exit_code=1)"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_success_auto_yes_removes_worktree() {
+        // When exit_code=0 and yes=true, cleanup should attempt to remove the worktree.
+        let (tmp, repo) = init_test_repo_for_batch();
+
+        // Create a real worktree to remove
+        let wt_path = tmp.path().join("cleanup-wt");
+        std::process::Command::new("git")
+            .args(["branch", "feat/cleanup-test"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/cleanup-test",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        assert!(wt_path.exists(), "worktree must exist before cleanup");
+
+        // exit_code=0, yes=true → should remove
+        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false);
+
+        assert!(
+            !wt_path.exists(),
+            "worktree dir should be removed on successful PRD with yes=true"
+        );
     }
 }
