@@ -2350,6 +2350,298 @@ fn test_already_merged_learning_skipped_in_second_cluster() {
     );
 }
 
+// ── TEST-001: Additional merge_cluster edge cases ─────────────────────────────
+
+#[test]
+fn test_merge_large_cluster_5_sources_sums_all_stats_and_unions_metadata() {
+    // AC: merging 5 learnings — all stats summed, all metadata unioned
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Low,
+        Some(vec!["src/a.rs"]),
+        Some(vec!["FEAT-"]),
+        Some(vec!["E001"]),
+        Some(vec!["tag-a"]),
+        3,
+        1,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "B",
+        Confidence::Medium,
+        Some(vec!["src/b.rs"]),
+        Some(vec!["FIX-"]),
+        Some(vec!["E002"]),
+        Some(vec!["tag-b"]),
+        4,
+        2,
+    );
+    let id3 = insert_learning_full(
+        &conn,
+        "C",
+        Confidence::High,
+        Some(vec!["src/c.rs"]),
+        Some(vec!["TEST-"]),
+        Some(vec!["E003"]),
+        Some(vec!["tag-c"]),
+        5,
+        3,
+    );
+    let id4 = insert_learning_full(
+        &conn,
+        "D",
+        Confidence::Low,
+        Some(vec!["src/d.rs"]),
+        Some(vec!["REFACTOR-"]),
+        Some(vec!["E004"]),
+        None,
+        6,
+        4,
+    );
+    let id5 = insert_learning_full(
+        &conn,
+        "E",
+        Confidence::Medium,
+        Some(vec!["src/e.rs"]),
+        Some(vec!["FEAT-"]), // duplicate with id1
+        Some(vec!["E005"]),
+        Some(vec!["tag-a"]), // duplicate with id1
+        7,
+        5,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2, id3, id4, id5],
+        merged_title: "Big Merge".to_string(),
+        merged_content: "Merged from 5 sources".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster 5 sources");
+
+    // All 5 sources retired
+    assert_eq!(
+        result.retired_source_ids.len(),
+        5,
+        "all 5 sources must be retired"
+    );
+    assert!(result.skipped_source_ids.is_empty(), "no skipped sources");
+
+    // Stats summed: 3+4+5+6+7=25 shown, 1+2+3+4+5=15 applied
+    let shown = get_learning_col_i32(&conn, result.merged_learning_id, "times_shown");
+    let applied = get_learning_col_i32(&conn, result.merged_learning_id, "times_applied");
+    assert_eq!(shown, 25, "times_shown must be sum of all 5 sources");
+    assert_eq!(applied, 15, "times_applied must be sum of all 5 sources");
+
+    // Metadata union: deduplicated
+    let files = parse_json_array_col(&conn, result.merged_learning_id, "applies_to_files");
+    assert_eq!(
+        files,
+        vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs"]
+    );
+
+    let task_types =
+        parse_json_array_col(&conn, result.merged_learning_id, "applies_to_task_types");
+    assert_eq!(task_types, vec!["FEAT-", "FIX-", "REFACTOR-", "TEST-"]);
+
+    let errors = parse_json_array_col(&conn, result.merged_learning_id, "applies_to_errors");
+    assert_eq!(errors, vec!["E001", "E002", "E003", "E004", "E005"]);
+
+    // Tags deduped: tag-a appears in id1 and id5 — must appear once
+    let tags = get_tags(&conn, result.merged_learning_id);
+    assert_eq!(tags, vec!["tag-a", "tag-b", "tag-c"]);
+
+    // Highest confidence (High from id3)
+    let confidence = get_learning_col_str(&conn, result.merged_learning_id, "confidence")
+        .expect("confidence must exist");
+    assert_eq!(confidence, "high");
+}
+
+#[test]
+fn test_merge_all_null_metadata_produces_null_fields() {
+    // AC: when ALL sources have NULL metadata, merged learning has NULL fields (not empty arrays)
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 2, 1);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 3, 2);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "All Null Merge".to_string(),
+        merged_content: "No metadata".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster all-null");
+
+    // All metadata fields must be NULL, not empty arrays
+    let files = get_learning_col_str(&conn, result.merged_learning_id, "applies_to_files");
+    let task_types =
+        get_learning_col_str(&conn, result.merged_learning_id, "applies_to_task_types");
+    let errors = get_learning_col_str(&conn, result.merged_learning_id, "applies_to_errors");
+
+    assert!(
+        files.is_none(),
+        "applies_to_files must be NULL (not '[]') when all sources are NULL"
+    );
+    assert!(
+        task_types.is_none(),
+        "applies_to_task_types must be NULL (not '[]') when all sources are NULL"
+    );
+    assert!(
+        errors.is_none(),
+        "applies_to_errors must be NULL (not '[]') when all sources are NULL"
+    );
+}
+
+#[test]
+fn test_merge_confidence_medium_plus_high_gives_high() {
+    // AC: confidence ordering edge case — medium + high = high
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::High, None, None, None, None, 0, 0);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let confidence = get_learning_col_str(&conn, result.merged_learning_id, "confidence")
+        .expect("confidence must exist");
+    assert_eq!(confidence, "high", "medium + high = high");
+}
+
+#[test]
+fn test_merge_confidence_low_plus_low_gives_low() {
+    // AC: confidence ordering edge case — low + low = low
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Low, None, None, None, None, 0, 0);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let confidence = get_learning_col_str(&conn, result.merged_learning_id, "confidence")
+        .expect("confidence must exist");
+    assert_eq!(confidence, "low", "low + low = low");
+}
+
+#[test]
+fn test_merge_outcome_is_pattern_not_computed_from_sources() {
+    // AC: merged outcome is "pattern" (LLM-proposed default), not computed from source outcomes
+    // Even if sources have failure/success/workaround outcomes, merge always uses pattern
+    let (_dir, conn) = setup_db();
+
+    // Insert with non-pattern outcomes via raw SQL after creation
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    conn.execute(
+        "UPDATE learnings SET outcome = 'failure' WHERE id = ?1",
+        [id1],
+    )
+    .expect("set outcome to failure");
+    conn.execute(
+        "UPDATE learnings SET outcome = 'success' WHERE id = ?1",
+        [id2],
+    )
+    .expect("set outcome to success");
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let outcome = get_learning_col_str(&conn, result.merged_learning_id, "outcome")
+        .expect("outcome must exist");
+    assert_eq!(
+        outcome, "pattern",
+        "merged outcome must be 'pattern', not derived from source outcomes"
+    );
+}
+
+#[test]
+fn test_merge_root_cause_and_solution_not_propagated() {
+    // AC: root_cause and solution from sources are NOT propagated to merged learning
+    // The merged content captures this information instead.
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    // Set root_cause and solution on source learnings
+    conn.execute(
+        "UPDATE learnings SET root_cause = 'Source root cause A', solution = 'Source solution A' WHERE id = ?1",
+        [id1],
+    )
+    .expect("set root_cause/solution on id1");
+    conn.execute(
+        "UPDATE learnings SET root_cause = 'Source root cause B', solution = 'Source solution B' WHERE id = ?1",
+        [id2],
+    )
+    .expect("set root_cause/solution on id2");
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "Merged content captures root cause and solution".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let root_cause = get_learning_col_str(&conn, result.merged_learning_id, "root_cause");
+    let solution = get_learning_col_str(&conn, result.merged_learning_id, "solution");
+    assert!(
+        root_cause.is_none(),
+        "root_cause must be NULL on merged learning (not propagated from sources)"
+    );
+    assert!(
+        solution.is_none(),
+        "solution must be NULL on merged learning (not propagated from sources)"
+    );
+}
+
+#[test]
+fn test_merge_created_at_is_now_not_copied_from_sources() {
+    // AC: merged learning has created_at set to now, not copied from oldest source
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+
+    // Age both sources by 100 days
+    set_age_days(&conn, id1, 100);
+    set_age_days(&conn, id2, 100);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    // Merged learning's created_at must be recent (within the last minute), not 100 days ago.
+    // We measure age using the same julianday approach as the retirement criteria.
+    let age_days: f64 = conn
+        .query_row(
+            "SELECT julianday('now') - julianday(created_at) FROM learnings WHERE id = ?1",
+            [result.merged_learning_id],
+            |row| row.get(0),
+        )
+        .expect("query merged created_at age");
+
+    assert!(
+        age_days < 1.0,
+        "merged learning created_at must be recent (< 1 day old), not copied from 100-day-old sources; age={age_days:.3}"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // TEST-INIT-002: dedup LLM prompt building and response parsing
 //
