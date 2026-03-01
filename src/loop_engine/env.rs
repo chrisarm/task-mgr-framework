@@ -460,6 +460,17 @@ pub fn ensure_worktree(
     Ok(worktree_path)
 }
 
+/// Remove a git worktree, skipping dirty worktrees.
+///
+/// Returns `Ok(true)` if the worktree was removed, `Ok(false)` if skipped due to
+/// uncommitted changes, and `Err` if the path does not exist or git commands fail.
+///
+/// After removal, if the parent directory is empty (no other worktrees remain),
+/// it is also removed.
+pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResult<bool> {
+    todo!("FEAT-001: implement remove_worktree — project_root={project_root:?}, worktree_path={worktree_path:?}")
+}
+
 /// Ensure the working directory is on the correct git branch.
 ///
 /// If the current branch doesn't match `branch_name`:
@@ -2056,5 +2067,206 @@ detached
         let result = is_inside_worktree(&wt_path);
         assert!(result.is_ok());
         assert!(result.unwrap(), "Worktree should be detected as worktree");
+    }
+
+    // --- TEST-INIT-001: remove_worktree() and early exit cleanup ---
+
+    #[test]
+    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    fn test_remove_worktree_clean_returns_true_and_path_removed() {
+        let tmp = setup_git_repo();
+
+        // Create a worktree to remove
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/cleanup-me", true).expect("create worktree");
+        assert!(wt_path.exists(), "Worktree should exist before removal");
+
+        let result = remove_worktree(tmp.path(), &wt_path);
+        assert!(
+            result.is_ok(),
+            "remove_worktree on clean worktree should return Ok: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "remove_worktree on clean worktree should return Ok(true)"
+        );
+        assert!(
+            !wt_path.exists(),
+            "Worktree path should no longer exist after removal"
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    fn test_remove_worktree_dirty_returns_false_and_path_preserved() {
+        let tmp = setup_git_repo();
+
+        // Create a worktree
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/dirty-wt", true).expect("create worktree");
+
+        // Dirty the worktree
+        fs::write(wt_path.join("dirty.txt"), "uncommitted content").expect("write dirty file");
+
+        let result = remove_worktree(tmp.path(), &wt_path);
+        assert!(
+            result.is_ok(),
+            "remove_worktree on dirty worktree should return Ok (skip with warning): {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "remove_worktree on dirty worktree should return Ok(false)"
+        );
+        assert!(
+            wt_path.exists(),
+            "Dirty worktree path should still exist (was skipped)"
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    fn test_remove_worktree_removes_empty_parent_dir() {
+        let tmp = setup_git_repo();
+
+        // Create a single worktree (will be the only one in the parent dir)
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/last-wt", true).expect("create worktree");
+        let parent = wt_path
+            .parent()
+            .expect("worktree has parent dir")
+            .to_path_buf();
+        assert!(parent.exists(), "Parent dir should exist");
+
+        // Remove the only worktree — parent should be removed too (now empty)
+        let result = remove_worktree(tmp.path(), &wt_path).expect("remove_worktree should succeed");
+        assert!(result, "Should have removed the worktree");
+
+        assert!(
+            !parent.exists(),
+            "Empty parent dir should be removed after last worktree is gone: {:?}",
+            parent
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    fn test_remove_worktree_non_empty_parent_dir_preserved() {
+        let tmp = setup_git_repo();
+
+        // Create two worktrees in the same parent dir
+        let wt1 = ensure_worktree(tmp.path(), "feature/wt-alpha", true).expect("create wt1");
+        let wt2 = ensure_worktree(tmp.path(), "feature/wt-beta", true).expect("create wt2");
+
+        let parent = wt1.parent().expect("wt1 has parent").to_path_buf();
+        assert_eq!(
+            wt1.parent().unwrap(),
+            wt2.parent().unwrap(),
+            "Both worktrees should share a parent dir"
+        );
+
+        // Remove only one — parent should NOT be removed (wt2 still there)
+        let result = remove_worktree(tmp.path(), &wt1).expect("remove wt1");
+        assert!(result, "Should have removed wt1");
+
+        assert!(
+            parent.exists(),
+            "Parent dir should NOT be removed when other worktrees remain"
+        );
+        assert!(wt2.exists(), "wt2 should still exist");
+    }
+
+    // Known-bad discriminator: non-existent path is an error, not Ok(true)
+    #[test]
+    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    fn test_remove_worktree_non_existent_path_returns_error() {
+        let tmp = setup_git_repo();
+
+        let nonexistent = tmp.path().join("does-not-exist");
+        assert!(!nonexistent.exists(), "Path should not exist for this test");
+
+        let result = remove_worktree(tmp.path(), &nonexistent);
+        assert!(
+            result.is_err(),
+            "remove_worktree with non-existent path should return Err, not Ok(true): {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-002: ensure_worktree cleanup on failure not yet implemented"]
+    fn test_ensure_worktree_cleans_up_empty_parent_on_git_add_failure() {
+        // When git worktree add fails after creating the parent dir,
+        // ensure_worktree should remove the empty parent dir (not leave orphan dirs).
+        //
+        // To trigger git worktree add failure: request a branch that is already
+        // checked out in the main repo (git refuses to add it as a worktree).
+        let tmp = setup_git_repo();
+
+        // 'main' is already checked out in tmp — git worktree add for 'main' should fail
+        // The parent dir for the worktree would be created before the git add call.
+        // After failure, that empty parent should be cleaned up.
+        let wt_path = compute_worktree_path(tmp.path(), "main");
+        let parent = wt_path.parent().expect("has parent").to_path_buf();
+
+        let result = ensure_worktree(tmp.path(), "main", true);
+        // git worktree add for an already-checked-out branch fails
+        assert!(
+            result.is_err(),
+            "ensure_worktree for already-checked-out branch should fail"
+        );
+
+        // Parent dir must not be left as an orphan
+        assert!(
+            !parent.exists(),
+            "Empty parent dir should be cleaned up after git worktree add failure: {:?}",
+            parent
+        );
+    }
+
+    #[test]
+    #[ignore = "FEAT-002: ensure_worktree prune on failure not yet implemented"]
+    fn test_ensure_worktree_runs_git_prune_on_partial_failure() {
+        // When git worktree add creates a partial entry then fails, ensure_worktree
+        // should call `git worktree prune` so stale entries don't accumulate.
+        //
+        // This is difficult to trigger deterministically (requires a mid-operation
+        // failure). The test validates the behavior via state inspection: after a
+        // forced failure, `git worktree list` should not contain stale entries.
+        let tmp = setup_git_repo();
+
+        // Simulate partial failure: create the worktree directory manually,
+        // then try to add a worktree at that path. git will fail because the dir exists.
+        let wt_path = compute_worktree_path(tmp.path(), "feature/prune-test");
+        let parent = wt_path.parent().expect("has parent");
+        fs::create_dir_all(&wt_path).expect("create dir to cause conflict");
+
+        let result = ensure_worktree(tmp.path(), "feature/prune-test", true);
+        assert!(
+            result.is_err(),
+            "ensure_worktree should fail when directory already exists"
+        );
+
+        // After failure, run git worktree list and verify no stale entry for the path
+        let list_output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git worktree list");
+        let list_str = String::from_utf8_lossy(&list_output.stdout);
+
+        // The failed worktree should not appear in the list (prune was called)
+        let wt_str = wt_path.to_string_lossy();
+        assert!(
+            !list_str.contains(wt_str.as_ref()),
+            "Stale worktree entry should be pruned after partial failure, got list: {}",
+            list_str
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(parent);
     }
 }
