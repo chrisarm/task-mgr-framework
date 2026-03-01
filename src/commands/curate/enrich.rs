@@ -5,9 +5,14 @@
 //!
 //! NOTE: `parse_enrich_response` is a stub deferred to FEAT-005.
 
-use crate::commands::curate::types::EnrichProposal;
-use crate::learnings::EditLearningParams;
+use rusqlite::Connection;
+
+use crate::commands::curate::types::{EnrichCandidate, EnrichParams, EnrichProposal, EnrichResult};
+use crate::learnings::{edit_learning, get_learning, get_learning_tags, EditLearningParams};
+use crate::loop_engine::claude;
 use crate::TaskMgrResult;
+
+use super::{find_enrichment_candidates, types::EnrichFieldFilter};
 
 /// Raw LLM response object before mapping to `EnrichProposal`.
 #[derive(serde::Deserialize)]
@@ -175,6 +180,188 @@ pub fn proposal_to_edit_params(
         Some(params)
     } else {
         None
+    }
+}
+
+/// Orchestrates the full enrich workflow: query candidates, batch, call LLM, apply proposals.
+///
+/// - Short-circuits with empty result when there are no candidates (no LLM call).
+/// - Prints batch progress to stderr: "Processing batch N/M...".
+/// - Continues to next batch on LLM failure (best-effort).
+/// - Per-batch transactions: a transaction failure increments `llm_errors` and continues.
+/// - `dry_run=true`: generates proposals but makes no DB changes.
+pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<EnrichResult> {
+    let candidates = find_enrichment_candidates(conn, &params)?;
+    let total_candidates = candidates.len();
+
+    let field_filter = params.field_filter.as_ref().map(|f| match f {
+        EnrichFieldFilter::AppliesToFiles => "applies_to_files".to_string(),
+        EnrichFieldFilter::AppliesToTaskTypes => "applies_to_task_types".to_string(),
+        EnrichFieldFilter::AppliesToErrors => "applies_to_errors".to_string(),
+    });
+
+    if total_candidates == 0 {
+        return Ok(EnrichResult {
+            dry_run: params.dry_run,
+            field_filter,
+            total_candidates: 0,
+            batches_processed: 0,
+            learnings_enriched: 0,
+            llm_errors: 0,
+            proposals: Vec::new(),
+        });
+    }
+
+    let batch_size = params.batch_size.max(1);
+    let total_batches = candidates.len().div_ceil(batch_size);
+
+    let mut all_proposals: Vec<EnrichProposal> = Vec::new();
+    let mut learnings_enriched: usize = 0;
+    let mut llm_errors: usize = 0;
+    let mut batches_processed: usize = 0;
+
+    for (batch_idx, chunk) in candidates.chunks(batch_size).enumerate() {
+        eprintln!("Processing batch {}/{}...", batch_idx + 1, total_batches);
+
+        let batch_items = build_batch_items(conn, chunk)?;
+        if batch_items.is_empty() {
+            continue;
+        }
+
+        let batch_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
+        let prompt = build_enrich_prompt(&batch_items);
+
+        let claude_result = match claude::spawn_claude(&prompt, None, None, None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "Warning: LLM call failed for batch {}/{}: {}",
+                    batch_idx + 1,
+                    total_batches,
+                    e
+                );
+                llm_errors += 1;
+                continue;
+            }
+        };
+
+        if claude_result.exit_code != 0 {
+            eprintln!(
+                "Warning: Claude exited with code {} for batch {}/{}",
+                claude_result.exit_code,
+                batch_idx + 1,
+                total_batches
+            );
+            llm_errors += 1;
+            continue;
+        }
+
+        batches_processed += 1;
+
+        let mut proposals = parse_enrich_response(&claude_result.output, &batch_ids)?;
+
+        // Fill in learning_title (not present in LLM response)
+        for proposal in &mut proposals {
+            if let Some(item) = batch_items.iter().find(|i| i.id == proposal.learning_id) {
+                proposal.learning_title = item.title.clone();
+            }
+        }
+
+        if !params.dry_run && !proposals.is_empty() {
+            let enriched = apply_proposals_in_transaction(conn, &proposals);
+            match enriched {
+                Ok(n) => learnings_enriched += n,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: batch {}/{} transaction failed: {}",
+                        batch_idx + 1,
+                        total_batches,
+                        e
+                    );
+                    llm_errors += 1;
+                }
+            }
+        }
+
+        all_proposals.extend(proposals);
+    }
+
+    Ok(EnrichResult {
+        dry_run: params.dry_run,
+        field_filter,
+        total_candidates,
+        batches_processed,
+        learnings_enriched,
+        llm_errors,
+        proposals: all_proposals,
+    })
+}
+
+/// Fetches full learning content for each candidate to build LLM batch items.
+/// Silently skips candidates whose learning no longer exists.
+fn build_batch_items(
+    conn: &Connection,
+    chunk: &[EnrichCandidate],
+) -> TaskMgrResult<Vec<EnrichBatchItem>> {
+    let mut items = Vec::new();
+    for candidate in chunk {
+        let Some(learning) = get_learning(conn, candidate.id)? else {
+            continue;
+        };
+        let existing_tags = get_learning_tags(conn, candidate.id).unwrap_or_default();
+        items.push(EnrichBatchItem {
+            id: candidate.id,
+            title: candidate.title.clone(),
+            content: learning.content,
+            existing_tags,
+        });
+    }
+    Ok(items)
+}
+
+/// Applies a slice of proposals within a single transaction.
+/// Returns the number of learnings actually enriched.
+/// On any error, rolls back the transaction and propagates the error.
+fn apply_proposals_in_transaction(
+    conn: &Connection,
+    proposals: &[EnrichProposal],
+) -> TaskMgrResult<usize> {
+    conn.execute("BEGIN", [])?;
+    let result: TaskMgrResult<usize> = (|| {
+        let mut enriched = 0usize;
+        for proposal in proposals {
+            let Some(learning) = get_learning(conn, proposal.learning_id)? else {
+                continue;
+            };
+            let current_files = learning.applies_to_files.as_deref();
+            let current_task_types = learning.applies_to_task_types.as_deref();
+            let current_errors = learning.applies_to_errors.as_deref();
+            let existing_tags = get_learning_tags(conn, proposal.learning_id).unwrap_or_default();
+            let has_tags = !existing_tags.is_empty();
+
+            if let Some(edit_params) = proposal_to_edit_params(
+                current_files,
+                current_task_types,
+                current_errors,
+                has_tags,
+                proposal,
+            ) {
+                edit_learning(conn, proposal.learning_id, edit_params)?;
+                enriched += 1;
+            }
+        }
+        Ok(enriched)
+    })();
+
+    match result {
+        Ok(n) => {
+            conn.execute("COMMIT", [])?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
     }
 }
 
