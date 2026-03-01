@@ -587,6 +587,56 @@
       "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-1-001",
+      "title": "Extract shared LLM JSON parsing utilities (extract_json_array, find_matching_bracket)",
+      "description": "extract_json_array() and find_matching_bracket() are duplicated verbatim between extraction.rs (lines 108-176) and enrich.rs (lines 370-434). The enrich.rs copy even acknowledges this in a comment. Phase 3 dedup will likely need the same parsing, making this a 3-way duplication risk. Extract both functions to a shared module (e.g. src/llm/json_parsing.rs or src/utils/json.rs), make pub(crate), and import in both extraction.rs and enrich.rs.",
+      "acceptanceCriteria": [
+        "extract_json_array and find_matching_bracket exist in exactly one location (shared module)",
+        "extraction.rs imports and uses the shared functions",
+        "enrich.rs imports and uses the shared functions",
+        "All existing tests pass unchanged",
+        "cargo check + clippy + fmt clean"
+      ],
+      "priority": 18,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "~65 lines of identical code. Both functions are private in extraction.rs, private in enrich.rs. Move to a shared location and make pub(crate). Consider placing under src/llm/ since these are LLM response parsing utilities, or under src/utils/ if a more generic location is preferred.",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs",
+        "src/learnings/ingestion/extraction.rs"
+      ],
+      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-1-002",
+      "title": "Extract batch processing loop from curate_enrich into helper function",
+      "description": "curate_enrich() in enrich.rs is ~105 lines (193-298), well over the 30-line guideline. The batch loop body (lines 234-287) handles LLM call, error recovery, parsing, title backfill, and transaction application. Extract this into a process_single_batch() helper to improve readability and testability.",
+      "acceptanceCriteria": [
+        "curate_enrich() is under 40 lines (orchestration only)",
+        "New helper function handles single-batch processing",
+        "All existing tests pass unchanged",
+        "cargo check + clippy + fmt clean"
+      ],
+      "priority": 19,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "The function is already partially decomposed (build_batch_items, apply_proposals_in_transaction). The remaining batch loop body could be extracted to process_single_batch(conn, batch_items, dry_run) -> (Vec<EnrichProposal>, usize enriched, usize errors). Note: edit_learning's repetitive field handling (3x identical add/remove/serialize pattern) is pre-existing and intentionally explicit — not worth abstracting for 3 uses.",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs"
+      ],
+      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "synergyWith": ["REFACTOR-1-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
       "id": "MILESTONE-1",
       "title": "Phase 2 implementation complete: enrich working, FR-006 done",
       "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
@@ -609,7 +659,7 @@
       "passes": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "REFACTOR-1-001", "REFACTOR-1-002"],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],

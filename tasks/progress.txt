@@ -385,6 +385,16 @@
 - **Learnings:** Stub function with todo!() + #[ignore] tests is the right pattern for TDD stubs — tests compile and are tracked but don't break CI
 ---
 
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-1
+- Reviewed enrich.rs, extraction.rs, update.rs for DRY, complexity, coupling, maintainability
+- **Issue 1 (REFACTOR-1-001)**: `extract_json_array()` + `find_matching_bracket()` duplicated verbatim (~65 lines) between extraction.rs and enrich.rs. Extract to shared module.
+- **Issue 2 (REFACTOR-1-002)**: `curate_enrich()` is ~105 lines, well over 30-line guideline. Extract batch loop body to helper.
+- **Not flagged**: `edit_learning()` repetitive field handling (3x add/remove/serialize pattern) — pre-existing, intentionally explicit, not worth abstracting for 3 uses.
+- **No coupling issues**: enrich module uses public CRUD API cleanly.
+- **Extensibility**: Phase 3 dedup will benefit from shared JSON parsing (REFACTOR-1-001).
+- **Learnings:** Verbatim duplication with an acknowledging comment ("mirrors extraction.rs logic") is a clear signal to extract — the author already knew it should be shared.
+---
+
 ## 2026-03-01 - ef543206-CODE-REVIEW-1
 - Reviewed all 9 files for quality, security, and integration wiring
 - **unwrap() audit**: No unwrap() in production code — only in #[cfg(test)] modules. PASS
