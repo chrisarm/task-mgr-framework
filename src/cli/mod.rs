@@ -20,7 +20,7 @@ pub mod enums;
 mod tests;
 
 // Re-export commonly used types at the module level for convenience
-pub use commands::{Commands, MigrateAction, RunAction};
+pub use commands::{Commands, MigrateAction, RunAction, WorktreesAction};
 pub use enums::{
     Confidence, FailStatus, LearningOutcome, OutputFormat, RunEndStatus, Shell, TaskStatusFilter,
 };

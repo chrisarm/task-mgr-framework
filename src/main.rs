@@ -8,14 +8,15 @@ use std::process;
 
 use clap::Parser;
 
-use task_mgr::cli::{Cli, Commands, MigrateAction, RunAction};
+use task_mgr::cli::{Cli, Commands, MigrateAction, RunAction, WorktreesAction};
 use task_mgr::commands::{
     apply_learning, auto_unblock_all, begin, complete, count_resettable_tasks, doctor, end, export,
     fail, format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
     get_reviewable_tasks, history, history_detail, import_learnings, init, irrelevant, learn, list,
     list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
-    reset_all_tasks, reset_tasks, show, skip, stats, unblock, unskip, update, LearnParams,
-    LearningsListParams, RecallCmdParams, ReviewOptions,
+    reset_all_tasks, reset_tasks, show, skip, stats, unblock, unskip, update, worktrees_list,
+    worktrees_prune, worktrees_remove, LearnParams, LearningsListParams, RecallCmdParams,
+    ReviewOptions,
 };
 use task_mgr::db::{open_connection, LockGuard};
 use task_mgr::handlers::{
@@ -689,6 +690,25 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         Commands::Archive { dry_run } => {
             let result = task_mgr::loop_engine::archive::run_archive(&cli.dir, dry_run)?;
             output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Worktrees { action } => {
+            let project_root = get_project_root()?;
+            match action {
+                WorktreesAction::List => {
+                    let result = worktrees_list(&cli.dir, &project_root)?;
+                    output_result(&result, cli.format);
+                }
+                WorktreesAction::Prune => {
+                    let result = worktrees_prune(&cli.dir, &project_root)?;
+                    output_result(&result, cli.format);
+                }
+                WorktreesAction::Remove { target } => {
+                    let result = worktrees_remove(&cli.dir, &project_root, &target)?;
+                    output_result(&result, cli.format);
+                }
+            }
             Ok(())
         }
 

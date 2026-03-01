@@ -761,6 +761,12 @@ EXAMPLES:
         run_id: Option<String>,
     },
 
+    /// Manage git worktrees (list, prune, remove)
+    Worktrees {
+        #[command(subcommand)]
+        action: WorktreesAction,
+    },
+
     /// Generate man pages for task-mgr and all subcommands
     #[command(after_help = "\
 EXAMPLES:
@@ -811,6 +817,22 @@ GENERATED MAN PAGES:
         /// List all available man page names without generating
         #[arg(long, default_value_t = false)]
         list: bool,
+    },
+}
+
+/// Worktrees subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum WorktreesAction {
+    /// List all git worktrees with branch, path, and lock status
+    List,
+
+    /// Remove unlocked worktrees (skips locked and dirty)
+    Prune,
+
+    /// Remove a specific worktree by path or branch name
+    Remove {
+        /// Path or branch name of the worktree to remove
+        target: String,
     },
 }
 

@@ -26,11 +26,12 @@ use crate::commands::{
     format_learn_text, format_learnings_text, format_list_text, format_migrate_text,
     format_next_text, format_recall_text, format_reset_text, format_review_text, format_show_text,
     format_skip_text, format_stats_text, format_status_text, format_unblock_text,
-    format_unskip_text, format_update_text, ApplyLearningResult, BeginResult, CompleteResult,
-    DoctorResult, EndResult, ExportResult, FailResult, HistoryResult, ImportLearningsResult,
-    InitResult, IrrelevantResult, LearnResult, LearningsListResult, ListResult, MigrateResult,
-    NextResult, RecallCmdResult, ResetResult, ReviewResult, RunDetailResult, ShowResult,
-    SkipResult, StatsResult, StatusResult, UnblockResult, UnskipResult, UpdateResult,
+    format_unskip_text, format_update_text, format_worktrees_text, ApplyLearningResult,
+    BeginResult, CompleteResult, DoctorResult, EndResult, ExportResult, FailResult, HistoryResult,
+    ImportLearningsResult, InitResult, IrrelevantResult, LearnResult, LearningsListResult,
+    ListResult, MigrateResult, NextResult, RecallCmdResult, ResetResult, ReviewResult,
+    RunDetailResult, ShowResult, SkipResult, StatsResult, StatusResult, UnblockResult,
+    UnskipResult, UpdateResult, WorktreesResult,
 };
 use crate::learnings::{
     format_delete_text, format_edit_text, DeleteLearningResult, EditLearningResult,
@@ -89,6 +90,7 @@ impl_text_formattable!(DeleteLearningResult, format_delete_text);
 impl_text_formattable!(EditLearningResult, format_edit_text);
 impl_text_formattable!(ReviewResult, format_review_text);
 impl_text_formattable!(StatusResult, format_status_text);
+impl_text_formattable!(WorktreesResult, format_worktrees_text);
 impl_text_formattable!(
     crate::loop_engine::archive::ArchiveResult,
     crate::loop_engine::archive::format_text

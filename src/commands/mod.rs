@@ -44,6 +44,7 @@ pub mod show;
 pub mod skip;
 pub mod stats;
 pub mod unblock;
+pub mod worktrees;
 
 pub use apply_learning::{
     apply_learning, format_text as format_apply_learning_text, ApplyLearningResult,
@@ -111,6 +112,10 @@ pub use stats::{
 };
 pub use unblock::{
     format_unblock_text, format_unskip_text, unblock, unskip, UnblockResult, UnskipResult,
+};
+pub use worktrees::{
+    format_text as format_worktrees_text, list as worktrees_list, prune as worktrees_prune,
+    remove as worktrees_remove, WorktreesResult,
 };
 
 /// Truncate a string to at most `max_chars` Unicode characters, appending "..." if truncated.
