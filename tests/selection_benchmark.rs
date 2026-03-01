@@ -154,6 +154,7 @@ fn test_benchmark_task_selection_200_tasks() {
             &conn,
             &["src/main.rs".to_string(), "src/lib.rs".to_string()],
             &["US-005".to_string()],
+            None,
         );
         let elapsed = start.elapsed();
         selection_times.push(elapsed);
@@ -409,7 +410,7 @@ fn test_benchmark_worst_case_all_todo() {
     let start = Instant::now();
     let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
     let result =
-        task_mgr::commands::next::select_next_task(&conn, &["src/file_0.rs".to_string()], &[]);
+        task_mgr::commands::next::select_next_task(&conn, &["src/file_0.rs".to_string()], &[], None);
     let elapsed = start.elapsed();
 
     println!("\n=== Worst Case Benchmark (200 todo tasks, chain dependencies) ===");
@@ -461,7 +462,7 @@ fn test_benchmark_many_files_overlap() {
 
     let start = Instant::now();
     let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
-    let result = task_mgr::commands::next::select_next_task(&conn, &after_files, &[]);
+    let result = task_mgr::commands::next::select_next_task(&conn, &after_files, &[], None);
     let elapsed = start.elapsed();
 
     println!("\n=== Many Files Overlap Benchmark ===");

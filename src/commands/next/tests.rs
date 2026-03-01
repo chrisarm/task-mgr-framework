@@ -59,7 +59,7 @@ mod selection_tests {
     fn test_select_no_tasks() {
         let (_temp_dir, conn) = setup_test_db();
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_none());
         assert_eq!(result.eligible_count, 0);
     }
@@ -69,7 +69,7 @@ mod selection_tests {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "First Task", "todo", 10);
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-001");
         assert_eq!(result.eligible_count, 1);
@@ -82,7 +82,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "High Priority", "todo", 10);
         insert_test_task(&conn, "US-003", "Medium Priority", "todo", 30);
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         // Higher priority (lower number) should be selected
@@ -96,7 +96,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Done Task", "done", 1);
         insert_test_task(&conn, "US-002", "Todo Task", "todo", 50);
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-002");
         assert_eq!(result.eligible_count, 1);
@@ -108,7 +108,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Blocked Task", "blocked", 1);
         insert_test_task(&conn, "US-002", "Todo Task", "todo", 50);
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-002");
     }
@@ -120,7 +120,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         // US-002 has higher priority but is blocked, so US-001 should be selected
         assert_eq!(result.task.unwrap().task.id, "US-001");
@@ -134,7 +134,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         // Dependency is satisfied, so US-002 should be selected
         assert_eq!(result.task.unwrap().task.id, "US-002");
@@ -147,7 +147,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         // Dependency is satisfied by irrelevant status
         assert_eq!(result.task.unwrap().task.id, "US-002");
@@ -163,7 +163,7 @@ mod selection_tests {
 
         // Pass after_files that overlap with US-001
         let after_files = vec!["src/commands/init.rs".to_string()];
-        let result = select_next_task(&conn, &after_files, &[]).unwrap();
+        let result = select_next_task(&conn, &after_files, &[], None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -186,7 +186,7 @@ mod selection_tests {
             "src/commands/init.rs".to_string(),
             "src/commands/list.rs".to_string(),
         ];
-        let result = select_next_task(&conn, &after_files, &[]).unwrap();
+        let result = select_next_task(&conn, &after_files, &[], None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -204,7 +204,7 @@ mod selection_tests {
 
         // Pass US-001 as recently completed
         let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed).unwrap();
+        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -224,7 +224,7 @@ mod selection_tests {
 
         // Pass US-001 as recently completed
         let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed).unwrap();
+        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -243,7 +243,7 @@ mod selection_tests {
         insert_test_relationship(&conn, "US-002", "US-001", "conflictsWith");
 
         let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed).unwrap();
+        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -259,7 +259,7 @@ mod selection_tests {
         insert_test_task(&conn, "FIX-001", "Batch Task", "todo", 50);
         insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         assert_eq!(task.task.id, "US-001");
@@ -274,7 +274,7 @@ mod selection_tests {
         insert_test_task(&conn, "FIX-001", "Completed Batch Task", "done", 50);
         insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
 
-        let result = select_next_task(&conn, &[], &[]).unwrap();
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         assert_eq!(task.batch_with, vec!["FIX-001"]);
@@ -294,7 +294,7 @@ mod selection_tests {
         // File overlap + synergy should overcome priority difference
         let after_files = vec!["src/main.rs".to_string()];
         let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &after_files, &recently_completed).unwrap();
+        let result = select_next_task(&conn, &after_files, &recently_completed, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -323,7 +323,7 @@ mod selection_tests {
             "src/cli.rs".to_string(),
         ];
         let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &after_files, &recently_completed).unwrap();
+        let result = select_next_task(&conn, &after_files, &recently_completed, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -400,7 +400,7 @@ mod next_command_tests {
         let (temp_dir, conn) = setup_test_db();
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], false, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         assert!(result.task.is_none());
         assert!(result.learnings.is_empty());
         assert!(result.claim.is_none());
@@ -413,7 +413,7 @@ mod next_command_tests {
         insert_test_task(&conn, "US-001", "First Task", "todo", 10);
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], false, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         assert_eq!(task.id, "US-001");
@@ -428,7 +428,7 @@ mod next_command_tests {
         insert_test_task(&conn, "US-001", "First Task", "todo", 10);
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], true, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], true, None, false, None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         assert_eq!(task.status, "in_progress"); // Claimed
@@ -456,7 +456,7 @@ mod next_command_tests {
         drop(conn);
 
         // First claim
-        let result1 = next(temp_dir.path(), &[], true, None, false).unwrap();
+        let result1 = next(temp_dir.path(), &[], true, None, false, None).unwrap();
         assert_eq!(result1.claim.unwrap().iteration, 1);
 
         // Complete first task so US-002 is next
@@ -466,7 +466,7 @@ mod next_command_tests {
         drop(conn);
 
         // Second claim
-        let result2 = next(temp_dir.path(), &[], true, None, false).unwrap();
+        let result2 = next(temp_dir.path(), &[], true, None, false, None).unwrap();
         assert_eq!(result2.claim.unwrap().iteration, 2);
     }
 
@@ -482,7 +482,7 @@ mod next_command_tests {
         .unwrap();
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], true, Some("test-run-123"), false).unwrap();
+        let result = next(temp_dir.path(), &[], true, Some("test-run-123"), false, None).unwrap();
         assert!(result.task.is_some());
         assert!(result.claim.is_some());
         let claim = result.claim.unwrap();
@@ -508,7 +508,7 @@ mod next_command_tests {
         drop(conn);
 
         // Attempt to claim with a non-existent run_id
-        let result = next(temp_dir.path(), &[], true, Some("nonexistent-run"), false);
+        let result = next(temp_dir.path(), &[], true, Some("nonexistent-run"), false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Run not found"));
     }
@@ -526,7 +526,7 @@ mod next_command_tests {
         drop(conn);
 
         // Attempt to claim with inactive run
-        let result = next(temp_dir.path(), &[], true, Some("completed-run"), false);
+        let result = next(temp_dir.path(), &[], true, Some("completed-run"), false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expected active"));
     }
@@ -537,7 +537,7 @@ mod next_command_tests {
         insert_test_task(&conn, "US-001", "First Task", "todo", 20);
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], false, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         let task = result.task.unwrap();
         assert_eq!(task.score.priority, 980); // 1000 - 20
         assert_eq!(task.score.file_overlap, 0);
@@ -554,7 +554,7 @@ mod next_command_tests {
         insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], false, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.batch_tasks, vec!["FIX-001".to_string()]);
     }
@@ -687,7 +687,7 @@ mod next_command_tests {
         drop(conn);
 
         // With verbose=true, should include top candidates
-        let result = next(temp_dir.path(), &[], false, None, true).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, true, None).unwrap();
         assert!(result.task.is_some());
         assert!(!result.top_candidates.is_empty());
         assert_eq!(result.top_candidates.len(), 3); // All 3 tasks
@@ -706,7 +706,7 @@ mod next_command_tests {
         drop(conn);
 
         // With verbose=false, top_candidates should be empty
-        let result = next(temp_dir.path(), &[], false, None, false).unwrap();
+        let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         assert!(result.task.is_some());
         assert!(result.top_candidates.is_empty());
     }

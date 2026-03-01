@@ -63,13 +63,14 @@ fn test_full_loop_cycle() {
     drop(conn);
 
     // Step 3: Get next task (using the library function)
-    // next::next(dir, after_files, claim, run_id, verbose)
+    // next::next(dir, after_files, claim, run_id, verbose, None)
     let next_result = next::next(
         temp_dir.path(),
         &[],   // no after_files
         false, // don't claim
         None,  // no run_id
         false, // not verbose
+        None,  // no task_prefix
     )
     .unwrap();
 
@@ -86,6 +87,7 @@ fn test_full_loop_cycle() {
         true, // claim
         Some(&begin_result.run_id),
         false,
+        None,
     )
     .unwrap();
 
@@ -159,6 +161,7 @@ fn test_failure_flow_with_learning() {
         true, // claim
         Some(&begin_result.run_id),
         false,
+        None,
     )
     .unwrap();
     let task = next_result.task.as_ref().expect("Should have a task");
@@ -263,6 +266,7 @@ fn test_doctor_fixes_stale_after_crash() {
         true, // claim
         Some(&begin_result.run_id),
         false,
+        None,
     )
     .unwrap();
     let task = next_result.task.as_ref().expect("Should have a task");
@@ -357,6 +361,7 @@ fn test_crash_recovery_via_export() {
         true, // claim
         Some(&begin_result.run_id),
         false,
+        None,
     )
     .unwrap();
     let task = next_result.task.as_ref().expect("Should have task");
@@ -411,6 +416,7 @@ fn test_crash_recovery_via_export() {
         false,
         None,
         false,
+        None,
     )
     .unwrap();
     assert!(
@@ -457,6 +463,7 @@ fn test_multiple_iterations_respect_dependencies() {
             true, // claim
             Some(&begin_result.run_id),
             false,
+            None,
         )
         .unwrap();
 
@@ -553,6 +560,7 @@ fn test_doctor_dry_run() {
         true, // claim
         Some(&begin_result.run_id),
         false,
+        None,
     )
     .unwrap();
     let task_id = next_result.task.as_ref().unwrap().id.clone();
@@ -643,6 +651,7 @@ fn test_full_feedback_loop_lifecycle() {
             true, // claim
             Some(&begin_result.run_id),
             false,
+            None,
         )
         .unwrap();
 
@@ -714,7 +723,7 @@ fn test_full_feedback_loop_lifecycle() {
     );
 
     // Step 5: Verify no more tasks available
-    let next_result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let next_result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
     assert!(
         next_result.task.is_none(),
         "No tasks should remain after completing all 3"

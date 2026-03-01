@@ -108,12 +108,13 @@ pub fn select_next_task(
     conn: &Connection,
     after_files: &[String],
     recently_completed: &[String],
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<SelectionResult> {
     // Get IDs of tasks that are done or irrelevant (satisfy dependencies)
-    let completed_ids = get_completed_task_ids(conn)?;
+    let completed_ids = get_completed_task_ids(conn, task_prefix)?;
 
     // Get all todo tasks
-    let todo_tasks = get_todo_tasks(conn)?;
+    let todo_tasks = get_todo_tasks(conn, task_prefix)?;
 
     // Get all relationships
     let dependencies = get_relationships_by_type(conn, "dependsOn")?;
@@ -261,27 +262,51 @@ pub fn select_next_task(
 }
 
 /// Get IDs of tasks that are done or irrelevant (can satisfy dependencies).
-fn get_completed_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE status IN ('done', 'irrelevant')")?;
+fn get_completed_task_ids(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<HashSet<String>> {
+    let like_pattern = task_prefix.map(|p| format!("{}-%", p));
+    let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match &like_pattern {
+        Some(pattern) => (
+            "SELECT id FROM tasks WHERE status IN ('done', 'irrelevant') AND id LIKE ?".to_string(),
+            vec![Box::new(pattern.clone())],
+        ),
+        None => (
+            "SELECT id FROM tasks WHERE status IN ('done', 'irrelevant')".to_string(),
+            vec![],
+        ),
+    };
+    let mut stmt = conn.prepare(&query)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let ids: Result<HashSet<String>, rusqlite::Error> =
-        stmt.query_map([], |row| row.get(0))?.collect();
+        stmt.query_map(param_refs.as_slice(), |row| row.get(0))?.collect();
     Ok(ids?)
 }
 
 /// Get all tasks with status='todo'.
-fn get_todo_tasks(conn: &Connection) -> TaskMgrResult<Vec<Task>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, description, priority, status, notes, \
+fn get_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<Vec<Task>> {
+    let like_pattern = task_prefix.map(|p| format!("{}-%", p));
+    let base = "SELECT id, title, description, priority, status, notes, \
          acceptance_criteria, review_scope, severity, source_review, \
          created_at, updated_at, started_at, completed_at, \
          last_error, error_count, \
          blocked_at_iteration, skipped_at_iteration, \
          model, difficulty, escalation_note \
-         FROM tasks WHERE status = 'todo' ORDER BY priority ASC",
-    )?;
+         FROM tasks WHERE status = 'todo'";
+    let query = match &like_pattern {
+        Some(_) => format!("{} AND id LIKE ? ORDER BY priority ASC", base),
+        None => format!("{} ORDER BY priority ASC", base),
+    };
+    let mut stmt = conn.prepare(&query)?;
+
+    let params: Vec<&dyn rusqlite::ToSql> = match &like_pattern {
+        Some(p) => vec![p as &dyn rusqlite::ToSql],
+        None => vec![],
+    };
 
     let tasks: Result<Vec<Task>, rusqlite::Error> = stmt
-        .query_map([], |row| {
+        .query_map(params.as_slice(), |row| {
             Task::try_from(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,

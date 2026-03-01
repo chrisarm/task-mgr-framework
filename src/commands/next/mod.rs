@@ -137,12 +137,13 @@ pub fn next(
     claim: bool,
     run_id: Option<&str>,
     verbose: bool,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<NextResult> {
     // Open connection once and reuse for all operations
     let conn = open_connection(dir)?;
 
     // Step 1: Run task selection
-    let selection = select_next_task(&conn, after_files, &[])?;
+    let selection = select_next_task(&conn, after_files, &[], task_prefix)?;
 
     // Build top candidates for verbose output
     let top_candidates = if verbose {

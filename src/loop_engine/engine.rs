@@ -286,20 +286,27 @@ pub fn run_iteration(
         steering_path: params.steering_path,
         verbose: params.verbose,
         default_model: params.default_model,
+        task_prefix: params.task_prefix,
     };
 
     let prompt_result = match prompt::build_prompt(&prompt_params) {
         Ok(Some(result)) => result,
         Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
-            let remaining: i64 = params
-                .conn
-                .query_row(
+            let like_pat = prefix_like_pattern(params.task_prefix);
+            let remaining: i64 = match &like_pat {
+                Some(pat) => params.conn.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
+                    [pat],
+                    |row| row.get(0),
+                ),
+                None => params.conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
                     [],
                     |row| row.get(0),
-                )
-                .unwrap_or(0);
+                ),
+            }
+            .unwrap_or(0);
             if remaining == 0 {
                 eprintln!("All tasks complete!");
                 return Ok(IterationResult {
@@ -321,12 +328,17 @@ pub fn run_iteration(
                 reconcile_passes_with_db(params.conn, prd, params.task_prefix);
             }
 
-            let recovered = params.conn
-                .execute(
+            let recovered = match &like_pat {
+                Some(pat) => params.conn.execute(
+                    "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' AND id LIKE ?",
+                    [pat],
+                ),
+                None => params.conn.execute(
                     "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
                     [],
-                )
-                .unwrap_or(0);
+                ),
+            }
+            .unwrap_or(0);
 
             if recovered > 0 {
                 eprintln!(
@@ -676,12 +688,34 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
     }
 
-    // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
+    // Step 7: Read PRD metadata for branch name, task count, and external repo
+    let prd_metadata = match read_prd_metadata(&conn) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("Error reading PRD metadata: {}", e);
+            return 1;
+        }
+    };
+    let branch_name = prd_metadata.branch_name;
+    let task_count = prd_metadata.task_count;
+    let task_prefix = prd_metadata.task_prefix;
+    let default_model = prd_metadata.default_model;
+
+    // Step 6.6 (after metadata read so we can scope by prefix):
+    // Recover stale in_progress tasks from previous crashed/killed runs.
     // Safe because we hold the exclusive loop lock — no other loop can be running.
-    match conn.execute(
-        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
-        [],
-    ) {
+    let startup_like_pat = prefix_like_pattern(task_prefix.as_deref());
+    let startup_recovery_result = match &startup_like_pat {
+        Some(pat) => conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' AND id LIKE ?",
+            [pat],
+        ),
+        None => conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
+            [],
+        ),
+    };
+    match startup_recovery_result {
         Ok(count) if count > 0 => {
             eprintln!(
                 "Recovered {} stale in_progress task(s) from previous run",
@@ -695,19 +729,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             return 1;
         }
     }
-
-    // Step 7: Read PRD metadata for branch name, task count, and external repo
-    let prd_metadata = match read_prd_metadata(&conn) {
-        Ok(meta) => meta,
-        Err(e) => {
-            eprintln!("Error reading PRD metadata: {}", e);
-            return 1;
-        }
-    };
-    let branch_name = prd_metadata.branch_name;
-    let task_count = prd_metadata.task_count;
-    let task_prefix = prd_metadata.task_prefix;
-    let default_model = prd_metadata.default_model;
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
     // This catches tasks completed in a previous run where the DB status was never
@@ -1282,14 +1303,21 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
         )
         .unwrap_or((None, None, None, None));
 
-    let task_count: usize = conn
-        .query_row(
+    let like_pat = prefix_like_pattern(task_prefix.as_deref());
+    let task_count: usize = match &like_pat {
+        Some(pat) => conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
+            [pat],
+            |row| row.get::<_, i64>(0),
+        ),
+        None => conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
             [],
             |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c as usize)
-        .unwrap_or(0);
+        ),
+    }
+    .map(|c| c as usize)
+    .unwrap_or(0);
 
     Ok(PrdMetadata {
         branch_name,
@@ -1507,17 +1535,34 @@ fn mark_task_done(
 fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Option<&str>) {
     use std::fs;
 
-    // Get all todo/in_progress task IDs from the DB
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')") {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-    let candidate_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
+    // Get all todo/in_progress task IDs from the DB (scoped by prefix)
+    let like_pat = prefix_like_pattern(task_prefix);
+    let candidate_ids: Vec<String> = match &like_pat {
+        Some(pat) => {
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND id LIKE ?",
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map([pat], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+        None => {
+            let mut stmt = match conn
+                .prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')")
+            {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stmt.query_map([], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+    };
 
     if candidate_ids.is_empty() {
         return;
@@ -1590,6 +1635,12 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
 /// e.g., `strip_task_prefix("aeb10a1f-FIX-001", Some("aeb10a1f"))` → `"FIX-001"`
 ///       `strip_task_prefix("P5.1-FIX-001", Some("P5.1"))` → `"FIX-001"`
 ///       `strip_task_prefix("FIX-001", None)` → `"FIX-001"`
+/// Build a LIKE pattern for filtering tasks by prefix: `"SS"` → `"SS-%"`.
+/// Returns `None` when no prefix is set (match all tasks).
+fn prefix_like_pattern(prefix: Option<&str>) -> Option<String> {
+    prefix.map(|p| format!("{}-%", p))
+}
+
 fn strip_task_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &'a str {
     match prefix {
         Some(pfx) => {
@@ -1636,18 +1687,34 @@ fn scan_output_for_completed_tasks(
 ) -> Vec<String> {
     let mut completed = Vec::new();
 
-    // Query all non-done task IDs
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
-            Ok(s) => s,
-            Err(_) => return completed,
-        };
-
-    let task_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
+    // Query all non-done task IDs (scoped by prefix)
+    let like_pat = prefix_like_pattern(task_prefix);
+    let task_ids: Vec<String> = match &like_pat {
+        Some(pat) => {
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
+            ) {
+                Ok(s) => s,
+                Err(_) => return completed,
+            };
+            stmt.query_map([pat], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+        None => {
+            let mut stmt = match conn
+                .prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')")
+            {
+                Ok(s) => s,
+                Err(_) => return completed,
+            };
+            stmt.query_map([], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+    };
 
     for task_id in task_ids {
         if check_output_for_task_completion(output, &task_id, task_prefix) {
@@ -1718,23 +1785,40 @@ fn reconcile_external_git_completions(
     // to prevent cross-commit substring collisions.
     let commit_lines: Vec<String> = output.lines().map(|l| l.to_uppercase()).collect();
 
-    // Query all incomplete task IDs
-    let mut stmt =
-        match conn.prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-                return 0;
-            }
-        };
-
-    let task_ids: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    drop(stmt);
+    // Query all incomplete task IDs (scoped by prefix)
+    let like_pat = prefix_like_pattern(task_prefix);
+    let task_ids: Vec<String> = match &like_pat {
+        Some(pat) => {
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+                    return 0;
+                }
+            };
+            stmt.query_map([pat], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+        None => {
+            let mut stmt = match conn
+                .prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')")
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+                    return 0;
+                }
+            };
+            stmt.query_map([], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+    };
 
     let mut reconciled = 0;
 

@@ -120,7 +120,7 @@ fn test_highest_priority_task_selected_when_no_other_factors() {
     .unwrap();
 
     // Select next task without any after_files
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -186,7 +186,7 @@ fn test_file_overlap_boosts_task_selection() {
         "src/cli.rs".to_string(),
     ];
 
-    let result = next::next(temp_dir.path(), &after_files, false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &after_files, false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -249,7 +249,7 @@ fn test_dependencies_block_task_selection_until_satisfied() {
     .unwrap();
 
     // First selection: TASK-002 has higher priority but is blocked by dependency
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
     assert!(result.task.is_some());
     let task = result.task.unwrap();
     assert_eq!(
@@ -307,7 +307,7 @@ fn test_dependencies_satisfied_by_done_status() {
     .unwrap();
 
     // TASK-002 should be selected since TASK-001 is done
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
     assert!(result.task.is_some());
     let task = result.task.unwrap();
     assert_eq!(
@@ -370,7 +370,7 @@ fn test_dependencies_satisfied_by_completing_task() {
     drop(conn);
 
     // Now TASK-002 should be selected (dependency satisfied)
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
     assert!(result.task.is_some());
     let task = result.task.unwrap();
     assert_eq!(
@@ -405,7 +405,7 @@ fn test_synergy_bonus_from_recently_completed_tasks() {
     // - TASK-003 and TASK-004 are eligible (TASK-002 is done)
 
     // Get initial selection without any context
-    let result_initial = next::next(temp_dir.path(), &[], false, None, true).unwrap();
+    let result_initial = next::next(temp_dir.path(), &[], false, None, true, None).unwrap();
     assert!(result_initial.task.is_some());
 
     // Both TASK-003 and TASK-004 depend on TASK-002 and should be eligible
@@ -481,7 +481,7 @@ fn test_conflict_penalty_from_recently_completed_tasks() {
     // Let's verify the conflict penalty logic at the integration level by using
     // the internal select_next_task with recently_completed
     let conn = open_connection(temp_dir.path()).unwrap();
-    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()]).unwrap();
+    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -575,7 +575,7 @@ fn test_conflict_penalty_changes_selection() {
     // TASK-003 should win
 
     let conn = open_connection(temp_dir.path()).unwrap();
-    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()]).unwrap();
+    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -608,7 +608,7 @@ fn test_batch_tasks_included_in_output() {
     // TASK-003 depends on TASK-002 which is done (passes: true)
     // TASK-003 has batchWith: ["TASK-004"]
 
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -683,7 +683,7 @@ fn test_batch_tasks_excludes_completed_tasks() {
     )
     .unwrap();
 
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -730,7 +730,7 @@ fn test_all_tasks_done_returns_no_task() {
     )
     .unwrap();
 
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(
         result.task.is_none(),
@@ -796,7 +796,7 @@ fn test_all_tasks_blocked_returns_no_task() {
     .unwrap();
     drop(conn);
 
-    let result = next::next(temp_dir.path(), &[], false, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(
         result.task.is_none(),
@@ -870,6 +870,7 @@ fn test_combined_scoring_factors() {
         &conn,
         &["src/main.rs".to_string(), "src/lib.rs".to_string()],
         &["TASK-001".to_string()],
+        None,
     )
     .unwrap();
 
@@ -918,7 +919,7 @@ fn test_next_with_claim_updates_status() {
     .unwrap();
 
     // Select with --claim
-    let result = next::next(temp_dir.path(), &[], true, None, false).unwrap();
+    let result = next::next(temp_dir.path(), &[], true, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -968,7 +969,7 @@ fn test_verbose_output_includes_top_candidates() {
     .unwrap();
 
     // Select with verbose=true
-    let result = next::next(temp_dir.path(), &[], false, None, true).unwrap();
+    let result = next::next(temp_dir.path(), &[], false, None, true, None).unwrap();
 
     assert!(result.task.is_some());
     assert!(
