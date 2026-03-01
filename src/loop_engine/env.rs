@@ -181,7 +181,7 @@ fn sanitize_branch_name(branch_name: &str) -> String {
 /// Compute the worktree path for a given branch.
 ///
 /// Returns `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`
-fn compute_worktree_path(project_root: &Path, branch_name: &str) -> PathBuf {
+pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> PathBuf {
     let repo_name = project_root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -218,7 +218,7 @@ fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
 /// Parse the output of `git worktree list --porcelain` to find existing worktrees.
 ///
 /// Returns a list of (worktree_path, branch_name) tuples.
-fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)> {
+pub(crate) fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)> {
     let mut worktrees = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
@@ -488,7 +488,64 @@ pub fn ensure_worktree(
 /// After removal, if the parent directory is empty (no other worktrees remain),
 /// it is also removed.
 pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResult<bool> {
-    todo!("FEAT-001: implement remove_worktree — project_root={project_root:?}, worktree_path={worktree_path:?}")
+    if !worktree_path.exists() {
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "Git worktree".to_string(),
+            id: worktree_path.display().to_string(),
+            expected: "worktree path to exist".to_string(),
+            actual: "path does not exist".to_string(),
+        });
+    }
+
+    let path_str = worktree_path.to_string_lossy();
+    let output = Command::new("git")
+        .args(["worktree", "remove", path_str.as_ref()])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| {
+            TaskMgrError::io_error(
+                project_root.display().to_string(),
+                "running git worktree remove",
+                e,
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // git exits non-zero with this message when the worktree has dirty changes
+        if stderr.contains("contains modified or untracked files") {
+            eprintln!(
+                "warning: skipping removal of dirty worktree at {} (uncommitted changes)",
+                worktree_path.display()
+            );
+            return Ok(false);
+        }
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "Git worktree".to_string(),
+            id: worktree_path.display().to_string(),
+            expected: "successful worktree removal".to_string(),
+            actual: format!("git error: {}", stderr.trim()),
+        });
+    }
+
+    // Prune stale worktree metadata from git's internal tracking
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(project_root)
+        .output();
+
+    // Remove empty parent dir (the {repo}-worktrees/ container)
+    if let Some(parent) = worktree_path.parent() {
+        if parent.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(parent) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 /// Ensure the working directory is on the correct git branch.
@@ -2178,7 +2235,7 @@ detached
     // --- TEST-INIT-001: remove_worktree() and early exit cleanup ---
 
     #[test]
-    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    
     fn test_remove_worktree_clean_returns_true_and_path_removed() {
         let tmp = setup_git_repo();
 
@@ -2205,7 +2262,7 @@ detached
     }
 
     #[test]
-    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    
     fn test_remove_worktree_dirty_returns_false_and_path_preserved() {
         let tmp = setup_git_repo();
 
@@ -2234,7 +2291,7 @@ detached
     }
 
     #[test]
-    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    
     fn test_remove_worktree_removes_empty_parent_dir() {
         let tmp = setup_git_repo();
 
@@ -2259,7 +2316,7 @@ detached
     }
 
     #[test]
-    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    
     fn test_remove_worktree_non_empty_parent_dir_preserved() {
         let tmp = setup_git_repo();
 
@@ -2287,7 +2344,7 @@ detached
 
     // Known-bad discriminator: non-existent path is an error, not Ok(true)
     #[test]
-    #[ignore = "FEAT-001: remove_worktree not yet implemented"]
+    
     fn test_remove_worktree_non_existent_path_returns_error() {
         let tmp = setup_git_repo();
 
