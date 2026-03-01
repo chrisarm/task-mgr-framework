@@ -1719,3 +1719,592 @@ fn test_init_auto_prefix_dry_run_deterministic() {
         "Dry-run should produce deterministic prefix"
     );
 }
+
+// ============================================================================
+// SS-SS-TEST-INIT-004: TDD tests for upsert-by-task_prefix and scoped
+// drop_existing_data() — RED PHASE (written before implementation).
+//
+// All tests below are #[ignore]d pending:
+//   1. Migration v9 (removal of CHECK(id=1) singleton from prd_metadata)
+//   2. insert_prd_metadata returning TaskMgrResult<i64> and upserting by task_prefix
+//   3. insert_prd_file accepting a prd_id: i64 parameter
+//   4. drop_existing_data accepting prefix: Option<&str>
+// ============================================================================
+
+#[cfg(test)]
+mod scoped_import_tests {
+    use tempfile::TempDir;
+
+    use crate::commands::init::import::{drop_existing_data, insert_prd_file, insert_prd_metadata};
+    use crate::commands::init::parse::PrdFile;
+    use crate::db::open_connection;
+
+    /// Create a migrated in-memory database (all migrations including v9).
+    fn setup_migrated_db() -> (TempDir, rusqlite::Connection) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
+        crate::db::run_migrations(&mut conn).unwrap();
+        (temp_dir, conn)
+    }
+
+    /// Build a minimal PrdFile for testing.
+    fn make_prd(project: &str, task_prefix: Option<&str>) -> PrdFile {
+        PrdFile {
+            project: project.to_string(),
+            branch_name: Some("main".to_string()),
+            description: None,
+            priority_philosophy: None,
+            global_acceptance_criteria: None,
+            review_guidelines: None,
+            user_stories: vec![],
+            external_git_repo: None,
+            task_prefix: task_prefix.map(|s| s.to_string()),
+            prd_file: None,
+            model: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_prd_metadata: upsert by task_prefix, returns i64
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_insert_prd_metadata_new_prefix_returns_id() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd = make_prd("project-one", Some("P1"));
+        let id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        assert!(id > 0, "returned id must be positive");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_insert_prd_metadata_upsert_existing_prefix() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd1 = make_prd("project-original", Some("P1"));
+        let prd2 = make_prd("project-updated", Some("P1"));
+        insert_prd_metadata(&conn, &prd1, None).unwrap();
+        insert_prd_metadata(&conn, &prd2, None).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert must not create a duplicate row");
+        let project: String = conn
+            .query_row(
+                "SELECT project FROM prd_metadata WHERE task_prefix='P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, "project-updated");
+    }
+
+    #[test]
+    fn test_insert_prd_metadata_two_different_prefixes_creates_two_rows() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd1 = make_prd("project-one", Some("P1"));
+        let prd2 = make_prd("project-two", Some("P2"));
+        let id1 = insert_prd_metadata(&conn, &prd1, None).unwrap();
+        let id2 = insert_prd_metadata(&conn, &prd2, None).unwrap();
+        assert_ne!(id1, id2, "distinct prefixes must yield distinct row ids");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_prd_file: dynamic prd_id parameter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_insert_prd_file_uses_dynamic_prd_id() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd = make_prd("proj", Some("PX"));
+        let prd_id = insert_prd_metadata(&conn, &prd, None).unwrap();
+        insert_prd_file(&conn, prd_id, "tasks/prd.json", "task_list").unwrap();
+        let stored_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path='tasks/prd.json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_prd_id, prd_id,
+            "prd_id must match the value passed in, not hardcoded 1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // drop_existing_data: scoped prefix filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_drop_existing_data_scoped_deletes_only_prefix_tasks() {
+        let (_dir, conn) = setup_migrated_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+             VALUES ('P1-US-001','T1','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) \
+             VALUES ('P2-US-001','T2','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let p1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let p2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(p1, 0, "P1 tasks must be deleted");
+        assert_eq!(p2, 1, "P2 tasks must be preserved");
+    }
+
+    /// Known-bad discriminator: after inserting P1 and P2 tasks, a scoped
+    /// force-delete of P1 must leave all P2 tasks intact.
+    #[test]
+    fn test_cross_prd_force_delete_leaves_other_prd_intact() {
+        let (_dir, conn) = setup_migrated_db();
+        // Insert P1 task with file
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P1-US-001','P1T','todo',10,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_files (task_id,file_path) VALUES ('P1-US-001','a.rs')",
+            [],
+        )
+        .unwrap();
+        // Insert P2 tasks with relationship
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-001','P2T1','todo',10,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-002','P2T2','todo',20,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_relationships (task_id,related_id,rel_type) \
+             VALUES ('P2-US-002','P2-US-001','dependsOn')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let p2_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let p2_rel: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE 'P2-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p2_count, 2, "both P2 tasks must survive scoped P1 delete");
+        assert_eq!(p2_rel, 1, "P2 relationships must survive");
+    }
+
+    #[test]
+    fn test_drop_existing_data_none_prefix_wipes_everything() {
+        let (_dir, conn) = setup_migrated_db();
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P1-US-001','T1','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id,title,status,priority,acceptance_criteria) \
+             VALUES ('P2-US-001','T2','todo',1,'[]')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, None).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "None-prefix drop must wipe all tasks");
+    }
+
+    #[test]
+    fn test_drop_existing_data_scoped_preserves_learnings() {
+        let (_dir, conn) = setup_migrated_db();
+        conn.execute(
+            "INSERT INTO learnings (title, content, outcome, confidence) \
+             VALUES ('test learning', 'content', 'success', 'high')",
+            [],
+        )
+        .unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "learnings must not be deleted by scoped --force");
+    }
+
+    #[test]
+    fn test_drop_existing_data_scoped_preserves_other_prd_metadata() {
+        let (_dir, conn) = setup_migrated_db();
+        let prd1 = make_prd("proj-one", Some("P1"));
+        let prd2 = make_prd("proj-two", Some("P2"));
+        insert_prd_metadata(&conn, &prd1, None).unwrap();
+        insert_prd_metadata(&conn, &prd2, None).unwrap();
+        drop_existing_data(&conn, Some("P1")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix='P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "P2 prd_metadata must survive scoped P1 delete");
+    }
+}
+
+// ============================================================================
+// SS-SS-TEST-003: Full init() flow tests for multi-PRD import, upsert, and
+// scoped --force behavior.
+// ============================================================================
+
+mod multi_prd_import_tests {
+    use crate::commands::init::{init, PrefixMode};
+    use crate::db::open_connection;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_prd_json(task_prefix: &str, task_id: &str) -> String {
+        format!(
+            r#"{{
+                "project": "test-{task_prefix}",
+                "taskPrefix": "{task_prefix}",
+                "userStories": [
+                    {{"id": "{task_id}", "title": "Task {task_id}", "priority": 1, "passes": false}}
+                ]
+            }}"#
+        )
+    }
+
+    // AC 1: Import P1 then P2 — both prd_metadata rows must exist, and each
+    // prd_files row must link to the correct prd_id for its PRD.
+    #[test]
+    fn test_import_p1_then_p2_both_metadata_rows_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true, // append
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "importing two PRDs must create two prd_metadata rows"
+        );
+
+        let p1_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM prd_metadata WHERE task_prefix = 'P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let p2_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(p1_exists, "prd_metadata row for P1 must exist");
+        assert!(p2_exists, "prd_metadata row for P2 must exist");
+    }
+
+    // AC 1 (continued): prd_files for each PRD must link to the correct prd_id.
+    #[test]
+    fn test_import_p1_then_p2_prd_files_correct_associations() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+
+        // Retrieve the prd_id for each PRD
+        let p1_id: i64 = conn
+            .query_row(
+                "SELECT id FROM prd_metadata WHERE task_prefix = 'P1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let p2_id: i64 = conn
+            .query_row(
+                "SELECT id FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(p1_id, p2_id, "each PRD must have a distinct prd_id");
+
+        // prd_files for p1.json must link to p1_id only
+        // file_path is stored as the full path (or relative to tasks/) — use LIKE for portability
+        let p1_file_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path LIKE '%p1.json' AND file_type = 'task_list'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p1_file_prd_id, p1_id,
+            "p1.json prd_files row must link to P1's prd_id"
+        );
+
+        // prd_files for p2.json must link to p2_id only
+        let p2_file_prd_id: i64 = conn
+            .query_row(
+                "SELECT prd_id FROM prd_files WHERE file_path LIKE '%p2.json' AND file_type = 'task_list'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_file_prd_id, p2_id,
+            "p2.json prd_files row must link to P2's prd_id"
+        );
+    }
+
+    // AC 2: Import P1 twice (with --force on second import).
+    // The prd_metadata row must be updated (not duplicated), and prd_files must
+    // not be doubled.
+    #[test]
+    fn test_import_p1_twice_metadata_not_duplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        // Re-import with --force (scoped to P1)
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "re-importing P1 with --force must not duplicate prd_metadata"
+        );
+    }
+
+    #[test]
+    fn test_import_p1_twice_prd_files_not_duplicated() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |r| r.get(0))
+            .unwrap();
+
+        // Re-import with --force
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prd_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "re-importing P1 with --force must not duplicate prd_files entries"
+        );
+    }
+
+    // AC 3: After importing P1 and P2, --force P1 must delete only P1's data.
+    // P2 tasks, relationships, and prd_metadata must survive.
+    #[test]
+    fn test_force_p1_deletes_only_p1_leaves_p2_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let path1 = temp_dir.path().join("p1.json");
+        let path2 = temp_dir.path().join("p2.json");
+        fs::write(&path1, make_prd_json("P1", "US-001")).unwrap();
+        fs::write(&path2, make_prd_json("P2", "US-001")).unwrap();
+
+        // Import both PRDs
+        init(
+            temp_dir.path(),
+            &[&path1],
+            false,
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+        init(
+            temp_dir.path(),
+            &[&path2],
+            false,
+            true, // append
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        // Force re-import P1 only
+        init(
+            temp_dir.path(),
+            &[&path1],
+            true, // force
+            false,
+            false,
+            false,
+            PrefixMode::Auto,
+        )
+        .unwrap();
+
+        let conn = open_connection(temp_dir.path()).unwrap();
+
+        // P2 task must still exist
+        let p2_task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            p2_task_count, 1,
+            "P2 task must survive scoped --force of P1"
+        );
+
+        // P2 prd_metadata must still exist
+        let p2_meta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'P2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_meta_count, 1,
+            "P2 prd_metadata must survive scoped --force of P1"
+        );
+
+        // P1 task must be re-imported (force deleted then re-inserted)
+        let p1_task_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            p1_task_count, 1,
+            "P1 task must be re-imported after --force"
+        );
+    }
+}

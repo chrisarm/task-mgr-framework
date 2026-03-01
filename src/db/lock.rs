@@ -810,6 +810,93 @@ mod tests {
         );
     }
 
+    // --- Per-prefix lock file naming and concurrent acquisition tests ---
+
+    #[test]
+    fn test_lock_name_for_prefix_uses_loop_dash_prefix_dot_lock() {
+        // Verify naming convention: loop-{prefix}.lock for prefixed sessions
+        let temp_dir = TempDir::new().unwrap();
+        let expected_path = temp_dir.path().join("loop-P1.lock");
+
+        assert!(!expected_path.exists());
+
+        let guard = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock").unwrap();
+
+        assert!(expected_path.exists());
+        assert_eq!(guard.path(), expected_path);
+    }
+
+    #[test]
+    fn test_lock_name_for_none_prefix_uses_loop_dot_lock() {
+        // Verify naming convention: loop.lock when no prefix
+        let temp_dir = TempDir::new().unwrap();
+        let expected_path = temp_dir.path().join("loop.lock");
+
+        let guard = LockGuard::acquire_named(temp_dir.path(), "loop.lock").unwrap();
+
+        assert_eq!(guard.path(), expected_path);
+        assert!(expected_path.exists());
+    }
+
+    #[test]
+    fn test_concurrent_p1_and_p2_locks_both_succeed() {
+        // loop-P1.lock and loop-P2.lock are independent — both sessions can run concurrently
+        let temp_dir = TempDir::new().unwrap();
+
+        let guard_p1 = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock").unwrap();
+        let guard_p2 = LockGuard::acquire_named(temp_dir.path(), "loop-P2.lock").unwrap();
+
+        // Both lock files exist concurrently
+        assert!(temp_dir.path().join("loop-P1.lock").exists());
+        assert!(temp_dir.path().join("loop-P2.lock").exists());
+
+        // Explicitly drop to verify both clean up
+        drop(guard_p1);
+        drop(guard_p2);
+
+        assert!(!temp_dir.path().join("loop-P1.lock").exists());
+        assert!(!temp_dir.path().join("loop-P2.lock").exists());
+    }
+
+    #[test]
+    fn test_same_prd_lock_fails_with_clear_error_message() {
+        // Acquiring loop-P1.lock twice must fail with a clear "locked" error
+        let temp_dir = TempDir::new().unwrap();
+
+        let _guard = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock").unwrap();
+
+        let result = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock");
+        assert!(result.is_err(), "Second acquire for same PRD must fail");
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("locked"),
+            "Error should mention 'locked': {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_same_prd_lock_error_contains_holder_pid() {
+        // The error message should identify the holder process
+        let temp_dir = TempDir::new().unwrap();
+        let our_pid = std::process::id();
+
+        let _guard = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock").unwrap();
+
+        let result = LockGuard::acquire_named(temp_dir.path(), "loop-P1.lock");
+        assert!(result.is_err());
+
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains(&our_pid.to_string()),
+            "Error should contain holder PID {}: {}",
+            our_pid,
+            msg
+        );
+    }
+
     #[test]
     fn test_stale_lockfile_does_not_block() {
         let temp_dir = TempDir::new().unwrap();

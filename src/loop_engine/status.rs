@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::db::lock::LockGuard;
 use crate::db::open_connection;
+use crate::db::prefix::{prefix_and, prefix_where};
 use crate::TaskMgrResult;
 
 use super::DEADLINE_FILE_PREFIX;
@@ -134,7 +135,7 @@ pub fn show_status(
         .map(|s| s.to_string())
         .or_else(|| prd_file.and_then(read_task_prefix_from_prd));
 
-    let project = query_project_info(&conn)?;
+    let project = query_project_info(&conn, task_prefix.as_deref())?;
     let tasks = query_dashboard_task_counts(&conn, task_prefix.as_deref())?;
 
     let completion_percentage = if tasks.total > 0 {
@@ -194,7 +195,7 @@ pub fn show_status(
 }
 
 /// Read the `taskPrefix` field from a PRD JSON file.
-fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
+pub fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
     let content = fs::read_to_string(prd_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     json.get("taskPrefix")
@@ -203,18 +204,38 @@ fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
 }
 
 /// Query project metadata from prd_metadata table.
-fn query_project_info(conn: &Connection) -> TaskMgrResult<Option<ProjectInfo>> {
-    let result = conn.query_row(
-        "SELECT project, branch_name, description FROM prd_metadata WHERE id = 1",
-        [],
-        |row| {
-            Ok(ProjectInfo {
-                name: row.get(0)?,
-                branch: row.get(1)?,
-                description: row.get(2)?,
-            })
-        },
-    );
+///
+/// When `task_prefix` is provided, queries `WHERE task_prefix = ?` to select the
+/// matching PRD row. Falls back to `LIMIT 1 ORDER BY id ASC` when no prefix is given.
+fn query_project_info(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<Option<ProjectInfo>> {
+    let result = if let Some(prefix) = task_prefix {
+        conn.query_row(
+            "SELECT project, branch_name, description FROM prd_metadata WHERE task_prefix = ?1",
+            rusqlite::params![prefix],
+            |row| {
+                Ok(ProjectInfo {
+                    name: row.get(0)?,
+                    branch: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            },
+        )
+    } else {
+        conn.query_row(
+            "SELECT project, branch_name, description FROM prd_metadata ORDER BY id ASC LIMIT 1",
+            [],
+            |row| {
+                Ok(ProjectInfo {
+                    name: row.get(0)?,
+                    branch: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            },
+        )
+    };
 
     match result {
         Ok(info) => Ok(Some(info)),
@@ -230,7 +251,7 @@ fn query_dashboard_task_counts(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<DashboardTaskCounts> {
-    let (where_clause, like_pattern) = prefix_filter(task_prefix);
+    let (where_clause, like_pattern) = prefix_where(task_prefix);
 
     let sql = format!(
         r#"
@@ -284,22 +305,16 @@ fn query_pending_tasks(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<PendingTask>> {
-    let (where_extra, like_pattern) = prefix_filter(task_prefix);
+    let (and_clause, like_pattern) = prefix_and(task_prefix);
 
     let sql = format!(
         r#"
         SELECT id, title, priority, status
         FROM tasks
         WHERE status IN ('todo', 'in_progress', 'blocked')
-        {and_extra}
+        {and_clause}
         ORDER BY priority ASC, id ASC
         "#,
-        and_extra = if where_extra.is_empty() {
-            String::new()
-        } else {
-            // prefix_filter returns "WHERE id LIKE ?", convert to AND
-            where_extra.replacen("WHERE", "AND", 1)
-        },
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -346,17 +361,6 @@ fn query_distinct_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
 fn read_active_lock_prefix(dir: &Path) -> Option<String> {
     let lock_path = dir.join("loop.lock");
     LockGuard::read_holder_info(&lock_path).and_then(|info| info.prefix)
-}
-
-/// Build a WHERE clause and LIKE pattern for filtering tasks by prefix.
-///
-/// Returns `("WHERE id LIKE ?", Some("prefix-%"))` when a prefix is given,
-/// or `("", None)` when no filtering is needed.
-fn prefix_filter(task_prefix: Option<&str>) -> (String, Option<String>) {
-    match task_prefix {
-        Some(prefix) => ("WHERE id LIKE ?".to_string(), Some(format!("{}-%", prefix))),
-        None => (String::new(), None),
-    }
 }
 
 /// Read deadline info from .deadline-* files in the tasks directory.
@@ -1011,7 +1015,7 @@ mod tests {
     #[test]
     fn test_query_project_info_no_metadata() {
         let (_temp_dir, conn) = setup_test_db();
-        let result = query_project_info(&conn).unwrap();
+        let result = query_project_info(&conn, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -1019,7 +1023,7 @@ mod tests {
     fn test_query_project_info_with_metadata() {
         let (_temp_dir, conn) = setup_test_db();
         insert_prd_metadata(&conn, "test-proj", Some("develop"), None);
-        let result = query_project_info(&conn).unwrap();
+        let result = query_project_info(&conn, None).unwrap();
         let info = result.unwrap();
         assert_eq!(info.name, "test-proj");
         assert_eq!(info.branch.unwrap(), "develop");
@@ -1160,6 +1164,13 @@ mod tests {
     #[test]
     fn test_show_status_prefix_filter_suppresses_prd_summaries() {
         let (_temp_dir, conn) = setup_test_db();
+        // Add columns that migrations would add (test DB uses base schema only)
+        conn.execute_batch(
+            "ALTER TABLE prd_metadata ADD COLUMN task_prefix TEXT;
+             ALTER TABLE prd_metadata ADD COLUMN external_git_repo TEXT;
+             ALTER TABLE prd_metadata ADD COLUMN default_model TEXT;",
+        )
+        .unwrap();
         insert_task(&conn, "abc123-FEAT-001", "A feat", "done", 10);
         insert_task(&conn, "def456-FEAT-001", "B feat", "todo", 10);
         drop(conn);

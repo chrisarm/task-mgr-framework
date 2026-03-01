@@ -133,7 +133,7 @@ pub fn wait_for_usage_reset(wait_secs: u64, tasks_dir: &Path, fallback_wait: u64
 
     while remaining > 0 {
         // Check for stop signal
-        if signals::check_stop_signal(tasks_dir) {
+        if signals::check_stop_signal(tasks_dir, None) {
             eprintln!("Stop signal detected during usage wait. Exiting wait.");
             return false;
         }

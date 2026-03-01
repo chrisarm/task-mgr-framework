@@ -8,52 +8,121 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::db::prefix::make_like_pattern;
 use crate::models::TaskStatus;
 use crate::TaskMgrResult;
 
 use super::output::DryRunDeletePreview;
 use super::parse::{PrdFile, PrdUserStory};
 
-/// Drop all existing data from the database.
-pub fn drop_existing_data(conn: &Connection) -> TaskMgrResult<()> {
-    // Drop in correct order due to foreign keys
-    conn.execute("DELETE FROM learning_tags", [])?;
-    conn.execute("DELETE FROM learnings", [])?;
-    conn.execute("DELETE FROM run_tasks", [])?;
-    conn.execute("DELETE FROM runs", [])?;
-    conn.execute("DELETE FROM task_relationships", [])?;
-    conn.execute("DELETE FROM task_files", [])?;
-    conn.execute("DELETE FROM tasks", [])?;
-    // prd_files may not exist in pre-v6 databases
-    let _ = conn.execute("DELETE FROM prd_files", []);
-    conn.execute("DELETE FROM prd_metadata", [])?;
-    // Reset global_state but don't delete the row
-    conn.execute(
-        "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL",
-        [],
-    )?;
+/// Drop existing data from the database.
+///
+/// When `task_prefix` is `Some(prefix)`, only data belonging to that PRD prefix
+/// is deleted (tasks, relationships, files, and the matching prd_metadata row).
+/// Learnings, runs, and other PRDs are preserved.
+///
+/// When `task_prefix` is `None`, all data is wiped (legacy global-force behavior).
+pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<()> {
+    match task_prefix {
+        Some(prefix) => {
+            let pattern = make_like_pattern(prefix);
+            // Delete child tables before parent (FK ordering)
+            conn.execute(
+                "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+            )?;
+            conn.execute(
+                "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+            )?;
+            conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
+            // prd_files must be removed before prd_metadata (FK ordering)
+            conn.execute(
+                "DELETE FROM prd_files WHERE prd_id = \
+                 (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
+                [prefix],
+            )?;
+            conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+        }
+        None => {
+            // Global wipe — preserve nothing (legacy behavior).
+            // Drop in correct order due to foreign keys.
+            conn.execute("DELETE FROM learning_tags", [])?;
+            conn.execute("DELETE FROM learnings", [])?;
+            conn.execute("DELETE FROM run_tasks", [])?;
+            conn.execute("DELETE FROM runs", [])?;
+            conn.execute("DELETE FROM task_relationships", [])?;
+            conn.execute("DELETE FROM task_files", [])?;
+            conn.execute("DELETE FROM tasks", [])?;
+            // prd_files may not exist in pre-v6 databases
+            let _ = conn.execute("DELETE FROM prd_files", []);
+            conn.execute("DELETE FROM prd_metadata", [])?;
+            // Reset global_state but don't delete the row
+            conn.execute(
+                "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL",
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
 /// Get a preview of what would be deleted in dry-run mode with --force.
-pub fn get_delete_preview(conn: &Connection) -> TaskMgrResult<DryRunDeletePreview> {
-    let tasks: usize = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
-    let files: usize = conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
-    let relationships: usize =
-        conn.query_row("SELECT COUNT(*) FROM task_relationships", [], |row| {
-            row.get(0)
-        })?;
-    let learnings: usize =
-        conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
-    let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
-
-    Ok(DryRunDeletePreview {
-        tasks,
-        files,
-        relationships,
-        learnings,
-        runs,
-    })
+///
+/// When `task_prefix` is `Some`, counts only rows belonging to that prefix.
+/// Learnings and runs are always reported as 0 in scoped mode (they are never deleted).
+/// When `task_prefix` is `None`, counts all rows (global wipe preview).
+pub fn get_delete_preview(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<DryRunDeletePreview> {
+    match task_prefix {
+        Some(prefix) => {
+            let pattern = make_like_pattern(prefix);
+            let tasks: usize = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            let files: usize = conn.query_row(
+                "SELECT COUNT(*) FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            let relationships: usize = conn.query_row(
+                "SELECT COUNT(*) FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                [&pattern],
+                |row| row.get(0),
+            )?;
+            Ok(DryRunDeletePreview {
+                tasks,
+                files,
+                relationships,
+                learnings: 0,
+                runs: 0,
+            })
+        }
+        None => {
+            let tasks: usize =
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+            let files: usize =
+                conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
+            let relationships: usize =
+                conn.query_row("SELECT COUNT(*) FROM task_relationships", [], |row| {
+                    row.get(0)
+                })?;
+            let learnings: usize =
+                conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+            let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+            Ok(DryRunDeletePreview {
+                tasks,
+                files,
+                relationships,
+                learnings,
+                runs,
+            })
+        }
+    }
 }
 
 /// Check if the database is fresh (no tasks).
@@ -73,12 +142,17 @@ pub fn get_existing_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>
     Ok(result)
 }
 
-/// Insert PRD metadata into the database.
+/// Insert or update PRD metadata keyed by `task_prefix`.
+///
+/// Uses `ON CONFLICT(task_prefix) DO UPDATE` so calling this twice with the
+/// same prefix updates the existing row rather than creating a duplicate.
+///
+/// Returns the row id of the upserted row (new or existing).
 pub fn insert_prd_metadata(
     conn: &Connection,
     prd: &PrdFile,
     raw_json: Option<&str>,
-) -> TaskMgrResult<()> {
+) -> TaskMgrResult<i64> {
     let priority_philosophy = prd
         .priority_philosophy
         .as_ref()
@@ -95,13 +169,23 @@ pub fn insert_prd_metadata(
         .map(serde_json::to_string)
         .transpose()?;
 
-    // Use INSERT OR REPLACE to handle the singleton constraint
     conn.execute(
-        r#"INSERT OR REPLACE INTO prd_metadata
-           (id, project, branch_name, description, priority_philosophy,
+        r#"INSERT INTO prd_metadata
+           (project, branch_name, description, priority_philosophy,
             global_acceptance_criteria, review_guidelines, raw_json,
             external_git_repo, task_prefix, default_model, updated_at)
-           VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           ON CONFLICT(task_prefix) DO UPDATE SET
+               project = excluded.project,
+               branch_name = excluded.branch_name,
+               description = excluded.description,
+               priority_philosophy = excluded.priority_philosophy,
+               global_acceptance_criteria = excluded.global_acceptance_criteria,
+               review_guidelines = excluded.review_guidelines,
+               raw_json = excluded.raw_json,
+               external_git_repo = excluded.external_git_repo,
+               default_model = excluded.default_model,
+               updated_at = excluded.updated_at"#,
         rusqlite::params![
             prd.project,
             prd.branch_name,
@@ -116,7 +200,7 @@ pub fn insert_prd_metadata(
         ],
     )?;
 
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 /// Insert a task into the database.
@@ -264,10 +348,15 @@ pub fn delete_task_relationships(conn: &Connection, task_id: &str) -> TaskMgrRes
 }
 
 /// Insert a PRD file record into the prd_files table.
-pub fn insert_prd_file(conn: &Connection, file_path: &str, file_type: &str) -> TaskMgrResult<()> {
+pub fn insert_prd_file(
+    conn: &Connection,
+    prd_id: i64,
+    file_path: &str,
+    file_type: &str,
+) -> TaskMgrResult<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (1, ?, ?)",
-        [file_path, file_type],
+        "INSERT OR IGNORE INTO prd_files (prd_id, file_path, file_type) VALUES (?, ?, ?)",
+        rusqlite::params![prd_id, file_path, file_type],
     )?;
     Ok(())
 }
@@ -282,6 +371,7 @@ pub fn insert_prd_file(conn: &Connection, file_path: &str, file_type: &str) -> T
 /// All paths are stored relative to the tasks directory.
 pub fn register_prd_files(
     conn: &Connection,
+    prd_id: i64,
     json_path: &Path,
     prd: &PrdFile,
     tasks_dir: &Path,
@@ -291,7 +381,7 @@ pub fn register_prd_files(
         .strip_prefix(tasks_dir)
         .unwrap_or(json_path)
         .to_string_lossy();
-    insert_prd_file(conn, &json_relative, "task_list")?;
+    insert_prd_file(conn, prd_id, &json_relative, "task_list")?;
 
     // Derive prompt file path: <stem>-prompt.md
     if let Some(stem) = json_path.file_stem() {
@@ -302,13 +392,13 @@ pub fn register_prd_files(
                 .strip_prefix(tasks_dir)
                 .unwrap_or(&prompt_path)
                 .to_string_lossy();
-            insert_prd_file(conn, &prompt_relative, "prompt")?;
+            insert_prd_file(conn, prd_id, &prompt_relative, "prompt")?;
         }
     }
 
     // Store PRD markdown file if specified
     if let Some(ref prd_file) = prd.prd_file {
-        insert_prd_file(conn, prd_file, "prd")?;
+        insert_prd_file(conn, prd_id, prd_file, "prd")?;
     }
 
     Ok(())

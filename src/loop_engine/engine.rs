@@ -22,6 +22,7 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
+use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
@@ -41,6 +42,7 @@ use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
+use crate::loop_engine::status::read_task_prefix_from_prd;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::models::RunStatus;
 use crate::TaskMgrResult;
@@ -191,7 +193,7 @@ pub fn run_iteration(
     }
 
     // Step 1: Check file-based signals
-    if signals::check_stop_signal(params.tasks_dir) {
+    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
         eprintln!("Stop signal detected (.stop file found)");
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -203,11 +205,12 @@ pub fn run_iteration(
         });
     }
 
-    if signals::check_pause_signal(params.tasks_dir) {
+    if signals::check_pause_signal(params.tasks_dir, params.task_prefix) {
         signals::handle_pause(
             params.tasks_dir,
             params.iteration,
             &mut ctx.session_guidance,
+            params.task_prefix,
         );
     }
 
@@ -293,20 +296,18 @@ pub fn run_iteration(
         Ok(Some(result)) => result,
         Ok(None) => {
             // No eligible task found — check if truly all done or just temporarily unavailable
-            let like_pat = prefix_like_pattern(params.task_prefix);
-            let remaining: i64 = match &like_pat {
-                Some(pat) => params.conn.query_row(
-                    "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
-                    [pat],
-                    |row| row.get(0),
-                ),
-                None => params.conn.query_row(
-                    "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-                    [],
-                    |row| row.get(0),
-                ),
-            }
-            .unwrap_or(0);
+            let (rem_pfx_clause, rem_pfx_param) = prefix_and(params.task_prefix);
+            let rem_sql = format!(
+                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {rem_pfx_clause}"
+            );
+            let rem_params: Vec<&dyn rusqlite::types::ToSql> = match &rem_pfx_param {
+                Some(p) => vec![p],
+                None => vec![],
+            };
+            let remaining: i64 = params
+                .conn
+                .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
+                .unwrap_or(0);
             if remaining == 0 {
                 eprintln!("All tasks complete!");
                 return Ok(IterationResult {
@@ -328,17 +329,18 @@ pub fn run_iteration(
                 reconcile_passes_with_db(params.conn, prd, params.task_prefix);
             }
 
-            let recovered = match &like_pat {
-                Some(pat) => params.conn.execute(
-                    "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' AND id LIKE ?",
-                    [pat],
-                ),
-                None => params.conn.execute(
-                    "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
-                    [],
-                ),
-            }
-            .unwrap_or(0);
+            let (mid_pfx_clause, mid_pfx_param) = prefix_and(params.task_prefix);
+            let mid_recovery_sql = format!(
+                "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {mid_pfx_clause}"
+            );
+            let mid_params: Vec<&dyn rusqlite::types::ToSql> = match &mid_pfx_param {
+                Some(p) => vec![p],
+                None => vec![],
+            };
+            let recovered = params
+                .conn
+                .execute(&mid_recovery_sql, mid_params.as_slice())
+                .unwrap_or(0);
 
             if recovered > 0 {
                 eprintln!(
@@ -654,13 +656,32 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Must be before any DB mutations (init, migrations, recovery).
     // Separate from tasks.db.lock (short-lived per-command) so read-only commands
     // like `status` and `stats` are not blocked.
-    let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, "loop.lock") {
+    //
+    // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
+    // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
+    // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
+    let pre_lock_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file)
+        .and_then(|p| {
+            // Only use prefix if it is safe for filenames
+            if validate_prefix(&p).is_ok() {
+                Some(p)
+            } else {
+                None
+            }
+        });
+    let lock_name = match &pre_lock_prefix {
+        Some(p) => format!("loop-{p}.lock"),
+        None => "loop.lock".to_string(),
+    };
+    let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, &lock_name) {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!(
-                "Error: another loop is already running on this database. {}",
-                e
-            );
+            match &pre_lock_prefix {
+                Some(p) => {
+                    eprintln!("Error: another loop is already running for PRD prefix {p}. {e}")
+                }
+                None => eprintln!("Error: another loop is already running on this database. {e}"),
+            }
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
@@ -737,57 +758,22 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
     }
 
-    // Step 7: Read PRD metadata for branch name, task count, and external repo
-    let prd_metadata = match read_prd_metadata(&conn) {
-        Ok(meta) => meta,
-        Err(e) => {
-            eprintln!("Error reading PRD metadata: {}", e);
-            return LoopResult {
-                exit_code: 1,
-                worktree_path: None,
-            };
-        }
-    };
-    let branch_name = prd_metadata.branch_name;
-    let task_count = prd_metadata.task_count;
-    let task_prefix = prd_metadata.task_prefix;
-    let default_model = prd_metadata.default_model;
+    // Step 6.55: Read task prefix from PRD JSON before initial recovery so the
+    // recovery query can be scoped to this PRD's tasks only.
+    let early_task_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file);
 
-    // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
-    // resolve_paths was called at Step 3 with None prefix because metadata wasn't available yet.
-    let mut paths = paths;
-    if let Some(ref pfx) = task_prefix {
-        paths.progress_file = paths.tasks_dir.join(format!("progress-{}.txt", pfx));
-    }
-
-    // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
-    // This allows lock error messages to show which branch/PRD holds the lock.
-    if let Err(e) = loop_lock.write_holder_info_extended(
-        branch_name.as_deref(),
-        run_config.working_root.to_str(),
-        task_prefix.as_deref(),
-    ) {
-        eprintln!(
-            "Warning: failed to write extended lock metadata: {} (continuing)",
-            e
-        );
-    }
-
-    // Step 6.6 (after metadata read so we can scope by prefix):
-    // Recover stale in_progress tasks from previous crashed/killed runs.
+    // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
     // Safe because we hold the exclusive loop lock — no other loop can be running.
-    let startup_like_pat = prefix_like_pattern(task_prefix.as_deref());
-    let startup_recovery_result = match &startup_like_pat {
-        Some(pat) => conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' AND id LIKE ?",
-            [pat],
-        ),
-        None => conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
-            [],
-        ),
+    // Scoped by prefix so concurrent loops on different PRDs don't reset each other.
+    let (recovery_pfx_clause, recovery_pfx_param) = prefix_and(early_task_prefix.as_deref());
+    let recovery_sql = format!(
+        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
+    );
+    let recovery_params: Vec<&dyn rusqlite::types::ToSql> = match &recovery_pfx_param {
+        Some(p) => vec![p as &dyn rusqlite::types::ToSql],
+        None => vec![],
     };
-    match startup_recovery_result {
+    match conn.execute(&recovery_sql, recovery_params.as_slice()) {
         Ok(count) if count > 0 => {
             eprintln!(
                 "Recovered {} stale in_progress task(s) from previous run",
@@ -804,6 +790,41 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             };
         }
     }
+
+    // Step 7: Read PRD metadata for branch name, task count, and external repo
+    let prd_metadata = match read_prd_metadata(&conn, early_task_prefix.as_deref()) {
+        Ok(meta) => meta,
+        Err(e) => {
+            eprintln!("Error reading PRD metadata: {}", e);
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
+        }
+    };
+    let branch_name = prd_metadata.branch_name;
+    let task_count = prd_metadata.task_count;
+    let task_prefix = prd_metadata.task_prefix;
+    let default_model = prd_metadata.default_model;
+
+    // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
+    let mut paths = paths;
+    if let Some(ref pfx) = task_prefix {
+        paths.progress_file = paths.tasks_dir.join(format!("progress-{}.txt", pfx));
+    }
+
+    // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
+    if let Err(e) = loop_lock.write_holder_info_extended(
+        branch_name.as_deref(),
+        run_config.working_root.to_str(),
+        task_prefix.as_deref(),
+    ) {
+        eprintln!(
+            "Warning: failed to write extended lock metadata: {} (continuing)",
+            e
+        );
+    }
+
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
     // This catches tasks completed in a previous run where the DB status was never
@@ -1383,12 +1404,12 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
     // Step 20: Recalibrate weights if completed
     if final_run_status == RunStatus::Completed {
-        on_run_completed(&conn);
+        on_run_completed(&conn, task_prefix.as_deref());
     }
 
     // Step 21: Cleanup
     deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
-    signals::cleanup_signal_files(&paths.tasks_dir);
+    signals::cleanup_signal_files_for_prefix(&paths.tasks_dir, task_prefix.as_deref());
 
     // Step 21.5: Worktree cleanup (if a worktree was used)
     if let Some(ref wt_path) = actual_worktree_path {
@@ -1449,15 +1470,32 @@ struct PrdMetadata {
 
 /// Read branch name, task count, external_git_repo, task_prefix, and default_model
 /// from prd_metadata and tasks tables.
-fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
+///
+/// When `task_prefix` is provided, queries `WHERE task_prefix = ?` to select the
+/// matching PRD row. Falls back to `LIMIT 1 ORDER BY id ASC` when no prefix is given.
+fn read_prd_metadata(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<PrdMetadata> {
     let (branch_name, external_git_repo, task_prefix, default_model): (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = conn
-        .query_row(
-            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE id = 1",
+    ) = if let Some(prefix) = task_prefix {
+        conn.query_row(
+            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata WHERE task_prefix = ?1",
+            rusqlite::params![prefix],
+            |row| {
+                Ok((
+                    row.get("branch_name")?,
+                    row.get("external_git_repo")?,
+                    row.get("task_prefix")?,
+                    row.get("default_model")?,
+                ))
+            },
+        )
+        .unwrap_or((None, None, None, None))
+    } else {
+        conn.query_row(
+            "SELECT branch_name, external_git_repo, task_prefix, default_model FROM prd_metadata ORDER BY id ASC LIMIT 1",
             [],
             |row| {
                 Ok((
@@ -1468,23 +1506,21 @@ fn read_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata> {
                 ))
             },
         )
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None))
+    };
 
-    let like_pat = prefix_like_pattern(task_prefix.as_deref());
-    let task_count: usize = match &like_pat {
-        Some(pat) => conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
-            [pat],
-            |row| row.get::<_, i64>(0),
-        ),
-        None => conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant')",
-            [],
-            |row| row.get::<_, i64>(0),
-        ),
-    }
-    .map(|c| c as usize)
-    .unwrap_or(0);
+    let (tc_pfx_clause, tc_pfx_param) = prefix_and(task_prefix.as_deref());
+    let tc_sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {tc_pfx_clause}"
+    );
+    let tc_params: Vec<&dyn rusqlite::types::ToSql> = match &tc_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let task_count: usize = conn
+        .query_row(&tc_sql, tc_params.as_slice(), |row| row.get::<_, i64>(0))
+        .map(|c| c as usize)
+        .unwrap_or(0);
 
     Ok(PrdMetadata {
         branch_name,
@@ -1533,8 +1569,8 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
 ///
 /// Analyzes historical task outcomes and adjusts the scoring weights used by
 /// `select_next_task()`. Errors are logged but do not propagate (best-effort).
-pub fn on_run_completed(conn: &Connection) {
-    match calibrate::recalibrate_weights(conn) {
+pub fn on_run_completed(conn: &Connection, task_prefix: Option<&str>) {
+    match calibrate::recalibrate_weights(conn, task_prefix) {
         Ok(weights) => {
             let defaults = calibrate::SelectionWeights::default();
             if weights != defaults {
@@ -1702,34 +1738,26 @@ fn mark_task_done(
 fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Option<&str>) {
     use std::fs;
 
-    // Get all todo/in_progress task IDs from the DB (scoped by prefix)
-    let like_pat = prefix_like_pattern(task_prefix);
-    let candidate_ids: Vec<String> = match &like_pat {
-        Some(pat) => {
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND id LIKE ?",
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            stmt.query_map([pat], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
-        None => {
-            let mut stmt = match conn
-                .prepare("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress')")
-            {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            stmt.query_map([], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
+    // Get all todo/in_progress task IDs from the DB, scoped to this PRD's prefix.
+    let (rpdb_pfx_clause, rpdb_pfx_param) = prefix_and(task_prefix);
+    let rpdb_sql =
+        format!("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') {rpdb_pfx_clause}");
+    let mut stmt = match conn.prepare(&rpdb_sql) {
+        Ok(s) => s,
+        Err(_) => return,
     };
+    let rpdb_params: Vec<&dyn rusqlite::types::ToSql> = match &rpdb_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let candidate_ids: Vec<String> = stmt
+        .query_map(rpdb_params.as_slice(), |row| row.get(0))
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     if candidate_ids.is_empty() {
         return;
@@ -1809,12 +1837,6 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
 /// e.g., `strip_task_prefix("aeb10a1f-FIX-001", Some("aeb10a1f"))` → `"FIX-001"`
 ///       `strip_task_prefix("P5.1-FIX-001", Some("P5.1"))` → `"FIX-001"`
 ///       `strip_task_prefix("FIX-001", None)` → `"FIX-001"`
-/// Build a LIKE pattern for filtering tasks by prefix: `"SS"` → `"SS-%"`.
-/// Returns `None` when no prefix is set (match all tasks).
-fn prefix_like_pattern(prefix: Option<&str>) -> Option<String> {
-    prefix.map(|p| format!("{}-%", p))
-}
-
 fn strip_task_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &'a str {
     match prefix {
         Some(pfx) => {
@@ -1878,34 +1900,28 @@ fn scan_output_for_completed_tasks(
 ) -> Vec<String> {
     let mut completed = Vec::new();
 
-    // Query all non-done task IDs (scoped by prefix)
-    let like_pat = prefix_like_pattern(task_prefix);
-    let task_ids: Vec<String> = match &like_pat {
-        Some(pat) => {
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
-            ) {
-                Ok(s) => s,
-                Err(_) => return completed,
-            };
-            stmt.query_map([pat], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
-        None => {
-            let mut stmt = match conn
-                .prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')")
-            {
-                Ok(s) => s,
-                Err(_) => return completed,
-            };
-            stmt.query_map([], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
+    // Query all non-done task IDs, scoped to this PRD's prefix.
+    let (soct_pfx_clause, soct_pfx_param) = prefix_and(task_prefix);
+    let soct_sql = format!(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {soct_pfx_clause}"
+    );
+    let mut stmt = match conn.prepare(&soct_sql) {
+        Ok(s) => s,
+        Err(_) => return completed,
     };
+
+    let soct_params: Vec<&dyn rusqlite::types::ToSql> = match &soct_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let task_ids: Vec<String> = stmt
+        .query_map(soct_params.as_slice(), |row| row.get(0))
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     for task_id in task_ids {
         if check_output_for_task_completion(output, &task_id, task_prefix) {
@@ -1976,40 +1992,33 @@ fn reconcile_external_git_completions(
     // to prevent cross-commit substring collisions.
     let commit_lines: Vec<String> = output.lines().map(|l| l.to_uppercase()).collect();
 
-    // Query all incomplete task IDs (scoped by prefix)
-    let like_pat = prefix_like_pattern(task_prefix);
-    let task_ids: Vec<String> = match &like_pat {
-        Some(pat) => {
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND id LIKE ?",
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-                    return 0;
-                }
-            };
-            stmt.query_map([pat], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        }
-        None => {
-            let mut stmt = match conn
-                .prepare("SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant')")
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Warning: could not query tasks for reconciliation: {}", e);
-                    return 0;
-                }
-            };
-            stmt.query_map([], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
+    // Query all incomplete task IDs, scoped to this PRD's prefix.
+    let (regc_pfx_clause, regc_pfx_param) = prefix_and(task_prefix);
+    let regc_sql = format!(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {regc_pfx_clause}"
+    );
+    let mut stmt = match conn.prepare(&regc_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: could not query tasks for reconciliation: {}", e);
+            return 0;
         }
     };
+
+    let regc_params: Vec<&dyn rusqlite::types::ToSql> = match &regc_pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let task_ids: Vec<String> = stmt
+        .query_map(regc_params.as_slice(), |row| row.get(0))
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    drop(stmt);
 
     let mut reconciled = 0;
 
@@ -2552,7 +2561,7 @@ mod tests {
         let (_temp_dir, conn) = setup_test_db();
 
         // Should not panic even with no data
-        on_run_completed(&conn);
+        on_run_completed(&conn, None);
     }
 
     // --- record_session_guidance tests ---
@@ -4091,5 +4100,326 @@ mod tests {
         let output = "<completed>  FEAT-001  </completed>";
         let result = parse_completed_tasks(output);
         assert_eq!(result, vec!["FEAT-001"]);
+    }
+
+    // =====================================================================
+    // Prefix-scoped engine query tests (SS-SS-TEST-001)
+    //
+    // Each test sets up two PRDs (P1-*, P2-*) in the same DB and verifies
+    // that engine queries respect prefix boundaries.
+    // =====================================================================
+
+    /// Helper: insert P1 and P2 tasks into the test DB.
+    ///
+    /// P1 tasks: P1-TASK-001 (in_progress), P1-TASK-002 (todo), P1-TASK-003 (done)
+    /// P2 tasks: P2-TASK-001 (in_progress), P2-TASK-002 (todo)
+    fn insert_dual_prd_tasks(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority, started_at) VALUES
+             ('P1-TASK-001', 'P1 stale task',   'in_progress', 1, datetime('now', '-1 hour')),
+             ('P1-TASK-002', 'P1 todo task',     'todo',        2, NULL),
+             ('P1-TASK-003', 'P1 done task',     'done',        3, NULL),
+             ('P2-TASK-001', 'P2 stale task',    'in_progress', 1, datetime('now', '-1 hour')),
+             ('P2-TASK-002', 'P2 todo task',     'todo',        2, NULL);",
+        )
+        .unwrap();
+    }
+
+    // --- Initial recovery scoping ---
+
+    #[test]
+    fn test_initial_recovery_resets_only_p1_in_progress() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // Simulate initial recovery with P1 prefix (as done in run_loop)
+        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
+        let sql = format!(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let count = conn.execute(&sql, params.as_slice()).unwrap();
+
+        assert_eq!(count, 1, "Should reset only P1's in_progress task");
+
+        // P1-TASK-001 should now be todo
+        let p1_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1_status, "todo");
+
+        // P2-TASK-001 must still be in_progress — untouched by P1 recovery
+        let p2_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P2-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_status, "in_progress",
+            "P2 task must not be affected by P1 recovery"
+        );
+    }
+
+    #[test]
+    fn test_initial_recovery_none_prefix_resets_all_in_progress() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // None prefix → no WHERE clause addition → resets all in_progress
+        let (pfx_clause, pfx_param) = prefix_and(None);
+        let sql = format!(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let count = conn.execute(&sql, params.as_slice()).unwrap();
+
+        assert_eq!(
+            count, 2,
+            "None prefix should reset all in_progress tasks (backwards compat)"
+        );
+    }
+
+    // --- Remaining count scoping ---
+
+    #[test]
+    fn test_remaining_count_scoped_to_p1() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // Count remaining (not done/irrelevant) for P1 only
+        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
+        let sql = format!(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let remaining: i64 = conn
+            .query_row(&sql, params.as_slice(), |row| row.get(0))
+            .unwrap();
+
+        // P1 has in_progress + todo = 2 remaining (P1-TASK-003 is done)
+        assert_eq!(remaining, 2, "P1 remaining should be 2 (not counting P2)");
+    }
+
+    #[test]
+    fn test_remaining_count_none_prefix_counts_all() {
+        use crate::db::prefix::prefix_and;
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        let (pfx_clause, pfx_param) = prefix_and(None);
+        let sql = format!(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let remaining: i64 = conn
+            .query_row(&sql, params.as_slice(), |row| row.get(0))
+            .unwrap();
+
+        // 4 tasks total (P1: 2 + P2: 2), done is excluded
+        assert_eq!(remaining, 4, "None prefix should count all remaining tasks");
+    }
+
+    // --- reconcile_passes_with_db scoping ---
+
+    #[test]
+    fn test_reconcile_passes_with_db_only_marks_p1_tasks_done() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        // P1: both in_progress and todo; P2: one todo
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 in_progress', 'in_progress', 1),
+             ('P1-TASK-002', 'P1 todo',        'todo',        2),
+             ('P2-TASK-001', 'P2 todo',         'todo',        1);",
+        )
+        .unwrap();
+
+        // PRD JSON where P1-TASK-001 has passes: true (using base ID TASK-001)
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("prd.json");
+        let prd_json = serde_json::json!({
+            "userStories": [
+                {"id": "TASK-001", "passes": true},
+                {"id": "TASK-002", "passes": false}
+            ]
+        });
+        std::fs::write(&prd_path, prd_json.to_string()).unwrap();
+
+        reconcile_passes_with_db(&conn, &prd_path, Some("P1"));
+
+        // P1-TASK-001 (base id TASK-001, passes: true) should be done
+        let p1_001_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p1_001_status, "done",
+            "P1-TASK-001 should be reconciled to done"
+        );
+
+        // P1-TASK-002 (passes: false) should remain todo
+        let p1_002_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P1-TASK-002'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1_002_status, "todo", "P1-TASK-002 should remain todo");
+
+        // P2-TASK-001 must NOT be touched (different prefix)
+        let p2_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'P2-TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_status, "todo",
+            "P2-TASK-001 must not be affected by P1 reconciliation"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_passes_with_db_none_prefix_marks_all_matching() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('TASK-001', 'Task 1', 'in_progress', 1),
+             ('TASK-002', 'Task 2', 'todo',        2);",
+        )
+        .unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("prd.json");
+        let prd_json = serde_json::json!({
+            "userStories": [
+                {"id": "TASK-001", "passes": true},
+                {"id": "TASK-002", "passes": false}
+            ]
+        });
+        std::fs::write(&prd_path, prd_json.to_string()).unwrap();
+
+        reconcile_passes_with_db(&conn, &prd_path, None);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'TASK-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "done",
+            "None prefix should reconcile matching tasks"
+        );
+    }
+
+    // --- scan_output_for_completed_tasks scoping ---
+
+    #[test]
+    fn test_scan_output_scoped_to_p1_only() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 task', 'todo', 1),
+             ('P2-TASK-001', 'P2 task', 'todo', 1);",
+        )
+        .unwrap();
+
+        // Output mentions both task IDs in bracket format
+        let output = "Completed [P1-TASK-001] and [P2-TASK-001]";
+
+        let completed = scan_output_for_completed_tasks(output, &conn, Some("P1"));
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-001".to_string()],
+            "Only P1 task should be detected when prefix is P1"
+        );
+    }
+
+    #[test]
+    fn test_scan_output_none_prefix_matches_all() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 task', 'todo', 1),
+             ('P2-TASK-001', 'P2 task', 'todo', 1);",
+        )
+        .unwrap();
+
+        let output = "Completed [P1-TASK-001] and [P2-TASK-001]";
+        let mut completed = scan_output_for_completed_tasks(output, &conn, None);
+        completed.sort();
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-001".to_string(), "P2-TASK-001".to_string()],
+            "None prefix should match all task IDs in output"
+        );
+    }
+
+    #[test]
+    fn test_scan_output_excludes_done_tasks() {
+        use crate::loop_engine::test_utils::setup_test_db;
+
+        let (_temp_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('P1-TASK-001', 'P1 done',  'done', 1),
+             ('P1-TASK-002', 'P1 todo',  'todo', 2);",
+        )
+        .unwrap();
+
+        // Both are mentioned in output but done tasks should not appear
+        let output = "Completed [P1-TASK-001] and [P1-TASK-002]";
+        let completed = scan_output_for_completed_tasks(output, &conn, Some("P1"));
+
+        assert_eq!(
+            completed,
+            vec!["P1-TASK-002".to_string()],
+            "Done tasks should not appear in scan results"
+        );
     }
 }

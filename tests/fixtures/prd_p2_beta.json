@@ -1,0 +1,32 @@
+{
+  "branchName": "feat/p2-beta",
+  "description": "PRD Beta for multi-PRD isolation testing.",
+  "project": "beta-project",
+  "taskPrefix": "P2",
+  "userStories": [
+    {
+      "acceptanceCriteria": ["Task B1 done"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Beta task 1",
+      "id": "TASK-001",
+      "passes": false,
+      "priority": 10,
+      "status": "todo",
+      "title": "Beta Task 1"
+    },
+    {
+      "acceptanceCriteria": ["Task B2 done"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Beta task 2",
+      "id": "TASK-002",
+      "passes": false,
+      "priority": 20,
+      "status": "done",
+      "title": "Beta Task 2"
+    }
+  ]
+}

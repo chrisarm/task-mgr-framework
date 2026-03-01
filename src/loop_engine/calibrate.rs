@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::commands::next::selection::{
     CONFLICT_PENALTY, FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS,
 };
+use crate::db::prefix::prefix_and;
 use crate::TaskMgrResult;
 
 /// Minimum number of completed tasks before calibration adjusts weights.
@@ -131,15 +132,18 @@ fn load_weights_from_db(conn: &Connection) -> TaskMgrResult<Option<SelectionWeig
 /// `MIN_TASKS_FOR_CALIBRATION` (10) completed tasks.
 ///
 /// Called after `run::end()` with Completed status.
-pub fn recalibrate_weights(conn: &Connection) -> TaskMgrResult<SelectionWeights> {
-    let completed_count = count_completed_tasks(conn)?;
+pub fn recalibrate_weights(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<SelectionWeights> {
+    let completed_count = count_completed_tasks(conn, task_prefix)?;
 
     if completed_count < MIN_TASKS_FOR_CALIBRATION {
         return Ok(SelectionWeights::default());
     }
 
     // Analyze correlations and compute adjusted weights
-    let weights = compute_calibrated_weights(conn)?;
+    let weights = compute_calibrated_weights(conn, task_prefix)?;
 
     // Store updated weights
     store_weights(conn, &weights)?;
@@ -148,12 +152,13 @@ pub fn recalibrate_weights(conn: &Connection) -> TaskMgrResult<SelectionWeights>
 }
 
 /// Count completed tasks that have score breakdown data.
-fn count_completed_tasks(conn: &Connection) -> TaskMgrResult<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE status = 'done'",
-        [],
-        |row| row.get(0),
-    )?;
+fn count_completed_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<usize> {
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql = format!("SELECT COUNT(*) FROM tasks WHERE status = 'done' {prefix_clause}");
+    let count: i64 = match prefix_param {
+        Some(ref p) => conn.query_row(&sql, rusqlite::params![p], |row| row.get(0))?,
+        None => conn.query_row(&sql, [], |row| row.get(0))?,
+    };
     Ok(count as usize)
 }
 
@@ -175,8 +180,11 @@ struct TaskOutcome {
 /// tasks with higher dimension scores tended to complete on the first try
 /// (vs requiring retries or failing). Uses point-biserial correlation
 /// (mean difference of dimension values between success/failure groups).
-fn compute_calibrated_weights(conn: &Connection) -> TaskMgrResult<SelectionWeights> {
-    let outcomes = load_task_outcomes(conn)?;
+fn compute_calibrated_weights(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<SelectionWeights> {
+    let outcomes = load_task_outcomes(conn, task_prefix)?;
 
     if outcomes.is_empty() {
         return Ok(SelectionWeights::default());
@@ -209,23 +217,49 @@ fn compute_calibrated_weights(conn: &Connection) -> TaskMgrResult<SelectionWeigh
 /// For each unique task that appears in run_tasks, determines:
 /// - Whether it completed on its first attempt (first_try_success)
 /// - Its scoring dimension values (file overlap, synergy, conflict counts)
-fn load_task_outcomes(conn: &Connection) -> TaskMgrResult<Vec<TaskOutcome>> {
+fn load_task_outcomes(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<Vec<TaskOutcome>> {
     // Get task attempt history: for each task, count attempts and check if first was successful
-    let mut stmt = conn.prepare(
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            (
+                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
+                Some(pattern),
+            )
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
         "SELECT task_id, status, iteration \
          FROM run_tasks \
-         ORDER BY task_id, iteration ASC",
-    )?;
+         {prefix_clause}\
+         ORDER BY task_id, iteration ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-    let rows: Result<Vec<(String, String, i64)>, rusqlite::Error> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect();
+    let rows: Result<Vec<(String, String, i64)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![p], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect(),
+        None => stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect(),
+    };
     let rows = rows?;
 
     if rows.is_empty() {
@@ -243,11 +277,11 @@ fn load_task_outcomes(conn: &Connection) -> TaskMgrResult<Vec<TaskOutcome>> {
     }
 
     // Load file counts per task
-    let file_counts = get_task_file_counts(conn)?;
+    let file_counts = get_task_file_counts(conn, task_prefix)?;
 
     // Load synergy/conflict counts per task
-    let synergy_counts = get_relationship_counts(conn, "synergyWith")?;
-    let conflict_counts = get_relationship_counts(conn, "conflictsWith")?;
+    let synergy_counts = get_relationship_counts(conn, "synergyWith", task_prefix)?;
+    let conflict_counts = get_relationship_counts(conn, "conflictsWith", task_prefix)?;
 
     // Build outcome records
     let outcomes: Vec<TaskOutcome> = task_first_try
@@ -266,25 +300,59 @@ fn load_task_outcomes(conn: &Connection) -> TaskMgrResult<Vec<TaskOutcome>> {
 /// Get the number of files each task touches.
 fn get_task_file_counts(
     conn: &Connection,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<std::collections::HashMap<String, i32>> {
-    let mut stmt = conn.prepare("SELECT task_id, COUNT(*) FROM task_files GROUP BY task_id")?;
-    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect();
+    // task_files uses task_id column, not id — build clause manually
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            (
+                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
+                Some(pattern),
+            )
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!("SELECT task_id, COUNT(*) FROM task_files {prefix_clause} GROUP BY task_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![p], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect(),
+        None => stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect(),
+    };
     Ok(rows?.into_iter().collect())
 }
 
-/// Get the count of relationships of a given type per task.
+/// Get the count of relationships of a given type per task, optionally filtered by prefix.
 fn get_relationship_counts(
     conn: &Connection,
     rel_type: &str,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<std::collections::HashMap<String, i32>> {
-    let mut stmt = conn.prepare(
-        "SELECT task_id, COUNT(*) FROM task_relationships WHERE rel_type = ? GROUP BY task_id",
-    )?;
-    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = stmt
-        .query_map([rel_type], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect();
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            ("AND task_id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
+        "SELECT task_id, COUNT(*) FROM task_relationships WHERE rel_type = ? {prefix_clause} GROUP BY task_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![rel_type, p], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect(),
+        None => stmt
+            .query_map([rel_type], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect(),
+    };
     Ok(rows?.into_iter().collect())
 }
 
@@ -364,7 +432,7 @@ mod tests {
     fn test_no_historical_data_returns_defaults() {
         let (_temp_dir, conn) = setup_test_db();
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         let defaults = SelectionWeights::default();
         assert_eq!(weights, defaults, "Should return defaults with no data");
     }
@@ -459,7 +527,7 @@ mod tests {
             insert_done_task(&conn, &format!("TASK-{:03}", i));
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         assert_eq!(
             weights,
             SelectionWeights::default(),
@@ -476,7 +544,7 @@ mod tests {
             insert_done_task(&conn, &format!("TASK-{:03}", i));
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         // Currently returns defaults since compute_calibrated_weights is a placeholder,
         // but should NOT early-return with "below threshold" message
         assert_eq!(weights.file_overlap, FILE_OVERLAP_SCORE);
@@ -780,7 +848,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
 
         // File overlap weight should increase because tasks with more files succeeded
         assert!(
@@ -795,7 +863,7 @@ mod tests {
     #[test]
     fn test_load_task_outcomes_empty() {
         let (_temp_dir, conn) = setup_test_db();
-        let outcomes = load_task_outcomes(&conn).unwrap();
+        let outcomes = load_task_outcomes(&conn, None).unwrap();
         assert!(outcomes.is_empty());
     }
 
@@ -833,7 +901,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcomes = load_task_outcomes(&conn).unwrap();
+        let outcomes = load_task_outcomes(&conn, None).unwrap();
         assert_eq!(outcomes.len(), 2);
 
         // Find each outcome
@@ -855,7 +923,7 @@ mod tests {
             insert_done_task(&conn, &format!("TASK-{:03}", i));
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         // No run_tasks → compute_calibrated_weights returns defaults
         assert_eq!(weights, SelectionWeights::default());
     }
@@ -923,7 +991,7 @@ mod tests {
             }
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
 
         // file_overlap should INCREASE (successful tasks had more files)
         assert!(
@@ -965,7 +1033,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         // Zero correlation → adjustment factor is 0 → weights equal defaults
         assert_eq!(
             weights,
@@ -999,7 +1067,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         assert_eq!(
             weights,
             SelectionWeights::default(),
@@ -1090,7 +1158,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
 
         // With strong positive correlation for file_overlap:
         assert!(
@@ -1134,7 +1202,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcomes = load_task_outcomes(&conn).unwrap();
+        let outcomes = load_task_outcomes(&conn, None).unwrap();
         // TASK-000 should be first_try_success=false because its first appearance
         // (ordered by iteration ASC) was "failed"
         let task_outcome = outcomes.iter().find(|o| !o.first_try_success);
@@ -1407,7 +1475,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         assert_eq!(
             weights,
             SelectionWeights::default(),
@@ -1453,7 +1521,7 @@ mod tests {
             .unwrap();
         }
 
-        let weights = recalibrate_weights(&conn).unwrap();
+        let weights = recalibrate_weights(&conn, None).unwrap();
         // Should have actually calibrated (not returned defaults due to threshold)
         // file_overlap should be >= default since successful tasks had files
         assert!(

@@ -89,7 +89,7 @@ pub struct BuildPromptParams<'a> {
     pub verbose: bool,
     /// Default model from PRD metadata (threaded from engine, not queried here).
     pub default_model: Option<&'a str>,
-    /// Task prefix for scoping queries to the current PRD session.
+    /// Optional PRD task prefix for scoping task selection to a specific PRD.
     pub task_prefix: Option<&'a str>,
 }
 

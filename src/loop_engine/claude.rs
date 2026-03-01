@@ -273,6 +273,11 @@ fn watchdog_loop(_child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate CLAUDE_BINARY to avoid race conditions
+    // when cargo test runs threads in parallel.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // --- AC: ClaudeResult struct has expected fields ---
 
@@ -392,6 +397,7 @@ mod tests {
     #[test]
     fn test_spawn_without_signal_flag() {
         // spawn_claude with None should behave like before
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("hello", None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
@@ -404,6 +410,7 @@ mod tests {
     #[test]
     fn test_spawn_with_signal_flag_no_signal() {
         // spawn_claude with a SignalFlag that is NOT signaled should work normally
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
         let result = spawn_claude("test output", Some(&flag), None, None);
@@ -514,6 +521,7 @@ mod tests {
     #[test]
     fn test_watchdog_kills_child_on_signal() {
         // Spawn a long-running process via spawn_claude with a signal flag
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "sleep");
         let flag = SignalFlag::new();
 
@@ -553,6 +561,7 @@ mod tests {
     #[test]
     fn test_watchdog_does_not_interfere_with_normal_exit() {
         // If the child exits normally, the watchdog should stop cleanly
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
         let result = spawn_claude("quick exit", Some(&flag), None, None);
@@ -573,6 +582,7 @@ mod tests {
     /// pre-model behavior.
     #[test]
     fn test_spawn_model_none_no_model_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
@@ -608,6 +618,7 @@ mod tests {
     /// model=Some("claude-opus-4-6") → --model flag present with correct value in echoed args.
     #[test]
     fn test_spawn_model_some_opus_includes_model_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
         std::env::remove_var("CLAUDE_BINARY");
@@ -627,6 +638,7 @@ mod tests {
     /// Guards against naively passing --model '' to the Claude CLI.
     #[test]
     fn test_spawn_model_empty_string_treated_as_none() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some(""));
         std::env::remove_var("CLAUDE_BINARY");
@@ -646,6 +658,7 @@ mod tests {
     /// Rejects implementations that append --model after the prompt flag.
     #[test]
     fn test_spawn_model_flag_appears_before_prompt_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
         std::env::remove_var("CLAUDE_BINARY");
@@ -685,6 +698,7 @@ mod tests {
         ];
 
         for (model, expected_fragment) in &models {
+            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
             let result = spawn_claude("test_prompt", None, None, Some(model));
             std::env::remove_var("CLAUDE_BINARY");
@@ -705,6 +719,7 @@ mod tests {
     #[test]
     fn test_spawn_model_whitespace_only_treated_as_none() {
         for model in &["  ", "\t", " \t "] {
+            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
             let result = spawn_claude("test_prompt", None, None, Some(model));
             std::env::remove_var("CLAUDE_BINARY");
@@ -723,6 +738,7 @@ mod tests {
     /// --print and --dangerously-skip-permissions must be present regardless of model value.
     #[test]
     fn test_spawn_model_some_preserves_required_flags() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
         std::env::remove_var("CLAUDE_BINARY");
@@ -760,6 +776,7 @@ mod tests {
     #[case("claude-haiku-4-5-20251001")]
     #[case("my-custom-model")]
     fn test_spawn_claude_model_variants(#[case] model: &str) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test prompt", None, None, Some(model));
         std::env::remove_var("CLAUDE_BINARY");
@@ -796,6 +813,7 @@ mod tests {
     #[case("model.with.dots")]
     #[case("model-with_mixed.chars-v2")]
     fn test_spawn_claude_model_special_chars(#[case] model: &str) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test prompt", None, None, Some(model));
         std::env::remove_var("CLAUDE_BINARY");
@@ -818,6 +836,7 @@ mod tests {
     #[case(Some("claude-sonnet-4-6"))]
     #[case(None)]
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("my prompt", None, None, model);
         std::env::remove_var("CLAUDE_BINARY");
@@ -874,6 +893,7 @@ mod tests {
     /// Exact string comparison to verify no extra args are added.
     #[test]
     fn test_spawn_claude_none_model_identical_to_pre_phase2() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("my prompt text", None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
@@ -894,6 +914,7 @@ mod tests {
     #[case("\t")]
     #[case(" \t ")]
     fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let result = spawn_claude("test prompt", None, None, Some(model));
         std::env::remove_var("CLAUDE_BINARY");

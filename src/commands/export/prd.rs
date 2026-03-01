@@ -110,7 +110,7 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
         r#"SELECT project, branch_name, description,
            priority_philosophy, global_acceptance_criteria, review_guidelines,
            default_model
-           FROM prd_metadata WHERE id = 1"#,
+           FROM prd_metadata ORDER BY id ASC LIMIT 1"#,
         [],
         |row| {
             let project: String = row.get("project")?;

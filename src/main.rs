@@ -115,6 +115,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             claim,
             run_id,
             decay_threshold,
+            prefix,
         } => {
             let _lock = if claim || decay_threshold > 0 {
                 Some(LockGuard::acquire(&cli.dir)?)
@@ -124,8 +125,12 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
 
             if decay_threshold > 0 {
                 let conn = open_connection(&cli.dir)?;
-                let decayed =
-                    task_mgr::commands::next::apply_decay(&conn, decay_threshold, cli.verbose)?;
+                let decayed = task_mgr::commands::next::apply_decay(
+                    &conn,
+                    decay_threshold,
+                    cli.verbose,
+                    None,
+                )?;
                 if !decayed.is_empty() && cli.verbose {
                     eprintln!(
                         "[verbose] Decayed {} blocked/skipped task(s) back to todo",
@@ -144,7 +149,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 claim,
                 run_id.as_deref(),
                 cli.verbose,
-                None,
+                prefix.as_deref(),
             )?;
 
             if cli.verbose {

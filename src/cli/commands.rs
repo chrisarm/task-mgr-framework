@@ -142,6 +142,10 @@ EXAMPLES:
         /// Tasks blocked/skipped longer than this will auto-reset to todo
         #[arg(long = "decay-threshold", default_value_t = 32)]
         decay_threshold: i64,
+
+        /// Scope task selection to a specific PRD prefix (e.g., "P1" returns only P1-* tasks)
+        #[arg(long)]
+        prefix: Option<String>,
     },
 
     /// Mark one or more tasks as completed
