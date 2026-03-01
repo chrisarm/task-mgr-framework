@@ -361,3 +361,18 @@
 - **Tasks created**: REFACTOR-2-001 (extract shared helpers, p40), REFACTOR-2-002 (remove dead fts5 alias, p41)
 - Both added to MILESTONE-2 dependsOn
 ---
+## 2026-03-01 - adece6fc-INT-001
+- Added 7 CLI integration tests (tests/cli_tests.rs) for curate retire/unretire
+- Added 3 migration v10 tests (src/db/migrations/tests.rs) for retired_at column
+- Added 2 text format unit tests (src/commands/curate/tests.rs)
+- setup_dir_with_learning() helper uses 'migrate all' + 'learn' CLI to set up test DB
+- Direct rusqlite DB manipulation used to set times_shown/created_at for test scenarios
+- AC note: task said 'v8 migration' but code uses v10 for retired_at column
+---
+
+## 2026-03-01 - REFACTOR-REVIEW-3
+- Final refactoring review of all Phase 1 curate module code
+- Files reviewed: mod.rs, types.rs, output.rs, tests.rs
+- **Findings:** No issues found. Code is clean, well-structured, DRY. Minor placeholder duplication (2 uses) is acceptable per CLAUDE.md anti-premature-abstraction guidance. build_reason has 8 params but is an internal helper; struct wrapping would be over-engineering. Phase 2/3 can extend without modifying Phase 1.
+- **No REFACTOR-3-xxx tasks needed.**
+---
