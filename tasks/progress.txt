@@ -410,3 +410,13 @@
 - **No CODE-FIX tasks needed** — all acceptance criteria met
 - **Learnings:** unwrap_or_default() on get_learning_tags is acceptable graceful degradation for supplementary LLM prompt data
 ---
+
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-2
+- Reviewed curate/tests.rs (1810 lines) and crud/tests.rs for duplication, helper extraction, and test name clarity
+- **No issues found requiring REFACTOR-2-xxx tasks**
+- Three `set_applies_to_*` helpers (lines 954-978) are similar but extracting would need dynamic SQL column names — not worth it for 3 uses
+- Cross-file duplication (setup_db, retire_learning) is pre-existing, already tracked by Phase 1 REFACTOR-2-001
+- Test names are all descriptive and behavior-focused
+- Helpers (insert_learning, insert_fully_enriched_learning, make_batch, make_enrich_proposal) are well-factored
+- **Learnings:** When 3 helpers differ only by column name, a dynamic-column helper would risk SQL injection or need an enum — 3 explicit helpers is the right call
+---

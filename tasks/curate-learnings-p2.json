@@ -735,8 +735,8 @@
       "priority": 39,
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
+      "passes": true,
+      "notes": "Review complete. No REFACTOR-2-xxx tasks needed. Test helpers are well-factored within scope files. Cross-file duplication (setup_db, retire_learning) is pre-existing and already tracked by Phase 1 REFACTOR-2-001. Three set_applies_to_* helpers are similar but extracting would require dynamic SQL column names — not worth it for 3 uses.",
       "touchesFiles": [
         "src/commands/curate/tests.rs",
         "src/learnings/crud/update.rs"
