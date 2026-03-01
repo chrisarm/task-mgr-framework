@@ -16,8 +16,12 @@ pub use types::{
     RetireResult, RetirementCandidate, UnretireResult,
 };
 
-use rusqlite::Connection;
+use std::collections::HashSet;
 
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
+use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
 
 /// Identifies retirement candidates and optionally soft-archives them.
@@ -315,10 +319,160 @@ pub fn find_enrichment_candidates(
 /// # Stub
 /// Not yet implemented — tracked as FEAT-004.
 pub fn merge_cluster(
-    _conn: &Connection,
-    _params: MergeClusterParams,
+    conn: &Connection,
+    params: MergeClusterParams,
 ) -> TaskMgrResult<MergeClusterResult> {
-    todo!("FEAT-004: implement merge_cluster")
+    // Phase 1: determine which source learnings are active vs already-retired.
+    // Uses raw SQL because the Learning struct does not expose retired_at.
+    struct SourceRow {
+        id: i64,
+        applies_to_files: Option<String>,
+        applies_to_task_types: Option<String>,
+        applies_to_errors: Option<String>,
+        confidence: String,
+        times_shown: i32,
+        times_applied: i32,
+    }
+
+    let mut active_rows: Vec<SourceRow> = Vec::new();
+    let mut skipped_source_ids: Vec<i64> = Vec::new();
+
+    for &id in &params.source_ids {
+        let row: Option<SourceRow> = conn
+            .query_row(
+                "SELECT id, applies_to_files, applies_to_task_types, applies_to_errors,
+                         confidence, times_shown, times_applied
+                 FROM learnings WHERE id = ?1 AND retired_at IS NULL",
+                [id],
+                |row| {
+                    Ok(SourceRow {
+                        id: row.get("id")?,
+                        applies_to_files: row.get("applies_to_files")?,
+                        applies_to_task_types: row.get("applies_to_task_types")?,
+                        applies_to_errors: row.get("applies_to_errors")?,
+                        confidence: row.get("confidence")?,
+                        times_shown: row.get("times_shown")?,
+                        times_applied: row.get("times_applied")?,
+                    })
+                },
+            )
+            .optional()?;
+
+        match row {
+            Some(r) => active_rows.push(r),
+            None => skipped_source_ids.push(id),
+        }
+    }
+
+    // Aggregate metadata from active sources.
+    let mut files_set: HashSet<String> = HashSet::new();
+    let mut task_types_set: HashSet<String> = HashSet::new();
+    let mut errors_set: HashSet<String> = HashSet::new();
+    let mut tags_set: HashSet<String> = HashSet::new();
+    let mut total_shown: i64 = 0;
+    let mut total_applied: i64 = 0;
+
+    // Confidence rank: High=2, Medium=1, Low=0.
+    let confidence_rank = |s: &str| match s {
+        "high" => 2u8,
+        "medium" => 1,
+        _ => 0,
+    };
+    let mut best_confidence_str = "low";
+
+    for row in &active_rows {
+        if let Some(ref json) = row.applies_to_files {
+            let v: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+            files_set.extend(v);
+        }
+        if let Some(ref json) = row.applies_to_task_types {
+            let v: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+            task_types_set.extend(v);
+        }
+        if let Some(ref json) = row.applies_to_errors {
+            let v: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+            errors_set.extend(v);
+        }
+        let tags = get_learning_tags(conn, row.id)?;
+        tags_set.extend(tags);
+        total_shown += i64::from(row.times_shown);
+        total_applied += i64::from(row.times_applied);
+        if confidence_rank(&row.confidence) > confidence_rank(best_confidence_str) {
+            best_confidence_str = match row.confidence.as_str() {
+                "high" => "high",
+                "medium" => "medium",
+                _ => "low",
+            };
+        }
+    }
+
+    let best_confidence: Confidence = best_confidence_str.parse().unwrap_or(Confidence::Low);
+
+    // Convert sets to sorted vecs for deterministic output.
+    let union_files: Vec<String> = {
+        let mut v: Vec<_> = files_set.into_iter().collect();
+        v.sort();
+        v
+    };
+    let union_task_types: Vec<String> = {
+        let mut v: Vec<_> = task_types_set.into_iter().collect();
+        v.sort();
+        v
+    };
+    let union_errors: Vec<String> = {
+        let mut v: Vec<_> = errors_set.into_iter().collect();
+        v.sort();
+        v
+    };
+    let union_tags: Vec<String> = {
+        let mut v: Vec<_> = tags_set.into_iter().collect();
+        v.sort();
+        v
+    };
+
+    let active_ids: Vec<i64> = active_rows.iter().map(|r| r.id).collect();
+
+    // Phase 2: all DB writes in a single transaction.
+    let tx = conn.unchecked_transaction()?;
+
+    let record_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: params.merged_title,
+        content: params.merged_content,
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: if union_files.is_empty() { None } else { Some(union_files) },
+        applies_to_task_types: if union_task_types.is_empty() { None } else { Some(union_task_types) },
+        applies_to_errors: if union_errors.is_empty() { None } else { Some(union_errors) },
+        tags: if union_tags.is_empty() { None } else { Some(union_tags) },
+        confidence: best_confidence,
+    };
+    let merged = record_learning(&tx, record_params)?;
+    let merged_id = merged.learning_id;
+
+    // Update bandit stats (record_learning always inserts 0,0).
+    tx.execute(
+        "UPDATE learnings SET times_shown = ?1, times_applied = ?2 WHERE id = ?3",
+        rusqlite::params![total_shown, total_applied, merged_id],
+    )?;
+
+    // Soft-archive all active sources.
+    for &id in &active_ids {
+        tx.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [id],
+        )?;
+    }
+
+    tx.commit()?;
+
+    Ok(MergeClusterResult {
+        merged_learning_id: merged_id,
+        retired_source_ids: active_ids,
+        skipped_source_ids,
+    })
 }
 
 /// Orchestrates the full dedup flow: loads active learnings, batches them,

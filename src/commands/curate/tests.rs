@@ -1902,7 +1902,6 @@ fn parse_json_array_col(conn: &Connection, id: i64, col: &str) -> Vec<String> {
 // ── Core merge tests ──────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_two_learnings_creates_one_merged() {
     // Merging 2 source learnings must produce exactly 1 new learning whose
     // title and content come from the MergeClusterParams (not from the sources).
@@ -1949,7 +1948,6 @@ fn test_merge_two_learnings_creates_one_merged() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_union_applies_to_files_no_duplicates() {
     // merged learning.applies_to_files = union(source1, source2) with no dupes
     let (_dir, conn) = setup_db();
@@ -1993,7 +1991,6 @@ fn test_merge_union_applies_to_files_no_duplicates() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_union_applies_to_task_types() {
     let (_dir, conn) = setup_db();
 
@@ -2033,7 +2030,6 @@ fn test_merge_union_applies_to_task_types() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_union_applies_to_errors() {
     let (_dir, conn) = setup_db();
 
@@ -2072,7 +2068,6 @@ fn test_merge_union_applies_to_errors() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_union_tags_no_duplicates() {
     let (_dir, conn) = setup_db();
 
@@ -2113,7 +2108,6 @@ fn test_merge_union_tags_no_duplicates() {
 // ── Bandit stat tests ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_times_shown_is_sum_of_sources() {
     // Known-bad discriminator: naive impl may forget to sum stats (leaves at 0).
     let (_dir, conn) = setup_db();
@@ -2136,7 +2130,6 @@ fn test_merge_times_shown_is_sum_of_sources() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_times_applied_is_sum_of_sources() {
     // Known-bad discriminator: naive impl may forget to sum stats.
     let (_dir, conn) = setup_db();
@@ -2161,7 +2154,6 @@ fn test_merge_times_applied_is_sum_of_sources() {
 // ── Confidence tests ──────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_confidence_is_highest_from_sources() {
     // high > medium > low; merged learning takes the highest, not from LLM
     let (_dir, conn) = setup_db();
@@ -2183,7 +2175,6 @@ fn test_merge_confidence_is_highest_from_sources() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_confidence_not_from_llm_response() {
     // Confidence must be computed from source confidences, not accepted from
     // the LLM merged content.  We verify it equals "medium" (max of low+medium),
@@ -2213,7 +2204,6 @@ fn test_merge_confidence_not_from_llm_response() {
 // ── Retirement / lifecycle tests ──────────────────────────────────────────────
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_sources_are_retired_after_merge() {
     let (_dir, conn) = setup_db();
 
@@ -2238,7 +2228,6 @@ fn test_merge_sources_are_retired_after_merge() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_merged_learning_is_active() {
     // The merged learning itself must NOT be retired (retired_at IS NULL)
     let (_dir, conn) = setup_db();
@@ -2261,7 +2250,6 @@ fn test_merge_merged_learning_is_active() {
 }
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_merge_window_stats_reset_to_zero() {
     // window_shown and window_applied on the merged learning must be 0
     // (per US-003: window stats are NOT carried from source learnings)
@@ -2313,7 +2301,6 @@ fn test_merge_window_stats_reset_to_zero() {
 // ── Cross-cluster dedup test ───────────────────────────────────────────────────
 
 #[test]
-#[ignore = "FEAT-004: merge_cluster not yet implemented"]
 fn test_already_merged_learning_skipped_in_second_cluster() {
     // If learning A appears in cluster 1 (merged → M1) and cluster 2 also
     // lists A as a source, the second cluster should skip A (already retired)
