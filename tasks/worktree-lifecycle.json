@@ -938,7 +938,7 @@
       "estimatedEffort": "high",
       "id": "TEST-003",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 30,
       "synergyWith": [],
       "title": "Comprehensive tests for worktrees command, batch cleanup, and multi-PRD views",
