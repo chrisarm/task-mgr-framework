@@ -2440,6 +2440,208 @@ detached
         );
     }
 
+    // --- TEST-001: Comprehensive tests for remove_worktree() and early exit cleanup ---
+
+    /// Test: remove_worktree() on worktree with staged but uncommitted changes.
+    /// Staged changes are "modified" from git's perspective, so `git worktree remove`
+    /// should refuse and return Ok(false) (skip with warning).
+    #[test]
+    fn test_remove_worktree_staged_changes_returns_false() {
+        let tmp = setup_git_repo();
+
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/staged-changes", true).expect("create worktree");
+
+        // Stage a new file in the worktree without committing
+        let new_file = wt_path.join("staged.txt");
+        fs::write(&new_file, "staged content").expect("write staged file");
+        Command::new("git")
+            .args(["add", "staged.txt"])
+            .current_dir(&wt_path)
+            .output()
+            .expect("git add");
+
+        // Verify the file is staged
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt_path)
+            .output()
+            .expect("git status");
+        let status_str = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_str.contains("staged.txt"),
+            "File should be staged: {}",
+            status_str
+        );
+
+        // remove_worktree should skip dirty (staged) worktree
+        let result = remove_worktree(tmp.path(), &wt_path);
+        assert!(
+            result.is_ok(),
+            "remove_worktree with staged changes should return Ok (skip): {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "remove_worktree with staged changes should return Ok(false)"
+        );
+        assert!(
+            wt_path.exists(),
+            "Worktree with staged changes should be preserved"
+        );
+    }
+
+    /// Test: remove_worktree() when the worktree path was deleted out-of-band (directory is gone
+    /// but git may still have it in its worktree list). The path no longer exists on disk.
+    #[test]
+    fn test_remove_worktree_out_of_band_delete_returns_error() {
+        let tmp = setup_git_repo();
+
+        // Create a real worktree first so git knows about it
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/out-of-band", true).expect("create worktree");
+        assert!(wt_path.exists(), "Worktree should exist initially");
+
+        // Simulate out-of-band deletion: manually remove the directory without going through git
+        fs::remove_dir_all(&wt_path).expect("manual rm -rf of worktree dir");
+        assert!(
+            !wt_path.exists(),
+            "Worktree directory should be gone after manual delete"
+        );
+
+        // remove_worktree should return Err because the path is already gone
+        let result = remove_worktree(tmp.path(), &wt_path);
+        assert!(
+            result.is_err(),
+            "remove_worktree on out-of-band-deleted path should return Err, got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// Test: parent dir is preserved when it contains a regular file (non-empty for reasons
+    /// other than worktrees). cleanup_empty_dir is best-effort and must not remove non-empty dirs.
+    #[test]
+    fn test_remove_worktree_parent_with_extra_file_not_removed() {
+        let tmp = setup_git_repo();
+
+        let wt_path =
+            ensure_worktree(tmp.path(), "feature/wt-with-sibling", true).expect("create worktree");
+        let parent = wt_path.parent().expect("worktree has parent").to_path_buf();
+
+        // Place a regular file in the parent dir (simulates user-created content)
+        let extra_file = parent.join("README.txt");
+        fs::write(&extra_file, "some user content").expect("write extra file");
+
+        // Remove the worktree
+        let result = remove_worktree(tmp.path(), &wt_path).expect("remove worktree");
+        assert!(result, "Should have removed the worktree");
+
+        // Parent dir must NOT be removed because it still has README.txt
+        assert!(
+            parent.exists(),
+            "Parent dir should be preserved when it contains extra files"
+        );
+        assert!(
+            extra_file.exists(),
+            "Extra file in parent should be preserved"
+        );
+    }
+
+    /// Parameterized-style test: remove_worktree() behavior for various git states.
+    /// Tests clean worktree (Ok(true)), dirty with untracked (Ok(false)),
+    /// and dirty with modified tracked file (Ok(false)).
+    #[test]
+    fn test_remove_worktree_git_state_table() {
+        struct TestCase {
+            name: &'static str,
+            // mutate fn: receives the worktree path, sets up git state
+            setup: fn(&std::path::Path),
+            expected_ok: bool,
+            expected_value: bool,
+            path_removed: bool,
+        }
+
+        let cases: &[TestCase] = &[
+            TestCase {
+                name: "clean worktree",
+                setup: |_| {},
+                expected_ok: true,
+                expected_value: true,
+                path_removed: true,
+            },
+            TestCase {
+                name: "dirty: untracked file",
+                setup: |wt| {
+                    fs::write(wt.join("new_untracked.txt"), "data").expect("write untracked");
+                },
+                expected_ok: true,
+                expected_value: false,
+                path_removed: false,
+            },
+            TestCase {
+                name: "dirty: modified tracked file",
+                setup: |wt| {
+                    // file.txt was committed in setup_git_repo via the main repo,
+                    // but the worktree has its own copy of the repo state.
+                    // We need to create a file that was previously committed in this worktree.
+                    fs::write(wt.join("new_tracked.txt"), "original").expect("write tracked");
+                    Command::new("git")
+                        .args(["add", "new_tracked.txt"])
+                        .current_dir(wt)
+                        .output()
+                        .expect("git add");
+                    Command::new("git")
+                        .args(["commit", "-m", "add tracked"])
+                        .current_dir(wt)
+                        .output()
+                        .expect("git commit");
+                    // Now modify it without committing
+                    fs::write(wt.join("new_tracked.txt"), "modified").expect("modify tracked");
+                },
+                expected_ok: true,
+                expected_value: false,
+                path_removed: false,
+            },
+        ];
+
+        for case in cases {
+            let tmp = setup_git_repo();
+            let branch = format!("feature/state-test-{}", case.name.replace([':', ' '], "-"));
+            let wt_path = ensure_worktree(tmp.path(), &branch, true)
+                .unwrap_or_else(|e| panic!("[{}] create worktree: {:?}", case.name, e));
+
+            (case.setup)(&wt_path);
+
+            let result = remove_worktree(tmp.path(), &wt_path);
+            assert_eq!(
+                result.is_ok(),
+                case.expected_ok,
+                "[{}] expected is_ok()={}, got: {:?}",
+                case.name,
+                case.expected_ok,
+                result
+            );
+            if case.expected_ok {
+                assert_eq!(
+                    result.unwrap(),
+                    case.expected_value,
+                    "[{}] expected Ok({})",
+                    case.name,
+                    case.expected_value
+                );
+            }
+            assert_eq!(
+                !wt_path.exists(),
+                case.path_removed,
+                "[{}] path_removed={} but path exists={}",
+                case.name,
+                case.path_removed,
+                wt_path.exists()
+            );
+        }
+    }
+
     #[test]
     fn test_ensure_worktree_runs_git_prune_on_partial_failure() {
         // When git worktree add creates a partial entry then fails, ensure_worktree
