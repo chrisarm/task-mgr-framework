@@ -21,11 +21,13 @@ fn sample_prd_path() -> std::path::PathBuf {
         .join("sample_prd.json")
 }
 
-/// Set up a fresh database with schema.
+/// Set up a fresh database with schema and all migrations.
 fn setup_db() -> (TempDir, rusqlite::Connection) {
+    use task_mgr::db::migrations::run_migrations;
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 

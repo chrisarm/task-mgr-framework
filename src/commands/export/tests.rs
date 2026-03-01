@@ -409,8 +409,9 @@ fn test_atomic_write() {
 #[test]
 fn test_calculate_statistics() {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
 
     // Insert some tasks
     conn.execute(

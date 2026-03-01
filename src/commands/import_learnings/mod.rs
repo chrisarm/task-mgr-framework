@@ -135,7 +135,7 @@ fn compute_dedup_key(title: &str, content: &str) -> String {
 
 /// Load dedup keys of all existing learnings in the database.
 fn load_existing_keys(conn: &rusqlite::Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT title, content FROM learnings")?;
+    let mut stmt = conn.prepare("SELECT title, content FROM learnings WHERE retired_at IS NULL")?;
     let rows = stmt.query_map([], |row| {
         let title: String = row.get(0)?;
         let content: String = row.get(1)?;

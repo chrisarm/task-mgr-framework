@@ -153,6 +153,7 @@ fn query_learning_counts(conn: &Connection) -> TaskMgrResult<LearningCounts> {
             COALESCE(SUM(CASE WHEN outcome = 'workaround' THEN 1 ELSE 0 END), 0) as workaround,
             COALESCE(SUM(CASE WHEN outcome = 'pattern' THEN 1 ELSE 0 END), 0) as pattern
         FROM learnings
+        WHERE retired_at IS NULL
         "#,
     )?;
 
@@ -287,14 +288,15 @@ pub fn format_text(result: &StatsResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::create_schema;
+    use crate::db::{create_schema, migrations::run_migrations};
     use rusqlite::params;
     use tempfile::TempDir;
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 

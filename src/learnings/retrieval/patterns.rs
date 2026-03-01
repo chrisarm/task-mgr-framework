@@ -297,10 +297,11 @@ fn load_learnings_with_applicability(conn: &Connection) -> TaskMgrResult<Vec<Lea
             l.applies_to_files, l.applies_to_task_types, l.applies_to_errors,
             l.confidence, l.times_shown, l.times_applied, l.last_shown_at, l.last_applied_at
         FROM learnings l
-        WHERE l.applies_to_files IS NOT NULL
+        WHERE l.retired_at IS NULL
+          AND (l.applies_to_files IS NOT NULL
            OR l.applies_to_task_types IS NOT NULL
            OR l.applies_to_errors IS NOT NULL
-           OR EXISTS (SELECT 1 FROM learning_tags lt WHERE lt.learning_id = l.id)
+           OR EXISTS (SELECT 1 FROM learning_tags lt WHERE lt.learning_id = l.id))
         "#,
     )?;
 

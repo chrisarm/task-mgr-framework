@@ -12,9 +12,11 @@ use super::patterns::{extract_task_prefix, file_matches_pattern};
 use super::{CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery};
 
 fn setup_db() -> (TempDir, Connection) {
+    use crate::db::migrations::run_migrations;
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 
@@ -354,7 +356,13 @@ fn test_composite_backend_respects_limit() {
 
 #[test]
 fn test_like_escape_metacharacters() {
-    let (_temp_dir, conn) = setup_db(); // No FTS5 → uses LIKE fallback
+    // Run all migrations (for retired_at column), then remove FTS5 to force LIKE path.
+    // Must drop triggers before the table to avoid insert failures.
+    let (_temp_dir, conn) = setup_db();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ai", []).unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ad", []).unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_au", []).unwrap();
+    conn.execute("DROP TABLE IF EXISTS learnings_fts", []).unwrap();
 
     // Insert learnings — one with a literal % in the title
     create_test_learning(
@@ -1009,7 +1017,10 @@ fn test_escape_fts5_query_with_quotes() {
 
 #[test]
 fn test_is_fts5_available_without_migration() {
-    let (_temp_dir, conn) = setup_db();
+    let temp_dir = TempDir::new().unwrap();
+    let conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    // Intentionally no migrations — verifying FTS5 is absent before migration
     assert!(!is_fts5_available(&conn));
 }
 

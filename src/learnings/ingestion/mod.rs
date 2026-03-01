@@ -189,7 +189,7 @@ fn learning_exists(
     title: &str,
 ) -> TaskMgrResult<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM learnings WHERE outcome = ?1 AND title = ?2",
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL AND outcome = ?1 AND title = ?2",
         rusqlite::params![outcome.as_db_str(), title],
         |row| row.get(0),
     )?;

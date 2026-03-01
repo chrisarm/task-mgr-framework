@@ -63,7 +63,11 @@ pub fn list_learnings(
     params: LearningsListParams,
 ) -> TaskMgrResult<LearningsListResult> {
     // Get total count first
-    let total: usize = conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+    let total: usize = conn.query_row(
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
 
     // Build query with optional LIMIT
     // Use id DESC as secondary sort to ensure deterministic ordering when timestamps are equal
@@ -76,6 +80,7 @@ pub fn list_learnings(
                 applies_to_files, applies_to_task_types, applies_to_errors,
                 confidence, times_shown, times_applied, last_shown_at, last_applied_at
             FROM learnings
+            WHERE retired_at IS NULL
             ORDER BY created_at DESC, id DESC
             LIMIT {}
             "#,
@@ -89,6 +94,7 @@ pub fn list_learnings(
                 applies_to_files, applies_to_task_types, applies_to_errors,
                 confidence, times_shown, times_applied, last_shown_at, last_applied_at
             FROM learnings
+            WHERE retired_at IS NULL
             ORDER BY created_at DESC, id DESC
             "#
         .to_string()
@@ -178,15 +184,16 @@ pub fn format_text(result: &LearningsListResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
+    use crate::db::{create_schema, migrations::run_migrations, open_connection};
     use crate::learnings::{record_learning, RecordLearningParams};
     use crate::models::{Confidence, LearningOutcome};
     use tempfile::TempDir;
 
     fn setup_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
