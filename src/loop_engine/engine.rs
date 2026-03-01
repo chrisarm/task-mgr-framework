@@ -545,6 +545,22 @@ pub fn run_iteration(
     })
 }
 
+/// Result returned by `run_loop()`.
+///
+/// Carries the exit code and (when applicable) the worktree path so that
+/// callers can perform post-loop cleanup.
+#[derive(Debug)]
+pub struct LoopResult {
+    /// Exit code to pass to the process (0 = success, 1 = error, etc.)
+    pub exit_code: i32,
+    /// Worktree path used for this run.
+    ///
+    /// `Some` only when the loop actually created/reused a worktree (i.e.
+    /// `use_worktrees = true` and a branch was specified). `None` when running
+    /// directly in source_root or when no branch was configured.
+    pub worktree_path: Option<PathBuf>,
+}
+
 /// Configuration for running the loop, built from CLI args + env.
 pub struct LoopRunConfig {
     /// Database directory (--dir flag, default ".task-mgr/")
@@ -591,7 +607,7 @@ pub struct LoopRunConfig {
 /// - 2: blocked
 /// - 130: SIGINT
 /// - 143: SIGTERM
-pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
+pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 1: Load environment
     env::load_env();
 
@@ -599,7 +615,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     if let Err(e) = env::validate_git_repo(&run_config.source_root) {
         eprintln!("Error: {}", e);
         eprintln!("Hint: Run task-mgr from within a git repository.");
-        return 1;
+        return LoopResult {
+            exit_code: 1,
+            worktree_path: None,
+        };
     }
 
     // Step 3: Resolve paths (PRD, prompt, progress live in source_root)
@@ -615,14 +634,20 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
             eprintln!(
                 "Hint: Check that the PRD file path is correct relative to your project root."
             );
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
         }
     };
 
     // Step 4: Ensure directories exist (in source_root)
     if let Err(e) = env::ensure_directories(&run_config.source_root) {
         eprintln!("Error creating directories: {}", e);
-        return 1;
+        return LoopResult {
+            exit_code: 1,
+            worktree_path: None,
+        };
     }
 
     // Step 4.5: Acquire exclusive loop lock — prevents concurrent loops on same DB.
@@ -636,7 +661,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 "Error: another loop is already running on this database. {}",
                 e
             );
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
         }
     };
 
@@ -670,7 +698,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         crate::commands::init::PrefixMode::Auto,
     ) {
         eprintln!("Error initializing PRD: {}", e);
-        return 1;
+        return LoopResult {
+            exit_code: 1,
+            worktree_path: None,
+        };
     }
 
     // Step 5.5: Compute initial PRD hash for change detection during iterations
@@ -681,7 +712,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error opening database: {}", e);
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
         }
     };
 
@@ -708,7 +742,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         Ok(meta) => meta,
         Err(e) => {
             eprintln!("Error reading PRD metadata: {}", e);
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
         }
     };
     let branch_name = prd_metadata.branch_name;
@@ -754,7 +791,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         Err(e) => {
             // Hard error: if recovery fails, the loop will deadlock on blocked dependencies
             eprintln!("Error: failed to reset stale tasks: {}", e);
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: None,
+            };
         }
     }
 
@@ -779,15 +819,23 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     // Step 8: Determine working_root (worktree or source_root)
     // If using worktrees and a branch is specified, create/use a worktree.
     // Otherwise, check out the branch in source_root (old behavior).
+    // Track whether we actually set up a worktree so we can clean it up later.
+    let mut actual_worktree_path: Option<PathBuf> = None;
     let working_root = if let Some(ref branch) = branch_name {
         if run_config.config.use_worktrees {
             // Create or reuse worktree for this branch
             match env::ensure_worktree(&run_config.source_root, branch, run_config.config.yes_mode)
             {
-                Ok(wt_path) => wt_path,
+                Ok(wt_path) => {
+                    actual_worktree_path = Some(wt_path.clone());
+                    wt_path
+                }
                 Err(e) => {
                     eprintln!("Error setting up worktree: {}", e);
-                    return 1;
+                    return LoopResult {
+                        exit_code: 1,
+                        worktree_path: None,
+                    };
                 }
             }
         } else {
@@ -796,7 +844,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
                 env::ensure_branch(&run_config.source_root, branch, run_config.config.yes_mode)
             {
                 eprintln!("Error: {}", e);
-                return 1;
+                return LoopResult {
+                    exit_code: 1,
+                    worktree_path: None,
+                };
             }
             run_config.source_root.clone()
         }
@@ -808,7 +859,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     // Step 9: Check uncommitted changes (in working_root)
     if let Err(e) = env::check_uncommitted_changes(&working_root, run_config.config.yes_mode) {
         eprintln!("Error: {}", e);
-        return 1;
+        return LoopResult {
+            exit_code: 1,
+            worktree_path: actual_worktree_path,
+        };
     }
 
     // Step 10: Calculate max iterations
@@ -829,7 +883,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     if let Some(hours) = run_config.config.hours {
         if let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours) {
             eprintln!("Error creating deadline: {}", e);
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: actual_worktree_path,
+            };
         }
     }
 
@@ -839,7 +896,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         Err(e) => {
             eprintln!("Error beginning run: {}", e);
             deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
-            return 1;
+            return LoopResult {
+                exit_code: 1,
+                worktree_path: actual_worktree_path,
+            };
         }
     };
     let run_id = begin_result.run_id;
@@ -1286,6 +1346,38 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
     signals::cleanup_signal_files(&paths.tasks_dir);
 
+    // Step 21.5: Worktree cleanup (if a worktree was used)
+    if let Some(ref wt_path) = actual_worktree_path {
+        let should_cleanup = if run_config.config.cleanup_worktree {
+            // --cleanup-worktree flag: always attempt removal
+            true
+        } else if run_config.config.yes_mode {
+            // --yes without --cleanup-worktree: keep worktree (auto-keep)
+            false
+        } else {
+            // Interactive: prompt user
+            eprint!("Remove worktree at '{}'? [y/N] ", wt_path.display());
+            let mut response = String::new();
+            let _ = std::io::stdin().read_line(&mut response);
+            matches!(response.trim().to_lowercase().as_str(), "y" | "yes")
+        };
+
+        if should_cleanup {
+            match env::remove_worktree(&run_config.source_root, wt_path) {
+                Ok(true) => eprintln!("Worktree '{}' removed.", wt_path.display()),
+                Ok(false) => eprintln!(
+                    "Warning: worktree '{}' has uncommitted changes — not removed.",
+                    wt_path.display()
+                ),
+                Err(e) => eprintln!(
+                    "Warning: failed to remove worktree '{}': {} — continuing.",
+                    wt_path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
     // Step 22: Print final banner
     let total_elapsed = start_time.elapsed().as_secs();
     display::print_final_banner(
@@ -1295,7 +1387,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
         &exit_reason,
     );
 
-    exit_code
+    LoopResult {
+        exit_code,
+        worktree_path: actual_worktree_path,
+    }
 }
 
 /// PRD metadata read from the database.

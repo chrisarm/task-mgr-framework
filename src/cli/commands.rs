@@ -662,6 +662,14 @@ EXAMPLES:
         /// scan its commits for task completion evidence.
         #[arg(long = "external-repo")]
         external_repo: Option<PathBuf>,
+
+        /// Remove the git worktree on loop exit (requires worktree mode)
+        ///
+        /// When set, the worktree created for this loop run will be removed
+        /// after the loop finishes. Dirty worktrees are warned but not forced.
+        /// In interactive mode (no --yes), the user is prompted instead.
+        #[arg(long = "cleanup-worktree", default_value_t = false)]
+        cleanup_worktree: bool,
     },
 
     /// Show status dashboard for PRD projects

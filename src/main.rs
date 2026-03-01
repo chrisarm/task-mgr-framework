@@ -137,7 +137,14 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             }
 
             let files = after_files.unwrap_or_default();
-            let result = next(&cli.dir, &files, claim, run_id.as_deref(), cli.verbose, None)?;
+            let result = next(
+                &cli.dir,
+                &files,
+                claim,
+                run_id.as_deref(),
+                cli.verbose,
+                None,
+            )?;
 
             if cli.verbose {
                 eprint!("{}", format_next_verbose(&result));
@@ -585,6 +592,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             verbose,
             no_worktree,
             external_repo,
+            cleanup_worktree,
         } => {
             let project_root = get_project_root()?;
 
@@ -593,6 +601,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             config.hours = hours;
             config.verbose = verbose || cli.verbose;
             config.use_worktrees = !no_worktree;
+            config.cleanup_worktree = cleanup_worktree;
 
             // Anchor db_dir to source_root so worktrees don't create a separate DB.
             // If the user passed an absolute --dir, respect it; otherwise resolve
@@ -620,10 +629,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
                 })?;
 
-            let exit_code =
+            let result =
                 rt.block_on(async { task_mgr::loop_engine::engine::run_loop(run_config).await });
 
-            process::exit(exit_code);
+            process::exit(result.exit_code);
         }
 
         Commands::Status { prd_file, verbose } => {

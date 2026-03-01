@@ -2047,6 +2047,7 @@ fn test_loop_with_prd_file_and_yes() {
             verbose,
             no_worktree,
             external_repo,
+            cleanup_worktree,
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert!(prompt_file.is_none());
@@ -2055,6 +2056,7 @@ fn test_loop_with_prd_file_and_yes() {
             assert!(!verbose);
             assert!(!no_worktree);
             assert!(external_repo.is_none());
+            assert!(!cleanup_worktree);
         }
         _ => panic!("Expected Loop command"),
     }
@@ -2132,6 +2134,7 @@ fn test_loop_minimal() {
             verbose,
             no_worktree,
             external_repo,
+            ..
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert!(prompt_file.is_none());
@@ -2167,6 +2170,7 @@ fn test_loop_with_all_options() {
             verbose,
             no_worktree,
             external_repo,
+            ..
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert_eq!(prompt_file, Some(PathBuf::from("tasks/prompt.md")));

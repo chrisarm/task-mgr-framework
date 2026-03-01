@@ -223,7 +223,8 @@ pub async fn run_batch(
             external_repo: None, // Batch mode reads from PRD metadata
         };
 
-        let exit_code = engine::run_loop(run_config).await;
+        let loop_result = engine::run_loop(run_config).await;
+        let exit_code = loop_result.exit_code;
 
         results.push(PrdRunResult {
             prd_file: prd_file.clone(),

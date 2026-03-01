@@ -38,6 +38,12 @@ pub struct LoopConfig {
     /// A broader window (default 50) ensures legitimate external completions
     /// aren't missed across prior runs.
     pub external_git_scan_depth: usize,
+    /// Whether to remove the worktree on loop exit.
+    ///
+    /// When true (set by --cleanup-worktree), the worktree is removed after
+    /// the loop finishes. Only applies when `use_worktrees` is true and the
+    /// loop is running in a worktree. Dirty worktrees are warned but not forced.
+    pub cleanup_worktree: bool,
 }
 
 impl Default for LoopConfig {
@@ -55,6 +61,7 @@ impl Default for LoopConfig {
             use_worktrees: true,
             git_scan_depth: 7,
             external_git_scan_depth: 50,
+            cleanup_worktree: false,
         }
     }
 }
@@ -97,6 +104,7 @@ impl LoopConfig {
             git_scan_depth: parse_env("LOOP_GIT_SCAN_DEPTH").unwrap_or(defaults.git_scan_depth),
             external_git_scan_depth: parse_env("LOOP_EXTERNAL_GIT_SCAN_DEPTH")
                 .unwrap_or(defaults.external_git_scan_depth),
+            cleanup_worktree: defaults.cleanup_worktree,
         }
     }
 }
