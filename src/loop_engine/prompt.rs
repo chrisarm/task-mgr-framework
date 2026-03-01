@@ -155,10 +155,8 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     };
 
     // Critical: Escalation policy
-    let escalation_section = build_escalation_section(
-        params.base_prompt_path,
-        resolved_model.as_deref(),
-    );
+    let escalation_section =
+        build_escalation_section(params.base_prompt_path, resolved_model.as_deref());
 
     // Critical: Reorder instruction
     let reorder_instr_section =
@@ -205,8 +203,12 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let mut dropped_sections: Vec<String> = Vec::new();
 
     let learnings_section = build_learnings_section(&next_result.learnings);
-    let learnings_section =
-        try_fit_section(learnings_section, "Learnings", &mut remaining, &mut dropped_sections);
+    let learnings_section = try_fit_section(
+        learnings_section,
+        "Learnings",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let source_ctx = context::scan_source_context(
         &task_output.files,
@@ -214,34 +216,51 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         params.project_root,
     );
     let source_section = source_ctx.format_for_prompt();
-    let source_section =
-        try_fit_section(source_section, "Source Context", &mut remaining, &mut dropped_sections);
+    let source_section = try_fit_section(
+        source_section,
+        "Source Context",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let dep_section = build_dependency_section(params.conn, &task_output.id);
-    let dep_section =
-        try_fit_section(dep_section, "Dependency Summaries", &mut remaining, &mut dropped_sections);
+    let dep_section = try_fit_section(
+        dep_section,
+        "Dependency Summaries",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let synergy_section = build_synergy_section(params.conn, &task_output.id, params.run_id);
-    let synergy_section =
-        try_fit_section(synergy_section, "Synergy Context", &mut remaining, &mut dropped_sections);
+    let synergy_section = try_fit_section(
+        synergy_section,
+        "Synergy Context",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let steering_section = params
         .steering_path
         .map(build_steering_section)
         .unwrap_or_default();
-    let steering_section =
-        try_fit_section(steering_section, "Steering", &mut remaining, &mut dropped_sections);
+    let steering_section = try_fit_section(
+        steering_section,
+        "Steering",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let guidance_section = if params.session_guidance.is_empty() {
         String::new()
     } else {
-        format!(
-            "## Session Guidance\n\n{}\n\n",
-            params.session_guidance,
-        )
+        format!("## Session Guidance\n\n{}\n\n", params.session_guidance,)
     };
-    let guidance_section =
-        try_fit_section(guidance_section, "Session Guidance", &mut remaining, &mut dropped_sections);
+    let guidance_section = try_fit_section(
+        guidance_section,
+        "Session Guidance",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     let hint_section = params
         .reorder_hint
@@ -252,8 +271,12 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
             )
         })
         .unwrap_or_default();
-    let hint_section =
-        try_fit_section(hint_section, "Reorder Hint", &mut remaining, &mut dropped_sections);
+    let hint_section = try_fit_section(
+        hint_section,
+        "Reorder Hint",
+        &mut remaining,
+        &mut dropped_sections,
+    );
 
     // ============================================================
     // Assembly: concatenate in display order
@@ -505,7 +528,10 @@ fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
     let learnings_json =
         serde_json::to_string_pretty(learnings).unwrap_or_else(|_| "[]".to_string());
     let learnings_json = truncate_to_budget(&learnings_json, LEARNINGS_BUDGET);
-    format!("## Relevant Learnings\n\n```json\n{}\n```\n\n", learnings_json)
+    format!(
+        "## Relevant Learnings\n\n```json\n{}\n```\n\n",
+        learnings_json
+    )
 }
 
 /// Append learnings to the prompt.
@@ -584,7 +610,6 @@ fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str
         None => String::new(),
     }
 }
-
 
 /// Resolve the model for a synergy cluster (the selected task + its pending synergyWith partners).
 ///
@@ -3417,7 +3442,10 @@ pub enum ApiError {
             !prompt.contains("[truncated to"),
             "Short base prompt should not be truncated"
         );
-        assert!(prompt.contains("Short prompt"), "Content should be preserved");
+        assert!(
+            prompt.contains("Short prompt"),
+            "Content should be preserved"
+        );
     }
 
     // ===== Two-phase prompt assembly tests =====
@@ -3439,9 +3467,16 @@ pub enum ApiError {
         let mut dropped = Vec::new();
         let section = "hello world".to_string(); // 11 bytes > 5
         let result = try_fit_section(section, "Test", &mut remaining, &mut dropped);
-        assert!(result.is_empty(), "Section should be dropped when over budget");
+        assert!(
+            result.is_empty(),
+            "Section should be dropped when over budget"
+        );
         assert_eq!(remaining, 5, "Budget should not be consumed");
-        assert_eq!(dropped, vec!["Test"], "Should record the dropped section name");
+        assert_eq!(
+            dropped,
+            vec!["Test"],
+            "Should record the dropped section name"
+        );
     }
 
     #[test]
@@ -3452,7 +3487,10 @@ pub enum ApiError {
         let result = try_fit_section(section, "Test", &mut remaining, &mut dropped);
         assert!(result.is_empty());
         assert_eq!(remaining, 100, "Empty section should not consume budget");
-        assert!(dropped.is_empty(), "Empty sections should not appear in dropped list");
+        assert!(
+            dropped.is_empty(),
+            "Empty sections should not appear in dropped list"
+        );
     }
 
     #[test]
@@ -3516,7 +3554,9 @@ pub enum ApiError {
             "Base prompt (critical) must be present"
         );
         assert!(
-            result.prompt.contains("strong reason to work on a different"),
+            result
+                .prompt
+                .contains("strong reason to work on a different"),
             "Reorder instruction (critical) must be present"
         );
 
@@ -3592,19 +3632,27 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         // All sections should be present
-        assert!(result.prompt.contains("## Current Task"), "Task JSON present");
+        assert!(
+            result.prompt.contains("## Current Task"),
+            "Task JSON present"
+        );
         assert!(result.prompt.contains("## Steering"), "Steering present");
         assert!(
             result.prompt.contains("## Session Guidance"),
             "Session Guidance present"
         );
-        assert!(result.prompt.contains("## Reorder Hint"), "Reorder Hint present");
+        assert!(
+            result.prompt.contains("## Reorder Hint"),
+            "Reorder Hint present"
+        );
         assert!(
             result.prompt.contains("## Current Source Context"),
             "Source Context present"
         );
         assert!(
-            result.prompt.contains("strong reason to work on a different"),
+            result
+                .prompt
+                .contains("strong reason to work on a different"),
             "Reorder instruction present"
         );
         assert!(

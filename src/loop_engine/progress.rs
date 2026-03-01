@@ -426,10 +426,7 @@ mod tests {
         rotate_progress(&progress_path);
 
         let after = fs::read_to_string(&progress_path).unwrap();
-        assert_eq!(
-            after, content,
-            "Exact-limit file should not be modified"
-        );
+        assert_eq!(after, content, "Exact-limit file should not be modified");
     }
 
     #[test]

@@ -210,7 +210,11 @@ pub fn format_text(result: &ListResult) -> String {
                 "ID", "STATUS", "PRI", "TITLE"
             ));
             output.push_str(&format!("{}\n", "-".repeat(70)));
-            for task in result.tasks.iter().filter(|t| extract_task_prefix(&t.id) == *prefix) {
+            for task in result
+                .tasks
+                .iter()
+                .filter(|t| extract_task_prefix(&t.id) == *prefix)
+            {
                 render_task_row(task, &mut output);
             }
             output.push('\n');

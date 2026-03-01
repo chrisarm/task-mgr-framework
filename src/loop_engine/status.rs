@@ -1139,11 +1139,19 @@ mod tests {
 
         let result = show_status(_temp_dir.path(), None, false, None).unwrap();
         assert_eq!(result.prd_summaries.len(), 2);
-        let a = result.prd_summaries.iter().find(|s| s.prefix == "abc123").unwrap();
+        let a = result
+            .prd_summaries
+            .iter()
+            .find(|s| s.prefix == "abc123")
+            .unwrap();
         assert_eq!(a.total, 2);
         assert_eq!(a.done, 1);
         assert_eq!(a.in_progress, 0);
-        let b = result.prd_summaries.iter().find(|s| s.prefix == "def456").unwrap();
+        let b = result
+            .prd_summaries
+            .iter()
+            .find(|s| s.prefix == "def456")
+            .unwrap();
         assert_eq!(b.total, 2);
         assert_eq!(b.done, 1);
         assert_eq!(b.in_progress, 1);

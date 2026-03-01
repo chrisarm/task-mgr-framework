@@ -34,6 +34,9 @@ impl std::fmt::Display for HolderInfo {
         if let Some(b) = &self.branch {
             write!(f, " branch={}", b)?;
         }
+        if let Some(w) = &self.worktree {
+            write!(f, " worktree={}", w)?;
+        }
         if let Some(p) = &self.prefix {
             write!(f, " prefix={}", p)?;
         }
@@ -727,7 +730,10 @@ mod tests {
             prefix: Some("feat-my-branch".to_string()),
         };
         let s = info.to_string();
-        assert_eq!(s, "1234@myhost branch=feat/my-branch prefix=feat-my-branch");
+        assert_eq!(
+            s,
+            "1234@myhost branch=feat/my-branch worktree=/some/worktree prefix=feat-my-branch"
+        );
     }
 
     #[test]

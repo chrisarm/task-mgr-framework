@@ -121,7 +121,8 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
 /// Policy:
 /// - `keep_worktrees = true` → never remove
 /// - failed PRD (exit_code != 0) → keep regardless of flags (preserve for debugging)
-/// - `yes = true` + success → auto-remove
+/// - `cleanup_worktree = true` → auto-remove (explicit opt-in)
+/// - `yes = true` without `cleanup_worktree` → keep (matches engine behavior)
 /// - `yes = false` (interactive) → prompt user
 /// - Cleanup failure warns but does not affect batch result
 fn cleanup_worktree_after_prd(
@@ -130,6 +131,7 @@ fn cleanup_worktree_after_prd(
     exit_code: i32,
     yes: bool,
     keep_worktrees: bool,
+    cleanup_worktree: bool,
 ) {
     if keep_worktrees {
         return;
@@ -141,8 +143,12 @@ fn cleanup_worktree_after_prd(
         return;
     }
 
-    let should_remove = if yes {
+    let should_remove = if cleanup_worktree {
+        // --cleanup-worktree flag: always attempt removal
         true
+    } else if yes {
+        // --yes without --cleanup-worktree: keep worktree (matches engine behavior)
+        false
     } else {
         // Interactive: prompt user
         eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
@@ -280,6 +286,7 @@ pub async fn run_batch(
             external_repo: None, // Batch mode reads from PRD metadata
         };
 
+        let should_cleanup_worktree = run_config.config.cleanup_worktree;
         let loop_result = engine::run_loop(run_config).await;
         let exit_code = loop_result.exit_code;
         let worktree_path = loop_result.worktree_path.clone();
@@ -298,7 +305,14 @@ pub async fn run_batch(
 
         // Worktree cleanup after each PRD
         if let Some(ref wt_path) = worktree_path {
-            cleanup_worktree_after_prd(project_root, wt_path, exit_code, yes, keep_worktrees);
+            cleanup_worktree_after_prd(
+                project_root,
+                wt_path,
+                exit_code,
+                yes,
+                keep_worktrees,
+                should_cleanup_worktree,
+            );
         }
     }
 
@@ -606,7 +620,7 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // Pass keep_worktrees=true — function should return without touching path
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true);
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true, false);
 
         assert!(
             dummy_path.exists(),
@@ -622,7 +636,7 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // exit_code=1 → keep worktree for debugging
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false);
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false, true);
 
         assert!(
             dummy_path.exists(),
@@ -655,8 +669,8 @@ mod tests {
 
         assert!(wt_path.exists(), "worktree must exist before cleanup");
 
-        // exit_code=0, yes=true → should remove
-        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false);
+        // exit_code=0, cleanup_worktree=true → should remove
+        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false, true);
 
         assert!(
             !wt_path.exists(),

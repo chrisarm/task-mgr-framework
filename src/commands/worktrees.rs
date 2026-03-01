@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use fs2::FileExt;
+
 use crate::db::LockGuard;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::env::{parse_worktree_list, remove_worktree};
@@ -72,11 +74,33 @@ fn locked_worktree_paths(db_dir: &Path) -> Vec<String> {
         }
         if let Some(info) = LockGuard::read_holder_info(&path) {
             if let Some(wt) = info.worktree {
-                locked.push(wt);
+                // Verify the flock is actually held (not stale from SIGKILL)
+                if is_flock_held(&path) {
+                    locked.push(wt);
+                }
             }
         }
     }
     locked
+}
+
+/// Check if a file has an active flock held by another process.
+///
+/// Attempts a non-blocking exclusive lock. If it succeeds, the lock file is stale
+/// (no process holds the flock). If it fails with WouldBlock, a process holds it.
+fn is_flock_held(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // Lock acquired — it was stale. Release immediately.
+            let _ = file.unlock();
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
 }
 
 /// Determine the lock status for a worktree path given the set of locked paths.
@@ -157,8 +181,8 @@ pub fn prune(db_dir: &Path, source_root: &Path) -> TaskMgrResult<WorktreesResult
 
     for wt in &list_result.worktrees {
         // Skip the main worktree (always first, always unlocked but keep it)
-        // Heuristic: skip if path == source_root
-        if wt.path == source_root {
+        // Canonicalize to handle trailing slashes, symlinks, mount differences
+        if wt.path.canonicalize().ok() == source_root.canonicalize().ok() {
             continue;
         }
 
@@ -232,7 +256,15 @@ pub fn remove(db_dir: &Path, source_root: &Path, target: &str) -> TaskMgrResult<
     let worktree_path = wt.path.clone();
     let wt_info = wt.clone();
 
-    remove_worktree(source_root, &worktree_path)?;
+    let removed = remove_worktree(source_root, &worktree_path)?;
+    if !removed {
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "Git worktree".to_string(),
+            id: target.to_string(),
+            expected: "clean worktree".to_string(),
+            actual: "worktree has uncommitted changes — not removed".to_string(),
+        });
+    }
 
     Ok(WorktreesResult {
         action: "remove".to_string(),
@@ -254,15 +286,35 @@ pub fn format_text(result: &WorktreesResult) -> String {
             if result.worktrees.is_empty() {
                 out.push_str("No worktrees found.\n");
             } else {
-                out.push_str(&format!("{:<50} {:<30} {}\n", "PATH", "BRANCH", "LOCK"));
-                out.push_str(&format!("{:-<50} {:-<30} {:-<8}\n", "", "", ""));
+                let path_width = result
+                    .worktrees
+                    .iter()
+                    .map(|wt| wt.path.to_string_lossy().len())
+                    .max()
+                    .unwrap_or(4) // "PATH".len()
+                    .max(50);
+                out.push_str(&format!(
+                    "{:<pw$} {:<30} {}\n",
+                    "PATH",
+                    "BRANCH",
+                    "LOCK",
+                    pw = path_width
+                ));
+                out.push_str(&format!(
+                    "{:-<pw$} {:-<30} {:-<8}\n",
+                    "",
+                    "",
+                    "",
+                    pw = path_width
+                ));
                 for wt in &result.worktrees {
                     let branch = wt.branch.as_deref().unwrap_or("(detached)");
                     out.push_str(&format!(
-                        "{:<50} {:<30} {}\n",
+                        "{:<pw$} {:<30} {}\n",
                         wt.path.display(),
                         branch,
-                        wt.lock_status
+                        wt.lock_status,
+                        pw = path_width
                     ));
                 }
             }
@@ -291,7 +343,7 @@ pub fn format_text(result: &WorktreesResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, File};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -331,12 +383,34 @@ mod tests {
     }
 
     /// Write a lock file that claims the given worktree path is locked.
+    /// Does NOT hold an flock — useful for testing stale lock detection.
     fn write_lock_file(lock_path: &Path, worktree_path: &str) {
         let content = format!(
             "12345@testhost\nbranch=test\nworktree={}\nprefix=test\n",
             worktree_path
         );
         fs::write(lock_path, content).expect("write lock file");
+    }
+
+    /// Write a lock file AND hold an exclusive flock on it.
+    /// Returns the File handle — the flock is released when dropped.
+    fn write_lock_file_with_flock(lock_path: &Path, worktree_path: &str) -> File {
+        use std::io::Write;
+        let content = format!(
+            "12345@testhost\nbranch=test\nworktree={}\nprefix=test\n",
+            worktree_path
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(lock_path)
+            .expect("open lock file");
+        file.write_all(content.as_bytes()).expect("write lock file");
+        file.sync_all().expect("sync lock file");
+        fs2::FileExt::lock_exclusive(&file).expect("acquire flock");
+        file
     }
 
     // ── lock_status_for ────────────────────────────────────────────────────────
@@ -367,12 +441,27 @@ mod tests {
     fn test_locked_worktree_paths_reads_lock_files() {
         let tmp = TempDir::new().expect("create temp dir");
         let worktree_path = "/path/to/my/worktree";
-        write_lock_file(&tmp.path().join("loop.lock"), worktree_path);
+        let _flock = write_lock_file_with_flock(&tmp.path().join("loop.lock"), worktree_path);
 
         let paths = locked_worktree_paths(tmp.path());
         assert!(
             paths.contains(&worktree_path.to_string()),
             "Expected locked path to appear, got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_locked_worktree_paths_treats_stale_lock_as_unlocked() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let worktree_path = "/path/to/stale/worktree";
+        // Write lock file WITHOUT holding flock (simulates SIGKILL'd process)
+        write_lock_file(&tmp.path().join("loop.lock"), worktree_path);
+
+        let paths = locked_worktree_paths(tmp.path());
+        assert!(
+            paths.is_empty(),
+            "Stale lock (no flock held) should be treated as unlocked, got: {:?}",
             paths
         );
     }
@@ -524,9 +613,9 @@ mod tests {
         let db_dir = tmp.path().join(".task-mgr");
         fs::create_dir_all(&db_dir).expect("create db dir");
 
-        // Write a lock file claiming the repo path is active
+        // Write a lock file claiming the repo path is active, with an actual flock
         let repo_str = repo.to_string_lossy().to_string();
-        write_lock_file(&db_dir.join("loop.lock"), &repo_str);
+        let _flock = write_lock_file_with_flock(&db_dir.join("loop.lock"), &repo_str);
 
         let result = list(&db_dir, &repo).expect("list should succeed");
         let main_wt = result.worktrees.iter().find(|w| w.path == repo);
@@ -564,9 +653,9 @@ mod tests {
             .output()
             .expect("git worktree add");
 
-        // Lock the worktree via a lock file
+        // Lock the worktree via a lock file with actual flock
         let wt_str = wt_path.to_string_lossy().to_string();
-        write_lock_file(&db_dir.join("loop.lock"), &wt_str);
+        let _flock = write_lock_file_with_flock(&db_dir.join("loop.lock"), &wt_str);
 
         let result = prune(&db_dir, &repo).expect("prune should succeed");
 
@@ -683,9 +772,9 @@ mod tests {
             .output()
             .expect("git worktree add");
 
-        // Lock the worktree
+        // Lock the worktree with actual flock
         let wt_str = wt_path.to_string_lossy().to_string();
-        write_lock_file(&db_dir.join("loop.lock"), &wt_str);
+        let _flock = write_lock_file_with_flock(&db_dir.join("loop.lock"), &wt_str);
 
         let result = remove(&db_dir, &repo, "feat/locked-remove");
         assert!(result.is_err(), "should fail to remove locked worktree");

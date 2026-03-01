@@ -409,8 +409,12 @@ fn test_benchmark_worst_case_all_todo() {
     // Measure selection time (includes connection open)
     let start = Instant::now();
     let conn = open_connection(temp_dir.path()).expect("Failed to open connection");
-    let result =
-        task_mgr::commands::next::select_next_task(&conn, &["src/file_0.rs".to_string()], &[], None);
+    let result = task_mgr::commands::next::select_next_task(
+        &conn,
+        &["src/file_0.rs".to_string()],
+        &[],
+        None,
+    );
     let elapsed = start.elapsed();
 
     println!("\n=== Worst Case Benchmark (200 todo tasks, chain dependencies) ===");

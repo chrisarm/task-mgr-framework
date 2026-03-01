@@ -74,11 +74,7 @@ pub fn format_session_banner(
     let sep = format!("╠{}╣", "═".repeat(INNER));
     let bot = format!("╚{}╝", "═".repeat(INNER));
 
-    let title = format!(
-        "║{:^width$}║",
-        "AUTONOMOUS AGENT LOOP START",
-        width = INNER
-    );
+    let title = format!("║{:^width$}║", "AUTONOMOUS AGENT LOOP START", width = INNER);
 
     lines.push(String::new());
     lines.push(top);
