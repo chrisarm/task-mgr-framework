@@ -663,6 +663,7 @@ fn test_edit_learning_all_fields() {
         remove_tags: Some(vec!["original-tag".to_string()]),
         add_files: Some(vec!["src/new.rs".to_string()]),
         remove_files: Some(vec!["src/old.rs".to_string()]),
+        ..Default::default()
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
@@ -745,6 +746,270 @@ fn test_format_edit_text_no_updates() {
 
     let text = format_edit_text(&result);
     assert!(text.contains("No fields were updated"));
+}
+
+// ============ EditLearningParams: task_types and errors (FR-006) ============
+// These tests are #[ignore] until FEAT-001 implements the update.rs handling.
+
+#[test]
+#[ignore = "requires FEAT-001: add_task_types/remove_task_types handling in edit_learning"]
+fn test_edit_learning_add_task_types() {
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let task_types = learning.applies_to_task_types.unwrap();
+    assert!(task_types.contains(&"US-".to_string()));
+    assert!(task_types.contains(&"FIX-".to_string()));
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_task_types/remove_task_types handling in edit_learning"]
+fn test_edit_learning_remove_task_types() {
+    let (_temp_dir, conn) = setup_db();
+
+    // Create a learning with pre-existing task types
+    let create_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Task types learning".to_string(),
+        content: "Content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    let learning_id = record_learning(&conn, create_params).unwrap().learning_id;
+
+    let params = EditLearningParams {
+        remove_task_types: Some(vec!["US-".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let task_types = learning.applies_to_task_types.unwrap();
+    assert!(!task_types.contains(&"US-".to_string()));
+    assert!(task_types.contains(&"FIX-".to_string()));
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_errors/remove_errors handling in edit_learning"]
+fn test_edit_learning_add_errors() {
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    let params = EditLearningParams {
+        add_errors: Some(vec!["E0001".to_string(), "timeout".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let errors = learning.applies_to_errors.unwrap();
+    assert!(errors.contains(&"E0001".to_string()));
+    assert!(errors.contains(&"timeout".to_string()));
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_errors/remove_errors handling in edit_learning"]
+fn test_edit_learning_remove_errors() {
+    let (_temp_dir, conn) = setup_db();
+
+    // Create a learning with pre-existing errors
+    let create_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Errors learning".to_string(),
+        content: "Content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: Some(vec!["E0001".to_string(), "timeout".to_string()]),
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    let learning_id = record_learning(&conn, create_params).unwrap().learning_id;
+
+    let params = EditLearningParams {
+        remove_errors: Some(vec!["E0001".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let errors = learning.applies_to_errors.unwrap();
+    assert!(!errors.contains(&"E0001".to_string()));
+    assert!(errors.contains(&"timeout".to_string()));
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
+fn test_edit_learning_task_types_null_field_creates_array() {
+    // Learning starts with NULL applies_to_task_types; adding should create the array
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn); // created with applies_to_task_types: None
+
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    assert_eq!(
+        learning.applies_to_task_types,
+        Some(vec!["US-".to_string()])
+    );
+}
+
+#[test]
+#[ignore = "requires FEAT-001: remove_errors handling in edit_learning"]
+fn test_edit_learning_errors_null_field_remove_is_noop() {
+    // Learning starts with NULL applies_to_errors; removing should not crash
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn); // created with applies_to_errors: None
+
+    let params = EditLearningParams {
+        remove_errors: Some(vec!["E0001".to_string()]),
+        ..Default::default()
+    };
+
+    // Should not error
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    // Field still updated (even though nothing changed)
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    // applies_to_errors should remain None/empty after removing from NULL
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    assert!(
+        learning.applies_to_errors.is_none()
+            || learning
+                .applies_to_errors
+                .as_ref()
+                .map_or(true, |v| v.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
+fn test_edit_learning_task_types_duplicate_add_is_idempotent() {
+    let (_temp_dir, conn) = setup_db();
+
+    let create_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Idempotent test".to_string(),
+        content: "Content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: Some(vec!["US-".to_string()]),
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    let learning_id = record_learning(&conn, create_params).unwrap().learning_id;
+
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string()]), // already exists
+        ..Default::default()
+    };
+
+    edit_learning(&conn, learning_id, params).unwrap();
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let task_types = learning.applies_to_task_types.unwrap();
+    // Should still be exactly one "US-", not two
+    assert_eq!(task_types.iter().filter(|t| t.as_str() == "US-").count(), 1);
+}
+
+#[test]
+#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
+fn test_edit_learning_task_types_does_not_overwrite_files() {
+    // Known-bad discriminator: adding task_types must not affect applies_to_files
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn); // has applies_to_files: ["src/old.rs"]
+
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string()]),
+        ..Default::default()
+    };
+
+    edit_learning(&conn, learning_id, params).unwrap();
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    // applies_to_files must be unchanged
+    let files = learning.applies_to_files.unwrap();
+    assert_eq!(files, vec!["src/old.rs".to_string()]);
+    // applies_to_task_types must be set
+    assert_eq!(
+        learning.applies_to_task_types,
+        Some(vec!["US-".to_string()])
+    );
+}
+
+#[test]
+fn test_edit_learning_has_updates_with_task_types_and_errors() {
+    // These fields exist on the struct (stubs), so has_updates() should reflect them
+    let with_add_task_types = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string()]),
+        ..Default::default()
+    };
+    assert!(with_add_task_types.has_updates());
+
+    let with_remove_task_types = EditLearningParams {
+        remove_task_types: Some(vec!["US-".to_string()]),
+        ..Default::default()
+    };
+    assert!(with_remove_task_types.has_updates());
+
+    let with_add_errors = EditLearningParams {
+        add_errors: Some(vec!["E0001".to_string()]),
+        ..Default::default()
+    };
+    assert!(with_add_errors.has_updates());
+
+    let with_remove_errors = EditLearningParams {
+        remove_errors: Some(vec!["E0001".to_string()]),
+        ..Default::default()
+    };
+    assert!(with_remove_errors.has_updates());
 }
 
 #[test]

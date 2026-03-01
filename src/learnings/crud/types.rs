@@ -81,6 +81,14 @@ pub struct EditLearningParams {
     pub add_files: Option<Vec<String>>,
     /// File patterns to remove
     pub remove_files: Option<Vec<String>>,
+    /// Task type prefixes to add
+    pub add_task_types: Option<Vec<String>>,
+    /// Task type prefixes to remove
+    pub remove_task_types: Option<Vec<String>>,
+    /// Error patterns to add
+    pub add_errors: Option<Vec<String>>,
+    /// Error patterns to remove
+    pub remove_errors: Option<Vec<String>>,
 }
 
 impl EditLearningParams {
@@ -95,6 +103,10 @@ impl EditLearningParams {
             || self.remove_tags.is_some()
             || self.add_files.is_some()
             || self.remove_files.is_some()
+            || self.add_task_types.is_some()
+            || self.remove_task_types.is_some()
+            || self.add_errors.is_some()
+            || self.remove_errors.is_some()
     }
 }
 

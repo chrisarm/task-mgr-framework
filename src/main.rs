@@ -516,6 +516,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 remove_tags,
                 add_files,
                 remove_files,
+                add_task_types: None,
+                remove_task_types: None,
+                add_errors: None,
+                remove_errors: None,
             };
 
             let result = edit_learning(&conn, learning_id, params)?;
