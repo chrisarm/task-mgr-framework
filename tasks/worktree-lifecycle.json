@@ -589,8 +589,8 @@
       "title": "Wire SessionBannerHints into run_loop() print_session_banner call",
       "description": "print_session_banner in engine.rs (Step 15) passes None for hints. Wire db_dir, task_prefix, and actual_worktree_path into a SessionBannerHints struct and pass it.",
       "priority": 14,
-      "status": "in_progress",
-      "passes": false,
+      "status": "done",
+      "passes": true,
       "estimatedEffort": "small",
       "modifiesBehavior": false,
       "touchesFiles": [

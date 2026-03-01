@@ -937,12 +937,18 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
     // Step 15: Print session banner
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");
+    let db_path = run_config.db_dir.join("tasks.db");
+    let banner_hints = display::SessionBannerHints {
+        db_path: &db_path,
+        prefix: task_prefix.as_deref(),
+        worktree_path: actual_worktree_path.as_deref(),
+    };
     display::print_session_banner(
         &prd_basename,
         branch_display,
         max_iterations,
         run_config.config.hours,
-        None,
+        Some(&banner_hints),
     );
 
     // Step 16: Build usage params
