@@ -1,17 +1,9 @@
 {
-  "branchName": "feat/curate-learnings-p1",
-  "description": "Phase 3 of Learning Curation: curate dedup subcommand — LLM-powered semantic deduplication and merging of learnings. Finds duplicate clusters via Claude, creates consolidated merged learnings with union metadata and summed bandit stats, soft-archives originals. PREREQUISITE: Phase 1 (tasks/curate-learnings-p1.json) must be merged to main before starting this phase.",
-  "globalAcceptanceCriteria": {
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "No breaking changes to existing APIs unless explicitly required"
-    ],
-    "description": "These criteria apply to ALL implementation tasks"
-  },
+  "version": "1.0",
+  "project": "task-mgr",
   "model": "claude-sonnet-4-6",
+  "branchName": "feat/curate-learnings-p1",
+  "description": "Phase 3 of Learning Curation: curate dedup subcommand \u2014 LLM-powered semantic deduplication and merging of learnings. Finds duplicate clusters via Claude, creates consolidated merged learnings with union metadata and summed bandit stats, soft-archives originals. PREREQUISITE: Phase 1 (tasks/curate-learnings-p1.json) must be merged to main before starting this phase.",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -27,18 +19,29 @@
       "Handle Option/Result explicitly; avoid unwrap() in production code"
     ]
   },
-  "project": "task-mgr",
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ]
+  },
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "low": "51-99: Defer to hardening phase",
-      "medium": "21-50: Fix in current phase if time permits"
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
     }
   },
-  "taskPrefix": "a8e80384",
   "userStories": [
     {
+      "id": "TEST-INIT-001",
+      "title": "Initial tests for dedup cluster merge logic",
+      "description": "Write tests BEFORE implementation for the core merge_cluster() function: given a set of source learnings and merged content, verify the merged learning is created correctly with union metadata, summed bandit stats, highest confidence, and source learnings are soft-archived.",
       "acceptanceCriteria": [
         "Test: merging 2 learnings creates 1 new learning with combined content from LLM",
         "Test: merged learning has union of applies_to_files from all sources (no duplicates)",
@@ -52,23 +55,29 @@
         "Test: merged learning has retired_at = NULL (is active)",
         "Test: merged learning has window_shown=0 and window_applied=0 (window stats reset per US-003, not carried from sources)",
         "Test: merged learning confidence is computed from source confidences (highest wins), NOT from LLM response",
-        "Test: same learning in multiple clusters — second cluster skips already-merged learning",
-        "Known-bad discriminator: naive implementation that creates merged learning but forgets to sum bandit stats (leaves at 0,0) — test must catch this",
+        "Test: same learning in multiple clusters \u2014 second cluster skips already-merged learning",
+        "Known-bad discriminator: naive implementation that creates merged learning but forgets to sum bandit stats (leaves at 0,0) \u2014 test must catch this",
         "Test file compiles (tests may be #[ignore] or expected to fail until FEAT-004)"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [],
-      "description": "Write tests BEFORE implementation for the core merge_cluster() function: given a set of source learnings and merged content, verify the merged learning is created correctly with union metadata, summed bandit stats, highest confidence, and source learnings are soft-archived.",
-      "edgeCases": [
-        "Same learning in multiple dedup clusters — process clusters in order, skip learnings already merged/retired",
-        "Merging learnings where one has applies_to_files and other has NULL — union should include the non-NULL values",
-        "Merging learnings with overlapping tags — union should deduplicate",
-        "Merging learnings with different confidence levels — must use highest (high > medium > low)",
-        "Cluster of 1 learning — edge case, should be skipped (nothing to merge)",
-        "Summed times_shown overflows i32 — unlikely but document assumption"
-      ],
+      "priority": 1,
       "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Focus on the pure DB merge logic, not the LLM interaction. Use in-memory SQLite with schema+migrations. Create learnings with known metadata and stats, then verify merge output. The merge function takes pre-validated cluster data (source IDs + merged content) and executes the DB operations.",
+      "edgeCases": [
+        "Same learning in multiple dedup clusters \u2014 process clusters in order, skip learnings already merged/retired",
+        "Merging learnings where one has applies_to_files and other has NULL \u2014 union should include the non-NULL values",
+        "Merging learnings with overlapping tags \u2014 union should deduplicate",
+        "Merging learnings with different confidence levels \u2014 must use highest (high > medium > low)",
+        "Cluster of 1 learning \u2014 edge case, should be skipped (nothing to merge)",
+        "Summed times_shown overflows i32 \u2014 unlikely but document assumption"
+      ],
+      "invariants": [
+        "After merge: exactly 1 new learning created per valid cluster",
+        "After merge: all source learnings have retired_at IS NOT NULL",
+        "After merge: merged learning has retired_at IS NULL",
+        "After merge: merged times_shown = SUM(source times_shown), merged times_applied = SUM(source times_applied)",
+        "After merge: merged confidence >= MAX(source confidences)"
+      ],
       "failureModes": [
         {
           "cause": "Bandit stats not copied to merged learning (left at default 0,0)",
@@ -83,54 +92,52 @@
           "expectedBehavior": "Test asserts tag count equals unique tag count across sources"
         }
       ],
-      "id": "TEST-INIT-001",
-      "invariants": [
-        "After merge: exactly 1 new learning created per valid cluster",
-        "After merge: all source learnings have retired_at IS NOT NULL",
-        "After merge: merged learning has retired_at IS NULL",
-        "After merge: merged times_shown = SUM(source times_shown), merged times_applied = SUM(source times_applied)",
-        "After merge: merged confidence >= MAX(source confidences)"
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
       ],
-      "modifiesBehavior": false,
-      "notes": "Focus on the pure DB merge logic, not the LLM interaction. Use in-memory SQLite with schema+migrations. Create learnings with known metadata and stats, then verify merge output. The merge function takes pre-validated cluster data (source IDs + merged content) and executes the DB operations.",
-      "passes": true,
-      "priority": 1,
+      "dependsOn": [],
       "synergyWith": [
         "FEAT-004"
       ],
-      "title": "Initial tests for dedup cluster merge logic",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "TEST-INIT-002",
+      "title": "Initial tests for dedup LLM prompt building and response parsing",
+      "description": "Write tests for the LLM prompt construction (injection protection, content formatting) and response parsing (JSON extraction, cluster validation, error handling).",
       "acceptanceCriteria": [
         "Test: prompt contains random UUID boundary delimiter (injection protection)",
         "Test: prompt contains UNTRUSTED warning for learning content",
         "Test: prompt includes all learning IDs, titles, and content",
         "Test: prompt includes threshold value as guidance",
         "Test: valid JSON response parses to Vec<RawDedupCluster> correctly",
-        "Test: response with non-existent learning IDs — invalid IDs filtered out, valid clusters preserved",
-        "Test: response with same learning in multiple clusters — first cluster wins, later skipped",
+        "Test: response with non-existent learning IDs \u2014 invalid IDs filtered out, valid clusters preserved",
+        "Test: response with same learning in multiple clusters \u2014 first cluster wins, later skipped",
         "Test: non-JSON response returns empty clusters (best-effort, no crash)",
         "Test: markdown-wrapped JSON (```json ... ```) is extracted correctly",
         "Test: empty array response returns 0 clusters",
         "Known-bad discriminator: response with cluster containing only 1 ID should be rejected (not a merge)",
         "Test file compiles"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [],
-      "description": "Write tests for the LLM prompt construction (injection protection, content formatting) and response parsing (JSON extraction, cluster validation, error handling).",
-      "edgeCases": [
-        "LLM returns non-JSON / garbage — log warning, increment llm_errors counter, return empty clusters",
-        "LLM references non-existent learning IDs — validate all IDs against active learning set before acting; skip invalid clusters",
-        "LLM returns cluster with only 1 source ID — skip (not a valid merge cluster)",
-        "LLM returns empty clusters array — valid, return empty result",
-        "claude binary not found — propagate IoError with context; user sees clear error message",
-        "LLM response exceeds expected format — extract JSON array robustly (same as extraction.rs pattern)"
-      ],
+      "priority": 3,
       "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Follow the testing pattern from src/learnings/ingestion/extraction.rs tests. The prompt builder and parser are pure functions \u2014 easy to test without DB or LLM. Focus on edge cases in JSON parsing and cluster validation.",
+      "edgeCases": [
+        "LLM returns non-JSON / garbage \u2014 log warning, increment llm_errors counter, return empty clusters",
+        "LLM references non-existent learning IDs \u2014 validate all IDs against active learning set before acting; skip invalid clusters",
+        "LLM returns cluster with only 1 source ID \u2014 skip (not a valid merge cluster)",
+        "LLM returns empty clusters array \u2014 valid, return empty result",
+        "claude binary not found \u2014 propagate IoError with context; user sees clear error message",
+        "LLM response exceeds expected format \u2014 extract JSON array robustly (same as extraction.rs pattern)"
+      ],
+      "invariants": [
+        "Prompt must always contain injection protection (random delimiter + UNTRUSTED warning)",
+        "Parser must never crash on malformed LLM output \u2014 always return best-effort result",
+        "Every cluster must have >= 2 source_ids to be valid"
+      ],
       "failureModes": [
         {
           "cause": "LLM returns garbage instead of JSON",
@@ -141,45 +148,45 @@
           "expectedBehavior": "validate_clusters filters out invalid IDs, logs warning per invalid cluster"
         }
       ],
-      "id": "TEST-INIT-002",
-      "invariants": [
-        "Prompt must always contain injection protection (random delimiter + UNTRUSTED warning)",
-        "Parser must never crash on malformed LLM output — always return best-effort result",
-        "Every cluster must have >= 2 source_ids to be valid"
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
       ],
-      "modifiesBehavior": false,
-      "notes": "Follow the testing pattern from src/learnings/ingestion/extraction.rs tests. The prompt builder and parser are pure functions — easy to test without DB or LLM. Focus on edge cases in JSON parsing and cluster validation.",
-      "passes": true,
-      "priority": 3,
+      "dependsOn": [],
       "synergyWith": [
         "FEAT-003"
       ],
-      "title": "Initial tests for dedup LLM prompt building and response parsing",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "TEST-INIT-003",
+      "title": "Initial tests for dedup dry-run, re-run idempotency, and short-circuit",
+      "description": "Write tests for the orchestration-level behavior: dry-run shows proposed merges without DB changes, re-running after partial completion naturally skips already-merged learnings, and 0 active learnings short-circuits without LLM call.",
       "acceptanceCriteria": [
         "Test: dry_run=true returns DedupResult with clusters but no DB changes (no new learnings, no retired_at set)",
         "Test: 0 active learnings returns empty DedupResult immediately (no LLM invocation)",
-        "Test: after merging cluster A, re-running excludes cluster A's source IDs (they're retired) — only remaining active learnings are processed",
-        "Test: per-cluster transaction — if cluster 2 merge fails, cluster 1 is already committed",
-        "Known-bad discriminator: dry_run=true that accidentally modifies DB — test queries learning count before/after",
+        "Test: after merging cluster A, re-running excludes cluster A's source IDs (they're retired) \u2014 only remaining active learnings are processed",
+        "Test: per-cluster transaction \u2014 if cluster 2 merge fails, cluster 1 is already committed",
+        "Known-bad discriminator: dry_run=true that accidentally modifies DB \u2014 test queries learning count before/after",
         "Test file compiles"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [],
-      "description": "Write tests for the orchestration-level behavior: dry-run shows proposed merges without DB changes, re-running after partial completion naturally skips already-merged learnings, and 0 active learnings short-circuits without LLM call.",
-      "edgeCases": [
-        "0 learnings in database — return empty result, no LLM invocation, no error",
-        "All active learnings are unique (no duplicates) — LLM returns empty clusters, 0 merges",
-        "Process killed between clusters — committed clusters are durable, re-run picks up remaining",
-        "Process killed mid-cluster — transaction rolls back, no partial state. LLM work lost but DB consistent",
-        "Dedup threshold too aggressive (0.1) — merges unrelated learnings, but originals recoverable via unretire"
-      ],
+      "priority": 5,
       "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "These tests exercise the curate_dedup() orchestration function. For LLM-dependent tests, mock spawn_claude via CLAUDE_BINARY env var (existing pattern). For DB-only tests, use in-memory SQLite. Focus on the invariants around dry-run safety and re-run idempotency.",
+      "edgeCases": [
+        "0 learnings in database \u2014 return empty result, no LLM invocation, no error",
+        "All active learnings are unique (no duplicates) \u2014 LLM returns empty clusters, 0 merges",
+        "Process killed between clusters \u2014 committed clusters are durable, re-run picks up remaining",
+        "Process killed mid-cluster \u2014 transaction rolls back, no partial state. LLM work lost but DB consistent",
+        "Dedup threshold too aggressive (0.1) \u2014 merges unrelated learnings, but originals recoverable via unretire"
+      ],
+      "invariants": [
+        "dry_run=true must NEVER modify the database (no inserts, no updates)",
+        "After re-run: total active learnings + total retired learnings = original total",
+        "Per-cluster transactions: committed clusters survive even if later clusters fail"
+      ],
       "failureModes": [
         {
           "cause": "dry_run flag not checked before DB writes",
@@ -190,92 +197,93 @@
           "expectedBehavior": "Test verifies merged sources (retired) are excluded from second run"
         }
       ],
-      "id": "TEST-INIT-003",
-      "invariants": [
-        "dry_run=true must NEVER modify the database (no inserts, no updates)",
-        "After re-run: total active learnings + total retired learnings = original total",
-        "Per-cluster transactions: committed clusters survive even if later clusters fail"
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
       ],
-      "modifiesBehavior": false,
-      "notes": "These tests exercise the curate_dedup() orchestration function. For LLM-dependent tests, mock spawn_claude via CLAUDE_BINARY env var (existing pattern). For DB-only tests, use in-memory SQLite. Focus on the invariants around dry-run safety and re-run idempotency.",
-      "passes": true,
-      "priority": 5,
+      "dependsOn": [],
       "synergyWith": [
         "FEAT-005"
       ],
-      "title": "Initial tests for dedup dry-run, re-run idempotency, and short-circuit",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "FEAT-001",
+      "title": "Add Dedup variant to CurateAction enum with CLI flags",
+      "description": "Extend the existing CurateAction enum (created by Phase 1) to add the Dedup variant with --dry-run, --threshold, and --batch-size flags.",
       "acceptanceCriteria": [
         "CurateAction::Dedup variant added to cli/commands.rs",
         "Dedup has: --dry-run (bool, default false)",
-        "Dedup has: --threshold (f64, default 0.7) — merge aggressiveness",
-        "Dedup has: --batch-size (Option<usize>, None = auto) — max learnings per LLM call",
+        "Dedup has: --threshold (f64, default 0.7) \u2014 merge aggressiveness",
+        "Dedup has: --batch-size (Option<usize>, None = auto) \u2014 max learnings per LLM call",
         "task-mgr curate dedup --help shows correct flags with descriptions",
         "--threshold value validated: clap rejects negative values or values > 1.0 with descriptive error",
         "Compiles without warnings"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 6,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Phase 1 creates CurateAction with Retire and Unretire variants. This task adds the Dedup variant. Follow the exact same pattern for CLI flag definitions. The threshold is semantic guidance passed to the LLM prompt, not a computed similarity score.",
+      "touchesFiles": [
+        "src/cli/commands.rs"
+      ],
       "dependsOn": [
         "TEST-INIT-001",
         "TEST-INIT-002",
         "TEST-INIT-003"
       ],
-      "description": "Extend the existing CurateAction enum (created by Phase 1) to add the Dedup variant with --dry-run, --threshold, and --batch-size flags.",
-      "estimatedEffort": "low",
-      "id": "FEAT-001",
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "Phase 1 creates CurateAction with Retire and Unretire variants. This task adds the Dedup variant. Follow the exact same pattern for CLI flag definitions. The threshold is semantic guidance passed to the LLM prompt, not a computed similarity score.",
-      "passes": true,
-      "priority": 6,
       "qualityDimensions": {
         "correctness": [
           "Default threshold must be 0.7 (conservative to avoid merging unrelated learnings)",
-          "batch_size must be Option<usize> — None means auto-calculate from content size"
+          "batch_size must be Option<usize> \u2014 None means auto-calculate from content size"
         ],
         "performance": [],
         "style": [
           "Follow exact pattern from Phase 1's Retire variant for --dry-run flag",
           "Add #[command(after_help = ...)] with usage examples"
         ]
-      },
-      "synergyWith": [
-        "FEAT-002"
-      ],
-      "title": "Add Dedup variant to CurateAction enum with CLI flags",
-      "touchesFiles": [
-        "src/cli/commands.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-002",
+      "title": "Dedup types: DedupParams, DedupResult, DedupCluster structs",
+      "description": "Create the parameter, result, and intermediate types for the dedup subcommand. Add to the existing src/commands/curate/types.rs (created by Phase 1).",
       "acceptanceCriteria": [
         "DedupParams struct: dry_run (bool), threshold (f64), batch_size (Option<usize>)",
         "DedupResult struct: dry_run (bool), clusters_found (usize), learnings_merged (usize), learnings_created (usize), llm_errors (usize), clusters (Vec<DedupCluster>)",
         "DedupCluster struct: source_ids (Vec<i64>), source_titles (Vec<String>), merged_title (String), merged_content (String), merged_outcome (String), merged_confidence (String), reason (String), merged_learning_id (Option<i64>)",
         "All types derive Debug, Clone, Serialize, Deserialize",
         "DedupResult derives Serialize for JSON output mode",
-        "RawDedupCluster struct (serde::Deserialize only) for parsing LLM response: source_ids, merged_title, merged_content, merged_outcome, reason — all Optional for robustness",
+        "RawDedupCluster struct (serde::Deserialize only) for parsing LLM response: source_ids, merged_title, merged_content, merged_outcome, reason \u2014 all Optional for robustness",
         "Compiles without warnings"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 7,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Follow the type pattern from Phase 1's RetireResult and UnretireResult. RawDedupCluster is the deserialization target from LLM JSON \u2014 fields are Optional because LLM output is untrusted. DedupCluster is the validated internal type.",
+      "touchesFiles": [
+        "src/commands/curate/types.rs"
+      ],
       "dependsOn": [
         "FEAT-001"
       ],
-      "description": "Create the parameter, result, and intermediate types for the dedup subcommand. Add to the existing src/commands/curate/types.rs (created by Phase 1).",
-      "estimatedEffort": "low",
-      "id": "FEAT-002",
+      "synergyWith": [
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "Follow the type pattern from Phase 1's RetireResult and UnretireResult. RawDedupCluster is the deserialization target from LLM JSON — fields are Optional because LLM output is untrusted. DedupCluster is the validated internal type.",
-      "passes": true,
-      "priority": 7,
       "qualityDimensions": {
         "correctness": [
-          "RawDedupCluster fields must all be Option<T> — LLM output is untrusted and may omit fields",
+          "RawDedupCluster fields must all be Option<T> \u2014 LLM output is untrusted and may omit fields",
           "DedupCluster.merged_learning_id is Option<i64>: None in dry-run, Some(id) after merge"
         ],
         "performance": [],
@@ -283,17 +291,12 @@
           "Follow existing type patterns: Params/Result pairs, Serialize for all result types",
           "Place RawDedupCluster in types.rs alongside other dedup types (not in a separate file)"
         ]
-      },
-      "synergyWith": [
-        "FEAT-003",
-        "FEAT-004"
-      ],
-      "title": "Dedup types: DedupParams, DedupResult, DedupCluster structs",
-      "touchesFiles": [
-        "src/commands/curate/types.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-003",
+      "title": "Dedup LLM prompt building and response parsing",
+      "description": "Implement build_dedup_prompt() and parse_dedup_response() functions following the pattern from src/learnings/ingestion/extraction.rs. The prompt presents active learnings to Claude and asks it to identify duplicate clusters with proposed merged content. The parser extracts JSON, validates structure, and filters invalid clusters.",
       "acceptanceCriteria": [
         "build_dedup_prompt(learnings, threshold) returns a prompt string with: random UUID delimiter, UNTRUSTED warning, all learning content, threshold guidance, expected JSON format",
         "Prompt requests JSON array of cluster objects with: source_ids, merged_title, merged_content, merged_outcome, reason",
@@ -303,23 +306,27 @@
         "validate_clusters(raw_clusters, active_ids) filters: clusters with < 2 source_ids, clusters with non-existent IDs, learnings appearing in multiple clusters (first wins)",
         "All TEST-INIT-002 tests pass"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Follow extraction.rs pattern exactly for injection protection and JSON parsing. The prompt should instruct Claude to evaluate semantic similarity at the given threshold level. Include the learning's ID, title, content, outcome, and tags in the prompt so Claude has full context. Reuse the extract_json_array() pattern from extraction.rs (or factor out as shared utility if extraction.rs is accessible).",
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs"
+      ],
       "dependsOn": [
         "FEAT-002"
       ],
-      "description": "Implement build_dedup_prompt() and parse_dedup_response() functions following the pattern from src/learnings/ingestion/extraction.rs. The prompt presents active learnings to Claude and asks it to identify duplicate clusters with proposed merged content. The parser extracts JSON, validates structure, and filters invalid clusters.",
-      "estimatedEffort": "medium",
-      "id": "FEAT-003",
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "Follow extraction.rs pattern exactly for injection protection and JSON parsing. The prompt should instruct Claude to evaluate semantic similarity at the given threshold level. Include the learning's ID, title, content, outcome, and tags in the prompt so Claude has full context. Reuse the extract_json_array() pattern from extraction.rs (or factor out as shared utility if extraction.rs is accessible).",
-      "passes": true,
-      "priority": 8,
       "qualityDimensions": {
         "correctness": [
           "Prompt must use random UUID delimiter to prevent injection (not a predictable string)",
           "Prompt must mark learning content as UNTRUSTED",
-          "Parser must never crash on malformed input — always return best-effort result",
+          "Parser must never crash on malformed input \u2014 always return best-effort result",
           "validate_clusters must ensure each learning ID appears in at most one cluster"
         ],
         "performance": [
@@ -329,44 +336,45 @@
           "Follow extraction.rs patterns: build_extraction_prompt() style, extract_json_array() style",
           "RawDedupCluster uses all-Optional fields like RawExtractedLearning"
         ]
-      },
-      "synergyWith": [
-        "FEAT-004"
-      ],
-      "title": "Dedup LLM prompt building and response parsing",
-      "touchesFiles": [
-        "src/commands/curate/dedup.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-004",
+      "title": "Cluster merge logic: merge_cluster() function",
+      "description": "Implement the core merge_cluster() function that, given a validated cluster (source IDs + merged content), executes the DB operations: create merged learning via record_learning(), update bandit stats via raw SQL, collect union metadata and tags from sources, set retired_at on all source learnings. Single transaction per cluster.",
       "acceptanceCriteria": [
         "merge_cluster(conn, cluster, source_learnings) creates merged learning via record_learning()",
         "Merged learning has: title/content/outcome from cluster, union of applies_to_files/task_types/errors from sources, union of tags from sources, highest confidence from sources",
         "After creation, UPDATE times_shown and times_applied with summed values from sources (raw SQL)",
         "Set retired_at = datetime('now') on all source learning IDs",
-        "Merged learning has window_shown=0, window_applied=0 (natural from INSERT defaults — verified, not explicitly set)",
+        "Merged learning has window_shown=0, window_applied=0 (natural from INSERT defaults \u2014 verified, not explicitly set)",
         "All operations in a single transaction (conn.transaction())",
         "Returns merged learning ID on success",
         "All TEST-INIT-001 tests pass"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "record_learning() always sets times_shown=0, times_applied=0. After creating the merged learning, execute a raw UPDATE to set the summed stats. This is the cleanest approach that reuses existing CRUD. For metadata union: collect all applies_to_files from sources into a HashSet, then convert back to Vec. Same for task_types, errors, and tags. For tags, use the tag INSERT from record_learning() (which handles it), but ensure union is deduplicated before passing.",
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs"
+      ],
       "dependsOn": [
         "FEAT-002"
       ],
-      "description": "Implement the core merge_cluster() function that, given a validated cluster (source IDs + merged content), executes the DB operations: create merged learning via record_learning(), update bandit stats via raw SQL, collect union metadata and tags from sources, set retired_at on all source learnings. Single transaction per cluster.",
-      "estimatedEffort": "medium",
-      "id": "FEAT-004",
+      "synergyWith": [
+        "FEAT-003",
+        "FEAT-005"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "record_learning() always sets times_shown=0, times_applied=0. After creating the merged learning, execute a raw UPDATE to set the summed stats. This is the cleanest approach that reuses existing CRUD. For metadata union: collect all applies_to_files from sources into a HashSet, then convert back to Vec. Same for task_types, errors, and tags. For tags, use the tag INSERT from record_learning() (which handles it), but ensure union is deduplicated before passing.",
-      "passes": true,
-      "priority": 9,
       "qualityDimensions": {
         "correctness": [
           "Bandit stats (times_shown, times_applied) MUST be summed from sources, not left at 0",
-          "Metadata union must deduplicate (HashSet) — no duplicate file paths or tags",
+          "Metadata union must deduplicate (HashSet) \u2014 no duplicate file paths or tags",
           "Confidence must be highest from cluster (high > medium > low), not from LLM",
-          "All source learnings must have retired_at set — missing even one means duplicates persist",
+          "All source learnings must have retired_at set \u2014 missing even one means duplicates persist",
           "Transaction must be atomic: if any step fails, no partial merge state"
         ],
         "performance": [
@@ -377,17 +385,12 @@
           "Use record_learning() for creation, raw SQL only for stats update and retirement",
           "Use HashSet for metadata deduplication, not manual Vec iteration"
         ]
-      },
-      "synergyWith": [
-        "FEAT-003",
-        "FEAT-005"
-      ],
-      "title": "Cluster merge logic: merge_cluster() function",
-      "touchesFiles": [
-        "src/commands/curate/dedup.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-005",
+      "title": "Dedup orchestration: curate_dedup() main function",
+      "description": "Implement the curate_dedup() function that orchestrates the full dedup flow: load active learnings, auto-calculate or apply batch size, iterate batches calling spawn_claude(), parse/validate responses, iterate clusters calling merge_cluster(), track progress and errors, handle dry-run mode.",
       "acceptanceCriteria": [
         "curate_dedup(conn, params) loads all active learnings (WHERE retired_at IS NULL)",
         "Short-circuits with empty result if 0 active learnings (no LLM call)",
@@ -401,25 +404,28 @@
         "Gracefully handles spawn_claude() failure (IoError for missing binary, non-zero exit code)",
         "All TEST-INIT-003 tests pass"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 10,
+      "estimatedEffort": "high",
+      "passes": false,
+      "notes": "This is the orchestration function that ties everything together. Follow the pattern from src/learnings/ingestion/mod.rs for LLM error handling (best-effort, continue on failure). For batch size auto-calculation: sum content.len() for all learnings; if < 150_000, single batch; otherwise divide into batches of ~20. Track already-merged IDs across batches to handle the case where a learning appears in clusters from different batches.",
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs"
+      ],
       "dependsOn": [
         "FEAT-003",
         "FEAT-004"
       ],
-      "description": "Implement the curate_dedup() function that orchestrates the full dedup flow: load active learnings, auto-calculate or apply batch size, iterate batches calling spawn_claude(), parse/validate responses, iterate clusters calling merge_cluster(), track progress and errors, handle dry-run mode.",
-      "estimatedEffort": "high",
-      "id": "FEAT-005",
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "This is the orchestration function that ties everything together. Follow the pattern from src/learnings/ingestion/mod.rs for LLM error handling (best-effort, continue on failure). For batch size auto-calculation: sum content.len() for all learnings; if < 150_000, single batch; otherwise divide into batches of ~20. Track already-merged IDs across batches to handle the case where a learning appears in clusters from different batches.",
-      "passes": true,
-      "priority": 10,
       "qualityDimensions": {
         "correctness": [
-          "0 learnings must short-circuit immediately — no LLM call, no error",
+          "0 learnings must short-circuit immediately \u2014 no LLM call, no error",
           "dry_run must NEVER modify the database",
           "Already-merged learning IDs must be tracked across batches and skipped in later clusters",
-          "spawn_claude() failure must not crash the operation — log error, increment counter, continue"
+          "spawn_claude() failure must not crash the operation \u2014 log error, increment counter, continue"
         ],
         "performance": [
           "Print batch progress (e.g., 'Processing batch 2/15...')",
@@ -430,35 +436,37 @@
           "Follow ingestion/mod.rs pattern for spawn_claude() error handling",
           "Use eprintln! for progress output (not stdout, which is for result output)"
         ]
-      },
-      "synergyWith": [],
-      "title": "Dedup orchestration: curate_dedup() main function",
-      "touchesFiles": [
-        "src/commands/curate/dedup.rs",
-        "src/commands/curate/mod.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-006",
+      "title": "Dedup output formatting: format_dedup_text() + TextFormattable",
+      "description": "Implement the text output formatting for DedupResult and register TextFormattable in handlers.rs.",
       "acceptanceCriteria": [
         "format_dedup_text(result) returns human-readable text with: summary line (N clusters, M learnings merged, K created), dry-run indicator, per-cluster details (source titles, merged title, reason)",
-        "Dry-run output clearly marked: 'DRY RUN — no changes made'",
+        "Dry-run output clearly marked: 'DRY RUN \u2014 no changes made'",
         "Error count shown if llm_errors > 0: 'N LLM errors encountered'",
         "Format function added to src/commands/curate/output.rs",
         "impl_text_formattable!(DedupResult, format_dedup_text) added to handlers.rs",
-        "JSON output works via derive(Serialize) — no additional code needed"
+        "JSON output works via derive(Serialize) \u2014 no additional code needed"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 11,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Follow the formatting pattern from Phase 1's format_retire_text and format_unretire_text. Keep output concise: summary line at top, cluster details below. For dry-run, show what WOULD be merged. For non-dry-run, show what WAS merged with merged learning IDs.",
+      "touchesFiles": [
+        "src/commands/curate/output.rs",
+        "src/handlers.rs"
+      ],
       "dependsOn": [
         "FEAT-002"
       ],
-      "description": "Implement the text output formatting for DedupResult and register TextFormattable in handlers.rs.",
-      "estimatedEffort": "low",
-      "id": "FEAT-006",
+      "synergyWith": [
+        "FEAT-007"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "Follow the formatting pattern from Phase 1's format_retire_text and format_unretire_text. Keep output concise: summary line at top, cluster details below. For dry-run, show what WOULD be merged. For non-dry-run, show what WAS merged with merged learning IDs.",
-      "passes": true,
-      "priority": 11,
       "qualityDimensions": {
         "correctness": [
           "DedupResult must impl Serialize (derive) for JSON output mode",
@@ -469,17 +477,12 @@
           "Follow Phase 1 output patterns for consistency",
           "Dry-run output clearly distinguishable from actual execution output"
         ]
-      },
-      "synergyWith": [
-        "FEAT-007"
-      ],
-      "title": "Dedup output formatting: format_dedup_text() + TextFormattable",
-      "touchesFiles": [
-        "src/commands/curate/output.rs",
-        "src/handlers.rs"
-      ]
+      }
     },
     {
+      "id": "FEAT-007",
+      "title": "Wire up dedup dispatch in main.rs and handlers.rs",
+      "description": "Add the CurateAction::Dedup match arm in main.rs dispatch, connecting CLI flags to curate_dedup(). Add necessary imports to main.rs and handlers.rs.",
       "acceptanceCriteria": [
         "Commands::Curate match in main.rs has CurateAction::Dedup arm",
         "Dedup arm: acquires LockGuard, opens connection, constructs DedupParams, calls curate_dedup(), calls output_result()",
@@ -490,19 +493,23 @@
         "JSON output mode works (--format json curate dedup --dry-run)",
         "Dispatch propagates errors from curate_dedup() to CLI error output (no silent swallowing)"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 12,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Follow the exact dispatch pattern from Phase 1's Retire and Unretire arms. LockGuard is required because dedup creates and modifies learnings. The curate_dedup function takes &Connection and DedupParams.",
+      "touchesFiles": [
+        "src/main.rs",
+        "src/handlers.rs",
+        "src/commands/curate/mod.rs"
+      ],
       "dependsOn": [
         "FEAT-005",
         "FEAT-006"
       ],
-      "description": "Add the CurateAction::Dedup match arm in main.rs dispatch, connecting CLI flags to curate_dedup(). Add necessary imports to main.rs and handlers.rs.",
-      "estimatedEffort": "low",
-      "id": "FEAT-007",
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
       "modifiesBehavior": false,
-      "notes": "Follow the exact dispatch pattern from Phase 1's Retire and Unretire arms. LockGuard is required because dedup creates and modifies learnings. The curate_dedup function takes &Connection and DedupParams.",
-      "passes": true,
-      "priority": 12,
       "qualityDimensions": {
         "correctness": [
           "LockGuard must be acquired before DB operations",
@@ -513,16 +520,12 @@
           "Follow exact dispatch pattern from Phase 1's curate retire/unretire arms",
           "Import new types alongside existing curate imports"
         ]
-      },
-      "synergyWith": [],
-      "title": "Wire up dedup dispatch in main.rs and handlers.rs",
-      "touchesFiles": [
-        "src/main.rs",
-        "src/handlers.rs",
-        "src/commands/curate/mod.rs"
-      ]
+      }
     },
     {
+      "id": "CODE-REVIEW-1",
+      "title": "Review dedup implementation for quality, security, and integration wiring",
+      "description": "Review all Phase 3 implementation for code quality, error handling, security (especially LLM prompt injection protection), and verify all new code is fully integrated.",
       "acceptanceCriteria": [
         "No unwrap() in production code paths",
         "All errors properly propagated with context",
@@ -538,8 +541,20 @@
         "spawn_claude() failure handling is best-effort (no crash)",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 13,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": true,
+      "notes": "Critical review. Focus areas: 1) LLM security (injection protection), 2) Transaction safety (per-cluster commits), 3) Bandit stats summing (must not lose data), 4) Integration wiring (end-to-end reachability). For each issue found: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn, commit JSON changes.",
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/output.rs",
+        "src/commands/curate/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ],
       "dependsOn": [
         "FEAT-001",
         "FEAT-002",
@@ -549,57 +564,46 @@
         "FEAT-006",
         "FEAT-007"
       ],
-      "description": "Review all Phase 3 implementation for code quality, error handling, security (especially LLM prompt injection protection), and verify all new code is fully integrated.",
-      "estimatedEffort": "medium",
-      "id": "CODE-REVIEW-1",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Critical review. Focus areas: 1) LLM security (injection protection), 2) Transaction safety (per-cluster commits), 3) Bandit stats summing (must not lose data), 4) Integration wiring (end-to-end reachability). For each issue found: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn, commit JSON changes.",
-      "passes": true,
-      "priority": 13,
       "synergyWith": [],
-      "title": "Review dedup implementation for quality, security, and integration wiring",
-      "touchesFiles": [
-        "src/commands/curate/dedup.rs",
-        "src/commands/curate/types.rs",
-        "src/commands/curate/output.rs",
-        "src/commands/curate/mod.rs",
-        "src/cli/commands.rs",
-        "src/main.rs",
-        "src/handlers.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false,
+      "status": "done"
     },
     {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review dedup implementation for refactoring opportunities",
+      "description": "Analyze dedup implementation code for DRY violations, complexity, coupling, and maintainability issues. Pay special attention to shared patterns between dedup and extraction.rs that could be factored out.",
       "acceptanceCriteria": [
-        "No code duplication (DRY principle) — especially JSON parsing logic shared with extraction.rs",
+        "No code duplication (DRY principle) \u2014 especially JSON parsing logic shared with extraction.rs",
         "Functions under 30 lines (flag complex ones)",
         "No tight coupling between dedup and internal query details",
         "Code is easy to change and extend",
         "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "CODE-REVIEW-1"
-      ],
-      "description": "Analyze dedup implementation code for DRY violations, complexity, coupling, and maintainability issues. Pay special attention to shared patterns between dedup and extraction.rs that could be factored out.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-1",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Look especially for opportunities to share JSON extraction utilities between dedup and extraction.rs (extract_json_array, find_matching_bracket). For each issue: 1) Add REFACTOR-1-xxx (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON.",
-      "passes": true,
       "priority": 17,
-      "synergyWith": [],
-      "title": "Review dedup implementation for refactoring opportunities",
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Look especially for opportunities to share JSON extraction utilities between dedup and extraction.rs (extract_json_array, find_matching_bracket). For each issue: 1) Add REFACTOR-1-xxx (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON.",
       "touchesFiles": [
         "src/commands/curate/dedup.rs",
         "src/commands/curate/types.rs",
         "src/commands/curate/output.rs",
         "src/learnings/ingestion/extraction.rs"
-      ]
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "MILESTONE-1",
+      "title": "Phase 3 implementation complete: dedup working with initial tests",
+      "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001, TEST-INIT-002, TEST-INIT-003) pass",
         "All implementation tasks (FEAT-001 through FEAT-007) pass",
@@ -612,8 +616,13 @@
         "task-mgr curate dedup --help shows correct flags",
         "task-mgr curate dedup --dry-run executes without error on test DB"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 20,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
+      "touchesFiles": [],
       "dependsOn": [
         "TEST-INIT-001",
         "TEST-INIT-002",
@@ -626,113 +635,180 @@
         "FEAT-006",
         "FEAT-007",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
-      "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-1",
-      "model": "claude-sonnet-4-6",
-      "modifiesBehavior": false,
-      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "passes": true,
-      "priority": 20,
       "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Phase 3 implementation complete: dedup working with initial tests",
-      "touchesFiles": []
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "TEST-001",
+      "title": "Comprehensive tests for dedup merge edge cases",
+      "description": "Expand test coverage for merge logic: metadata combinations, large clusters, confidence ordering, outcome handling, transaction isolation.",
       "acceptanceCriteria": [
-        "Test: merging 5+ learnings in a single cluster — all stats summed, all metadata unioned",
-        "Test: merging learnings where ALL metadata fields are NULL — merged learning has NULL fields (not empty arrays)",
-        "Test: merging learnings with overlapping applies_to_files — deduplication correct",
-        "Test: confidence ordering edge cases — medium + high = high, low + low = low",
+        "Test: merging 5+ learnings in a single cluster \u2014 all stats summed, all metadata unioned",
+        "Test: merging learnings where ALL metadata fields are NULL \u2014 merged learning has NULL fields (not empty arrays)",
+        "Test: merging learnings with overlapping applies_to_files \u2014 deduplication correct",
+        "Test: confidence ordering edge cases \u2014 medium + high = high, low + low = low",
         "Test: merged outcome matches LLM-proposed outcome (not computed from sources)",
-        "Test: cluster with one source already retired (from previous cluster in same run) — skipped gracefully",
+        "Test: cluster with one source already retired (from previous cluster in same run) \u2014 skipped gracefully",
         "Test: root_cause and solution from sources are not propagated to merged learning (content captures this)",
         "Test: merged learning has correct created_at (now, not copied from sources)",
         "80%+ coverage for merge_cluster function"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 25,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "These tests expand on TEST-INIT-001 with more complex scenarios. Focus on interaction between metadata union and various NULL/non-NULL combinations.",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ],
       "dependsOn": [
         "MILESTONE-1"
       ],
-      "description": "Expand test coverage for merge logic: metadata combinations, large clusters, confidence ordering, outcome handling, transaction isolation.",
-      "estimatedEffort": "medium",
-      "id": "TEST-001",
-      "modifiesBehavior": false,
-      "notes": "These tests expand on TEST-INIT-001 with more complex scenarios. Focus on interaction between metadata union and various NULL/non-NULL combinations.",
-      "passes": true,
-      "priority": 25,
       "synergyWith": [
         "TEST-002"
       ],
-      "title": "Comprehensive tests for dedup merge edge cases",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "TEST-002",
+      "title": "Comprehensive tests for dedup LLM interaction and failure modes",
+      "description": "Expand test coverage for LLM prompt/parse/orchestration: batching behavior, progress output, error accumulation, threshold variation, large corpus handling.",
       "acceptanceCriteria": [
-        "Test: batch auto-calculation — corpus > 150K chars splits into multiple batches",
-        "Test: batch_size override — explicit --batch-size 5 creates batches of 5",
-        "Test: LLM returns duplicate IDs across batches — already-merged tracking prevents double-merge",
-        "Test: multiple consecutive LLM failures — llm_errors count accurate, no crash",
-        "Test: threshold=0.0 (merge everything) — LLM receives extreme threshold, result is whatever LLM decides",
-        "Test: threshold=1.0 (merge nothing) — LLM receives extreme threshold, result likely 0 clusters",
+        "Test: batch auto-calculation \u2014 corpus > 150K chars splits into multiple batches",
+        "Test: batch_size override \u2014 explicit --batch-size 5 creates batches of 5",
+        "Test: LLM returns duplicate IDs across batches \u2014 already-merged tracking prevents double-merge",
+        "Test: multiple consecutive LLM failures \u2014 llm_errors count accurate, no crash",
+        "Test: threshold=0.0 (merge everything) \u2014 LLM receives extreme threshold, result is whatever LLM decides",
+        "Test: threshold=1.0 (merge nothing) \u2014 LLM receives extreme threshold, result likely 0 clusters",
         "Test: progress output goes to stderr (not stdout, which is for result)",
         "Test: JSON output mode produces valid JSON for DedupResult with all fields",
         "80%+ coverage for curate_dedup orchestration function"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 30,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "For LLM-dependent tests, mock spawn_claude via CLAUDE_BINARY env var pointing to a script that returns pre-canned JSON responses. This avoids real LLM calls in tests.",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ],
       "dependsOn": [
         "MILESTONE-1"
       ],
-      "description": "Expand test coverage for LLM prompt/parse/orchestration: batching behavior, progress output, error accumulation, threshold variation, large corpus handling.",
-      "estimatedEffort": "medium",
-      "id": "TEST-002",
-      "modifiesBehavior": false,
-      "notes": "For LLM-dependent tests, mock spawn_claude via CLAUDE_BINARY env var pointing to a script that returns pre-canned JSON responses. This avoids real LLM calls in tests.",
-      "passes": true,
-      "priority": 30,
       "synergyWith": [
         "TEST-001"
       ],
-      "title": "Comprehensive tests for dedup LLM interaction and failure modes",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-REVIEW-2",
+      "title": "Review test code for refactoring opportunities",
+      "description": "Analyze dedup test code for duplication, helper extraction opportunities, and clarity improvements.",
       "acceptanceCriteria": [
         "No duplicated test setup code (helper functions for creating learnings with specific metadata/stats)",
         "Helper functions extracted for common patterns (e.g., create_learning_with_stats, create_mock_claude_script)",
         "Test names clearly describe what is tested",
         "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 39,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ],
       "dependsOn": [
         "TEST-001",
         "TEST-002"
       ],
-      "description": "Analyze dedup test code for duplication, helper extraction opportunities, and clarity improvements.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-2",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
-      "passes": true,
-      "priority": 39,
       "synergyWith": [],
-      "title": "Review test code for refactoring opportunities",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-2-001",
+      "title": "Unify duplicated set_applies_to_* helpers and insert_learning variants",
+      "description": "Replace set_applies_to_files, set_applies_to_task_types, set_applies_to_errors (3 identical functions differing only in column name) with a single set_json_column(conn, id, column, value) helper. Also unify insert_learning and insert_learning_with_content into one function with an optional content parameter.",
+      "acceptanceCriteria": [
+        "Single set_json_column helper replaces 3 set_applies_to_* functions",
+        "insert_learning accepts optional content (default 'Test content')",
+        "insert_learning_with_content removed",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 40,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Straightforward mechanical refactor. set_json_column should validate column name against an allowlist to avoid SQL injection.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": ["REFACTOR-2-002"],
+      "batchWith": ["REFACTOR-2-002"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-2-002",
+      "title": "Extract make_merge_params helper for MergeClusterParams boilerplate",
+      "description": "~15 merge tests repeat MergeClusterParams { source_ids: vec![...], merged_title: 'M'.to_string(), merged_content: 'MC'.to_string() }. Extract a make_merge_params(ids: &[i64]) helper with sensible defaults and an optional title/content variant.",
+      "acceptanceCriteria": [
+        "make_merge_params helper exists with default title/content",
+        "All merge tests use the helper instead of inline struct construction",
+        "Tests that need custom title/content can override",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 41,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Most tests use 'M'/'MC' as placeholders. Tests that need specific title/content (e.g., test_merge_confidence_not_from_llm_response) should use an extended variant.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": ["REFACTOR-2-001"],
+      "batchWith": ["REFACTOR-2-001"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-2-003",
+      "title": "Create RAII guard for CLAUDE_BINARY env var + mutex pattern",
+      "description": "4 tests repeat the pattern: lock DEDUP_ENV_MUTEX, set_var CLAUDE_BINARY, run test, remove_var. Extract a ClaudeBinaryGuard RAII struct that acquires the mutex lock and sets/removes the env var on Drop, preventing env var leaks on test panics.",
+      "acceptanceCriteria": [
+        "ClaudeBinaryGuard struct implements Drop to remove CLAUDE_BINARY",
+        "Guard acquires DEDUP_ENV_MUTEX lock",
+        "All 4+ tests using CLAUDE_BINARY pattern use the guard",
+        "DEDUP_ENV_MUTEX and manual set_var/remove_var calls removed from test bodies",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 42,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "RAII ensures env var cleanup even on panic. Guard should take &str (script path or 'false') and return a guard that holds the MutexGuard.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-2",
+      "title": "Full test coverage achieved for Phase 3 dedup",
+      "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
       "acceptanceCriteria": [
         "All comprehensive tests (TEST-001, TEST-002) pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
@@ -740,30 +816,33 @@
         "cargo test passes with no failures",
         "No flaky tests"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 50,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "touchesFiles": [],
       "dependsOn": [
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
-      "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-2",
-      "model": "claude-sonnet-4-6",
-      "modifiesBehavior": false,
-      "notes": "Full test coverage achieved, test code refactored.",
-      "passes": true,
-      "priority": 50,
       "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Full test coverage achieved for Phase 3 dedup",
-      "touchesFiles": []
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "INT-001",
+      "title": "Integration verification: end-to-end dedup workflow",
+      "description": "Verify the complete dedup workflow end-to-end: create learnings with duplicate content, run curate dedup --dry-run, verify no changes, run curate dedup, verify merged learnings created and originals retired, verify merged learnings appear in recall.",
       "acceptanceCriteria": [
-        "E2E test: create 6 learnings with 2 clusters of duplicates → curate dedup --dry-run shows 2 clusters → curate dedup creates 2 merged learnings and retires 6 originals",
+        "E2E test: create 6 learnings with 2 clusters of duplicates \u2192 curate dedup --dry-run shows 2 clusters \u2192 curate dedup creates 2 merged learnings and retires 6 originals",
         "Verify merged learning has correct union metadata from sources",
         "Verify merged learning has summed bandit stats from sources",
         "Verify retired originals excluded from recall queries",
@@ -772,25 +851,25 @@
         "Verify JSON and Text output modes for DedupResult",
         "Verify --threshold flag changes LLM behavior (at least prompt content)"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 55,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "This is the integration test that exercises the full workflow. For LLM calls, use CLAUDE_BINARY mock that returns pre-canned responses. Test the full flow from CLI args \u2192 DB operations \u2192 output formatting.",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ],
       "dependsOn": [
         "MILESTONE-2"
       ],
-      "description": "Verify the complete dedup workflow end-to-end: create learnings with duplicate content, run curate dedup --dry-run, verify no changes, run curate dedup, verify merged learnings created and originals retired, verify merged learnings appear in recall.",
-      "estimatedEffort": "medium",
-      "id": "INT-001",
-      "modifiesBehavior": false,
-      "notes": "This is the integration test that exercises the full workflow. For LLM calls, use CLAUDE_BINARY mock that returns pre-canned responses. Test the full flow from CLI args → DB operations → output formatting.",
-      "passes": true,
-      "priority": 55,
       "synergyWith": [],
-      "title": "Integration verification: end-to-end dedup workflow",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ]
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final refactoring review for maintainability",
+      "description": "Comprehensive review of all Phase 3 code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
       "acceptanceCriteria": [
         "No code duplication across implementation and tests",
         "All functions under 30 lines or documented exceptions",
@@ -798,29 +877,29 @@
         "Code follows project patterns (see CLAUDE.md)",
         "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "INT-001"
-      ],
-      "description": "Comprehensive review of all Phase 3 code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-3",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Final opportunity to improve code before merge. For each issue: 1) Add REFACTOR-3-xxx (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON.",
-      "passes": true,
       "priority": 65,
-      "synergyWith": [],
-      "title": "Final refactoring review for maintainability",
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Final opportunity to improve code before merge. For each issue: 1) Add REFACTOR-3-xxx (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON.",
       "touchesFiles": [
         "src/commands/curate/dedup.rs",
         "src/commands/curate/types.rs",
         "src/commands/curate/output.rs",
         "src/commands/curate/tests.rs"
-      ]
+      ],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "VERIFY-001",
+      "title": "Final verification: all checks pass",
+      "description": "Final gate verification: full test suite, linting, formatting, no warnings.",
       "acceptanceCriteria": [
         "cargo fmt --check passes",
         "cargo check produces no warnings",
@@ -830,26 +909,26 @@
         "task-mgr curate dedup --help shows correct flags and descriptions",
         "task-mgr curate --help shows retire, unretire, and dedup subcommands"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 90,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Run all quality checks. This is the final gate before merge.",
+      "touchesFiles": [],
       "dependsOn": [
         "INT-001",
         "REFACTOR-REVIEW-3"
       ],
-      "description": "Final gate verification: full test suite, linting, formatting, no warnings.",
-      "estimatedEffort": "low",
-      "id": "VERIFY-001",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Run all quality checks. This is the final gate before merge.",
-      "passes": true,
-      "priority": 90,
       "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Final verification: all checks pass",
-      "touchesFiles": []
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "MILESTONE-FINAL",
+      "title": "Phase 3 complete: curate dedup ready for merge",
+      "description": "All Phase 3 acceptance criteria met. curate dedup working end-to-end, all tests pass, all quality checks pass.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
@@ -857,25 +936,68 @@
         "No open CODE-FIX, WIRE-FIX, IMPL-FIX, or REFACTOR tasks",
         "Branch is ready to merge to main"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Phase 3 complete. Learning curation system now has: retire/unretire (Phase 1) + dedup (Phase 3). Phase 2 (enrich) can be added independently.",
+      "touchesFiles": [],
       "dependsOn": [
         "VERIFY-001",
         "REFACTOR-REVIEW-3"
       ],
-      "description": "All Phase 3 acceptance criteria met. curate dedup working end-to-end, all tests pass, all quality checks pass.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-FINAL",
-      "model": "claude-sonnet-4-6",
-      "modifiesBehavior": false,
-      "notes": "Phase 3 complete. Learning curation system now has: retire/unretire (Phase 1) + dedup (Phase 3). Phase 2 (enrich) can be added independently.",
-      "passes": true,
-      "priority": 99,
       "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Phase 3 complete: curate dedup ready for merge",
-      "touchesFiles": []
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-1-001",
+      "title": "Extract shared JSON array parsing utilities (3-way duplication)",
+      "description": "extract_json_array() and find_matching_bracket() are duplicated verbatim (~65 lines each) across dedup.rs, enrich.rs, and extraction.rs. Extract to a shared utility module and replace all three call sites.",
+      "priority": 18,
+      "status": "pending",
+      "passes": false,
+      "acceptanceCriteria": [
+        "Single implementation of extract_json_array and find_matching_bracket in a shared module",
+        "dedup.rs, enrich.rs, and extraction.rs all import from the shared module",
+        "All existing tests pass unchanged",
+        "cargo clippy clean, no dead code warnings"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/enrich.rs",
+        "src/learnings/ingestion/extraction.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-002"
+      ]
+    },
+    {
+      "id": "REFACTOR-1-002",
+      "title": "Extract confidence_rank helper (duplicated in merge_cluster and curate_dedup)",
+      "description": "The confidence_rank closure (high=2, medium=1, _=0) is duplicated in merge_cluster() line 377 and curate_dedup() line 659. Extract as a shared helper function in the curate module.",
+      "priority": 19,
+      "status": "pending",
+      "passes": false,
+      "acceptanceCriteria": [
+        "Single confidence_rank function used by both merge_cluster and curate_dedup",
+        "All existing tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/mod.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ]
     }
-  ],
-  "version": "1.0"
+  ]
 }

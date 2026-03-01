@@ -88,7 +88,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "This is the most critical test in Phase 1. Every one of the 14 YES-filter queries must be verified. Group tests by module (retrieval, recall, bandit, commands). Tests will fail until FEAT-001 (migration) and FEAT-002 (filters) are implemented.",
-      "passes": true,
+      "passes": false,
       "priority": 1,
       "synergyWith": [
         "FEAT-001",
@@ -145,7 +145,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Use in-memory SQLite with schema+migrations applied. Set created_at manually for age-based tests. Tests depend on FEAT-001 for the retired_at column to exist.",
-      "passes": true,
+      "passes": false,
       "priority": 3,
       "synergyWith": [
         "FEAT-004"
@@ -190,7 +190,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Simpler than retire — straightforward CRUD operation. Tests depend on FEAT-001 for schema.",
-      "passes": true,
+      "passes": false,
       "priority": 5,
       "synergyWith": [
         "FEAT-005"
@@ -219,7 +219,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Follow exact pattern from v7.rs. The down_sql can be a no-op like v7 since SQLite doesn't support DROP COLUMN in older versions. NULL columns are safe to leave.",
-      "passes": true,
+      "passes": false,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -269,7 +269,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "This is mechanical but error-prone (14 locations). Work through each file systematically. The PRD's #1 risk is missing a filter in one location. The test from TEST-INIT-001 will catch any missed locations.",
-      "passes": true,
+      "passes": false,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -324,7 +324,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Follow the existing pattern from other subcommand enums (if any exist, e.g. run begin/end). CurateAction is similar to how other subcommand groups are organized. Result types must derive Serialize for JSON output mode.",
-      "passes": true,
+      "passes": false,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -375,7 +375,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Use CAST(times_applied AS REAL) / CAST(times_shown AS REAL) to avoid integer division. Use julianday('now') - julianday(created_at) for age calculation. Single SQL query with OR for all criteria, then post-process to assign reason strings.",
-      "passes": true,
+      "passes": false,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -421,7 +421,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": false,
       "notes": "Simple CRUD operation. Check existence with get_learning(), then UPDATE. For invalid IDs (not found or not retired), collect errors but continue processing remaining IDs.",
-      "passes": true,
+      "passes": false,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -465,7 +465,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "This is the integration wiring task. Follow the exact pattern from other commands in main.rs (e.g., DeleteLearning dispatch at lines ~449-473). The LockGuard must be acquired for write operations.",
-      "passes": true,
+      "passes": false,
       "priority": 11,
       "qualityDimensions": {
         "correctness": [
@@ -503,7 +503,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": false,
       "notes": "Small enhancement to the existing list command. Add one more COUNT query without the retired_at filter. Only change the output format when retired count > 0 to avoid noise.",
-      "passes": true,
+      "passes": false,
       "priority": 12,
       "qualityDimensions": {
         "correctness": [
@@ -613,6 +613,48 @@
     },
     {
       "acceptanceCriteria": [
+        "Extract a shared helper fn build_in_clause(ids: &[i64]) -> (String, Vec<...>) in curate/mod.rs",
+        "retire_candidates and curate_unretire both use the helper",
+        "All existing tests pass unchanged"
+      ],
+      "batchWith": ["REFACTOR-1-002"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "description": "retire_candidates (mod.rs:153-158) and curate_unretire (mod.rs:197-202) have identical IN-clause placeholder building code. Extract a shared helper.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-001",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Simple extraction. The helper takes &[i64] and returns the SQL fragment + params.",
+      "passes": false,
+      "priority": 18,
+      "synergyWith": ["REFACTOR-1-002"],
+      "title": "Extract duplicate IN-clause placeholder builder into shared helper",
+      "touchesFiles": ["src/commands/curate/mod.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "build_reason takes a struct (or &RetireParams + a row-data struct) instead of 8 positional args",
+        "The #[allow(clippy::too_many_arguments)] annotation is removed",
+        "All existing tests pass unchanged"
+      ],
+      "batchWith": ["REFACTOR-1-001"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "description": "build_reason has 8 parameters and requires #[allow(clippy::too_many_arguments)]. Introduce a small struct for the row data (confidence, age_days, times_shown, times_applied) and pass &RetireParams for thresholds.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-002",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "This also improves readability of the query_map closure in curate_retire.",
+      "passes": false,
+      "priority": 18,
+      "synergyWith": ["REFACTOR-1-001"],
+      "title": "Reduce build_reason parameter count with struct",
+      "touchesFiles": ["src/commands/curate/mod.rs", "src/commands/curate/types.rs"]
+    },
+    {
+      "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001, TEST-INIT-002, TEST-INIT-003) pass",
         "All implementation tasks (FEAT-001 through FEAT-007) pass",
         "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
@@ -638,7 +680,9 @@
         "FEAT-006",
         "FEAT-007",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
       "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "estimatedEffort": "low",
@@ -646,7 +690,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "passes": true,
+      "passes": false,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -674,7 +718,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "These tests expand on TEST-INIT-001 with more realistic scenarios. Focus on interaction between retired_at filter and existing query features.",
-      "passes": true,
+      "passes": false,
       "priority": 25,
       "synergyWith": [
         "TEST-002"
@@ -708,7 +752,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "Focus on robustness: what happens with unexpected inputs, edge-case threshold values, and mixed populations.",
-      "passes": true,
+      "passes": false,
       "priority": 30,
       "synergyWith": [
         "TEST-001"
@@ -737,7 +781,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
-      "passes": true,
+      "passes": false,
       "priority": 39,
       "synergyWith": [],
       "title": "Review test code for refactoring opportunities",
@@ -745,6 +789,66 @@
         "src/learnings/retrieval/tests.rs",
         "src/learnings/recall/tests.rs",
         "src/commands/curate/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "setup_db() defined once (not duplicated across retrieval/tests.rs, recall/tests.rs, curate/tests.rs)",
+        "create_test_learning() defined once (not duplicated across retrieval/tests.rs and recall/tests.rs)",
+        "retire_learning() defined once (not duplicated across recall/tests.rs and curate/tests.rs)",
+        "All tests still pass after extraction",
+        "Helpers accessible via super::test_helpers or a shared test utility module"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Extract duplicated test helpers (setup_db, create_test_learning, retire_learning) into shared modules to eliminate copy-paste across 3 test files.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "setup_db() is identical in all 3 files. create_test_learning() is identical in retrieval and recall. retire_learning() is identical in recall and curate. Follow learning #57: use #[cfg(test)] mod test_helpers at file level. For cross-file sharing, consider a src/test_helpers.rs or keep helpers local but deduplicate within each file.",
+      "passes": false,
+      "priority": 40,
+      "synergyWith": [
+        "REFACTOR-2-002"
+      ],
+      "title": "Extract duplicated test helpers into shared module",
+      "touchesFiles": [
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/tests.rs",
+        "src/commands/curate/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "setup_db_with_fts5() removed from retrieval/tests.rs",
+        "setup_db_with_fts5() removed from recall/tests.rs",
+        "All call sites updated to use setup_db() instead",
+        "All tests still pass"
+      ],
+      "batchWith": [
+        "REFACTOR-2-001"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Remove setup_db_with_fts5() which is identical to setup_db() — a dead abstraction that adds confusion.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "notes": "In both retrieval/tests.rs and recall/tests.rs, setup_db_with_fts5() has the exact same body as setup_db(). The name implies FTS5-specific setup but no differentiation exists. Replace all call sites with setup_db().",
+      "passes": false,
+      "priority": 41,
+      "synergyWith": [
+        "REFACTOR-2-001"
+      ],
+      "title": "Remove dead setup_db_with_fts5() alias",
+      "touchesFiles": [
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/tests.rs"
       ]
     },
     {
@@ -761,7 +865,9 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002"
       ],
       "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
       "estimatedEffort": "low",
@@ -769,7 +875,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Full test coverage achieved, test code refactored.",
-      "passes": true,
+      "passes": false,
       "priority": 50,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -795,7 +901,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "This is the integration test that exercises the full workflow. Use a temp directory with task-mgr init.",
-      "passes": true,
+      "passes": false,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration verification: end-to-end curate retire/unretire workflow",
@@ -857,7 +963,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Run all quality checks. This is the final gate before merge.",
-      "passes": true,
+      "passes": false,
       "priority": 90,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -885,7 +991,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Phase 1 complete. Phase 2 (enrich) and Phase 3 (dedup) can be implemented on top of this.",
-      "passes": true,
+      "passes": false,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,
