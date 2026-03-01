@@ -438,3 +438,15 @@
 - No DB changes needed; all AC covered without real LLM calls
 - **Learnings:** `CLAUDE_BINARY` env var + assert_cmd's `.env()` is the clean pattern for LLM integration tests — no subprocess mocking complexity
 ---
+
+## 2026-03-01 - a8e80384-CODE-REVIEW-1
+- Reviewed all 7 dedup implementation files for quality, security, and integration wiring
+- **Format fix**: `cargo fmt` was failing on mod.rs long lines — fixed by running `cargo fmt`
+- **Security**: LLM prompt injection protection verified (UUID delimiter + UNTRUSTED warning)
+- **Error handling**: No bare `unwrap()` in production; all Option/Result handled gracefully
+- **Integration**: Full trace verified: CLI → main.rs → curate_dedup() → merge_cluster() → record_learning()
+- **Transaction safety**: Per-cluster atomic commits via unchecked_transaction()
+- **Bandit stats**: Summing uses i64::from(i32) for safe widening, UPDATE after record_learning
+- **No CODE-FIX tasks needed**: All acceptance criteria pass, no issues requiring fix tasks
+- **Learnings:** cargo fmt should be run before committing each FEAT task to avoid accumulated drift
+---

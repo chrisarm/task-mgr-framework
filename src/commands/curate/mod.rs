@@ -444,10 +444,26 @@ pub fn merge_cluster(
         run_id: None,
         root_cause: None,
         solution: None,
-        applies_to_files: if union_files.is_empty() { None } else { Some(union_files) },
-        applies_to_task_types: if union_task_types.is_empty() { None } else { Some(union_task_types) },
-        applies_to_errors: if union_errors.is_empty() { None } else { Some(union_errors) },
-        tags: if union_tags.is_empty() { None } else { Some(union_tags) },
+        applies_to_files: if union_files.is_empty() {
+            None
+        } else {
+            Some(union_files)
+        },
+        applies_to_task_types: if union_task_types.is_empty() {
+            None
+        } else {
+            Some(union_task_types)
+        },
+        applies_to_errors: if union_errors.is_empty() {
+            None
+        } else {
+            Some(union_errors)
+        },
+        tags: if union_tags.is_empty() {
+            None
+        } else {
+            Some(union_tags)
+        },
         confidence: best_confidence,
     };
     let merged = record_learning(&tx, record_params)?;
@@ -583,7 +599,11 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         let claude_result = match spawn_claude(&prompt, None, None, None) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Warning: spawn_claude failed for batch {}: {}", batch_idx + 1, e);
+                eprintln!(
+                    "Warning: spawn_claude failed for batch {}: {}",
+                    batch_idx + 1,
+                    e
+                );
                 llm_errors += 1;
                 continue;
             }
@@ -602,7 +622,11 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         let raw_clusters = match parse_dedup_response(&claude_result.output, &eligible_ids) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Warning: failed to parse dedup response for batch {}: {}", batch_idx + 1, e);
+                eprintln!(
+                    "Warning: failed to parse dedup response for batch {}: {}",
+                    batch_idx + 1,
+                    e
+                );
                 llm_errors += 1;
                 continue;
             }
@@ -619,19 +643,16 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 continue;
             }
 
-            let merged_title = raw.merged_title.unwrap_or_else(|| "Merged learning".to_string());
+            let merged_title = raw
+                .merged_title
+                .unwrap_or_else(|| "Merged learning".to_string());
             let merged_content = raw.merged_content.unwrap_or_default();
             let merged_outcome = raw.merged_outcome.unwrap_or_else(|| "pattern".to_string());
             let reason = raw.reason.unwrap_or_default();
 
             let source_titles: Vec<String> = source_ids
                 .iter()
-                .map(|id| {
-                    id_info
-                        .get(id)
-                        .map(|(t, _)| t.clone())
-                        .unwrap_or_default()
-                })
+                .map(|id| id_info.get(id).map(|(t, _)| t.clone()).unwrap_or_default())
                 .collect();
 
             // Best confidence among sources: high > medium > low.

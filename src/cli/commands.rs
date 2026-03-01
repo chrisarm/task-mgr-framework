@@ -1016,10 +1016,7 @@ fn parse_threshold(s: &str) -> Result<f64, String> {
         .parse()
         .map_err(|_| format!("'{}' is not a valid number", s))?;
     if !(0.0..=1.0).contains(&v) {
-        return Err(format!(
-            "threshold must be between 0.0 and 1.0, got {}",
-            v
-        ));
+        return Err(format!("threshold must be between 0.0 and 1.0, got {}", v));
     }
     Ok(v)
 }
