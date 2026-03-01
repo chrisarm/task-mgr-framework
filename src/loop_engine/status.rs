@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::db::lock::LockGuard;
 use crate::db::open_connection;
 use crate::TaskMgrResult;
 
@@ -31,6 +32,26 @@ pub struct DashboardResult {
     /// Pending tasks (only populated in verbose mode)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending_tasks: Vec<PendingTask>,
+    /// Per-PRD summaries (populated when multiple PRDs exist and no prefix filter)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prd_summaries: Vec<PrdSummary>,
+}
+
+/// Summary row for a single PRD in multi-PRD view.
+#[derive(Debug, Serialize)]
+pub struct PrdSummary {
+    /// Task ID prefix identifying this PRD
+    pub prefix: String,
+    /// Total task count for this PRD
+    pub total: i64,
+    /// Completed task count
+    pub done: i64,
+    /// In-progress task count
+    pub in_progress: i64,
+    /// Completion percentage
+    pub completion_pct: f64,
+    /// Whether this PRD has an active loop lock
+    pub active_lock: bool,
 }
 
 /// Project metadata from prd_metadata table.
@@ -90,23 +111,28 @@ pub struct PendingTask {
 /// lists pending tasks (in verbose mode). Also reads .deadline-* files
 /// to show deadline information.
 ///
-/// When a PRD file is provided, tasks are filtered to only those belonging
-/// to that PRD (matched by the `taskPrefix` field in the PRD JSON).
+/// When a PRD file or prefix is provided, tasks are filtered to only those
+/// belonging to that PRD. When neither is provided and multiple PRDs exist,
+/// a per-PRD summary row is shown for each.
 ///
 /// # Arguments
 ///
 /// * `dir` - Directory containing the database
 /// * `prd_file` - Optional PRD file path (filters tasks by PRD's taskPrefix)
 /// * `verbose` - If true, includes pending task listing
+/// * `prefix` - Optional task ID prefix filter (overrides prd_file-derived prefix)
 pub fn show_status(
     dir: &Path,
     prd_file: Option<&Path>,
     verbose: bool,
+    prefix: Option<&str>,
 ) -> TaskMgrResult<DashboardResult> {
     let conn = open_connection(dir)?;
 
-    // Extract task prefix from PRD JSON for filtering
-    let task_prefix = prd_file.and_then(read_task_prefix_from_prd);
+    // Resolve prefix: explicit flag > prd_file-derived > none
+    let task_prefix = prefix
+        .map(|s| s.to_string())
+        .or_else(|| prd_file.and_then(read_task_prefix_from_prd));
 
     let project = query_project_info(&conn)?;
     let tasks = query_dashboard_task_counts(&conn, task_prefix.as_deref())?;
@@ -125,12 +151,45 @@ pub fn show_status(
         Vec::new()
     };
 
+    // Populate per-PRD summaries only when no prefix filter is active
+    let prd_summaries = if task_prefix.is_none() {
+        let prefixes = query_distinct_prefixes(&conn)?;
+        if prefixes.len() >= 2 {
+            let active_lock_prefix = read_active_lock_prefix(dir);
+            prefixes
+                .into_iter()
+                .map(|p| {
+                    let counts = query_dashboard_task_counts(&conn, Some(&p))?;
+                    let pct = if counts.total > 0 {
+                        (counts.done as f64 / counts.total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let active_lock = active_lock_prefix.as_deref() == Some(&p);
+                    Ok(PrdSummary {
+                        prefix: p,
+                        total: counts.total,
+                        done: counts.done,
+                        in_progress: counts.in_progress,
+                        completion_pct: pct,
+                        active_lock,
+                    })
+                })
+                .collect::<TaskMgrResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     Ok(DashboardResult {
         project,
         tasks,
         completion_percentage,
         deadline,
         pending_tasks,
+        prd_summaries,
     })
 }
 
@@ -267,6 +326,26 @@ fn query_pending_tasks(
     };
 
     Ok(tasks)
+}
+
+/// Query distinct task ID prefixes present in the tasks table.
+///
+/// A prefix is the part of a task ID before the first `-` separator.
+/// Returns prefixes in sorted order.
+fn query_distinct_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT SUBSTR(id, 1, INSTR(id, '-') - 1) FROM tasks WHERE INSTR(id, '-') > 0 ORDER BY 1",
+    )?;
+    let prefixes = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(prefixes)
+}
+
+/// Read the active loop lock and return the prefix of the lock holder, if any.
+fn read_active_lock_prefix(dir: &Path) -> Option<String> {
+    let lock_path = dir.join("loop.lock");
+    LockGuard::read_holder_info(&lock_path).and_then(|info| info.prefix)
 }
 
 /// Build a WHERE clause and LIKE pattern for filtering tasks by prefix.
@@ -433,6 +512,29 @@ pub fn format_text(result: &DashboardResult) -> String {
         }
     }
 
+    // Multi-PRD summary table
+    if !result.prd_summaries.is_empty() {
+        output.push('\n');
+        output.push_str("PRD Summaries:\n");
+        output.push_str(&format!(
+            "  {:<12} {:>5} {:>5} {:>5} {:>7}  {}\n",
+            "PREFIX", "TOTAL", "DONE", "WIP", "%", "LOCK"
+        ));
+        output.push_str(&format!("  {}\n", "-".repeat(48)));
+        for prd in &result.prd_summaries {
+            let lock_indicator = if prd.active_lock { "[ACTIVE]" } else { "" };
+            output.push_str(&format!(
+                "  {:<12} {:>5} {:>5} {:>5} {:>6.1}%  {}\n",
+                prd.prefix,
+                prd.total,
+                prd.done,
+                prd.in_progress,
+                prd.completion_pct,
+                lock_indicator,
+            ));
+        }
+    }
+
     output
 }
 
@@ -502,7 +604,7 @@ mod tests {
         let (temp_dir, conn) = setup_test_db();
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert!(result.project.is_none());
         assert_eq!(result.tasks.total, 0);
         assert_eq!(result.completion_percentage, 0.0);
@@ -516,7 +618,7 @@ mod tests {
         insert_prd_metadata(&conn, "my-project", Some("main"), Some("A test project"));
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         let project = result.project.unwrap();
         assert_eq!(project.name, "my-project");
         assert_eq!(project.branch.unwrap(), "main");
@@ -533,7 +635,7 @@ mod tests {
         insert_task(&conn, "T-005", "Task 5", "blocked", 50);
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert_eq!(result.tasks.total, 5);
         assert_eq!(result.tasks.done, 2);
         assert_eq!(result.tasks.todo, 1);
@@ -552,7 +654,7 @@ mod tests {
         insert_task(&conn, "T-004", "Task 4", "todo", 40);
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert_eq!(result.completion_percentage, 50.0);
     }
 
@@ -563,7 +665,7 @@ mod tests {
         insert_task(&conn, "T-002", "Task 2", "done", 20);
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert_eq!(result.completion_percentage, 100.0);
     }
 
@@ -578,7 +680,7 @@ mod tests {
         insert_task(&conn, "T-006", "Irrelevant", "irrelevant", 50);
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, true).unwrap();
+        let result = show_status(temp_dir.path(), None, true, None).unwrap();
         // Pending = todo + in_progress + blocked
         assert_eq!(result.pending_tasks.len(), 3);
         // Ordered by priority ASC
@@ -596,7 +698,7 @@ mod tests {
         insert_task(&conn, "T-001", "Todo Task", "todo", 10);
         drop(conn);
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert!(result.pending_tasks.is_empty());
     }
 
@@ -614,7 +716,7 @@ mod tests {
             + 3600;
         fs::write(tasks_dir.join(".deadline-my-prd"), future_epoch.to_string()).unwrap();
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         let deadline = result.deadline.unwrap();
         assert_eq!(deadline.prd_basename, "my-prd");
         assert!(!deadline.expired);
@@ -636,7 +738,7 @@ mod tests {
             - 10;
         fs::write(tasks_dir.join(".deadline-test"), past_epoch.to_string()).unwrap();
 
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         let deadline = result.deadline.unwrap();
         assert!(deadline.expired);
         assert_eq!(deadline.seconds_remaining, 0);
@@ -660,7 +762,7 @@ mod tests {
 
         // When prd_file is specified, only read that deadline
         let prd_path = Path::new("tasks/prd-a.json");
-        let result = show_status(temp_dir.path(), Some(prd_path), false).unwrap();
+        let result = show_status(temp_dir.path(), Some(prd_path), false, None).unwrap();
         let deadline = result.deadline.unwrap();
         assert_eq!(deadline.prd_basename, "prd-a");
     }
@@ -668,7 +770,7 @@ mod tests {
     #[test]
     fn test_show_status_no_deadline_file() {
         let (temp_dir, _conn) = setup_test_db();
-        let result = show_status(temp_dir.path(), None, false).unwrap();
+        let result = show_status(temp_dir.path(), None, false, None).unwrap();
         assert!(result.deadline.is_none());
     }
 
@@ -694,6 +796,7 @@ mod tests {
             completion_percentage: 50.0,
             deadline: None,
             pending_tasks: vec![],
+            prd_summaries: vec![],
         };
 
         let text = format_text(&result);
@@ -721,6 +824,7 @@ mod tests {
             completion_percentage: 0.0,
             deadline: None,
             pending_tasks: vec![],
+            prd_summaries: vec![],
         };
 
         let text = format_text(&result);
@@ -748,6 +852,7 @@ mod tests {
                 time_remaining: "1h 0m remaining".to_string(),
             }),
             pending_tasks: vec![],
+            prd_summaries: vec![],
         };
 
         let text = format_text(&result);
@@ -776,6 +881,7 @@ mod tests {
                 time_remaining: "expired".to_string(),
             }),
             pending_tasks: vec![],
+            prd_summaries: vec![],
         };
 
         let text = format_text(&result);
@@ -817,6 +923,7 @@ mod tests {
                     status: "blocked".to_string(),
                 },
             ],
+            prd_summaries: vec![],
         };
 
         let text = format_text(&result);
@@ -1005,6 +1112,98 @@ mod tests {
         // Filter to def456: 2 pending
         let b = query_pending_tasks(&conn, Some("def456")).unwrap();
         assert_eq!(b.len(), 2);
+    }
+
+    // --- multi-PRD summary tests ---
+
+    #[test]
+    fn test_show_status_single_prefix_no_prd_summaries() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_task(&conn, "abc123-FEAT-001", "A feat", "done", 10);
+        insert_task(&conn, "abc123-FEAT-002", "A feat 2", "todo", 20);
+        drop(conn);
+
+        let result = show_status(_temp_dir.path(), None, false, None).unwrap();
+        // Only one prefix → no prd_summaries
+        assert!(result.prd_summaries.is_empty());
+    }
+
+    #[test]
+    fn test_show_status_multiple_prefixes_populates_prd_summaries() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_task(&conn, "abc123-FEAT-001", "A feat", "done", 10);
+        insert_task(&conn, "abc123-FEAT-002", "A feat 2", "todo", 20);
+        insert_task(&conn, "def456-FEAT-001", "B feat", "done", 10);
+        insert_task(&conn, "def456-FEAT-002", "B feat 2", "in_progress", 20);
+        drop(conn);
+
+        let result = show_status(_temp_dir.path(), None, false, None).unwrap();
+        assert_eq!(result.prd_summaries.len(), 2);
+        let a = result.prd_summaries.iter().find(|s| s.prefix == "abc123").unwrap();
+        assert_eq!(a.total, 2);
+        assert_eq!(a.done, 1);
+        assert_eq!(a.in_progress, 0);
+        let b = result.prd_summaries.iter().find(|s| s.prefix == "def456").unwrap();
+        assert_eq!(b.total, 2);
+        assert_eq!(b.done, 1);
+        assert_eq!(b.in_progress, 1);
+    }
+
+    #[test]
+    fn test_show_status_prefix_filter_suppresses_prd_summaries() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_task(&conn, "abc123-FEAT-001", "A feat", "done", 10);
+        insert_task(&conn, "def456-FEAT-001", "B feat", "todo", 10);
+        drop(conn);
+
+        // Prefix filter → no prd_summaries, counts scoped to prefix
+        let result = show_status(_temp_dir.path(), None, false, Some("abc123")).unwrap();
+        assert!(result.prd_summaries.is_empty());
+        assert_eq!(result.tasks.total, 1);
+        assert_eq!(result.tasks.done, 1);
+    }
+
+    #[test]
+    fn test_format_text_shows_prd_summaries() {
+        let result = DashboardResult {
+            project: None,
+            tasks: DashboardTaskCounts {
+                total: 4,
+                done: 2,
+                todo: 1,
+                in_progress: 1,
+                blocked: 0,
+                skipped: 0,
+                irrelevant: 0,
+            },
+            completion_percentage: 50.0,
+            deadline: None,
+            pending_tasks: vec![],
+            prd_summaries: vec![
+                PrdSummary {
+                    prefix: "abc123".to_string(),
+                    total: 2,
+                    done: 1,
+                    in_progress: 0,
+                    completion_pct: 50.0,
+                    active_lock: false,
+                },
+                PrdSummary {
+                    prefix: "def456".to_string(),
+                    total: 2,
+                    done: 1,
+                    in_progress: 1,
+                    completion_pct: 50.0,
+                    active_lock: true,
+                },
+            ],
+        };
+
+        let text = format_text(&result);
+        assert!(text.contains("PRD Summaries:"));
+        assert!(text.contains("abc123"));
+        assert!(text.contains("def456"));
+        assert!(text.contains("[ACTIVE]"));
     }
 
     #[test]

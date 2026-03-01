@@ -2289,7 +2289,7 @@ fn test_loop_short_yes_flag() {
 fn test_status_no_args() {
     let cli = Cli::parse_from(["task-mgr", "status"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status { prd_file, verbose, .. } => {
             assert!(prd_file.is_none());
             assert!(!verbose);
         }
@@ -2301,7 +2301,7 @@ fn test_status_no_args() {
 fn test_status_with_prd_file() {
     let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status { prd_file, verbose, .. } => {
             assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
             assert!(!verbose);
         }
@@ -2313,7 +2313,7 @@ fn test_status_with_prd_file() {
 fn test_status_with_verbose() {
     let cli = Cli::parse_from(["task-mgr", "status", "-v"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status { prd_file, verbose, .. } => {
             assert!(prd_file.is_none());
             assert!(verbose);
         }
@@ -2336,7 +2336,7 @@ fn test_status_with_verbose_long() {
 fn test_status_with_prd_file_and_verbose() {
     let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json", "-v"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status { prd_file, verbose, .. } => {
             assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
             assert!(verbose);
         }

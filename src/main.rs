@@ -636,11 +636,16 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             process::exit(result.exit_code);
         }
 
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status {
+            prd_file,
+            verbose,
+            prefix,
+        } => {
             let result = task_mgr::loop_engine::status::show_status(
                 &cli.dir,
                 prd_file.as_deref(),
                 verbose || cli.verbose,
+                prefix.as_deref(),
             )?;
             output_result(&result, cli.format);
             Ok(())

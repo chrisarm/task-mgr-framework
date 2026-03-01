@@ -680,6 +680,10 @@ EXAMPLES:
         /// Show detailed task listing
         #[arg(short = 'v', long)]
         verbose: bool,
+
+        /// Filter to a single PRD by task ID prefix (e.g., "9c5c8a1d")
+        #[arg(long)]
+        prefix: Option<String>,
     },
 
     /// Run multiple PRDs in sequence
