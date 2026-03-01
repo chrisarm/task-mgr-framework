@@ -940,3 +940,266 @@ fn test_unretire_result_json_serialization() {
     assert!(json.contains("\"errors\""), "must have errors field");
     assert!(json.contains("99"), "errors content must be present");
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-INIT-002: Enrich metadata query and field filter
+//
+// All tests are #[ignore] until FEAT-003 implements find_enrichment_candidates.
+// ──────────────────────────────────────────────────────────────────────────────
+
+use super::{find_enrichment_candidates, EnrichParams};
+use crate::commands::curate::types::EnrichFieldFilter;
+
+/// Sets `applies_to_files` on a learning to a JSON array (simulates enriched field).
+fn set_applies_to_files(conn: &Connection, id: i64, value: Option<&str>) {
+    conn.execute(
+        "UPDATE learnings SET applies_to_files = ?1 WHERE id = ?2",
+        rusqlite::params![value, id],
+    )
+    .expect("set_applies_to_files");
+}
+
+/// Sets `applies_to_task_types` on a learning to a JSON array.
+fn set_applies_to_task_types(conn: &Connection, id: i64, value: Option<&str>) {
+    conn.execute(
+        "UPDATE learnings SET applies_to_task_types = ?1 WHERE id = ?2",
+        rusqlite::params![value, id],
+    )
+    .expect("set_applies_to_task_types");
+}
+
+/// Sets `applies_to_errors` on a learning to a JSON array.
+fn set_applies_to_errors(conn: &Connection, id: i64, value: Option<&str>) {
+    conn.execute(
+        "UPDATE learnings SET applies_to_errors = ?1 WHERE id = ?2",
+        rusqlite::params![value, id],
+    )
+    .expect("set_applies_to_errors");
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_query_returns_learning_with_null_files() {
+    // AC: query returns learnings where applies_to_files IS NULL
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Missing files",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // applies_to_files is NULL by default
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().any(|c| c.id == id),
+        "learning with NULL applies_to_files must be a candidate"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_query_returns_learning_with_null_task_types() {
+    // AC: query returns learnings where applies_to_task_types IS NULL
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Missing task types",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // Set files so only task_types is NULL
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().any(|c| c.id == id),
+        "learning with NULL applies_to_task_types must be a candidate"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_query_returns_learning_with_null_errors() {
+    // AC: query returns learnings where applies_to_errors IS NULL
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Missing errors",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // Set files and task_types so only errors is NULL
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+    set_applies_to_task_types(&conn, id, Some("[\"FEAT-\"]"));
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().any(|c| c.id == id),
+        "learning with NULL applies_to_errors must be a candidate"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_query_excludes_retired_learnings() {
+    // AC: query excludes retired learnings (retired_at IS NOT NULL)
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Retired with nulls",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // All metadata fields are NULL — but learning is retired
+    retire_learning(&conn, id);
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().all(|c| c.id != id),
+        "retired learning must NOT be returned even if metadata fields are NULL"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_query_excludes_fully_enriched_learnings() {
+    // AC: query excludes learnings where all 3 fields are populated
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Fully enriched",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+    set_applies_to_task_types(&conn, id, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(&conn, id, Some("[\"E0001\"]"));
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().all(|c| c.id != id),
+        "fully-enriched learning (all 3 fields set) must NOT be a candidate"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_field_filter_files_restricts_to_missing_files() {
+    // AC: --field=applies_to_files restricts to learnings missing only that field
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Missing files only",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    // applies_to_files is NULL, task_types and errors set
+    set_applies_to_task_types(&conn, id, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(&conn, id, Some("[\"E0001\"]"));
+
+    let params = EnrichParams {
+        field_filter: Some(EnrichFieldFilter::AppliesToFiles),
+        ..EnrichParams::default()
+    };
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().any(|c| c.id == id),
+        "--field=applies_to_files must return learning with NULL applies_to_files"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_field_filter_files_known_bad_discriminator() {
+    // Known-bad discriminator: --field=applies_to_files must NOT return a learning
+    // that has applies_to_files set but applies_to_task_types NULL
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Has files, missing task_types",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+    // applies_to_task_types is NULL, applies_to_errors is NULL
+
+    let params = EnrichParams {
+        field_filter: Some(EnrichFieldFilter::AppliesToFiles),
+        ..EnrichParams::default()
+    };
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.iter().all(|c| c.id != id),
+        "--field=applies_to_files must NOT return learning that has applies_to_files set (even if task_types is NULL)"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_zero_candidates_returns_empty_vec() {
+    // AC: 0 matching learnings returns empty vec (no error)
+    let (_dir, conn) = setup_db();
+
+    // Insert only a fully-enriched learning (no candidates)
+    let id = insert_learning(
+        &conn,
+        "Fully enriched",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    set_applies_to_files(&conn, id, Some("[\"src/**/*.rs\"]"));
+    set_applies_to_task_types(&conn, id, Some("[\"FEAT-\"]"));
+    set_applies_to_errors(&conn, id, Some("[\"E0001\"]"));
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates");
+
+    assert!(
+        candidates.is_empty(),
+        "no candidates expected when all learnings are fully enriched"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-003: find_enrichment_candidates not yet implemented"]
+fn test_enrich_empty_database_returns_empty_vec() {
+    // Edge case: 0 learnings in database — return empty vec, no error
+    let (_dir, conn) = setup_db();
+
+    let params = EnrichParams::default();
+    let candidates =
+        find_enrichment_candidates(&conn, &params).expect("find_enrichment_candidates on empty db");
+
+    assert!(
+        candidates.is_empty(),
+        "empty db must return empty candidates"
+    );
+}

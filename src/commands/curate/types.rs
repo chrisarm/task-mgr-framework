@@ -117,6 +117,21 @@ pub struct EnrichResult {
     pub proposals: Vec<EnrichProposal>,
 }
 
+/// A learning identified as a candidate for metadata enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichCandidate {
+    /// Learning ID
+    pub id: i64,
+    /// Learning title
+    pub title: String,
+    /// Whether `applies_to_files` is NULL
+    pub missing_files: bool,
+    /// Whether `applies_to_task_types` is NULL
+    pub missing_task_types: bool,
+    /// Whether `applies_to_errors` is NULL
+    pub missing_errors: bool,
+}
+
 /// Parameters for the `curate retire` command.
 #[derive(Debug, Clone)]
 pub struct RetireParams {

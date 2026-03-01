@@ -7,7 +7,9 @@ pub mod output;
 pub mod types;
 
 pub use output::{format_retire_text, format_unretire_text};
-pub use types::{RetireParams, RetireResult, RetirementCandidate, UnretireResult};
+pub use types::{
+    EnrichCandidate, EnrichParams, RetireParams, RetireResult, RetirementCandidate, UnretireResult,
+};
 
 use rusqlite::Connection;
 
@@ -206,6 +208,22 @@ pub fn curate_unretire(conn: &Connection, learning_ids: Vec<i64>) -> TaskMgrResu
     }
 
     Ok(UnretireResult { restored, errors })
+}
+
+/// Queries active learnings that are missing at least one metadata field.
+///
+/// - Excludes retired learnings (`retired_at IS NOT NULL`).
+/// - Excludes learnings with all three metadata fields populated.
+/// - When `params.field_filter` is `Some(field)`, restricts to learnings
+///   missing only that specific field.
+/// - Returns `Ok(vec![])` when no candidates exist (never errors on empty result).
+///
+/// **NOTE**: This is a stub — implementation deferred to FEAT-003.
+pub fn find_enrichment_candidates(
+    _conn: &Connection,
+    _params: &EnrichParams,
+) -> crate::TaskMgrResult<Vec<EnrichCandidate>> {
+    todo!("FEAT-003: implement find_enrichment_candidates query")
 }
 
 #[cfg(test)]
