@@ -189,7 +189,7 @@ impl LockGuard {
     /// - Old single-line: `{pid}@{host}` (branch/worktree/prefix will be `None`)
     ///
     /// Returns `None` if the file doesn't exist, can't be read, or is empty.
-    pub(crate) fn read_holder_info(path: &Path) -> Option<HolderInfo> {
+    pub fn read_holder_info(path: &Path) -> Option<HolderInfo> {
         let mut file = File::open(path).ok()?;
         let mut contents = String::new();
         file.read_to_string(&mut contents).ok()?;
