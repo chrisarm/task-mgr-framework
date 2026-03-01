@@ -792,7 +792,7 @@
       "id": "FEAT-009",
       "modifiesBehavior": false,
       "notes": "Group C. Depends on FEAT-007 (LoopResult) being complete. Add cleanup logic after each engine::run_loop() call in the batch for-loop.",
-      "passes": false,
+      "passes": true,
       "priority": 23,
       "qualityDimensions": {
         "correctness": [
