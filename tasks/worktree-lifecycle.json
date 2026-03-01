@@ -1117,7 +1117,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "May need to simplify by testing individual subsystems rather than full end-to-end if loop spawning is complex in test context.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration test: full loop with worktree cleanup",
