@@ -735,7 +735,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         Commands::Curate { action } => {
             use task_mgr::commands::curate::enrich::curate_enrich;
             use task_mgr::commands::curate::{
-                curate_retire, curate_unretire, EnrichParams, RetireParams,
+                curate_dedup, curate_retire, curate_unretire, DedupParams, EnrichParams,
+                RetireParams,
             };
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -786,11 +787,17 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     output_result(&result, cli.format);
                 }
                 CurateAction::Dedup {
-                    dry_run: _,
-                    threshold: _,
-                    batch_size: _,
+                    dry_run,
+                    threshold,
+                    batch_size,
                 } => {
-                    todo!("curate dedup: not yet implemented (a8e80384-FEAT-002+)")
+                    let params = DedupParams {
+                        dry_run,
+                        threshold,
+                        batch_size,
+                    };
+                    let result = curate_dedup(&conn, params)?;
+                    output_result(&result, cli.format);
                 }
             }
             Ok(())
