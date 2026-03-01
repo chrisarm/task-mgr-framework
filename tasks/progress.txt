@@ -1,4 +1,17 @@
 
+## 2026-03-01 - adece6fc-CODE-REVIEW-1
+- Reviewed all 20 files across migrations, retrieval, commands, CLI, handlers, and main.rs
+- **14 filtered queries**: All 14 have `retired_at IS NULL` — PASS
+- **5 exempt queries**: All 5 correctly lack the filter — PASS
+- **No unwrap() in production**: PASS
+- **Error propagation**: Proper `?` usage throughout, per-ID errors collected in unretire
+- **Integration wiring**: Complete (mod.rs export, handlers.rs imports+TextFormattable, main.rs dispatch for both variants)
+- **Integer division**: Safe — SQL uses CAST to REAL, Rust uses f64
+- **Transaction safety**: Single UPDATE statements are implicitly atomic in SQLite — no issue
+- **No CODE-FIX tasks needed** — all acceptance criteria met
+- **Learnings:** SQLite single-statement atomicity means explicit BEGIN/COMMIT is unnecessary for single UPDATE...WHERE IN(...) patterns
+---
+
 ## 2026-02-28 - SS-REFACTOR-REVIEW-3
 - Reviewed all 11 files: prefix.rs, v9.rs, import.rs, selection.rs, next/mod.rs, decay.rs, engine.rs, prompt.rs, signals.rs, status.rs, calibrate.rs
 - **1 issue found**: `read_task_prefix_from_prd` logic (parse PRD JSON for taskPrefix) duplicated 3 times — private fn in status.rs:139, inline in engine.rs:636-643 and engine.rs:734-742
@@ -314,4 +327,15 @@
 - Created fixtures `prd_p1_alpha.json` and `prd_p2_beta.json` (bare IDs, PrefixMode::Auto prepends prefix)
 - Tests cover: dual-PRD prd_metadata rows, scoped task counts, prefix-scoped select_next_task, scoped force-reinit preserving P2+learnings, .stop signal prefix/fallback, independent per-prefix locks, single-PRD backwards compat
 - **Learnings:** PrefixMode::Auto prepends taskPrefix to bare IDs — don't pre-prefix IDs in fixtures; ScoredTask wraps the Task struct, access via `.task.id`
+---
+
+## 2026-03-01 - adece6fc-TEST-INIT-001
+- Wrote TDD test scaffold for retired_at filtering across all 14 query locations
+- 16 tests added across 7 files, all marked #[ignore] pending FEAT-001+FEAT-002
+- Files: retrieval/tests.rs, recall/tests.rs, commands/learnings.rs, export/tests.rs, stats.rs, ingestion/mod.rs, import_learnings/mod.rs
+- Helper `retire_learning(conn, id)` pattern: UPDATE learnings SET retired_at = datetime('now')
+- Private function `load_existing_keys` and `learning_exists` tested via inline `#[cfg(test)] mod retired_tests` in their own files
+- `ProgressStatistics` uses `learnings_by_outcome.failures` (not `outcomes` map)
+- Discriminator test confirms: without filter, retired learning IS in the table (passes pre-FEAT-002)
+- **Learnings:** ingestion/import private-fn tests require inline #[cfg(test)] mod in source file, not separate tests.rs
 ---
