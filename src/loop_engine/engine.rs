@@ -629,7 +629,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     // Must be before any DB mutations (init, migrations, recovery).
     // Separate from tasks.db.lock (short-lived per-command) so read-only commands
     // like `status` and `stats` are not blocked.
-    let _loop_lock = match LockGuard::acquire_named(&run_config.db_dir, "loop.lock") {
+    let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, "loop.lock") {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!(
@@ -715,6 +715,19 @@ pub async fn run_loop(run_config: LoopRunConfig) -> i32 {
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
     let default_model = prd_metadata.default_model;
+
+    // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
+    // This allows lock error messages to show which branch/PRD holds the lock.
+    if let Err(e) = loop_lock.write_holder_info_extended(
+        branch_name.as_deref(),
+        run_config.working_root.to_str(),
+        task_prefix.as_deref(),
+    ) {
+        eprintln!(
+            "Warning: failed to write extended lock metadata: {} (continuing)",
+            e
+        );
+    }
 
     // Step 6.6 (after metadata read so we can scope by prefix):
     // Recover stale in_progress tasks from previous crashed/killed runs.
