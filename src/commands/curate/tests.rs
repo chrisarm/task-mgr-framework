@@ -21,14 +21,16 @@ use super::{curate_retire, curate_unretire, RetireParams};
 // Test helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Creates an in-memory test database with schema applied.
+/// Creates an in-memory test database with schema and all migrations applied.
 ///
 /// Uses a temp-file-backed connection (not `:memory:`) so that `open_connection`
 /// can apply migrations via the normal path.
 fn setup_db() -> (tempfile::TempDir, Connection) {
+    use crate::db::migrations::run_migrations;
     let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-    let conn = open_connection(temp_dir.path()).expect("open connection");
+    let mut conn = open_connection(temp_dir.path()).expect("open connection");
     create_schema(&conn).expect("create schema");
+    run_migrations(&mut conn).expect("run migrations");
     (temp_dir, conn)
 }
 
@@ -100,7 +102,6 @@ fn is_retired(conn: &Connection, id: i64) -> bool {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion1_old_low_confidence_unapplied_is_candidate() {
     // AC: learning matching criterion 1 (age >= 90 days, confidence=low, times_applied=0) is a candidate
     let (_dir, conn) = setup_db();
@@ -123,7 +124,6 @@ fn test_criterion1_old_low_confidence_unapplied_is_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion1_high_confidence_not_candidate() {
     // Known-bad discriminator: high-confidence learning with 0 applications must NOT match criterion 1
     let (_dir, conn) = setup_db();
@@ -146,7 +146,6 @@ fn test_criterion1_high_confidence_not_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion1_boundary_89_days_not_candidate() {
     // Edge case: 89 days old is below the 90-day threshold — must NOT be a candidate
     let (_dir, conn) = setup_db();
@@ -168,7 +167,6 @@ fn test_criterion1_boundary_89_days_not_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion2_shown_never_applied_is_candidate() {
     // AC: learning matching criterion 2 (times_shown >= 10, times_applied=0) is a candidate
     let (_dir, conn) = setup_db();
@@ -190,7 +188,6 @@ fn test_criterion2_shown_never_applied_is_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion2_shown_9_times_not_candidate() {
     // Edge case: times_shown=9 is below min_shows=10 — must NOT be a candidate
     let (_dir, conn) = setup_db();
@@ -212,7 +209,6 @@ fn test_criterion2_shown_9_times_not_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion3_low_application_rate_is_candidate() {
     // AC: learning matching criterion 3 (times_shown >= 20, application rate < 0.05) is a candidate
     // Rate = 1/20 = 0.05 — NOT < 0.05 (must be strictly less), so use 1/21 ≈ 0.0476
@@ -235,7 +231,6 @@ fn test_criterion3_low_application_rate_is_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_criterion3_rate_exactly_at_threshold_not_candidate() {
     // Edge case: rate = 0.05 exactly is NOT < 0.05, so must NOT be a candidate
     // 1/20 = 0.05 exactly
@@ -258,7 +253,6 @@ fn test_criterion3_rate_exactly_at_threshold_not_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_non_matching_learning_not_candidate() {
     // AC: learning NOT matching any criterion is NOT a candidate
     let (_dir, conn) = setup_db();
@@ -282,7 +276,6 @@ fn test_non_matching_learning_not_candidate() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_dry_run_true_does_not_set_retired_at() {
     // AC: dry_run=true identifies candidates but does NOT set retired_at
     let (_dir, conn) = setup_db();
@@ -317,7 +310,6 @@ fn test_dry_run_true_does_not_set_retired_at() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_dry_run_false_sets_retired_at() {
     // AC: dry_run=false sets retired_at on all candidates
     let (_dir, conn) = setup_db();
@@ -348,7 +340,6 @@ fn test_dry_run_false_sets_retired_at() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_already_retired_excluded_from_candidates() {
     // Edge case: already-retired learning must not appear as candidate again
     let (_dir, conn) = setup_db();
@@ -371,7 +362,6 @@ fn test_already_retired_excluded_from_candidates() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_zero_candidates_returns_empty_result() {
     // AC: 0 candidates returns empty result, no errors
     let (_dir, conn) = setup_db();
@@ -388,7 +378,6 @@ fn test_zero_candidates_returns_empty_result() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_zero_candidates_empty_database() {
     // Edge case: 0 learnings in database — return empty result, no error
     let (_dir, conn) = setup_db();
@@ -400,7 +389,6 @@ fn test_zero_candidates_empty_database() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_custom_thresholds_change_candidate_set() {
     // AC: custom thresholds (min_age_days, min_shows, max_rate) change candidate set
     let (_dir, conn) = setup_db();
@@ -434,7 +422,6 @@ fn test_custom_thresholds_change_candidate_set() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_each_candidate_has_reason_string() {
     // Invariant: each candidate must have a human-readable reason string
     let (_dir, conn) = setup_db();
@@ -461,7 +448,6 @@ fn test_each_candidate_has_reason_string() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001 (retired_at migration), FEAT-003 (types), FEAT-004 (curate_retire impl)"]
 fn test_candidates_found_matches_learnings_retired() {
     // Invariant: candidate count in result must match actual retired_at updates when dry_run=false
     let (_dir, conn) = setup_db();

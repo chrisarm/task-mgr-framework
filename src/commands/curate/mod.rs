@@ -22,9 +22,147 @@ use crate::TaskMgrResult;
 ///
 /// Already-retired learnings (retired_at IS NOT NULL) are excluded.
 pub fn curate_retire(conn: &Connection, params: RetireParams) -> TaskMgrResult<RetireResult> {
-    let _ = conn;
-    let _ = params;
-    todo!("FEAT-004: implement retire candidate identification and soft-archive")
+    let min_shows_doubled = i64::from(params.min_shows) * 2;
+
+    let sql = "
+        SELECT id, title, confidence,
+               julianday('now') - julianday(created_at) AS age_days,
+               times_shown, times_applied
+        FROM learnings
+        WHERE retired_at IS NULL
+          AND (
+            (julianday('now') - julianday(created_at) >= ?1
+             AND confidence = 'low'
+             AND times_applied = 0)
+            OR
+            (times_shown >= ?2 AND times_applied = 0)
+            OR
+            (times_shown >= ?3
+             AND CAST(times_applied AS REAL) / CAST(times_shown AS REAL) < ?4)
+          )
+    ";
+
+    let mut stmt = conn.prepare(sql)?;
+    let candidates: Vec<RetirementCandidate> = stmt
+        .query_map(
+            rusqlite::params![
+                i64::from(params.min_age_days),
+                i64::from(params.min_shows),
+                min_shows_doubled,
+                params.max_rate
+            ],
+            |row| {
+                let id: i64 = row.get("id")?;
+                let title: String = row.get("title")?;
+                let confidence: String = row.get("confidence")?;
+                let age_days: f64 = row.get("age_days")?;
+                let times_shown: i64 = row.get("times_shown")?;
+                let times_applied: i64 = row.get("times_applied")?;
+
+                let reason = build_reason(
+                    &confidence,
+                    age_days,
+                    times_shown,
+                    times_applied,
+                    i64::from(params.min_age_days),
+                    i64::from(params.min_shows),
+                    min_shows_doubled,
+                    params.max_rate,
+                );
+
+                Ok(RetirementCandidate { id, title, reason })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let candidates_found = candidates.len();
+
+    let learnings_retired = if params.dry_run {
+        0
+    } else {
+        // Retire all candidates in a single transaction
+        let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+        retire_candidates(conn, &ids)?
+    };
+
+    Ok(RetireResult {
+        dry_run: params.dry_run,
+        candidates_found,
+        learnings_retired,
+        candidates,
+    })
+}
+
+/// Determines which criterion matched and returns a human-readable reason string.
+#[allow(clippy::too_many_arguments)]
+fn build_reason(
+    confidence: &str,
+    age_days: f64,
+    times_shown: i64,
+    times_applied: i64,
+    min_age_days: i64,
+    min_shows: i64,
+    min_shows_doubled: i64,
+    max_rate: f64,
+) -> String {
+    let c1 = age_days >= min_age_days as f64 && confidence == "low" && times_applied == 0;
+    let c2 = times_shown >= min_shows && times_applied == 0;
+    let c3 = times_shown >= min_shows_doubled
+        && (times_applied as f64 / times_shown as f64) < max_rate;
+
+    match (c1, c2, c3) {
+        (true, false, false) => format!(
+            "Low-confidence learning not applied in {age_days:.0} days (threshold: {min_age_days})"
+        ),
+        (false, true, false) => format!(
+            "Shown {times_shown} times but never applied (threshold: {min_shows})"
+        ),
+        (false, false, true) => {
+            let rate = (times_applied as f64 / times_shown as f64) * 100.0;
+            let max_pct = max_rate * 100.0;
+            format!(
+                "Application rate {rate:.1}% below threshold {max_pct:.1}% after {times_shown} shows"
+            )
+        }
+        _ => {
+            // Multiple criteria matched — list them all
+            let mut parts = Vec::new();
+            if c1 {
+                parts.push(format!("low-confidence and {age_days:.0} days old"));
+            }
+            if c2 {
+                parts.push(format!("shown {times_shown}x, never applied"));
+            }
+            if c3 {
+                let rate = (times_applied as f64 / times_shown as f64) * 100.0;
+                parts.push(format!("application rate {rate:.1}%"));
+            }
+            parts.join("; ")
+        }
+    }
+}
+
+/// Sets `retired_at = datetime('now')` for all given IDs in a single transaction.
+/// Returns the number of rows updated.
+fn retire_candidates(conn: &Connection, ids: &[i64]) -> TaskMgrResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Build a parameterized IN clause
+    let placeholders = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE learnings SET retired_at = datetime('now') WHERE id IN ({placeholders})"
+    );
+
+    let params = rusqlite::params_from_iter(ids.iter());
+    let rows_updated = conn.execute(&sql, params)?;
+    Ok(rows_updated)
 }
 
 /// Restores soft-archived learnings by setting retired_at = NULL.
