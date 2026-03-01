@@ -2235,7 +2235,7 @@ detached
     // --- TEST-INIT-001: remove_worktree() and early exit cleanup ---
 
     #[test]
-    
+
     fn test_remove_worktree_clean_returns_true_and_path_removed() {
         let tmp = setup_git_repo();
 
@@ -2262,7 +2262,7 @@ detached
     }
 
     #[test]
-    
+
     fn test_remove_worktree_dirty_returns_false_and_path_preserved() {
         let tmp = setup_git_repo();
 
@@ -2291,7 +2291,7 @@ detached
     }
 
     #[test]
-    
+
     fn test_remove_worktree_removes_empty_parent_dir() {
         let tmp = setup_git_repo();
 
@@ -2316,7 +2316,7 @@ detached
     }
 
     #[test]
-    
+
     fn test_remove_worktree_non_empty_parent_dir_preserved() {
         let tmp = setup_git_repo();
 
@@ -2344,7 +2344,7 @@ detached
 
     // Known-bad discriminator: non-existent path is an error, not Ok(true)
     #[test]
-    
+
     fn test_remove_worktree_non_existent_path_returns_error() {
         let tmp = setup_git_repo();
 
