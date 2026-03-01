@@ -15,6 +15,7 @@ use crate::db::{create_schema, open_connection};
 use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{Confidence, LearningOutcome};
 
+use super::output::{format_retire_text, format_unretire_text};
 use super::{curate_retire, curate_unretire, RetireParams};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -656,4 +657,249 @@ fn test_unretire_only_modifies_retired_at() {
     assert_eq!(times_shown, 5, "times_shown must not change");
     assert_eq!(times_applied, 3, "times_applied must not change");
     assert_eq!(confidence, "high", "confidence must not change");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-002: Additional edge cases
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_retire_threshold_zero_min_age_retires_recent() {
+    // Edge: min_age_days=0 means even brand-new low-conf learnings are candidates
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "New low-conf",
+        Confidence::Low,
+        LearningOutcome::Pattern,
+    );
+    // No set_age_days — learning was just created (0 days old)
+
+    let params = RetireParams {
+        min_age_days: 0,
+        ..RetireParams::default()
+    };
+    let result = curate_retire(&conn, params).expect("curate_retire min_age=0");
+
+    assert!(
+        result.candidates.iter().any(|c| c.id == id),
+        "with min_age_days=0, even brand-new low-conf unapplied learnings must be candidates"
+    );
+}
+
+#[test]
+fn test_retire_threshold_zero_min_shows_retires_unshown() {
+    // Edge: min_shows=0 — criterion 2 matches anything with times_applied=0
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Never shown",
+        Confidence::High,
+        LearningOutcome::Success,
+    );
+    // times_shown=0, times_applied=0 by default
+
+    let params = RetireParams {
+        min_shows: 0,
+        ..RetireParams::default()
+    };
+    let result = curate_retire(&conn, params).expect("curate_retire min_shows=0");
+
+    assert!(
+        result.candidates.iter().any(|c| c.id == id),
+        "with min_shows=0, any unapplied learning must match criterion 2"
+    );
+}
+
+#[test]
+fn test_retire_all_learnings_are_candidates() {
+    // All learnings match at least one criterion — all should be retired
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning(&conn, "C1", Confidence::Low, LearningOutcome::Pattern);
+    let id2 = insert_learning(&conn, "C2", Confidence::Low, LearningOutcome::Pattern);
+    set_age_days(&conn, id1, 91);
+    set_age_days(&conn, id2, 91);
+
+    let params = RetireParams {
+        dry_run: false,
+        ..RetireParams::default()
+    };
+    let result = curate_retire(&conn, params).expect("curate_retire all candidates");
+
+    assert_eq!(
+        result.candidates_found, 2,
+        "both learnings must be candidates"
+    );
+    assert_eq!(result.learnings_retired, 2, "both must be retired");
+    assert!(is_retired(&conn, id1), "id1 must be retired");
+    assert!(is_retired(&conn, id2), "id2 must be retired");
+}
+
+#[test]
+fn test_retire_database_has_only_retired_learnings() {
+    // When all learnings are already retired, candidates_found must be 0
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Already retired",
+        Confidence::Low,
+        LearningOutcome::Pattern,
+    );
+    set_age_days(&conn, id, 91);
+    retire_learning(&conn, id);
+
+    let result = curate_retire(&conn, RetireParams::default()).expect("curate_retire only retired");
+
+    assert_eq!(
+        result.candidates_found, 0,
+        "no active learnings = 0 candidates"
+    );
+    assert_eq!(result.learnings_retired, 0);
+    assert!(result.candidates.is_empty());
+}
+
+#[test]
+fn test_unretire_empty_id_list_is_noop() {
+    // unretire([]) must return empty restored and empty errors
+    let (_dir, conn) = setup_db();
+
+    let result = curate_unretire(&conn, vec![]).expect("curate_unretire empty list");
+
+    assert!(
+        result.restored.is_empty(),
+        "restored must be empty for empty input"
+    );
+    assert!(
+        result.errors.is_empty(),
+        "errors must be empty for empty input"
+    );
+}
+
+#[test]
+fn test_unretire_mix_valid_and_invalid_ids_partial_success() {
+    // unretire with one valid retired ID and one invalid ID — partial success
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Valid retired",
+        Confidence::Medium,
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    let result = curate_unretire(&conn, vec![id, 99999]).expect("curate_unretire partial");
+
+    assert!(
+        result.restored.contains(&id),
+        "valid retired ID must be restored"
+    );
+    assert!(
+        !result.errors.is_empty(),
+        "must have error for invalid ID 99999"
+    );
+    assert!(
+        result.errors.iter().any(|e| e.contains("99999")),
+        "error must identify the missing ID"
+    );
+    assert!(!is_retired(&conn, id), "valid ID must be unretired");
+}
+
+#[test]
+fn test_retire_dry_run_text_format() {
+    // Dry-run text output must include candidate count and "no changes made"
+    let (_dir, conn) = setup_db();
+
+    let id = insert_learning(
+        &conn,
+        "Dry candidate",
+        Confidence::Low,
+        LearningOutcome::Pattern,
+    );
+    set_age_days(&conn, id, 91);
+
+    let params = RetireParams {
+        dry_run: true,
+        ..RetireParams::default()
+    };
+    let result = curate_retire(&conn, params).expect("curate_retire dry run");
+    let text = format_retire_text(&result);
+
+    assert!(
+        text.contains("Dry run"),
+        "dry-run text must start with 'Dry run'"
+    );
+    assert!(
+        text.contains("no changes made"),
+        "dry-run text must say 'no changes made'"
+    );
+    assert!(
+        text.contains("1"),
+        "dry-run text must include candidate count"
+    );
+    assert!(
+        text.contains("Dry candidate"),
+        "dry-run text must list the candidate title"
+    );
+}
+
+#[test]
+fn test_retire_result_json_serialization() {
+    // RetireResult must serialize to JSON with all expected fields
+    use super::types::RetireResult;
+    use super::types::RetirementCandidate;
+
+    let result = RetireResult {
+        dry_run: true,
+        candidates_found: 1,
+        learnings_retired: 0,
+        candidates: vec![RetirementCandidate {
+            id: 42,
+            title: "Test learning".to_string(),
+            reason: "Some reason".to_string(),
+        }],
+    };
+
+    let json = serde_json::to_string(&result).expect("serialize RetireResult");
+    assert!(json.contains("\"dry_run\""), "must have dry_run field");
+    assert!(
+        json.contains("\"candidates_found\""),
+        "must have candidates_found field"
+    );
+    assert!(
+        json.contains("\"learnings_retired\""),
+        "must have learnings_retired field"
+    );
+    assert!(
+        json.contains("\"candidates\""),
+        "must have candidates field"
+    );
+    assert!(json.contains("\"id\""), "candidate must have id field");
+    assert!(
+        json.contains("\"title\""),
+        "candidate must have title field"
+    );
+    assert!(
+        json.contains("\"reason\""),
+        "candidate must have reason field"
+    );
+}
+
+#[test]
+fn test_unretire_result_json_serialization() {
+    use super::types::UnretireResult;
+
+    let result = UnretireResult {
+        restored: vec![1, 2, 3],
+        errors: vec!["Learning 99 not found".to_string()],
+    };
+
+    let json = serde_json::to_string(&result).expect("serialize UnretireResult");
+    assert!(json.contains("\"restored\""), "must have restored field");
+    assert!(json.contains("\"errors\""), "must have errors field");
+    assert!(json.contains("99"), "errors content must be present");
 }
