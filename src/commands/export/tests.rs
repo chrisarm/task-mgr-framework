@@ -409,8 +409,9 @@ fn test_atomic_write() {
 #[test]
 fn test_calculate_statistics() {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
 
     // Insert some tasks
     conn.execute(
@@ -613,5 +614,135 @@ fn test_export_preserves_model_fields_in_json_format() {
     assert!(
         exported_json.contains("\"model\""),
         "exported JSON should contain model field"
+    );
+}
+
+// ========== TEST-INIT-001: retired_at Filtering Tests ==========
+//
+// Tests verify retired learnings are excluded from export queries.
+// All tests are #[ignore] until FEAT-001 and FEAT-002 are implemented.
+//
+// Query locations covered:
+//  10. Export load_learnings (progress::load_learnings)
+//  11. Export calculate_statistics (progress::calculate_statistics)
+
+use crate::learnings::test_helpers::retire_learning as retire_learning_export;
+
+#[test]
+fn test_retired_excluded_from_export_load_learnings() {
+    // AC: retired learning excluded from export load_learnings query
+    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = crate::db::open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    // Insert a retired learning
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Success,
+        title: "Retired export target".to_string(),
+        content: "Should not appear in export".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    let result = record_learning(&conn, params).unwrap();
+    retire_learning_export(&conn, result.learning_id);
+
+    // Insert an active learning
+    let active_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Active export learning".to_string(),
+        content: "Should appear in export".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, active_params).unwrap();
+
+    let learnings = progress::load_learnings(&conn).unwrap();
+
+    assert_eq!(
+        learnings.len(),
+        1,
+        "load_learnings must exclude retired learning"
+    );
+    assert_eq!(
+        learnings[0].title, "Active export learning",
+        "only the active learning must appear in export"
+    );
+}
+
+#[test]
+fn test_retired_excluded_from_export_calculate_statistics() {
+    // AC: retired learning excluded from export calculate_statistics outcome counts
+    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = crate::db::open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    // One active success learning
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Success,
+        title: "Active stat".to_string(),
+        content: "Should be counted".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    // One retired failure learning (must NOT be counted)
+    let retired_params = RecordLearningParams {
+        outcome: LearningOutcome::Failure,
+        title: "Retired stat".to_string(),
+        content: "Must not be counted".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Low,
+    };
+    let retired_result = record_learning(&conn, retired_params).unwrap();
+    retire_learning_export(&conn, retired_result.learning_id);
+
+    let stats = calculate_statistics(&conn).unwrap();
+
+    assert_eq!(
+        stats.total_learnings, 1,
+        "calculate_statistics total must exclude retired (expected 1, got {})",
+        stats.total_learnings
+    );
+    // Failure count must be 0 since the only failure is retired
+    assert_eq!(
+        stats.learnings_by_outcome.failures, 0,
+        "retired failure learning must not be counted in calculate_statistics outcome breakdown"
     );
 }

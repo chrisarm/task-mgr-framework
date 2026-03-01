@@ -7,6 +7,7 @@
 //! - Each migration runs in a transaction for atomicity
 
 mod v1;
+mod v10;
 mod v2;
 mod v3;
 mod v4;
@@ -24,7 +25,7 @@ use rusqlite::{Connection, Transaction};
 use crate::TaskMgrResult;
 
 /// Current schema version - increment when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 /// A single migration with up and down SQL
 pub struct Migration {
@@ -50,6 +51,7 @@ pub static MIGRATIONS: &[&Migration] = &[
     &v7::MIGRATION,
     &v8::MIGRATION,
     &v9::MIGRATION,
+    &v10::MIGRATION,
 ];
 
 /// Get the current schema version from the database.

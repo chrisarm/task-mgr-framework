@@ -1,4 +1,45 @@
 
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-2
+- Reviewed 3518-line test file src/commands/curate/tests.rs for duplication and helper extraction
+- **Issue 1 (REFACTOR-2-001)**: 3 identical `set_applies_to_*` functions differ only in column name → unify into `set_json_column`. Also `insert_learning` vs `insert_learning_with_content` should be unified.
+- **Issue 2 (REFACTOR-2-002)**: ~15 merge tests repeat `MergeClusterParams { source_ids, merged_title: "M".to_string(), merged_content: "MC".to_string() }` → extract `make_merge_params` helper.
+- **Issue 3 (REFACTOR-2-003)**: 4+ tests repeat DEDUP_ENV_MUTEX lock + set_var/remove_var CLAUDE_BINARY pattern → RAII guard for env var cleanup safety.
+- Test names are clear and descriptive — no issues found there.
+- Added 3 REFACTOR-2-xxx tasks (priority 40-42) to JSON, added to MILESTONE-2 dependsOn.
+---
+
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-3
+- Reviewed all 7 Phase 2 files: enrich.rs, types.rs, output.rs, mod.rs, tests.rs, crud/types.rs, crud/update.rs
+- **Issue 1 (REFACTOR-3-001)**: `extract_json_array` + `find_matching_bracket` duplicated identically (~60 lines) between enrich.rs and extraction.rs. Critical for Phase 3 reuse — extract to shared module.
+- **Issue 2 (REFACTOR-3-002)**: `current_has_tags` param in `proposal_to_edit_params` is unused (suppressed with `let _`). Remove from signature.
+- **Not worth extracting**: find_enrichment_candidates SQL duplication (4 match arms) — each arm is small, readable, and dynamic SQL would add complexity. edit_learning repetitive blocks (3x file/task_type/error) — only 3 uses, helper adds indirection. curate_enrich at 105 lines — well-structured orchestration, splitting would scatter the flow.
+- **Phase 3 reusability**: LLM prompt/parse infrastructure IS reusable after REFACTOR-3-001 extracts the shared JSON parser. build_enrich_prompt pattern (delimiter injection, batch items, JSON response) is a template Phase 3 can follow.
+- **Learnings:** Acknowledged duplication (comment on enrich.rs:369) should become a task, not remain as a comment.
+---
+
+## 2026-03-01 - adece6fc-REFACTOR-REVIEW-1
+- Reviewed curate/mod.rs, types.rs, output.rs, fts5.rs, patterns.rs for DRY, complexity, coupling
+- **retired_at IS NULL centralization**: NOT worth it — 14 filters use different aliases (l.retired_at vs retired_at) and query patterns (dynamic builders vs static SQL). Tests guard correctness better than abstraction.
+- **Issue 1 (REFACTOR-1-001)**: Duplicate IN-clause placeholder builder in retire_candidates and curate_unretire — extract helper
+- **Issue 2 (REFACTOR-1-002)**: build_reason has 8 params with #[allow(clippy::too_many_arguments)] — introduce struct
+- **No coupling issues**: curate module uses direct SQL consistent with codebase
+- **Extensibility**: Module structure ready for Phase 2/3 enrich/dedup additions
+- **Learnings:** Simple SQL filter fragments (retired_at IS NULL) don't benefit from centralization when alias context varies — test coverage is the real guard
+---
+
+## 2026-03-01 - adece6fc-CODE-REVIEW-1
+- Reviewed all 20 files across migrations, retrieval, commands, CLI, handlers, and main.rs
+- **14 filtered queries**: All 14 have `retired_at IS NULL` — PASS
+- **5 exempt queries**: All 5 correctly lack the filter — PASS
+- **No unwrap() in production**: PASS
+- **Error propagation**: Proper `?` usage throughout, per-ID errors collected in unretire
+- **Integration wiring**: Complete (mod.rs export, handlers.rs imports+TextFormattable, main.rs dispatch for both variants)
+- **Integer division**: Safe — SQL uses CAST to REAL, Rust uses f64
+- **Transaction safety**: Single UPDATE statements are implicitly atomic in SQLite — no issue
+- **No CODE-FIX tasks needed** — all acceptance criteria met
+- **Learnings:** SQLite single-statement atomicity means explicit BEGIN/COMMIT is unnecessary for single UPDATE...WHERE IN(...) patterns
+---
+
 ## 2026-02-28 - SS-REFACTOR-REVIEW-3
 - Reviewed all 11 files: prefix.rs, v9.rs, import.rs, selection.rs, next/mod.rs, decay.rs, engine.rs, prompt.rs, signals.rs, status.rs, calibrate.rs
 - **1 issue found**: `read_task_prefix_from_prd` logic (parse PRD JSON for taskPrefix) duplicated 3 times — private fn in status.rs:139, inline in engine.rs:636-643 and engine.rs:734-742
@@ -314,4 +355,134 @@
 - Created fixtures `prd_p1_alpha.json` and `prd_p2_beta.json` (bare IDs, PrefixMode::Auto prepends prefix)
 - Tests cover: dual-PRD prd_metadata rows, scoped task counts, prefix-scoped select_next_task, scoped force-reinit preserving P2+learnings, .stop signal prefix/fallback, independent per-prefix locks, single-PRD backwards compat
 - **Learnings:** PrefixMode::Auto prepends taskPrefix to bare IDs — don't pre-prefix IDs in fixtures; ScoredTask wraps the Task struct, access via `.task.id`
+---
+
+## 2026-03-01 - adece6fc-TEST-INIT-001
+- Wrote TDD test scaffold for retired_at filtering across all 14 query locations
+- 16 tests added across 7 files, all marked #[ignore] pending FEAT-001+FEAT-002
+- Files: retrieval/tests.rs, recall/tests.rs, commands/learnings.rs, export/tests.rs, stats.rs, ingestion/mod.rs, import_learnings/mod.rs
+- Helper `retire_learning(conn, id)` pattern: UPDATE learnings SET retired_at = datetime('now')
+- Private function `load_existing_keys` and `learning_exists` tested via inline `#[cfg(test)] mod retired_tests` in their own files
+- `ProgressStatistics` uses `learnings_by_outcome.failures` (not `outcomes` map)
+- Discriminator test confirms: without filter, retired learning IS in the table (passes pre-FEAT-002)
+- **Learnings:** ingestion/import private-fn tests require inline #[cfg(test)] mod in source file, not separate tests.rs
+---
+
+## 2026-03-01 - adece6fc-REFACTOR-REVIEW-2
+- Analyzed 3 test files for duplication and clarity
+- **Issues found:**
+  1. `setup_db()` duplicated 3x across retrieval, recall, curate test files
+  2. `setup_db_with_fts5()` identical to `setup_db()` — dead abstraction (2 files)
+  3. `create_test_learning()` duplicated in retrieval + recall tests
+  4. `retire_learning()` duplicated in recall + curate tests
+- **Test names**: All clear and descriptive — no issues found
+- **Tasks created**: REFACTOR-2-001 (extract shared helpers, p40), REFACTOR-2-002 (remove dead fts5 alias, p41)
+- Both added to MILESTONE-2 dependsOn
+---
+## 2026-03-01 - adece6fc-INT-001
+- Added 7 CLI integration tests (tests/cli_tests.rs) for curate retire/unretire
+- Added 3 migration v10 tests (src/db/migrations/tests.rs) for retired_at column
+- Added 2 text format unit tests (src/commands/curate/tests.rs)
+- setup_dir_with_learning() helper uses 'migrate all' + 'learn' CLI to set up test DB
+- Direct rusqlite DB manipulation used to set times_shown/created_at for test scenarios
+- AC note: task said 'v8 migration' but code uses v10 for retired_at column
+---
+
+## 2026-03-01 - REFACTOR-REVIEW-3
+- Final refactoring review of all Phase 1 curate module code
+- Files reviewed: mod.rs, types.rs, output.rs, tests.rs
+- **Findings:** No issues found. Code is clean, well-structured, DRY. Minor placeholder duplication (2 uses) is acceptable per CLAUDE.md anti-premature-abstraction guidance. build_reason has 8 params but is an internal helper; struct wrapping would be over-engineering. Phase 2/3 can extend without modifying Phase 1.
+- **No REFACTOR-3-xxx tasks needed.**
+---
+
+## 2026-03-01 - ef543206-TEST-INIT-002
+- Added `EnrichCandidate` struct to types.rs
+- Added stub `find_enrichment_candidates` (todo!()) to mod.rs so tests compile
+- Added 9 `#[ignore]` tests to tests.rs covering all acceptance criteria
+- Tests compile clean; all 9 are ignored pending FEAT-003 implementation
+- **Learnings:** Stub function with todo!() + #[ignore] tests is the right pattern for TDD stubs — tests compile and are tracked but don't break CI
+---
+
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-1
+- Reviewed enrich.rs, extraction.rs, update.rs for DRY, complexity, coupling, maintainability
+- **Issue 1 (REFACTOR-1-001)**: `extract_json_array()` + `find_matching_bracket()` duplicated verbatim (~65 lines) between extraction.rs and enrich.rs. Extract to shared module.
+- **Issue 2 (REFACTOR-1-002)**: `curate_enrich()` is ~105 lines, well over 30-line guideline. Extract batch loop body to helper.
+- **Not flagged**: `edit_learning()` repetitive field handling (3x add/remove/serialize pattern) — pre-existing, intentionally explicit, not worth abstracting for 3 uses.
+- **No coupling issues**: enrich module uses public CRUD API cleanly.
+- **Extensibility**: Phase 3 dedup will benefit from shared JSON parsing (REFACTOR-1-001).
+- **Learnings:** Verbatim duplication with an acknowledging comment ("mirrors extraction.rs logic") is a clear signal to extract — the author already knew it should be shared.
+---
+
+## 2026-03-01 - ef543206-CODE-REVIEW-1
+- Reviewed all 9 files for quality, security, and integration wiring
+- **unwrap() audit**: No unwrap() in production code — only in #[cfg(test)] modules. PASS
+- **Error propagation**: Proper `?` throughout, context via `map_err` in main.rs field parsing. PASS
+- **Security: injection protection**: enrich.rs:53 uses UUID-based random delimiter. PASS
+- **Security: ID validation**: enrich.rs:122 validates learning_id against batch_ids. PASS
+- **NULL-only semantics**: proposal_to_edit_params only sets add_* when current field is None. PASS
+- **Integration wiring**: mod.rs exports enrich, handlers.rs has TextFormattable impl, main.rs dispatches. PASS
+- **edit_learning handles task_types/errors**: update.rs:120-178 mirrors files pattern exactly. PASS
+- **Dead code**: cargo check + clippy zero warnings. PASS
+- **Edge case coverage**: TEST-INIT-001 has 10 tests, TEST-INIT-002 has 9 tests — all edge cases covered. PASS
+- **Formatting fix**: cargo fmt --check failed on enrich.rs test helper signature (long line) — fixed with cargo fmt
+- **No CODE-FIX tasks needed** — all acceptance criteria met
+- **Learnings:** unwrap_or_default() on get_learning_tags is acceptable graceful degradation for supplementary LLM prompt data
+---
+
+## 2026-03-01 - ef543206-REFACTOR-REVIEW-2
+- Reviewed curate/tests.rs (1810 lines) and crud/tests.rs for duplication, helper extraction, and test name clarity
+- **No issues found requiring REFACTOR-2-xxx tasks**
+- Three `set_applies_to_*` helpers (lines 954-978) are similar but extracting would need dynamic SQL column names — not worth it for 3 uses
+- Cross-file duplication (setup_db, retire_learning) is pre-existing, already tracked by Phase 1 REFACTOR-2-001
+- Test names are all descriptive and behavior-focused
+- Helpers (insert_learning, insert_fully_enriched_learning, make_batch, make_enrich_proposal) are well-factored
+- **Learnings:** When 3 helpers differ only by column name, a dynamic-column helper would risk SQL injection or need an enum — 3 explicit helpers is the right call
+---
+
+## 2026-03-01 - ef543206-INT-001
+- Added 10 CLI integration tests for curate enrich workflow
+- Created tests/fixtures/fake_claude.sh: bash script that parses `-p` prompt arg, extracts "ID: N" lines, outputs valid enrich JSON
+- Tests: dry-run no-changes, metadata populated, idempotent second run, retired learnings skipped, field filter, edit-learning --add-task-types, edit-learning --add-errors, JSON output, text output, help flags
+- All tests use CLAUDE_BINARY env var to inject fake_claude.sh as LLM mock
+- No DB changes needed; all AC covered without real LLM calls
+- **Learnings:** `CLAUDE_BINARY` env var + assert_cmd's `.env()` is the clean pattern for LLM integration tests — no subprocess mocking complexity
+---
+
+## 2026-03-01 - a8e80384-CODE-REVIEW-1
+- Reviewed all 7 dedup implementation files for quality, security, and integration wiring
+- **Format fix**: `cargo fmt` was failing on mod.rs long lines — fixed by running `cargo fmt`
+- **Security**: LLM prompt injection protection verified (UUID delimiter + UNTRUSTED warning)
+- **Error handling**: No bare `unwrap()` in production; all Option/Result handled gracefully
+- **Integration**: Full trace verified: CLI → main.rs → curate_dedup() → merge_cluster() → record_learning()
+- **Transaction safety**: Per-cluster atomic commits via unchecked_transaction()
+- **Bandit stats**: Summing uses i64::from(i32) for safe widening, UPDATE after record_learning
+- **No CODE-FIX tasks needed**: All acceptance criteria pass, no issues requiring fix tasks
+- **Learnings:** cargo fmt should be run before committing each FEAT task to avoid accumulated drift
+---
+
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-1
+- Reviewed dedup.rs, types.rs, output.rs, extraction.rs for DRY, complexity, coupling, maintainability
+- **Issue 1 (REFACTOR-1-001)**: `extract_json_array()` + `find_matching_bracket()` duplicated verbatim 3× across dedup.rs, enrich.rs, extraction.rs (~195 lines total). Extract to shared utility module.
+- **Issue 2 (REFACTOR-1-002)**: `confidence_rank` closure duplicated in merge_cluster() and curate_dedup(). Extract as shared helper.
+- **Flagged but acceptable**: merge_cluster (~170 lines) and curate_dedup (~217 lines) exceed 30-line guideline but are orchestration functions — splitting would scatter flow. 4× set-to-sorted-vec pattern is only in one function.
+- **No coupling issues**: dedup.rs depends only on types; mod.rs uses public CRUD APIs cleanly.
+- **Learnings:** 3-way duplication of JSON parsing utils is the single biggest DRY violation in the curation codebase; confidence_rank is a minor but easy win
+---
+
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-3
+- Final refactoring review of all Phase 3 dedup code: dedup.rs, types.rs, output.rs, tests.rs, mod.rs
+- **No new issues found** requiring REFACTOR-3-xxx tasks
+- Pre-existing issues already tracked: extract_json_array 3× duplication (REFACTOR-1-001), confidence_rank duplication (REFACTOR-1-002), MergeClusterParams boilerplate (REFACTOR-2-002), DEDUP_ENV_MUTEX pattern (REFACTOR-2-003)
+- Functions over 30 lines: merge_cluster (~170), curate_dedup (~217) — orchestration functions, splitting would scatter flow (accepted in REFACTOR-REVIEW-1)
+- Code follows project patterns, clear separation of concerns, no new DRY violations
+---
+
+## 2026-03-01 - a8e80384-TEST-002
+- Added 8 new tests covering dedup LLM interaction and failure modes
+- Files changed: src/commands/curate/tests.rs
+- Approach: CLAUDE_BINARY=false for failure tests; Unix shell script mock for JSON response tests
+- Added DEDUP_ENV_MUTEX static to serialise env-mutating tests
+- Added setup_claude_mock() helper (unix): writes JSON to tmpfile, creates cat script
+- Added insert_learning_with_content() helper for large-corpus tests
+- **Learnings:** CLAUDE_BINARY=false works well for counting batches (each failed batch = 1 llm_error); script mock approach avoids single-quote issues in JSON by writing to a data file and cat-ing it
 ---

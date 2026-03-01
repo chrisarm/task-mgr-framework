@@ -197,7 +197,7 @@ pub(crate) fn load_learnings(conn: &Connection) -> TaskMgrResult<Vec<LearningExp
            root_cause, solution, applies_to_files, applies_to_task_types,
            applies_to_errors, confidence, times_shown, times_applied,
            last_shown_at, last_applied_at
-           FROM learnings ORDER BY created_at DESC"#,
+           FROM learnings WHERE retired_at IS NULL ORDER BY created_at DESC"#,
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -364,7 +364,9 @@ pub(crate) fn calculate_statistics(conn: &Connection) -> TaskMgrResult<ProgressS
     }
 
     // Count learnings by outcome
-    let mut stmt = conn.prepare("SELECT outcome, COUNT(*) FROM learnings GROUP BY outcome")?;
+    let mut stmt = conn.prepare(
+        "SELECT outcome, COUNT(*) FROM learnings WHERE retired_at IS NULL GROUP BY outcome",
+    )?;
     let rows = stmt.query_map([], |row| {
         let outcome: String = row.get(0)?;
         let count: i32 = row.get(1)?;

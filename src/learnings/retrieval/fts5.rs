@@ -149,6 +149,7 @@ fn execute_fts5_query(
         FROM learnings l
         INNER JOIN learnings_fts fts ON l.id = fts.rowid
         WHERE learnings_fts MATCH ?1
+        AND l.retired_at IS NULL
         {}
         ORDER BY relevance DESC
         LIMIT ?
@@ -185,6 +186,9 @@ fn execute_like_query(
 ) -> TaskMgrResult<Vec<ScoredLearning>> {
     let mut conditions = Vec::new();
     let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    // Exclude retired learnings
+    conditions.push("retired_at IS NULL".to_string());
 
     // Text search condition (escape LIKE metacharacters)
     conditions.push("(title LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\')".to_string());
@@ -243,16 +247,12 @@ fn execute_unfiltered_query(
     conn: &Connection,
     query: &RetrievalQuery,
 ) -> TaskMgrResult<Vec<ScoredLearning>> {
-    let mut conditions = Vec::new();
+    let mut conditions = vec!["retired_at IS NULL".to_string()];
     let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     append_common_filters(query, &mut conditions, &mut sql_params, "id", "outcome");
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
+    let where_clause = format!("WHERE {}", conditions.join(" AND "));
 
     let sql = format!(
         r#"

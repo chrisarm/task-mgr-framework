@@ -8,7 +8,7 @@ use std::process;
 
 use clap::Parser;
 
-use task_mgr::cli::{Cli, Commands, MigrateAction, RunAction, WorktreesAction};
+use task_mgr::cli::{Cli, Commands, CurateAction, MigrateAction, RunAction, WorktreesAction};
 use task_mgr::commands::{
     apply_learning, auto_unblock_all, begin, complete, count_resettable_tasks, doctor, end, export,
     fail, format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
@@ -496,6 +496,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             remove_tags,
             add_files,
             remove_files,
+            add_task_types,
+            remove_task_types,
+            add_errors,
+            remove_errors,
         } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -516,6 +520,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 remove_tags,
                 add_files,
                 remove_files,
+                add_task_types,
+                remove_task_types,
+                add_errors,
+                remove_errors,
             };
 
             let result = edit_learning(&conn, learning_id, params)?;
@@ -718,6 +726,77 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 }
                 WorktreesAction::Remove { target } => {
                     let result = worktrees_remove(&cli.dir, &project_root, &target)?;
+                    output_result(&result, cli.format);
+                }
+            }
+            Ok(())
+        }
+
+        Commands::Curate { action } => {
+            use task_mgr::commands::curate::enrich::curate_enrich;
+            use task_mgr::commands::curate::{
+                curate_dedup, curate_retire, curate_unretire, DedupParams, EnrichParams,
+                RetireParams,
+            };
+            let _lock = LockGuard::acquire(&cli.dir)?;
+            let conn = open_connection(&cli.dir)?;
+            match action {
+                CurateAction::Retire {
+                    dry_run,
+                    min_age_days,
+                    min_shows,
+                    max_rate,
+                } => {
+                    let params = RetireParams {
+                        dry_run,
+                        min_age_days,
+                        min_shows,
+                        max_rate,
+                    };
+                    let result = curate_retire(&conn, params)?;
+                    output_result(&result, cli.format);
+                }
+                CurateAction::Unretire { learning_ids } => {
+                    let result = curate_unretire(&conn, learning_ids)?;
+                    output_result(&result, cli.format);
+                }
+                CurateAction::Enrich {
+                    dry_run,
+                    batch_size,
+                    field,
+                } => {
+                    let field_filter = field
+                        .map(|s| {
+                            let id = s.clone();
+                            s.parse().map_err(|e: String| TaskMgrError::InvalidState {
+                                resource_type: "curate enrich --field".to_string(),
+                                id,
+                                expected:
+                                    "applies_to_files, applies_to_task_types, or applies_to_errors"
+                                        .to_string(),
+                                actual: e,
+                            })
+                        })
+                        .transpose()?;
+                    let params = EnrichParams {
+                        dry_run,
+                        batch_size,
+                        field_filter,
+                    };
+                    let result = curate_enrich(&conn, params)?;
+                    output_result(&result, cli.format);
+                }
+                CurateAction::Dedup {
+                    dry_run,
+                    threshold,
+                    batch_size,
+                } => {
+                    let params = DedupParams {
+                        dry_run,
+                        threshold,
+                        batch_size,
+                    };
+                    let result = curate_dedup(&conn, params)?;
                     output_result(&result, cli.format);
                 }
             }

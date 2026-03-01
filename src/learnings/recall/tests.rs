@@ -7,14 +7,15 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use super::{format_text, recall_learnings, RecallParams, RecallResult};
-use crate::db::{create_schema, open_connection};
+use crate::db::{create_schema, migrations::run_migrations, open_connection};
 use crate::learnings::crud::{record_learning, RecordLearningParams};
 use crate::models::{Confidence, Learning, LearningOutcome};
 
 fn setup_db() -> (TempDir, Connection) {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 
@@ -722,4 +723,129 @@ fn test_rerank_preserves_relevance_tiers() {
     // File-matched (10.0 * 100 + ucb) always beats fallback (0.1 * 100 + ucb)
     assert_eq!(result.learnings[0].title, "File matched");
     assert_eq!(result.learnings[1].title, "Fallback");
+}
+
+// ========== TEST-INIT-001: retired_at Filtering Tests ==========
+//
+// Tests for retired learning exclusion in the recall and bandit paths.
+// All tests are #[ignore] until FEAT-001 and FEAT-002 are implemented.
+//
+// Query locations covered:
+//   6. Bandit total_window_shows aggregate (get_total_window_shows)
+//   7. Recall list (recall_learnings text/recency path)
+//   Exempt: get_learning() by ID still returns retired
+//   Exempt: apply_learning() still works for retired
+
+use crate::learnings::test_helpers::retire_learning;
+
+#[test]
+fn test_retired_excluded_from_bandit_total_window_shows() {
+    // AC: retired learning excluded from bandit total_window_shows aggregate
+    use crate::learnings::bandit::get_total_window_shows;
+
+    let (_dir, conn) = setup_db_with_fts5();
+
+    // Retired learning with window_shown = 7
+    let retired_id =
+        create_test_learning(&conn, "Retired bandit", "content", LearningOutcome::Pattern);
+    conn.execute(
+        "UPDATE learnings SET window_shown = 7 WHERE id = ?1",
+        [retired_id],
+    )
+    .unwrap();
+    retire_learning(&conn, retired_id);
+
+    // Active learning with window_shown = 3
+    let active_id =
+        create_test_learning(&conn, "Active bandit", "content", LearningOutcome::Pattern);
+    conn.execute(
+        "UPDATE learnings SET window_shown = 3 WHERE id = ?1",
+        [active_id],
+    )
+    .unwrap();
+
+    let total = get_total_window_shows(&conn).unwrap();
+    assert_eq!(
+        total, 3,
+        "retired learning's window_shown (7) must be excluded from total_window_shows aggregate; \
+         got {total} (expected 3)"
+    );
+}
+
+#[test]
+fn test_retired_excluded_from_recall_text_search() {
+    // AC: retired learning excluded from recall text search (LIKE or FTS5 path)
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let retired_id = create_test_learning(
+        &conn,
+        "Retired recall target",
+        "unique searchable xyz",
+        LearningOutcome::Success,
+    );
+    retire_learning(&conn, retired_id);
+
+    create_test_learning(
+        &conn,
+        "Active learning",
+        "other content",
+        LearningOutcome::Pattern,
+    );
+
+    let params = RecallParams {
+        query: Some("searchable".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let result = recall_learnings(&conn, params).unwrap();
+
+    assert!(
+        result.learnings.iter().all(|l| l.id != Some(retired_id)),
+        "retired learning must not appear in recall text search results"
+    );
+}
+
+#[test]
+fn test_get_learning_by_id_still_returns_retired() {
+    // AC (exempt): get_learning() by ID is NOT subject to retired_at filter
+    use crate::learnings::crud::get_learning;
+
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let id = create_test_learning(
+        &conn,
+        "Retired learning",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    let result = get_learning(&conn, id).unwrap();
+    assert!(
+        result.is_some(),
+        "get_learning() must still return retired learning by ID (single-record lookup is exempt)"
+    );
+    assert_eq!(result.unwrap().title, "Retired learning");
+}
+
+#[test]
+fn test_apply_learning_works_for_retired() {
+    // AC (exempt): apply_learning() by ID is NOT subject to retired_at filter
+    use crate::commands::apply_learning::apply_learning;
+
+    let (_dir, conn) = setup_db_with_fts5();
+
+    let id = create_test_learning(
+        &conn,
+        "Retired apply target",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    let result = apply_learning(&conn, id);
+    assert!(
+        result.is_ok(),
+        "apply_learning() must succeed for retired learning by ID (single-record lookup is exempt)"
+    );
 }

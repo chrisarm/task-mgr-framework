@@ -317,6 +317,8 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
+    // Migrate down from version 10 to version 9 (reverts retired_at column)
+    migrate_down(&mut conn).unwrap();
     // Migrate down from version 9 to version 8 (reverts prd_metadata singleton removal)
     migrate_down(&mut conn).unwrap();
     // Migrate down from version 8 to version 7 (reverts FTS5 tag indexing stub)
@@ -544,8 +546,8 @@ fn test_migration_v8_schema_version_is_8() {
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(
-        version, 9,
-        "schema_version should be 9 after all migrations"
+        version, 10,
+        "schema_version should be 10 after all migrations"
     );
 }
 
@@ -981,7 +983,9 @@ fn test_migration_v8_down_reverts_to_v7() {
     // Verify v8 down migration specifically reverts to v7 (not further).
     let (_temp_dir, mut conn) = setup_db();
     run_migrations(&mut conn).unwrap();
-    // Current latest is v9; first migrate down to v8
+    // Current latest is v10; first migrate down to v9, then v8
+    assert_eq!(get_schema_version(&conn).unwrap(), 10);
+    migrate_down(&mut conn).unwrap();
     assert_eq!(get_schema_version(&conn).unwrap(), 9);
     migrate_down(&mut conn).unwrap();
     assert_eq!(get_schema_version(&conn).unwrap(), 8);
@@ -1177,8 +1181,8 @@ fn test_migration_v9_schema_version_is_9() {
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(
-        version, 9,
-        "schema_version should be 9 after all migrations"
+        version, 10,
+        "schema_version should be 10 after all migrations"
     );
 }
 
@@ -1407,4 +1411,86 @@ fn test_migration_v8_fts5_rebuild_succeeds() {
         )
         .unwrap();
     assert_eq!(count, 1, "data must be searchable after FTS5 rebuild");
+}
+
+// ========== Migration v10 Tests (retired_at soft-archive column) ==========
+
+#[test]
+fn test_migration_v10_adds_retired_at_column() {
+    // AC2: migration v10 adds retired_at column on a fresh DB
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('learnings') WHERE name = 'retired_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        exists,
+        "retired_at column must exist on learnings table after migration v10"
+    );
+}
+
+#[test]
+fn test_migration_v10_retired_at_defaults_to_null() {
+    // All learnings inserted after v10 must have retired_at = NULL by default
+    let (_temp_dir, mut conn) = setup_db();
+    run_migrations(&mut conn).unwrap();
+
+    conn.execute(
+        "INSERT INTO learnings (outcome, title, content, confidence) VALUES ('pattern', 'Test', 'Content', 'high')",
+        [],
+    )
+    .unwrap();
+
+    let retired_at: Option<String> = conn
+        .query_row(
+            "SELECT retired_at FROM learnings WHERE title = 'Test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        retired_at.is_none(),
+        "retired_at must default to NULL for newly inserted learnings"
+    );
+}
+
+#[test]
+fn test_migration_v10_on_existing_data() {
+    // AC3: migration v10 applied to a DB that already has learnings (v9 -> v10)
+    // Existing learnings must have retired_at = NULL after migration
+    let (_temp_dir, mut conn) = setup_db();
+
+    // Apply only through v9 (v8 + 1 more)
+    migrate_to_v8(&mut conn);
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 9);
+
+    // Insert a learning at v9 (no retired_at column yet)
+    conn.execute(
+        "INSERT INTO learnings (outcome, title, content, confidence) VALUES ('pattern', 'Pre-v10 learning', 'Content', 'high')",
+        [],
+    )
+    .unwrap();
+
+    // Apply v10
+    migrate_up(&mut conn).unwrap();
+    assert_eq!(get_schema_version(&conn).unwrap(), 10);
+
+    // Existing learning must have retired_at = NULL
+    let retired_at: Option<String> = conn
+        .query_row(
+            "SELECT retired_at FROM learnings WHERE title = 'Pre-v10 learning'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        retired_at.is_none(),
+        "existing learnings must have retired_at = NULL after v10 migration"
+    );
 }

@@ -278,20 +278,20 @@ pub fn format_verbose(result: &RecallCmdResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
+    use crate::db::{create_schema, migrations::run_migrations, open_connection};
     use crate::learnings::{record_learning, RecordLearningParams};
     use crate::models::Confidence;
     use tempfile::TempDir;
 
     fn setup_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
     fn setup_db_with_migrations() -> (TempDir, Connection) {
-        use crate::db::migrations::run_migrations;
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();

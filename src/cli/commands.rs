@@ -551,6 +551,22 @@ MATCHING BEHAVIOR:
         /// File patterns to remove (comma-separated)
         #[arg(long = "remove-files", value_delimiter = ',')]
         remove_files: Option<Vec<String>>,
+
+        /// Task type prefixes to add (comma-separated)
+        #[arg(long = "add-task-types", value_delimiter = ',')]
+        add_task_types: Option<Vec<String>>,
+
+        /// Task type prefixes to remove (comma-separated)
+        #[arg(long = "remove-task-types", value_delimiter = ',')]
+        remove_task_types: Option<Vec<String>>,
+
+        /// Error patterns to add (comma-separated)
+        #[arg(long = "add-errors", value_delimiter = ',')]
+        add_errors: Option<Vec<String>>,
+
+        /// Error patterns to remove (comma-separated)
+        #[arg(long = "remove-errors", value_delimiter = ',')]
+        remove_errors: Option<Vec<String>>,
     },
 
     /// Review blocked and skipped tasks
@@ -837,6 +853,129 @@ GENERATED MAN PAGES:
         #[arg(long, default_value_t = false)]
         list: bool,
     },
+
+    /// Curate learnings (retire stale entries, unretire archived ones)
+    Curate {
+        #[command(subcommand)]
+        action: CurateAction,
+    },
+}
+
+/// Curate subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum CurateAction {
+    /// Identify and soft-archive stale learnings
+    Retire {
+        /// Preview candidates without modifying the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Minimum age in days for a low-confidence, never-applied learning to be retired
+        #[arg(long = "min-age-days", default_value_t = 90)]
+        min_age_days: u32,
+
+        /// Minimum times_shown for a never-applied or low-rate learning to be retired
+        #[arg(long = "min-shows", default_value_t = 10)]
+        min_shows: u32,
+
+        /// Maximum application rate (times_applied / times_shown) below which a learning is retired
+        #[arg(long = "max-rate", default_value_t = 0.05)]
+        max_rate: f64,
+    },
+
+    /// Restore soft-archived learnings by ID
+    Unretire {
+        /// Learning IDs to restore
+        #[arg(required = true)]
+        learning_ids: Vec<i64>,
+    },
+
+    /// Identify and merge duplicate learnings using LLM semantic analysis
+    #[command(after_help = "\
+EXAMPLES:
+    # Preview duplicate clusters without modifying the database
+    task-mgr curate dedup --dry-run
+
+    # Run dedup with default threshold (0.7)
+    task-mgr curate dedup
+
+    # Run with aggressive merging (higher threshold = more merges)
+    task-mgr curate dedup --threshold 0.9
+
+    # Run with conservative merging
+    task-mgr curate dedup --threshold 0.5
+
+    # Use a smaller batch size for LLM calls
+    task-mgr curate dedup --batch-size 10 --dry-run
+
+THRESHOLD:
+    Controls how aggressively the LLM should merge learnings.
+    0.0 = never merge (only exact duplicates)
+    0.7 = merge learnings capturing the same insight (default)
+    1.0 = merge any related learnings
+    Must be between 0.0 and 1.0 (inclusive).
+")]
+    Dedup {
+        /// Preview duplicate clusters without modifying the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Merge aggressiveness: 0.0 (conservative) to 1.0 (aggressive); default 0.7.
+        /// Passed as semantic guidance to the LLM prompt.
+        #[arg(
+            long,
+            default_value_t = 0.7,
+            value_parser = parse_threshold
+        )]
+        threshold: f64,
+
+        /// Maximum number of learnings per LLM call (None = auto)
+        #[arg(long = "batch-size")]
+        batch_size: Option<usize>,
+    },
+
+    /// Enrich learning metadata using LLM analysis
+    #[command(after_help = "\
+EXAMPLES:
+    # Preview enrichment proposals without saving (dry run)
+    task-mgr curate enrich --dry-run
+
+    # Enrich all metadata fields in batches of 20 (default)
+    task-mgr curate enrich
+
+    # Enrich only applies_to_files metadata
+    task-mgr curate enrich --field applies_to_files
+
+    # Enrich only applies_to_task_types metadata
+    task-mgr curate enrich --field applies_to_task_types
+
+    # Enrich only applies_to_errors metadata
+    task-mgr curate enrich --field applies_to_errors
+
+    # Use a smaller batch size
+    task-mgr curate enrich --batch-size 5 --dry-run
+
+FIELD VALUES:
+    applies_to_files       - File glob patterns the learning applies to
+    applies_to_task_types  - Task type prefixes (e.g., FEAT-, FIX-)
+    applies_to_errors      - Error patterns or codes (e.g., E0277)
+
+    Note: tags enrichment is always included and cannot be filtered separately.
+")]
+    Enrich {
+        /// Preview proposals without saving to the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Number of learnings to process per LLM batch
+        #[arg(long = "batch-size", default_value_t = 20)]
+        batch_size: usize,
+
+        /// Restrict enrichment to a specific metadata field.
+        /// Accepted values: applies_to_files, applies_to_task_types, applies_to_errors
+        #[arg(long)]
+        field: Option<String>,
+    },
 }
 
 /// Worktrees subcommand actions
@@ -869,6 +1008,17 @@ pub enum MigrateAction {
 
     /// Apply all pending migrations (default behavior on db open)
     All,
+}
+
+/// Validates that threshold is in [0.0, 1.0].
+fn parse_threshold(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("threshold must be between 0.0 and 1.0, got {}", v));
+    }
+    Ok(v)
 }
 
 /// Run lifecycle actions

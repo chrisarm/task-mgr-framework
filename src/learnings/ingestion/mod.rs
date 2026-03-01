@@ -189,7 +189,7 @@ fn learning_exists(
     title: &str,
 ) -> TaskMgrResult<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM learnings WHERE outcome = ?1 AND title = ?2",
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL AND outcome = ?1 AND title = ?2",
         rusqlite::params![outcome.as_db_str(), title],
         |row| row.get(0),
     )?;
@@ -395,6 +395,44 @@ mod tests {
             !files.contains(&"src/main.rs".to_string()),
             "Must NOT contain hardcoded 'src/main.rs'; query the DB, got: {:?}",
             files
+        );
+    }
+
+    // ========== TEST-INIT-001: retired_at Filtering Tests ==========
+    //
+    // Tests verify retired learnings are excluded from the ingestion dedup check.
+    // #[ignore] until FEAT-001 and FEAT-002 are implemented.
+    //
+    // Query location covered:
+    //  13. Ingestion dedup check (learning_exists: SELECT COUNT WHERE outcome=? AND title=?)
+
+    use crate::learnings::test_helpers::retire_learning as retire_learning_ingestion;
+
+    #[test]
+    fn test_retired_excluded_from_ingestion_dedup_learning_exists() {
+        // AC: ingestion dedup check (learning_exists) must exclude retired learnings.
+        // After retirement, a new learning with the same outcome+title should NOT be
+        // considered a duplicate — it should be allowed through.
+        use crate::learnings::crud::record_learning;
+
+        let (_dir, conn) = setup_db();
+
+        // Insert a learning and retire it
+        let initial = make_minimal_params("Retired dedup target");
+        let result = record_learning(&conn, initial).unwrap();
+        retire_learning_ingestion(&conn, result.learning_id);
+
+        // learning_exists is private; verify via query_row directly
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learnings WHERE outcome = 'pattern' AND title = 'Retired dedup target' AND retired_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "after retirement, learning_exists must return false (no active learning with same outcome+title)"
         );
     }
 }

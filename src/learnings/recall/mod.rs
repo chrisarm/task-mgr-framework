@@ -187,6 +187,7 @@ fn load_ucb_fallback(
                    applies_to_files, applies_to_task_types, applies_to_errors,
                    confidence, times_shown, times_applied, last_shown_at, last_applied_at
             FROM learnings
+            WHERE retired_at IS NULL
             "#,
         )?;
         let result = stmt
@@ -206,7 +207,8 @@ fn load_ucb_fallback(
                    applies_to_files, applies_to_task_types, applies_to_errors,
                    confidence, times_shown, times_applied, last_shown_at, last_applied_at
             FROM learnings
-            WHERE id NOT IN ({})
+            WHERE retired_at IS NULL
+            AND id NOT IN ({})
             "#,
             placeholders.join(", ")
         );

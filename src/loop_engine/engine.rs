@@ -660,8 +660,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
     // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
     // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
-    let pre_lock_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file)
-        .and_then(|p| {
+    let pre_lock_prefix: Option<String> =
+        read_task_prefix_from_prd(&run_config.prd_file).and_then(|p| {
             // Only use prefix if it is safe for filenames
             if validate_prefix(&p).is_ok() {
                 Some(p)
@@ -824,7 +824,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             e
         );
     }
-
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
     // This catches tasks completed in a previous run where the DB status was never
@@ -1132,111 +1131,111 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
                 // Fallback 1: git commit detection (only if no <completed> tags found)
                 if completed_tags.is_empty() {
-                if let Some(commit_hash) = check_git_for_task_completion(
-                    &working_root,
-                    task_id,
-                    task_prefix.as_deref(),
-                    run_config.config.git_scan_depth,
-                ) {
-                    // Mark task done in DB
-                    let task_ids = [task_id.clone()];
-                    match complete_cmd::complete(
-                        &mut conn,
-                        &task_ids,
-                        Some(&run_id),
-                        Some(&commit_hash),
-                        false, // force
-                    ) {
-                        Ok(_) => {
-                            last_claimed_task = None;
-                            tasks_completed += 1;
-                            task_marked_done_this_iteration = true;
-
-                            // Override outcome so stale tracker resets — task was actually completed
-                            result.outcome = IterationOutcome::Completed;
-
-                            // Update PRD JSON to set passes: true
-                            if let Err(e) = update_prd_task_passes(
-                                &paths.prd_file,
-                                task_id,
-                                true,
-                                task_prefix.as_deref(),
-                            ) {
-                                eprintln!(
-                                    "Warning: failed to update PRD for task {}: {}",
-                                    task_id, e
-                                );
-                            } else {
-                                eprintln!(
-                                    "Task {} completed (commit {})",
-                                    task_id,
-                                    &commit_hash[..7.min(commit_hash.len())]
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: failed to mark task {} as done in DB: {}",
-                                task_id, e
-                            );
-                        }
-                    }
-                } else {
-                    // Fallback: scan Claude's output for ANY completed task IDs.
-                    // Claude may complete the claimed task or others in a single iteration,
-                    // and commits happen in a different repo (e.g. restaurant_agent_ex/).
-                    let completed_ids = scan_output_for_completed_tasks(
-                        &result.output,
-                        &conn,
+                    if let Some(commit_hash) = check_git_for_task_completion(
+                        &working_root,
+                        task_id,
                         task_prefix.as_deref(),
-                    );
-                    for completed_id in &completed_ids {
-                        let ids = [completed_id.clone()];
+                        run_config.config.git_scan_depth,
+                    ) {
+                        // Mark task done in DB
+                        let task_ids = [task_id.clone()];
                         match complete_cmd::complete(
                             &mut conn,
-                            &ids,
+                            &task_ids,
                             Some(&run_id),
-                            None, // no commit hash — different repo
-                            false,
+                            Some(&commit_hash),
+                            false, // force
                         ) {
                             Ok(_) => {
-                                // Clear tracker if the claimed task was completed via output scan
-                                if result.task_id.as_deref() == Some(completed_id.as_str()) {
-                                    last_claimed_task = None;
-                                    task_marked_done_this_iteration = true;
-                                }
-
+                                last_claimed_task = None;
                                 tasks_completed += 1;
+                                task_marked_done_this_iteration = true;
 
                                 // Override outcome so stale tracker resets — task was actually completed
                                 result.outcome = IterationOutcome::Completed;
 
+                                // Update PRD JSON to set passes: true
                                 if let Err(e) = update_prd_task_passes(
                                     &paths.prd_file,
-                                    completed_id,
+                                    task_id,
                                     true,
                                     task_prefix.as_deref(),
                                 ) {
                                     eprintln!(
                                         "Warning: failed to update PRD for task {}: {}",
-                                        completed_id, e
+                                        task_id, e
                                     );
                                 } else {
                                     eprintln!(
-                                        "Task {} completed (detected from output)",
-                                        completed_id
+                                        "Task {} completed (commit {})",
+                                        task_id,
+                                        &commit_hash[..7.min(commit_hash.len())]
                                     );
                                 }
                             }
                             Err(e) => {
                                 eprintln!(
-                                    "Warning: failed to mark task {} as done: {}",
-                                    completed_id, e
+                                    "Warning: failed to mark task {} as done in DB: {}",
+                                    task_id, e
                                 );
                             }
                         }
+                    } else {
+                        // Fallback: scan Claude's output for ANY completed task IDs.
+                        // Claude may complete the claimed task or others in a single iteration,
+                        // and commits happen in a different repo (e.g. restaurant_agent_ex/).
+                        let completed_ids = scan_output_for_completed_tasks(
+                            &result.output,
+                            &conn,
+                            task_prefix.as_deref(),
+                        );
+                        for completed_id in &completed_ids {
+                            let ids = [completed_id.clone()];
+                            match complete_cmd::complete(
+                                &mut conn,
+                                &ids,
+                                Some(&run_id),
+                                None, // no commit hash — different repo
+                                false,
+                            ) {
+                                Ok(_) => {
+                                    // Clear tracker if the claimed task was completed via output scan
+                                    if result.task_id.as_deref() == Some(completed_id.as_str()) {
+                                        last_claimed_task = None;
+                                        task_marked_done_this_iteration = true;
+                                    }
+
+                                    tasks_completed += 1;
+
+                                    // Override outcome so stale tracker resets — task was actually completed
+                                    result.outcome = IterationOutcome::Completed;
+
+                                    if let Err(e) = update_prd_task_passes(
+                                        &paths.prd_file,
+                                        completed_id,
+                                        true,
+                                        task_prefix.as_deref(),
+                                    ) {
+                                        eprintln!(
+                                            "Warning: failed to update PRD for task {}: {}",
+                                            completed_id, e
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "Task {} completed (detected from output)",
+                                            completed_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: failed to mark task {} as done: {}",
+                                        completed_id, e
+                                    );
+                                }
+                            }
+                        }
                     }
-                }
                 } // end: if completed_tags.is_empty()
 
                 // Final fallback: Claude reports the task as "already complete" without committing.
@@ -2434,7 +2433,10 @@ mod tests {
         git_commit(temp_dir.path(), "feat: SEC-H005-completed - Add feature");
 
         let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
-        assert!(result.is_some(), "Should find task ID with -completed suffix in commit message");
+        assert!(
+            result.is_some(),
+            "Should find task ID with -completed suffix in commit message"
+        );
     }
 
     #[test]
@@ -2477,7 +2479,10 @@ mod tests {
     fn test_check_git_completion_finds_task_in_earlier_commit() {
         // Claude may create multiple commits; the task ID might be in an earlier one
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(temp_dir.path(), "feat: TASK-001-completed - implement feature");
+        git_commit(
+            temp_dir.path(),
+            "feat: TASK-001-completed - implement feature",
+        );
         git_commit(temp_dir.path(), "fix: adjust config formatting");
         git_commit(temp_dir.path(), "chore: update lockfile");
 
@@ -2673,8 +2678,14 @@ mod tests {
 
         // Create external git repo with commits containing task IDs
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: FEAT-001-completed - Implement feature");
-        git_commit(ext_repo.path(), "feat: FEAT-003-completed - Already done task");
+        git_commit(
+            ext_repo.path(),
+            "feat: FEAT-001-completed - Implement feature",
+        );
+        git_commit(
+            ext_repo.path(),
+            "feat: FEAT-003-completed - Already done task",
+        );
 
         // Create PRD file
         let prd_dir = tempfile::TempDir::new().unwrap();
@@ -2969,7 +2980,10 @@ mod tests {
         // Regression: git-based detection returns Some(hash) which the loop
         // uses to increment tasks_completed by 1.
         let repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(repo.path(), "feat: P3-FEAT-001-completed - Implement CallSupervisor");
+        git_commit(
+            repo.path(),
+            "feat: P3-FEAT-001-completed - Implement CallSupervisor",
+        );
 
         let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", None, 7);
         assert!(
@@ -3023,8 +3037,14 @@ mod tests {
             ext_repo.path(),
             "feat: P3-FEAT-001-completed - Implement CallSupervisor",
         );
-        git_commit(ext_repo.path(), "feat: P3-FEAT-002-completed - Implement CallActor");
-        git_commit(ext_repo.path(), "feat: P3-FEAT-003-completed - Implement BargeIn");
+        git_commit(
+            ext_repo.path(),
+            "feat: P3-FEAT-002-completed - Implement CallActor",
+        );
+        git_commit(
+            ext_repo.path(),
+            "feat: P3-FEAT-003-completed - Implement BargeIn",
+        );
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3224,7 +3244,10 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "fix: aeb10a1f-FIX-001-completed Fix the bug");
+        git_commit(
+            ext_repo.path(),
+            "fix: aeb10a1f-FIX-001-completed Fix the bug",
+        );
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -4092,7 +4115,10 @@ mod tests {
     fn test_parse_completed_malformed_no_close() {
         let output = "<completed>FEAT-001 some text";
         let result = parse_completed_tasks(output);
-        assert!(result.is_empty(), "Malformed tag without close should be ignored");
+        assert!(
+            result.is_empty(),
+            "Malformed tag without close should be ignored"
+        );
     }
 
     #[test]

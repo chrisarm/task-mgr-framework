@@ -238,7 +238,7 @@ pub fn record_learning_applied(conn: &Connection, learning_id: i64) -> TaskMgrRe
 /// Used as the denominator in the UCB exploration term.
 pub fn get_total_window_shows(conn: &Connection) -> TaskMgrResult<i64> {
     let total: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(window_shown), 0) FROM learnings",
+        "SELECT COALESCE(SUM(window_shown), 0) FROM learnings WHERE retired_at IS NULL",
         [],
         |row| row.get(0),
     )?;

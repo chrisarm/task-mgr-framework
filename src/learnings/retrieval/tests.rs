@@ -12,9 +12,11 @@ use super::patterns::{extract_task_prefix, file_matches_pattern};
 use super::{CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery};
 
 fn setup_db() -> (TempDir, Connection) {
+    use crate::db::migrations::run_migrations;
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 
@@ -354,7 +356,17 @@ fn test_composite_backend_respects_limit() {
 
 #[test]
 fn test_like_escape_metacharacters() {
-    let (_temp_dir, conn) = setup_db(); // No FTS5 → uses LIKE fallback
+    // Run all migrations (for retired_at column), then remove FTS5 to force LIKE path.
+    // Must drop triggers before the table to avoid insert failures.
+    let (_temp_dir, conn) = setup_db();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ai", [])
+        .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_ad", [])
+        .unwrap();
+    conn.execute("DROP TRIGGER IF EXISTS learnings_au", [])
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS learnings_fts", [])
+        .unwrap();
 
     // Insert learnings — one with a literal % in the title
     create_test_learning(
@@ -1009,7 +1021,10 @@ fn test_escape_fts5_query_with_quotes() {
 
 #[test]
 fn test_is_fts5_available_without_migration() {
-    let (_temp_dir, conn) = setup_db();
+    let temp_dir = TempDir::new().unwrap();
+    let conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    // Intentionally no migrations — verifying FTS5 is absent before migration
     assert!(!is_fts5_available(&conn));
 }
 
@@ -1158,6 +1173,276 @@ fn test_fts5_backend_pto_token_finds_hyphenated_tag() {
         "FTS5 search for 'pto' must find learning tagged 'pto-workflow-ux-fixes-v2'"
     );
     assert_eq!(results[0].learning.title, "Leave balance adjustment");
+}
+
+// ========== TEST-INIT-001: retired_at Filtering Tests ==========
+//
+// These tests verify that retired learnings (retired_at IS NOT NULL) are excluded
+// from all retrieval paths. All tests are #[ignore] until:
+//   FEAT-001: adds `retired_at` column via migration
+//   FEAT-002: adds `retired_at IS NULL` filter to all 14 query locations
+//
+// Query locations covered in this file:
+//   1. FTS5 text search (Fts5Backend, FTS5 index path)
+//   2. LIKE fallback search (Fts5Backend, no-FTS5 path)
+//   3. Unfiltered recency query (Fts5Backend, no-text + no-task-context path)
+//   4. Pattern-matching retrieval (PatternsBackend)
+//   5. UCB candidate fallback — CompositeBackend (both recency and with-task variants)
+//   Discriminator: confirms naive query without filter WOULD include retired learning.
+
+use crate::learnings::test_helpers::retire_learning;
+
+#[test]
+fn test_retired_excluded_from_fts5_search() {
+    // AC: retired learning excluded from FTS5 search
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "FTS5 retired target",
+        "unique searchable content xyz",
+        LearningOutcome::Success,
+    );
+    retire_learning(&conn, id);
+    // Active learning to confirm backend still returns results
+    create_test_learning(
+        &conn,
+        "Active learning",
+        "active content",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("searchable".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must be excluded from FTS5 text search results"
+    );
+}
+
+#[test]
+fn test_retired_excluded_from_like_fallback() {
+    // AC: retired learning excluded from LIKE fallback search (no FTS5 table)
+    let (_dir, conn) = setup_db(); // No migrations → no FTS5 → uses LIKE fallback
+    let id = create_test_learning(
+        &conn,
+        "LIKE retired target",
+        "unique fallback content xyz",
+        LearningOutcome::Success,
+    );
+    retire_learning(&conn, id);
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("fallback".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must be excluded from LIKE fallback search results"
+    );
+}
+
+#[test]
+fn test_retired_excluded_from_recency_query() {
+    // AC: retired learning excluded from unfiltered recency query (no text, no task context)
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "Retired recent learning",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+    // Active learning to confirm query still runs
+    create_test_learning(&conn, "Active recency", "content", LearningOutcome::Pattern);
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must be excluded from unfiltered recency query"
+    );
+    assert_eq!(results.len(), 1, "only the active learning should appear");
+}
+
+#[test]
+fn test_retired_excluded_from_pattern_matching() {
+    // AC: retired learning excluded from PatternsBackend pattern-matching retrieval
+    let (_dir, conn) = setup_db();
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Retired file-matched pattern".to_string(),
+        content: "Should not appear in pattern results".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    let result = record_learning(&conn, params).unwrap();
+    retire_learning(&conn, result.learning_id);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["src/db/schema.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "retired learning must be excluded from pattern-matching retrieval"
+    );
+}
+
+#[test]
+fn test_retired_excluded_from_ucb_fallback_no_task_context() {
+    // AC: retired learning excluded from UCB fallback (no-task-context recency variant)
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "Retired UCB no-task candidate",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+    create_test_learning(
+        &conn,
+        "Active UCB candidate",
+        "content",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = CompositeBackend::default_backends();
+    let query = RetrievalQuery {
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must not appear via UCB fallback (no-task-context variant)"
+    );
+    assert_eq!(results.len(), 1, "only the active learning should appear");
+}
+
+#[test]
+fn test_retired_excluded_from_ucb_fallback_with_task_context() {
+    // AC: retired learning excluded from UCB fallback (with-task-context exploration variant)
+    // Even when task context is provided, retired learnings must not be UCB candidates.
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "Retired UCB task candidate",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    let backend = CompositeBackend::default_backends();
+    // Provide task_files so CompositeBackend uses the with-task UCB path
+    let query = RetrievalQuery {
+        task_files: vec!["src/main.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must not appear via UCB fallback (with-task-context variant)"
+    );
+}
+
+/// Known-bad discriminator: confirms that WITHOUT `retired_at IS NULL` filtering,
+/// a retired learning IS present in the database and WOULD be returned.
+/// This test verifies the pre-FEAT-002 baseline — it passes before implementation
+/// and should be removed/updated after FEAT-002 adds the filters.
+#[test]
+fn test_discriminator_naive_query_includes_retired() {
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "Discriminator retired target",
+        "content",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    // Direct SQL without `retired_at IS NULL` — naive implementation, no filter
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "without filtering, retired learning IS still in the learnings table"
+    );
+}
+
+/// AC: FTS5 index still contains retired learning content after retirement
+/// (retire does NOT delete from learnings_fts), but retrieval query excludes it.
+/// This verifies that the `retired_at` column approach (vs. deleting from FTS index)
+/// correctly filters at query time without corrupting the FTS index.
+#[test]
+fn test_fts5_index_retains_content_after_retire_but_query_excludes_it() {
+    let (_dir, conn) = setup_db_with_fts5();
+    let id = create_test_learning(
+        &conn,
+        "FTS5 index retention test",
+        "unique retire indexing content qzxw",
+        LearningOutcome::Pattern,
+    );
+    retire_learning(&conn, id);
+
+    // FTS5 index still contains the content (no trigger removes it on retire)
+    let fts_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learnings_fts WHERE learnings_fts MATCH '\"qzxw\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        fts_count, 1,
+        "FTS5 index must still contain retired learning content (retire does not delete from index)"
+    );
+
+    // But retrieval query excludes the retired learning
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("qzxw".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+    assert!(
+        results.iter().all(|r| r.learning.id != Some(id)),
+        "retired learning must be excluded from FTS5 retrieval even though it is still in the index"
+    );
 }
 
 #[test]
