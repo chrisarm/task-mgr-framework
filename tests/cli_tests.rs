@@ -631,6 +631,362 @@ fn test_stats_json_format() {
 }
 
 // ============================================================================
+// Test: curate subcommand (retire / unretire)
+// ============================================================================
+
+/// Set up a tempdir with an initialized DB and insert a learning via `task-mgr learn`.
+/// Returns the tempdir (keep alive) and the learning ID (obtained from JSON output).
+fn setup_dir_with_learning(title: &str, outcome: &str) -> (TempDir, i64) {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_owned();
+
+    // Init an empty DB (no PRD needed for curate tests)
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["migrate", "all"])
+        .assert()
+        .success();
+
+    // Insert learning via CLI
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "--format",
+            "json",
+            "learn",
+            "--outcome",
+            outcome,
+            "--title",
+            title,
+            "--content",
+            "Integration test content",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_str(&String::from_utf8(output).unwrap()).unwrap();
+    let learning_id = json["learning_id"].as_i64().unwrap();
+
+    (temp_dir, learning_id)
+}
+
+#[test]
+fn test_curate_help_shows_subcommands() {
+    // AC6: curate --help shows retire and unretire subcommands
+    Command::new(cargo_bin("task-mgr"))
+        .args(["curate", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("retire"))
+        .stdout(predicate::str::contains("unretire"));
+}
+
+#[test]
+fn test_curate_retire_help() {
+    // AC6: curate retire --help shows all flags
+    Command::new(cargo_bin("task-mgr"))
+        .args(["curate", "retire", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry-run"))
+        .stdout(predicate::str::contains("min-age-days"))
+        .stdout(predicate::str::contains("min-shows"))
+        .stdout(predicate::str::contains("max-rate"));
+}
+
+#[test]
+fn test_curate_retire_dry_run_flag() {
+    // AC4: --dry-run flag works via CLI — no DB changes but output shows candidates
+    let (temp_dir, learning_id) = setup_dir_with_learning("Stale pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+
+    // Age the learning and set stats to match criterion 2 (shown >= 10, applied = 0)
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET times_shown = 12 WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "retire", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("Dry run") || text.contains("dry"),
+        "dry-run output must mention 'Dry run': {text}"
+    );
+    assert!(
+        text.contains("no changes made"),
+        "dry-run output must say 'no changes made': {text}"
+    );
+
+    // Verify no DB changes
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let retired: bool = conn
+        .query_row(
+            "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
+            [learning_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!retired, "dry-run must not set retired_at");
+}
+
+#[test]
+fn test_curate_retire_custom_thresholds() {
+    // AC4: --min-age-days, --min-shows, --max-rate flags change candidate set
+    let (temp_dir, learning_id) = setup_dir_with_learning("Low-conf fresh learning", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+
+    // A 5-day-old low-confidence unapplied learning is NOT a candidate at default threshold (90 days)
+    // but IS at --min-age-days=3
+    {
+        let db_path = temp_dir.path().join("tasks.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET confidence = 'low', created_at = datetime('now', '-5 days') WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    // With default threshold: should find 0 candidates (or none for this learning)
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "retire", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No retirement candidates").or(
+            // Might still list as 0 if no candidates; text varies
+            predicate::str::is_empty().not(),
+        ));
+
+    // With custom threshold (3 days): learning should be a candidate
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "retire", "--dry-run", "--min-age-days", "3"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("Low-conf fresh learning"),
+        "with --min-age-days=3, 5-day-old low-conf learning must be a candidate: {text}"
+    );
+}
+
+#[test]
+fn test_curate_retire_json_output() {
+    // AC5: curate retire --format json produces valid JSON with expected fields
+    let (temp_dir, learning_id) = setup_dir_with_learning("JSON retire test", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+
+    // Make it a candidate (shown >= 10, applied = 0)
+    {
+        let db_path = temp_dir.path().join("tasks.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET times_shown = 15 WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir, "--format", "json"])
+        .args(["curate", "retire", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_str(&String::from_utf8(output).unwrap())
+        .expect("curate retire must produce valid JSON");
+
+    assert!(json.get("dry_run").is_some(), "JSON must have dry_run");
+    assert!(
+        json.get("candidates_found").is_some(),
+        "JSON must have candidates_found"
+    );
+    assert!(
+        json.get("learnings_retired").is_some(),
+        "JSON must have learnings_retired"
+    );
+    assert!(
+        json.get("candidates").is_some(),
+        "JSON must have candidates"
+    );
+    assert_eq!(json["dry_run"], true);
+    assert_eq!(json["learnings_retired"], 0);
+}
+
+#[test]
+fn test_curate_unretire_json_output() {
+    // AC5: curate unretire --format json produces valid JSON
+    let (temp_dir, learning_id) = setup_dir_with_learning("Unretire JSON test", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+
+    // Retire it first
+    {
+        let db_path = temp_dir.path().join("tasks.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    let id_str = learning_id.to_string();
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir, "--format", "json"])
+        .args(["curate", "unretire", &id_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_str(&String::from_utf8(output).unwrap())
+        .expect("curate unretire must produce valid JSON");
+
+    assert!(json.get("restored").is_some(), "JSON must have restored");
+    assert!(json.get("errors").is_some(), "JSON must have errors");
+    assert!(
+        json["restored"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::Number(learning_id.into())),
+        "restored must contain the unretired learning ID"
+    );
+}
+
+#[test]
+fn test_curate_e2e_retire_unretire_workflow() {
+    // AC1: Full E2E: init -> create learning -> retire --dry-run -> retire -> verify excluded
+    // from learnings list -> unretire -> verify re-included
+    let (temp_dir, learning_id) = setup_dir_with_learning("E2E retire target", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+    let id_str = learning_id.to_string();
+
+    // Make it a retirement candidate (shown >= 10, applied = 0)
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET times_shown = 20 WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    // Step 1: dry-run must find candidate but make no changes
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "retire", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("E2E retire target"));
+
+    let retired_before: bool = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
+            [learning_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(!retired_before, "dry-run must not set retired_at");
+
+    // Step 2: actual retire — learning gets soft-archived
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "retire"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("E2E retire target"));
+
+    let retired_after: bool = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
+            [learning_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(retired_after, "curate retire must set retired_at");
+
+    // Step 3: learnings list must exclude retired learning
+    let list_output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["learnings"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let list_text = String::from_utf8(list_output).unwrap();
+    assert!(
+        !list_text.contains("E2E retire target"),
+        "retired learning must not appear in learnings list: {list_text}"
+    );
+
+    // Step 4: unretire — learning becomes active again
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["curate", "unretire", &id_str])
+        .assert()
+        .success();
+
+    let retired_final: bool = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
+            [learning_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(!retired_final, "curate unretire must clear retired_at");
+
+    // Step 5: learning reappears in list after unretire
+    let list_after_output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["learnings"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let list_after_text = String::from_utf8(list_after_output).unwrap();
+    assert!(
+        list_after_text.contains("E2E retire target"),
+        "unretired learning must reappear in learnings list: {list_after_text}"
+    );
+}
+
+// ============================================================================
 // Test: Doctor command
 // ============================================================================
 

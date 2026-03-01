@@ -848,6 +848,43 @@ fn test_retire_dry_run_text_format() {
 }
 
 #[test]
+fn test_unretire_text_format_restored() {
+    // AC5: unretire text output mentions restored IDs
+    use super::types::UnretireResult;
+
+    let result = UnretireResult {
+        restored: vec![42, 99],
+        errors: vec![],
+    };
+    let text = format_unretire_text(&result);
+    assert!(
+        text.contains("Restored"),
+        "unretire text must say 'Restored': {text}"
+    );
+    assert!(text.contains("2"), "must include count of restored: {text}");
+}
+
+#[test]
+fn test_unretire_text_format_error() {
+    // AC5: unretire text output includes error messages when present
+    use super::types::UnretireResult;
+
+    let result = UnretireResult {
+        restored: vec![],
+        errors: vec!["Learning 999 not found".to_string()],
+    };
+    let text = format_unretire_text(&result);
+    assert!(
+        text.contains("Error"),
+        "unretire text must show errors: {text}"
+    );
+    assert!(
+        text.contains("999"),
+        "error text must identify the missing ID: {text}"
+    );
+}
+
+#[test]
 fn test_retire_result_json_serialization() {
     // RetireResult must serialize to JSON with all expected fields
     use super::types::RetireResult;
