@@ -736,6 +736,76 @@
       "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-2-001",
+      "title": "Unify duplicated set_applies_to_* helpers and insert_learning variants",
+      "description": "Replace set_applies_to_files, set_applies_to_task_types, set_applies_to_errors (3 identical functions differing only in column name) with a single set_json_column(conn, id, column, value) helper. Also unify insert_learning and insert_learning_with_content into one function with an optional content parameter.",
+      "acceptanceCriteria": [
+        "Single set_json_column helper replaces 3 set_applies_to_* functions",
+        "insert_learning accepts optional content (default 'Test content')",
+        "insert_learning_with_content removed",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 40,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Straightforward mechanical refactor. set_json_column should validate column name against an allowlist to avoid SQL injection.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": ["REFACTOR-2-002"],
+      "batchWith": ["REFACTOR-2-002"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-2-002",
+      "title": "Extract make_merge_params helper for MergeClusterParams boilerplate",
+      "description": "~15 merge tests repeat MergeClusterParams { source_ids: vec![...], merged_title: 'M'.to_string(), merged_content: 'MC'.to_string() }. Extract a make_merge_params(ids: &[i64]) helper with sensible defaults and an optional title/content variant.",
+      "acceptanceCriteria": [
+        "make_merge_params helper exists with default title/content",
+        "All merge tests use the helper instead of inline struct construction",
+        "Tests that need custom title/content can override",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 41,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "Most tests use 'M'/'MC' as placeholders. Tests that need specific title/content (e.g., test_merge_confidence_not_from_llm_response) should use an extended variant.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": ["REFACTOR-2-001"],
+      "batchWith": ["REFACTOR-2-001"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-2-003",
+      "title": "Create RAII guard for CLAUDE_BINARY env var + mutex pattern",
+      "description": "4 tests repeat the pattern: lock DEDUP_ENV_MUTEX, set_var CLAUDE_BINARY, run test, remove_var. Extract a ClaudeBinaryGuard RAII struct that acquires the mutex lock and sets/removes the env var on Drop, preventing env var leaks on test panics.",
+      "acceptanceCriteria": [
+        "ClaudeBinaryGuard struct implements Drop to remove CLAUDE_BINARY",
+        "Guard acquires DEDUP_ENV_MUTEX lock",
+        "All 4+ tests using CLAUDE_BINARY pattern use the guard",
+        "DEDUP_ENV_MUTEX and manual set_var/remove_var calls removed from test bodies",
+        "All tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "priority": 42,
+      "estimatedEffort": "low",
+      "model": "claude-sonnet-4-6",
+      "passes": false,
+      "notes": "RAII ensures env var cleanup even on panic. Guard should take &str (script path or 'false') and return a guard that holds the MutexGuard.",
+      "touchesFiles": ["src/commands/curate/tests.rs"],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
       "id": "MILESTONE-2",
       "title": "Full test coverage achieved for Phase 3 dedup",
       "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
@@ -757,7 +827,10 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
       "synergyWith": [],
       "batchWith": [],

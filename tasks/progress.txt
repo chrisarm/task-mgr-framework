@@ -1,4 +1,13 @@
 
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-2
+- Reviewed 3518-line test file src/commands/curate/tests.rs for duplication and helper extraction
+- **Issue 1 (REFACTOR-2-001)**: 3 identical `set_applies_to_*` functions differ only in column name → unify into `set_json_column`. Also `insert_learning` vs `insert_learning_with_content` should be unified.
+- **Issue 2 (REFACTOR-2-002)**: ~15 merge tests repeat `MergeClusterParams { source_ids, merged_title: "M".to_string(), merged_content: "MC".to_string() }` → extract `make_merge_params` helper.
+- **Issue 3 (REFACTOR-2-003)**: 4+ tests repeat DEDUP_ENV_MUTEX lock + set_var/remove_var CLAUDE_BINARY pattern → RAII guard for env var cleanup safety.
+- Test names are clear and descriptive — no issues found there.
+- Added 3 REFACTOR-2-xxx tasks (priority 40-42) to JSON, added to MILESTONE-2 dependsOn.
+---
+
 ## 2026-03-01 - ef543206-REFACTOR-REVIEW-3
 - Reviewed all 7 Phase 2 files: enrich.rs, types.rs, output.rs, mod.rs, tests.rs, crud/types.rs, crud/update.rs
 - **Issue 1 (REFACTOR-3-001)**: `extract_json_array` + `find_matching_bracket` duplicated identically (~60 lines) between enrich.rs and extraction.rs. Critical for Phase 3 reuse — extract to shared module.
@@ -458,4 +467,14 @@
 - **Flagged but acceptable**: merge_cluster (~170 lines) and curate_dedup (~217 lines) exceed 30-line guideline but are orchestration functions — splitting would scatter flow. 4× set-to-sorted-vec pattern is only in one function.
 - **No coupling issues**: dedup.rs depends only on types; mod.rs uses public CRUD APIs cleanly.
 - **Learnings:** 3-way duplication of JSON parsing utils is the single biggest DRY violation in the curation codebase; confidence_rank is a minor but easy win
+---
+
+## 2026-03-01 - a8e80384-TEST-002
+- Added 8 new tests covering dedup LLM interaction and failure modes
+- Files changed: src/commands/curate/tests.rs
+- Approach: CLAUDE_BINARY=false for failure tests; Unix shell script mock for JSON response tests
+- Added DEDUP_ENV_MUTEX static to serialise env-mutating tests
+- Added setup_claude_mock() helper (unix): writes JSON to tmpfile, creates cat script
+- Added insert_learning_with_content() helper for large-corpus tests
+- **Learnings:** CLAUDE_BINARY=false works well for counting batches (each failed batch = 1 llm_error); script mock approach avoids single-quote issues in JSON by writing to a data file and cat-ing it
 ---
