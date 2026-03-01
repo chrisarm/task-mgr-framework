@@ -534,15 +534,7 @@ mod tests {
     //   8. Learnings list (list_learnings — SELECT rows)
     //   9. Learnings count (list_learnings — SELECT COUNT(*) total)
 
-    /// Sets `retired_at = NOW` on a learning.
-    /// Requires FEAT-001 (retired_at column).
-    fn retire_learning(conn: &Connection, id: i64) {
-        conn.execute(
-            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-            [id],
-        )
-        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-    }
+    use crate::learnings::test_helpers::retire_learning;
 
     #[test]
     fn test_retired_excluded_from_list_results() {

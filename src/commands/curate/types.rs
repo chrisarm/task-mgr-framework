@@ -227,7 +227,7 @@ impl Default for DedupParams {
     fn default() -> Self {
         Self {
             dry_run: false,
-            threshold: 0.85,
+            threshold: 0.7,
             batch_size: None,
         }
     }

@@ -12,6 +12,9 @@ use crate::learnings::{edit_learning, get_learning, get_learning_tags, EditLearn
 use crate::loop_engine::claude;
 use crate::TaskMgrResult;
 
+use std::collections::HashSet;
+
+use super::json_utils::extract_json_array;
 use super::{find_enrichment_candidates, types::EnrichFieldFilter};
 
 /// Raw LLM response object before mapping to `EnrichProposal`.
@@ -25,7 +28,7 @@ struct RawEnrichItem {
     #[serde(default)]
     applies_to_errors: Vec<String>,
     #[serde(default)]
-    applies_to_tags: Vec<String>,
+    tags: Vec<String>,
 }
 
 /// A single learning passed to the enrich LLM prompt.
@@ -116,10 +119,12 @@ pub fn parse_enrich_response(
         }
     };
 
+    let valid_ids: HashSet<i64> = batch_ids.iter().copied().collect();
+
     let proposals = raw
         .into_iter()
         .filter_map(|item| {
-            if !batch_ids.contains(&item.learning_id) {
+            if !valid_ids.contains(&item.learning_id) {
                 eprintln!(
                     "Warning: enrich response contained hallucinated learning_id {}; skipping",
                     item.learning_id
@@ -133,7 +138,7 @@ pub fn parse_enrich_response(
                 proposed_files: item.applies_to_files,
                 proposed_task_types: item.applies_to_task_types,
                 proposed_errors: item.applies_to_errors,
-                proposed_tags: item.applies_to_tags,
+                proposed_tags: item.tags,
             })
         })
         .collect();
@@ -153,7 +158,6 @@ pub fn proposal_to_edit_params(
     current_files: Option<&[String]>,
     current_task_types: Option<&[String]>,
     current_errors: Option<&[String]>,
-    current_has_tags: bool,
     proposal: &EnrichProposal,
 ) -> Option<EditLearningParams> {
     let mut params = EditLearningParams::default();
@@ -171,10 +175,6 @@ pub fn proposal_to_edit_params(
     if !proposal.proposed_tags.is_empty() {
         params.add_tags = Some(proposal.proposed_tags.clone());
     }
-
-    // Suppress the unused variable warning — current_has_tags informs callers
-    // whether to skip tag enrichment; here we always enrich tags additively.
-    let _ = current_has_tags;
 
     if params.has_updates() {
         Some(params)
@@ -326,111 +326,28 @@ fn apply_proposals_in_transaction(
     conn: &Connection,
     proposals: &[EnrichProposal],
 ) -> TaskMgrResult<usize> {
-    conn.execute("BEGIN", [])?;
-    let result: TaskMgrResult<usize> = (|| {
-        let mut enriched = 0usize;
-        for proposal in proposals {
-            let Some(learning) = get_learning(conn, proposal.learning_id)? else {
-                continue;
-            };
-            let current_files = learning.applies_to_files.as_deref();
-            let current_task_types = learning.applies_to_task_types.as_deref();
-            let current_errors = learning.applies_to_errors.as_deref();
-            let existing_tags = get_learning_tags(conn, proposal.learning_id).unwrap_or_default();
-            let has_tags = !existing_tags.is_empty();
-
-            if let Some(edit_params) = proposal_to_edit_params(
-                current_files,
-                current_task_types,
-                current_errors,
-                has_tags,
-                proposal,
-            ) {
-                edit_learning(conn, proposal.learning_id, edit_params)?;
-                enriched += 1;
-            }
-        }
-        Ok(enriched)
-    })();
-
-    match result {
-        Ok(n) => {
-            conn.execute("COMMIT", [])?;
-            Ok(n)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(e)
-        }
-    }
-}
-
-/// Finds a JSON array in the response text, handling markdown code blocks.
-/// Mirrors extraction.rs logic (private there, duplicated here).
-fn extract_json_array(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-
-    if trimmed.starts_with('[') {
-        if let Some(end) = find_matching_bracket(trimmed) {
-            return Some(trimmed[..=end].to_string());
-        }
-    }
-
-    if let Some(start) = trimmed.find("```json") {
-        let after_marker = start + "```json".len();
-        if let Some(end) = trimmed[after_marker..].find("```") {
-            let json = trimmed[after_marker..after_marker + end].trim();
-            return Some(json.to_string());
-        }
-    }
-
-    if let Some(start) = trimmed.find("```\n") {
-        let after_marker = start + "```\n".len();
-        if let Some(end) = trimmed[after_marker..].find("```") {
-            let json = trimmed[after_marker..after_marker + end].trim();
-            if json.starts_with('[') {
-                return Some(json.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Finds the index of the closing bracket matching the opening bracket at index 0.
-fn find_matching_bracket(text: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (i, ch) in text.char_indices() {
-        if escape_next {
-            escape_next = false;
+    let tx = conn.unchecked_transaction()?;
+    let mut enriched = 0usize;
+    for proposal in proposals {
+        let Some(learning) = get_learning(&tx, proposal.learning_id)? else {
             continue;
-        }
-        if ch == '\\' && in_string {
-            escape_next = true;
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
+        };
+        let current_files = learning.applies_to_files.as_deref();
+        let current_task_types = learning.applies_to_task_types.as_deref();
+        let current_errors = learning.applies_to_errors.as_deref();
+
+        if let Some(edit_params) = proposal_to_edit_params(
+            current_files,
+            current_task_types,
+            current_errors,
+            proposal,
+        ) {
+            edit_learning(&tx, proposal.learning_id, edit_params)?;
+            enriched += 1;
         }
     }
-    None
+    tx.commit()?;
+    Ok(enriched)
 }
 
 #[cfg(test)]
@@ -456,7 +373,7 @@ mod tests {
     #[test]
     fn all_null_fields_get_populated() {
         let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &["E0308"], &["rust"]);
-        let params = proposal_to_edit_params(None, None, None, false, &proposal)
+        let params = proposal_to_edit_params(None, None, None, &proposal)
             .expect("should return Some when all fields are NULL");
         assert_eq!(params.add_files, Some(vec!["src/**/*.rs".to_string()]));
         assert_eq!(params.add_task_types, Some(vec!["FEAT-".to_string()]));
@@ -468,7 +385,7 @@ mod tests {
     fn existing_files_not_overwritten() {
         let existing = vec!["**/*.toml".to_string()];
         let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &[]);
-        let params = proposal_to_edit_params(Some(&existing), None, None, false, &proposal)
+        let params = proposal_to_edit_params(Some(&existing), None, None, &proposal)
             .expect("should return Some (task_types is NULL)");
         assert!(
             params.add_files.is_none(),
@@ -481,7 +398,7 @@ mod tests {
     fn existing_task_types_not_overwritten() {
         let existing = vec!["FIX-".to_string()];
         let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &[]);
-        let params = proposal_to_edit_params(None, Some(&existing), None, false, &proposal)
+        let params = proposal_to_edit_params(None, Some(&existing), None, &proposal)
             .expect("should return Some (files is NULL)");
         assert!(params.add_task_types.is_none());
         assert_eq!(params.add_files, Some(vec!["src/**/*.rs".to_string()]));
@@ -496,7 +413,6 @@ mod tests {
             Some(&[]),
             Some(&[]),
             Some(&existing_errors),
-            false,
             &proposal,
         );
         assert!(
@@ -510,7 +426,7 @@ mod tests {
         let existing_files = vec!["src/**/*.rs".to_string()];
         let proposal = make_proposal(&["ignored"], &[], &[], &["new-tag"]);
         // files is Some → add_files not set; but tags should still be set
-        let params = proposal_to_edit_params(Some(&existing_files), None, None, true, &proposal)
+        let params = proposal_to_edit_params(Some(&existing_files), None, None, &proposal)
             .expect("should return Some due to tags");
         assert!(params.add_files.is_none());
         assert_eq!(params.add_tags, Some(vec!["new-tag".to_string()]));
@@ -523,14 +439,14 @@ mod tests {
         let errors = vec!["E0308".to_string()];
         let proposal = make_proposal(&["ignored"], &["ignored"], &["ignored"], &[]);
         let result =
-            proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), true, &proposal);
+            proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), &proposal);
         assert!(result.is_none());
     }
 
     #[test]
     fn empty_proposal_arrays_on_null_fields_yield_none() {
         let proposal = make_proposal(&[], &[], &[], &[]);
-        let result = proposal_to_edit_params(None, None, None, false, &proposal);
+        let result = proposal_to_edit_params(None, None, None, &proposal);
         assert!(
             result.is_none(),
             "empty proposals on NULL fields should return None"
@@ -540,8 +456,8 @@ mod tests {
     #[test]
     fn pure_deterministic() {
         let proposal = make_proposal(&["src/**/*.rs"], &["FEAT-"], &[], &["tag"]);
-        let r1 = proposal_to_edit_params(None, None, None, false, &proposal);
-        let r2 = proposal_to_edit_params(None, None, None, false, &proposal);
+        let r1 = proposal_to_edit_params(None, None, None, &proposal);
+        let r2 = proposal_to_edit_params(None, None, None, &proposal);
         let p1 = r1.unwrap();
         let p2 = r2.unwrap();
         assert_eq!(p1.add_files, p2.add_files);

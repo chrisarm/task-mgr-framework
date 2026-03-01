@@ -626,15 +626,7 @@ fn test_export_preserves_model_fields_in_json_format() {
 //  10. Export load_learnings (progress::load_learnings)
 //  11. Export calculate_statistics (progress::calculate_statistics)
 
-/// Sets `retired_at = NOW` on a learning.
-/// Requires FEAT-001 (retired_at column).
-fn retire_learning_export(conn: &rusqlite::Connection, id: i64) {
-    conn.execute(
-        "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-        [id],
-    )
-    .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-}
+use crate::learnings::test_helpers::retire_learning as retire_learning_export;
 
 #[test]
 fn test_retired_excluded_from_export_load_learnings() {

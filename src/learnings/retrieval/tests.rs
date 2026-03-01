@@ -1190,15 +1190,7 @@ fn test_fts5_backend_pto_token_finds_hyphenated_tag() {
 //   5. UCB candidate fallback — CompositeBackend (both recency and with-task variants)
 //   Discriminator: confirms naive query without filter WOULD include retired learning.
 
-/// Sets `retired_at = NOW` on a learning, simulating the retire operation.
-/// Requires FEAT-001 to have added the `retired_at` column.
-fn retire_learning(conn: &Connection, id: i64) {
-    conn.execute(
-        "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-        [id],
-    )
-    .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-}
+use crate::learnings::test_helpers::retire_learning;
 
 #[test]
 fn test_retired_excluded_from_fts5_search() {

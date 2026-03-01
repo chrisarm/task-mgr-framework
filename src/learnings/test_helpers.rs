@@ -14,6 +14,15 @@ pub(crate) fn setup_db() -> (TempDir, Connection) {
     (temp_dir, conn)
 }
 
+/// Sets `retired_at = datetime('now')` on a learning (simulates a prior retirement).
+pub(crate) fn retire_learning(conn: &Connection, id: i64) {
+    conn.execute(
+        "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+        [id],
+    )
+    .expect("retire_learning");
+}
+
 /// Insert a task and associate file paths with it in task_files.
 pub(crate) fn insert_task_with_files(conn: &Connection, task_id: &str, files: &[&str]) {
     conn.execute(

@@ -736,15 +736,7 @@ fn test_rerank_preserves_relevance_tiers() {
 //   Exempt: get_learning() by ID still returns retired
 //   Exempt: apply_learning() still works for retired
 
-/// Sets `retired_at = NOW` on a learning.
-/// Requires FEAT-001 (retired_at column).
-fn retire_learning(conn: &Connection, id: i64) {
-    conn.execute(
-        "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-        [id],
-    )
-    .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-}
+use crate::learnings::test_helpers::retire_learning;
 
 #[test]
 fn test_retired_excluded_from_bandit_total_window_shows() {

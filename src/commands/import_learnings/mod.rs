@@ -264,13 +264,7 @@ mod retired_tests {
         (dir, conn)
     }
 
-    fn retire_learning(conn: &rusqlite::Connection, id: i64) {
-        conn.execute(
-            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-            [id],
-        )
-        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-    }
+    use crate::learnings::test_helpers::retire_learning;
 
     #[test]
     fn test_retired_excluded_from_import_dedup_load_existing_keys() {

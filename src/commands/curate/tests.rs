@@ -84,14 +84,7 @@ fn set_show_stats(conn: &Connection, id: i64, times_shown: i32, times_applied: i
     .expect("set_show_stats");
 }
 
-/// Sets `retired_at` to now on a learning (simulates a prior retirement).
-fn retire_learning(conn: &Connection, id: i64) {
-    conn.execute(
-        "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-        [id],
-    )
-    .expect("retire_learning: requires FEAT-001 (retired_at column)");
-}
+use crate::learnings::test_helpers::retire_learning;
 
 /// Returns true if `retired_at` IS NOT NULL for the given learning.
 fn is_retired(conn: &Connection, id: i64) -> bool {
@@ -1314,14 +1307,14 @@ fn test_parse_enrich_valid_json_array() {
             "applies_to_files": ["src/db/*.rs"],
             "applies_to_task_types": ["FEAT-", "FIX-"],
             "applies_to_errors": ["SQLITE_BUSY"],
-            "applies_to_tags": ["sqlite"]
+            "tags": ["sqlite"]
         },
         {
             "learning_id": 2,
             "applies_to_files": ["src/**/*.rs"],
             "applies_to_task_types": [],
             "applies_to_errors": [],
-            "applies_to_tags": []
+            "tags": []
         }
     ]"#;
 
@@ -1361,7 +1354,7 @@ fn test_parse_enrich_markdown_code_block_json() {
     let response = r#"Here are my suggestions:
 
 ```json
-[{"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": ["TEST-"], "applies_to_errors": [], "applies_to_tags": []}]
+[{"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": ["TEST-"], "applies_to_errors": [], "tags": []}]
 ```
 
 Let me know if you need anything else."#;
@@ -1382,8 +1375,8 @@ fn test_parse_enrich_rejects_hallucinated_id() {
     // learning ID 999 when the batch only contains IDs [1, 2, 3].
     let batch_ids = vec![1i64, 2, 3];
     let response = r#"[
-        {"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "applies_to_tags": []},
-        {"learning_id": 999, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "applies_to_tags": []}
+        {"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "tags": []},
+        {"learning_id": 999, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "tags": []}
     ]"#;
 
     let result = parse_enrich_response(response, &batch_ids).unwrap();

@@ -406,15 +406,7 @@ mod tests {
     // Query location covered:
     //  13. Ingestion dedup check (learning_exists: SELECT COUNT WHERE outcome=? AND title=?)
 
-    /// Sets `retired_at = NOW` on a learning.
-    /// Requires FEAT-001 (retired_at column).
-    fn retire_learning_ingestion(conn: &rusqlite::Connection, id: i64) {
-        conn.execute(
-            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
-            [id],
-        )
-        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
-    }
+    use crate::learnings::test_helpers::retire_learning as retire_learning_ingestion;
 
     #[test]
     fn test_retired_excluded_from_ingestion_dedup_learning_exists() {

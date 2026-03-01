@@ -5,6 +5,7 @@
 
 pub mod dedup;
 pub mod enrich;
+mod json_utils;
 pub mod output;
 pub mod types;
 
@@ -71,16 +72,16 @@ pub fn curate_retire(conn: &Connection, params: RetireParams) -> TaskMgrResult<R
                 let times_shown: i64 = row.get("times_shown")?;
                 let times_applied: i64 = row.get("times_applied")?;
 
-                let reason = build_reason(
-                    &confidence,
+                let reason = build_reason(&ReasonContext {
+                    confidence: &confidence,
                     age_days,
                     times_shown,
                     times_applied,
-                    i64::from(params.min_age_days),
-                    i64::from(params.min_shows),
+                    min_age_days: i64::from(params.min_age_days),
+                    min_shows: i64::from(params.min_shows),
                     min_shows_doubled,
-                    params.max_rate,
-                );
+                    max_rate: params.max_rate,
+                });
 
                 Ok(RetirementCandidate { id, title, reason })
             },
@@ -105,10 +106,9 @@ pub fn curate_retire(conn: &Connection, params: RetireParams) -> TaskMgrResult<R
     })
 }
 
-/// Determines which criterion matched and returns a human-readable reason string.
-#[allow(clippy::too_many_arguments)]
-fn build_reason(
-    confidence: &str,
+/// Context for building a human-readable retirement reason string.
+struct ReasonContext<'a> {
+    confidence: &'a str,
     age_days: f64,
     times_shown: i64,
     times_applied: i64,
@@ -116,7 +116,20 @@ fn build_reason(
     min_shows: i64,
     min_shows_doubled: i64,
     max_rate: f64,
-) -> String {
+}
+
+/// Determines which criterion matched and returns a human-readable reason string.
+fn build_reason(ctx: &ReasonContext<'_>) -> String {
+    let ReasonContext {
+        confidence,
+        age_days,
+        times_shown,
+        times_applied,
+        min_age_days,
+        min_shows,
+        min_shows_doubled,
+        max_rate,
+    } = *ctx;
     let c1 = age_days >= min_age_days as f64 && confidence == "low" && times_applied == 0;
     let c2 = times_shown >= min_shows && times_applied == 0;
     let c3 =
@@ -181,12 +194,12 @@ fn retire_candidates(conn: &Connection, ids: &[i64]) -> TaskMgrResult<usize> {
 /// Validates each ID: must exist and must currently be retired.
 /// Processes all IDs in a single transaction; collects per-ID errors without aborting.
 pub fn curate_unretire(conn: &Connection, learning_ids: Vec<i64>) -> TaskMgrResult<UnretireResult> {
+    let tx = conn.unchecked_transaction()?;
     let mut restored = Vec::new();
     let mut errors = Vec::new();
 
-    // Validate each ID before opening a transaction
     for &id in &learning_ids {
-        let result: rusqlite::Result<Option<bool>> = conn.query_row(
+        let result: rusqlite::Result<Option<bool>> = tx.query_row(
             "SELECT retired_at IS NOT NULL FROM learnings WHERE id = ?1",
             [id],
             |row| row.get::<_, bool>(0).map(Some),
@@ -214,9 +227,10 @@ pub fn curate_unretire(conn: &Connection, learning_ids: Vec<i64>) -> TaskMgrResu
             .join(", ");
         let sql = format!("UPDATE learnings SET retired_at = NULL WHERE id IN ({placeholders})");
         let params = rusqlite::params_from_iter(restored.iter());
-        conn.execute(&sql, params)?;
+        tx.execute(&sql, params)?;
     }
 
+    tx.commit()?;
     Ok(UnretireResult { restored, errors })
 }
 
