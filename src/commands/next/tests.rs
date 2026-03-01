@@ -482,7 +482,15 @@ mod next_command_tests {
         .unwrap();
         drop(conn);
 
-        let result = next(temp_dir.path(), &[], true, Some("test-run-123"), false, None).unwrap();
+        let result = next(
+            temp_dir.path(),
+            &[],
+            true,
+            Some("test-run-123"),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(result.task.is_some());
         assert!(result.claim.is_some());
         let claim = result.claim.unwrap();
@@ -508,7 +516,14 @@ mod next_command_tests {
         drop(conn);
 
         // Attempt to claim with a non-existent run_id
-        let result = next(temp_dir.path(), &[], true, Some("nonexistent-run"), false, None);
+        let result = next(
+            temp_dir.path(),
+            &[],
+            true,
+            Some("nonexistent-run"),
+            false,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Run not found"));
     }
@@ -526,7 +541,14 @@ mod next_command_tests {
         drop(conn);
 
         // Attempt to claim with inactive run
-        let result = next(temp_dir.path(), &[], true, Some("completed-run"), false, None);
+        let result = next(
+            temp_dir.path(),
+            &[],
+            true,
+            Some("completed-run"),
+            false,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expected active"));
     }

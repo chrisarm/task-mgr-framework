@@ -10,8 +10,39 @@
 use crate::error::{TaskMgrError, TaskMgrResult};
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Identity of the process holding a lock, with optional worktree context.
+#[derive(Debug, PartialEq)]
+pub struct HolderInfo {
+    /// PID of the lock holder
+    pub pid: u32,
+    /// Hostname of the lock holder
+    pub host: String,
+    /// Git branch active when the lock was acquired (None for old-format locks)
+    pub branch: Option<String>,
+    /// Worktree path active when the lock was acquired (None for old-format locks)
+    pub worktree: Option<String>,
+    /// Worktree name prefix (None for old-format locks)
+    pub prefix: Option<String>,
+}
+
+impl std::fmt::Display for HolderInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.pid, self.host)?;
+        if let Some(b) = &self.branch {
+            write!(f, " branch={}", b)?;
+        }
+        if let Some(w) = &self.worktree {
+            write!(f, " worktree={}", w)?;
+        }
+        if let Some(p) = &self.prefix {
+            write!(f, " prefix={}", p)?;
+        }
+        Ok(())
+    }
+}
 
 /// A guard that holds an exclusive lock on the task-mgr database.
 ///
@@ -115,31 +146,89 @@ impl LockGuard {
 
     /// Writes the current process identity (`{pid}@{hostname}`) to the lockfile.
     fn write_holder_info(&mut self) -> TaskMgrResult<()> {
+        self.write_holder_info_extended(None, None, None)
+    }
+
+    /// Writes extended holder info in multi-line format:
+    /// ```text
+    /// {pid}@{hostname}
+    /// branch={branch}
+    /// worktree={worktree_path}
+    /// prefix={prefix}
+    /// ```
+    /// Lines for None fields are omitted.
+    pub fn write_holder_info_extended(
+        &mut self,
+        branch: Option<&str>,
+        worktree: Option<&str>,
+        prefix: Option<&str>,
+    ) -> TaskMgrResult<()> {
         self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
         let pid = std::process::id();
         let host = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "unknown".to_string());
-        write!(self.file, "{}@{}", pid, host)?;
+        let mut content = format!("{}@{}", pid, host);
+        if let Some(b) = branch {
+            content.push_str(&format!("\nbranch={}", b));
+        }
+        if let Some(w) = worktree {
+            content.push_str(&format!("\nworktree={}", w));
+        }
+        if let Some(p) = prefix {
+            content.push_str(&format!("\nprefix={}", p));
+        }
+        write!(self.file, "{}", content)?;
         self.file.sync_all()?;
         Ok(())
     }
 
-    /// Reads the holder identity string from an existing lockfile, if present.
+    /// Reads holder info from an existing lockfile, if present.
     ///
-    /// Returns the raw contents (e.g. `"12345@myhost"`) or `None` if the file
-    /// doesn't exist or can't be read.
-    fn read_holder_info(path: &Path) -> Option<String> {
+    /// Supports both formats:
+    /// - New multi-line: first line `{pid}@{host}`, followed by `key=value` lines
+    /// - Old single-line: `{pid}@{host}` (branch/worktree/prefix will be `None`)
+    ///
+    /// Returns `None` if the file doesn't exist, can't be read, or is empty.
+    pub fn read_holder_info(path: &Path) -> Option<HolderInfo> {
         let mut file = File::open(path).ok()?;
         let mut contents = String::new();
         file.read_to_string(&mut contents).ok()?;
-        let trimmed = contents.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+        let mut lines = contents.lines();
+
+        // First line must be pid@host
+        let first = lines.next()?.trim();
+        if first.is_empty() {
+            return None;
         }
+        let (pid_str, host) = first.split_once('@')?;
+        let pid: u32 = pid_str.trim().parse().ok()?;
+        let host = host.trim().to_string();
+
+        // Parse optional key=value lines (new multi-line format)
+        let mut branch = None;
+        let mut worktree = None;
+        let mut prefix = None;
+        for line in lines {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("branch=") {
+                branch = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("worktree=") {
+                worktree = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("prefix=") {
+                prefix = Some(v.to_string());
+            }
+        }
+
+        Some(HolderInfo {
+            pid,
+            host,
+            branch,
+            worktree,
+            prefix,
+        })
     }
 
     /// Returns the path to the lockfile.
@@ -321,8 +410,15 @@ mod tests {
 
         fs::write(&lock_path, "12345@myhost").unwrap();
 
+        // Old format: branch/worktree/prefix are None, not empty strings
         let info = LockGuard::read_holder_info(&lock_path);
-        assert_eq!(info, Some("12345@myhost".to_string()));
+        assert!(info.is_some());
+        let h = info.unwrap();
+        assert_eq!(h.pid, 12345);
+        assert_eq!(h.host, "myhost");
+        assert_eq!(h.branch, None);
+        assert_eq!(h.worktree, None);
+        assert_eq!(h.prefix, None);
     }
 
     #[test]
@@ -333,7 +429,153 @@ mod tests {
         fs::write(&lock_path, "67890@host\n").unwrap();
 
         let info = LockGuard::read_holder_info(&lock_path);
-        assert_eq!(info, Some("67890@host".to_string()));
+        assert!(info.is_some());
+        let h = info.unwrap();
+        assert_eq!(h.pid, 67890);
+        assert_eq!(h.host, "host");
+    }
+
+    // --- HolderInfo / enhanced lock format tests (TDD for FEAT-003) ---
+
+    #[test]
+    fn test_write_holder_info_extended_writes_multiline_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
+
+        guard
+            .write_holder_info_extended(
+                Some("feat/worktree-lifecycle"),
+                Some("/path/to/worktree"),
+                Some("feat-worktree-lifecycle"),
+            )
+            .unwrap();
+
+        let contents = fs::read_to_string(guard.path()).unwrap();
+        assert!(
+            contents.contains("branch=feat/worktree-lifecycle"),
+            "should contain branch line: {}",
+            contents
+        );
+        assert!(
+            contents.contains("worktree=/path/to/worktree"),
+            "should contain worktree line: {}",
+            contents
+        );
+        assert!(
+            contents.contains("prefix=feat-worktree-lifecycle"),
+            "should contain prefix line: {}",
+            contents
+        );
+        // First line must be pid@host
+        let first_line = contents.lines().next().unwrap();
+        assert!(
+            first_line.contains('@'),
+            "first line should be pid@host: {}",
+            first_line
+        );
+    }
+
+    #[test]
+    fn test_write_holder_info_extended_omits_none_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
+
+        guard
+            .write_holder_info_extended(Some("feat/branch"), None, None)
+            .unwrap();
+
+        let contents = fs::read_to_string(guard.path()).unwrap();
+        assert!(contents.contains("branch=feat/branch"));
+        assert!(
+            !contents.contains("worktree="),
+            "should not write None worktree"
+        );
+        assert!(
+            !contents.contains("prefix="),
+            "should not write None prefix"
+        );
+    }
+
+    #[test]
+    fn test_read_holder_info_parses_multiline_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("multi.lock");
+
+        fs::write(
+            &lock_path,
+            "42@testhost\nbranch=feat/my-feature\nworktree=/some/path\nprefix=feat-my-feature\n",
+        )
+        .unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path).unwrap();
+        assert_eq!(info.pid, 42);
+        assert_eq!(info.host, "testhost");
+        assert_eq!(info.branch, Some("feat/my-feature".to_string()));
+        assert_eq!(info.worktree, Some("/some/path".to_string()));
+        assert_eq!(info.prefix, Some("feat-my-feature".to_string()));
+    }
+
+    #[test]
+    fn test_read_holder_info_falls_back_to_old_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("old.lock");
+
+        // Old single-line format
+        fs::write(&lock_path, "99@legacyhost").unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path).unwrap();
+        assert_eq!(info.pid, 99);
+        assert_eq!(info.host, "legacyhost");
+        // Must be None, not empty string — this is the known-bad discriminator
+        assert_eq!(
+            info.branch, None,
+            "old format must yield None branch, not \"\""
+        );
+        assert_eq!(
+            info.worktree, None,
+            "old format must yield None worktree, not \"\""
+        );
+        assert_eq!(
+            info.prefix, None,
+            "old format must yield None prefix, not \"\""
+        );
+    }
+
+    #[test]
+    fn test_read_holder_info_new_returns_none_for_empty_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("empty.lock");
+
+        fs::write(&lock_path, "").unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path);
+        assert!(info.is_none(), "empty file should return None");
+    }
+
+    #[test]
+    fn test_lock_error_message_includes_branch_and_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Acquire the lock and write extended info
+        let mut guard1 = LockGuard::acquire(temp_dir.path()).unwrap();
+        guard1
+            .write_holder_info_extended(
+                Some("feat/my-feature"),
+                Some("/path/to/wt"),
+                Some("feat-my-feature"),
+            )
+            .unwrap();
+
+        // Second acquire should fail with branch/prefix in message
+        let result = LockGuard::acquire(temp_dir.path());
+        assert!(result.is_err());
+
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("feat/my-feature") || msg.contains("feat-my-feature"),
+            "error message should include branch or prefix: {}",
+            msg
+        );
     }
 
     #[test]
@@ -387,6 +629,185 @@ mod tests {
         // Both should coexist
         assert!(temp_dir.path().join("tasks.db.lock").exists());
         assert!(temp_dir.path().join("loop.lock").exists());
+    }
+
+    // --- TEST-002: HolderInfo metadata coverage ---
+
+    #[test]
+    fn test_write_read_roundtrip_all_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
+
+        guard
+            .write_holder_info_extended(
+                Some("feat/round-trip"),
+                Some("/worktrees/round-trip"),
+                Some("feat-round-trip"),
+            )
+            .unwrap();
+
+        let info = LockGuard::read_holder_info(guard.path()).unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.branch, Some("feat/round-trip".to_string()));
+        assert_eq!(info.worktree, Some("/worktrees/round-trip".to_string()));
+        assert_eq!(info.prefix, Some("feat-round-trip".to_string()));
+        // host should be populated (non-empty)
+        assert!(!info.host.is_empty(), "host should be non-empty");
+    }
+
+    #[test]
+    fn test_write_read_roundtrip_no_optional_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
+
+        guard.write_holder_info_extended(None, None, None).unwrap();
+
+        let info = LockGuard::read_holder_info(guard.path()).unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.branch, None);
+        assert_eq!(info.worktree, None);
+        assert_eq!(info.prefix, None);
+    }
+
+    #[test]
+    fn test_read_holder_info_partial_fields_only_branch() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("partial.lock");
+
+        // Only branch present, no worktree or prefix
+        fs::write(&lock_path, "100@partialhost\nbranch=feat/partial\n").unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path).unwrap();
+        assert_eq!(info.pid, 100);
+        assert_eq!(info.host, "partialhost");
+        assert_eq!(info.branch, Some("feat/partial".to_string()));
+        assert_eq!(info.worktree, None);
+        assert_eq!(info.prefix, None);
+    }
+
+    #[test]
+    fn test_read_holder_info_partial_fields_only_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("partial2.lock");
+
+        // Only prefix present, no branch or worktree
+        fs::write(&lock_path, "200@prefixhost\nprefix=my-prefix\n").unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path).unwrap();
+        assert_eq!(info.pid, 200);
+        assert_eq!(info.branch, None);
+        assert_eq!(info.worktree, None);
+        assert_eq!(info.prefix, Some("my-prefix".to_string()));
+    }
+
+    #[test]
+    fn test_read_holder_info_ignores_unknown_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let lock_path = temp_dir.path().join("future.lock");
+
+        // Unknown keys from a future version of task-mgr should be silently ignored
+        fs::write(
+            &lock_path,
+            "300@futurehost\nbranch=feat/future\nunknown_key=some_value\nanother_future=42\nprefix=feat-future\n",
+        )
+        .unwrap();
+
+        let info = LockGuard::read_holder_info(&lock_path).unwrap();
+        assert_eq!(info.pid, 300);
+        assert_eq!(info.host, "futurehost");
+        assert_eq!(info.branch, Some("feat/future".to_string()));
+        assert_eq!(info.prefix, Some("feat-future".to_string()));
+        // unknown keys are ignored, no panic or error
+    }
+
+    #[test]
+    fn test_holder_info_display_full() {
+        let info = HolderInfo {
+            pid: 1234,
+            host: "myhost".to_string(),
+            branch: Some("feat/my-branch".to_string()),
+            worktree: Some("/some/worktree".to_string()),
+            prefix: Some("feat-my-branch".to_string()),
+        };
+        let s = info.to_string();
+        assert_eq!(
+            s,
+            "1234@myhost branch=feat/my-branch worktree=/some/worktree prefix=feat-my-branch"
+        );
+    }
+
+    #[test]
+    fn test_holder_info_display_no_optional_fields() {
+        let info = HolderInfo {
+            pid: 5678,
+            host: "otherhost".to_string(),
+            branch: None,
+            worktree: None,
+            prefix: None,
+        };
+        let s = info.to_string();
+        // Only pid@host, no extra fields
+        assert_eq!(s, "5678@otherhost");
+    }
+
+    #[test]
+    fn test_holder_info_display_branch_only() {
+        let info = HolderInfo {
+            pid: 9999,
+            host: "branchhost".to_string(),
+            branch: Some("main".to_string()),
+            worktree: None,
+            prefix: None,
+        };
+        let s = info.to_string();
+        assert_eq!(s, "9999@branchhost branch=main");
+    }
+
+    #[test]
+    fn test_lock_error_message_no_holder_info() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Acquire lock, then manually truncate the lockfile to simulate unreadable holder
+        let guard = LockGuard::acquire(temp_dir.path()).unwrap();
+        // Write invalid (non-parseable) content — the existing guard holds the flock
+        // We can verify the error message format when holder_info is None by checking
+        // the acquire path with a fresh dir where lock file has no valid content.
+        // Since we can't hold two locks in same process, test the message format directly.
+        drop(guard);
+
+        // Write a file with content that won't parse as pid@host
+        let lock_path = temp_dir.path().join("tasks.db.lock");
+        fs::write(&lock_path, "not-valid-format").unwrap();
+
+        // read_holder_info should return None for invalid format
+        let info = LockGuard::read_holder_info(&lock_path);
+        assert!(
+            info.is_none(),
+            "invalid format should return None, got {:?}",
+            info
+        );
+    }
+
+    #[test]
+    fn test_lock_error_message_with_partial_holder_info() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Acquire with branch only (no prefix)
+        let mut guard1 = LockGuard::acquire(temp_dir.path()).unwrap();
+        guard1
+            .write_holder_info_extended(Some("main"), None, None)
+            .unwrap();
+
+        // Second acquire should fail and show branch in error
+        let result = LockGuard::acquire(temp_dir.path());
+        assert!(result.is_err());
+
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("main"),
+            "error should include branch 'main': {}",
+            msg
+        );
     }
 
     #[test]

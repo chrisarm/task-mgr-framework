@@ -898,8 +898,9 @@ fn test_run_loop_with_mock_claude() {
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
-    let exit_code =
+    let loop_result =
         rt.block_on(async { task_mgr::loop_engine::engine::run_loop(run_config).await });
+    let exit_code = loop_result.exit_code;
 
     // Clean up env vars
     std::env::remove_var("CLAUDE_BINARY");

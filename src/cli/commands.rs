@@ -662,6 +662,14 @@ EXAMPLES:
         /// scan its commits for task completion evidence.
         #[arg(long = "external-repo")]
         external_repo: Option<PathBuf>,
+
+        /// Remove the git worktree on loop exit (requires worktree mode)
+        ///
+        /// When set, the worktree created for this loop run will be removed
+        /// after the loop finishes. Dirty worktrees are warned but not forced.
+        /// In interactive mode (no --yes), the user is prompted instead.
+        #[arg(long = "cleanup-worktree", default_value_t = false)]
+        cleanup_worktree: bool,
     },
 
     /// Show status dashboard for PRD projects
@@ -672,6 +680,10 @@ EXAMPLES:
         /// Show detailed task listing
         #[arg(short = 'v', long)]
         verbose: bool,
+
+        /// Filter to a single PRD by task ID prefix (e.g., "9c5c8a1d")
+        #[arg(long)]
+        prefix: Option<String>,
     },
 
     /// Run multiple PRDs in sequence
@@ -682,6 +694,9 @@ EXAMPLES:
 
     # Run with max iterations per PRD
     task-mgr batch 'tasks/*.json' 10 --yes
+
+    # Keep worktrees after each PRD (default: auto-remove on success)
+    task-mgr batch 'tasks/*.json' --yes --keep-worktrees
 ")]
     Batch {
         /// Glob pattern to match PRD files
@@ -693,6 +708,14 @@ EXAMPLES:
         /// Auto-confirm all prompts
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Keep worktrees after each PRD completes (never auto-remove)
+        ///
+        /// By default, worktrees are removed on success in --yes mode,
+        /// and the user is prompted in interactive mode.
+        /// This flag skips cleanup entirely.
+        #[arg(long = "keep-worktrees", default_value_t = false)]
+        keep_worktrees: bool,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -753,6 +776,12 @@ EXAMPLES:
         run_id: Option<String>,
     },
 
+    /// Manage git worktrees (list, prune, remove)
+    Worktrees {
+        #[command(subcommand)]
+        action: WorktreesAction,
+    },
+
     /// Generate man pages for task-mgr and all subcommands
     #[command(after_help = "\
 EXAMPLES:
@@ -803,6 +832,22 @@ GENERATED MAN PAGES:
         /// List all available man page names without generating
         #[arg(long, default_value_t = false)]
         list: bool,
+    },
+}
+
+/// Worktrees subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum WorktreesAction {
+    /// List all git worktrees with branch, path, and lock status
+    List,
+
+    /// Remove unlocked worktrees (skips locked and dirty)
+    Prune,
+
+    /// Remove a specific worktree by path or branch name
+    Remove {
+        /// Path or branch name of the worktree to remove
+        target: String,
     },
 }
 

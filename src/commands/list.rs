@@ -167,29 +167,67 @@ fn query_tasks(
     Ok(tasks)
 }
 
+/// Extract the task ID prefix (first segment before `-`).
+fn extract_task_prefix(id: &str) -> &str {
+    id.find('-').map_or(id, |i| &id[..i])
+}
+
 /// Format list result as human-readable text.
+///
+/// When tasks from multiple distinct prefixes are present, groups them
+/// under section headers. When a single prefix exists, renders a flat list.
 pub fn format_text(result: &ListResult) -> String {
     if result.tasks.is_empty() {
         return "No tasks found matching the filter criteria.".to_string();
     }
 
+    // Collect distinct prefixes in order of first appearance
+    let mut seen = std::collections::HashSet::new();
+    let mut prefixes: Vec<&str> = Vec::new();
+    for task in &result.tasks {
+        let p = extract_task_prefix(&task.id);
+        if seen.insert(p) {
+            prefixes.push(p);
+        }
+    }
+
+    let multi_prefix = prefixes.len() >= 2;
     let mut output = String::new();
 
-    // Header
-    output.push_str(&format!(
-        "{:<12} {:<12} {:>5}  {}\n",
-        "ID", "STATUS", "PRI", "TITLE"
-    ));
-    output.push_str(&format!("{}\n", "-".repeat(70)));
-
-    // Task rows
-    for task in &result.tasks {
+    let render_task_row = |task: &TaskSummary, out: &mut String| {
         let title_display = super::truncate_str(&task.title, 37);
-
-        output.push_str(&format!(
+        out.push_str(&format!(
             "{:<12} {:<12} {:>5}  {}\n",
             task.id, task.status, task.priority, title_display
         ));
+    };
+
+    if multi_prefix {
+        for prefix in &prefixes {
+            output.push_str(&format!("=== {} ===\n", prefix));
+            output.push_str(&format!(
+                "{:<12} {:<12} {:>5}  {}\n",
+                "ID", "STATUS", "PRI", "TITLE"
+            ));
+            output.push_str(&format!("{}\n", "-".repeat(70)));
+            for task in result
+                .tasks
+                .iter()
+                .filter(|t| extract_task_prefix(&t.id) == *prefix)
+            {
+                render_task_row(task, &mut output);
+            }
+            output.push('\n');
+        }
+    } else {
+        output.push_str(&format!(
+            "{:<12} {:<12} {:>5}  {}\n",
+            "ID", "STATUS", "PRI", "TITLE"
+        ));
+        output.push_str(&format!("{}\n", "-".repeat(70)));
+        for task in &result.tasks {
+            render_task_row(task, &mut output);
+        }
     }
 
     // Footer
@@ -465,6 +503,69 @@ mod tests {
         assert!(text.contains("..."));
         // Should not contain the full title
         assert!(!text.contains("maximum display length"));
+    }
+
+    #[test]
+    fn test_format_text_single_prefix_no_headers() {
+        let result = ListResult {
+            tasks: vec![
+                TaskSummary {
+                    id: "abc123-FEAT-001".to_string(),
+                    title: "Feature 1".to_string(),
+                    status: "todo".to_string(),
+                    priority: 10,
+                },
+                TaskSummary {
+                    id: "abc123-FEAT-002".to_string(),
+                    title: "Feature 2".to_string(),
+                    status: "done".to_string(),
+                    priority: 20,
+                },
+            ],
+            count: 2,
+            filter_status: None,
+            filter_file: None,
+            filter_task_type: None,
+        };
+
+        let text = format_text(&result);
+        // Single prefix → flat list, no section header
+        assert!(!text.contains("=== abc123 ==="));
+        assert!(text.contains("abc123-FEAT-001"));
+        assert!(text.contains("abc123-FEAT-002"));
+        assert!(text.contains("Total: 2 task(s)"));
+    }
+
+    #[test]
+    fn test_format_text_multiple_prefixes_shows_headers() {
+        let result = ListResult {
+            tasks: vec![
+                TaskSummary {
+                    id: "abc123-FEAT-001".to_string(),
+                    title: "Feature 1".to_string(),
+                    status: "todo".to_string(),
+                    priority: 10,
+                },
+                TaskSummary {
+                    id: "def456-FEAT-001".to_string(),
+                    title: "Other Feature".to_string(),
+                    status: "done".to_string(),
+                    priority: 10,
+                },
+            ],
+            count: 2,
+            filter_status: None,
+            filter_file: None,
+            filter_task_type: None,
+        };
+
+        let text = format_text(&result);
+        // Two prefixes → section headers
+        assert!(text.contains("=== abc123 ==="));
+        assert!(text.contains("=== def456 ==="));
+        assert!(text.contains("abc123-FEAT-001"));
+        assert!(text.contains("def456-FEAT-001"));
+        assert!(text.contains("Total: 2 task(s)"));
     }
 
     #[test]

@@ -2047,6 +2047,7 @@ fn test_loop_with_prd_file_and_yes() {
             verbose,
             no_worktree,
             external_repo,
+            cleanup_worktree,
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert!(prompt_file.is_none());
@@ -2055,6 +2056,7 @@ fn test_loop_with_prd_file_and_yes() {
             assert!(!verbose);
             assert!(!no_worktree);
             assert!(external_repo.is_none());
+            assert!(!cleanup_worktree);
         }
         _ => panic!("Expected Loop command"),
     }
@@ -2132,6 +2134,7 @@ fn test_loop_minimal() {
             verbose,
             no_worktree,
             external_repo,
+            ..
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert!(prompt_file.is_none());
@@ -2167,6 +2170,7 @@ fn test_loop_with_all_options() {
             verbose,
             no_worktree,
             external_repo,
+            ..
         } => {
             assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
             assert_eq!(prompt_file, Some(PathBuf::from("tasks/prompt.md")));
@@ -2285,7 +2289,9 @@ fn test_loop_short_yes_flag() {
 fn test_status_no_args() {
     let cli = Cli::parse_from(["task-mgr", "status"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status {
+            prd_file, verbose, ..
+        } => {
             assert!(prd_file.is_none());
             assert!(!verbose);
         }
@@ -2297,7 +2303,9 @@ fn test_status_no_args() {
 fn test_status_with_prd_file() {
     let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status {
+            prd_file, verbose, ..
+        } => {
             assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
             assert!(!verbose);
         }
@@ -2309,7 +2317,9 @@ fn test_status_with_prd_file() {
 fn test_status_with_verbose() {
     let cli = Cli::parse_from(["task-mgr", "status", "-v"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status {
+            prd_file, verbose, ..
+        } => {
             assert!(prd_file.is_none());
             assert!(verbose);
         }
@@ -2332,7 +2342,9 @@ fn test_status_with_verbose_long() {
 fn test_status_with_prd_file_and_verbose() {
     let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json", "-v"]);
     match cli.command {
-        Commands::Status { prd_file, verbose } => {
+        Commands::Status {
+            prd_file, verbose, ..
+        } => {
             assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
             assert!(verbose);
         }
@@ -2352,6 +2364,7 @@ fn test_batch_with_pattern_and_yes() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert!(max_iterations.is_none());
@@ -2369,6 +2382,7 @@ fn test_batch_with_max_iterations() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert_eq!(max_iterations, Some(10));
@@ -2387,6 +2401,7 @@ fn test_batch_minimal() {
             pattern,
             max_iterations,
             yes,
+            ..
         } => {
             assert_eq!(pattern, "tasks/*.json");
             assert!(max_iterations.is_none());
@@ -2400,6 +2415,39 @@ fn test_batch_minimal() {
 fn test_batch_missing_pattern_fails() {
     let result = Cli::try_parse_from(["task-mgr", "batch"]);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_batch_keep_worktrees_flag() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        "tasks/*.json",
+        "--yes",
+        "--keep-worktrees",
+    ]);
+    match cli.command {
+        Commands::Batch {
+            keep_worktrees,
+            yes,
+            ..
+        } => {
+            assert!(keep_worktrees);
+            assert!(yes);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_keep_worktrees_defaults_false() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json"]);
+    match cli.command {
+        Commands::Batch { keep_worktrees, .. } => {
+            assert!(!keep_worktrees);
+        }
+        _ => panic!("Expected Batch command"),
+    }
 }
 
 #[test]

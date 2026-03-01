@@ -279,8 +279,9 @@ fn get_completed_task_ids(
     };
     let mut stmt = conn.prepare(&query)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let ids: Result<HashSet<String>, rusqlite::Error> =
-        stmt.query_map(param_refs.as_slice(), |row| row.get(0))?.collect();
+    let ids: Result<HashSet<String>, rusqlite::Error> = stmt
+        .query_map(param_refs.as_slice(), |row| row.get(0))?
+        .collect();
     Ok(ids?)
 }
 

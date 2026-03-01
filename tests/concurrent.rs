@@ -14,6 +14,7 @@
 
 use assert_cmd::cargo::cargo_bin;
 use fs2::FileExt;
+use hostname;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::process::Command;
@@ -76,10 +77,14 @@ impl TestLockHolder {
         file.try_lock_exclusive()
             .expect("Failed to acquire exclusive lock");
 
-        // Write our fake PID (use a high number to identify as test)
+        // Write our PID in pid@host format (matches read_holder_info parser)
         let pid = std::process::id();
+        let host = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
         file.set_len(0).unwrap();
-        write!(file, "{}", pid).unwrap();
+        write!(file, "{}@{}", pid, host).unwrap();
         file.sync_all().unwrap();
 
         TestLockHolder { file }

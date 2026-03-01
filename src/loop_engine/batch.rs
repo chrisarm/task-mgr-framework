@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopRunConfig};
+use crate::loop_engine::env;
 use crate::loop_engine::signals;
 
 /// Result of a batch run.
@@ -115,6 +116,66 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
     Ok(pairs)
 }
 
+/// Offer to clean up a worktree after a PRD run in batch mode.
+///
+/// Policy:
+/// - `keep_worktrees = true` → never remove
+/// - failed PRD (exit_code != 0) → keep regardless of flags (preserve for debugging)
+/// - `cleanup_worktree = true` → auto-remove (explicit opt-in)
+/// - `yes = true` without `cleanup_worktree` → keep (matches engine behavior)
+/// - `yes = false` (interactive) → prompt user
+/// - Cleanup failure warns but does not affect batch result
+fn cleanup_worktree_after_prd(
+    project_root: &Path,
+    wt_path: &Path,
+    exit_code: i32,
+    yes: bool,
+    keep_worktrees: bool,
+    cleanup_worktree: bool,
+) {
+    if keep_worktrees {
+        return;
+    }
+
+    if exit_code != 0 {
+        // Keep worktrees from failed runs for debugging
+        eprintln!("Keeping worktree (PRD failed): {}", wt_path.display());
+        return;
+    }
+
+    let should_remove = if cleanup_worktree {
+        // --cleanup-worktree flag: always attempt removal
+        true
+    } else if yes {
+        // --yes without --cleanup-worktree: keep worktree (matches engine behavior)
+        false
+    } else {
+        // Interactive: prompt user
+        eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+        } else {
+            false
+        }
+    };
+
+    if should_remove {
+        match env::remove_worktree(project_root, wt_path) {
+            Ok(true) => eprintln!("Removed worktree: {}", wt_path.display()),
+            Ok(false) => eprintln!(
+                "Warning: worktree has uncommitted changes, kept: {}",
+                wt_path.display()
+            ),
+            Err(e) => eprintln!(
+                "Warning: failed to remove worktree '{}': {}",
+                wt_path.display(),
+                e
+            ),
+        }
+    }
+}
+
 /// Run multiple PRDs in sequence.
 ///
 /// 1. Expand glob pattern with natural sort
@@ -132,6 +193,7 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
 /// * `dir` - Database directory (--dir flag)
 /// * `project_root` - Git repository root for git operations and path resolution
 /// * `verbose` - Verbose output
+/// * `keep_worktrees` - Never remove worktrees after PRD completion
 pub async fn run_batch(
     pattern: &str,
     max_iterations: Option<usize>,
@@ -139,6 +201,7 @@ pub async fn run_batch(
     dir: &Path,
     project_root: &Path,
     verbose: bool,
+    keep_worktrees: bool,
 ) -> BatchResult {
     // Step 1: Expand glob
     let prd_files = match expand_glob(pattern) {
@@ -223,7 +286,10 @@ pub async fn run_batch(
             external_repo: None, // Batch mode reads from PRD metadata
         };
 
-        let exit_code = engine::run_loop(run_config).await;
+        let should_cleanup_worktree = run_config.config.cleanup_worktree;
+        let loop_result = engine::run_loop(run_config).await;
+        let exit_code = loop_result.exit_code;
+        let worktree_path = loop_result.worktree_path.clone();
 
         results.push(PrdRunResult {
             prd_file: prd_file.clone(),
@@ -235,6 +301,18 @@ pub async fn run_batch(
             succeeded += 1;
         } else {
             failed += 1;
+        }
+
+        // Worktree cleanup after each PRD
+        if let Some(ref wt_path) = worktree_path {
+            cleanup_worktree_after_prd(
+                project_root,
+                wt_path,
+                exit_code,
+                yes,
+                keep_worktrees,
+                should_cleanup_worktree,
+            );
         }
     }
 
@@ -497,5 +575,106 @@ mod tests {
 
         fs::write(temp_dir.path().join(STOP_FILE), "").expect("create stop");
         assert!(signals::check_stop_signal(temp_dir.path()));
+    }
+
+    // --- cleanup_worktree_after_prd tests ---
+
+    /// Helper: initialize a temporary git repo with an initial commit.
+    fn init_test_repo_for_batch() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().expect("create temp dir");
+        let repo = tmp.path().to_path_buf();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(&repo)
+            .output()
+            .ok();
+        fs::write(repo.join("README.md"), "# Test").expect("write README");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo)
+            .output()
+            .expect("git commit");
+        (tmp, repo)
+    }
+
+    #[test]
+    fn test_cleanup_keep_worktrees_flag_preserves_worktree() {
+        // When keep_worktrees=true, cleanup should return immediately without removing anything.
+        let tmp = TempDir::new().expect("create temp dir");
+        let dummy_path = tmp.path().join("worktree");
+        fs::create_dir_all(&dummy_path).expect("create dummy dir");
+
+        // Pass keep_worktrees=true — function should return without touching path
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true, false);
+
+        assert!(
+            dummy_path.exists(),
+            "worktree dir should still exist when keep_worktrees=true"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_failed_prd_keeps_worktree() {
+        // When exit_code != 0, cleanup should keep the worktree regardless of yes/keep flags.
+        let tmp = TempDir::new().expect("create temp dir");
+        let dummy_path = tmp.path().join("worktree");
+        fs::create_dir_all(&dummy_path).expect("create dummy dir");
+
+        // exit_code=1 → keep worktree for debugging
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false, true);
+
+        assert!(
+            dummy_path.exists(),
+            "worktree dir should be kept when PRD failed (exit_code=1)"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_success_auto_yes_removes_worktree() {
+        // When exit_code=0 and yes=true, cleanup should attempt to remove the worktree.
+        let (tmp, repo) = init_test_repo_for_batch();
+
+        // Create a real worktree to remove
+        let wt_path = tmp.path().join("cleanup-wt");
+        std::process::Command::new("git")
+            .args(["branch", "feat/cleanup-test"])
+            .current_dir(&repo)
+            .output()
+            .expect("git branch");
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                "feat/cleanup-test",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git worktree add");
+
+        assert!(wt_path.exists(), "worktree must exist before cleanup");
+
+        // exit_code=0, cleanup_worktree=true → should remove
+        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false, true);
+
+        assert!(
+            !wt_path.exists(),
+            "worktree dir should be removed on successful PRD with yes=true"
+        );
     }
 }
