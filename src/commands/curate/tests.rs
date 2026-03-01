@@ -18,7 +18,10 @@ use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
-use super::{curate_retire, curate_unretire, merge_cluster, MergeClusterParams, RetireParams};
+use super::{
+    build_dedup_prompt, curate_retire, curate_unretire, merge_cluster, parse_dedup_response,
+    DeduplicateLearningItem, MergeClusterParams, RetireParams,
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test helpers
@@ -2358,4 +2361,241 @@ fn test_already_merged_learning_skipped_in_second_cluster() {
         retired_at.is_none(),
         "merged learning M2 must be active (retired_at IS NULL)"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-INIT-002: dedup LLM prompt building and response parsing
+//
+// All tests are #[ignore] until FEAT-004 (build_dedup_prompt / parse_dedup_response).
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Helper: build a minimal batch of DeduplicateLearningItem for prompt tests.
+fn make_dedup_items(pairs: &[(i64, &str, &str)]) -> Vec<DeduplicateLearningItem> {
+    pairs
+        .iter()
+        .map(|(id, title, content)| DeduplicateLearningItem {
+            id: *id,
+            title: title.to_string(),
+            content: content.to_string(),
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
+    // AC: prompt contains a random UUID boundary delimiter (injection protection)
+    let items = make_dedup_items(&[(1, "Title A", "Content A"), (2, "Title B", "Content B")]);
+    let prompt = build_dedup_prompt(&items, 0.85);
+
+    // The delimiter must contain "===BOUNDARY_" followed by a UUID fragment
+    assert!(
+        prompt.contains("===BOUNDARY_"),
+        "prompt must contain ===BOUNDARY_<uuid> delimiter for injection protection"
+    );
+    // The delimiter must appear at least twice (wrapping untrusted content)
+    let count = prompt.matches("===BOUNDARY_").count();
+    assert!(
+        count >= 2,
+        "delimiter must appear at least twice to wrap the untrusted content block; found {count}"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+fn test_dedup_prompt_contains_untrusted_warning() {
+    // AC: prompt contains UNTRUSTED warning for learning content
+    let items = make_dedup_items(&[(1, "Title", "Content")]);
+    let prompt = build_dedup_prompt(&items, 0.85);
+
+    assert!(
+        prompt.contains("UNTRUSTED"),
+        "prompt must contain UNTRUSTED warning to guard against prompt injection"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+fn test_dedup_prompt_includes_learning_ids_titles_content() {
+    // AC: prompt includes all learning IDs, titles, and content
+    let items = make_dedup_items(&[
+        (42, "Caching pattern", "Use Redis for hot paths"),
+        (
+            99,
+            "Database indexing",
+            "Add composite indexes for slow queries",
+        ),
+    ]);
+    let prompt = build_dedup_prompt(&items, 0.85);
+
+    assert!(prompt.contains("42"), "prompt must include learning ID 42");
+    assert!(
+        prompt.contains("Caching pattern"),
+        "prompt must include title for ID 42"
+    );
+    assert!(
+        prompt.contains("Use Redis for hot paths"),
+        "prompt must include content for ID 42"
+    );
+    assert!(prompt.contains("99"), "prompt must include learning ID 99");
+    assert!(
+        prompt.contains("Database indexing"),
+        "prompt must include title for ID 99"
+    );
+    assert!(
+        prompt.contains("Add composite indexes for slow queries"),
+        "prompt must include content for ID 99"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_dedup_prompt not yet implemented"]
+fn test_dedup_prompt_includes_threshold_value() {
+    // AC: prompt includes threshold value as guidance
+    let items = make_dedup_items(&[(1, "Title", "Content")]);
+    let prompt = build_dedup_prompt(&items, 0.85);
+
+    assert!(
+        prompt.contains("0.85"),
+        "prompt must include the similarity threshold value 0.85 as guidance"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_valid_json() {
+    // AC: valid JSON response parses to Vec<RawDedupCluster> correctly
+    let response = r#"[{"ids": [1, 2, 3]}, {"ids": [4, 5]}]"#;
+    let valid_ids = vec![1, 2, 3, 4, 5];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    assert_eq!(clusters.len(), 2, "should parse 2 clusters");
+    let c0_ids = &clusters[0].ids;
+    assert!(c0_ids.contains(&1) && c0_ids.contains(&2) && c0_ids.contains(&3));
+    let c1_ids = &clusters[1].ids;
+    assert!(c1_ids.contains(&4) && c1_ids.contains(&5));
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_filters_nonexistent_ids() {
+    // AC: response with non-existent learning IDs — invalid IDs filtered out, valid clusters preserved
+    // Cluster 1: all IDs valid → kept
+    // Cluster 2: contains ID 999 which is not in valid_ids → that cluster is filtered out
+    let response = r#"[{"ids": [1, 2]}, {"ids": [3, 999]}]"#;
+    let valid_ids = vec![1, 2, 3];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    // Cluster with valid IDs [1,2] must be preserved
+    let has_valid = clusters
+        .iter()
+        .any(|c| c.ids.contains(&1) && c.ids.contains(&2));
+    assert!(has_valid, "cluster with valid IDs [1, 2] must be preserved");
+
+    // Cluster containing hallucinated ID 999 must be filtered out
+    let has_invalid = clusters.iter().any(|c| c.ids.contains(&999));
+    assert!(
+        !has_invalid,
+        "cluster containing non-existent ID 999 must be filtered out"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_first_cluster_wins_on_duplicate_id() {
+    // AC: response with same learning in multiple clusters — first cluster wins, later skipped
+    // Learning ID 2 appears in both clusters; the first cluster should be kept, second skipped.
+    let response = r#"[{"ids": [1, 2]}, {"ids": [2, 3]}]"#;
+    let valid_ids = vec![1, 2, 3];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    // First cluster [1,2] must be present
+    let first_kept = clusters
+        .iter()
+        .any(|c| c.ids.contains(&1) && c.ids.contains(&2));
+    assert!(first_kept, "first cluster [1, 2] must be kept");
+
+    // Second cluster [2,3] must NOT be present (ID 2 already claimed)
+    let second_present = clusters.iter().any(|c| c.ids.contains(&3));
+    assert!(
+        !second_present,
+        "second cluster containing already-claimed ID 2 must be skipped"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_non_json_returns_empty() {
+    // AC: non-JSON response returns empty clusters (best-effort, no crash)
+    let response = "Sorry, I cannot help with that.";
+    let valid_ids = vec![1, 2, 3];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should not error");
+
+    assert!(
+        clusters.is_empty(),
+        "non-JSON response must return empty clusters without crashing"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_markdown_wrapped_json() {
+    // AC: markdown-wrapped JSON (```json ... ```) is extracted correctly
+    let response = "```json\n[{\"ids\": [10, 20]}]\n```";
+    let valid_ids = vec![10, 20];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    assert_eq!(
+        clusters.len(),
+        1,
+        "should extract 1 cluster from markdown-wrapped JSON"
+    );
+    assert!(
+        clusters[0].ids.contains(&10) && clusters[0].ids.contains(&20),
+        "extracted cluster must contain IDs 10 and 20"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_empty_array() {
+    // AC: empty array response returns 0 clusters
+    let response = "[]";
+    let valid_ids = vec![1, 2, 3];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    assert_eq!(
+        clusters.len(),
+        0,
+        "empty array response must return 0 clusters"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: parse_dedup_response not yet implemented"]
+fn test_parse_dedup_response_single_id_cluster_rejected() {
+    // Known-bad discriminator: cluster with only 1 ID is not a merge — must be rejected
+    let response = r#"[{"ids": [42]}, {"ids": [1, 2]}]"#;
+    let valid_ids = vec![1, 2, 42];
+
+    let clusters = parse_dedup_response(response, &valid_ids).expect("parse should succeed");
+
+    // Single-ID cluster must be filtered out
+    let has_singleton = clusters.iter().any(|c| c.ids == vec![42]);
+    assert!(
+        !has_singleton,
+        "cluster with only 1 ID must be rejected (requires at least 2 for a merge)"
+    );
+
+    // Valid 2-ID cluster must be kept
+    let has_valid_pair = clusters
+        .iter()
+        .any(|c| c.ids.contains(&1) && c.ids.contains(&2));
+    assert!(has_valid_pair, "valid 2-ID cluster must be preserved");
 }

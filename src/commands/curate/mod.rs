@@ -3,14 +3,17 @@
 //! Provides `curate retire` and `curate unretire` commands for managing
 //! the institutional memory quality via soft-archiving stale learnings.
 
+pub mod dedup;
 pub mod enrich;
 pub mod output;
 pub mod types;
 
+pub use dedup::{build_dedup_prompt, parse_dedup_response};
 pub use output::{format_enrich_text, format_retire_text, format_unretire_text};
 pub use types::{
-    EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, MergeClusterResult,
-    RetireParams, RetireResult, RetirementCandidate, UnretireResult,
+    DeduplicateLearningItem, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
+    MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
+    UnretireResult,
 };
 
 use rusqlite::Connection;

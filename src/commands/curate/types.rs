@@ -159,6 +159,26 @@ pub struct MergeClusterResult {
     pub skipped_source_ids: Vec<i64>,
 }
 
+/// A single learning passed to the dedup LLM prompt.
+#[derive(Debug, Clone)]
+pub struct DeduplicateLearningItem {
+    /// Learning ID
+    pub id: i64,
+    /// Learning title
+    pub title: String,
+    /// Full learning content
+    pub content: String,
+}
+
+/// Raw LLM response cluster: a list of learning IDs that are semantic duplicates.
+///
+/// A valid cluster must have at least 2 IDs (otherwise it is not a merge).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RawDedupCluster {
+    /// IDs of learnings in this duplicate cluster
+    pub ids: Vec<i64>,
+}
+
 /// Parameters for the `curate retire` command.
 #[derive(Debug, Clone)]
 pub struct RetireParams {
