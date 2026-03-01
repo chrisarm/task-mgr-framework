@@ -86,8 +86,9 @@ When review tasks add new tasks, they modify `tasks/worktree-lifecycle.json` dir
    - Check each `qualityDimensions` constraint: does the code satisfy it?
    - If the implementation can exit early, avoid redundant work, or be simplified — revise now
 10. Run quality checks (see below)
-11. If checks pass, commit with message: `feat: [Story ID] - [Story Title]`
-12. Update `tasks/worktree-lifecycle.json` to set `passes: true` for the completed story
+11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
+    For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
+12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
 13. Append progress to `tasks/progress.txt` (include approach chosen and any edge cases discovered)
 14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 

@@ -102,8 +102,9 @@ What matters most, in order:
    - Review for correctness, idiomatic style, and performance. Revise if improvements exist
    - Check each `qualityDimensions` constraint: does the code satisfy it?
 10. Run quality checks (see below)
-11. If checks pass, commit with message: `feat: [Story ID] - [Story Title]`
-12. Update `tasks/improve-learning-recall.json` to set `passes: true`
+11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
+    For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
+12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
 13. Append progress to `tasks/progress.txt`
 14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 

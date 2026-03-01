@@ -118,14 +118,10 @@ fn categorize_crash(exit_code: i32) -> CrashType {
 pub fn is_task_reported_already_complete(
     output: &str,
     task_id: &str,
-    task_prefix: Option<&str>,
+    _task_prefix: Option<&str>,
 ) -> bool {
-    // Condition 1: output mentions this task
-    let has_task_id = output.contains(task_id) || {
-        let base_id = strip_prefix(task_id, task_prefix);
-        base_id != task_id && output.contains(base_id)
-    };
-    if !has_task_id {
+    // Condition 1: output mentions this task (full ID only — no base ID fallback)
+    if !output.contains(task_id) {
         return false;
     }
 
@@ -143,17 +139,6 @@ pub fn is_task_reported_already_complete(
     already_complete_signals
         .iter()
         .any(|signal| output_lower.contains(signal))
-}
-
-/// Strip a task prefix (e.g. "a3e1b7c9-FEAT-001" → "FEAT-001").
-fn strip_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &'a str {
-    match prefix {
-        Some(pfx) => {
-            let with_dash = format!("{}-", pfx);
-            task_id.strip_prefix(&with_dash).unwrap_or(task_id)
-        }
-        None => task_id,
-    }
 }
 
 #[cfg(test)]
@@ -983,13 +968,13 @@ mod tests {
     }
 
     #[test]
-    fn test_already_complete_with_base_id() {
+    fn test_already_complete_with_base_id_no_match() {
+        // Base ID only (no full prefixed ID) should NOT match anymore
         let output = "This task (TEST-003) is already completed in a previous iteration.";
-        assert!(is_task_reported_already_complete(
-            output,
-            "a3e1b7c9-TEST-003",
-            Some("a3e1b7c9"),
-        ));
+        assert!(
+            !is_task_reported_already_complete(output, "a3e1b7c9-TEST-003", Some("a3e1b7c9")),
+            "Should NOT match base ID without prefix"
+        );
     }
 
     #[test]
@@ -1012,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_already_complete_case_insensitive_signal() {
-        let output = "Task TEST-003 was ALREADY COMPLETED in a prior run.";
+        let output = "Task a3e1b7c9-TEST-003 was ALREADY COMPLETED in a prior run.";
         assert!(is_task_reported_already_complete(
             output,
             "a3e1b7c9-TEST-003",

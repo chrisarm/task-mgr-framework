@@ -91,8 +91,9 @@ When review tasks add new tasks, they modify `tasks/scoped-sessions.json` direct
    - Check each `qualityDimensions` constraint: does the code satisfy it?
    - If the implementation can exit early, avoid redundant work, or be simplified — revise now
 10. Run quality checks (see below)
-11. If checks pass, commit with message: `feat: [Story ID] - [Story Title]`
-12. Update `tasks/scoped-sessions.json` to set `passes: true` for the completed story
+11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
+    For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
+12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
 13. Append progress to `tasks/progress.txt` (include approach chosen and any edge cases discovered)
 14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 
@@ -325,9 +326,9 @@ Review tasks are special: they **CAN AND SHOULD add new tasks directly to the JS
 - For EACH issue found, add a `CODE-FIX-xxx` or `WIRE-FIX-xxx` task to the JSON (priority 14-16)
 - **CRITICAL**: Add each CODE-FIX-xxx and WIRE-FIX-xxx to MILESTONE-1's `dependsOn` array
 - Commit JSON changes: `chore: CODE-REVIEW-1 - Add CODE-FIX/WIRE-FIX tasks`
-- Mark CODE-REVIEW-1 as `passes: true` once review complete AND all tasks added
+- Commit and output `<completed>CODE-REVIEW-1</completed>` once review complete AND all tasks added
 
-**If no issues found**: Mark `passes: true` with note "No issues found"
+**If no issues found**: Output `<completed>CODE-REVIEW-1</completed>` with note "No issues found"
 
 ### REFACTOR-REVIEW-1, 2, 3
 

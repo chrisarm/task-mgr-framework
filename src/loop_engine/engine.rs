@@ -1077,10 +1077,40 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             eprintln!("Warning: failed to update run: {}", e);
         }
 
-        // Check git for task completion: if recent commit contains task ID, mark done
+        // Check for task completion via multiple detection paths.
+        // Priority: <completed> tags > git commit > output scan > already-complete
         if let Some(ref task_id) = result.task_id {
             if !matches!(result.outcome, IterationOutcome::Empty) {
                 let mut task_marked_done_this_iteration = false;
+
+                // Primary: parse <completed> tags from output
+                let completed_tags = parse_completed_tasks(&result.output);
+                if !completed_tags.is_empty() {
+                    for completed_id in &completed_tags {
+                        if let Ok(()) = mark_task_done(
+                            &mut conn,
+                            completed_id,
+                            &run_id,
+                            None,
+                            &paths.prd_file,
+                            task_prefix.as_deref(),
+                        ) {
+                            if completed_id == task_id {
+                                last_claimed_task = None;
+                                task_marked_done_this_iteration = true;
+                            }
+                            tasks_completed += 1;
+                            result.outcome = IterationOutcome::Completed;
+                            eprintln!(
+                                "Task {} completed (detected from <completed> tag)",
+                                completed_id
+                            );
+                        }
+                    }
+                }
+
+                // Fallback 1: git commit detection (only if no <completed> tags found)
+                if completed_tags.is_empty() {
                 if let Some(commit_hash) = check_git_for_task_completion(
                     &working_root,
                     task_id,
@@ -1186,6 +1216,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         }
                     }
                 }
+                } // end: if completed_tags.is_empty()
 
                 // Final fallback: Claude reports the task as "already complete" without committing.
                 // This catches tasks completed in a prior run where the DB was never updated.
@@ -1719,10 +1750,18 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
         None => return,
     };
 
-    let passing_ids: std::collections::HashSet<&str> = stories
+    // Build passing_ids with full prefixed IDs: prepend task prefix to each PRD story ID
+    let passing_ids: std::collections::HashSet<String> = stories
         .iter()
         .filter(|s| s.get("passes").and_then(|v| v.as_bool()) == Some(true))
         .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
+        .flat_map(|id| {
+            let mut ids = vec![id.to_string()];
+            if let Some(pfx) = task_prefix {
+                ids.push(format!("{}-{}", pfx, id));
+            }
+            ids
+        })
         .collect();
 
     // Loop until convergence: marking a task done may unblock dependents that also have
@@ -1743,8 +1782,7 @@ fn reconcile_passes_with_db(conn: &Connection, prd_path: &Path, task_prefix: Opt
                 continue;
             }
 
-            let base_id = strip_task_prefix(task_id, task_prefix);
-            if passing_ids.contains(base_id) || passing_ids.contains(task_id.as_str()) {
+            if passing_ids.contains(task_id.as_str()) {
                 if !complete_cmd::are_dependencies_satisfied(conn, task_id) {
                     continue;
                 }
@@ -1787,28 +1825,45 @@ fn strip_task_prefix<'a>(task_id: &'a str, prefix: Option<&str>) -> &'a str {
     }
 }
 
+/// Parse `<completed>TASK-ID</completed>` tags from Claude's output.
+///
+/// Returns a vec of full task IDs found. Multiple tags per iteration are supported.
+/// This is the primary completion signal — explicit declaration vs. mere mention.
+fn parse_completed_tasks(output: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let start_tag = "<completed>";
+    let end_tag = "</completed>";
+    let mut search_from = 0;
+
+    while let Some(start_pos) = output[search_from..].find(start_tag) {
+        let abs_start = search_from + start_pos;
+        let content_start = abs_start + start_tag.len();
+        if let Some(end_pos) = output[content_start..].find(end_tag) {
+            let task_id = output[content_start..content_start + end_pos].trim();
+            if !task_id.is_empty() {
+                results.push(task_id.to_string());
+            }
+            search_from = content_start + end_pos + end_tag.len();
+        } else {
+            break;
+        }
+    }
+
+    results
+}
+
 /// Check Claude's output for evidence the task was completed (commit message containing task ID).
 ///
 /// Fallback for when Claude commits in a different repo than the working directory.
 /// Looks for the task ID in brackets, e.g. `[FEAT-005]` in a commit message.
-/// Also tries the base ID (prefix stripped) as a fallback.
+/// Requires full prefixed ID — no base ID fallback.
 fn check_output_for_task_completion(
     output: &str,
     task_id: &str,
-    task_prefix: Option<&str>,
+    _task_prefix: Option<&str>,
 ) -> bool {
     let pattern = format!("[{}]", task_id);
-    if output.contains(&pattern) {
-        return true;
-    }
-    // Fallback: try base ID without prefix
-    let base_id = strip_task_prefix(task_id, task_prefix);
-    if base_id != task_id {
-        let base_pattern = format!("[{}]", base_id);
-        output.contains(&base_pattern)
-    } else {
-        false
-    }
+    output.contains(&pattern)
 }
 
 /// Scan Claude's output for any completed task IDs from the database.
@@ -1959,12 +2014,11 @@ fn reconcile_external_git_completions(
     let mut reconciled = 0;
 
     for task_id in &task_ids {
-        let task_id_upper = task_id.to_uppercase();
-        let base_id_upper = strip_task_prefix(task_id, task_prefix).to_uppercase();
-        let matched = commit_lines.iter().any(|line| {
-            contains_task_id(line, &task_id_upper)
-                || (task_id_upper != base_id_upper && contains_task_id(line, &base_id_upper))
-        });
+        // Require "-completed" suffix in commit message (case-insensitive)
+        let completed_marker = format!("{}-COMPLETED", task_id.to_uppercase());
+        let matched = commit_lines
+            .iter()
+            .any(|line| contains_task_id(line, &completed_marker));
         if matched {
             // Mark as done — force=false so dependency gating applies
             let ids = [task_id.clone()];
@@ -2029,16 +2083,16 @@ fn contains_task_id(text: &str, task_id: &str) -> bool {
     false
 }
 
-/// Check recent git commits for the task ID.
+/// Check recent git commits for the task ID with `-completed` suffix.
 ///
 /// Returns the commit hash if found, None otherwise.
 /// Checks the last `scan_depth` commits (subject + body) to handle multi-commit
 /// iterations where the task ID may appear in an earlier commit.
-/// Also tries the base ID (prefix stripped) as a fallback.
+/// Requires full prefixed ID with `-completed` suffix — no base ID fallback.
 fn check_git_for_task_completion(
     project_root: &Path,
     task_id: &str,
-    task_prefix: Option<&str>,
+    _task_prefix: Option<&str>,
     scan_depth: usize,
 ) -> Option<String> {
     use std::process::Command;
@@ -2057,8 +2111,8 @@ fn check_git_for_task_completion(
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
-    let task_id_upper = task_id.to_uppercase();
-    let base_id_upper = strip_task_prefix(task_id, task_prefix).to_uppercase();
+    // Require "-completed" suffix in commit message (case-insensitive)
+    let completed_marker = format!("{}-COMPLETED", task_id.to_uppercase());
 
     // Each record is: <hash>\0<full message>\0
     // Split on \0 and process pairs.
@@ -2076,9 +2130,7 @@ fn check_git_for_task_completion(
         }
 
         let message_upper = message.to_uppercase();
-        if contains_task_id(&message_upper, &task_id_upper)
-            || (task_id_upper != base_id_upper && contains_task_id(&message_upper, &base_id_upper))
-        {
+        if contains_task_id(&message_upper, &completed_marker) {
             return Some(hash.to_string());
         }
     }
@@ -2370,16 +2422,16 @@ mod tests {
     #[test]
     fn test_check_git_completion_finds_task_id_in_commit() {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(temp_dir.path(), "feat: [SEC-H005] Add feature");
+        git_commit(temp_dir.path(), "feat: SEC-H005-completed - Add feature");
 
         let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
-        assert!(result.is_some(), "Should find task ID in commit message");
+        assert!(result.is_some(), "Should find task ID with -completed suffix in commit message");
     }
 
     #[test]
     fn test_check_git_completion_case_insensitive() {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(temp_dir.path(), "feat: SEC-h005 lowercase");
+        git_commit(temp_dir.path(), "feat: sec-h005-Completed lowercase");
 
         let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
         assert!(result.is_some(), "Should find task ID case-insensitively");
@@ -2400,7 +2452,7 @@ mod tests {
     #[test]
     fn test_check_git_completion_returns_commit_hash() {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(temp_dir.path(), "feat: TASK-001 test");
+        git_commit(temp_dir.path(), "feat: TASK-001-completed test");
 
         let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
         assert!(result.is_some());
@@ -2416,7 +2468,7 @@ mod tests {
     fn test_check_git_completion_finds_task_in_earlier_commit() {
         // Claude may create multiple commits; the task ID might be in an earlier one
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(temp_dir.path(), "feat: [TASK-001] implement feature");
+        git_commit(temp_dir.path(), "feat: TASK-001-completed - implement feature");
         git_commit(temp_dir.path(), "fix: adjust config formatting");
         git_commit(temp_dir.path(), "chore: update lockfile");
 
@@ -2436,7 +2488,7 @@ mod tests {
                 "commit",
                 "--allow-empty",
                 "-m",
-                "feat: implement tests\n\nCompletes TASK-001 acceptance criteria",
+                "feat: TASK-001-completed\n\nCompletes TASK-001 acceptance criteria",
             ])
             .current_dir(temp_dir.path())
             .output()
@@ -2612,8 +2664,8 @@ mod tests {
 
         // Create external git repo with commits containing task IDs
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: FEAT-001 Implement feature");
-        git_commit(ext_repo.path(), "feat: FEAT-003 Already done task");
+        git_commit(ext_repo.path(), "feat: FEAT-001-completed - Implement feature");
+        git_commit(ext_repo.path(), "feat: FEAT-003-completed - Already done task");
 
         // Create PRD file
         let prd_dir = tempfile::TempDir::new().unwrap();
@@ -2675,7 +2727,7 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: sec-h005 lowercase commit");
+        git_commit(ext_repo.path(), "feat: sec-h005-completed lowercase commit");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -2908,7 +2960,7 @@ mod tests {
         // Regression: git-based detection returns Some(hash) which the loop
         // uses to increment tasks_completed by 1.
         let repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(repo.path(), "feat: P3-FEAT-001 Implement CallSupervisor");
+        git_commit(repo.path(), "feat: P3-FEAT-001-completed - Implement CallSupervisor");
 
         let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", None, 7);
         assert!(
@@ -2960,10 +3012,10 @@ mod tests {
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(
             ext_repo.path(),
-            "feat: P3-FEAT-001 Implement CallSupervisor",
+            "feat: P3-FEAT-001-completed - Implement CallSupervisor",
         );
-        git_commit(ext_repo.path(), "feat: P3-FEAT-002 Implement CallActor");
-        git_commit(ext_repo.path(), "feat: P3-FEAT-003 Implement BargeIn");
+        git_commit(ext_repo.path(), "feat: P3-FEAT-002-completed - Implement CallActor");
+        git_commit(ext_repo.path(), "feat: P3-FEAT-003-completed - Implement BargeIn");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3014,8 +3066,8 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: FEAT-001 Already done");
-        git_commit(ext_repo.path(), "feat: FEAT-002 New completion");
+        git_commit(ext_repo.path(), "feat: FEAT-001-completed Already done");
+        git_commit(ext_repo.path(), "feat: FEAT-002-completed New completion");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3106,8 +3158,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reconciliation_matches_base_id() {
-        // DB has prefixed ID "aeb10a1f-FIX-001", external repo commit uses "FIX-001"
+    fn test_reconciliation_no_match_without_completed_suffix() {
+        // DB has prefixed ID "aeb10a1f-FIX-001", commit uses bare "FIX-001" (no -completed suffix)
+        // Should NOT match — requires -completed suffix now
         let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
 
         conn.execute_batch(
@@ -3145,29 +3198,14 @@ mod tests {
         );
 
         assert_eq!(
-            count, 1,
-            "Should match base ID FIX-001 in commit even though DB has aeb10a1f-FIX-001"
+            count, 0,
+            "Should NOT match bare base ID without -completed suffix"
         );
-
-        // Verify task is done
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'aeb10a1f-FIX-001'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "done");
-
-        // Verify PRD was updated (via base ID fallback)
-        let prd_content = std::fs::read_to_string(&prd_path).unwrap();
-        let prd: serde_json::Value = serde_json::from_str(&prd_content).unwrap();
-        assert_eq!(prd["userStories"][0]["passes"], true);
     }
 
     #[test]
-    fn test_reconciliation_matches_full_id() {
-        // Commit uses full prefixed ID — should still match
+    fn test_reconciliation_matches_full_id_with_completed_suffix() {
+        // Commit uses full prefixed ID with -completed suffix — should match
         let (_temp_dir, mut conn) = crate::loop_engine::test_utils::setup_test_db();
 
         conn.execute_batch(
@@ -3177,7 +3215,7 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "fix: aeb10a1f-FIX-001 Fix the bug");
+        git_commit(ext_repo.path(), "fix: aeb10a1f-FIX-001-completed Fix the bug");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3208,8 +3246,8 @@ mod tests {
     }
 
     #[test]
-    fn test_output_scan_matches_base_id() {
-        // DB has prefixed ID, output has unprefixed bracket tag
+    fn test_output_scan_no_match_base_id() {
+        // DB has prefixed ID, output has unprefixed bracket tag — should NOT match
         use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
@@ -3222,19 +3260,57 @@ mod tests {
         let output = "Completed [FIX-001] successfully";
         let completed = scan_output_for_completed_tasks(output, &conn, Some("aeb10a1f"));
 
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], "aeb10a1f-FIX-001");
+        assert!(
+            completed.is_empty(),
+            "Should NOT match base ID without prefix in brackets"
+        );
     }
 
     #[test]
-    fn test_git_completion_matches_base_id() {
-        // DB has "uuid-FIX-001", commit has "FIX-001"
+    fn test_git_completion_no_match_without_completed_suffix() {
+        // DB has "uuid-FIX-001", commit has bare "FIX-001" — should NOT match
         let repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(repo.path(), "feat: FIX-001 implement feature");
 
         let result =
             check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"), 7);
-        assert!(result.is_some(), "Should match base ID FIX-001 in commit");
+        assert!(
+            result.is_none(),
+            "Should NOT match bare ID without -completed suffix"
+        );
+    }
+
+    #[test]
+    fn test_git_completion_matches_with_completed_suffix() {
+        let repo = crate::loop_engine::test_utils::setup_git_repo();
+        git_commit(
+            repo.path(),
+            "feat: aeb10a1f-FIX-001-completed - Fix the bug",
+        );
+
+        let result =
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"), 7);
+        assert!(
+            result.is_some(),
+            "Should match full ID with -completed suffix"
+        );
+    }
+
+    #[test]
+    fn test_git_completion_mention_in_body_no_match() {
+        // Commit body mentions another task ID without -completed suffix
+        let repo = crate::loop_engine::test_utils::setup_git_repo();
+        git_commit(
+            repo.path(),
+            "feat: some work\n\nThis prepares for aeb10a1f-FIX-002",
+        );
+
+        let result =
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-002", Some("aeb10a1f"), 7);
+        assert!(
+            result.is_none(),
+            "Mention in body without -completed suffix should NOT match"
+        );
     }
 
     #[test]
@@ -3262,14 +3338,13 @@ mod tests {
     }
 
     #[test]
-    fn test_check_output_matches_base_id() {
-        // Output has "[FIX-001]", DB ID is "aeb10a1f-FIX-001"
+    fn test_check_output_no_match_base_id() {
+        // Output has "[FIX-001]", DB ID is "aeb10a1f-FIX-001" — should NOT match
         let output = "feat: [FIX-001] Fix the bug";
-        assert!(check_output_for_task_completion(
-            output,
-            "aeb10a1f-FIX-001",
-            Some("aeb10a1f"),
-        ));
+        assert!(
+            !check_output_for_task_completion(output, "aeb10a1f-FIX-001", Some("aeb10a1f")),
+            "Should NOT match base ID without prefix in brackets"
+        );
     }
 
     // --- Stale tracker wiring tests ---
@@ -3782,9 +3857,9 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        // Both tasks appear in commits
-        git_commit(ext_repo.path(), "feat: FEAT-001 done");
-        git_commit(ext_repo.path(), "feat: FEAT-002 done");
+        // Both tasks appear in commits with -completed suffix
+        git_commit(ext_repo.path(), "feat: FEAT-001-completed done");
+        git_commit(ext_repo.path(), "feat: FEAT-002-completed done");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3845,7 +3920,7 @@ mod tests {
         .unwrap();
 
         let ext_repo = crate::loop_engine::test_utils::setup_git_repo();
-        git_commit(ext_repo.path(), "feat: FEAT-001 done");
+        git_commit(ext_repo.path(), "feat: FEAT-001-completed done");
 
         let prd_dir = tempfile::TempDir::new().unwrap();
         let prd_path = prd_dir.path().join("prd.json");
@@ -3970,5 +4045,51 @@ mod tests {
             !contains_task_id("FEAT-001", "FEAT-0010"),
             "FEAT-001 should not match FEAT-0010 (not a substring)"
         );
+    }
+
+    // ======================================================================
+    // parse_completed_tasks tests
+    // ======================================================================
+
+    #[test]
+    fn test_parse_completed_single_tag() {
+        let output = "Done!\n<completed>11dc526c-FEAT-001</completed>\n";
+        let result = parse_completed_tasks(output);
+        assert_eq!(result, vec!["11dc526c-FEAT-001"]);
+    }
+
+    #[test]
+    fn test_parse_completed_multiple_tags() {
+        let output = "<completed>ID-001</completed> and <completed>ID-002</completed>";
+        let result = parse_completed_tasks(output);
+        assert_eq!(result, vec!["ID-001", "ID-002"]);
+    }
+
+    #[test]
+    fn test_parse_completed_no_tags() {
+        let output = "Just mentioning 11dc526c-FEAT-001 in output";
+        let result = parse_completed_tasks(output);
+        assert!(result.is_empty(), "Bare mention should not match");
+    }
+
+    #[test]
+    fn test_parse_completed_empty_tag() {
+        let output = "<completed></completed>";
+        let result = parse_completed_tasks(output);
+        assert!(result.is_empty(), "Empty tag should be ignored");
+    }
+
+    #[test]
+    fn test_parse_completed_malformed_no_close() {
+        let output = "<completed>FEAT-001 some text";
+        let result = parse_completed_tasks(output);
+        assert!(result.is_empty(), "Malformed tag without close should be ignored");
+    }
+
+    #[test]
+    fn test_parse_completed_whitespace_trimmed() {
+        let output = "<completed>  FEAT-001  </completed>";
+        let result = parse_completed_tasks(output);
+        assert_eq!(result, vec!["FEAT-001"]);
     }
 }

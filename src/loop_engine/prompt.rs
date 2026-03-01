@@ -138,20 +138,24 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
     let task_section = format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json);
 
-    // Critical: Non-code task completion instruction (conditional)
-    let completion_section = if task_output.files.is_empty() {
+    // Critical: Universal completion instruction for ALL tasks
+    let completion_section = {
+        let non_code_note = if task_output.files.is_empty() {
+            "This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\n"
+        } else {
+            ""
+        };
         format!(
             "## Completing This Task\n\n\
-             This task has no `touchesFiles` — it is a verification, milestone, or polish task.\n\
-             After all acceptance criteria pass:\n\
-             1. Run `task-mgr done {task_id} --force` to mark it done in the DB\n\
-             2. Update the PRD JSON to set `passes: true` for this task\n\
-             3. Print the task ID in brackets in your output, e.g.: `Completed [{task_id}]`\n\n\
-             All three steps are **required** for the loop to detect completion.\n\n",
+             {non_code_note}\
+             When all acceptance criteria pass:\n\
+             1. Commit with message: `feat: {task_id}-completed - [Title]`\n\
+                If completing multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`\n\
+             2. Output `<completed>{task_id}</completed>` (using the full task ID shown above).\n\n\
+             The loop will automatically mark the task done and update the PRD.\n\
+             Do NOT run `task-mgr done` manually.\n\n",
             task_id = task_output.id,
         )
-    } else {
-        String::new()
     };
 
     // Critical: Escalation policy
