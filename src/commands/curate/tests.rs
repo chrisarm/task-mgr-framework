@@ -1,9 +1,11 @@
-//! Tests for curate retire and curate unretire commands.
+//! Tests for curate retire, curate unretire, and curate dedup merge commands.
 //!
+//! TEST-INIT-001: Dedup cluster merge logic (merge_cluster function).
 //! TEST-INIT-002: Retirement candidate identification (three criteria, dry-run, thresholds).
 //! TEST-INIT-003: Unretire (restore retired learnings, error handling).
 //!
-//! All tests are #[ignore] until the following are implemented:
+//! TEST-INIT-001 tests are #[ignore] until FEAT-004 is implemented.
+//! TEST-INIT-002/003 tests are #[ignore] until the following are implemented:
 //!   FEAT-001: retired_at column migration (v8)
 //!   FEAT-003: CLI scaffolding + types
 //!   FEAT-004: curate_retire() implementation
@@ -16,7 +18,7 @@ use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
-use super::{curate_retire, curate_unretire, RetireParams};
+use super::{curate_retire, curate_unretire, merge_cluster, MergeClusterParams, RetireParams};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Test helpers
@@ -1806,4 +1808,554 @@ fn test_enrich_batch_failure_previous_batches_committed_and_durable() {
     }
     // (stub setup: first batch succeeds, second fails apply_proposals_in_transaction)
     // assertions depend on stub behavior
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-INIT-001: merge_cluster() — dedup cluster merge logic
+//
+// All tests are #[ignore] until FEAT-004 (merge_cluster implementation).
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Helper: insert a learning with full metadata and bandit stats for merge tests.
+///
+/// Returns the new learning ID.
+fn insert_learning_full(
+    conn: &Connection,
+    title: &str,
+    confidence: Confidence,
+    applies_to_files: Option<Vec<&str>>,
+    applies_to_task_types: Option<Vec<&str>>,
+    applies_to_errors: Option<Vec<&str>>,
+    tags: Option<Vec<&str>>,
+    times_shown: i32,
+    times_applied: i32,
+) -> i64 {
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: title.to_string(),
+        content: format!("Content for {title}"),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: applies_to_files.map(|v| v.into_iter().map(str::to_string).collect()),
+        applies_to_task_types: applies_to_task_types
+            .map(|v| v.into_iter().map(str::to_string).collect()),
+        applies_to_errors: applies_to_errors.map(|v| v.into_iter().map(str::to_string).collect()),
+        tags: tags.map(|v| v.into_iter().map(str::to_string).collect()),
+        confidence,
+    };
+    let id = record_learning(conn, params)
+        .expect("insert_learning_full")
+        .learning_id;
+    // record_learning always initialises bandit stats to 0 — patch them now
+    conn.execute(
+        "UPDATE learnings SET times_shown = ?1, times_applied = ?2 WHERE id = ?3",
+        rusqlite::params![times_shown, times_applied, id],
+    )
+    .expect("set bandit stats");
+    id
+}
+
+/// Reads a single column value from the learnings table for the given learning.
+fn get_learning_col_str(conn: &Connection, id: i64, col: &str) -> Option<String> {
+    let sql = format!("SELECT {col} FROM learnings WHERE id = ?1");
+    conn.query_row(&sql, [id], |row| row.get::<_, Option<String>>(0))
+        .expect("get_learning_col_str: learning must exist")
+}
+
+fn get_learning_col_i64(conn: &Connection, id: i64, col: &str) -> i64 {
+    let sql = format!("SELECT {col} FROM learnings WHERE id = ?1");
+    conn.query_row(&sql, [id], |row| row.get::<_, i64>(0))
+        .expect("get_learning_col_i64: learning must exist")
+}
+
+fn get_learning_col_i32(conn: &Connection, id: i64, col: &str) -> i32 {
+    let sql = format!("SELECT {col} FROM learnings WHERE id = ?1");
+    conn.query_row(&sql, [id], |row| row.get::<_, i32>(0))
+        .expect("get_learning_col_i32: learning must exist")
+}
+
+/// Reads the sorted tags list for a learning from the `learning_tags` table.
+fn get_tags(conn: &Connection, id: i64) -> Vec<String> {
+    use crate::learnings::get_learning_tags;
+    let mut tags = get_learning_tags(conn, id).expect("get_tags");
+    tags.sort();
+    tags
+}
+
+/// Parses the JSON array column (applies_to_files etc.) into a sorted Vec.
+fn parse_json_array_col(conn: &Connection, id: i64, col: &str) -> Vec<String> {
+    match get_learning_col_str(conn, id, col) {
+        Some(json) => {
+            let mut v: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+            v.sort();
+            v
+        }
+        None => vec![],
+    }
+}
+
+// ── Core merge tests ──────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_two_learnings_creates_one_merged() {
+    // Merging 2 source learnings must produce exactly 1 new learning whose
+    // title and content come from the MergeClusterParams (not from the sources).
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "Learning A",
+        Confidence::Medium,
+        None,
+        None,
+        None,
+        None,
+        0,
+        0,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "Learning B",
+        Confidence::Medium,
+        None,
+        None,
+        None,
+        None,
+        0,
+        0,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "Merged Title".to_string(),
+        merged_content: "Merged Content".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    // Verify the merged learning has the LLM-supplied title/content
+    let title = get_learning_col_str(&conn, result.merged_learning_id, "title")
+        .expect("merged title must exist");
+    let content = get_learning_col_str(&conn, result.merged_learning_id, "content")
+        .expect("merged content must exist");
+    assert_eq!(title, "Merged Title");
+    assert_eq!(content, "Merged Content");
+    assert_eq!(result.retired_source_ids.len(), 2);
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_union_applies_to_files_no_duplicates() {
+    // merged learning.applies_to_files = union(source1, source2) with no dupes
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Medium,
+        Some(vec!["src/lib.rs", "src/main.rs"]),
+        None,
+        None,
+        None,
+        0,
+        0,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "B",
+        Confidence::Medium,
+        Some(vec!["src/main.rs", "src/foo.rs"]), // "src/main.rs" is a duplicate
+        None,
+        None,
+        None,
+        0,
+        0,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let files = parse_json_array_col(&conn, result.merged_learning_id, "applies_to_files");
+    assert_eq!(
+        files,
+        vec!["src/foo.rs", "src/lib.rs", "src/main.rs"],
+        "union of files, sorted, no duplicates"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_union_applies_to_task_types() {
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Medium,
+        None,
+        Some(vec!["FEAT-", "FIX-"]),
+        None,
+        None,
+        0,
+        0,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "B",
+        Confidence::Medium,
+        None,
+        Some(vec!["FIX-", "TEST-"]), // "FIX-" is a duplicate
+        None,
+        None,
+        0,
+        0,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let task_types =
+        parse_json_array_col(&conn, result.merged_learning_id, "applies_to_task_types");
+    assert_eq!(task_types, vec!["FEAT-", "FIX-", "TEST-"]);
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_union_applies_to_errors() {
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Medium,
+        None,
+        None,
+        Some(vec!["E0001", "E0002"]),
+        None,
+        0,
+        0,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "B",
+        Confidence::Medium,
+        None,
+        None,
+        Some(vec!["E0002", "E0003"]), // "E0002" is a duplicate
+        None,
+        0,
+        0,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let errors = parse_json_array_col(&conn, result.merged_learning_id, "applies_to_errors");
+    assert_eq!(errors, vec!["E0001", "E0002", "E0003"]);
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_union_tags_no_duplicates() {
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Medium,
+        None,
+        None,
+        None,
+        Some(vec!["alpha", "beta"]),
+        0,
+        0,
+    );
+    let id2 = insert_learning_full(
+        &conn,
+        "B",
+        Confidence::Medium,
+        None,
+        None,
+        None,
+        Some(vec!["beta", "gamma"]), // "beta" is a duplicate
+        0,
+        0,
+    );
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let tags = get_tags(&conn, result.merged_learning_id);
+    assert_eq!(tags, vec!["alpha", "beta", "gamma"]);
+}
+
+// ── Bandit stat tests ─────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_times_shown_is_sum_of_sources() {
+    // Known-bad discriminator: naive impl may forget to sum stats (leaves at 0).
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 5, 2);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 7, 3);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let times_shown = get_learning_col_i32(&conn, result.merged_learning_id, "times_shown");
+    assert_eq!(
+        times_shown, 12,
+        "times_shown must be 5+7=12, not 0 (naive bug)"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_times_applied_is_sum_of_sources() {
+    // Known-bad discriminator: naive impl may forget to sum stats.
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 5, 2);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 7, 3);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let times_applied = get_learning_col_i32(&conn, result.merged_learning_id, "times_applied");
+    assert_eq!(
+        times_applied, 5,
+        "times_applied must be 2+3=5, not 0 (naive bug)"
+    );
+}
+
+// ── Confidence tests ──────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_confidence_is_highest_from_sources() {
+    // high > medium > low; merged learning takes the highest, not from LLM
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::High, None, None, None, None, 0, 0);
+    let id3 = insert_learning_full(&conn, "C", Confidence::Medium, None, None, None, None, 0, 0);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2, id3],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let confidence = get_learning_col_str(&conn, result.merged_learning_id, "confidence")
+        .expect("confidence must exist");
+    assert_eq!(confidence, "high", "highest confidence from cluster wins");
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_confidence_not_from_llm_response() {
+    // Confidence must be computed from source confidences, not accepted from
+    // the LLM merged content.  We verify it equals "medium" (max of low+medium),
+    // regardless of what the LLM-produced content might claim.
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+
+    // The merged_content deliberately embeds "confidence: high" to tempt a naive
+    // implementation into parsing the LLM response for confidence.
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "Merged insight. confidence: high".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let confidence = get_learning_col_str(&conn, result.merged_learning_id, "confidence")
+        .expect("confidence must exist");
+    assert_eq!(
+        confidence, "medium",
+        "confidence must come from sources (medium), not from LLM content"
+    );
+}
+
+// ── Retirement / lifecycle tests ──────────────────────────────────────────────
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_sources_are_retired_after_merge() {
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    merge_cluster(&conn, params).expect("merge_cluster");
+
+    // Both sources must have retired_at set
+    for id in [id1, id2] {
+        let retired_at = get_learning_col_str(&conn, id, "retired_at");
+        assert!(
+            retired_at.is_some(),
+            "source learning {id} must have retired_at set after merge"
+        );
+    }
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_merged_learning_is_active() {
+    // The merged learning itself must NOT be retired (retired_at IS NULL)
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let retired_at = get_learning_col_str(&conn, result.merged_learning_id, "retired_at");
+    assert!(
+        retired_at.is_none(),
+        "merged learning must have retired_at = NULL (is active)"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_merge_window_stats_reset_to_zero() {
+    // window_shown and window_applied on the merged learning must be 0
+    // (per US-003: window stats are NOT carried from source learnings)
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning_full(
+        &conn,
+        "A",
+        Confidence::Medium,
+        None,
+        None,
+        None,
+        None,
+        10,
+        4,
+    );
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 8, 3);
+    // Manually set window_shown / window_applied on sources to non-zero values
+    conn.execute(
+        "UPDATE learnings SET window_shown = 6, window_applied = 2 WHERE id = ?1",
+        [id1],
+    )
+    .expect("set window stats on source 1");
+    conn.execute(
+        "UPDATE learnings SET window_shown = 4, window_applied = 1 WHERE id = ?1",
+        [id2],
+    )
+    .expect("set window stats on source 2");
+
+    let params = MergeClusterParams {
+        source_ids: vec![id1, id2],
+        merged_title: "M".to_string(),
+        merged_content: "MC".to_string(),
+    };
+    let result = merge_cluster(&conn, params).expect("merge_cluster");
+
+    let window_shown = get_learning_col_i32(&conn, result.merged_learning_id, "window_shown");
+    let window_applied = get_learning_col_i32(&conn, result.merged_learning_id, "window_applied");
+    assert_eq!(
+        window_shown, 0,
+        "window_shown must be 0 (reset, not summed)"
+    );
+    assert_eq!(
+        window_applied, 0,
+        "window_applied must be 0 (reset, not summed)"
+    );
+}
+
+// ── Cross-cluster dedup test ───────────────────────────────────────────────────
+
+#[test]
+#[ignore = "FEAT-004: merge_cluster not yet implemented"]
+fn test_already_merged_learning_skipped_in_second_cluster() {
+    // If learning A appears in cluster 1 (merged → M1) and cluster 2 also
+    // lists A as a source, the second cluster should skip A (already retired)
+    // and still create a merged learning from the remaining active sources.
+    let (_dir, conn) = setup_db();
+
+    let id_a = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 3, 1);
+    let id_b = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 4, 2);
+    let id_c = insert_learning_full(&conn, "C", Confidence::Medium, None, None, None, None, 5, 1);
+
+    // Cluster 1: merge A + B → M1
+    let params1 = MergeClusterParams {
+        source_ids: vec![id_a, id_b],
+        merged_title: "M1".to_string(),
+        merged_content: "Content M1".to_string(),
+    };
+    let result1 = merge_cluster(&conn, params1).expect("cluster 1 merge");
+    assert_eq!(result1.retired_source_ids.len(), 2);
+
+    // Cluster 2: A (already retired) + C → M2; A must be skipped
+    let params2 = MergeClusterParams {
+        source_ids: vec![id_a, id_c],
+        merged_title: "M2".to_string(),
+        merged_content: "Content M2".to_string(),
+    };
+    let result2 = merge_cluster(&conn, params2).expect("cluster 2 merge");
+
+    // A was already retired — it must appear in skipped, not retired
+    assert!(
+        result2.skipped_source_ids.contains(&id_a),
+        "already-merged learning A must be skipped in second cluster"
+    );
+    assert!(
+        !result2.retired_source_ids.contains(&id_a),
+        "already-merged learning A must NOT appear in retired list"
+    );
+    // C must be retired
+    assert!(
+        result2.retired_source_ids.contains(&id_c),
+        "active learning C must be retired in second cluster"
+    );
+    // M2 must be active
+    let retired_at = get_learning_col_str(&conn, result2.merged_learning_id, "retired_at");
+    assert!(
+        retired_at.is_none(),
+        "merged learning M2 must be active (retired_at IS NULL)"
+    );
 }

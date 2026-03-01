@@ -9,8 +9,8 @@ pub mod types;
 
 pub use output::{format_enrich_text, format_retire_text, format_unretire_text};
 pub use types::{
-    EnrichCandidate, EnrichParams, EnrichResult, RetireParams, RetireResult, RetirementCandidate,
-    UnretireResult,
+    EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, MergeClusterResult,
+    RetireParams, RetireResult, RetirementCandidate, UnretireResult,
 };
 
 use rusqlite::Connection;
@@ -294,6 +294,28 @@ pub fn find_enrichment_candidates(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(candidates)
+}
+
+/// Merges a cluster of duplicate learnings into a single canonical learning.
+///
+/// Given pre-validated `params` (source IDs + LLM-generated merged content),
+/// this function:
+/// 1. Loads each source learning; skips any that are already retired.
+/// 2. Creates a new merged learning whose metadata fields are the union of all
+///    source fields and whose bandit stats are the sums of the source stats.
+/// 3. Soft-archives each active source by setting `retired_at = datetime('now')`.
+/// 4. Returns the merged learning ID plus the lists of retired / skipped IDs.
+///
+/// All DB writes are performed inside a single transaction so the operation is
+/// atomic.
+///
+/// # Stub
+/// Not yet implemented — tracked as FEAT-004.
+pub fn merge_cluster(
+    _conn: &Connection,
+    _params: MergeClusterParams,
+) -> TaskMgrResult<MergeClusterResult> {
+    todo!("FEAT-004: implement merge_cluster")
 }
 
 #[cfg(test)]

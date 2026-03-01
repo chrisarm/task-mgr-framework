@@ -132,6 +132,33 @@ pub struct EnrichCandidate {
     pub missing_errors: bool,
 }
 
+/// Parameters for `merge_cluster()`: the pre-validated input to the DB merge operation.
+///
+/// The caller is responsible for resolving which source IDs form a duplicate
+/// cluster and for obtaining merged title/content from the LLM.  This struct
+/// carries only what the DB layer needs to perform the merge.
+#[derive(Debug, Clone)]
+pub struct MergeClusterParams {
+    /// IDs of source learnings to merge and retire.
+    pub source_ids: Vec<i64>,
+    /// Merged title produced by the LLM.
+    pub merged_title: String,
+    /// Merged content produced by the LLM.
+    pub merged_content: String,
+}
+
+/// Result of a single `merge_cluster()` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeClusterResult {
+    /// Database ID of the newly-created merged learning.
+    pub merged_learning_id: i64,
+    /// Source IDs that were retired as part of this merge.
+    pub retired_source_ids: Vec<i64>,
+    /// Source IDs skipped because they were already retired (e.g. merged by a
+    /// prior cluster in the same batch).
+    pub skipped_source_ids: Vec<i64>,
+}
+
 /// Parameters for the `curate retire` command.
 #[derive(Debug, Clone)]
 pub struct RetireParams {
