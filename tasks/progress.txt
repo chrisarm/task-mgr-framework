@@ -1,4 +1,14 @@
 
+## 2026-03-01 - adece6fc-REFACTOR-REVIEW-1
+- Reviewed curate/mod.rs, types.rs, output.rs, fts5.rs, patterns.rs for DRY, complexity, coupling
+- **retired_at IS NULL centralization**: NOT worth it — 14 filters use different aliases (l.retired_at vs retired_at) and query patterns (dynamic builders vs static SQL). Tests guard correctness better than abstraction.
+- **Issue 1 (REFACTOR-1-001)**: Duplicate IN-clause placeholder builder in retire_candidates and curate_unretire — extract helper
+- **Issue 2 (REFACTOR-1-002)**: build_reason has 8 params with #[allow(clippy::too_many_arguments)] — introduce struct
+- **No coupling issues**: curate module uses direct SQL consistent with codebase
+- **Extensibility**: Module structure ready for Phase 2/3 enrich/dedup additions
+- **Learnings:** Simple SQL filter fragments (retired_at IS NULL) don't benefit from centralization when alias context varies — test coverage is the real guard
+---
+
 ## 2026-03-01 - adece6fc-CODE-REVIEW-1
 - Reviewed all 20 files across migrations, retrieval, commands, CLI, handlers, and main.rs
 - **14 filtered queries**: All 14 have `retired_at IS NULL` — PASS
