@@ -572,8 +572,8 @@
       "id": "REFACTOR-REVIEW-1",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "notes": "For each issue found: 1) Add a REFACTOR-1-xxx task to JSON (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "notes": "Found 2 DRY issues: (1) lock.rs write_holder_info duplicates pid/host logic with write_holder_info_extended, (2) env.rs empty-parent cleanup duplicated between ensure_worktree and remove_worktree. Created REFACTOR-1-001 and REFACTOR-1-002.",
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "title": "Review implementation for refactoring opportunities",
@@ -627,6 +627,60 @@
       "conflictsWith": []
     },
     {
+      "id": "REFACTOR-1-001",
+      "title": "DRY: Deduplicate pid/host logic in lock.rs write_holder_info methods",
+      "description": "write_holder_info() and write_holder_info_extended() duplicate pid/host resolution and file truncation logic. Make write_holder_info delegate to write_holder_info_extended(None, None, None).",
+      "priority": 18,
+      "passes": false,
+      "status": "pending",
+      "estimatedEffort": "low",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/db/lock.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [],
+      "batchWith": [
+        "REFACTOR-1-002"
+      ],
+      "conflictsWith": [],
+      "acceptanceCriteria": [
+        "write_holder_info() delegates to write_holder_info_extended(None, None, None)",
+        "No duplicate pid/host resolution code",
+        "All existing lock tests pass"
+      ]
+    },
+    {
+      "id": "REFACTOR-1-002",
+      "title": "DRY: Extract cleanup_empty_parent() helper in env.rs",
+      "description": "The 'remove empty parent dir' logic appears in both ensure_worktree() (failure path) and remove_worktree(). Extract a shared cleanup_empty_parent(path) helper.",
+      "priority": 18,
+      "passes": false,
+      "status": "pending",
+      "estimatedEffort": "low",
+      "modifiesBehavior": false,
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
+      "batchWith": [
+        "REFACTOR-1-001"
+      ],
+      "conflictsWith": [],
+      "acceptanceCriteria": [
+        "Shared cleanup_empty_parent() helper used in both ensure_worktree and remove_worktree",
+        "No duplicate empty-parent cleanup code",
+        "All existing env tests pass"
+      ]
+    },
+    {
       "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001 through TEST-INIT-003) pass",
         "All implementation tasks (FEAT-001 through FEAT-007) pass",
@@ -653,7 +707,9 @@
         "CODE-REVIEW-1",
         "REFACTOR-REVIEW-1",
         "WIRE-FIX-001",
-        "WIRE-FIX-002"
+        "WIRE-FIX-002",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
       "description": "Verify all Group A+B features pass: remove_worktree, early exit cleanup, enhanced locks, banner hints, per-PRD progress, loop exit cleanup. All initial tests pass.",
       "estimatedEffort": "low",
