@@ -3,6 +3,7 @@
 //! Provides `curate retire` and `curate unretire` commands for managing
 //! the institutional memory quality via soft-archiving stale learnings.
 
+pub mod enrich;
 pub mod output;
 pub mod types;
 

@@ -1203,3 +1203,210 @@ fn test_enrich_empty_database_returns_empty_vec() {
         "empty db must return empty candidates"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-INIT-003: Enrich LLM prompt building and response parsing
+//
+// All tests are #[ignore] until FEAT-004 (build_enrich_prompt) and
+// FEAT-005 (parse_enrich_response) are implemented.
+// ──────────────────────────────────────────────────────────────────────────────
+
+use super::enrich::{build_enrich_prompt, parse_enrich_response, EnrichBatchItem};
+
+/// Returns a minimal batch of two items for prompt/parser tests.
+fn make_batch() -> Vec<EnrichBatchItem> {
+    vec![
+        EnrichBatchItem {
+            id: 1,
+            title: "SQLite busy error".to_string(),
+            content: "Concurrent writes cause SQLITE_BUSY due to missing busy_timeout.".to_string(),
+            existing_tags: vec!["sqlite".to_string(), "concurrency".to_string()],
+        },
+        EnrichBatchItem {
+            id: 2,
+            title: "Use Result for fallible ops".to_string(),
+            content: "Always return Result from functions that can fail.".to_string(),
+            existing_tags: vec![],
+        },
+    ]
+}
+
+#[test]
+#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
+fn test_enrich_prompt_contains_uuid_delimiter() {
+    // AC: prompt wraps learning content with a random UUID-based delimiter
+    let batch = make_batch();
+    let prompt = build_enrich_prompt(&batch);
+
+    assert!(
+        prompt.contains("===BOUNDARY_"),
+        "prompt must contain a UUID-based boundary delimiter for injection protection"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
+fn test_enrich_prompt_contains_untrusted_warning() {
+    // AC: prompt includes UNTRUSTED warning to guard against prompt injection
+    let batch = make_batch();
+    let prompt = build_enrich_prompt(&batch);
+
+    assert!(
+        prompt.contains("UNTRUSTED"),
+        "prompt must contain UNTRUSTED warning for injection protection"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
+fn test_enrich_prompt_includes_learning_id_title_content_tags() {
+    // AC: prompt includes ID, title, content, and existing tags for each batch item
+    let batch = make_batch();
+    let prompt = build_enrich_prompt(&batch);
+
+    // Item 1
+    assert!(prompt.contains("1"), "prompt must include learning ID 1");
+    assert!(
+        prompt.contains("SQLite busy error"),
+        "prompt must include learning title"
+    );
+    assert!(
+        prompt.contains("SQLITE_BUSY"),
+        "prompt must include learning content"
+    );
+    assert!(
+        prompt.contains("sqlite"),
+        "prompt must include existing tags"
+    );
+
+    // Item 2
+    assert!(prompt.contains("2"), "prompt must include learning ID 2");
+    assert!(
+        prompt.contains("Use Result for fallible ops"),
+        "prompt must include second learning title"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-004: build_enrich_prompt not yet implemented"]
+fn test_enrich_prompt_requests_json_with_expected_field_names() {
+    // AC: prompt requests a JSON response with specific field names
+    let batch = make_batch();
+    let prompt = build_enrich_prompt(&batch);
+
+    assert!(
+        prompt.contains("learning_id"),
+        "prompt must request 'learning_id' field in JSON response"
+    );
+    assert!(
+        prompt.contains("applies_to_files"),
+        "prompt must request 'applies_to_files' field"
+    );
+    assert!(
+        prompt.contains("applies_to_task_types"),
+        "prompt must request 'applies_to_task_types' field"
+    );
+    assert!(
+        prompt.contains("applies_to_errors"),
+        "prompt must request 'applies_to_errors' field"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
+fn test_parse_enrich_valid_json_array() {
+    // AC: parser returns proposals from a valid JSON array
+    let batch_ids = vec![1i64, 2];
+    let response = r#"[
+        {
+            "learning_id": 1,
+            "applies_to_files": ["src/db/*.rs"],
+            "applies_to_task_types": ["FEAT-", "FIX-"],
+            "applies_to_errors": ["SQLITE_BUSY"],
+            "applies_to_tags": ["sqlite"]
+        },
+        {
+            "learning_id": 2,
+            "applies_to_files": ["src/**/*.rs"],
+            "applies_to_task_types": [],
+            "applies_to_errors": [],
+            "applies_to_tags": []
+        }
+    ]"#;
+
+    let result = parse_enrich_response(response, &batch_ids).unwrap();
+
+    assert_eq!(result.len(), 2, "must return 2 proposals");
+    let p1 = result
+        .iter()
+        .find(|p| p.learning_id == 1)
+        .expect("proposal for id=1");
+    assert!(
+        p1.proposed_files.contains(&"src/db/*.rs".to_string()),
+        "proposal must include proposed files"
+    );
+    assert!(
+        p1.proposed_task_types.contains(&"FEAT-".to_string()),
+        "proposal must include proposed task types"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
+fn test_parse_enrich_garbage_response_returns_empty() {
+    // AC: parser returns empty vec on non-JSON garbage (no crash)
+    let batch_ids = vec![1i64, 2, 3];
+    let result = parse_enrich_response("not json at all", &batch_ids).unwrap();
+
+    assert!(
+        result.is_empty(),
+        "garbage response must return empty vec, not crash"
+    );
+}
+
+#[test]
+#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
+fn test_parse_enrich_markdown_code_block_json() {
+    // AC: parser handles JSON wrapped in markdown code block
+    let batch_ids = vec![1i64];
+    let response = r#"Here are my suggestions:
+
+```json
+[{"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": ["TEST-"], "applies_to_errors": [], "applies_to_tags": []}]
+```
+
+Let me know if you need anything else."#;
+
+    let result = parse_enrich_response(response, &batch_ids).unwrap();
+
+    assert_eq!(
+        result.len(),
+        1,
+        "must parse proposal from markdown code block"
+    );
+    assert_eq!(result[0].learning_id, 1);
+}
+
+#[test]
+#[ignore = "FEAT-005: parse_enrich_response not yet implemented"]
+fn test_parse_enrich_rejects_hallucinated_id() {
+    // Known-bad discriminator: parser must reject a response that references
+    // learning ID 999 when the batch only contains IDs [1, 2, 3].
+    let batch_ids = vec![1i64, 2, 3];
+    let response = r#"[
+        {"learning_id": 1, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "applies_to_tags": []},
+        {"learning_id": 999, "applies_to_files": ["src/**/*.rs"], "applies_to_task_types": [], "applies_to_errors": [], "applies_to_tags": []}
+    ]"#;
+
+    let result = parse_enrich_response(response, &batch_ids).unwrap();
+
+    assert!(
+        result.iter().all(|p| p.learning_id != 999),
+        "hallucinated ID 999 (not in batch [1,2,3]) must be rejected"
+    );
+    assert_eq!(
+        result.len(),
+        1,
+        "only the valid proposal (id=1) should be returned"
+    );
+}
