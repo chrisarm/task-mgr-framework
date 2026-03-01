@@ -837,6 +837,42 @@ GENERATED MAN PAGES:
         #[arg(long, default_value_t = false)]
         list: bool,
     },
+
+    /// Curate learnings (retire stale entries, unretire archived ones)
+    Curate {
+        #[command(subcommand)]
+        action: CurateAction,
+    },
+}
+
+/// Curate subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum CurateAction {
+    /// Identify and soft-archive stale learnings
+    Retire {
+        /// Preview candidates without modifying the database
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Minimum age in days for a low-confidence, never-applied learning to be retired
+        #[arg(long = "min-age-days", default_value_t = 90)]
+        min_age_days: u32,
+
+        /// Minimum times_shown for a never-applied or low-rate learning to be retired
+        #[arg(long = "min-shows", default_value_t = 10)]
+        min_shows: u32,
+
+        /// Maximum application rate (times_applied / times_shown) below which a learning is retired
+        #[arg(long = "max-rate", default_value_t = 0.05)]
+        max_rate: f64,
+    },
+
+    /// Restore soft-archived learnings by ID
+    Unretire {
+        /// Learning IDs to restore
+        #[arg(required = true)]
+        learning_ids: Vec<i64>,
+    },
 }
 
 /// Worktrees subcommand actions
