@@ -1,9 +1,17 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "feat/curate-learnings-p1",
   "description": "Phase 1 of Learning Curation: soft-archive infrastructure (retired_at column), curate retire/unretire commands, and retired_at IS NULL filters across all 14 retrieval queries.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -19,29 +27,18 @@
       "Handle Option/Result explicitly; avoid unwrap() in production code"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "No breaking changes to existing APIs unless explicitly required"
-    ]
-  },
+  "project": "task-mgr",
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "adece6fc",
   "userStories": [
     {
-      "id": "TEST-INIT-001",
-      "title": "Initial tests for retired_at filtering across all retrieval paths",
-      "description": "Write tests BEFORE implementation that verify retired learnings (retired_at IS NOT NULL) are excluded from every retrieval, list, count, and aggregate query. Must cover all 14 query locations. Also test that get_learning() by ID still returns retired learnings (exempt).",
       "acceptanceCriteria": [
         "Test creates a retired learning (manually set retired_at) and verifies it's excluded from FTS5 search",
         "Test verifies retired learning excluded from LIKE fallback search",
@@ -60,10 +57,10 @@
         "Known-bad discriminator: test that a naive implementation without filtering would include retired learnings",
         "Test file compiles (tests may be #[ignore] or expected to fail until FEAT-002)"
       ],
-      "priority": 1,
-      "estimatedEffort": "high",
-      "passes": false,
-      "notes": "This is the most critical test in Phase 1. Every one of the 14 YES-filter queries must be verified. Group tests by module (retrieval, recall, bandit, commands). Tests will fail until FEAT-001 (migration) and FEAT-002 (filters) are implemented.",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation that verify retired learnings (retired_at IS NOT NULL) are excluded from every retrieval, list, count, and aggregate query. Must cover all 14 query locations. Also test that get_learning() by ID still returns retired learnings (exempt).",
       "edgeCases": [
         "Retired learning with retired_at set appears in FTS5 search results — must be excluded",
         "Retired learning counted in SELECT COUNT(*) FROM learnings — must be excluded from count",
@@ -71,12 +68,7 @@
         "get_learning() by ID returns retired learning — must NOT be excluded (admin view)",
         "learning_exists() dedup check: retired learning with same outcome+title should not block new creation — debatable but current PRD says YES filter"
       ],
-      "invariants": [
-        "A learning with retired_at IS NOT NULL must never appear in any recall/retrieval result",
-        "A learning with retired_at IS NOT NULL must still be accessible by direct ID lookup",
-        "Active learning count must equal total minus retired count",
-        "Retiring a learning must not affect other active learnings"
-      ],
+      "estimatedEffort": "high",
       "failureModes": [
         {
           "cause": "Missing retired_at IS NULL filter in one of 14 queries",
@@ -87,21 +79,29 @@
           "expectedBehavior": "Test verifying retired learning accessible by ID fails"
         }
       ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "A learning with retired_at IS NOT NULL must never appear in any recall/retrieval result",
+        "A learning with retired_at IS NOT NULL must still be accessible by direct ID lookup",
+        "Active learning count must equal total minus retired count",
+        "Retiring a learning must not affect other active learnings"
+      ],
+      "modifiesBehavior": false,
+      "notes": "This is the most critical test in Phase 1. Every one of the 14 YES-filter queries must be verified. Group tests by module (retrieval, recall, bandit, commands). Tests will fail until FEAT-001 (migration) and FEAT-002 (filters) are implemented.",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "title": "Initial tests for retired_at filtering across all retrieval paths",
       "touchesFiles": [
         "src/learnings/retrieval/tests.rs",
         "src/learnings/recall/tests.rs",
         "src/commands/learnings.rs"
-      ],
-      "dependsOn": [],
-      "synergyWith": ["FEAT-001", "FEAT-002"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "TEST-INIT-002",
-      "title": "Initial tests for curate retire candidate identification",
-      "description": "Write tests for the retirement candidate identification logic: three criteria (old+low+unapplied, shown-but-never-applied, low-application-rate), dry-run mode, and actual retirement execution. Tests will fail until FEAT-004 is implemented.",
       "acceptanceCriteria": [
         "Test: learning matching criterion 1 (age >= 90 days, confidence=low, times_applied=0) is a candidate",
         "Test: learning matching criterion 2 (times_shown >= 10, times_applied=0) is a candidate",
@@ -113,10 +113,12 @@
         "Test: 0 candidates returns empty result, no errors",
         "Known-bad discriminator: high-confidence learning with 0 applications should NOT be retired by criterion 1 (requires low confidence)"
       ],
-      "priority": 3,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Use in-memory SQLite with schema+migrations applied. Set created_at manually for age-based tests. Tests depend on FEAT-001 for the retired_at column to exist.",
+      "batchWith": [
+        "TEST-INIT-003"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for the retirement candidate identification logic: three criteria (old+low+unapplied, shown-but-never-applied, low-application-rate), dry-run mode, and actual retirement execution. Tests will fail until FEAT-004 is implemented.",
       "edgeCases": [
         "0 learnings in database — return empty result, no error",
         "Learning exactly at age threshold boundary (89 days vs 90 days) — 89 should not be candidate",
@@ -124,11 +126,7 @@
         "Learning with application rate exactly at 0.05 threshold — should NOT be candidate (< 0.05, not <=)",
         "Already-retired learning — should not appear as candidate again"
       ],
-      "invariants": [
-        "dry_run=true must never modify the database",
-        "Candidate count in result must match actual retired_at updates when dry_run=false",
-        "Each candidate must have a human-readable reason string"
-      ],
+      "estimatedEffort": "medium",
       "failureModes": [
         {
           "cause": "Integer division in application rate (times_applied/times_shown returns 0 for 1/20)",
@@ -139,19 +137,25 @@
           "expectedBehavior": "Use >= for age comparison, test with boundary values"
         }
       ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "dry_run=true must never modify the database",
+        "Candidate count in result must match actual retired_at updates when dry_run=false",
+        "Each candidate must have a human-readable reason string"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Use in-memory SQLite with schema+migrations applied. Set created_at manually for age-based tests. Tests depend on FEAT-001 for the retired_at column to exist.",
+      "passes": false,
+      "priority": 3,
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "Initial tests for curate retire candidate identification",
       "touchesFiles": [
         "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": [],
-      "synergyWith": ["FEAT-004"],
-      "batchWith": ["TEST-INIT-003"],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "TEST-INIT-003",
-      "title": "Initial tests for curate unretire",
-      "description": "Write tests for the unretire subcommand: restoring retired learnings to active status, error handling for invalid/non-retired IDs.",
       "acceptanceCriteria": [
         "Test: unretire sets retired_at = NULL on a retired learning",
         "Test: unretired learning reappears in recall/list queries",
@@ -160,39 +164,43 @@
         "Test: unretire multiple IDs in one call",
         "Known-bad discriminator: unretiring an already-active learning should not succeed silently (must distinguish from actual unretire)"
       ],
-      "priority": 5,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Simpler than retire — straightforward CRUD operation. Tests depend on FEAT-001 for schema.",
+      "batchWith": [
+        "TEST-INIT-002"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for the unretire subcommand: restoring retired learnings to active status, error handling for invalid/non-retired IDs.",
       "edgeCases": [
         "Unretire non-existent learning ID — return NotFound error",
         "Unretire learning that is already active (retired_at IS NULL) — return error or no-op with message",
         "Unretire multiple IDs where some are valid and some are not — handle partial success"
       ],
-      "invariants": [
-        "After unretire, learning.retired_at must be NULL",
-        "After unretire, learning must appear in standard recall queries",
-        "Unretire must not modify any field other than retired_at"
-      ],
+      "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Unretire succeeds silently on non-existent ID",
           "expectedBehavior": "Return NotFound error with learning ID in message"
         }
       ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "After unretire, learning.retired_at must be NULL",
+        "After unretire, learning must appear in standard recall queries",
+        "Unretire must not modify any field other than retired_at"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Simpler than retire — straightforward CRUD operation. Tests depend on FEAT-001 for schema.",
+      "passes": false,
+      "priority": 5,
+      "synergyWith": [
+        "FEAT-005"
+      ],
+      "title": "Initial tests for curate unretire",
       "touchesFiles": [
         "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": [],
-      "synergyWith": ["FEAT-005"],
-      "batchWith": ["TEST-INIT-002"],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "FEAT-001",
-      "title": "Migration v8: add retired_at column to learnings table",
-      "description": "Create migration v8.rs that adds `retired_at TEXT DEFAULT NULL` to the learnings table. Register in migrations/mod.rs, bump CURRENT_SCHEMA_VERSION to 8.",
       "acceptanceCriteria": [
         "src/db/migrations/v8.rs exists with up_sql and down_sql",
         "up_sql: ALTER TABLE learnings ADD COLUMN retired_at TEXT DEFAULT NULL",
@@ -201,19 +209,18 @@
         "CURRENT_SCHEMA_VERSION bumped to 8",
         "cargo test passes (existing migration tests still work)"
       ],
-      "priority": 6,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Follow exact pattern from v7.rs. The down_sql can be a no-op like v7 since SQLite doesn't support DROP COLUMN in older versions. NULL columns are safe to leave.",
-      "touchesFiles": [
-        "src/db/migrations/v8.rs",
-        "src/db/migrations/mod.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["FEAT-002"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Create migration v8.rs that adds `retired_at TEXT DEFAULT NULL` to the learnings table. Register in migrations/mod.rs, bump CURRENT_SCHEMA_VERSION to 8.",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
       "modifiesBehavior": false,
+      "notes": "Follow exact pattern from v7.rs. The down_sql can be a no-op like v7 since SQLite doesn't support DROP COLUMN in older versions. NULL columns are safe to leave.",
+      "passes": false,
+      "priority": 6,
       "qualityDimensions": {
         "correctness": [
           "Migration must be idempotent when run on already-migrated DB (handled by version check)",
@@ -223,12 +230,17 @@
         "style": [
           "Follow exact pattern from v7.rs: static MIGRATION, version/description/up_sql/down_sql"
         ]
-      }
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Migration v8: add retired_at column to learnings table",
+      "touchesFiles": [
+        "src/db/migrations/v8.rs",
+        "src/db/migrations/mod.rs"
+      ]
     },
     {
-      "id": "FEAT-002",
-      "title": "Add retired_at IS NULL filter to all 14 retrieval queries",
-      "description": "Add `AND retired_at IS NULL` (or `WHERE retired_at IS NULL`) to all 14 queries that select from the learnings table for retrieval, listing, counting, or aggregation. Exempt queries: get_learning() by ID, apply_learning by ID, get_window_stats by ID, delete, bandit refresh_sliding_window.",
       "acceptanceCriteria": [
         "fts5.rs: FTS5 search query (line ~148) adds AND l.retired_at IS NULL",
         "fts5.rs: LIKE fallback query (line ~202) adds AND retired_at IS NULL",
@@ -246,26 +258,19 @@
         "stats.rs: query_learning_counts (line ~147) adds WHERE retired_at IS NULL",
         "All TEST-INIT-001 tests pass"
       ],
-      "priority": 7,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "This is mechanical but error-prone (14 locations). Work through each file systematically. The PRD's #1 risk is missing a filter in one location. The test from TEST-INIT-001 will catch any missed locations.",
-      "touchesFiles": [
-        "src/learnings/retrieval/fts5.rs",
-        "src/learnings/retrieval/patterns.rs",
-        "src/learnings/recall/mod.rs",
-        "src/learnings/bandit.rs",
-        "src/learnings/ingestion/mod.rs",
-        "src/commands/learnings.rs",
-        "src/commands/export/progress.rs",
-        "src/commands/import_learnings/mod.rs",
-        "src/commands/stats.rs"
-      ],
-      "dependsOn": ["FEAT-001", "TEST-INIT-001"],
-      "synergyWith": ["FEAT-001"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "TEST-INIT-001"
+      ],
+      "description": "Add `AND retired_at IS NULL` (or `WHERE retired_at IS NULL`) to all 14 queries that select from the learnings table for retrieval, listing, counting, or aggregation. Exempt queries: get_learning() by ID, apply_learning by ID, get_window_stats by ID, delete, bandit refresh_sliding_window.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
       "modifiesBehavior": true,
+      "notes": "This is mechanical but error-prone (14 locations). Work through each file systematically. The PRD's #1 risk is missing a filter in one location. The test from TEST-INIT-001 will catch any missed locations.",
+      "passes": false,
+      "priority": 7,
       "qualityDimensions": {
         "correctness": [
           "ALL 14 queries must have the filter — missing even one means retired learnings leak into recall",
@@ -279,12 +284,24 @@
           "Use consistent placement: AND retired_at IS NULL at end of WHERE clause",
           "For queries using append_common_filters(), consider adding the filter there if all callers need it"
         ]
-      }
+      },
+      "synergyWith": [
+        "FEAT-001"
+      ],
+      "title": "Add retired_at IS NULL filter to all 14 retrieval queries",
+      "touchesFiles": [
+        "src/learnings/retrieval/fts5.rs",
+        "src/learnings/retrieval/patterns.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/bandit.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/commands/learnings.rs",
+        "src/commands/export/progress.rs",
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/stats.rs"
+      ]
     },
     {
-      "id": "FEAT-003",
-      "title": "CLI scaffolding: CurateAction enum, Curate variant, module structure",
-      "description": "Create the CLI command structure for `curate` with subcommands. Add CurateAction enum in commands.rs, Curate variant in Commands enum, create src/commands/curate/ module with types.rs, mod.rs, output.rs stubs.",
       "acceptanceCriteria": [
         "CurateAction enum in cli/commands.rs with Retire, Unretire, and placeholder variants",
         "Retire variant has: --dry-run, --min-age-days (default 90), --min-shows (default 10), --max-rate (default 0.05)",
@@ -296,22 +313,19 @@
         "src/commands/mod.rs exports curate module",
         "task-mgr curate --help shows subcommands"
       ],
-      "priority": 8,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Follow the existing pattern from other subcommand enums (if any exist, e.g. run begin/end). CurateAction is similar to how other subcommand groups are organized. Result types must derive Serialize for JSON output mode.",
-      "touchesFiles": [
-        "src/cli/commands.rs",
-        "src/commands/curate/mod.rs",
-        "src/commands/curate/types.rs",
-        "src/commands/curate/output.rs",
-        "src/commands/mod.rs"
-      ],
-      "dependsOn": ["TEST-INIT-002", "TEST-INIT-003"],
-      "synergyWith": ["FEAT-004", "FEAT-005"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-002",
+        "TEST-INIT-003"
+      ],
+      "description": "Create the CLI command structure for `curate` with subcommands. Add CurateAction enum in commands.rs, Curate variant in Commands enum, create src/commands/curate/ module with types.rs, mod.rs, output.rs stubs.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
       "modifiesBehavior": false,
+      "notes": "Follow the existing pattern from other subcommand enums (if any exist, e.g. run begin/end). CurateAction is similar to how other subcommand groups are organized. Result types must derive Serialize for JSON output mode.",
+      "passes": false,
+      "priority": 8,
       "qualityDimensions": {
         "correctness": [
           "All result types must derive Serialize for JSON output",
@@ -322,12 +336,21 @@
           "Follow existing CLI patterns: clap derive, #[arg(long)] with defaults, #[command(after_help)] for examples",
           "RetirementCandidate must include reason string for human-readable dry-run output"
         ]
-      }
+      },
+      "synergyWith": [
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "title": "CLI scaffolding: CurateAction enum, Curate variant, module structure",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/output.rs",
+        "src/commands/mod.rs"
+      ]
     },
     {
-      "id": "FEAT-004",
-      "title": "Implement curate retire: candidate identification and soft-archive",
-      "description": "Implement the curate_retire() function that identifies stale learnings based on three criteria and either previews (dry-run) or soft-archives them by setting retired_at.",
       "acceptanceCriteria": [
         "curate_retire() in src/commands/curate/retire.rs accepts conn, dry_run, min_age_days, min_shows, max_rate",
         "SQL query identifies candidates matching ANY of 3 criteria with correct threshold comparisons",
@@ -341,18 +364,19 @@
         "Already-retired learnings excluded from candidate query (WHERE retired_at IS NULL)",
         "All TEST-INIT-002 tests pass"
       ],
-      "priority": 9,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Use CAST(times_applied AS REAL) / CAST(times_shown AS REAL) to avoid integer division. Use julianday('now') - julianday(created_at) for age calculation. Single SQL query with OR for all criteria, then post-process to assign reason strings.",
-      "touchesFiles": [
-        "src/commands/curate/retire.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-003"],
-      "synergyWith": ["FEAT-005"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-003"
+      ],
+      "description": "Implement the curate_retire() function that identifies stale learnings based on three criteria and either previews (dry-run) or soft-archives them by setting retired_at.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
       "modifiesBehavior": false,
+      "notes": "Use CAST(times_applied AS REAL) / CAST(times_shown AS REAL) to avoid integer division. Use julianday('now') - julianday(created_at) for age calculation. Single SQL query with OR for all criteria, then post-process to assign reason strings.",
+      "passes": false,
+      "priority": 9,
       "qualityDimensions": {
         "correctness": [
           "Integer division trap: MUST cast to REAL for application rate calculation",
@@ -367,12 +391,16 @@
           "Follow existing command pattern: Params struct, Result struct, main function",
           "Reason strings should be human-readable: 'Low confidence, never applied, 95 days old'"
         ]
-      }
+      },
+      "synergyWith": [
+        "FEAT-005"
+      ],
+      "title": "Implement curate retire: candidate identification and soft-archive",
+      "touchesFiles": [
+        "src/commands/curate/retire.rs"
+      ]
     },
     {
-      "id": "FEAT-005",
-      "title": "Implement curate unretire: restore soft-archived learnings",
-      "description": "Implement curate_unretire() that takes learning IDs and sets retired_at = NULL, restoring them to active status.",
       "acceptanceCriteria": [
         "curate_unretire() in src/commands/curate/unretire.rs accepts conn and learning_ids (Vec<i64>)",
         "Validates each ID exists in database",
@@ -382,18 +410,19 @@
         "Uses a transaction for atomicity",
         "All TEST-INIT-003 tests pass"
       ],
-      "priority": 10,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Simple CRUD operation. Check existence with get_learning(), then UPDATE. For invalid IDs (not found or not retired), collect errors but continue processing remaining IDs.",
-      "touchesFiles": [
-        "src/commands/curate/unretire.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-003"],
-      "synergyWith": ["FEAT-004"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-003"
+      ],
+      "description": "Implement curate_unretire() that takes learning IDs and sets retired_at = NULL, restoring them to active status.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
       "modifiesBehavior": false,
+      "notes": "Simple CRUD operation. Check existence with get_learning(), then UPDATE. For invalid IDs (not found or not retired), collect errors but continue processing remaining IDs.",
+      "passes": false,
+      "priority": 10,
       "qualityDimensions": {
         "correctness": [
           "Must validate learning exists AND is retired before unretiring",
@@ -403,12 +432,16 @@
         "style": [
           "Follow error handling pattern: collect per-ID results, return aggregate"
         ]
-      }
+      },
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "Implement curate unretire: restore soft-archived learnings",
+      "touchesFiles": [
+        "src/commands/curate/unretire.rs"
+      ]
     },
     {
-      "id": "FEAT-006",
-      "title": "Wire up handlers, text formatters, and main.rs dispatch for curate commands",
-      "description": "Connect the curate retire/unretire implementations to the CLI: add dispatch in main.rs, add TextFormattable impls in handlers.rs, ensure output_result works for both Text and JSON formats.",
       "acceptanceCriteria": [
         "Commands::Curate match arm in main.rs dispatches to retire/unretire based on CurateAction",
         "LockGuard acquired before DB operations",
@@ -420,19 +453,20 @@
         "task-mgr curate unretire 42 works end-to-end",
         "JSON output mode works (--format json)"
       ],
-      "priority": 11,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "This is the integration wiring task. Follow the exact pattern from other commands in main.rs (e.g., DeleteLearning dispatch at lines ~449-473). The LockGuard must be acquired for write operations.",
-      "touchesFiles": [
-        "src/main.rs",
-        "src/handlers.rs"
-      ],
-      "dependsOn": ["FEAT-003", "FEAT-004", "FEAT-005"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Connect the curate retire/unretire implementations to the CLI: add dispatch in main.rs, add TextFormattable impls in handlers.rs, ensure output_result works for both Text and JSON formats.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-006",
       "modifiesBehavior": false,
+      "notes": "This is the integration wiring task. Follow the exact pattern from other commands in main.rs (e.g., DeleteLearning dispatch at lines ~449-473). The LockGuard must be acquired for write operations.",
+      "passes": false,
+      "priority": 11,
       "qualityDimensions": {
         "correctness": [
           "LockGuard must be acquired before any DB write operation",
@@ -443,12 +477,15 @@
           "Follow exact dispatch pattern from existing commands in main.rs",
           "Import new types alongside existing learning imports in handlers.rs"
         ]
-      }
+      },
+      "synergyWith": [],
+      "title": "Wire up handlers, text formatters, and main.rs dispatch for curate commands",
+      "touchesFiles": [
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
     },
     {
-      "id": "FEAT-007",
-      "title": "Update learnings list to show active vs total count",
-      "description": "Modify the learnings list command to show both active count and total count (including retired). The existing count/list queries already filter by retired_at IS NULL (from FEAT-002), so add a separate total-including-retired count.",
       "acceptanceCriteria": [
         "LearningsListResult gains a `total_including_retired` field (or similar)",
         "List command queries both: active count (WHERE retired_at IS NULL) and total count (no filter)",
@@ -456,18 +493,18 @@
         "Text output unchanged when no retired learnings exist",
         "JSON output includes the new field"
       ],
-      "priority": 12,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Small enhancement to the existing list command. Add one more COUNT query without the retired_at filter. Only change the output format when retired count > 0 to avoid noise.",
-      "touchesFiles": [
-        "src/commands/learnings.rs"
-      ],
-      "dependsOn": ["FEAT-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Modify the learnings list command to show both active count and total count (including retired). The existing count/list queries already filter by retired_at IS NULL (from FEAT-002), so add a separate total-including-retired count.",
+      "estimatedEffort": "low",
+      "id": "FEAT-007",
       "modifiesBehavior": false,
+      "notes": "Small enhancement to the existing list command. Add one more COUNT query without the retired_at filter. Only change the output format when retired count > 0 to avoid noise.",
+      "passes": false,
+      "priority": 12,
       "qualityDimensions": {
         "correctness": [
           "total_including_retired must count ALL learnings (no retired_at filter)",
@@ -477,12 +514,14 @@
         "style": [
           "Only show retired count in output when > 0 to avoid noise for users without retired learnings"
         ]
-      }
+      },
+      "synergyWith": [],
+      "title": "Update learnings list to show active vs total count",
+      "touchesFiles": [
+        "src/commands/learnings.rs"
+      ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review implementation for quality, security, and integration wiring",
-      "description": "Review all Phase 1 implementation for code quality, error handling, security, and verify all new code is fully integrated and wired in.",
       "acceptanceCriteria": [
         "No unwrap() in production code paths",
         "All errors properly propagated with context",
@@ -496,11 +535,27 @@
         "No dead code warnings for new code",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
-      "priority": 13,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review all Phase 1 implementation for code quality, error handling, security, and verify all new code is fully integrated and wired in.",
       "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "Critical review. The #1 risk is a missed retired_at filter. Count all 14 filtered queries and 5 exempt queries explicitly. For each issue found: 1) Add a CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review implementation for quality, security, and integration wiring",
       "touchesFiles": [
         "src/db/migrations/v8.rs",
         "src/db/migrations/mod.rs",
@@ -522,17 +577,9 @@
         "src/commands/mod.rs",
         "src/handlers.rs",
         "src/main.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-1",
-      "title": "Review implementation for refactoring opportunities",
-      "description": "Analyze Phase 1 implementation code for DRY violations, complexity, coupling, and maintainability issues.",
       "acceptanceCriteria": [
         "No code duplication (DRY principle) — especially in the 14 filter additions",
         "Functions under 30 lines (flag complex ones)",
@@ -540,11 +587,21 @@
         "Code is easy to change and extend (Phase 2/3 will add enrich/dedup)",
         "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
       ],
-      "priority": 17,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze Phase 1 implementation code for DRY violations, complexity, coupling, and maintainability issues.",
       "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "Look especially for opportunities to centralize the retired_at filter (e.g., a shared WHERE clause fragment or helper). For each issue: 1) Add REFACTOR-1-xxx (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review implementation for refactoring opportunities",
       "touchesFiles": [
         "src/commands/curate/retire.rs",
         "src/commands/curate/unretire.rs",
@@ -552,17 +609,9 @@
         "src/commands/curate/output.rs",
         "src/learnings/retrieval/fts5.rs",
         "src/learnings/retrieval/patterns.rs"
-      ],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-1",
-      "title": "Phase 1 implementation complete: retire/unretire working, all filters in place",
-      "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001, TEST-INIT-002, TEST-INIT-003) pass",
         "All implementation tasks (FEAT-001 through FEAT-007) pass",
@@ -575,23 +624,36 @@
         "task-mgr curate retire --dry-run executes without error on test DB",
         "task-mgr curate unretire works on a retired learning"
       ],
-      "priority": 20,
-      "estimatedEffort": "low",
-      "model": "claude-sonnet-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Gate checkpoint: all initial tests pass, implementation reviewed, refactored, and fully wired in.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 implementation complete: retire/unretire working, all filters in place",
+      "touchesFiles": []
     },
     {
-      "id": "TEST-001",
-      "title": "Comprehensive tests for retirement filtering edge cases",
-      "description": "Expand test coverage for retired_at filtering: concurrent retire/query, filter interaction with existing WHERE clauses, FTS5 trigger behavior with retired learnings, pagination with mixed active/retired.",
       "acceptanceCriteria": [
         "Test: FTS5 index still contains retired learning content (triggers don't remove on retire) but query excludes it",
         "Test: pattern matching with retired learning that has applies_to_files — excluded from results",
@@ -602,25 +664,29 @@
         "Test: learnings list with --recent limit works correctly with mix of active/retired",
         "80%+ coverage for new filter code paths"
       ],
-      "priority": 25,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage for retired_at filtering: concurrent retire/query, filter interaction with existing WHERE clauses, FTS5 trigger behavior with retired learnings, pagination with mixed active/retired.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "TEST-001",
+      "modifiesBehavior": false,
       "notes": "These tests expand on TEST-INIT-001 with more realistic scenarios. Focus on interaction between retired_at filter and existing query features.",
+      "passes": false,
+      "priority": 25,
+      "synergyWith": [
+        "TEST-002"
+      ],
+      "title": "Comprehensive tests for retirement filtering edge cases",
       "touchesFiles": [
         "src/learnings/retrieval/tests.rs",
         "src/learnings/recall/tests.rs",
         "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-002"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "TEST-002",
-      "title": "Comprehensive tests for curate retire/unretire edge cases",
-      "description": "Expand test coverage for retire/unretire: threshold boundary values, mixed populations, error handling, output formatting.",
       "acceptanceCriteria": [
         "Test: retire with all thresholds at extreme values (0, MAX_INT)",
         "Test: retire when all learnings are candidates — retires all",
@@ -632,49 +698,56 @@
         "Test: unretire result JSON serialization includes all fields",
         "80%+ coverage for retire.rs and unretire.rs"
       ],
-      "priority": 30,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Focus on robustness: what happens with unexpected inputs, edge-case threshold values, and mixed populations.",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-001"],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage for retire/unretire: threshold boundary values, mixed populations, error handling, output formatting.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "modifiesBehavior": false,
+      "notes": "Focus on robustness: what happens with unexpected inputs, edge-case threshold values, and mixed populations.",
+      "passes": false,
+      "priority": 30,
+      "synergyWith": [
+        "TEST-001"
+      ],
+      "title": "Comprehensive tests for curate retire/unretire edge cases",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-2",
-      "title": "Review test code for refactoring opportunities",
-      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
       "acceptanceCriteria": [
         "No duplicated test setup code (e.g., create_retired_learning helper exists if needed in multiple tests)",
         "Helper functions extracted for common patterns",
         "Test names clearly describe what is tested",
         "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
       ],
-      "priority": 39,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002"
+      ],
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
       "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-2",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
+      "passes": false,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
       "touchesFiles": [
         "src/learnings/retrieval/tests.rs",
         "src/learnings/recall/tests.rs",
         "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": ["TEST-001", "TEST-002"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-2",
-      "title": "Full test coverage achieved for Phase 1",
-      "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
       "acceptanceCriteria": [
         "All comprehensive tests (TEST-001, TEST-002) pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
@@ -682,23 +755,28 @@
         "cargo test passes with no failures",
         "No flaky tests"
       ],
-      "priority": 50,
-      "estimatedEffort": "low",
-      "model": "claude-sonnet-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Full test coverage achieved, test code refactored.",
-      "touchesFiles": [],
-      "dependsOn": ["MILESTONE-1", "TEST-001", "TEST-002", "REFACTOR-REVIEW-2"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "passes": false,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Full test coverage achieved for Phase 1",
+      "touchesFiles": []
     },
     {
-      "id": "INT-001",
-      "title": "Integration verification: end-to-end curate retire/unretire workflow",
-      "description": "Verify the complete workflow works end-to-end: init DB, create learnings, retire candidates, verify exclusion from recall, unretire, verify re-inclusion.",
       "acceptanceCriteria": [
         "E2E test: init -> create learnings with various stats -> curate retire --dry-run -> verify no changes -> curate retire -> verify retired excluded from recall -> curate unretire -> verify re-included",
         "Verify migration v8 applies correctly on fresh DB (init + migrate)",
@@ -707,23 +785,25 @@
         "Verify JSON and Text output modes for both retire and unretire",
         "Verify curate --help shows all subcommands"
       ],
-      "priority": 55,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "This is the integration test that exercises the full workflow. Use a temp directory with task-mgr init.",
-      "touchesFiles": [
-        "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": ["MILESTONE-2"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Verify the complete workflow works end-to-end: init DB, create learnings, retire candidates, verify exclusion from recall, unretire, verify re-inclusion.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "This is the integration test that exercises the full workflow. Use a temp directory with task-mgr init.",
+      "passes": false,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration verification: end-to-end curate retire/unretire workflow",
+      "touchesFiles": [
+        "src/commands/curate/tests.rs"
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-3",
-      "title": "Final refactoring review for maintainability",
-      "description": "Comprehensive review of all Phase 1 code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
       "acceptanceCriteria": [
         "No code duplication across entire implementation and tests",
         "All functions under 30 lines or documented exceptions",
@@ -732,11 +812,21 @@
         "Phase 2/3 can easily add enrich/dedup without modifying Phase 1 code",
         "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
       ],
-      "priority": 65,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all Phase 1 code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
       "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "Final opportunity to improve code before merge. For each issue: 1) Add REFACTOR-3-xxx (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON.",
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
       "touchesFiles": [
         "src/commands/curate/mod.rs",
         "src/commands/curate/types.rs",
@@ -744,17 +834,9 @@
         "src/commands/curate/unretire.rs",
         "src/commands/curate/output.rs",
         "src/commands/curate/tests.rs"
-      ],
-      "dependsOn": ["INT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "VERIFY-001",
-      "title": "Final verification: all checks pass",
-      "description": "Final gate verification: full test suite, linting, formatting, no warnings.",
       "acceptanceCriteria": [
         "cargo fmt --check passes",
         "cargo check produces no warnings",
@@ -763,23 +845,26 @@
         "No dead code warnings for any new code",
         "task-mgr curate --help shows retire and unretire subcommands with correct flags"
       ],
-      "priority": 90,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Run all quality checks. This is the final gate before merge.",
-      "touchesFiles": [],
-      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Final gate verification: full test suite, linting, formatting, no warnings.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Run all quality checks. This is the final gate before merge.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification: all checks pass",
+      "touchesFiles": []
     },
     {
-      "id": "MILESTONE-FINAL",
-      "title": "Phase 1 complete: ready for merge",
-      "description": "All Phase 1 acceptance criteria met. curate retire/unretire working, all filters in place, full test coverage, all quality checks pass.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
@@ -787,18 +872,26 @@
         "No open CODE-FIX, WIRE-FIX, IMPL-FIX, or REFACTOR tasks",
         "Branch is ready to merge to main"
       ],
-      "priority": 99,
-      "estimatedEffort": "low",
-      "model": "claude-sonnet-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Phase 1 complete. Phase 2 (enrich) and Phase 3 (dedup) can be implemented on top of this.",
-      "touchesFiles": [],
-      "dependsOn": ["MILESTONE-2", "VERIFY-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-2",
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "All Phase 1 acceptance criteria met. curate retire/unretire working, all filters in place, full test coverage, all quality checks pass.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Phase 1 complete. Phase 2 (enrich) and Phase 3 (dedup) can be implemented on top of this.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 complete: ready for merge",
+      "touchesFiles": []
     }
-  ]
+  ],
+  "version": "1.0"
 }

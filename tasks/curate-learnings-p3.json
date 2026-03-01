@@ -2,7 +2,7 @@
   "version": "1.0",
   "project": "task-mgr",
   "model": "claude-sonnet-4-6",
-  "branchName": "feat/curate-learnings-p3",
+  "branchName": "feat/curate-learnings-p1",
   "description": "Phase 3 of Learning Curation: curate dedup subcommand — LLM-powered semantic deduplication and merging of learnings. Finds duplicate clusters via Claude, creates consolidated merged learnings with union metadata and summed bandit stats, soft-archives originals. PREREQUISITE: Phase 1 (tasks/curate-learnings-p1.json) must be merged to main before starting this phase.",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",

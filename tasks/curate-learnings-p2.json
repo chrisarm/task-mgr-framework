@@ -2,7 +2,7 @@
   "version": "1.0",
   "project": "task-mgr",
   "model": "claude-sonnet-4-6",
-  "branchName": "feat/curate-learnings-p2",
+  "branchName": "feat/curate-learnings-p1",
   "description": "Phase 2 of Learning Curation: Implement `curate enrich` to backfill missing metadata (applies_to_files, applies_to_task_types, applies_to_errors, tags) on existing learnings using LLM analysis. Also extends EditLearningParams for task_types/errors (FR-006). Depends on Phase 1 (migration v8, retired_at filters) being merged first.",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
