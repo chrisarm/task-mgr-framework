@@ -635,7 +635,9 @@
         "FEAT-006",
         "FEAT-007",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
       "synergyWith": [],
       "batchWith": [],
@@ -876,6 +878,53 @@
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-1-001",
+      "title": "Extract shared JSON array parsing utilities (3-way duplication)",
+      "description": "extract_json_array() and find_matching_bracket() are duplicated verbatim (~65 lines each) across dedup.rs, enrich.rs, and extraction.rs. Extract to a shared utility module and replace all three call sites.",
+      "priority": 18,
+      "status": "pending",
+      "passes": false,
+      "acceptanceCriteria": [
+        "Single implementation of extract_json_array and find_matching_bracket in a shared module",
+        "dedup.rs, enrich.rs, and extraction.rs all import from the shared module",
+        "All existing tests pass unchanged",
+        "cargo clippy clean, no dead code warnings"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/enrich.rs",
+        "src/learnings/ingestion/extraction.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-002"
+      ]
+    },
+    {
+      "id": "REFACTOR-1-002",
+      "title": "Extract confidence_rank helper (duplicated in merge_cluster and curate_dedup)",
+      "description": "The confidence_rank closure (high=2, medium=1, _=0) is duplicated in merge_cluster() line 377 and curate_dedup() line 659. Extract as a shared helper function in the curate module.",
+      "priority": 19,
+      "status": "pending",
+      "passes": false,
+      "acceptanceCriteria": [
+        "Single confidence_rank function used by both merge_cluster and curate_dedup",
+        "All existing tests pass unchanged",
+        "cargo clippy clean"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/mod.rs"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ]
     }
   ]
 }

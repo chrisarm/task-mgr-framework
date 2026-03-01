@@ -450,3 +450,12 @@
 - **No CODE-FIX tasks needed**: All acceptance criteria pass, no issues requiring fix tasks
 - **Learnings:** cargo fmt should be run before committing each FEAT task to avoid accumulated drift
 ---
+
+## 2026-03-01 - a8e80384-REFACTOR-REVIEW-1
+- Reviewed dedup.rs, types.rs, output.rs, extraction.rs for DRY, complexity, coupling, maintainability
+- **Issue 1 (REFACTOR-1-001)**: `extract_json_array()` + `find_matching_bracket()` duplicated verbatim 3× across dedup.rs, enrich.rs, extraction.rs (~195 lines total). Extract to shared utility module.
+- **Issue 2 (REFACTOR-1-002)**: `confidence_rank` closure duplicated in merge_cluster() and curate_dedup(). Extract as shared helper.
+- **Flagged but acceptable**: merge_cluster (~170 lines) and curate_dedup (~217 lines) exceed 30-line guideline but are orchestration functions — splitting would scatter flow. 4× set-to-sorted-vec pattern is only in one function.
+- **No coupling issues**: dedup.rs depends only on types; mod.rs uses public CRUD APIs cleanly.
+- **Learnings:** 3-way duplication of JSON parsing utils is the single biggest DRY violation in the curation codebase; confidence_rank is a minor but easy win
+---
