@@ -725,10 +725,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         }
 
         Commands::Curate { action } => {
-            use task_mgr::commands::curate::{
-                curate_retire, curate_unretire, format_retire_text, format_unretire_text,
-                RetireParams,
-            };
+            use task_mgr::commands::curate::{curate_retire, curate_unretire, RetireParams};
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
             match action {
@@ -745,11 +742,11 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                         max_rate,
                     };
                     let result = curate_retire(&conn, params)?;
-                    println!("{}", format_retire_text(&result));
+                    output_result(&result, cli.format);
                 }
                 CurateAction::Unretire { learning_ids } => {
                     let result = curate_unretire(&conn, learning_ids)?;
-                    println!("{}", format_unretire_text(&result));
+                    output_result(&result, cli.format);
                 }
             }
             Ok(())
