@@ -745,7 +745,7 @@
       "id": "FEAT-008",
       "modifiesBehavior": false,
       "notes": "Group C. Depends on MILESTONE-1 (remove_worktree + enhanced locks). Follow existing command module pattern: Result struct + format_text() + registration in mod.rs + handlers.rs TextFormattable impl.",
-      "passes": false,
+      "passes": true,
       "priority": 22,
       "qualityDimensions": {
         "correctness": [
@@ -1180,7 +1180,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final validation gate.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -1207,7 +1207,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate before merge.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,
