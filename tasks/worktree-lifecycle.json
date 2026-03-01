@@ -1,0 +1,1033 @@
+{
+  "branchName": "feat/worktree-lifecycle",
+  "description": "Phase 2 Worktree Lifecycle Management: cleanup on loop/batch exit, early exit cleanup, worktrees command, enhanced lock metadata, session banner hints, multi-PRD status, per-PRD progress files.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases. Tests verify boundaries work correctly",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works according to the plan",
+      "3. CORRECTNESS - Code compiles, type-checks, passes all tests deterministically",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings",
+      "5. POLISH - Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Ship solid working code first, then use tests to improve it",
+      "Test the boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "9c5c8a1d",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Test: remove_worktree() on clean worktree returns Ok(true) and path no longer exists",
+        "Test: remove_worktree() on dirty worktree returns Ok(false) and prints warning",
+        "Test: remove_worktree() removes empty parent dir after last worktree removed",
+        "Test: ensure_worktree() cleans up empty parent dir on git worktree add failure",
+        "Test: ensure_worktree() calls git worktree prune on partial failure",
+        "Known-bad discriminator: remove_worktree() with non-existent path returns error (not Ok(true))",
+        "Tests compile (may use #[ignore] where implementation doesn't exist yet)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation for remove_worktree() in env.rs and early exit cleanup in ensure_worktree(). Cover happy path removal, dirty worktree skip, partial creation cleanup, and git worktree prune on failure.",
+      "edgeCases": [
+        "Worktree with uncommitted changes: git worktree remove fails, must warn and return false",
+        "Worktree directory deleted out-of-band: git worktree prune should clean metadata",
+        "Empty {repo}-worktrees/ parent dir: should be removed after last worktree removed",
+        "Non-existent worktree path: should return error, not silently succeed"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "git worktree remove fails (dirty tree)",
+          "expectedBehavior": "Return Ok(false), print warning to stderr"
+        },
+        {
+          "cause": "git worktree add partially fails",
+          "expectedBehavior": "Run git worktree prune, remove empty parent if created"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "remove_worktree() never deletes a worktree with uncommitted changes",
+        "Successful removal always followed by git worktree prune",
+        "ensure_worktree() error path never leaves orphaned empty directories"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Use existing setup_git_repo() test helper from env.rs. Implementation tasks FEAT-001 and FEAT-002 depend on these.",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [
+        "TEST-INIT-002"
+      ],
+      "title": "Initial tests for remove_worktree() and early exit cleanup",
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: write_holder_info_extended() writes multi-line format with branch/worktree/prefix",
+        "Test: read_holder_info() parses new multi-line format into HolderInfo struct",
+        "Test: read_holder_info() falls back to old single-line pid@host format (backwards compat)",
+        "Test: read_holder_info() returns None for empty file",
+        "Test: lock error message includes branch + prefix when available",
+        "Known-bad discriminator: old format returns HolderInfo with None for branch/worktree/prefix (not empty strings)",
+        "Tests compile (may use #[ignore] where implementation doesn't exist yet)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation for HolderInfo struct, write_holder_info_extended(), and updated read_holder_info() in lock.rs. Cover new multi-line format writing/reading and backwards compatibility with old single-line format.",
+      "edgeCases": [
+        "Lock file in old single-line format: must parse first line as identity, optionals all None",
+        "Lock file with partial metadata (e.g., branch but no prefix): parse what exists, None for rest",
+        "Lock file with extra unknown key=value lines: ignore them gracefully",
+        "Empty lock file: return None"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Old lock file format encountered",
+          "expectedBehavior": "Parse as identity-only, all metadata fields None"
+        },
+        {
+          "cause": "Malformed key=value line",
+          "expectedBehavior": "Skip the line, don't error"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "read_holder_info() always succeeds on old-format lock files (backwards compat)",
+        "HolderInfo.identity always contains pid@host regardless of format",
+        "write_holder_info_extended() first line is always pid@host (for old readers)"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Existing lock.rs tests provide patterns. FEAT-003 depends on these.",
+      "passes": false,
+      "priority": 2,
+      "synergyWith": [
+        "TEST-INIT-001"
+      ],
+      "title": "Initial tests for enhanced lock file metadata",
+      "touchesFiles": [
+        "src/db/lock.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: print_session_banner() with all hints (DB, stop, pause, worktree) doesn't panic",
+        "Test: print_session_banner() without worktree path omits worktree line",
+        "Test: print_session_banner() with prefix uses .stop-{prefix} in hint",
+        "Test: resolve_paths() with prefix returns progress-{prefix}.txt",
+        "Test: resolve_paths() without prefix returns progress.txt (legacy)",
+        "Known-bad discriminator: resolve_paths with prefix='P1' returns 'progress-P1.txt' not 'progress.txt'",
+        "Tests compile"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation for enhanced print_session_banner() with path hints, and for resolve_paths() with optional prefix parameter for per-PRD progress files.",
+      "edgeCases": [
+        "No prefix in legacy DB: progress file falls back to progress.txt",
+        "Prefix with special characters: sanitized in filename",
+        "Banner with very long paths: truncated to fit fixed-width box"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Very long worktree path in banner",
+          "expectedBehavior": "Truncated with ... to fit box width"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "resolve_paths() without prefix always returns progress.txt",
+        "Banner output always goes to stderr, never stdout"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Existing display.rs and env.rs test patterns apply. FEAT-004 and FEAT-005 depend on these.",
+      "passes": false,
+      "priority": 3,
+      "synergyWith": [],
+      "title": "Initial tests for session banner hints and per-PRD progress files",
+      "touchesFiles": [
+        "src/loop_engine/display.rs",
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "If git worktree add fails and parent dir was just created (empty), parent is removed",
+        "If git worktree add partially fails, git worktree prune is called",
+        "Successful worktree creation path is unchanged",
+        "All TEST-INIT-001 early-exit tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Add cleanup on error paths in ensure_worktree(). If git worktree add fails after parent dir was created, remove the empty parent and run git worktree prune. No change to the successful creation path.",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Group A (standalone). Only modify the error path after line 449 in env.rs where create_result.status.success() is false. Track whether we created the parent dir to know if cleanup is needed.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "Must not remove parent dir if it existed before ensure_worktree() was called",
+          "Must not remove parent dir if it contains other worktrees"
+        ],
+        "performance": [
+          "Best effort — git commands are fast"
+        ],
+        "style": [
+          "Follow existing TaskMgrResult error propagation pattern",
+          "Use eprintln! for cleanup diagnostics"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "US-P2-002: Early exit worktree cleanup in ensure_worktree()",
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "remove_worktree() calls git worktree remove from source_root",
+        "On success, calls git worktree prune",
+        "On failure (uncommitted changes), prints warning to stderr and returns Ok(false)",
+        "Removes empty {repo}-worktrees/ parent dir if it becomes empty",
+        "parse_worktree_list() and compute_worktree_path() are pub(crate)",
+        "All TEST-INIT-001 removal tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Add pub fn remove_worktree(source_root, worktree_path) -> TaskMgrResult<bool> to env.rs. Runs git worktree remove, then git worktree prune. Returns true if removed, false if skipped (dirty). Also make parse_worktree_list() and compute_worktree_path() pub(crate) for reuse.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Group A (standalone). This function is the foundation for US-P2-001, US-P2-003, US-P2-005. Pattern: follow ensure_worktree() style for git Command usage.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": {
+        "correctness": [
+          "Must never delete a worktree with uncommitted changes",
+          "Must handle non-existent worktree path gracefully"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Return TaskMgrResult<bool> — true=removed, false=skipped",
+          "Use Command::new('git') pattern consistent with existing env.rs functions"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-001"
+      ],
+      "title": "US-P2-002: Add remove_worktree() utility function",
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "HolderInfo struct with identity, branch, worktree, prefix fields",
+        "write_holder_info_extended() writes multi-line format: pid@host\\nbranch=X\\nworktree=Y\\nprefix=Z",
+        "read_holder_info() returns Option<HolderInfo> (breaking change from Option<String>)",
+        "Old single-line format parsed as HolderInfo with identity only, metadata fields None",
+        "Lock error message includes branch + prefix when available",
+        "All TEST-INIT-002 tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/db/lock.rs",
+            "impact": "BREAKS",
+            "line": 76,
+            "mitigation": "Update to use HolderInfo.identity for the error message, add branch/prefix when available",
+            "usage": "acquire_inner() calls read_holder_info() to get existing holder for error message"
+          }
+        ],
+        "semanticDistinctions": []
+      },
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Add HolderInfo struct, write_holder_info_extended() method, and update read_holder_info() in lock.rs. Lock files become multi-line with branch/worktree/prefix metadata. Backwards-compatible with old single-line format.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Group A (standalone). Breaking change to read_holder_info() return type — update the single caller in acquire_inner() at line 76. First line of new format is always pid@host for old-reader compat.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": {
+        "correctness": [
+          "Old lock files must still be readable — backwards compatibility is mandatory",
+          "First line of new format must always be pid@host"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "HolderInfo fields use Option<String> for metadata (not empty strings)",
+          "Parse unknown key=value lines gracefully (skip, don't error)"
+        ]
+      },
+      "synergyWith": [],
+      "title": "US-P2-004: Enhanced lock file metadata",
+      "touchesFiles": [
+        "src/db/lock.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "SessionBannerParams struct with all banner fields",
+        "Banner displays DB path, stop hint, pause hint",
+        "Stop hint uses .stop-{prefix} when prefix is available",
+        "Worktree path shown only when using worktrees",
+        "Single caller in engine.rs updated to pass new params",
+        "All TEST-INIT-003 banner tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-003"
+      ],
+      "description": "Update print_session_banner() in display.rs to accept and display DB path, stop/pause hints, and worktree path. Use a SessionBannerParams struct instead of positional args.",
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Group A (standalone). Breaking change to print_session_banner() signature — only one caller at engine.rs:831. Box width may need to increase for longer hint lines.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": {
+        "correctness": [
+          "Banner must not panic on very long paths — truncate"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Use struct param instead of many positional args",
+          "All output to stderr via eprintln!"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-005"
+      ],
+      "title": "US-P2-006: Enhanced session banner with path hints",
+      "touchesFiles": [
+        "src/loop_engine/display.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "resolve_paths() accepts optional prefix: Option<&str> parameter",
+        "With prefix: returns progress-{prefix}.txt path",
+        "Without prefix: returns progress.txt (unchanged)",
+        "Caller in engine.rs passes task_prefix to resolve_paths()",
+        "All TEST-INIT-003 progress file tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 660,
+            "mitigation": "Pass task_prefix (already available) as new parameter",
+            "usage": "Calls resolve_paths() to get progress_file path"
+          }
+        ],
+        "semanticDistinctions": []
+      },
+      "dependsOn": [
+        "TEST-INIT-003"
+      ],
+      "description": "Add optional prefix parameter to resolve_paths() in env.rs. When prefix is present, progress file becomes progress-{prefix}.txt. Falls back to progress.txt for legacy/no-prefix mode.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
+      "modifiesBehavior": true,
+      "notes": "Group A (standalone). Breaking change to resolve_paths() — update caller in engine.rs. The progress::rotate_progress() call at engine.rs:857 already uses paths.progress_file so it will automatically use the prefixed path.",
+      "passes": false,
+      "priority": 10,
+      "qualityDimensions": {
+        "correctness": [
+          "Must not break existing progress.txt when no prefix is used",
+          "Existing progress.txt continues to work (no migration needed)"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing resolve_paths() pattern"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "US-P2-008: Per-PRD progress files via resolve_paths()",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Loop lock acquisition calls write_holder_info_extended() with branch, worktree, prefix",
+        "Lock error messages now show branch + prefix from HolderInfo",
+        "Existing lock acquisition for DB commands (acquire()) still uses basic format"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Update engine.rs to pass branch name, worktree path, and task prefix to write_holder_info_extended() when acquiring the loop lock. This connects the enhanced lock format (FEAT-003) to the actual loop execution context.",
+      "estimatedEffort": "low",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Group B. Depends on FEAT-003 (enhanced lock) being complete. The lock is acquired early in run_loop() — update that call site.",
+      "passes": false,
+      "priority": 11,
+      "qualityDimensions": {
+        "correctness": [
+          "Lock must still be released properly on Drop"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Pass metadata as Option<&str> — None when not available yet"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "US-P2-004: Wire enhanced lock metadata into engine.rs",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "run_loop() returns LoopResult { exit_code: i32, worktree_path: Option<PathBuf> }",
+        "Both callers (main.rs, batch.rs) updated for new return type",
+        "--cleanup-worktree flag added to Loop command in cli/commands.rs",
+        "cleanup_worktree field added to LoopConfig",
+        "On completion with --cleanup-worktree: calls remove_worktree()",
+        "On completion interactive: prompts user to remove worktree",
+        "On completion with --yes (no --cleanup-worktree): keeps worktree",
+        "If removal fails (dirty): warns but exits with original exit code"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/main.rs",
+            "impact": "BREAKS",
+            "line": 606,
+            "mitigation": "Update to use .exit_code from LoopResult",
+            "usage": "Calls run_loop(), uses return as exit code"
+          },
+          {
+            "file": "src/loop_engine/batch.rs",
+            "impact": "BREAKS",
+            "line": 226,
+            "mitigation": "Update to use .exit_code, also access .worktree_path for batch cleanup",
+            "usage": "Calls run_loop(), stores exit_code in PrdRunResult"
+          }
+        ],
+        "semanticDistinctions": []
+      },
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Add --cleanup-worktree flag to the loop command. On loop completion, optionally clean up the worktree. In interactive mode, prompt to remove. With --cleanup-worktree, force removal. In --yes mode without --cleanup-worktree, auto-keep. Return LoopResult struct from run_loop() instead of bare i32.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-007",
+      "modifiesBehavior": true,
+      "notes": "Group B. Depends on FEAT-002 (remove_worktree). Insert cleanup logic after Step 21 in engine.rs (after deadline/signal cleanup, before final banner). The LoopResult return type change affects main.rs and batch.rs.",
+      "passes": false,
+      "priority": 12,
+      "qualityDimensions": {
+        "correctness": [
+          "Must not error on cleanup failure — warn only",
+          "LoopResult must be returned even if cleanup fails"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "LoopResult struct in engine.rs, derives Debug",
+          "Cleanup logic in a separate helper function, not inline in run_loop()"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "title": "US-P2-001: Worktree cleanup on loop exit",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/config.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context",
+        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "Edge case coverage: each edgeCases entry from TEST-INIT tasks has a corresponding test",
+        "Integration wiring: all new functions exported, called from correct places",
+        "No dead code warnings from cargo check/clippy",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review all implementation tasks (FEAT-001 through FEAT-007) for code quality, error handling, security, and integration wiring completeness.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add a CODE-FIX-xxx task to the JSON (priority 14-16), 2) Add CODE-FIX-xxx to MILESTONE-1 dependsOn array, 3) Commit JSON changes. Mark CODE-REVIEW-1 as passes:true once review is complete and all tasks are added.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review Group A+B implementation for quality, security, and integration wiring",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/db/lock.rs",
+        "src/loop_engine/display.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/config.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "No tight coupling between modules",
+        "Code is easy to change and extend",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues before MILESTONE-1.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add a REFACTOR-1-xxx task to JSON (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/db/lock.rs",
+        "src/loop_engine/display.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All initial tests (TEST-INIT-001 through TEST-INIT-003) pass",
+        "All implementation tasks (FEAT-001 through FEAT-007) pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx or WIRE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points (no dead code)",
+        "No unused warnings for new code in cargo check / cargo clippy",
+        "cargo test passes with no failures",
+        "cargo fmt --check passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Verify all Group A+B features pass: remove_worktree, early exit cleanup, enhanced locks, banner hints, per-PRD progress, loop exit cleanup. All initial tests pass.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Gate before Group C (worktrees command, batch cleanup) and comprehensive testing.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Gate: Core worktree lifecycle and enhanced locks implemented",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Worktrees subcommand added to Commands enum in cli/commands.rs with List, Prune, Remove(target) actions",
+        "commands/worktrees.rs module with list(), prune(), remove() functions",
+        "list: parses git worktree list, cross-references lock files in .task-mgr/, shows branch+path+lock status",
+        "prune: removes worktrees with no active lock via remove_worktree(), then git worktree prune",
+        "remove: finds worktree by path or branch, calls remove_worktree()",
+        "WorktreesResult struct with format_text() for human-readable output",
+        "Command dispatched from main.rs",
+        "Module registered in commands/mod.rs and handlers.rs"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Add new task-mgr worktrees subcommand with list, prune, and remove actions. List shows all worktrees with branch, path, and lock status. Prune removes unlocked worktrees. Remove targets a specific worktree by path or branch.",
+      "estimatedEffort": "high",
+      "id": "FEAT-008",
+      "modifiesBehavior": false,
+      "notes": "Group C. Depends on MILESTONE-1 (remove_worktree + enhanced locks). Follow existing command module pattern: Result struct + format_text() + registration in mod.rs + handlers.rs TextFormattable impl.",
+      "passes": false,
+      "priority": 22,
+      "qualityDimensions": {
+        "correctness": [
+          "prune must cross-reference lock files before removing — never remove an actively locked worktree",
+          "list must handle case where git worktree list returns bare repo as first entry"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow commands/ pattern: {Name}Result struct + format_text()",
+          "Register in handlers.rs via impl_text_formattable! macro"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-009"
+      ],
+      "title": "US-P2-003: Worktrees list/prune/remove command",
+      "touchesFiles": [
+        "src/commands/worktrees.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "--keep-worktrees flag added to Batch command in cli/commands.rs",
+        "batch.rs accesses LoopResult.worktree_path after each PRD run",
+        "On success + --yes: auto-remove worktree via remove_worktree()",
+        "On failure: keep worktree regardless of flags",
+        "With --keep-worktrees: never remove",
+        "Interactive (no --yes): prompt user to remove each worktree",
+        "Cleanup failure warns but doesn't affect batch result"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "After each PRD's loop completes in batch mode, offer to remove its worktree. In --yes mode, auto-remove on success, keep on failure. Add --keep-worktrees flag to batch command.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-009",
+      "modifiesBehavior": false,
+      "notes": "Group C. Depends on FEAT-007 (LoopResult) being complete. Add cleanup logic after each engine::run_loop() call in the batch for-loop.",
+      "passes": false,
+      "priority": 23,
+      "qualityDimensions": {
+        "correctness": [
+          "Must never remove worktree on failure — user needs to inspect",
+          "Cleanup failure must not change batch exit code"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing batch.rs patterns for flag threading"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-008"
+      ],
+      "title": "US-P2-005: Batch worktree cleanup between PRDs",
+      "touchesFiles": [
+        "src/loop_engine/batch.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "list command groups tasks by prefix header when multiple prefixes exist in DB",
+        "list with single prefix shows flat list (unchanged behavior)",
+        "status command shows per-PRD summary row: prefix, task counts, active lock",
+        "status --prefix P1 filters to single PRD",
+        "status with no prefix and multiple PRDs shows combined view with prefix headers"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Update task-mgr list to group tasks by prefix when multiple prefixes exist. Update task-mgr status to show per-PRD summary with prefix, task counts, and active lock. Add --prefix filter option.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-010",
+      "modifiesBehavior": false,
+      "notes": "Group C. Depends on MILESTONE-1 (enhanced lock info for detecting active locks). Queries prd_metadata for distinct prefixes. Uses Phase 1 prefix scoping if available.",
+      "passes": false,
+      "priority": 24,
+      "qualityDimensions": {
+        "correctness": [
+          "No prefix in legacy DB: show ungrouped (unchanged)",
+          "Single prefix: no grouping headers needed"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Follow existing format_text() patterns for tabular output"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-008"
+      ],
+      "title": "US-P2-007: Multi-PRD status and list awareness",
+      "touchesFiles": [
+        "src/commands/list.rs",
+        "src/loop_engine/status.rs",
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: remove_worktree() on worktree with staged but uncommitted changes",
+        "Test: remove_worktree() when worktree path is already gone (out-of-band delete)",
+        "Test: remove_worktree() removes parent dir only when truly empty",
+        "Test: ensure_worktree() cleanup when git worktree add fails with 'already exists' error",
+        "Parameterized tests for various git states (clean, dirty, detached HEAD)",
+        "80%+ coverage for new remove_worktree() function"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage for remove_worktree() and ensure_worktree() error paths. Cover concurrent scenarios, edge cases with permissions, and worktree prune behavior.",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 25,
+      "synergyWith": [
+        "TEST-002"
+      ],
+      "title": "Comprehensive tests for remove_worktree() and early exit cleanup",
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: write then read round-trip for all metadata fields",
+        "Test: read_holder_info with only some key=value lines present",
+        "Test: read_holder_info with unknown extra lines (future extensibility)",
+        "Test: lock error formatting with full HolderInfo vs partial vs None",
+        "Test: concurrent lock shows other process's branch/prefix in error",
+        "80%+ coverage for HolderInfo-related code"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage for HolderInfo, write_holder_info_extended(), and read_holder_info(). Cover format edge cases and backwards compatibility thoroughly.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 26,
+      "synergyWith": [
+        "TEST-001"
+      ],
+      "title": "Comprehensive tests for enhanced lock metadata",
+      "touchesFiles": [
+        "src/db/lock.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: worktrees list shows correct branch, path, lock status",
+        "Test: worktrees prune skips locked worktrees",
+        "Test: worktrees remove by branch name",
+        "Test: worktrees remove by path",
+        "Test: batch cleanup removes worktree on success, keeps on failure",
+        "Test: batch --keep-worktrees preserves all",
+        "Test: list groups by prefix with multiple prefixes in DB",
+        "Test: status --prefix filters correctly",
+        "Test: resolve_paths with prefix returns correct progress filename",
+        "80%+ coverage for new command and batch cleanup code"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010"
+      ],
+      "description": "Tests for worktrees list/prune/remove, batch worktree cleanup, multi-PRD list grouping, and per-PRD progress files.",
+      "estimatedEffort": "high",
+      "id": "TEST-003",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 30,
+      "synergyWith": [],
+      "title": "Comprehensive tests for worktrees command, batch cleanup, and multi-PRD views",
+      "touchesFiles": [
+        "src/commands/worktrees.rs",
+        "src/loop_engine/batch.rs",
+        "src/commands/list.rs",
+        "src/loop_engine/status.rs",
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns (e.g., setup_git_repo_with_worktree)",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002",
+        "TEST-003"
+      ],
+      "description": "Analyze all test code for duplication, helper extraction, and clarity improvements before MILESTONE-2.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add a REFACTOR-2-xxx task to JSON (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON. If no issues, mark passes:true.",
+      "passes": false,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/db/lock.rs",
+        "src/commands/worktrees.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All comprehensive tests (TEST-001 through TEST-003) pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "cargo test passes with no failures",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "TEST-003",
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "All comprehensive tests pass, test code refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Gate before integration testing.",
+      "passes": false,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Gate: Full test coverage for worktree lifecycle",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Integration test creates a git repo with PRD, runs loop (mocked Claude), verifies worktree created",
+        "Test verifies lock file contains branch/worktree/prefix metadata",
+        "Test verifies worktree is cleaned up when --cleanup-worktree is set",
+        "Test verifies banner output includes DB path and stop hints",
+        "cargo test passes for integration tests"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "End-to-end integration test verifying the worktree lifecycle: loop creates worktree, runs iterations, cleans up on exit. Also verify enhanced lock metadata is written and readable.",
+      "estimatedEffort": "high",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "May need to simplify by testing individual subsystems rather than full end-to-end if loop spawning is complex in test context.",
+      "passes": false,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration test: full loop with worktree cleanup",
+      "touchesFiles": [
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows project patterns (see CLAUDE.md)",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all implementation and test code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge. For each issue: add REFACTOR-3-xxx (priority 66-80) to JSON and MILESTONE-FINAL dependsOn.",
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/db/lock.rs",
+        "src/loop_engine/display.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/commands/worktrees.rs",
+        "src/commands/list.rs",
+        "src/loop_engine/status.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check produces no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes with no failures",
+        "All 8 user stories (US-P2-001 through US-P2-008) have corresponding passing tasks",
+        "No dead code warnings for any new code"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Run the full test suite, linting, and formatting checks. Verify all user stories from the PRD are covered.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final validation gate.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification: all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All user stories implemented and tested",
+        "No regressions in existing cargo test suite",
+        "Branch is merge-ready"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "All tasks complete, all tests pass, all reviews done. Ready to merge feat/worktree-lifecycle to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Gate: Worktree lifecycle management ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
