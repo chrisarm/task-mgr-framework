@@ -241,3 +241,70 @@ pub fn format_text(result: &ImportLearningsResult) -> String {
 
     output
 }
+
+// ========== TEST-INIT-001: retired_at Filtering Tests ==========
+// Inline tests (not in tests.rs) to access private `load_existing_keys`.
+// #[ignore] until FEAT-001 and FEAT-002 are implemented.
+//
+// Query location covered:
+//  14. Import dedup check (load_existing_keys: SELECT title, content FROM learnings)
+#[cfg(test)]
+mod retired_tests {
+    use super::load_existing_keys;
+    use crate::db::{create_schema, open_connection, run_migrations};
+    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::models::{Confidence, LearningOutcome};
+    use tempfile::TempDir;
+
+    fn setup_test_db() -> (TempDir, rusqlite::Connection) {
+        let dir = TempDir::new().expect("create temp dir");
+        let mut conn = open_connection(dir.path()).expect("open connection");
+        create_schema(&conn).expect("create schema");
+        run_migrations(&mut conn).expect("run migrations");
+        (dir, conn)
+    }
+
+    fn retire_learning(conn: &rusqlite::Connection, id: i64) {
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [id],
+        )
+        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_retired_excluded_from_import_dedup_load_existing_keys() {
+        // AC: import dedup (load_existing_keys) must exclude retired learnings.
+        // After retirement, reimporting the same title+content must succeed
+        // (not be blocked by the dedup check).
+        let (_dir, conn) = setup_test_db();
+
+        let params = RecordLearningParams {
+            outcome: LearningOutcome::Pattern,
+            title: "Import dedup target".to_string(),
+            content: "Dedup content".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::Medium,
+        };
+        let result = record_learning(&conn, params).unwrap();
+        retire_learning(&conn, result.learning_id);
+
+        let keys = load_existing_keys(&conn).unwrap();
+        let dedup_key = format!("{}:{}", "Import dedup target", "Dedup content");
+
+        assert!(
+            !keys.contains(&dedup_key),
+            "load_existing_keys must exclude retired learnings from dedup set; \
+             key '{}' should not be present",
+            dedup_key
+        );
+    }
+}

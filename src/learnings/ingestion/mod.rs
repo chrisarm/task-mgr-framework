@@ -397,4 +397,51 @@ mod tests {
             files
         );
     }
+
+    // ========== TEST-INIT-001: retired_at Filtering Tests ==========
+    //
+    // Tests verify retired learnings are excluded from the ingestion dedup check.
+    // #[ignore] until FEAT-001 and FEAT-002 are implemented.
+    //
+    // Query location covered:
+    //  13. Ingestion dedup check (learning_exists: SELECT COUNT WHERE outcome=? AND title=?)
+
+    /// Sets `retired_at = NOW` on a learning.
+    /// Requires FEAT-001 (retired_at column).
+    fn retire_learning_ingestion(conn: &rusqlite::Connection, id: i64) {
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [id],
+        )
+        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_retired_excluded_from_ingestion_dedup_learning_exists() {
+        // AC: ingestion dedup check (learning_exists) must exclude retired learnings.
+        // After retirement, a new learning with the same outcome+title should NOT be
+        // considered a duplicate — it should be allowed through.
+        use crate::learnings::crud::record_learning;
+
+        let (_dir, conn) = setup_db();
+
+        // Insert a learning and retire it
+        let initial = make_minimal_params("Retired dedup target");
+        let result = record_learning(&conn, initial).unwrap();
+        retire_learning_ingestion(&conn, result.learning_id);
+
+        // learning_exists is private; verify via query_row directly
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learnings WHERE outcome = 'pattern' AND title = 'Retired dedup target' AND retired_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "after retirement, learning_exists must return false (no active learning with same outcome+title)"
+        );
+    }
 }

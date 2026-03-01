@@ -533,4 +533,86 @@ mod tests {
         assert!(text.contains("0.0%"));
         assert!(!text.contains("Active Run"));
     }
+
+    // ========== TEST-INIT-001: retired_at Filtering Tests ==========
+    //
+    // Tests verify retired learnings are excluded from stats query.
+    // #[ignore] until FEAT-001 and FEAT-002 are implemented.
+    //
+    // Query location covered:
+    //  12. Stats query_learning_counts (query_learning_counts via get_stats)
+
+    /// Sets `retired_at = NOW` on a learning.
+    /// Requires FEAT-001 (retired_at column).
+    fn retire_learning_stats(conn: &Connection, id: i64) {
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [id],
+        )
+        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_retired_excluded_from_stats_query_learning_counts() {
+        // AC: retired learning excluded from stats query_learning_counts
+        use crate::learnings::{record_learning, RecordLearningParams};
+        use crate::models::{Confidence, LearningOutcome};
+
+        let (temp_dir, conn) = setup_test_db();
+
+        // Active success learning (should be counted)
+        let active = RecordLearningParams {
+            outcome: LearningOutcome::Success,
+            title: "Active stats learning".to_string(),
+            content: "Should be counted".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::High,
+        };
+        record_learning(&conn, active).unwrap();
+
+        // Retired failure learning (must NOT be counted)
+        let retired_params = RecordLearningParams {
+            outcome: LearningOutcome::Failure,
+            title: "Retired stats learning".to_string(),
+            content: "Must not be counted".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::Low,
+        };
+        let retired_result = record_learning(&conn, retired_params).unwrap();
+        retire_learning_stats(&conn, retired_result.learning_id);
+
+        let counts = query_learning_counts(&conn).unwrap();
+
+        assert_eq!(
+            counts.total, 1,
+            "query_learning_counts total must exclude retired learning (expected 1, got {})",
+            counts.total
+        );
+        assert_eq!(
+            counts.failure, 0,
+            "retired failure learning must not be included in failure count"
+        );
+        assert_eq!(
+            counts.success, 1,
+            "active success learning must still be counted"
+        );
+
+        // Keep temp_dir alive until end of test
+        drop(temp_dir);
+    }
 }

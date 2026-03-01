@@ -493,6 +493,72 @@ mod tests {
         assert!(json.contains("\"limited_to\":1"));
     }
 
+    // ========== TEST-INIT-001: retired_at Filtering Tests ==========
+    //
+    // Tests verify retired learnings are excluded from list results and counts.
+    // All tests are #[ignore] until FEAT-001 and FEAT-002 are implemented.
+    //
+    // Query locations covered:
+    //   8. Learnings list (list_learnings — SELECT rows)
+    //   9. Learnings count (list_learnings — SELECT COUNT(*) total)
+
+    /// Sets `retired_at = NOW` on a learning.
+    /// Requires FEAT-001 (retired_at column).
+    fn retire_learning(conn: &Connection, id: i64) {
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [id],
+        )
+        .expect("retire_learning: requires FEAT-001 (retired_at column in learnings)");
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_retired_excluded_from_list_results() {
+        // AC: retired learning excluded from learnings list rows
+        let (_temp_dir, conn) = setup_db();
+
+        let active_id = create_test_learning(&conn, "Active learning", LearningOutcome::Pattern);
+        let retired_id = create_test_learning(&conn, "Retired learning", LearningOutcome::Success);
+        retire_learning(&conn, retired_id);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+
+        assert_eq!(result.count, 1, "count must exclude retired learning");
+        assert!(
+            result.learnings.iter().all(|s| s.id != retired_id),
+            "retired learning must not appear in list results"
+        );
+        assert_eq!(
+            result.learnings[0].id, active_id,
+            "only the active learning must be listed"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires FEAT-001 (retired_at migration) and FEAT-002 (retired_at IS NULL filters)"]
+    fn test_retired_excluded_from_list_total_count() {
+        // AC: retired learning excluded from learnings list `total` (SELECT COUNT(*))
+        let (_temp_dir, conn) = setup_db();
+
+        create_test_learning(&conn, "Active", LearningOutcome::Pattern);
+        let retired_id = create_test_learning(&conn, "Retired", LearningOutcome::Success);
+        retire_learning(&conn, retired_id);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+
+        assert_eq!(
+            result.total, 1,
+            "total must exclude retired learning (expected 1, got {})",
+            result.total
+        );
+        assert_eq!(
+            result.count, 1,
+            "count must also exclude retired learning (expected 1, got {})",
+            result.count
+        );
+    }
+
     #[test]
     fn test_list_result_serialization_skips_none_limited_to() {
         let result = LearningsListResult {
