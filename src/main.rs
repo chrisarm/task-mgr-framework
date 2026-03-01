@@ -733,10 +733,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         }
 
         Commands::Curate { action } => {
+            use task_mgr::commands::curate::enrich::curate_enrich;
             use task_mgr::commands::curate::{
                 curate_retire, curate_unretire, EnrichParams, RetireParams,
             };
-            use task_mgr::commands::curate::enrich::curate_enrich;
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
             match action {
@@ -770,7 +770,9 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                             s.parse().map_err(|e: String| TaskMgrError::InvalidState {
                                 resource_type: "curate enrich --field".to_string(),
                                 id,
-                                expected: "applies_to_files, applies_to_task_types, or applies_to_errors".to_string(),
+                                expected:
+                                    "applies_to_files, applies_to_task_types, or applies_to_errors"
+                                        .to_string(),
                                 actual: e,
                             })
                         })
