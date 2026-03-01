@@ -752,7 +752,6 @@ fn test_format_edit_text_no_updates() {
 // These tests are #[ignore] until FEAT-001 implements the update.rs handling.
 
 #[test]
-#[ignore = "requires FEAT-001: add_task_types/remove_task_types handling in edit_learning"]
 fn test_edit_learning_add_task_types() {
     let (_temp_dir, conn) = setup_db();
     let learning_id = create_test_learning(&conn);
@@ -774,7 +773,6 @@ fn test_edit_learning_add_task_types() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_task_types/remove_task_types handling in edit_learning"]
 fn test_edit_learning_remove_task_types() {
     let (_temp_dir, conn) = setup_db();
 
@@ -812,7 +810,6 @@ fn test_edit_learning_remove_task_types() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_errors/remove_errors handling in edit_learning"]
 fn test_edit_learning_add_errors() {
     let (_temp_dir, conn) = setup_db();
     let learning_id = create_test_learning(&conn);
@@ -834,7 +831,6 @@ fn test_edit_learning_add_errors() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_errors/remove_errors handling in edit_learning"]
 fn test_edit_learning_remove_errors() {
     let (_temp_dir, conn) = setup_db();
 
@@ -872,7 +868,6 @@ fn test_edit_learning_remove_errors() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
 fn test_edit_learning_task_types_null_field_creates_array() {
     // Learning starts with NULL applies_to_task_types; adding should create the array
     let (_temp_dir, conn) = setup_db();
@@ -896,7 +891,6 @@ fn test_edit_learning_task_types_null_field_creates_array() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: remove_errors handling in edit_learning"]
 fn test_edit_learning_errors_null_field_remove_is_noop() {
     // Learning starts with NULL applies_to_errors; removing should not crash
     let (_temp_dir, conn) = setup_db();
@@ -926,7 +920,6 @@ fn test_edit_learning_errors_null_field_remove_is_noop() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
 fn test_edit_learning_task_types_duplicate_add_is_idempotent() {
     let (_temp_dir, conn) = setup_db();
 
@@ -960,7 +953,6 @@ fn test_edit_learning_task_types_duplicate_add_is_idempotent() {
 }
 
 #[test]
-#[ignore = "requires FEAT-001: add_task_types handling in edit_learning"]
 fn test_edit_learning_task_types_does_not_overwrite_files() {
     // Known-bad discriminator: adding task_types must not affect applies_to_files
     let (_temp_dir, conn) = setup_db();
@@ -1026,4 +1018,219 @@ fn test_edit_learning_duplicate_tag_ignored() {
     let result = edit_learning(&conn, learning_id, params).unwrap();
     // Should not count as added since it was a duplicate
     assert_eq!(result.tags_added, 0);
+}
+
+// ============ Comprehensive FR-006 tests (TEST-001 acceptance criteria) ============
+
+#[test]
+fn test_edit_learning_all_four_new_fields_simultaneously() {
+    // Acceptance criterion: edit_learning with all 4 new fields set simultaneously
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    let params = EditLearningParams {
+        title: Some("Updated title".to_string()),
+        add_task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+        remove_task_types: Some(vec![]), // no-op remove
+        add_errors: Some(vec!["E0001".to_string(), "timeout".to_string()]),
+        remove_errors: Some(vec![]), // no-op remove
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result.updated_fields.contains(&"title".to_string()));
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    assert_eq!(learning.title, "Updated title");
+    let task_types = learning.applies_to_task_types.unwrap();
+    assert!(task_types.contains(&"US-".to_string()));
+    assert!(task_types.contains(&"FIX-".to_string()));
+    let errors = learning.applies_to_errors.unwrap();
+    assert!(errors.contains(&"E0001".to_string()));
+    assert!(errors.contains(&"timeout".to_string()));
+}
+
+#[test]
+fn test_edit_learning_add_and_remove_task_types_in_same_call() {
+    // Acceptance criterion: add_task_types + remove_task_types in same call (remove first, then add)
+    let (_temp_dir, conn) = setup_db();
+
+    let create_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Combined edit".to_string(),
+        content: "Content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: Some(vec!["US-".to_string(), "FEAT-".to_string()]),
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    let learning_id = record_learning(&conn, create_params).unwrap().learning_id;
+
+    // Remove FEAT-, add FIX- in same call
+    let params = EditLearningParams {
+        remove_task_types: Some(vec!["FEAT-".to_string()]),
+        add_task_types: Some(vec!["FIX-".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let task_types = learning.applies_to_task_types.unwrap();
+    assert!(task_types.contains(&"US-".to_string()), "US- should remain");
+    assert!(
+        task_types.contains(&"FIX-".to_string()),
+        "FIX- should be added"
+    );
+    assert!(
+        !task_types.contains(&"FEAT-".to_string()),
+        "FEAT- should be removed"
+    );
+}
+
+#[test]
+fn test_edit_learning_add_errors_long_patterns() {
+    // Acceptance criterion: add_errors with very long error patterns (stress test)
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    // Generate 50 error patterns of varying lengths
+    let long_errors: Vec<String> = (0..50)
+        .map(|i| format!("error_pattern_{:0>100}", i)) // 113-char patterns
+        .collect();
+
+    let params = EditLearningParams {
+        add_errors: Some(long_errors.clone()),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let errors = learning.applies_to_errors.unwrap();
+    assert_eq!(errors.len(), 50);
+    // Spot check first and last
+    assert_eq!(errors[0], long_errors[0]);
+    assert_eq!(errors[49], long_errors[49]);
+}
+
+#[test]
+fn test_edit_learning_task_types_round_trip_add_read_remove_null() {
+    // Acceptance criterion: round-trip: add → read → verify populated → remove → verify NULL
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn); // starts with no task_types
+
+    // Step 1: add task types
+    let add_params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+        ..Default::default()
+    };
+    edit_learning(&conn, learning_id, add_params).unwrap();
+
+    // Step 2: read and verify populated
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    let task_types = learning.applies_to_task_types.unwrap();
+    assert_eq!(task_types.len(), 2);
+    assert!(task_types.contains(&"US-".to_string()));
+    assert!(task_types.contains(&"FIX-".to_string()));
+
+    // Step 3: remove all → verify NULL (stored as None when empty)
+    let remove_params = EditLearningParams {
+        remove_task_types: Some(vec!["US-".to_string(), "FIX-".to_string()]),
+        ..Default::default()
+    };
+    edit_learning(&conn, learning_id, remove_params).unwrap();
+
+    // Step 4: verify NULL
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    assert!(
+        learning.applies_to_task_types.is_none()
+            || learning
+                .applies_to_task_types
+                .as_ref()
+                .map_or(true, |v| v.is_empty()),
+        "applies_to_task_types should be NULL/empty after removing all items"
+    );
+}
+
+#[test]
+fn test_edit_learning_updated_fields_includes_task_types_and_errors() {
+    // Acceptance criterion: JSON output of EditLearningResult includes task_types and errors in updated_fields
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["US-".to_string()]),
+        add_errors: Some(vec!["E0001".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+
+    // Serialize to JSON and verify both fields appear
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(
+        json.contains("applies_to_task_types"),
+        "JSON should contain applies_to_task_types in updated_fields"
+    );
+    assert!(
+        json.contains("applies_to_errors"),
+        "JSON should contain applies_to_errors in updated_fields"
+    );
+}
+
+#[test]
+fn test_edit_learning_only_new_fields_no_existing_fields() {
+    // Acceptance criterion: edit_learning with only new fields set (no existing fields) works correctly
+    let (_temp_dir, conn) = setup_db();
+    let learning_id = create_test_learning(&conn);
+
+    // Only set new fields, nothing else
+    let params = EditLearningParams {
+        add_task_types: Some(vec!["TEST-".to_string()]),
+        add_errors: Some(vec!["compile error".to_string()]),
+        ..Default::default()
+    };
+
+    let result = edit_learning(&conn, learning_id, params).unwrap();
+
+    // Only task_types and errors should be in updated_fields
+    assert_eq!(result.updated_fields.len(), 2);
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_task_types".to_string()));
+    assert!(result
+        .updated_fields
+        .contains(&"applies_to_errors".to_string()));
+
+    // Verify original fields remain unchanged
+    let learning = get_learning(&conn, learning_id).unwrap().unwrap();
+    assert_eq!(learning.title, "Original Title");
+    assert_eq!(learning.content, "Original Content");
+    // New fields set correctly
+    assert_eq!(
+        learning.applies_to_task_types,
+        Some(vec!["TEST-".to_string()])
+    );
+    assert_eq!(
+        learning.applies_to_errors,
+        Some(vec!["compile error".to_string()])
+    );
 }
