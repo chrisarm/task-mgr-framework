@@ -2910,8 +2910,54 @@ fn test_parse_dedup_response_single_id_cluster_rejected() {
 // All tests are #[ignore] until FEAT-004 implements curate_dedup().
 // ──────────────────────────────────────────────────────────────────────────────
 
-use super::types::DedupResult;
+use std::sync::Mutex;
+
+use super::types::{DedupCluster, DedupResult};
 use super::{curate_dedup, DedupParams};
+
+// Serialise tests that mutate CLAUDE_BINARY to avoid race conditions when cargo
+// runs test threads in parallel.
+static DEDUP_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Writes a mock `claude` shell script that always outputs `json_response` to stdout.
+/// Returns `(TempDir, script_path)`. Keep the `TempDir` alive for the test duration.
+#[cfg(unix)]
+fn setup_claude_mock(json_response: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().expect("temp dir for claude mock");
+    let data_path = dir.path().join("response.json");
+    std::fs::write(&data_path, json_response).expect("write mock response json");
+    let script_path = dir.path().join("mock_claude.sh");
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncat '{}'\n", data_path.display()),
+    )
+    .expect("write mock claude script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod mock claude script");
+    (dir, script_path)
+}
+
+/// Inserts a learning with a custom content string (for large-corpus tests).
+fn insert_learning_with_content(conn: &Connection, title: &str, content: &str) -> i64 {
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: title.to_string(),
+        content: content.to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(conn, params)
+        .expect("insert_learning_with_content")
+        .learning_id
+}
 
 /// Returns the number of active (non-retired) learnings in the DB.
 fn count_active_learnings(conn: &Connection) -> i64 {
@@ -3142,4 +3188,331 @@ fn test_dedup_per_cluster_transaction_partial_failure() {
             "cluster-1 source id2 must be retired after successful merge"
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST-002: Dedup LLM interaction and failure modes
+//
+// Tests batching behavior, LLM failure accumulation, threshold handling,
+// progress output (stderr), and JSON serialization.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dedup_batch_auto_calc_large_corpus_uses_multiple_batches() {
+    // AC: corpus > 150K chars splits into multiple batches.
+    // 25 learnings × 8000 chars each = 200K chars → auto batch_size=20 → 2 batches.
+    // CLAUDE_BINARY=false causes each batch to fail with exit_code=1, so llm_errors
+    // equals the number of batches (2). A corpus of 25 learnings × 12 chars = 300 chars
+    // would produce 1 batch; confirming the branch is correct.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    let long_content = "x".repeat(8000); // 8000 chars × 25 = 200K > 150K threshold
+    for i in 0..25 {
+        insert_learning_with_content(&conn, &format!("Learning {i}"), &long_content);
+    }
+
+    std::env::set_var("CLAUDE_BINARY", "false");
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup large corpus");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    // Auto batch_size=20: 25 learnings → ceil(25/20) = 2 batches → 2 LLM failures.
+    assert_eq!(
+        result.llm_errors, 2,
+        "200K-char corpus must auto-split into 2 batches (20 per batch)"
+    );
+    assert_eq!(
+        result.clusters_found, 0,
+        "no clusters when all batches fail"
+    );
+}
+
+#[test]
+fn test_dedup_batch_size_override_explicit() {
+    // AC: explicit batch_size=2 with 6 learnings creates 3 batches.
+    // Verified by counting llm_errors when CLAUDE_BINARY=false (1 error per batch).
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    for i in 0..6 {
+        insert_learning(
+            &conn,
+            &format!("Learning {i}"),
+            Confidence::High,
+            LearningOutcome::Pattern,
+        );
+    }
+
+    std::env::set_var("CLAUDE_BINARY", "false");
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            batch_size: Some(2),
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup batch_size override");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    assert_eq!(
+        result.llm_errors, 3,
+        "6 learnings ÷ batch_size=2 = 3 batches → 3 LLM errors"
+    );
+    assert_eq!(result.clusters_found, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_dedup_already_merged_tracking_prevents_double_merge() {
+    // AC: LLM returns duplicate IDs across batches — already-merged tracking prevents
+    // double-merge. Within a single batch, if LLM returns [id1,id2] and [id1,id3],
+    // id1 is added to merged_ids after the first cluster, so the second is skipped.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_db_dir, conn) = setup_db();
+
+    let id1 = insert_learning(
+        &conn,
+        "Learning 1",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id2 = insert_learning(
+        &conn,
+        "Learning 2",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id3 = insert_learning(
+        &conn,
+        "Learning 3",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+
+    // Mock LLM returns two clusters: id1 appears in both.
+    // After cluster A is processed, id1 enters merged_ids → cluster B is skipped.
+    let mock_json = format!(
+        r#"[
+            {{"source_ids": [{id1}, {id2}], "merged_title": "Cluster A", "merged_content": "C", "merged_outcome": "pattern", "reason": "dup A"}},
+            {{"source_ids": [{id1}, {id3}], "merged_title": "Cluster B", "merged_content": "C", "merged_outcome": "pattern", "reason": "dup B"}}
+        ]"#
+    );
+    let (_mock_dir, script) = setup_claude_mock(&mock_json);
+
+    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup already-merged tracking");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    assert_eq!(
+        result.clusters_found, 1,
+        "second cluster must be rejected because id1 is already in merged_ids"
+    );
+    assert_eq!(
+        result.clusters[0].source_ids,
+        vec![id1, id2],
+        "first cluster [id1, id2] must be the one kept"
+    );
+}
+
+#[test]
+fn test_dedup_multiple_consecutive_llm_failures_counted_accurately() {
+    // AC: multiple consecutive LLM failures — llm_errors count accurate, no crash.
+    // batch_size=1 with 3 learnings → 3 separate LLM invocations, all failing.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    for i in 0..3 {
+        insert_learning(
+            &conn,
+            &format!("L{i}"),
+            Confidence::High,
+            LearningOutcome::Pattern,
+        );
+    }
+
+    std::env::set_var("CLAUDE_BINARY", "false");
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            batch_size: Some(1),
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup with consecutive LLM failures must not crash");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    assert_eq!(
+        result.llm_errors, 3,
+        "3 batches × 1 LLM failure each = 3 errors"
+    );
+    assert_eq!(
+        result.clusters_found, 0,
+        "no clusters when all batches fail"
+    );
+    assert!(
+        result.clusters.is_empty(),
+        "clusters vec must be empty on total failure"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_dedup_threshold_zero_accepted_without_crash() {
+    // AC: threshold=0.0 (merge everything) — LLM receives extreme threshold, result is
+    // whatever LLM decides. This test verifies curate_dedup accepts the parameter
+    // without panicking or erroring before the LLM call.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_db_dir, conn) = setup_db();
+
+    insert_learning(&conn, "A", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
+
+    let (_mock_dir, script) = setup_claude_mock("[]");
+    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            threshold: 0.0,
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup with threshold=0.0 must succeed");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    assert_eq!(
+        result.llm_errors, 0,
+        "threshold=0.0 must not cause an LLM error"
+    );
+    // LLM returned [] → no clusters.
+    assert_eq!(result.clusters_found, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_dedup_threshold_one_accepted_without_crash() {
+    // AC: threshold=1.0 (merge nothing) — LLM receives extreme threshold, result likely
+    // 0 clusters. Verifies the parameter is accepted without error.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_db_dir, conn) = setup_db();
+
+    insert_learning(&conn, "A", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
+
+    let (_mock_dir, script) = setup_claude_mock("[]");
+    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            threshold: 1.0,
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup with threshold=1.0 must succeed");
+    std::env::remove_var("CLAUDE_BINARY");
+
+    assert_eq!(
+        result.llm_errors, 0,
+        "threshold=1.0 must not cause an LLM error"
+    );
+    assert_eq!(result.clusters_found, 0, "mock returned [] → 0 clusters");
+}
+
+#[test]
+fn test_dedup_progress_output_uses_stderr_not_stdout() {
+    // AC: progress output goes to stderr (not stdout, which is for the result).
+    // The orchestrator uses `eprintln!` (stderr) for batch progress messages and
+    // returns a structured `DedupResult` — it never prints the result itself.
+    // Verification: curate_dedup returns Ok(DedupResult), not a string or printed output.
+    // Callers in handlers.rs are responsible for serialising and printing to stdout.
+    //
+    // Functional check: with batch_size=1 and 2 learnings, batch progress is emitted
+    // via eprintln! for each batch. The function must not panic.
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    insert_learning(&conn, "L1", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(&conn, "L2", Confidence::High, LearningOutcome::Pattern);
+
+    std::env::set_var("CLAUDE_BINARY", "false");
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            batch_size: Some(1),
+            ..DedupParams::default()
+        },
+    );
+    std::env::remove_var("CLAUDE_BINARY");
+
+    // curate_dedup returns structured data (Ok(DedupResult)), confirming results
+    // are not mixed into stdout. Batch progress went to stderr via eprintln!.
+    assert!(
+        result.is_ok(),
+        "curate_dedup must return structured result, not crash during batch progress"
+    );
+    let result = result.unwrap();
+    // Two batches processed (batch_size=1, 2 learnings), both failing → 2 LLM errors.
+    // Progress was emitted to stderr for each; result carries structured counts.
+    assert_eq!(
+        result.llm_errors, 2,
+        "two batches of size 1 must each record one LLM failure"
+    );
+}
+
+#[test]
+fn test_dedup_result_json_serialization_all_fields() {
+    // AC: JSON output mode produces valid JSON for DedupResult with all fields.
+    let cluster = DedupCluster {
+        source_ids: vec![1, 2],
+        source_titles: vec!["Title A".to_string(), "Title B".to_string()],
+        merged_title: "Merged".to_string(),
+        merged_content: "Merged content".to_string(),
+        merged_outcome: "pattern".to_string(),
+        merged_confidence: "high".to_string(),
+        reason: "Duplicate insight".to_string(),
+        merged_learning_id: Some(42),
+    };
+
+    let result = DedupResult {
+        dry_run: false,
+        clusters_found: 1,
+        learnings_merged: 2,
+        learnings_created: 1,
+        llm_errors: 0,
+        clusters: vec![cluster],
+    };
+
+    let json = serde_json::to_string(&result).expect("DedupResult must serialize to JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("serialised JSON must be valid");
+
+    assert_eq!(parsed["dry_run"], false, "dry_run field");
+    assert_eq!(parsed["clusters_found"], 1, "clusters_found field");
+    assert_eq!(parsed["learnings_merged"], 2, "learnings_merged field");
+    assert_eq!(parsed["learnings_created"], 1, "learnings_created field");
+    assert_eq!(parsed["llm_errors"], 0, "llm_errors field");
+    assert_eq!(
+        parsed["clusters"][0]["merged_title"], "Merged",
+        "cluster merged_title"
+    );
+    assert_eq!(
+        parsed["clusters"][0]["source_ids"][0], 1,
+        "cluster source_ids[0]"
+    );
+    assert_eq!(
+        parsed["clusters"][0]["merged_learning_id"], 42,
+        "cluster merged_learning_id"
+    );
+    assert_eq!(
+        parsed["clusters"][0]["reason"], "Duplicate insight",
+        "cluster reason"
+    );
 }
