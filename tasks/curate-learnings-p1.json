@@ -793,6 +793,66 @@
     },
     {
       "acceptanceCriteria": [
+        "setup_db() defined once (not duplicated across retrieval/tests.rs, recall/tests.rs, curate/tests.rs)",
+        "create_test_learning() defined once (not duplicated across retrieval/tests.rs and recall/tests.rs)",
+        "retire_learning() defined once (not duplicated across recall/tests.rs and curate/tests.rs)",
+        "All tests still pass after extraction",
+        "Helpers accessible via super::test_helpers or a shared test utility module"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Extract duplicated test helpers (setup_db, create_test_learning, retire_learning) into shared modules to eliminate copy-paste across 3 test files.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "setup_db() is identical in all 3 files. create_test_learning() is identical in retrieval and recall. retire_learning() is identical in recall and curate. Follow learning #57: use #[cfg(test)] mod test_helpers at file level. For cross-file sharing, consider a src/test_helpers.rs or keep helpers local but deduplicate within each file.",
+      "passes": false,
+      "priority": 40,
+      "synergyWith": [
+        "REFACTOR-2-002"
+      ],
+      "title": "Extract duplicated test helpers into shared module",
+      "touchesFiles": [
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/tests.rs",
+        "src/commands/curate/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "setup_db_with_fts5() removed from retrieval/tests.rs",
+        "setup_db_with_fts5() removed from recall/tests.rs",
+        "All call sites updated to use setup_db() instead",
+        "All tests still pass"
+      ],
+      "batchWith": [
+        "REFACTOR-2-001"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Remove setup_db_with_fts5() which is identical to setup_db() — a dead abstraction that adds confusion.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "notes": "In both retrieval/tests.rs and recall/tests.rs, setup_db_with_fts5() has the exact same body as setup_db(). The name implies FTS5-specific setup but no differentiation exists. Replace all call sites with setup_db().",
+      "passes": false,
+      "priority": 41,
+      "synergyWith": [
+        "REFACTOR-2-001"
+      ],
+      "title": "Remove dead setup_db_with_fts5() alias",
+      "touchesFiles": [
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
         "All comprehensive tests (TEST-001, TEST-002) pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
         "80%+ coverage on new code (retire.rs, unretire.rs, filter additions)",
@@ -805,7 +865,9 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002"
       ],
       "description": "Gate checkpoint: comprehensive tests pass, test code refactored.",
       "estimatedEffort": "low",

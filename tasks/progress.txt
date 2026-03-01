@@ -349,3 +349,15 @@
 - Discriminator test confirms: without filter, retired learning IS in the table (passes pre-FEAT-002)
 - **Learnings:** ingestion/import private-fn tests require inline #[cfg(test)] mod in source file, not separate tests.rs
 ---
+
+## 2026-03-01 - adece6fc-REFACTOR-REVIEW-2
+- Analyzed 3 test files for duplication and clarity
+- **Issues found:**
+  1. `setup_db()` duplicated 3x across retrieval, recall, curate test files
+  2. `setup_db_with_fts5()` identical to `setup_db()` — dead abstraction (2 files)
+  3. `create_test_learning()` duplicated in retrieval + recall tests
+  4. `retire_learning()` duplicated in recall + curate tests
+- **Test names**: All clear and descriptive — no issues found
+- **Tasks created**: REFACTOR-2-001 (extract shared helpers, p40), REFACTOR-2-002 (remove dead fts5 alias, p41)
+- Both added to MILESTONE-2 dependsOn
+---
