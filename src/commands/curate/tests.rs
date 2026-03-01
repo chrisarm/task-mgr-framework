@@ -3579,12 +3579,42 @@ fn test_e2e_dry_run_shows_two_clusters_no_db_changes() {
     let (_dir, conn) = setup_db();
 
     let ids: [i64; 6] = [
-        insert_learning(&conn, "Learning A1", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning A2", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning A3", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B1", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B2", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B3", Confidence::High, LearningOutcome::Pattern),
+        insert_learning(
+            &conn,
+            "Learning A1",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning A2",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning A3",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B1",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B2",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B3",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
     ];
 
     let active_before = count_active_learnings(&conn);
@@ -3640,19 +3670,48 @@ fn test_e2e_dedup_creates_two_merged_learnings_and_retires_six_originals() {
     let (_dir, conn) = setup_db();
 
     let ids: [i64; 6] = [
-        insert_learning(&conn, "Learning A1", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning A2", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning A3", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B1", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B2", Confidence::High, LearningOutcome::Pattern),
-        insert_learning(&conn, "Learning B3", Confidence::High, LearningOutcome::Pattern),
+        insert_learning(
+            &conn,
+            "Learning A1",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning A2",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning A3",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B1",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B2",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
+        insert_learning(
+            &conn,
+            "Learning B3",
+            Confidence::High,
+            LearningOutcome::Pattern,
+        ),
     ];
 
     let mock_response = two_cluster_json(&ids);
     let (_mock_dir, script) = setup_claude_mock(&mock_response);
     std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
-    let result = curate_dedup(&conn, DedupParams::default())
-        .expect("curate_dedup must succeed");
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup must succeed");
     std::env::remove_var("CLAUDE_BINARY");
 
     assert_eq!(result.clusters_found, 2, "2 clusters found");
@@ -3662,7 +3721,10 @@ fn test_e2e_dedup_creates_two_merged_learnings_and_retires_six_originals() {
 
     // All 6 originals must be retired.
     for &id in &ids {
-        assert!(is_retired(&conn, id), "original learning {id} must be retired");
+        assert!(
+            is_retired(&conn, id),
+            "original learning {id} must be retired"
+        );
     }
 
     // 2 active learnings remain (the merged ones).
@@ -3694,21 +3756,9 @@ fn test_e2e_merged_learning_has_union_metadata_and_summed_bandit_stats() {
     let (_dir, conn) = setup_db();
 
     // Three sources each with different files and distinct bandit stats.
-    let id1 = insert_learning_with_meta(
-        &conn, "A1", "Content A1",
-        Some(vec!["src/foo.rs"]),
-        5, 2,
-    );
-    let id2 = insert_learning_with_meta(
-        &conn, "A2", "Content A2",
-        Some(vec!["src/bar.rs"]),
-        3, 1,
-    );
-    let id3 = insert_learning_with_meta(
-        &conn, "A3", "Content A3",
-        Some(vec!["src/baz.rs"]),
-        4, 0,
-    );
+    let id1 = insert_learning_with_meta(&conn, "A1", "Content A1", Some(vec!["src/foo.rs"]), 5, 2);
+    let id2 = insert_learning_with_meta(&conn, "A2", "Content A2", Some(vec!["src/bar.rs"]), 3, 1);
+    let id3 = insert_learning_with_meta(&conn, "A3", "Content A3", Some(vec!["src/baz.rs"]), 4, 0);
 
     let mock_json = format!(
         r#"[{{"source_ids": [{id1},{id2},{id3}], "merged_title": "Merged ABC", "merged_content": "Merged content", "merged_outcome": "pattern", "reason": "dup"}}]"#
@@ -3731,8 +3781,14 @@ fn test_e2e_merged_learning_has_union_metadata_and_summed_bandit_stats() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("fetch merged learning stats");
-    assert_eq!(times_shown, 12, "times_shown must be sum of sources: 5+3+4=12");
-    assert_eq!(times_applied, 3, "times_applied must be sum of sources: 2+1+0=3");
+    assert_eq!(
+        times_shown, 12,
+        "times_shown must be sum of sources: 5+3+4=12"
+    );
+    assert_eq!(
+        times_applied, 3,
+        "times_applied must be sum of sources: 2+1+0=3"
+    );
 
     // Verify union of applies_to_files (all three file paths).
     let files_json: Option<String> = conn
@@ -3744,9 +3800,18 @@ fn test_e2e_merged_learning_has_union_metadata_and_summed_bandit_stats() {
         .expect("fetch merged learning files");
     let files: Vec<String> = serde_json::from_str(files_json.as_deref().unwrap_or("[]"))
         .expect("files must be valid JSON");
-    assert!(files.contains(&"src/foo.rs".to_string()), "union must include src/foo.rs");
-    assert!(files.contains(&"src/bar.rs".to_string()), "union must include src/bar.rs");
-    assert!(files.contains(&"src/baz.rs".to_string()), "union must include src/baz.rs");
+    assert!(
+        files.contains(&"src/foo.rs".to_string()),
+        "union must include src/foo.rs"
+    );
+    assert!(
+        files.contains(&"src/bar.rs".to_string()),
+        "union must include src/bar.rs"
+    );
+    assert!(
+        files.contains(&"src/baz.rs".to_string()),
+        "union must include src/baz.rs"
+    );
     assert_eq!(files.len(), 3, "union must have exactly 3 distinct files");
 }
 
@@ -3757,8 +3822,18 @@ fn test_e2e_retired_originals_excluded_from_recall_merged_included() {
     let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning(&conn, "Recall Test A1", Confidence::High, LearningOutcome::Pattern);
-    let id2 = insert_learning(&conn, "Recall Test A2", Confidence::High, LearningOutcome::Pattern);
+    let id1 = insert_learning(
+        &conn,
+        "Recall Test A1",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id2 = insert_learning(
+        &conn,
+        "Recall Test A2",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
 
     let mock_json = format!(
         r#"[{{"source_ids": [{id1},{id2}], "merged_title": "Merged Recall Test", "merged_content": "Merged recall content", "merged_outcome": "pattern", "reason": "dup"}}]"#
@@ -3769,7 +3844,9 @@ fn test_e2e_retired_originals_excluded_from_recall_merged_included() {
     std::env::remove_var("CLAUDE_BINARY");
 
     assert_eq!(result.clusters_found, 1);
-    let merged_id = result.clusters[0].merged_learning_id.expect("merged_learning_id");
+    let merged_id = result.clusters[0]
+        .merged_learning_id
+        .expect("merged_learning_id");
 
     // Recall should return the merged learning, not the originals.
     let recall_result = recall_learnings(
@@ -3822,8 +3899,14 @@ fn test_e2e_rerun_after_dedup_finds_zero_clusters_idempotent() {
     let first_result = curate_dedup(&conn, DedupParams::default()).expect("first dedup");
     std::env::remove_var("CLAUDE_BINARY");
 
-    assert_eq!(first_result.clusters_found, 1, "first run must find 1 cluster");
-    assert_eq!(first_result.learnings_created, 1, "first run must create 1 merged");
+    assert_eq!(
+        first_result.clusters_found, 1,
+        "first run must find 1 cluster"
+    );
+    assert_eq!(
+        first_result.learnings_created, 1,
+        "first run must create 1 merged"
+    );
 
     // Second run: the merged learning is the only active one, LLM returns [].
     // No 2-item clusters possible from a single learning → 0 clusters.
@@ -3884,11 +3967,26 @@ fn test_e2e_text_output_format_for_dedup_result() {
         text.contains("DRY RUN"),
         "text must mention dry-run mode: {text}"
     );
-    assert!(text.contains("Cluster A"), "text must mention Cluster A: {text}");
-    assert!(text.contains("Cluster B"), "text must mention Cluster B: {text}");
-    assert!(text.contains("Reason A"), "text must mention Reason A: {text}");
-    assert!(text.contains("T1"), "text must list source title T1: {text}");
-    assert!(text.contains("T4"), "text must list source title T4: {text}");
+    assert!(
+        text.contains("Cluster A"),
+        "text must mention Cluster A: {text}"
+    );
+    assert!(
+        text.contains("Cluster B"),
+        "text must mention Cluster B: {text}"
+    );
+    assert!(
+        text.contains("Reason A"),
+        "text must mention Reason A: {text}"
+    );
+    assert!(
+        text.contains("T1"),
+        "text must list source title T1: {text}"
+    );
+    assert!(
+        text.contains("T4"),
+        "text must list source title T4: {text}"
+    );
 }
 
 #[test]
@@ -3937,13 +4035,31 @@ fn test_e2e_threshold_flag_changes_prompt_content() {
 
     // Insert 2 learnings so a prompt is generated (non-empty corpus).
     let (_dir, conn) = setup_db();
-    insert_learning(&conn, "Threshold A", Confidence::High, LearningOutcome::Pattern);
-    insert_learning(&conn, "Threshold B", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(
+        &conn,
+        "Threshold A",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    insert_learning(
+        &conn,
+        "Threshold B",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
 
     // Build prompts directly using the public API without invoking LLM.
     let items = vec![
-        DeduplicateLearningItem { id: 1, title: "Threshold A".to_string(), content: "Test content".to_string() },
-        DeduplicateLearningItem { id: 2, title: "Threshold B".to_string(), content: "Test content".to_string() },
+        DeduplicateLearningItem {
+            id: 1,
+            title: "Threshold A".to_string(),
+            content: "Test content".to_string(),
+        },
+        DeduplicateLearningItem {
+            id: 2,
+            title: "Threshold B".to_string(),
+            content: "Test content".to_string(),
+        },
     ];
 
     let prompt_low = build_dedup_prompt(&items, 0.3);
