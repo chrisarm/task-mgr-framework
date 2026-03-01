@@ -88,7 +88,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "This is the most critical test in Phase 1. Every one of the 14 YES-filter queries must be verified. Group tests by module (retrieval, recall, bandit, commands). Tests will fail until FEAT-001 (migration) and FEAT-002 (filters) are implemented.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "synergyWith": [
         "FEAT-001",
@@ -145,7 +145,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Use in-memory SQLite with schema+migrations applied. Set created_at manually for age-based tests. Tests depend on FEAT-001 for the retired_at column to exist.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "synergyWith": [
         "FEAT-004"
@@ -190,7 +190,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Simpler than retire — straightforward CRUD operation. Tests depend on FEAT-001 for schema.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "synergyWith": [
         "FEAT-005"
@@ -219,7 +219,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Follow exact pattern from v7.rs. The down_sql can be a no-op like v7 since SQLite doesn't support DROP COLUMN in older versions. NULL columns are safe to leave.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -269,7 +269,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "This is mechanical but error-prone (14 locations). Work through each file systematically. The PRD's #1 risk is missing a filter in one location. The test from TEST-INIT-001 will catch any missed locations.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -324,7 +324,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Follow the existing pattern from other subcommand enums (if any exist, e.g. run begin/end). CurateAction is similar to how other subcommand groups are organized. Result types must derive Serialize for JSON output mode.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -375,7 +375,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Use CAST(times_applied AS REAL) / CAST(times_shown AS REAL) to avoid integer division. Use julianday('now') - julianday(created_at) for age calculation. Single SQL query with OR for all criteria, then post-process to assign reason strings.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -421,7 +421,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": false,
       "notes": "Simple CRUD operation. Check existence with get_learning(), then UPDATE. For invalid IDs (not found or not retired), collect errors but continue processing remaining IDs.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -465,7 +465,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "This is the integration wiring task. Follow the exact pattern from other commands in main.rs (e.g., DeleteLearning dispatch at lines ~449-473). The LockGuard must be acquired for write operations.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": {
         "correctness": [
@@ -503,7 +503,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": false,
       "notes": "Small enhancement to the existing list command. Add one more COUNT query without the retired_at filter. Only change the output format when retired count > 0 to avoid noise.",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": {
         "correctness": [
@@ -552,7 +552,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Critical review. The #1 risk is a missed retired_at filter. Count all 14 filtered queries and 5 exempt queries explicitly. For each issue found: 1) Add a CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "synergyWith": [],
       "title": "Review implementation for quality, security, and integration wiring",
@@ -598,7 +598,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Look especially for opportunities to centralize the retired_at filter (e.g., a shared WHERE clause fragment or helper). For each issue: 1) Add REFACTOR-1-xxx (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON.",
-      "passes": false,
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "title": "Review implementation for refactoring opportunities",
@@ -646,7 +646,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -674,7 +674,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "These tests expand on TEST-INIT-001 with more realistic scenarios. Focus on interaction between retired_at filter and existing query features.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "synergyWith": [
         "TEST-002"
@@ -708,7 +708,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "Focus on robustness: what happens with unexpected inputs, edge-case threshold values, and mixed populations.",
-      "passes": false,
+      "passes": true,
       "priority": 30,
       "synergyWith": [
         "TEST-001"
@@ -737,7 +737,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue: 1) Add REFACTOR-2-xxx (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
-      "passes": false,
+      "passes": true,
       "priority": 39,
       "synergyWith": [],
       "title": "Review test code for refactoring opportunities",
@@ -769,7 +769,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Full test coverage achieved, test code refactored.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -795,7 +795,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "This is the integration test that exercises the full workflow. Use a temp directory with task-mgr init.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration verification: end-to-end curate retire/unretire workflow",
@@ -823,7 +823,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final opportunity to improve code before merge. For each issue: 1) Add REFACTOR-3-xxx (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON.",
-      "passes": false,
+      "passes": true,
       "priority": 65,
       "synergyWith": [],
       "title": "Final refactoring review for maintainability",
@@ -857,7 +857,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Run all quality checks. This is the final gate before merge.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -885,7 +885,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Phase 1 complete. Phase 2 (enrich) and Phase 3 (dedup) can be implemented on top of this.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,
