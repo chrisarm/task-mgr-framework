@@ -262,6 +262,77 @@ Worktrees are created at `{repo-parent}/{repo-name}-worktrees/{branch-name}/`. F
 
 Use `--no-worktree` to revert to the old behavior of checking out branches directly (useful for CI/CD or when you prefer the simpler model).
 
+## Iterative Build Workflow
+
+task-mgr is designed around a 5-phase iterative workflow that takes you from idea to working code:
+
+```
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │  1. Plan │───▶│  2. PRD  │───▶│ 3. Tasks │───▶│ 4. Build │───▶│ 5. Learn │
+  │          │    │          │    │          │    │          │    │          │
+  │  Explore │    │  Define  │    │  Break   │    │  Execute │    │  Capture │
+  │  & Design│    │  Quality │    │  Down &  │    │  Loop or │    │  Lessons │
+  └──────────┘    └──────────┘    │  Sequence│    │  Batch   │    └──────────┘
+                                  └──────────┘    └──────────┘
+```
+
+### Phase 1: Plan
+
+Use Claude Code's **Plan Mode** (`Shift+Tab` to toggle) to explore the codebase, understand constraints, and design your approach before writing any code.
+
+### Phase 2: PRD
+
+The `/prd` skill generates a structured Product Requirements Document from rough requirements:
+
+```bash
+/prd "Add batch execution mode with configurable concurrency"
+```
+
+This produces a `tasks/prd-{feature}.md` file with quality dimensions, edge cases, multiple approaches with tradeoffs, public contracts, and risk analysis. The structured format ensures the implementing agent has precise targets instead of vague instructions.
+
+### Phase 3: Tasks
+
+The `/tasks` skill converts a PRD into a JSON task list and prompt file for loop execution:
+
+```bash
+/tasks tasks/prd-batch-mode.md
+```
+
+This produces:
+- `tasks/batch-mode.json` — Ordered task list with dependencies, quality dimensions, and edge cases per task
+- `tasks/batch-mode-prompt.md` — System prompt for the autonomous agent with codebase context
+
+### Phase 4: Build
+
+Run the iterative autonomous loop:
+
+```bash
+# Interactive (confirms before starting)
+task-mgr loop tasks/batch-mode.json
+
+# Non-interactive (CI/CD or background execution)
+task-mgr loop tasks/batch-mode.json --yes
+```
+
+The loop claims tasks in dependency order, runs Claude Code for each, validates results, and moves on. See [Loop Execution](#loop-execution) for details.
+
+### Phase 5: Learn
+
+Learnings accumulate automatically during loop execution. The agent captures what worked, what didn't, and patterns discovered. These feed into future iterations, making each build cycle more effective.
+
+### Setting Up the Skills
+
+The `/prd` and `/tasks` skills are included in this repo at `.claude/commands/`. To make them available in Claude Code:
+
+**Option A: Use the repo copies directly** — Claude Code automatically loads skills from `.claude/commands/` in the project root. Just clone the repo and they're available.
+
+**Option B: Symlink to your global commands** — If you want the skills available across all projects:
+
+```bash
+ln -s "$(pwd)/.claude/commands/prd.md" ~/.claude/commands/prd.md
+ln -s "$(pwd)/.claude/commands/tasks.md" ~/.claude/commands/tasks.md
+```
+
 ## Shell Integration
 
 For integrating task-mgr into your own agent loops or CI pipelines, see [docs/INTEGRATION.md](docs/INTEGRATION.md). The core pattern is:

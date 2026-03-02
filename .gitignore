@@ -9,8 +9,8 @@ target/
 # External project symlinks
 linked_projects/
 
-# Loop progress log (generated, large)
-tasks/progress.txt
+# Loop progress logs (generated, large)
+tasks/progress*.txt
 
 # IDE/Editor
 .idea/
