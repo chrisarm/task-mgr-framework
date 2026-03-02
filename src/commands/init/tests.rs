@@ -1815,6 +1815,25 @@ mod scoped_import_tests {
         assert_eq!(count, 2);
     }
 
+    #[test]
+    fn test_insert_prd_metadata_upsert_returns_correct_id_for_prd_files() {
+        // Regression: last_insert_rowid() returned 0 on ON CONFLICT DO UPDATE,
+        // causing register_prd_files to fail with FOREIGN KEY constraint.
+        let (_dir, conn) = setup_migrated_db();
+        let prd = make_prd("project-v1", Some("P1"));
+        let id1 = insert_prd_metadata(&conn, &prd, None).unwrap();
+        assert!(id1 > 0, "first insert must return positive id");
+
+        // Upsert same prefix — must return the SAME id, not 0
+        let prd_v2 = make_prd("project-v2", Some("P1"));
+        let id2 = insert_prd_metadata(&conn, &prd_v2, None).unwrap();
+        assert_eq!(id1, id2, "upsert must return the existing row id, not 0");
+
+        // The returned id must be valid for FK-constrained inserts
+        insert_prd_file(&conn, id2, "tasks/test.json", "task_list")
+            .expect("insert_prd_file must succeed with upserted prd_id");
+    }
+
     // -----------------------------------------------------------------------
     // insert_prd_file: dynamic prd_id parameter
     // -----------------------------------------------------------------------

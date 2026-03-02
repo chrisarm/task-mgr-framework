@@ -120,18 +120,23 @@ pub fn check_pause_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
 
 /// Clean up signal files for a specific session prefix.
 ///
-/// When `prefix` is `Some(p)`: removes only `.stop-{p}` and `.pause-{p}`.
+/// When `prefix` is `Some(p)`: removes `.stop-{p}` and `.pause-{p}`, and also
+/// removes the global `.stop`/`.pause` if present (since the engine's
+/// `check_stop_signal` falls back to global files, they must be cleaned up
+/// too — otherwise the stop signal persists across subsequent runs).
 /// When `prefix` is `None`: removes global `.stop` and `.pause`.
-/// Never removes other sessions' signal files.
 pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
-    let (stop, pause) = match prefix {
-        Some(p) => (format!("{STOP_FILE}-{p}"), format!("{PAUSE_FILE}-{p}")),
-        None => (STOP_FILE.to_string(), PAUSE_FILE.to_string()),
-    };
-    for filename in &[stop, pause] {
-        let path = tasks_dir.join(filename);
+    let mut files_to_remove = vec![
+        tasks_dir.join(STOP_FILE),
+        tasks_dir.join(PAUSE_FILE),
+    ];
+    if let Some(p) = prefix {
+        files_to_remove.push(tasks_dir.join(format!("{STOP_FILE}-{p}")));
+        files_to_remove.push(tasks_dir.join(format!("{PAUSE_FILE}-{p}")));
+    }
+    for path in &files_to_remove {
         if path.exists() {
-            if let Err(e) = fs::remove_file(&path) {
+            if let Err(e) = fs::remove_file(path) {
                 eprintln!("Warning: could not remove {}: {}", path.display(), e);
             }
         }
@@ -732,8 +737,9 @@ mod tests {
     // --- Prefix-scoped cleanup tests ---
 
     #[test]
-    fn test_cleanup_signal_files_prefix_removes_only_session_specific_files() {
-        // cleanup with prefix "P1" removes .stop-P1 and .pause-P1, not global or P2 files
+    fn test_cleanup_signal_files_prefix_removes_session_and_global_files() {
+        // cleanup with prefix "P1" removes .stop-P1, .pause-P1, AND global .stop/.pause
+        // (because check_stop_signal falls back to global, so both must be cleaned)
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join(".stop-P1"), "").unwrap();
         fs::write(temp_dir.path().join(".pause-P1"), "").unwrap();
@@ -746,10 +752,11 @@ mod tests {
         // Session-specific P1 files removed
         assert!(!temp_dir.path().join(".stop-P1").exists());
         assert!(!temp_dir.path().join(".pause-P1").exists());
-        // Other session and global files preserved
+        // Global files also removed (engine falls back to global)
+        assert!(!temp_dir.path().join(STOP_FILE).exists());
+        assert!(!temp_dir.path().join(PAUSE_FILE).exists());
+        // Other session files preserved
         assert!(temp_dir.path().join(".stop-P2").exists());
-        assert!(temp_dir.path().join(STOP_FILE).exists());
-        assert!(temp_dir.path().join(PAUSE_FILE).exists());
     }
 
     #[test]

@@ -200,7 +200,21 @@ pub fn insert_prd_metadata(
         ],
     )?;
 
-    Ok(conn.last_insert_rowid())
+    // last_insert_rowid() returns 0 on ON CONFLICT DO UPDATE (no new row).
+    // Query the actual id back by task_prefix to handle both insert and upsert.
+    let prd_id: i64 = match &prd.task_prefix {
+        Some(prefix) => conn.query_row(
+            "SELECT id FROM prd_metadata WHERE task_prefix = ?1",
+            [prefix],
+            |row| row.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT id FROM prd_metadata WHERE task_prefix IS NULL",
+            [],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(prd_id)
 }
 
 /// Insert a task into the database.
