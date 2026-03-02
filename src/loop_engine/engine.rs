@@ -15,6 +15,7 @@
 /// stale tracker, session guidance, reorder hints, etc.).
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -431,14 +432,36 @@ pub fn run_iteration(
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
     let monitor_handle = monitor::start_monitor(params.project_root);
+    let timeout_config = claude::TimeoutConfig::from_difficulty(
+        prompt_result.task_difficulty.as_deref(),
+        Arc::clone(&monitor_handle.last_activity_epoch),
+    );
     let claude_result = claude::spawn_claude(
         &prompt_result.prompt,
         Some(params.signal_flag),
         Some(params.project_root),
         effective_model.as_deref(),
+        Some(timeout_config),
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
+
+    // Step 6.5a: If iteration timed out, log and treat as a crash-like outcome
+    if claude_result.timed_out {
+        eprintln!(
+            "Iteration timed out for task {} (difficulty: {})",
+            task_id,
+            prompt_result.task_difficulty.as_deref().unwrap_or("medium"),
+        );
+        return Ok(IterationResult {
+            outcome: IterationOutcome::Crash(crate::loop_engine::config::CrashType::RuntimeError),
+            task_id: Some(task_id),
+            files_modified: task_files,
+            should_stop: false,
+            output: claude_result.output,
+            effective_model: effective_model,
+        });
+    }
 
     // Step 6.5: If signal arrived during Claude execution, stop immediately.
     // Without this, post-processing (learning extraction, feedback, inter-iteration

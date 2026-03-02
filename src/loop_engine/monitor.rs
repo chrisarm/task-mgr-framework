@@ -10,10 +10,10 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Interval between git status polls in seconds.
 const POLL_INTERVAL_SECS: u64 = 10;
@@ -27,6 +27,9 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 180;
 pub struct MonitorHandle {
     stop_flag: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Epoch seconds of the last detected file activity (0 = no activity yet).
+    /// Shared with the timeout watchdog in `claude.rs` to extend deadlines.
+    pub last_activity_epoch: Arc<AtomicU64>,
 }
 
 /// Start the activity monitor in a background thread.
@@ -41,15 +44,18 @@ pub struct MonitorHandle {
 pub fn start_monitor(dir: &Path) -> MonitorHandle {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let flag_clone = Arc::clone(&stop_flag);
+    let last_activity_epoch = Arc::new(AtomicU64::new(0));
+    let activity_clone = Arc::clone(&last_activity_epoch);
     let dir_owned = dir.to_path_buf();
 
     let thread = thread::spawn(move || {
-        monitor_loop(&dir_owned, &flag_clone);
+        monitor_loop(&dir_owned, &flag_clone, &activity_clone);
     });
 
     MonitorHandle {
         stop_flag,
         thread: Some(thread),
+        last_activity_epoch,
     }
 }
 
@@ -81,7 +87,7 @@ fn git_status_porcelain(dir: &Path) -> Option<String> {
 }
 
 /// The main monitor loop, running on the background thread.
-fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>) {
+fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &Arc<AtomicU64>) {
     let mut last_status: Option<String> = None;
     let mut last_change_time = Instant::now();
     let mut next_poll = Instant::now();
@@ -100,6 +106,11 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>) {
                 if changed && !current_status.is_empty() {
                     print_status_change(&current_status);
                     last_change_time = Instant::now();
+                    let epoch = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    last_activity_epoch.store(epoch, Ordering::Release);
                 }
 
                 last_status = Some(current_status);
@@ -303,7 +314,8 @@ mod tests {
 
         // monitor_loop should return almost immediately since flag is already set
         let start = Instant::now();
-        monitor_loop(&dir_buf, &stop_flag);
+        let activity = Arc::new(AtomicU64::new(0));
+        monitor_loop(&dir_buf, &stop_flag, &activity);
         let elapsed = start.elapsed();
 
         // Should exit within 2 seconds (1 sleep + overhead)

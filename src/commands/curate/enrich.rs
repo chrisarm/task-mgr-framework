@@ -231,7 +231,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         let batch_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
         let prompt = build_enrich_prompt(&batch_items);
 
-        let claude_result = match claude::spawn_claude(&prompt, None, None, None) {
+        let claude_result = match claude::spawn_claude(&prompt, None, None, None, None) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(

@@ -61,6 +61,9 @@ pub struct PromptResult {
     /// remaining budget. Empty when all sections fit. Useful for diagnostics and
     /// testing to distinguish "dropped due to budget" from "empty because no data".
     pub dropped_sections: Vec<String>,
+    /// Difficulty level of the selected task (for per-iteration timeout calculation).
+    /// Propagated from `NextTaskOutput.difficulty`.
+    pub task_difficulty: Option<String>,
 }
 
 /// Parameters for building a prompt.
@@ -308,6 +311,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         shown_learning_ids,
         resolved_model,
         dropped_sections,
+        task_difficulty: task_output.difficulty.clone(),
     }))
 }
 
@@ -915,6 +919,7 @@ mod tests {
             shown_learning_ids: vec![1, 2, 3],
             resolved_model: None,
             dropped_sections: vec![],
+            task_difficulty: None,
         };
 
         assert_eq!(result.task_id, "FEAT-001");

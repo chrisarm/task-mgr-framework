@@ -10,12 +10,51 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::signals::SignalFlag;
+
+/// Timeout constants for per-iteration time limits.
+const TIMEOUT_LOW_SECS: u64 = 20 * 60;
+const TIMEOUT_MEDIUM_SECS: u64 = 30 * 60;
+const TIMEOUT_HIGH_SECS: u64 = 40 * 60;
+const INITIAL_EXTENSION_SECS: u64 = 7 * 60;
+const EXTENSION_DECREMENT_SECS: u64 = 60;
+
+/// Configuration for per-iteration timeout with activity-based extensions.
+#[derive(Clone)]
+pub struct TimeoutConfig {
+    /// Maximum time allowed for the iteration.
+    pub base_timeout: Duration,
+    /// First activity extension amount (decreases by `EXTENSION_DECREMENT_SECS` each use).
+    pub initial_extension: Duration,
+    /// Shared epoch timestamp of last file activity from the monitor thread.
+    pub last_activity_epoch: Arc<AtomicU64>,
+}
+
+impl TimeoutConfig {
+    /// Create a `TimeoutConfig` from a task difficulty string.
+    ///
+    /// Maps: `"low"` → 20min, `"high"` → 40min, anything else (including `None`) → 30min.
+    pub fn from_difficulty(
+        difficulty: Option<&str>,
+        last_activity_epoch: Arc<AtomicU64>,
+    ) -> Self {
+        let base_secs = match difficulty.map(|d| d.to_ascii_lowercase()).as_deref() {
+            Some("low") => TIMEOUT_LOW_SECS,
+            Some("high") => TIMEOUT_HIGH_SECS,
+            _ => TIMEOUT_MEDIUM_SECS,
+        };
+        TimeoutConfig {
+            base_timeout: Duration::from_secs(base_secs),
+            initial_extension: Duration::from_secs(INITIAL_EXTENSION_SECS),
+            last_activity_epoch,
+        }
+    }
+}
 
 /// Result of a Claude subprocess invocation.
 #[derive(Debug)]
@@ -24,6 +63,8 @@ pub struct ClaudeResult {
     pub exit_code: i32,
     /// Complete stdout output collected from the process
     pub output: String,
+    /// Whether the process was killed due to iteration timeout.
+    pub timed_out: bool,
 }
 
 /// Spawn Claude with the given prompt and collect its output.
@@ -54,6 +95,7 @@ pub fn spawn_claude(
     signal_flag: Option<&SignalFlag>,
     working_dir: Option<&Path>,
     model: Option<&str>,
+    timeout: Option<TimeoutConfig>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<&str> = vec!["--print", "--dangerously-skip-permissions"];
@@ -123,15 +165,20 @@ pub fn spawn_claude(
         }
     }
 
-    // Start watchdog thread if signal handling is requested
+    // Start watchdog thread if signal handling or timeout is requested
     let stop_watchdog = Arc::new(AtomicBool::new(false));
-    let watchdog_handle = signal_flag.map(|flag| {
+    let timed_out_flag = Arc::new(AtomicBool::new(false));
+    let watchdog_handle = if signal_flag.is_some() || timeout.is_some() {
         let stop = Arc::clone(&stop_watchdog);
-        let flag = flag.clone();
-        std::thread::spawn(move || {
-            watchdog_loop(child_pid, &flag, &stop);
-        })
-    });
+        let flag = signal_flag.cloned();
+        let timeout_cfg = timeout;
+        let timed_out = Arc::clone(&timed_out_flag);
+        Some(std::thread::spawn(move || {
+            watchdog_loop(child_pid, flag.as_ref(), &stop, timeout_cfg.as_ref(), &timed_out);
+        }))
+    } else {
+        None
+    };
 
     // Take ownership of stdout for line-by-line reading
     let stdout = child
@@ -170,8 +217,9 @@ pub fn spawn_claude(
     }
 
     let exit_code = exit_code_from_status(status);
+    let timed_out = timed_out_flag.load(Ordering::Acquire);
 
-    Ok(ClaudeResult { exit_code, output })
+    Ok(ClaudeResult { exit_code, output, timed_out })
 }
 
 /// Extract exit code from process status, using 128+signal convention on Unix.
@@ -192,78 +240,130 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     1 // fallback
 }
 
-/// Watchdog loop: polls signal flag and terminates child process on signal.
+/// Send SIGTERM → wait grace period → SIGKILL to a process group.
 ///
-/// Runs on a dedicated OS thread (not tokio) so it works even when the
-/// main thread is blocked in synchronous I/O.
-///
-/// Escalation: SIGTERM → 3s grace period → SIGKILL.
+/// Returns once the process group is dead or force-killed.
+/// `stop` is checked during the grace period to detect early reaping by the main thread.
 #[cfg(unix)]
-fn watchdog_loop(child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+fn kill_process_group(child_pid: u32, stop: &AtomicBool, reason: &str) {
     const GRACE_PERIOD: Duration = Duration::from_secs(3);
     const GRACE_POLL: Duration = Duration::from_millis(100);
 
-    // Kill the process group (negative PID) so that Claude AND all its child
-    // processes are terminated. This prevents orphaned children from holding
-    // the stdout pipe open and blocking the main thread in reader.lines().
     let pgid = -(child_pid as i32);
 
-    // Poll until signaled or told to stop
-    while !stop.load(Ordering::Acquire) {
-        if signal_flag.is_signaled() {
-            eprintln!(
-                "\nSignal received, terminating Claude process group (pgid {})...",
-                child_pid
-            );
+    eprintln!(
+        "\n{}, terminating Claude process group (pgid {})...",
+        reason, child_pid
+    );
 
-            // Send SIGTERM to the entire process group
-            let ret = unsafe { libc::kill(pgid, libc::SIGTERM) };
-            if ret == -1 {
-                // ESRCH: process group already exited — nothing to do
+    let ret = unsafe { libc::kill(pgid, libc::SIGTERM) };
+    if ret == -1 {
+        return; // ESRCH: already exited
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < GRACE_PERIOD {
+        std::thread::sleep(GRACE_POLL);
+        if stop.load(Ordering::Acquire) {
+            return; // Main thread reaped
+        }
+        let ret = unsafe { libc::kill(pgid, 0) };
+        if ret == -1 {
+            return; // Exited
+        }
+    }
+
+    eprintln!(
+        "Grace period expired, sending SIGKILL to process group {}...",
+        child_pid
+    );
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+    }
+}
+
+/// Watchdog loop: polls signal flag and timeout, terminates child on either.
+///
+/// Runs on a dedicated OS thread (not tokio) so it works even when the
+/// main thread is blocked in synchronous I/O.
+#[cfg(unix)]
+fn watchdog_loop(
+    child_pid: u32,
+    signal_flag: Option<&SignalFlag>,
+    stop: &AtomicBool,
+    timeout: Option<&TimeoutConfig>,
+    timed_out: &AtomicBool,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+    // Timeout tracking
+    let mut deadline = timeout.map(|t| Instant::now() + t.base_timeout);
+    let mut last_seen_activity: u64 = 0;
+    let mut extensions_used: u32 = 0;
+
+    while !stop.load(Ordering::Acquire) {
+        // Check signal
+        if let Some(flag) = signal_flag {
+            if flag.is_signaled() {
+                kill_process_group(child_pid, stop, "Signal received");
                 return;
             }
-
-            // Wait up to 3s for graceful exit
-            let start = std::time::Instant::now();
-            while start.elapsed() < GRACE_PERIOD {
-                std::thread::sleep(GRACE_POLL);
-                if stop.load(Ordering::Acquire) {
-                    // Main thread reaped the child
-                    return;
-                }
-                // Check if process group leader still exists
-                let ret = unsafe { libc::kill(pgid, 0) };
-                if ret == -1 {
-                    // Process group exited
-                    return;
-                }
-            }
-
-            // Grace period expired — force kill the entire group
-            eprintln!(
-                "Grace period expired, sending SIGKILL to process group {}...",
-                child_pid
-            );
-            unsafe {
-                libc::kill(pgid, libc::SIGKILL);
-            }
-            return;
         }
+
+        // Check timeout
+        if let (Some(ref mut dl), Some(tc)) = (&mut deadline, timeout) {
+            // Check for new activity
+            let current_activity = tc.last_activity_epoch.load(Ordering::Acquire);
+            if current_activity > last_seen_activity {
+                last_seen_activity = current_activity;
+                let ext_secs = INITIAL_EXTENSION_SECS
+                    .saturating_sub(extensions_used as u64 * EXTENSION_DECREMENT_SECS);
+                if ext_secs > 0 {
+                    let remaining = dl.saturating_duration_since(Instant::now());
+                    let extended = remaining + Duration::from_secs(ext_secs);
+                    let capped = extended.min(tc.base_timeout);
+                    *dl = Instant::now() + capped;
+                    extensions_used += 1;
+                    eprintln!(
+                        "[timeout] Activity detected, extended deadline by {}s ({} remaining, {} extensions used)",
+                        ext_secs,
+                        capped.as_secs(),
+                        extensions_used
+                    );
+                }
+            }
+
+            if Instant::now() >= *dl {
+                eprintln!(
+                    "[timeout] Iteration exceeded {}s timeout",
+                    tc.base_timeout.as_secs()
+                );
+                timed_out.store(true, Ordering::Release);
+                kill_process_group(child_pid, stop, "Timeout exceeded");
+                return;
+            }
+        }
+
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
 #[cfg(not(unix))]
-fn watchdog_loop(_child_pid: u32, signal_flag: &SignalFlag, stop: &AtomicBool) {
+fn watchdog_loop(
+    _child_pid: u32,
+    signal_flag: Option<&SignalFlag>,
+    stop: &AtomicBool,
+    _timeout: Option<&TimeoutConfig>,
+    _timed_out: &AtomicBool,
+) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-    // On non-Unix, we can only poll — no SIGTERM/SIGKILL.
-    // The child will be terminated when the parent exits (default behavior).
     while !stop.load(Ordering::Acquire) {
-        if signal_flag.is_signaled() {
-            eprintln!("\nSignal received, Claude subprocess will be terminated...");
-            return;
+        if let Some(flag) = signal_flag {
+            if flag.is_signaled() {
+                eprintln!("\nSignal received, Claude subprocess will be terminated...");
+                return;
+            }
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -286,9 +386,11 @@ mod tests {
         let result = ClaudeResult {
             exit_code: 0,
             output: "Hello world\n".to_string(),
+            timed_out: false,
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
+        assert!(!result.timed_out);
     }
 
     #[test]
@@ -296,6 +398,7 @@ mod tests {
         let result = ClaudeResult {
             exit_code: 137,
             output: String::new(),
+            timed_out: false,
         };
         assert_eq!(result.exit_code, 137);
         assert!(result.output.is_empty());
@@ -340,6 +443,7 @@ mod tests {
         Ok(ClaudeResult {
             exit_code: status.code().unwrap_or(1),
             output: String::new(),
+            timed_out: false,
         })
     }
 
@@ -399,7 +503,7 @@ mod tests {
         // spawn_claude with None should behave like before
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None, None);
+        let result = spawn_claude("hello", None, None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -413,7 +517,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("test output", Some(&flag), None, None);
+        let result = spawn_claude("test output", Some(&flag), None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -482,6 +586,7 @@ mod tests {
         Ok(ClaudeResult {
             exit_code: exit_code_from_status(status),
             output,
+            timed_out: false,
         })
     }
 
@@ -534,7 +639,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // "60" is the argument to sleep — it will run for 60s unless killed
-        let result = spawn_claude("60", Some(&flag), None, None);
+        let result = spawn_claude("60", Some(&flag), None, None, None);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -564,7 +669,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("quick exit", Some(&flag), None, None);
+        let result = spawn_claude("quick exit", Some(&flag), None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -584,7 +689,7 @@ mod tests {
     fn test_spawn_model_none_no_model_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, None);
+        let result = spawn_claude("test_prompt", None, None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(
@@ -620,7 +725,7 @@ mod tests {
     fn test_spawn_model_some_opus_includes_model_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -640,7 +745,7 @@ mod tests {
     fn test_spawn_model_empty_string_treated_as_none() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some(""));
+        let result = spawn_claude("test_prompt", None, None, Some(""), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -660,7 +765,7 @@ mod tests {
     fn test_spawn_model_flag_appears_before_prompt_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -700,7 +805,7 @@ mod tests {
         for (model, expected_fragment) in &models {
             let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model));
+            let result = spawn_claude("test_prompt", None, None, Some(model), None);
             std::env::remove_var("CLAUDE_BINARY");
 
             assert!(result.is_ok(), "model='{}' should succeed", model);
@@ -721,7 +826,7 @@ mod tests {
         for model in &["  ", "\t", " \t "] {
             let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model));
+            let result = spawn_claude("test_prompt", None, None, Some(model), None);
             std::env::remove_var("CLAUDE_BINARY");
 
             assert!(result.is_ok());
@@ -740,7 +845,7 @@ mod tests {
     fn test_spawn_model_some_preserves_required_flags() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"));
+        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -778,7 +883,7 @@ mod tests {
     fn test_spawn_claude_model_variants(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model));
+        let result = spawn_claude("test prompt", None, None, Some(model), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -815,7 +920,7 @@ mod tests {
     fn test_spawn_claude_model_special_chars(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model));
+        let result = spawn_claude("test prompt", None, None, Some(model), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -838,7 +943,7 @@ mod tests {
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt", None, None, model);
+        let result = spawn_claude("my prompt", None, None, model, None);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -895,7 +1000,7 @@ mod tests {
     fn test_spawn_claude_none_model_identical_to_pre_phase2() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt text", None, None, None);
+        let result = spawn_claude("my prompt text", None, None, None, None);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -916,7 +1021,7 @@ mod tests {
     fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model));
+        let result = spawn_claude("test prompt", None, None, Some(model), None);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -928,5 +1033,149 @@ mod tests {
             model.escape_debug(),
             output
         );
+    }
+
+    // --- Timeout tests ---
+
+    #[test]
+    fn test_timeout_config_from_difficulty() {
+        let activity = Arc::new(AtomicU64::new(0));
+        let low = TimeoutConfig::from_difficulty(Some("low"), Arc::clone(&activity));
+        assert_eq!(low.base_timeout, Duration::from_secs(20 * 60));
+
+        let med = TimeoutConfig::from_difficulty(None, Arc::clone(&activity));
+        assert_eq!(med.base_timeout, Duration::from_secs(30 * 60));
+
+        let med2 = TimeoutConfig::from_difficulty(Some("medium"), Arc::clone(&activity));
+        assert_eq!(med2.base_timeout, Duration::from_secs(30 * 60));
+
+        let high = TimeoutConfig::from_difficulty(Some("high"), Arc::clone(&activity));
+        assert_eq!(high.base_timeout, Duration::from_secs(40 * 60));
+
+        // Case insensitive
+        let high2 = TimeoutConfig::from_difficulty(Some("HIGH"), Arc::clone(&activity));
+        assert_eq!(high2.base_timeout, Duration::from_secs(40 * 60));
+    }
+
+    /// Helper: create a script that sleeps for 120s, ignoring all CLI args.
+    /// Returns the path to the temp script (caller must keep TempDir alive).
+    fn create_sleep_script(dir: &std::path::Path) -> String {
+        let script_path = dir.join("fake_claude.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 120\n").unwrap();
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        script_path.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_timeout_kills_long_running_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = create_sleep_script(tmp.path());
+        std::env::set_var("CLAUDE_BINARY", &script);
+        let activity = Arc::new(AtomicU64::new(0));
+        let timeout = TimeoutConfig {
+            base_timeout: Duration::from_secs(2),
+            initial_extension: Duration::from_secs(INITIAL_EXTENSION_SECS),
+            last_activity_epoch: activity,
+        };
+
+        let start = Instant::now();
+        let result = spawn_claude("ignored", None, None, None, Some(timeout));
+        let elapsed = start.elapsed();
+
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(res.timed_out, "Process should be marked as timed out");
+        assert_ne!(res.exit_code, 0);
+        assert!(
+            elapsed.as_secs() < 10,
+            "Should timeout quickly, took {:?}",
+            elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_timeout_extends_on_activity() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = create_sleep_script(tmp.path());
+        std::env::set_var("CLAUDE_BINARY", &script);
+        let activity = Arc::new(AtomicU64::new(0));
+        let activity_clone = Arc::clone(&activity);
+        let timeout = TimeoutConfig {
+            base_timeout: Duration::from_secs(3),
+            initial_extension: Duration::from_secs(INITIAL_EXTENSION_SECS),
+            last_activity_epoch: activity,
+        };
+
+        // Simulate activity at 2s to extend the deadline
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            activity_clone.store(epoch, Ordering::Release);
+        });
+
+        let start = Instant::now();
+        let result = spawn_claude("ignored", None, None, None, Some(timeout));
+        let elapsed = start.elapsed();
+
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(res.timed_out, "Should eventually time out");
+        // With 3s base + activity at 2s extending by min(1+7*60, 3)=3s → deadline at ~5s
+        assert!(
+            elapsed.as_secs() >= 4,
+            "Activity should have extended lifetime past 3s, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_timeout_extension_decreases() {
+        // Verify the extension formula: 7min, 6min, 5min, ..., 0
+        for i in 0u32..10 {
+            let ext = INITIAL_EXTENSION_SECS
+                .saturating_sub(i as u64 * EXTENSION_DECREMENT_SECS);
+            let expected = match i {
+                0 => 7 * 60,
+                1 => 6 * 60,
+                2 => 5 * 60,
+                3 => 4 * 60,
+                4 => 3 * 60,
+                5 => 2 * 60,
+                6 => 1 * 60,
+                _ => 0,
+            };
+            assert_eq!(ext, expected, "Extension #{} should be {}s", i, expected);
+        }
+    }
+
+    #[test]
+    fn test_spawn_claude_without_timeout_not_timed_out() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("hello", None, None, None, None);
+        std::env::remove_var("CLAUDE_BINARY");
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert!(!res.timed_out, "Normal exit should not be timed_out");
     }
 }
