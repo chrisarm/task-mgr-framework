@@ -1144,6 +1144,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                             }
                             tasks_completed += 1;
                             result.outcome = IterationOutcome::Completed;
+                            ctx.crash_tracker.record_success();
                             eprintln!(
                                 "Task {} completed (detected from <completed> tag)",
                                 completed_id
@@ -1174,8 +1175,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                                 tasks_completed += 1;
                                 task_marked_done_this_iteration = true;
 
-                                // Override outcome so stale tracker resets — task was actually completed
+                                // Override outcome so stale/crash trackers reset — task was actually completed
                                 result.outcome = IterationOutcome::Completed;
+                                ctx.crash_tracker.record_success();
 
                                 // Update PRD JSON to set passes: true
                                 if let Err(e) = update_prd_task_passes(
@@ -1230,8 +1232,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
                                     tasks_completed += 1;
 
-                                    // Override outcome so stale tracker resets — task was actually completed
+                                    // Override outcome so stale/crash trackers reset — task was actually completed
                                     result.outcome = IterationOutcome::Completed;
+                                    ctx.crash_tracker.record_success();
 
                                     if let Err(e) = update_prd_task_passes(
                                         &paths.prd_file,
@@ -1283,6 +1286,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         last_claimed_task = None;
                         tasks_completed += 1;
                         result.outcome = IterationOutcome::Completed;
+                        ctx.crash_tracker.record_success();
                         eprintln!("Task {} completed (reported as already done)", task_id);
                     }
                 }
@@ -1304,8 +1308,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 if count > 0 {
                     tasks_completed += count as u32;
 
-                    // Override outcome so stale tracker resets — task was actually completed
+                    // Override outcome so stale/crash trackers reset — task was actually completed
                     result.outcome = IterationOutcome::Completed;
+                    ctx.crash_tracker.record_success();
 
                     eprintln!(
                         "Post-iteration reconciliation: marked {} task(s) done",
