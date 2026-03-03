@@ -748,8 +748,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         };
     }
 
-    // Step 5.5: Compute initial PRD hash for change detection during iterations
-    let mut prd_hash = hash_file(&run_config.prd_file);
+    // Step 5.5: PRD hash — computed after worktree setup (step 8.5) since
+    // Claude edits the worktree copy, not the source_root copy.
+    #[allow(unused_assignments)]
+    let mut prd_hash = String::new();
 
     // Step 6: Open DB connection (after init to ensure schema exists)
     let mut conn = match crate::db::open_connection(&run_config.db_dir) {
@@ -906,6 +908,49 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         run_config.source_root.clone()
     };
 
+    // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
+    // Claude edits the worktree copy, so hash checks and re-imports must use that path.
+    // paths.prd_file is canonicalized by resolve_paths(); canonicalize source_root too
+    // so strip_prefix works reliably (e.g. symlinks resolved on both sides).
+    let live_prd_file = if working_root != run_config.source_root {
+        let canonical_source = run_config
+            .source_root
+            .canonicalize()
+            .unwrap_or_else(|_| run_config.source_root.clone());
+        if let Ok(rel) = paths.prd_file.strip_prefix(&canonical_source) {
+            working_root.join(rel)
+        } else {
+            eprintln!(
+                "Warning: could not remap PRD to worktree (prd={}, source={})",
+                paths.prd_file.display(),
+                canonical_source.display()
+            );
+            paths.prd_file.clone()
+        }
+    } else {
+        paths.prd_file.clone()
+    };
+    // If using a worktree, re-import from the worktree PRD to pick up any tasks
+    // that were added in the worktree but not in source_root (e.g., tasks created
+    // by Claude during a previous run that only exist in the worktree copy).
+    if live_prd_file != run_config.prd_file && live_prd_file.exists() {
+        if let Err(e) = crate::commands::init(
+            &run_config.db_dir,
+            &[&live_prd_file],
+            false, // force
+            true,  // append
+            true,  // update_existing
+            false, // dry_run
+            crate::commands::init::PrefixMode::Auto,
+        ) {
+            eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
+        }
+    }
+    prd_hash = hash_file(&live_prd_file);
+    // Override paths.prd_file so all iteration code (mark_task_done, reconcile, etc.)
+    // reads/writes the worktree copy, not the source_root copy.
+    paths.prd_file = live_prd_file.clone();
+
     // Step 9: Check uncommitted changes (in working_root)
     if let Err(e) = env::check_uncommitted_changes(&working_root, run_config.config.yes_mode) {
         eprintln!("Error: {}", e);
@@ -1036,13 +1081,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             break;
         }
 
-        // Re-import PRD if Claude modified it during the previous iteration
-        let current_hash = hash_file(&run_config.prd_file);
+        // Re-import PRD if Claude modified it during the previous iteration.
+        // Use live_prd_file (worktree copy) since Claude edits in the worktree.
+        let current_hash = hash_file(&live_prd_file);
         if current_hash != prd_hash {
             eprintln!("PRD file changed, re-importing tasks...");
             if let Err(e) = crate::commands::init(
                 &run_config.db_dir,
-                &[&run_config.prd_file],
+                &[&live_prd_file],
                 false, // force
                 true,  // append
                 true,  // update_existing
@@ -1071,7 +1117,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             elapsed_secs: elapsed,
             verbose: run_config.config.verbose,
             usage_params: &usage_params,
-            prd_path: Some(run_config.prd_file.as_path()),
+            prd_path: Some(paths.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
         };

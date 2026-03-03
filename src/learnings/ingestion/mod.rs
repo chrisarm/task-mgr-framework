@@ -99,6 +99,11 @@ pub fn extract_learnings_from_output(
         }
     };
 
+    if params_list.is_empty() {
+        eprintln!("Learning extraction: LLM returned 0 learnings (output len={})", output.len());
+        return Ok(ExtractionResult::empty());
+    }
+
     // Enrich with task context (best-effort: fall back to unenriched params on error)
     let unenriched = params_list.clone();
     let params_list = enrich_extracted_params(conn, params_list, task_id).unwrap_or_else(|e| {
@@ -108,9 +113,11 @@ pub fn extract_learnings_from_output(
 
     // Record each extracted learning, skipping duplicates
     let mut learning_ids = Vec::new();
+    let mut deduped = 0usize;
     for params in params_list {
         // Dedup by (outcome, title) — same title with different wording is likely a duplicate
         if learning_exists(conn, &params.outcome, &params.title)? {
+            deduped += 1;
             continue;
         }
         match record_learning(conn, params) {
@@ -121,6 +128,10 @@ pub fn extract_learnings_from_output(
                 eprintln!("Warning: failed to record extracted learning: {}", e);
             }
         }
+    }
+
+    if deduped > 0 {
+        eprintln!("Learning extraction: {} duplicate(s) skipped", deduped);
     }
 
     Ok(ExtractionResult {
