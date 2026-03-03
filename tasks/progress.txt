@@ -1,4 +1,12 @@
 
+## 2026-03-03 - 2367d40c-REFACTOR-REVIEW-3
+- Reviewed all code changed on this branch: claude.rs (2233 lines), engine.rs, ingestion/mod.rs, extraction.rs, curate/mod.rs, curate/enrich.rs
+- **Issue 1 (REFACTOR-3-001)**: `tee_stream_json` double-parses each JSON line — once for live display (`tee_assistant_text`), then raw strings go to `parse_stream_json_lines` which parses again. Fix: parse once, pass `Value` objects to both consumers. Priority 67, added to VERIFY-001 and MILESTONE-FINAL dependsOn.
+- **Not worth extracting**: `spawn_claude` at 167 lines is pre-existing and the stream-json additions (args branching + tee branching) are clean and minimal. `process_assistant_message` at 36 lines is a simple match with clear arms. `parse_stream_json_lines` at 44 lines is a straightforward parser loop. `spawn_with_tee` test helper duplicates the plain-text tee loop but is only used for non-stream-json tests — coupling it to `spawn_claude` internals would make tests fragile.
+- **Pre-existing issues noted but out of scope**: `run_loop` (897 lines), `run_iteration` (393 lines), `confidence_rank` duplication in curate/mod.rs, IN-clause placeholder duplication, Claude spawn error-handling pattern across 3 call sites.
+- **Learnings:** Scoping refactor reviews to branch-changed code prevents scope creep while still catching real issues in new code.
+---
+
 ## 2026-03-01 - a8e80384-REFACTOR-REVIEW-2
 - Reviewed 3518-line test file src/commands/curate/tests.rs for duplication and helper extraction
 - **Issue 1 (REFACTOR-2-001)**: 3 identical `set_applies_to_*` functions differ only in column name → unify into `set_json_column`. Also `insert_learning` vs `insert_learning_with_content` should be unified.

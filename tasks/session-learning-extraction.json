@@ -635,7 +635,7 @@
       "id": "MILESTONE-2",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -658,7 +658,7 @@
       "estimatedEffort": "medium",
       "id": "INT-001",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration test: end-to-end stream-json capture with mock Claude binary",
@@ -692,6 +692,30 @@
     },
     {
       "acceptanceCriteria": [
+        "tee_stream_json parses each JSON line only once (not twice)",
+        "Parsed Value objects are passed to both tee_assistant_text and parse_stream_json_lines",
+        "All existing tests pass unchanged",
+        "No new clippy warnings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "tee_stream_json currently parses each line as serde_json::Value for live display (tee_assistant_text), then passes raw strings to parse_stream_json_lines which parses them again. Refactor to parse once and pass Value objects to both consumers.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-3-001",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 67,
+      "synergyWith": [],
+      "title": "Eliminate double JSON parsing in tee_stream_json",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
         "cargo fmt --check passes",
         "cargo check passes with no warnings",
         "cargo clippy -- -D warnings passes",
@@ -702,7 +726,8 @@
       "conflictsWith": [],
       "dependsOn": [
         "INT-001",
-        "REFACTOR-REVIEW-3"
+        "REFACTOR-REVIEW-3",
+        "REFACTOR-3-001"
       ],
       "description": "Run full test suite, clippy, fmt check, and verify no regressions.",
       "estimatedEffort": "low",
@@ -728,7 +753,8 @@
       "conflictsWith": [],
       "dependsOn": [
         "VERIFY-001",
-        "REFACTOR-REVIEW-3"
+        "REFACTOR-REVIEW-3",
+        "REFACTOR-3-001"
       ],
       "description": "Final gate checkpoint before merge to main.",
       "estimatedEffort": "low",
