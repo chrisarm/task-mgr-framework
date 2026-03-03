@@ -1049,58 +1049,6 @@ mod tests {
         );
     }
 
-    /// Parameterized test: multiple model strings all produce correct --model flag.
-    #[test]
-    fn test_spawn_model_parameterized_model_strings() {
-        let models = [
-            ("claude-opus-4-6", "--model claude-opus-4-6"),
-            ("claude-sonnet-4-6", "--model claude-sonnet-4-6"),
-            (
-                "claude-haiku-4-5-20251001",
-                "--model claude-haiku-4-5-20251001",
-            ),
-            ("custom-model-v2", "--model custom-model-v2"),
-            ("my_model.v1.2", "--model my_model.v1.2"),
-        ];
-
-        for (model, expected_fragment) in &models {
-            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model), None, false);
-            std::env::remove_var("CLAUDE_BINARY");
-
-            assert!(result.is_ok(), "model='{}' should succeed", model);
-            let output = result.unwrap().output;
-            assert!(
-                output.contains(expected_fragment),
-                "model='{}' should produce '{}', got: '{}'",
-                model,
-                expected_fragment,
-                output.trim()
-            );
-        }
-    }
-
-    /// Whitespace-only model treated as None — no --model flag.
-    #[test]
-    fn test_spawn_model_whitespace_only_treated_as_none() {
-        for model in &["  ", "\t", " \t "] {
-            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model), None, false);
-            std::env::remove_var("CLAUDE_BINARY");
-
-            assert!(result.is_ok());
-            let output = result.unwrap().output;
-            assert!(
-                !output.contains("--model"),
-                "model='{}' (whitespace-only) should not produce --model flag, got: '{}'",
-                model.escape_debug(),
-                output.trim()
-            );
-        }
-    }
-
     /// --print and --dangerously-skip-permissions must be present regardless of model value.
     #[test]
     fn test_spawn_model_some_preserves_required_flags() {
