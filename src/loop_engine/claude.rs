@@ -267,19 +267,26 @@ pub fn spawn_claude(
 /// - `output_text`: extracted from the final `result.result` field (what `--print` would emit).
 /// - `conversation`: formatted transcript of the full conversation, capped at
 ///   `MAX_CONVERSATION_CHARS`.
+///
+/// Each JSON line is parsed exactly once; the parsed `Value` is passed to both
+/// `tee_assistant_text` (for live display) and `process_stream_json_values` (for
+/// conversation building).
 fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<String>) {
-    let mut raw_lines: Vec<String> = Vec::new();
+    let mut parsed: Vec<serde_json::Value> = Vec::new();
 
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                // Display assistant text blocks live before collecting
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                    tee_assistant_text(&val);
-                } else {
-                    eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(val) => {
+                        // Tee assistant text live before collecting for conversation building
+                        tee_assistant_text(&val);
+                        parsed.push(val);
+                    }
+                    Err(_) => {
+                        eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                    }
                 }
-                raw_lines.push(line);
             }
             Err(e) => {
                 eprintln!("Warning: error reading Claude stdout: {}", e);
@@ -288,7 +295,7 @@ fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<Str
         }
     }
 
-    parse_stream_json_lines(raw_lines.iter().map(|s| s.as_str()))
+    process_stream_json_values(parsed.into_iter())
 }
 
 /// Tee assistant text content blocks to stderr for live display.
@@ -341,18 +348,29 @@ fn tee_assistant_text(val: &serde_json::Value) {
 pub fn parse_stream_json_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (String, Option<String>) {
+    let values = lines.filter_map(
+        |line| match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                None
+            }
+        },
+    );
+    process_stream_json_values(values)
+}
+
+/// Process an iterator of already-parsed stream-json `Value`s into (output_text, conversation).
+///
+/// This is the shared core used by both `parse_stream_json_lines` (which parses strings first)
+/// and `tee_stream_json` (which passes pre-parsed values to avoid double-parsing).
+fn process_stream_json_values(
+    values: impl Iterator<Item = serde_json::Value>,
+) -> (String, Option<String>) {
     let mut output_text = String::new();
     let mut conversation = String::new();
 
-    for line in lines {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("Warning: malformed stream-json line (not valid JSON)");
-                continue;
-            }
-        };
-
+    for val in values {
         match val.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
                 process_assistant_message(&val, &mut conversation);
