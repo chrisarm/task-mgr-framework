@@ -486,3 +486,20 @@
 - Added insert_learning_with_content() helper for large-corpus tests
 - **Learnings:** CLAUDE_BINARY=false works well for counting batches (each failed batch = 1 llm_error); script mock approach avoids single-quote issues in JSON by writing to a data file and cat-ing it
 ---
+
+## 2026-03-03 - 2367d40c-CODE-REVIEW-1
+- **Scope**: Reviewed FEAT-001, FEAT-002, FEAT-003 implementation (FEAT-004 not yet implemented)
+- **Files reviewed**: claude.rs (spawn_claude, ClaudeResult, tee_stream_json, parse_stream_json_lines, process_assistant_message, process_user_message, truncate_chars, append_capped), engine.rs (spawn call site, learning extraction)
+- **unwrap() audit**: PASS — all unwrap() in #[cfg(test)] only
+- **Error propagation**: PASS — `?` and map_err throughout
+- **Security (malformed JSON injection)**: PASS — serde_json validates, malformed lines skipped
+- **--no-session-persistence on ALL 4 spawn sites**: PASS — both stream_json branches include it
+- **Utility spawns pass stream_json=false**: PASS — enrich.rs:234, mod.rs:613, ingestion/mod.rs:77
+- **Arg ordering**: PASS — --output-format before -p
+- **Integration engine.rs**: BLOCKED — FEAT-004 not yet implemented (passes: false in JSON)
+- **cargo fmt**: Fixed minor formatting drift in test code
+- **cargo clippy/check/test**: All PASS (2228 lib + 58 integration, 0 failures)
+- **No CODE-FIX tasks needed** for FEAT-001/002/003
+- **Note**: FEAT-004 was listed as completed dependency in prompt but JSON shows passes: false. engine.rs:445 still passes stream_json: false.
+- **Learnings:** truncate_chars byte-length fast path is conservative for multi-byte Unicode but never incorrect
+---

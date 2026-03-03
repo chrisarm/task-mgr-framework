@@ -1464,7 +1464,10 @@ mod tests {
         let result = spawn_claude("prompt", None, None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
         let output = result.unwrap().output;
-        assert!(output.contains("--print"), "stream_json=false must use --print");
+        assert!(
+            output.contains("--print"),
+            "stream_json=false must use --print"
+        );
         assert!(
             !output.contains("--output-format"),
             "stream_json=false must NOT use --output-format"
@@ -1557,7 +1560,10 @@ mod tests {
         ];
         let (_, conv) = parse_stream_json_lines(lines.iter().copied());
         let conv = conv.unwrap();
-        assert!(!conv.contains("internal"), "thinking blocks should be skipped");
+        assert!(
+            !conv.contains("internal"),
+            "thinking blocks should be skipped"
+        );
         assert!(conv.contains("visible"));
     }
 
@@ -1568,7 +1574,10 @@ mod tests {
         ];
         let (_, conv) = parse_stream_json_lines(lines.iter().copied());
         let conv = conv.unwrap();
-        assert!(conv.contains("[Tool: Read]"), "tool_use must be formatted as [Tool: name]");
+        assert!(
+            conv.contains("[Tool: Read]"),
+            "tool_use must be formatted as [Tool: name]"
+        );
     }
 
     #[test]
@@ -1578,16 +1587,16 @@ mod tests {
         ];
         let (_, conv) = parse_stream_json_lines(lines.iter().copied());
         let conv = conv.unwrap();
-        assert!(conv.contains("[Result:"), "tool_result must be formatted as [Result: ...]");
+        assert!(
+            conv.contains("[Result:"),
+            "tool_result must be formatted as [Result: ...]"
+        );
         assert!(conv.contains("fn main()"));
     }
 
     #[test]
     fn test_parse_stream_json_malformed_line_skipped() {
-        let lines = [
-            "not json at all",
-            r#"{"type":"result","result":"ok"}"#,
-        ];
+        let lines = ["not json at all", r#"{"type":"result","result":"ok"}"#];
         // Should not panic; output extracted from result line
         let (output, _) = parse_stream_json_lines(lines.iter().copied());
         assert_eq!(output, "ok");
@@ -1601,7 +1610,10 @@ mod tests {
         ];
         let (output, conv) = parse_stream_json_lines(lines.iter().copied());
         assert_eq!(output, "final");
-        assert!(conv.is_none(), "system messages should not add to conversation");
+        assert!(
+            conv.is_none(),
+            "system messages should not add to conversation"
+        );
     }
 
     #[test]
@@ -1640,10 +1652,7 @@ mod tests {
         let conv = conv.unwrap();
         // The formatted tool_use line should not contain the full 1000-char input
         // (input JSON is serialized then truncated to 500 chars)
-        assert!(
-            conv.contains("[Tool: Write]"),
-            "tool_use must be formatted"
-        );
+        assert!(conv.contains("[Tool: Write]"), "tool_use must be formatted");
     }
 
     #[test]
