@@ -2039,6 +2039,207 @@ mod tests {
         );
     }
 
+    // --- TEST-002: spawn_claude stream_json arg construction ---
+
+    /// AC: stream_json=false with a model — --print, --no-session-persistence, and --model all present.
+    #[test]
+    fn test_stream_json_false_with_model_has_print_and_model() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("prompt", None, None, Some("claude-opus-4-6"), None, false);
+        std::env::remove_var("CLAUDE_BINARY");
+        let output = result.unwrap().output;
+        assert!(
+            output.contains("--print"),
+            "stream_json=false must use --print"
+        );
+        assert!(
+            output.contains("--no-session-persistence"),
+            "stream_json=false must include --no-session-persistence"
+        );
+        assert!(
+            output.contains("--model"),
+            "stream_json=false with model must include --model"
+        );
+        assert!(
+            output.contains("claude-opus-4-6"),
+            "stream_json=false with model must include the model value"
+        );
+        assert!(
+            !output.contains("--output-format"),
+            "stream_json=false must NOT use --output-format"
+        );
+    }
+
+    /// AC: stream_json=true with model + timeout — correct arg ordering.
+    ///
+    /// Expected order: --output-format stream-json, --no-session-persistence,
+    /// --dangerously-skip-permissions, --model <model>, -p <prompt>
+    #[test]
+    fn test_stream_json_true_with_model_and_timeout_arg_ordering() {
+        use std::io::Write;
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir();
+        let script_path = dir.join("task_mgr_test_stream_model_timeout.sh");
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
+        }
+        let _ = std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        );
+
+        let timeout = TimeoutConfig::from_difficulty(Some("medium"), Arc::new(AtomicU64::new(0)));
+        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        let result = spawn_claude(
+            "my-prompt",
+            None,
+            None,
+            Some("claude-sonnet-4-6"),
+            Some(timeout),
+            true,
+        );
+        std::env::remove_var("CLAUDE_BINARY");
+        let _ = std::fs::remove_file(&script_path);
+
+        let output = result.expect("spawn should succeed").output;
+
+        // --output-format stream-json must appear before " -p " (prompt flag).
+        // Use " -p " with spaces to avoid matching "-p" inside "--dangerously-skip-permissions".
+        let pos_output_format = output
+            .find("--output-format stream-json")
+            .expect("--output-format stream-json must be present");
+        let pos_prompt_flag =
+            output.find(" -p ").expect("' -p ' (prompt flag with spaces) must be present");
+        assert!(
+            pos_output_format < pos_prompt_flag,
+            "--output-format stream-json must appear before -p"
+        );
+
+        // --model must appear before -p <prompt>
+        let pos_model = output.find("--model").expect("--model must be present");
+        assert!(pos_model < pos_prompt_flag, "--model must appear before -p");
+
+        // model value must be present
+        assert!(
+            output.contains("claude-sonnet-4-6"),
+            "model value must be in args"
+        );
+
+        // --no-session-persistence present
+        assert!(
+            output.contains("--no-session-persistence"),
+            "--no-session-persistence must be present"
+        );
+
+        // --print must NOT be present
+        assert!(
+            !output.contains("--print"),
+            "--print must NOT be present for stream_json=true"
+        );
+    }
+
+    /// AC: parameterized tests for all 4 caller patterns:
+    ///   (stream_json=false, model=None)   — curate / ingestion callers
+    ///   (stream_json=false, model=Some)   — utility callers with model
+    ///   (stream_json=true,  model=None)   — loop engine (no model override)
+    ///   (stream_json=true,  model=Some)   — loop engine with model override
+    ///
+    /// For stream_json=false cases we use "echo" as the binary (returns args as text).
+    /// For stream_json=true cases we use a shell script that wraps args in a result JSON.
+    #[rstest]
+    #[case(false, None, true, false)] // curate/ingestion: --print, no --output-format
+    #[case(false, Some("opus"), true, false)] // utility+model: --print, no --output-format, has --model
+    #[case(true, None, false, true)] // engine no model: --output-format, no --print
+    #[case(true, Some("sonnet"), false, true)] // engine+model: --output-format, no --print, has --model
+    fn test_spawn_claude_four_caller_patterns(
+        #[case] stream_json: bool,
+        #[case] model: Option<&str>,
+        #[case] expect_print: bool,
+        #[case] expect_output_format: bool,
+    ) {
+        use std::io::Write;
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let output = if stream_json {
+            // Need a script that emits valid result JSON so the stream-json parser yields args
+            let dir = std::env::temp_dir();
+            let script_path = dir.join(format!(
+                "task_mgr_test_4callers_{}.sh",
+                model.unwrap_or("none")
+            ));
+            {
+                let mut f = std::fs::File::create(&script_path).unwrap();
+                writeln!(f, "#!/bin/sh").unwrap();
+                writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
+            }
+            let _ = std::fs::set_permissions(
+                &script_path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            );
+            std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
+            std::env::remove_var("CLAUDE_BINARY");
+            let _ = std::fs::remove_file(&script_path);
+            result.expect("spawn should succeed").output
+        } else {
+            std::env::set_var("CLAUDE_BINARY", "echo");
+            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
+            std::env::remove_var("CLAUDE_BINARY");
+            result.expect("spawn should succeed").output
+        };
+
+        if expect_print {
+            assert!(
+                output.contains("--print"),
+                "expected --print in output: {output}"
+            );
+        } else {
+            assert!(
+                !output.contains("--print"),
+                "expected NO --print in output: {output}"
+            );
+        }
+
+        if expect_output_format {
+            assert!(
+                output.contains("--output-format stream-json"),
+                "expected --output-format stream-json in output: {output}"
+            );
+        } else {
+            assert!(
+                !output.contains("--output-format"),
+                "expected NO --output-format in output: {output}"
+            );
+        }
+
+        // --no-session-persistence always present
+        assert!(
+            output.contains("--no-session-persistence"),
+            "--no-session-persistence must always be present: {output}"
+        );
+
+        // model presence
+        if let Some(m) = model {
+            assert!(
+                output.contains("--model"),
+                "expected --model in output: {output}"
+            );
+            assert!(
+                output.contains(m),
+                "expected model value '{m}' in output: {output}"
+            );
+        } else {
+            assert!(
+                !output.contains("--model"),
+                "expected NO --model flag when model=None: {output}"
+            );
+        }
+    }
+
     /// AC: truncate_chars at exact boundary — no off-by-one.
     #[rstest]
     #[case("hello", 5, "hello")] // exact boundary — keep all
