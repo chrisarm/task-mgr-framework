@@ -515,6 +515,16 @@
 - **Flagged but acceptable**: spawn_claude at 161 lines — orchestration function, splitting would scatter the flow.
 ---
 
+## 2026-03-03 - 2367d40c-REFACTOR-REVIEW-2
+- Reviewed claude.rs test code (lines 614-2280, ~1660 lines) for duplication and helper extraction
+- **Issue 1 (REFACTOR-2-001)**: 2 manual-loop tests (`test_spawn_model_parameterized_model_strings`, `test_spawn_model_whitespace_only_treated_as_none`) are exact duplicates of rstest parameterized versions added in TEST-001. ~50 lines removable.
+- **Issue 2 (REFACTOR-2-002)**: ENV_MUTEX lock + set_var("CLAUDE_BINARY","echo") + spawn_claude + remove_var pattern repeated 15+ times. Extract `spawn_claude_echo` helper.
+- **Issue 3 (REFACTOR-2-003)**: Temp shell script creation for stream_json=true tests duplicated 3× (lines 1492, 2082, 2167). Each creates identical script outputting `{"type":"result","result":"$*"}`. Extract shared helper.
+- **No issues found**: Test names are clear and descriptive. parse_stream_json_lines tests are well-structured with good use of rstest.
+- Added 3 REFACTOR-2-xxx tasks (priority 40-42) to JSON, added all to MILESTONE-2 dependsOn.
+- **Learnings:** rstest parameterized tests supersede manual-loop variants but the old tests weren't removed; shell-script-based mocks for stream-json should be a shared fixture.
+---
+
 ## 2026-03-03 - 2367d40c-MILESTONE-1
 - **Verification**: All acceptance criteria checked and passing
 - All tests: 2356 passed, 0 failed, 8 ignored

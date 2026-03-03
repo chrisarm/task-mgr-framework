@@ -438,7 +438,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -467,7 +467,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Use #[rstest] for parameterized tests.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "synergyWith": [
         "TEST-002"
@@ -494,7 +494,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "Extend existing test patterns in claude.rs.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "synergyWith": [
         "TEST-001"
@@ -529,6 +529,63 @@
     },
     {
       "acceptanceCriteria": [
+        "test_spawn_model_parameterized_model_strings deleted (superseded by rstest test_spawn_claude_model_variants)",
+        "test_spawn_model_whitespace_only_treated_as_none deleted (superseded by rstest test_spawn_claude_whitespace_only_model_treated_as_none)",
+        "All existing tests still pass"
+      ],
+      "batchWith": ["REFACTOR-2-002", "REFACTOR-2-003"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "description": "Delete 2 manual-loop tests that are duplicated by rstest parameterized versions (~50 lines).",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 40,
+      "synergyWith": ["REFACTOR-2-002"],
+      "title": "Remove duplicate manual-loop tests superseded by rstest",
+      "touchesFiles": ["src/loop_engine/claude.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "spawn_claude_echo helper extracts ENV_MUTEX lock + set_var + spawn_claude + remove_var pattern",
+        "15+ call sites in claude.rs tests use the helper instead of inline boilerplate",
+        "All tests still pass"
+      ],
+      "batchWith": ["REFACTOR-2-001", "REFACTOR-2-003"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "description": "Extract spawn_claude_echo(prompt, signal, model, stream_json) helper to eliminate 15+ repetitions of ENV_MUTEX + CLAUDE_BINARY=echo boilerplate.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 41,
+      "synergyWith": ["REFACTOR-2-001"],
+      "title": "Extract spawn_claude_echo test helper for ENV_MUTEX boilerplate",
+      "touchesFiles": ["src/loop_engine/claude.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "Shared helper creates temp script that wraps $* in result JSON",
+        "3 call sites (test_stream_json_true_uses_output_format_stream_json, test_stream_json_true_with_model_and_timeout_arg_ordering, test_spawn_claude_four_caller_patterns) use the helper",
+        "All tests still pass"
+      ],
+      "batchWith": ["REFACTOR-2-001", "REFACTOR-2-002"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "description": "Extract helper for creating temp shell script that outputs stream-json result wrapping args. Pattern duplicated 3x.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-003",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 42,
+      "synergyWith": ["REFACTOR-2-002"],
+      "title": "Extract stream-json result script helper for tests",
+      "touchesFiles": ["src/loop_engine/claude.rs"]
+    },
+    {
+      "acceptanceCriteria": [
         "All comprehensive tests pass",
         "REFACTOR-REVIEW-2 passes",
         "cargo test passes with no failures",
@@ -540,7 +597,10 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
       "description": "Gate checkpoint: comprehensive tests pass, test code is clean.",
       "estimatedEffort": "low",
