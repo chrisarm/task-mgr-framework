@@ -47,8 +47,11 @@
         "Test: assistant message with text block extracts text correctly",
         "Test: assistant message with tool_use block formats as [Tool: name] {truncated input}",
         "Test: assistant message with thinking block — thinking is excluded",
+        "Test: assistant message with error field set — output includes [Error: {error_text}]",
         "Test: user message with tool_result extracts content (truncated to 1000 chars)",
         "Test: result message extracts result field as the 'output' text",
+        "Test: result message with subtype=error — handled without panic, output is result text or empty",
+        "Test: result message with null result field — treated as empty string",
         "Test: system message is skipped entirely",
         "Test: tool_use input truncated to 500 chars when longer",
         "Test: tool_result content truncated to 1000 chars when longer",
@@ -68,6 +71,7 @@
         "Empty lines in stream — skip gracefully",
         "assistant message with error field set — include [Error: rate_limit] in output",
         "result message with null result field — treat as empty string",
+        "result message with subtype=error — handle gracefully",
         "Stream with only a result message (no assistant messages) — output is just the result text"
       ],
       "invariants": [
@@ -84,6 +88,10 @@
         {
           "cause": "result message missing or result field is null",
           "expectedBehavior": "ClaudeResult.output is empty string"
+        },
+        {
+          "cause": "result message with subtype=error",
+          "expectedBehavior": "Extract result text if present, otherwise empty string"
         }
       ],
       "touchesFiles": ["src/loop_engine/claude.rs"],
@@ -103,6 +111,7 @@
         "Test: spawn_claude with stream_json=true does NOT include --print in args",
         "Test: spawn_claude with stream_json=false includes --print in args (existing behavior)",
         "Test: spawn_claude with stream_json=false includes --no-session-persistence in args",
+        "Test: --output-format stream-json and --print are mutually exclusive (never both present)",
         "Known-bad discriminator: test that --output-format stream-json is placed BEFORE -p (not after prompt text)"
       ],
       "priority": 2,
@@ -111,7 +120,8 @@
       "notes": "Follow existing test patterns in claude.rs (lines 500-1030) which use CLAUDE_BINARY=echo to capture constructed args. Tests may use #[ignore] until implementation lands.",
       "edgeCases": [
         "stream_json=true + model=Some — both flags present in correct order",
-        "stream_json=true + timeout — both work together"
+        "stream_json=true + timeout — both work together",
+        "--no-session-persistence absent when it should be present (session files leak)"
       ],
       "invariants": [
         "--dangerously-skip-permissions always present regardless of stream_json",
@@ -122,6 +132,10 @@
         {
           "cause": "--output-format placed after -p, becoming part of prompt text",
           "expectedBehavior": "--output-format must appear before -p in args"
+        },
+        {
+          "cause": "--no-session-persistence missing from args",
+          "expectedBehavior": "Always present in both stream_json=true and stream_json=false modes"
         }
       ],
       "touchesFiles": ["src/loop_engine/claude.rs"],
@@ -133,43 +147,31 @@
     },
     {
       "id": "FEAT-001",
-      "title": "Add stream_json mode to spawn_claude with stream parser",
-      "description": "Extend spawn_claude with a stream_json: bool parameter. When true, use --output-format stream-json --no-session-persistence instead of --print. When false, use --print --no-session-persistence. In the tee loop, when stream_json is true: parse each JSON line, extract assistant text for live stderr display, collect formatted conversation content, extract result.result as output. Add conversation: Option<String> to ClaudeResult. Update all 4 callers to compile (all pass false initially).",
+      "title": "Add stream_json param to spawn_claude signature, update ClaudeResult, update all callers",
+      "description": "Add stream_json: bool parameter to spawn_claude. Add conversation: Option<String> to ClaudeResult. When stream_json=true: use --output-format stream-json --no-session-persistence (no --print). When stream_json=false: use --print --no-session-persistence. Update all 4 callers to pass stream_json=false so everything compiles. No behavior change in the tee loop yet — stream-json parsing comes in FEAT-002.",
       "acceptanceCriteria": [
-        "ClaudeResult has conversation: Option<String> field",
+        "ClaudeResult has conversation: Option<String> field (set to None for now)",
         "spawn_claude accepts stream_json: bool parameter",
-        "When stream_json=true: uses --output-format stream-json --no-session-persistence (no --print)",
-        "When stream_json=false: uses --print --no-session-persistence",
-        "Stream-json mode: assistant text blocks teed to stderr for live display",
-        "Stream-json mode: tool_use formatted as [Tool: name] {truncated input 500 chars}",
-        "Stream-json mode: tool_result content truncated to 1000 chars",
-        "Stream-json mode: thinking blocks and system messages skipped",
-        "Stream-json mode: result.result extracted into ClaudeResult.output",
-        "Stream-json mode: full formatted conversation stored in ClaudeResult.conversation",
-        "Conversation output capped at 50,000 chars",
-        "All 4 callers updated with stream_json=false (compile fix)",
-        "All existing tests pass",
-        "TEST-INIT-001 and TEST-INIT-002 tests pass"
+        "When stream_json=true: args include --output-format stream-json --no-session-persistence, no --print",
+        "When stream_json=false: args include --print --no-session-persistence",
+        "All 4 callers updated to pass stream_json=false",
+        "All existing tests pass (update test assertions for new arg: --no-session-persistence)",
+        "TEST-INIT-002 tests pass"
       ],
       "priority": 6,
-      "estimatedEffort": "high",
+      "estimatedEffort": "medium",
       "passes": false,
-      "notes": "This is the core change. The tee loop currently reads lines and echoes to stderr. In stream-json mode, each line is JSON that needs parsing. Extract a helper function for the parsing logic (testable separately). Malformed lines should be skipped with a warning.",
+      "notes": "This is a compile-fix task — the tee loop still reads lines as plain text. FEAT-002 adds the JSON parsing. conversation is always None at this point.",
       "qualityDimensions": {
         "correctness": [
-          "Malformed JSON lines must be skipped, not crash the loop",
-          "ClaudeResult.output must contain the result text (for detection::analyze_output compatibility)",
-          "Per-block truncation must not split mid-character"
+          "--no-session-persistence must appear in args for BOTH stream_json=true and false",
+          "Existing behavior unchanged when stream_json=false"
         ],
         "performance": [
-          "JSON parsing per line is fast (<1ms per serde_json::from_str call)",
-          "No buffering of display — text teed to stderr immediately per line",
-          "50K char cap prevents memory issues"
+          "No performance impact — just arg construction changes"
         ],
         "style": [
-          "Extract stream-json parsing into a separate testable function",
-          "Follow existing tee loop pattern in spawn_claude",
-          "Match graceful degradation pattern (eprintln! + continue)"
+          "Match existing arg construction pattern in spawn_claude"
         ]
       },
       "touchesFiles": [
@@ -179,31 +181,110 @@
         "src/commands/curate/mod.rs",
         "src/commands/curate/enrich.rs"
       ],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002"],
-      "synergyWith": [],
+      "dependsOn": ["TEST-INIT-002"],
+      "synergyWith": ["FEAT-002"],
       "batchWith": [],
       "conflictsWith": [],
       "modifiesBehavior": true
     },
     {
       "id": "FEAT-002",
+      "title": "Implement stream-json line parser as a testable function",
+      "description": "Create a pure function that accepts an iterator of stream-json lines and returns (output_text: String, conversation: Option<String>). Parses assistant messages (text blocks → full text, tool_use → [Tool: name] {truncated input 500 chars}, skip thinking), user messages (tool_result → truncated to 1000 chars), result messages (extract result field). Skips system messages and malformed lines. Caps conversation at 50K chars.",
+      "acceptanceCriteria": [
+        "Pure function: accepts iterator of lines, returns (String, Option<String>)",
+        "Assistant text blocks included as-is in conversation",
+        "Tool_use blocks formatted as [Tool: {name}] {json-serialized-input truncated to 500 chars}",
+        "Tool_result content truncated to 1000 chars in conversation",
+        "Thinking blocks skipped",
+        "System messages skipped",
+        "result.result extracted as output text",
+        "result with null result field → output is empty string",
+        "assistant error field → [Error: {error}] in conversation",
+        "Malformed JSON lines skipped with eprintln warning",
+        "Conversation capped at 50,000 chars",
+        "Per-block truncation does not split mid-character",
+        "TEST-INIT-001 tests pass"
+      ],
+      "priority": 7,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Keep this as a standalone function in claude.rs (or a submodule). It should be pure — no I/O, no stderr, just parsing. The caller (tee loop) handles stderr display.",
+      "qualityDimensions": {
+        "correctness": [
+          "Malformed JSON lines must be skipped, not crash",
+          "Per-block truncation must not split mid-character",
+          "result.result must be extracted correctly for detection::analyze_output"
+        ],
+        "performance": [
+          "JSON parsing per line is fast (<1ms per serde_json::from_str call)",
+          "50K char cap prevents memory issues"
+        ],
+        "style": [
+          "Pure function — testable without I/O",
+          "Match graceful degradation pattern (skip + warn on malformed lines)"
+        ]
+      },
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": ["FEAT-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Wire stream-json parser into spawn_claude tee loop",
+      "description": "In spawn_claude's tee loop, when stream_json=true: call the parser function from FEAT-002 on collected lines, tee assistant text blocks to stderr for live display, populate ClaudeResult.output from the parser's output_text, and ClaudeResult.conversation from the parser's conversation.",
+      "acceptanceCriteria": [
+        "When stream_json=true: tee loop parses JSON lines and displays assistant text on stderr",
+        "When stream_json=true: ClaudeResult.output contains result.result text",
+        "When stream_json=true: ClaudeResult.conversation contains formatted conversation",
+        "When stream_json=false: existing tee behavior unchanged (lines echoed to stderr, collected into output)",
+        "Malformed JSON lines in stream produce eprintln warning but don't crash"
+      ],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Two approaches for live display: (A) parse each line as it arrives and tee text blocks immediately, or (B) collect all lines and parse at end. Prefer (A) for real-time display. The parser from FEAT-002 can be called per-line or refactored to work incrementally.",
+      "qualityDimensions": {
+        "correctness": [
+          "Live display must show text as it arrives, not buffer until end",
+          "ClaudeResult.output must match what --print would have produced"
+        ],
+        "performance": [
+          "No buffering of display — text teed to stderr immediately per line"
+        ],
+        "style": [
+          "Follow existing tee loop pattern in spawn_claude"
+        ]
+      },
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["FEAT-001", "FEAT-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004",
       "title": "Wire engine to use stream_json=true and pass conversation to learning extraction",
-      "description": "In engine.rs: pass stream_json=true to spawn_claude for loop iterations. Use claude_result.conversation for learning extraction input when available, fall back to claude_result.output.",
+      "description": "In engine.rs: change spawn_claude call to pass stream_json=true for loop iterations. Use claude_result.conversation for learning extraction input when available, fall back to claude_result.output. If conversation is Some but empty, still pass it (don't fall back).",
       "acceptanceCriteria": [
         "Engine passes stream_json=true to spawn_claude",
-        "After iteration, uses claude_result.conversation for learning extraction if Some",
-        "Falls back to claude_result.output if conversation is None",
+        "After iteration, uses claude_result.conversation for learning extraction if Some (even if empty)",
+        "Falls back to claude_result.output only if conversation is None",
         "detection::analyze_output still uses claude_result.output (the result text)",
-        "Utility spawns still pass stream_json=false"
+        "Utility spawns (ingestion, curate, enrich) still pass stream_json=false"
       ],
       "priority": 9,
       "estimatedEffort": "low",
       "passes": false,
-      "notes": "detection::analyze_output must continue to use claude_result.output since it looks for specific markers like <completed>. Only the learning extraction input changes.",
+      "notes": "detection::analyze_output must continue to use claude_result.output since it looks for specific markers like <completed>. Only the learning extraction input changes. Empty conversation (Some(\"\")) is valid — it means the stream had no useful content beyond the result.",
       "qualityDimensions": {
         "correctness": [
           "detection::analyze_output must NOT be changed — it uses result text markers",
-          "Fallback to output must work when conversation is None"
+          "Fallback to output only when conversation is None, not when empty"
         ],
         "performance": [
           "No additional I/O — conversation is already in memory from the tee loop"
@@ -213,7 +294,7 @@
         ]
       },
       "touchesFiles": ["src/loop_engine/engine.rs"],
-      "dependsOn": ["FEAT-001"],
+      "dependsOn": ["FEAT-003"],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -222,14 +303,16 @@
     {
       "id": "CODE-REVIEW-1",
       "title": "Review implementation for quality, security, and integration wiring",
-      "description": "Review FEAT-001 and FEAT-002 for code quality, error handling, security, and integration wiring. Verify stream-json parsing is robust, arg ordering is correct, conversation field is used.",
+      "description": "Review all FEAT tasks for code quality, error handling, security, and integration wiring. Verify stream-json parsing is robust, arg ordering is correct, conversation field is used, --no-session-persistence is present on ALL spawn calls.",
       "acceptanceCriteria": [
         "No unwrap() in production code paths",
         "All errors properly propagated with context",
         "Security: no injection via malformed JSON lines",
-        "Quality dimensions met",
+        "Quality dimensions met for each task",
         "Edge case coverage: each edgeCases entry has a corresponding test",
         "Integration: engine.rs passes stream_json=true and uses conversation field",
+        "Verify: --no-session-persistence present on ALL 4 spawn_claude call sites",
+        "Verify: utility spawns (ingestion, curate, enrich) pass stream_json=false",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
       "priority": 13,
@@ -237,14 +320,8 @@
       "model": "claude-opus-4-6",
       "passes": false,
       "notes": "For each issue found: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn.",
-      "touchesFiles": [
-        "src/loop_engine/claude.rs",
-        "src/loop_engine/engine.rs",
-        "src/learnings/ingestion/mod.rs",
-        "src/commands/curate/mod.rs",
-        "src/commands/curate/enrich.rs"
-      ],
-      "dependsOn": ["FEAT-001", "FEAT-002"],
+      "touchesFiles": [],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -253,7 +330,7 @@
     {
       "id": "REFACTOR-REVIEW-1",
       "title": "Review implementation for refactoring opportunities",
-      "description": "Analyze implementation code for DRY violations, complexity, coupling. The stream-json parsing logic in spawn_claude's tee loop may be getting complex — check if extraction into a separate module is warranted.",
+      "description": "Analyze implementation code for DRY violations, complexity, coupling. The stream-json parsing logic and tee loop may be getting complex — check if extraction into a separate module is warranted.",
       "acceptanceCriteria": [
         "No code duplication (DRY principle)",
         "Functions under 30 lines (flag complex ones)",
@@ -264,8 +341,8 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "notes": "spawn_claude now has two code paths (text vs stream-json) in the tee loop. If this makes the function too long, suggest extracting.",
-      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/engine.rs"],
+      "notes": "spawn_claude now has two code paths (text vs stream-json) in the tee loop. If this makes the function too long, suggest extracting into a submodule.",
+      "touchesFiles": [],
       "dependsOn": ["CODE-REVIEW-1"],
       "synergyWith": [],
       "batchWith": [],
@@ -278,12 +355,13 @@
       "description": "Gate checkpoint: all implementation tasks pass, code reviewed, refactored.",
       "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001, TEST-INIT-002) pass",
-        "All implementation tasks (FEAT-001, FEAT-002) pass",
+        "All implementation tasks (FEAT-001 through FEAT-004) pass",
         "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
         "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
         "No dead code warnings for new code",
         "cargo test passes with no failures",
-        "cargo fmt --check passes"
+        "cargo fmt --check passes",
+        "--no-session-persistence present on all 4 spawn_claude call sites"
       ],
       "priority": 20,
       "estimatedEffort": "low",
@@ -292,7 +370,7 @@
       "passes": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
       "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "FEAT-001", "FEAT-002", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
       "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
@@ -358,7 +436,7 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "touchesFiles": [],
       "dependsOn": ["TEST-001", "TEST-002"],
       "synergyWith": [],
       "batchWith": [],
@@ -390,17 +468,17 @@
     {
       "id": "INT-001",
       "title": "Integration test: end-to-end stream-json capture with mock Claude binary",
-      "description": "Create an integration test using CLAUDE_BINARY pointing to a mock script that outputs stream-json lines. Verify spawn_claude parses them correctly and produces the expected ClaudeResult.",
+      "description": "Create an integration test using CLAUDE_BINARY pointing to a mock shell script at tests/fixtures/mock_stream_json.sh that outputs stream-json lines to stdout. Verify spawn_claude parses them correctly and produces the expected ClaudeResult.",
       "acceptanceCriteria": [
-        "Mock script outputs valid stream-json lines (assistant + user + result)",
+        "Mock script at tests/fixtures/mock_stream_json.sh outputs valid stream-json lines (assistant + user + result)",
         "Test verifies ClaudeResult.output contains result text",
-        "Test verifies ClaudeResult.conversation contains formatted conversation",
-        "Test verifies fallback when mock outputs non-JSON (stream_json=false mode)"
+        "Test verifies ClaudeResult.conversation contains formatted conversation with [Tool: ...] entries",
+        "Test verifies fallback when mock outputs plain text (stream_json=false mode)"
       ],
       "priority": 55,
       "estimatedEffort": "medium",
       "passes": false,
-      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "touchesFiles": ["src/loop_engine/claude.rs", "tests/fixtures/mock_stream_json.sh"],
       "dependsOn": ["MILESTONE-2"],
       "synergyWith": [],
       "batchWith": [],
@@ -421,7 +499,7 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/engine.rs"],
+      "touchesFiles": [],
       "dependsOn": ["INT-001"],
       "synergyWith": [],
       "batchWith": [],
