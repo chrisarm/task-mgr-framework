@@ -53,12 +53,13 @@ impl TimeoutConfig {
     }
 }
 
-/// Maximum characters for the formatted conversation in stream-json mode.
-const MAX_CONVERSATION_CHARS: usize = 50_000;
-/// Maximum characters for a single tool_use input block.
-const MAX_TOOL_USE_CHARS: usize = 500;
-/// Maximum characters for a single tool_result content block.
-const MAX_TOOL_RESULT_CHARS: usize = 1_000;
+/// Maximum bytes for the formatted conversation in stream-json mode.
+/// Byte-based for O(1) checking; limits are approximate and mostly-ASCII content means bytes ≈ chars.
+const MAX_CONVERSATION_BYTES: usize = 50_000;
+/// Maximum bytes for a single tool_use input block.
+const MAX_TOOL_USE_BYTES: usize = 500;
+/// Maximum bytes for a single tool_result content block.
+const MAX_TOOL_RESULT_BYTES: usize = 1_000;
 
 /// Result of a Claude subprocess invocation.
 #[derive(Debug)]
@@ -266,7 +267,7 @@ pub fn spawn_claude(
 ///
 /// - `output_text`: extracted from the final `result.result` field (what `--print` would emit).
 /// - `conversation`: formatted transcript of the full conversation, capped at
-///   `MAX_CONVERSATION_CHARS`.
+///   `MAX_CONVERSATION_BYTES`.
 ///
 /// Each JSON line is parsed exactly once; the parsed `Value` is passed to both
 /// `tee_assistant_text` (for live display) and `process_stream_json_values` (for
@@ -298,7 +299,6 @@ fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<Str
     process_stream_json_values(parsed.into_iter())
 }
 
-/// Tee assistant text content blocks to stderr for live display.
 /// Extract error text from an assistant message, handling both string and object error shapes.
 fn extract_error_text(val: &serde_json::Value) -> Option<String> {
     let error = val.get("error")?;
@@ -342,10 +342,11 @@ fn tee_assistant_text(val: &serde_json::Value) {
 ///
 /// - `output_text` is extracted from the final `{"type":"result","result":"..."}` line.
 /// - `conversation` is a formatted transcript of assistant messages (text, tool_use) and
-///   user messages (tool_result), capped at `MAX_CONVERSATION_CHARS`.
+///   user messages (tool_result), capped at `MAX_CONVERSATION_BYTES`.
 ///
 /// Malformed JSON lines and unknown message types are silently skipped with a warning.
-pub fn parse_stream_json_lines<'a>(
+#[cfg(test)]
+pub(crate) fn parse_stream_json_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (String, Option<String>) {
     let values = lines.filter_map(
@@ -382,22 +383,23 @@ fn process_stream_json_values(
                 // Extract the output text from the result line
                 output_text = val
                     .get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .map(|r| {
+                        r.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
+                            if r.is_null() {
+                                String::new()
+                            } else {
+                                r.to_string()
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
             }
             // Skip system/init and unknown types
             _ => {}
         }
     }
 
-    let conversation_opt = if conversation.is_empty() {
-        None
-    } else {
-        Some(conversation)
-    };
-
-    (output_text, conversation_opt)
+    (output_text, Some(conversation))
 }
 
 /// Append formatted assistant message content to the conversation buffer.
@@ -429,7 +431,7 @@ fn process_assistant_message(val: &serde_json::Value, conversation: &mut String)
                     .get("input")
                     .map(|i| i.to_string())
                     .unwrap_or_default();
-                let truncated = truncate_chars(&input_str, MAX_TOOL_USE_CHARS);
+                let truncated = truncate_bytes(&input_str, MAX_TOOL_USE_BYTES);
                 append_capped(conversation, &format!("[Tool: {}] {}\n", name, truncated));
             }
             _ => {} // Skip thinking blocks and unknown types
@@ -452,34 +454,44 @@ fn process_user_message(val: &serde_json::Value, conversation: &mut String) {
         if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
             let content_str = block
                 .get("content")
-                .and_then(|c| c.as_str())
+                .and_then(|c| {
+                    c.as_str().map(|s| s.to_string()).or_else(|| {
+                        c.as_array().map(|arr| {
+                            arr.iter()
+                                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                    })
+                })
                 .unwrap_or_default();
-            let truncated = truncate_chars(content_str, MAX_TOOL_RESULT_CHARS);
+            let truncated = truncate_bytes(&content_str, MAX_TOOL_RESULT_BYTES);
             append_capped(conversation, &format!("[Result: {}]\n", truncated));
         }
     }
 }
 
-/// Append `s` to `buf` only up to `MAX_CONVERSATION_CHARS` total.
+/// Append `s` to `buf` only up to `MAX_CONVERSATION_BYTES` total.
 fn append_capped(buf: &mut String, s: &str) {
-    if buf.len() >= MAX_CONVERSATION_CHARS {
+    if buf.len() >= MAX_CONVERSATION_BYTES {
         return;
     }
-    let remaining = MAX_CONVERSATION_CHARS - buf.len();
-    let to_append = truncate_chars(s, remaining);
+    let remaining = MAX_CONVERSATION_BYTES - buf.len();
+    let to_append = truncate_bytes(s, remaining);
     buf.push_str(to_append);
 }
 
-/// Truncate `s` to at most `max_chars` Unicode scalar values without splitting mid-character.
-fn truncate_chars(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
+/// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8 character.
+fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
         return s;
     }
-    // Find the byte boundary at the char boundary
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
+    // Walk backwards from max_bytes to find a char boundary
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
     }
+    &s[..end]
 }
 
 /// Extract exit code from process status, using 128+signal convention on Unix.
@@ -1531,15 +1543,16 @@ mod tests {
         ];
         let (output, conv) = parse_stream_json_lines(lines.iter().copied());
         assert_eq!(output, "final");
-        assert!(
-            conv.is_none(),
+        assert_eq!(
+            conv,
+            Some(String::new()),
             "system messages should not add to conversation"
         );
     }
 
     #[test]
     fn test_parse_stream_json_conversation_cap() {
-        // Fill conversation beyond MAX_CONVERSATION_CHARS with repeated text blocks
+        // Fill conversation beyond MAX_CONVERSATION_BYTES with repeated text blocks
         let big_text = "x".repeat(10_000);
         let block = serde_json::json!({
             "type": "assistant",
@@ -1552,9 +1565,9 @@ mod tests {
         let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
         let conv = conv.unwrap();
         assert!(
-            conv.len() <= MAX_CONVERSATION_CHARS,
+            conv.len() <= MAX_CONVERSATION_BYTES,
             "conversation must be capped at {} chars, got {}",
-            MAX_CONVERSATION_CHARS,
+            MAX_CONVERSATION_BYTES,
             conv.len()
         );
     }
@@ -1577,18 +1590,23 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_chars_ascii() {
-        assert_eq!(truncate_chars("hello world", 5), "hello");
-        assert_eq!(truncate_chars("hi", 100), "hi");
+    fn test_truncate_bytes_ascii() {
+        assert_eq!(truncate_bytes("hello world", 5), "hello");
+        assert_eq!(truncate_bytes("hi", 100), "hi");
     }
 
     #[test]
-    fn test_truncate_chars_multibyte() {
+    fn test_truncate_bytes_multibyte() {
         // "こんにちは" is 5 chars, each 3 bytes = 15 bytes total
         let s = "こんにちは";
-        assert_eq!(truncate_chars(s, 3), "こんに");
+        // 3 bytes = exactly 1 char boundary
+        assert_eq!(truncate_bytes(s, 3), "こ");
+        // 9 bytes = exactly 3 chars
+        assert_eq!(truncate_bytes(s, 9), "こんに");
+        // 4 bytes lands mid-char, should round down to 3
+        assert_eq!(truncate_bytes(s, 4), "こ");
         // Ensure we don't split mid-character
-        let truncated = truncate_chars(s, 3);
+        let truncated = truncate_bytes(s, 5);
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
@@ -1671,7 +1689,7 @@ mod tests {
         );
     }
 
-    /// AC: Truncation at exactly MAX_TOOL_USE_CHARS boundary (500 chars) — not off-by-one.
+    /// AC: Truncation at exactly MAX_TOOL_USE_BYTES boundary (500 chars) — not off-by-one.
     #[test]
     fn test_parse_stream_json_tool_use_truncation_at_500_boundary() {
         // Build an input value that serializes to exactly 500 chars
@@ -1720,14 +1738,14 @@ mod tests {
         // The suffix after "[Tool: Read] " is the truncated input_str
         let input_part = tool_line.trim_start_matches("[Tool: Read] ");
         assert!(
-            input_part.len() <= MAX_TOOL_USE_CHARS,
+            input_part.len() <= MAX_TOOL_USE_BYTES,
             "Input part must be <= {} chars, got {}",
-            MAX_TOOL_USE_CHARS,
+            MAX_TOOL_USE_BYTES,
             input_part.len()
         );
     }
 
-    /// AC: Truncation at exactly MAX_TOOL_RESULT_CHARS boundary (1000 chars) — not off-by-one.
+    /// AC: Truncation at exactly MAX_TOOL_RESULT_BYTES boundary (1000 chars) — not off-by-one.
     #[test]
     fn test_parse_stream_json_tool_result_truncation_at_1000_boundary() {
         // Exactly 1000 chars → not truncated
@@ -1770,7 +1788,7 @@ mod tests {
     /// AC: Unicode truncation preserves char boundaries for tool_result content.
     #[test]
     fn test_parse_stream_json_unicode_truncation_preserves_char_boundaries() {
-        // Build a string of 1001 Unicode chars (each 3 bytes in UTF-8) to exceed MAX_TOOL_RESULT_CHARS
+        // Build a string of 1001 Unicode chars (each 3 bytes in UTF-8) to exceed MAX_TOOL_RESULT_BYTES
         // We want char count > 1000 but byte count much higher
         let unicode_str: String = "α".repeat(1001); // α is 2 bytes each
         let line = serde_json::json!({
@@ -1800,9 +1818,9 @@ mod tests {
             .strip_suffix(']')
             .unwrap_or(result_line);
         assert!(
-            content_part.chars().count() <= MAX_TOOL_RESULT_CHARS,
-            "Unicode content must be truncated to {} chars",
-            MAX_TOOL_RESULT_CHARS
+            content_part.len() <= MAX_TOOL_RESULT_BYTES,
+            "Unicode content must be truncated to {} bytes",
+            MAX_TOOL_RESULT_BYTES
         );
     }
 
@@ -1810,7 +1828,7 @@ mod tests {
     #[test]
     fn test_parse_stream_json_very_large_conversation_truncated() {
         // Each block produces ~10_001 chars in conversation ("x"*10000 + "\n")
-        // 6 blocks = ~60_006 chars > MAX_CONVERSATION_CHARS (50_000)
+        // 6 blocks = ~60_006 chars > MAX_CONVERSATION_BYTES (50_000)
         let big_text = "x".repeat(10_000);
         let block = serde_json::json!({
             "type": "assistant",
@@ -1823,9 +1841,9 @@ mod tests {
         let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
         let conv = conv.expect("should have conversation");
         assert!(
-            conv.len() <= MAX_CONVERSATION_CHARS,
+            conv.len() <= MAX_CONVERSATION_BYTES,
             "Large conversation must be capped at {} chars, got {}",
-            MAX_CONVERSATION_CHARS,
+            MAX_CONVERSATION_BYTES,
             conv.len()
         );
         // Must still be valid UTF-8
@@ -1939,12 +1957,12 @@ mod tests {
         );
     }
 
-    /// AC: Empty lines iterator produces empty output and None conversation.
+    /// AC: Empty lines iterator produces empty output and Some("") conversation.
     #[test]
     fn test_parse_stream_json_empty_input() {
         let (output, conv) = parse_stream_json_lines(std::iter::empty());
         assert_eq!(output, "");
-        assert!(conv.is_none());
+        assert_eq!(conv, Some(String::new()));
     }
 
     /// AC: User message with non-tool_result content types are skipped gracefully.
@@ -1953,8 +1971,9 @@ mod tests {
         let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"user text"}]}}"#;
         let (_, conv) = parse_stream_json_lines(std::iter::once(line));
         // "text" type in user messages is not tool_result — should be skipped
-        assert!(
-            conv.is_none(),
+        assert_eq!(
+            conv,
+            Some(String::new()),
             "Non-tool_result user content must not add to conversation"
         );
     }
@@ -2135,39 +2154,40 @@ mod tests {
         }
     }
 
-    /// AC: truncate_chars at exact boundary — no off-by-one.
+    /// AC: truncate_bytes at exact boundary — no off-by-one.
     #[rstest]
     #[case("hello", 5, "hello")] // exact boundary — keep all
     #[case("hello!", 5, "hello")] // one over boundary — truncate
     #[case("hi", 5, "hi")] // under boundary — keep all
     #[case("", 5, "")] // empty string
     #[case("abcde", 0, "")] // zero max_chars
-    fn test_truncate_chars_boundary(
+    fn test_truncate_bytes_boundary(
         #[case] input: &str,
         #[case] max_chars: usize,
         #[case] expected: &str,
     ) {
         assert_eq!(
-            truncate_chars(input, max_chars),
+            truncate_bytes(input, max_chars),
             expected,
-            "truncate_chars({:?}, {}) should be {:?}",
+            "truncate_bytes({:?}, {}) should be {:?}",
             input,
             max_chars,
             expected
         );
     }
 
-    /// AC: truncate_chars with Unicode at boundary preserves char boundaries.
+    /// AC: truncate_bytes with Unicode at byte boundary preserves char boundaries.
     #[rstest]
-    #[case("αβγδε", 3, "αβγ")] // 3-char boundary in 2-byte chars
-    #[case("こんにちは", 4, "こんにち")] // 4-char boundary in 3-byte chars
-    #[case("🎉🎊🎈", 2, "🎉🎊")] // 4-byte emoji boundary
-    fn test_truncate_chars_unicode_boundary(
+    #[case("αβγδε", 6, "αβγ")] // 6 bytes = 3 two-byte chars
+    #[case("αβγδε", 5, "αβ")] // 5 bytes mid-char, rounds down to 4 (2 chars)
+    #[case("こんにちは", 9, "こんに")] // 9 bytes = 3 three-byte chars
+    #[case("🎉🎊🎈", 8, "🎉🎊")] // 8 bytes = 2 four-byte emojis
+    fn test_truncate_bytes_unicode_boundary(
         #[case] input: &str,
-        #[case] max_chars: usize,
+        #[case] max_bytes: usize,
         #[case] expected: &str,
     ) {
-        let result = truncate_chars(input, max_chars);
+        let result = truncate_bytes(input, max_bytes);
         assert_eq!(result, expected);
         // Must be valid UTF-8 (no split mid-codepoint)
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());

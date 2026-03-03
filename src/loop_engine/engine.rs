@@ -442,7 +442,7 @@ pub fn run_iteration(
         Some(params.project_root),
         effective_model.as_deref(),
         Some(timeout_config),
-        false,
+        true,
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
@@ -479,6 +479,7 @@ pub fn run_iteration(
     }
 
     // Step 7: Analyze output
+    let claude_conversation = claude_result.conversation;
     let claude_output = claude_result.output;
     let outcome =
         detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
@@ -504,10 +505,12 @@ pub fn run_iteration(
     }
 
     // Step 7.7: Extract learnings from output (best-effort, opt-out via env var)
-    if !crate::learnings::ingestion::is_extraction_disabled() && !claude_output.is_empty() {
+    // Prefer the structured conversation from stream-json mode; fall back to raw output.
+    let learning_source = claude_conversation.as_deref().unwrap_or(&claude_output);
+    if !crate::learnings::ingestion::is_extraction_disabled() && !learning_source.is_empty() {
         match crate::learnings::ingestion::extract_learnings_from_output(
             params.conn,
-            &claude_output,
+            learning_source,
             Some(&task_id),
             Some(params.run_id),
         ) {
