@@ -1,10 +1,10 @@
 # Claude Code Agent Instructions
 
-You are an autonomous coding agent implementing **Session-Based Learning Extraction** for **task-mgr**.
+You are an autonomous coding agent implementing **Stream-JSON Learning Extraction** for **task-mgr**.
 
 ## Problem Statement
 
-The learning extraction system receives only `--print` text output from Claude iterations. `--print` captures only the final assistant text response — not tool calls, file reads/writes, errors, or intermediate reasoning. Successful iterations typically end with just `<completed>task-id</completed>`, providing zero useful content for learning extraction. This enhancement reads Claude's session JSONL files post-iteration to provide the full conversation to the learning extractor.
+The learning extraction system receives only `--print` text output from Claude iterations. `--print` captures only the final assistant text response — not tool calls, file reads/writes, errors, or intermediate reasoning. Successful iterations typically end with just `<completed>task-id</completed>`, providing zero useful content for learning extraction. This enhancement switches loop iteration spawns to `--output-format stream-json --no-session-persistence`, capturing the full conversation (tool calls, results, errors) inline during the iteration for richer learning extraction.
 
 ---
 
@@ -123,30 +123,46 @@ Tasks have relationship fields:
 
 ### Key Files
 
-- `src/loop_engine/claude.rs` — `spawn_claude()` function and `ClaudeResult` struct
-- `src/loop_engine/session.rs` — **NEW** session JSONL reader (to be created)
-- `src/loop_engine/mod.rs` — module exports
+- `src/loop_engine/claude.rs` — `spawn_claude()` function and `ClaudeResult` struct (main changes here)
 - `src/loop_engine/engine.rs` — `run_iteration()`, learning extraction at ~line 506
 - `src/learnings/ingestion/mod.rs` — `extract_learnings_from_output()`
 - `src/learnings/ingestion/extraction.rs` — `build_extraction_prompt()`, `MAX_OUTPUT_CHARS`
 - `src/commands/curate/mod.rs` — dedup curation spawn
 - `src/commands/curate/enrich.rs` — enrichment spawn
 
-### Session JSONL Format
+### Stream-JSON Format
 
-Session files at `~/.claude/projects/<encoded-path>/<session-id>.jsonl`. Each line is JSON with a `type` field:
-- `assistant` — content array of blocks: `text`, `tool_use`, `thinking`
-- `user` — tool_result content
-- `queue-operation`, `progress`, `system`, `file-history-snapshot` — skip these
+Each stdout line from `claude --output-format stream-json` is a JSON object with a `type` field:
 
-### Path Encoding
+```json
+// Assistant message with content blocks
+{"type":"assistant","message":{"content":[
+  {"type":"text","text":"Let me read the file."},
+  {"type":"tool_use","id":"toolu_abc","name":"Read","input":{"file_path":"/src/main.rs"}},
+  {"type":"thinking","thinking":"..."}
+]},"model":"claude-sonnet-4-6","error":null}
 
-Working dir `$HOME/projects/task-mgr` → encoded as `-home-chris-Dropbox-startat0-task-mgr`
+// User message (tool results)
+{"type":"user","message":{"content":[
+  {"type":"tool_result","tool_use_id":"toolu_abc","content":"fn main() {...}","is_error":false}
+]}}
+
+// Final result (always last line)
+{"type":"result","subtype":"success","result":"<completed>TASK-ID</completed>","session_id":"..."}
+
+// System init (skip)
+{"type":"system","subtype":"init","data":{...}}
+```
+
+### Key Design: Two Code Paths in Tee Loop
+
+- `stream_json=false` (utility spawns): existing behavior — read lines, tee to stderr, collect into `output`
+- `stream_json=true` (loop iterations): parse JSON per line, extract text for stderr display, collect formatted conversation, extract `result.result` into `output`
 
 ### Existing Patterns
 
 - `spawn_claude` uses `CLAUDE_BINARY=echo` in tests to capture args
-- Graceful degradation pattern: `eprintln!("Warning: ...")` + return fallback value
+- Graceful degradation pattern: `eprintln!("Warning: ...")` + continue/fallback
 - Learning extraction uses `MAX_OUTPUT_CHARS = 50_000` truncation
 
 ---
@@ -183,10 +199,10 @@ cargo test
 
 ### After Implementing New Code, Verify:
 
-1. **Export Chain**: `pub mod session;` in `src/loop_engine/mod.rs`
-2. **Imports**: `engine.rs` imports and calls `session::read_session_for_learnings`
-3. **Call Sites**: All 4 `spawn_claude` callers updated with new params
-4. **No Dead Code**: `cargo check` shows no unused warnings for new code
+1. **Call Sites**: All 4 `spawn_claude` callers updated with `stream_json` param
+2. **Engine Wiring**: `engine.rs` passes `stream_json=true` and uses `conversation` field for learning extraction
+3. **No Dead Code**: `cargo check` shows no unused warnings for new code
+4. **Arg Ordering**: `--output-format stream-json` appears before `-p` in args
 
 ---
 

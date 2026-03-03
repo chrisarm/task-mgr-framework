@@ -1,18 +1,10 @@
 {
-  "branchName": "feat/session-learning-extraction",
-  "description": "Enrich learning extraction with full session conversation data by reading Claude's session JSONL files post-iteration, instead of relying on the sparse --print text output.",
-  "globalAcceptanceCriteria": {
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "No breaking changes to existing APIs unless explicitly required"
-    ],
-    "description": "These criteria apply to ALL implementation tasks"
-  },
-  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "version": "1.0",
+  "project": "task-mgr",
   "model": "claude-sonnet-4-6",
+  "branchName": "feat/session-learning-extraction",
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "description": "Enrich learning extraction by switching loop iteration spawns to --output-format stream-json, capturing the full conversation (tool calls, results, errors) instead of just the final --print text. All spawns use --no-session-persistence to keep ~/.claude/projects/ clean.",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -28,619 +20,459 @@
       "Handle Option/Result explicitly; avoid unwrap() in production code"
     ]
   },
-  "project": "task-mgr",
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ]
+  },
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "low": "51-99: Defer to hardening phase",
-      "medium": "21-50: Fix in current phase if time permits"
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
     }
   },
-  "taskPrefix": "2367d40c",
   "userStories": [
     {
-      "acceptanceCriteria": [
-        "Test: spawn_claude with session_id=Some(uuid) includes --session-id <uuid> in args",
-        "Test: spawn_claude with session_id=None does not include --session-id in args",
-        "Test: spawn_claude with no_session_persistence=true includes --no-session-persistence in args",
-        "Test: spawn_claude with no_session_persistence=false does not include --no-session-persistence",
-        "Test: ClaudeResult.session_id matches the passed-in session_id",
-        "Known-bad discriminator: test that --session-id is placed BEFORE -p (not after prompt text)"
-      ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [],
-      "description": "Write tests for the new spawn_claude parameters before implementation. Tests verify that --session-id <uuid> appears in args when session_id is Some, is absent when None, and that --no-session-persistence appears when requested.",
-      "edgeCases": [
-        "session_id=Some with empty string — should still add --session-id (or should it be treated as None?)",
-        "Both session_id=Some AND no_session_persistence=true — conflicting flags, should warn or just pass both",
-        "session_id with non-UUID string — Claude CLI will reject, but spawn_claude shouldn't validate"
-      ],
-      "estimatedEffort": "low",
-      "failureModes": [
-        {
-          "cause": "--session-id placed after -p, becoming part of prompt text",
-          "expectedBehavior": "--session-id must appear before -p in args"
-        }
-      ],
       "id": "TEST-INIT-001",
-      "invariants": [
-        "--print and --dangerously-skip-permissions always present regardless of new params",
-        "--session-id appears before -p when present",
-        "ClaudeResult.session_id always matches input session_id"
-      ],
-      "modifiesBehavior": false,
-      "notes": "Follow existing test patterns in claude.rs (lines 500-1030) which use CLAUDE_BINARY=echo to capture constructed args. Tests may use #[ignore] until implementation lands.",
-      "passes": false,
-      "priority": 1,
-      "synergyWith": [
-        "TEST-INIT-002"
-      ],
-      "title": "Initial tests for spawn_claude session_id and no_session_persistence params",
-      "touchesFiles": [
-        "src/loop_engine/claude.rs"
-      ]
-    },
-    {
+      "title": "Initial tests for stream-json parsing and content formatting",
+      "description": "Write tests for the stream-json line parser and content formatter before implementation. Tests use inline JSON fixtures to verify parsing of assistant, user, result, and system message types, content block extraction, truncation, and error handling.",
       "acceptanceCriteria": [
-        "Test: valid session with text + tool_use blocks produces formatted output with [Tool: name] prefix",
-        "Test: thinking blocks are excluded from output",
-        "Test: queue-operation, progress, system, file-history-snapshot messages are skipped",
+        "Test: assistant message with text block extracts text correctly",
+        "Test: assistant message with tool_use block formats as [Tool: name] {truncated input}",
+        "Test: assistant message with thinking block — thinking is excluded",
+        "Test: user message with tool_result extracts content (truncated to 1000 chars)",
+        "Test: result message extracts result field as the 'output' text",
+        "Test: system message is skipped entirely",
         "Test: tool_use input truncated to 500 chars when longer",
         "Test: tool_result content truncated to 1000 chars when longer",
         "Test: global output capped at 50,000 chars",
-        "Test: missing session file returns None",
-        "Test: malformed JSONL lines are skipped, valid lines still processed",
-        "Test: session with only thinking blocks returns None (empty useful content)",
+        "Test: malformed JSON line is skipped, subsequent valid lines still processed",
         "Known-bad discriminator: test that tool_use input is JSON-serialized (not Display-formatted)"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [],
-      "description": "Write tests for the session file reader before implementation. Tests use inline JSONL fixtures to verify content extraction, truncation, and error handling.",
-      "edgeCases": [
-        "Session file with only thinking blocks — should return None",
-        "Enormous tool result (>1000 chars) — truncated with ... suffix",
-        "Tool_use input with nested JSON objects — serialize to string then truncate",
-        "JSONL with trailing newlines or empty lines — skip gracefully",
-        "Unicode in tool results — truncation must not split mid-character",
-        "Worktree path encoding: $HOME/foo → -home-chris-foo"
-      ],
+      "priority": 1,
       "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "The parser function should accept an iterator of lines (for testability) rather than reading from a process. Tests can pass Vec<String> as input.",
+      "edgeCases": [
+        "Malformed JSON line — skip and continue",
+        "Enormous tool_use input (>500 chars) — truncated with char-boundary safety",
+        "Enormous tool_result content (>1000 chars) — truncated with char-boundary safety",
+        "Unicode in tool results — truncation must not split multi-byte characters",
+        "Empty lines in stream — skip gracefully",
+        "assistant message with error field set — include [Error: rate_limit] in output",
+        "result message with null result field — treat as empty string",
+        "Stream with only a result message (no assistant messages) — output is just the result text"
+      ],
+      "invariants": [
+        "Output text never exceeds 50,000 chars",
+        "Per-block truncation: tool_use ≤ 500 chars, tool_result ≤ 1000 chars",
+        "Message ordering preserved from input stream",
+        "result.result field always extracted into ClaudeResult.output"
+      ],
       "failureModes": [
         {
-          "cause": "Malformed JSONL line (incomplete JSON)",
+          "cause": "Malformed JSON line in stream",
           "expectedBehavior": "Skip the line, continue processing remaining lines"
         },
         {
-          "cause": "Session file missing or unreadable",
-          "expectedBehavior": "Return None, log warning via eprintln!"
+          "cause": "result message missing or result field is null",
+          "expectedBehavior": "ClaudeResult.output is empty string"
         }
       ],
-      "id": "TEST-INIT-002",
-      "invariants": [
-        "Return type is Option<String> — None on any error, never panic",
-        "Output length never exceeds 50,000 chars",
-        "Per-block truncation: tool_use ≤ 500 chars, tool_result ≤ 1000 chars",
-        "Message ordering preserved from JSONL"
-      ],
-      "modifiesBehavior": false,
-      "notes": "Use tempdir for session file fixtures. The reader function should accept a Path directly (for testability) rather than computing the path internally.",
-      "passes": false,
-      "priority": 2,
-      "synergyWith": [
-        "TEST-INIT-001"
-      ],
-      "title": "Initial tests for session JSONL reader",
-      "touchesFiles": [
-        "src/loop_engine/session.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "ClaudeResult has session_id: Option<String> field",
-        "spawn_claude accepts session_id: Option<String> and no_session_persistence: bool",
-        "When session_id is Some, --session-id <uuid> appears in args before -p",
-        "When no_session_persistence is true, --no-session-persistence appears in args",
-        "All 4 callers updated: engine.rs (session_id=None, no_session_persistence=false), ingestion/mod.rs (None, true), curate/mod.rs (None, true), curate/enrich.rs (None, true)",
-        "All existing tests pass (update test assertions for new arg count)",
-        "TEST-INIT-001 tests pass"
-      ],
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-002"],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "TEST-INIT-001"
+      "modifiesBehavior": false
+    },
+    {
+      "id": "TEST-INIT-002",
+      "title": "Initial tests for spawn_claude stream_json mode and --no-session-persistence",
+      "description": "Write tests for the new spawn_claude stream_json parameter. Tests verify that --output-format stream-json and --no-session-persistence appear in args when stream_json=true, and that --print and --no-session-persistence appear when stream_json=false.",
+      "acceptanceCriteria": [
+        "Test: spawn_claude with stream_json=true includes --output-format stream-json in args",
+        "Test: spawn_claude with stream_json=true includes --no-session-persistence in args",
+        "Test: spawn_claude with stream_json=true does NOT include --print in args",
+        "Test: spawn_claude with stream_json=false includes --print in args (existing behavior)",
+        "Test: spawn_claude with stream_json=false includes --no-session-persistence in args",
+        "Known-bad discriminator: test that --output-format stream-json is placed BEFORE -p (not after prompt text)"
       ],
-      "description": "Extend spawn_claude signature with session_id: Option<String> and no_session_persistence: bool. When session_id is Some, add --session-id <value> to args before -p. When no_session_persistence is true, add --no-session-persistence. Store session_id in ClaudeResult. Update all 4 callers to compile.",
-      "estimatedEffort": "medium",
-      "id": "FEAT-001",
-      "modifiesBehavior": true,
-      "notes": "Start by updating ClaudeResult and spawn_claude signature. Then update all callers with temporary None/false values so it compiles. Engine.rs caller will get real session_id in FEAT-003.",
+      "priority": 2,
+      "estimatedEffort": "low",
       "passes": false,
+      "notes": "Follow existing test patterns in claude.rs (lines 500-1030) which use CLAUDE_BINARY=echo to capture constructed args. Tests may use #[ignore] until implementation lands.",
+      "edgeCases": [
+        "stream_json=true + model=Some — both flags present in correct order",
+        "stream_json=true + timeout — both work together"
+      ],
+      "invariants": [
+        "--dangerously-skip-permissions always present regardless of stream_json",
+        "--no-session-persistence always present regardless of stream_json",
+        "--output-format stream-json and --print are mutually exclusive"
+      ],
+      "failureModes": [
+        {
+          "cause": "--output-format placed after -p, becoming part of prompt text",
+          "expectedBehavior": "--output-format must appear before -p in args"
+        }
+      ],
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-001",
+      "title": "Add stream_json mode to spawn_claude with stream parser",
+      "description": "Extend spawn_claude with a stream_json: bool parameter. When true, use --output-format stream-json --no-session-persistence instead of --print. When false, use --print --no-session-persistence. In the tee loop, when stream_json is true: parse each JSON line, extract assistant text for live stderr display, collect formatted conversation content, extract result.result as output. Add conversation: Option<String> to ClaudeResult. Update all 4 callers to compile (all pass false initially).",
+      "acceptanceCriteria": [
+        "ClaudeResult has conversation: Option<String> field",
+        "spawn_claude accepts stream_json: bool parameter",
+        "When stream_json=true: uses --output-format stream-json --no-session-persistence (no --print)",
+        "When stream_json=false: uses --print --no-session-persistence",
+        "Stream-json mode: assistant text blocks teed to stderr for live display",
+        "Stream-json mode: tool_use formatted as [Tool: name] {truncated input 500 chars}",
+        "Stream-json mode: tool_result content truncated to 1000 chars",
+        "Stream-json mode: thinking blocks and system messages skipped",
+        "Stream-json mode: result.result extracted into ClaudeResult.output",
+        "Stream-json mode: full formatted conversation stored in ClaudeResult.conversation",
+        "Conversation output capped at 50,000 chars",
+        "All 4 callers updated with stream_json=false (compile fix)",
+        "All existing tests pass",
+        "TEST-INIT-001 and TEST-INIT-002 tests pass"
+      ],
       "priority": 6,
+      "estimatedEffort": "high",
+      "passes": false,
+      "notes": "This is the core change. The tee loop currently reads lines and echoes to stderr. In stream-json mode, each line is JSON that needs parsing. Extract a helper function for the parsing logic (testable separately). Malformed lines should be skipped with a warning.",
       "qualityDimensions": {
         "correctness": [
-          "Session file reader must never crash the loop — all errors return None with a warning log",
-          "--session-id must be a valid UUID v4 (Claude CLI validates this)"
+          "Malformed JSON lines must be skipped, not crash the loop",
+          "ClaudeResult.output must contain the result text (for detection::analyze_output compatibility)",
+          "Per-block truncation must not split mid-character"
         ],
         "performance": [
-          "No performance impact — just adding args to command line"
+          "JSON parsing per line is fast (<1ms per serde_json::from_str call)",
+          "No buffering of display — text teed to stderr immediately per line",
+          "50K char cap prevents memory issues"
         ],
         "style": [
-          "Follow existing loop_engine module patterns",
-          "Match existing arg construction pattern in spawn_claude"
+          "Extract stream-json parsing into a separate testable function",
+          "Follow existing tee loop pattern in spawn_claude",
+          "Match graceful degradation pattern (eprintln! + continue)"
         ]
       },
-      "synergyWith": [
-        "FEAT-002"
-      ],
-      "title": "Add session_id and no_session_persistence params to spawn_claude",
       "touchesFiles": [
         "src/loop_engine/claude.rs",
         "src/loop_engine/engine.rs",
         "src/learnings/ingestion/mod.rs",
         "src/commands/curate/mod.rs",
         "src/commands/curate/enrich.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "New file src/loop_engine/session.rs created",
-        "pub mod session; added to src/loop_engine/mod.rs",
-        "read_session_for_learnings(session_id: &str, working_dir: &Path) -> Option<String> implemented",
-        "Path derivation: {HOME}/.claude/projects/{encoded_working_dir}/{session_id}.jsonl",
-        "Encoding: absolute path with / replaced by - (e.g., $HOME/foo → -home-chris-foo)",
-        "Assistant text blocks included as-is",
-        "Tool_use blocks formatted as [Tool: {name}] {json-serialized-input truncated to 500 chars}",
-        "Tool_result content truncated to 1000 chars",
-        "Thinking blocks, queue-operation, progress, system, file-history-snapshot skipped",
-        "Global output capped at 50,000 chars",
-        "Returns None with eprintln warning on missing file, parse error, or empty useful content",
-        "TEST-INIT-002 tests pass"
       ],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "TEST-INIT-002"
-      ],
-      "description": "Create src/loop_engine/session.rs with read_session_for_learnings(session_id, working_dir) -> Option<String>. Derives session file path from working_dir encoding + session_id. Parses JSONL line by line, extracts assistant text blocks and tool_use blocks (formatted as [Tool: name] truncated-input), tool_result content (truncated). Skips thinking, progress, system, queue-operation, file-history-snapshot. Applies per-block truncation (500 chars tool_use, 1000 chars tool_result) and global 50K cap. Returns None on any error with eprintln warning.",
-      "estimatedEffort": "medium",
+      "modifiesBehavior": true
+    },
+    {
       "id": "FEAT-002",
-      "modifiesBehavior": false,
-      "notes": "Use std::env::var(\"HOME\") for home dir (dirs crate not in deps). Design the core parsing function to accept a Path (for testability) with a thin wrapper that computes the path.",
-      "passes": false,
-      "priority": 7,
-      "qualityDimensions": {
-        "correctness": [
-          "Per-block truncation must not split mid-character (use char boundary truncation)",
-          "Malformed JSONL lines must be skipped, not crash",
-          "Empty useful content (only thinking blocks) should return None"
-        ],
-        "performance": [
-          "Exit early if session file doesn't exist — don't attempt directory listing",
-          "Per-block truncation prevents one large block from consuming the 50K budget",
-          "Line-by-line JSONL parsing, not full file load"
-        ],
-        "style": [
-          "Follow existing loop_engine module patterns: public function, eprintln! for warnings",
-          "Match graceful degradation pattern from src/learnings/ingestion/mod.rs"
-        ]
-      },
-      "synergyWith": [
-        "FEAT-001"
-      ],
-      "title": "Implement session JSONL reader",
-      "touchesFiles": [
-        "src/loop_engine/session.rs",
-        "src/loop_engine/mod.rs"
-      ]
-    },
-    {
+      "title": "Wire engine to use stream_json=true and pass conversation to learning extraction",
+      "description": "In engine.rs: pass stream_json=true to spawn_claude for loop iterations. Use claude_result.conversation for learning extraction input when available, fall back to claude_result.output.",
       "acceptanceCriteria": [
-        "Engine generates uuid::Uuid::new_v4() before spawn_claude call",
-        "session_id passed as Some(uuid.to_string()) to spawn_claude",
-        "After iteration, read_session_for_learnings called with session_id and project_root",
-        "If session content available, used as learning extraction input instead of claude_output",
-        "If session read returns None, falls back to claude_output (existing behavior)",
-        "detection::analyze_output still uses claude_output (--print text), not session content"
+        "Engine passes stream_json=true to spawn_claude",
+        "After iteration, uses claude_result.conversation for learning extraction if Some",
+        "Falls back to claude_result.output if conversation is None",
+        "detection::analyze_output still uses claude_result.output (the result text)",
+        "Utility spawns still pass stream_json=false"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "FEAT-001",
-        "FEAT-002"
-      ],
-      "description": "In engine.rs run_iteration: generate a UUID v4, pass it as session_id to spawn_claude. After iteration, call read_session_for_learnings and use the result (or fall back to claude_output) for learning extraction input.",
-      "estimatedEffort": "low",
-      "id": "FEAT-003",
-      "modifiesBehavior": false,
-      "notes": "detection::analyze_output must continue to use --print text (claude_output) since it looks for specific markers. Only the learning extraction input changes.",
-      "passes": false,
       "priority": 9,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "detection::analyze_output must continue to use claude_result.output since it looks for specific markers like <completed>. Only the learning extraction input changes.",
       "qualityDimensions": {
         "correctness": [
-          "detection::analyze_output must NOT be changed — it uses --print text markers",
-          "Fallback to claude_output must work when session read fails"
+          "detection::analyze_output must NOT be changed — it uses result text markers",
+          "Fallback to output must work when conversation is None"
         ],
         "performance": [
-          "Session file reading is post-hoc, not on hot path"
+          "No additional I/O — conversation is already in memory from the tee loop"
         ],
         "style": [
           "Follow existing engine.rs patterns for best-effort operations"
         ]
       },
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["FEAT-001"],
       "synergyWith": [],
-      "title": "Wire engine to generate session_id and read session for learning extraction",
-      "touchesFiles": [
-        "src/loop_engine/engine.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "src/learnings/ingestion/mod.rs spawn_claude call passes no_session_persistence=true",
-        "src/commands/curate/mod.rs spawn_claude call passes no_session_persistence=true",
-        "src/commands/curate/enrich.rs spawn_claude call passes no_session_persistence=true",
-        "All 3 callers still pass session_id=None",
-        "No functional change to utility spawn behavior (same output, same error handling)"
-      ],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "FEAT-001"
-      ],
-      "description": "Update the 3 utility spawn callers (learning extraction, dedup curation, enrichment) to pass no_session_persistence=true. These already pass session_id=None from FEAT-001. Verify they no longer create session files.",
-      "estimatedEffort": "low",
-      "id": "FEAT-004",
-      "modifiesBehavior": false,
-      "notes": "This was partially done in FEAT-001 (callers updated with false). Now change to true for utility callers only. Engine.rs caller keeps false.",
-      "passes": false,
-      "priority": 10,
-      "qualityDimensions": {
-        "correctness": [
-          "Only utility spawns get no_session_persistence=true",
-          "Engine.rs loop iteration spawn keeps no_session_persistence=false"
-        ],
-        "performance": [],
-        "style": []
-      },
-      "synergyWith": [],
-      "title": "Add --no-session-persistence to utility spawns with real session_id=None",
-      "touchesFiles": [
-        "src/learnings/ingestion/mod.rs",
-        "src/commands/curate/mod.rs",
-        "src/commands/curate/enrich.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "CODE-REVIEW-1",
+      "title": "Review implementation for quality, security, and integration wiring",
+      "description": "Review FEAT-001 and FEAT-002 for code quality, error handling, security, and integration wiring. Verify stream-json parsing is robust, arg ordering is correct, conversation field is used.",
       "acceptanceCriteria": [
         "No unwrap() in production code paths",
         "All errors properly propagated with context",
-        "Security: session file path cannot be manipulated to read arbitrary files",
-        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "Security: no injection via malformed JSON lines",
+        "Quality dimensions met",
         "Edge case coverage: each edgeCases entry has a corresponding test",
-        "Integration: session.rs exported from loop_engine, imported and called in engine.rs",
-        "Integration: --session-id and --no-session-persistence flags in correct arg positions",
+        "Integration: engine.rs passes stream_json=true and uses conversation field",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "FEAT-001",
-        "FEAT-002",
-        "FEAT-003",
-        "FEAT-004"
-      ],
-      "description": "Review all FEAT-xxx implementations for code quality, error handling, security, and integration wiring. Verify new session.rs is exported, imported, and called from engine.rs. Verify spawn_claude arg ordering is correct. Check for unwrap() usage and proper error propagation.",
-      "estimatedEffort": "medium",
-      "id": "CODE-REVIEW-1",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "For each issue found: 1) Add a CODE-FIX-xxx task to the JSON (priority 14-16), 2) Add CODE-FIX-xxx to MILESTONE-1 dependsOn array, 3) Commit the JSON changes.",
-      "passes": false,
       "priority": 13,
-      "synergyWith": [],
-      "title": "Review implementation for quality, security, and integration wiring",
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue found: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn.",
       "touchesFiles": [
         "src/loop_engine/claude.rs",
-        "src/loop_engine/session.rs",
-        "src/loop_engine/mod.rs",
         "src/loop_engine/engine.rs",
         "src/learnings/ingestion/mod.rs",
         "src/commands/curate/mod.rs",
         "src/commands/curate/enrich.rs"
-      ]
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review implementation for refactoring opportunities",
+      "description": "Analyze implementation code for DRY violations, complexity, coupling. The stream-json parsing logic in spawn_claude's tee loop may be getting complex — check if extraction into a separate module is warranted.",
       "acceptanceCriteria": [
         "No code duplication (DRY principle)",
         "Functions under 30 lines (flag complex ones)",
         "No tight coupling between modules",
-        "Code is easy to change and extend",
         "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
       ],
+      "priority": 17,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "spawn_claude now has two code paths (text vs stream-json) in the tee loop. If this makes the function too long, suggest extracting.",
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["CODE-REVIEW-1"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "CODE-REVIEW-1"
-      ],
-      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues. Check if spawn_claude's 7 params should use a struct (note: PRD defers this).",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-1",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "spawn_claude now has 7 params which is getting unwieldy. If this is flagged, create a REFACTOR task but keep it low priority — the PRD explicitly defers struct/builder refactor.",
-      "passes": false,
-      "priority": 17,
-      "synergyWith": [],
-      "title": "Review implementation for refactoring opportunities",
-      "touchesFiles": [
-        "src/loop_engine/claude.rs",
-        "src/loop_engine/session.rs",
-        "src/loop_engine/engine.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "MILESTONE-1",
+      "title": "Implementation complete: stream-json parsing and engine wiring verified",
+      "description": "Gate checkpoint: all implementation tasks pass, code reviewed, refactored.",
       "acceptanceCriteria": [
         "All initial tests (TEST-INIT-001, TEST-INIT-002) pass",
-        "All implementation tasks (FEAT-001 through FEAT-004) pass",
-        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx or WIRE-FIX-xxx tasks)",
+        "All implementation tasks (FEAT-001, FEAT-002) pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
         "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
-        "All new code is reachable from production entry points (no dead code)",
-        "No unused warnings for new code in cargo check/cargo clippy",
+        "No dead code warnings for new code",
         "cargo test passes with no failures",
         "cargo fmt --check passes"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "TEST-INIT-001",
-        "TEST-INIT-002",
-        "FEAT-001",
-        "FEAT-002",
-        "FEAT-003",
-        "FEAT-004",
-        "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
-      ],
-      "description": "Gate checkpoint: all implementation tasks pass, code reviewed, refactored. Initial tests pass, new code is fully wired in.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-1",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "passes": false,
       "priority": 20,
-      "synergyWith": [],
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
       "timeoutSecs": 1800,
-      "title": "Implementation complete: session reading and spawn_claude changes verified",
-      "touchesFiles": []
-    },
-    {
-      "acceptanceCriteria": [
-        "Parameterized tests (#[rstest]) for multiple JSONL message type combinations",
-        "Test: session with interleaved assistant/user/progress messages extracts only relevant ones",
-        "Test: truncation at exactly 500/1000 char boundaries (not off-by-one)",
-        "Test: Unicode truncation preserves char boundaries (e.g., multi-byte chars at boundary)",
-        "Test: very large session file (>50K chars of useful content) truncated correctly",
-        "Test: empty session file returns None",
-        "Test: session file with only queue-operation messages returns None",
-        "Test: path encoding for various working dir patterns (root, nested, with hyphens)",
-        "80%+ coverage for session.rs"
-      ],
+      "passes": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
+      "touchesFiles": [],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "FEAT-001", "FEAT-002", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "MILESTONE-1"
-      ],
-      "description": "Expand test coverage for session.rs beyond initial tests. Cover error handling, parameterized scenarios, and boundary conditions.",
-      "estimatedEffort": "medium",
-      "id": "TEST-001",
-      "modifiesBehavior": false,
-      "notes": "Use #[rstest] for parameterized tests. Create helper functions for building JSONL test fixtures.",
-      "passes": false,
-      "priority": 25,
-      "synergyWith": [
-        "TEST-002"
-      ],
-      "title": "Comprehensive tests for session JSONL reader",
-      "touchesFiles": [
-        "src/loop_engine/session.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "TEST-001",
+      "title": "Comprehensive tests for stream-json parsing",
+      "description": "Expand test coverage beyond initial tests. Cover parameterized scenarios, boundary conditions, and interaction between truncation levels.",
       "acceptanceCriteria": [
-        "Test: session_id + model + timeout all present — correct arg ordering",
-        "Test: no_session_persistence + model — both flags present",
-        "Test: session_id with special characters (hyphens in UUID) handled correctly",
+        "Parameterized tests (#[rstest]) for multiple message type combinations",
+        "Test: interleaved assistant/user/system messages — only relevant ones extracted",
+        "Test: truncation at exactly 500/1000 char boundaries (not off-by-one)",
+        "Test: Unicode truncation preserves char boundaries",
+        "Test: very large conversation (>50K chars) truncated correctly",
+        "Test: multiple assistant messages accumulate correctly",
+        "Test: assistant message with error field produces [Error: ...] in output",
+        "Test: result with subtype=error handled correctly",
+        "80%+ coverage for stream-json parsing code"
+      ],
+      "priority": 25,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Use #[rstest] for parameterized tests.",
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": ["TEST-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "TEST-002",
+      "title": "Comprehensive tests for spawn_claude stream_json arg construction",
+      "description": "Expand test coverage for spawn_claude's stream_json parameter interactions with model, timeout, etc.",
+      "acceptanceCriteria": [
+        "Test: stream_json=true + model + timeout — correct arg ordering",
+        "Test: stream_json=false + model — --print and --no-session-persistence present",
         "Parameterized tests (#[rstest]) for various param combinations",
         "Test: all 4 caller patterns produce expected arg combinations"
       ],
+      "priority": 28,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Extend existing test patterns in claude.rs.",
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": ["TEST-001"],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "MILESTONE-1"
-      ],
-      "description": "Expand test coverage for spawn_claude's new session_id and no_session_persistence parameters. Test interactions with existing params (model, timeout).",
-      "estimatedEffort": "low",
-      "id": "TEST-002",
-      "modifiesBehavior": false,
-      "notes": "Extend existing test patterns in claude.rs.",
-      "passes": false,
-      "priority": 28,
-      "synergyWith": [
-        "TEST-001"
-      ],
-      "title": "Comprehensive tests for spawn_claude session params",
-      "touchesFiles": [
-        "src/loop_engine/claude.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "REFACTOR-REVIEW-2",
+      "title": "Review test code for refactoring opportunities",
+      "description": "Analyze test code for duplication and helper extraction.",
       "acceptanceCriteria": [
         "No duplicated test setup code",
-        "Helper functions extracted for common patterns (e.g., JSONL fixture builders)",
-        "Test names clearly describe what is tested",
+        "Helper functions extracted for common patterns",
         "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
       ],
+      "priority": 39,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["TEST-001", "TEST-002"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "TEST-001",
-        "TEST-002"
-      ],
-      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-2",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Focus on session.rs test helpers — JSONL fixture construction likely has duplication.",
-      "passes": false,
-      "priority": 39,
-      "synergyWith": [],
-      "title": "Review test code for refactoring opportunities",
-      "touchesFiles": [
-        "src/loop_engine/session.rs",
-        "src/loop_engine/claude.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "MILESTONE-2",
+      "title": "Full test coverage achieved, test code refactored",
+      "description": "Gate checkpoint: comprehensive tests pass, test code is clean.",
       "acceptanceCriteria": [
-        "All comprehensive tests (TEST-001, TEST-002) pass",
-        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "All comprehensive tests pass",
+        "REFACTOR-REVIEW-2 passes",
         "cargo test passes with no failures",
         "80%+ coverage for new code"
       ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "MILESTONE-1",
-        "TEST-001",
-        "TEST-002",
-        "REFACTOR-REVIEW-2"
-      ],
-      "description": "Gate checkpoint: comprehensive tests pass, test code is clean.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-2",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Full test coverage achieved, test code refactored.",
-      "passes": false,
       "priority": 50,
-      "synergyWith": [],
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
       "timeoutSecs": 1800,
-      "title": "Full test coverage achieved, test code refactored",
-      "touchesFiles": []
-    },
-    {
-      "acceptanceCriteria": [
-        "Integration test creates a temp dir with a mock session JSONL file",
-        "Test verifies read_session_for_learnings finds and parses the file",
-        "Test verifies path encoding is correct for the temp dir path",
-        "Test verifies fallback behavior when session file is missing"
-      ],
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-1", "TEST-001", "TEST-002", "REFACTOR-REVIEW-2"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "MILESTONE-2"
-      ],
-      "description": "Create an integration test that uses CLAUDE_BINARY to point to a mock script that creates a session JSONL file, then verifies read_session_for_learnings can read it. Tests the full path: spawn_claude with session_id → session file created → session content read.",
-      "estimatedEffort": "medium",
-      "id": "INT-001",
-      "modifiesBehavior": false,
-      "notes": "May need to create a mock Claude binary script that writes to the expected session path. Alternatively, test just the reader with a pre-created fixture file.",
-      "passes": false,
-      "priority": 55,
-      "synergyWith": [],
-      "title": "Integration test: end-to-end session reading with mock Claude binary",
-      "touchesFiles": [
-        "src/loop_engine/session.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "INT-001",
+      "title": "Integration test: end-to-end stream-json capture with mock Claude binary",
+      "description": "Create an integration test using CLAUDE_BINARY pointing to a mock script that outputs stream-json lines. Verify spawn_claude parses them correctly and produces the expected ClaudeResult.",
       "acceptanceCriteria": [
-        "No code duplication across entire implementation",
+        "Mock script outputs valid stream-json lines (assistant + user + result)",
+        "Test verifies ClaudeResult.output contains result text",
+        "Test verifies ClaudeResult.conversation contains formatted conversation",
+        "Test verifies fallback when mock outputs non-JSON (stream_json=false mode)"
+      ],
+      "priority": 55,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "touchesFiles": ["src/loop_engine/claude.rs"],
+      "dependsOn": ["MILESTONE-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final refactoring review for maintainability",
+      "description": "Comprehensive review of all code.",
+      "acceptanceCriteria": [
+        "No code duplication",
         "All functions under 30 lines or documented exceptions",
-        "Clear separation of concerns between modules",
-        "Code follows project patterns",
+        "Clear separation of concerns",
         "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
       ],
+      "priority": 65,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": ["src/loop_engine/claude.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["INT-001"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "INT-001"
-      ],
-      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-REVIEW-3",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Final opportunity to improve code before merge.",
-      "passes": false,
-      "priority": 65,
-      "synergyWith": [],
-      "title": "Final refactoring review for maintainability",
-      "touchesFiles": [
-        "src/loop_engine/claude.rs",
-        "src/loop_engine/session.rs",
-        "src/loop_engine/engine.rs"
-      ]
+      "modifiesBehavior": false
     },
     {
+      "id": "VERIFY-001",
+      "title": "Final verification: all checks pass",
+      "description": "Run full test suite, clippy, fmt check, and verify no regressions.",
       "acceptanceCriteria": [
         "cargo fmt --check passes",
         "cargo check passes with no warnings",
         "cargo clippy -- -D warnings passes",
         "cargo test passes with no failures",
-        "No dead code warnings for new code",
-        "All new modules exported and reachable"
+        "No dead code warnings for new code"
       ],
+      "priority": 90,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "INT-001",
-        "REFACTOR-REVIEW-3"
-      ],
-      "description": "Run full test suite, clippy, fmt check, and verify no regressions.",
-      "estimatedEffort": "low",
-      "id": "VERIFY-001",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "Final validation gate.",
-      "passes": false,
-      "priority": 90,
-      "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Final verification: all checks pass",
-      "touchesFiles": []
+      "modifiesBehavior": false
     },
     {
+      "id": "MILESTONE-FINAL",
+      "title": "Ready for merge",
+      "description": "Final gate checkpoint before merge to main.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
-        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "REFACTOR-REVIEW-3 passes",
         "All tests pass",
-        "No warnings in cargo check or cargo clippy",
+        "No warnings",
         "Ready for merge"
       ],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "dependsOn": [
-        "VERIFY-001",
-        "REFACTOR-REVIEW-3"
-      ],
-      "description": "Final gate checkpoint before merge to main.",
-      "estimatedEffort": "low",
-      "id": "MILESTONE-FINAL",
-      "model": "claude-opus-4-6",
-      "modifiesBehavior": false,
-      "notes": "All acceptance criteria met, ready for merge.",
-      "passes": false,
-      "priority": 99,
-      "synergyWith": [],
-      "timeoutSecs": 1800,
-      "title": "Ready for merge: all checks pass, code reviewed and refactored",
-      "touchesFiles": []
+      "modifiesBehavior": false
     }
-  ],
-  "version": "1.0"
+  ]
 }
