@@ -292,15 +292,35 @@ fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<Str
 }
 
 /// Tee assistant text content blocks to stderr for live display.
+/// Extract error text from an assistant message, handling both string and object error shapes.
+fn extract_error_text(val: &serde_json::Value) -> Option<String> {
+    let error = val.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    if let Some(s) = error.as_str() {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract the content array from an assistant message value.
+fn assistant_content(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    val.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+}
+
 fn tee_assistant_text(val: &serde_json::Value) {
     if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return;
     }
-    if let Some(content) = val
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    {
+    if let Some(content) = assistant_content(val) {
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -364,28 +384,12 @@ pub fn parse_stream_json_lines<'a>(
 
 /// Append formatted assistant message content to the conversation buffer.
 fn process_assistant_message(val: &serde_json::Value, conversation: &mut String) {
-    // Handle error field on assistant message
-    if let Some(error) = val.get("error").and_then(|e| e.as_str()) {
-        if !error.is_empty() {
-            append_capped(conversation, &format!("[Error: {}]\n", error));
-            return;
-        }
-    }
-    // Also handle error as object
-    if let Some(error_obj) = val.get("error") {
-        if !error_obj.is_null() {
-            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
-                append_capped(conversation, &format!("[Error: {}]\n", msg));
-                return;
-            }
-        }
+    if let Some(error) = extract_error_text(val) {
+        append_capped(conversation, &format!("[Error: {}]\n", error));
+        return;
     }
 
-    let content = match val
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-    {
+    let content = match assistant_content(val) {
         Some(c) => c,
         None => return,
     };
@@ -410,10 +414,7 @@ fn process_assistant_message(val: &serde_json::Value, conversation: &mut String)
                 let truncated = truncate_chars(&input_str, MAX_TOOL_USE_CHARS);
                 append_capped(conversation, &format!("[Tool: {}] {}\n", name, truncated));
             }
-            Some("thinking") => {
-                // Skip thinking blocks
-            }
-            _ => {}
+            _ => {} // Skip thinking blocks and unknown types
         }
     }
 }
