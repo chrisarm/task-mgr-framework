@@ -514,3 +514,14 @@
 - **Created REFACTOR-1-001** (priority 40): Extract error-handling helper and unify assistant text navigation. Added to MILESTONE-1 dependsOn.
 - **Flagged but acceptable**: spawn_claude at 161 lines — orchestration function, splitting would scatter the flow.
 ---
+
+## 2026-03-03 - 2367d40c-MILESTONE-1
+- **Verification**: All acceptance criteria checked and passing
+- All tests: 2356 passed, 0 failed, 8 ignored
+- cargo fmt --check: clean
+- cargo clippy -- -D warnings: clean (zero warnings)
+- --no-session-persistence present on both stream_json code paths (lines 115, 121 of claude.rs)
+- All 3 production callers (engine.rs:439, curate/mod.rs:613, curate/enrich.rs:234) route through spawn_claude
+- Completed dependencies: TEST-INIT-001/002, FEAT-001/002/003/004, CODE-REVIEW-1, REFACTOR-REVIEW-1, REFACTOR-1-001
+- **Learnings:** Structured acceptance criteria table makes milestone gates fast and thorough
+---
