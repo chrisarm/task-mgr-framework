@@ -3,6 +3,8 @@
 //! The complete command marks one or more tasks as done, updating timestamps
 //! and run tracking information.
 
+use std::process::Command;
+
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -172,6 +174,52 @@ fn check_dependencies_satisfied(conn: &Connection, task_id: &str) -> TaskMgrResu
     }
 }
 
+/// Check that all required tests pass for a task.
+///
+/// Queries `required_tests` column for the task. If empty/null, returns Ok.
+/// For each test filter string, runs `cargo test <filter>` in the current directory.
+/// Returns Err with the list of failed test filters if any fail.
+fn check_required_tests_pass(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
+    // Column may not exist in pre-v11 databases; treat as no required tests
+    let required_tests: Option<String> = conn
+        .query_row(
+            "SELECT required_tests FROM tasks WHERE id = ?",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
+    let filters: Vec<String> = match required_tests {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => return Ok(()),
+    };
+
+    if filters.is_empty() {
+        return Ok(());
+    }
+
+    let mut failed = Vec::new();
+    for filter in &filters {
+        let result = Command::new("cargo")
+            .args(["test", filter, "--", "--no-capture"])
+            .status();
+
+        match result {
+            Ok(status) if status.success() => {} // test passed
+            _ => failed.push(filter.clone()),
+        }
+    }
+
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(TaskMgrError::RequiredTestsFailed {
+            task_id: task_id.to_string(),
+            failed_tests: failed.join(", "),
+        })
+    }
+}
+
 /// Complete a single task.
 fn complete_single_task(
     conn: &Connection,
@@ -197,6 +245,11 @@ fn complete_single_task(
     // Gate on dependency satisfaction (skip if already done or forcing)
     if !was_already_done && !force {
         check_dependencies_satisfied(conn, task_id)?;
+    }
+
+    // Gate on required tests (skip if already done or forcing)
+    if !was_already_done && !force {
+        check_required_tests_pass(conn, task_id)?;
     }
 
     // Validate status transition

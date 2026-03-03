@@ -995,6 +995,9 @@ Every task list should include:
    - Ordered by dependency
    - Goal: Make the initial tests pass
    - Acceptance criteria: "All TEST-INIT-xxx tests pass"
+   - **Integration wiring tasks** must include:
+     - A known-bad discriminator: a test that asserts the NEW behavior is observable from the production entry point. It MUST fail before wiring and MUST pass after — proving the feature is live, not just implemented.
+     - Example: "Test that a request through the main API hits the new `stream_json=true` path — fails until wiring is complete"
 
 3. **Code Review Task** (priority 13) - **CAN SPAWN TASKS**
 
@@ -1033,7 +1036,10 @@ Every task list should include:
      - "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)"
      - **"All new code is reachable from production entry points (no dead code)"**
      - **"No unused warnings for new code in `cargo check`/`cargo clippy`"**
-   - Notes: "Initial tests pass, implementation reviewed, refactored, and **fully wired in**"
+     - **"Integration test verifying the feature's observable behavior change exists and passes"**
+     - **"The feature's primary user story is exercised end-to-end (not just unit tested)"**
+   - If the feature has a critical integration boundary, add `"requiredTests": ["test_filter_name"]` to enforce test-gated completion (see `requiredTests` field docs below)
+   - Notes: "Initial tests pass, implementation reviewed, refactored, and **fully wired in**. If no integration test exists for the core behavior change, create one before marking complete."
 
 6. **Comprehensive Test Tasks** (priority 25-38)
 
@@ -1098,6 +1104,42 @@ Every task list should include:
     - Acceptance criteria must include: "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)"
     - All acceptance criteria met
     - Ready for merge
+    - If the feature has a critical integration path, add `"requiredTests": ["test_that_verifies_feature_purpose"]` — a test that verifies the feature's _purpose_ (the observable behavior change, not just compilation)
+
+### Known-Bad Discriminators
+
+A **known-bad discriminator** is a test that acts as a litmus test for whether a new feature is actually wired in to the production code path. It follows the TDD red→green cycle:
+
+| State | Test Result | What It Proves |
+|---|---|---|
+| Before wiring | FAIL | The old behavior is still active — feature isn't live yet |
+| After wiring | PASS | The new behavior is active — feature is correctly integrated |
+
+The key property: it **discriminates** between "code exists but isn't called" and "code exists AND is called."
+
+**What makes a good one:**
+
+1. **Assert on observable new behavior**, not just that code exists
+2. **Be impossible to pass with the old code path** — if someone forgets to wire it in, the test *must* fail
+3. **Be as minimal as possible** — it tests wiring, not full feature correctness
+
+**Examples:**
+
+- "Send a request through the production API entry point and assert that the response includes `stream_json=true` in the engine call. Fails until the engine is wired to use the new streaming path."
+- "Call the login endpoint with an OAuth token and assert the request reaches the new `OAuthProvider`, not the legacy `PasswordProvider`. Fails until the router is updated."
+- "Send a request and assert that the response headers include `X-RateLimit-Remaining`. Fails until the rate-limiting middleware is added to the pipeline."
+
+**Why it matters:** Without this, all unit tests for a new feature can pass (the feature works in isolation) but the feature is never actually called because nobody updated the router/factory/pipeline. The known-bad discriminator closes that gap.
+
+### `requiredTests` Field
+
+Hard gate for task completion. When present, `task-mgr complete` runs these tests and refuses completion if any fail.
+
+- **Purpose**: Prevents marking a task as done when the feature's core behavior isn't actually working
+- **When to use**: Milestones where the feature must be observably wired in. Not for every task — only critical integration paths.
+- **Format**: `"requiredTests": ["test_name_filter"]` — each entry is a `cargo test` filter string
+- **Behavior**: `force=true` bypasses the gate (consistent with dependency gate)
+- **Guidance**: `requiredTests` should be rare — only for critical integration paths where the feature's core value proposition can be verified by a named test
 
 ### Step 7.1: Task Templates
 

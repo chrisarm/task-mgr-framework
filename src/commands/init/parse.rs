@@ -40,6 +40,8 @@ pub struct PrdUserStory {
     pub difficulty: Option<String>,
     #[serde(default)]
     pub escalation_note: Option<String>,
+    #[serde(default)]
+    pub required_tests: Vec<String>,
 }
 
 /// JSON structure for the PRD file.

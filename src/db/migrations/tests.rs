@@ -317,22 +317,10 @@ fn test_fts5_migration_down_removes_table_and_triggers() {
         .unwrap();
     assert!(fts_exists);
 
-    // Migrate down from version 10 to version 9 (reverts retired_at column)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 9 to version 8 (reverts prd_metadata singleton removal)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 8 to version 7 (reverts FTS5 tag indexing stub)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 7 to version 6 (reverts model selection fields)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 6 to version 5 (reverts prd_files)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 5 to version 4 (reverts task_prefix)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 4 to version 3 (reverts external_git_repo)
-    migrate_down(&mut conn).unwrap();
-    // Migrate down from version 3 to version 2 (reverts FTS5)
-    migrate_down(&mut conn).unwrap();
+    // Migrate down from latest all the way to version 2 (which reverts FTS5)
+    while get_schema_version(&conn).unwrap() > 2 {
+        migrate_down(&mut conn).unwrap();
+    }
 
     // Verify FTS5 table is gone
     let fts_exists_after: bool = conn
@@ -546,8 +534,9 @@ fn test_migration_v8_schema_version_is_8() {
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(
-        version, 10,
-        "schema_version should be 10 after all migrations"
+        version, CURRENT_SCHEMA_VERSION,
+        "schema_version should be {} after all migrations",
+        CURRENT_SCHEMA_VERSION
     );
 }
 
@@ -983,11 +972,12 @@ fn test_migration_v8_down_reverts_to_v7() {
     // Verify v8 down migration specifically reverts to v7 (not further).
     let (_temp_dir, mut conn) = setup_db();
     run_migrations(&mut conn).unwrap();
-    // Current latest is v10; first migrate down to v9, then v8
-    assert_eq!(get_schema_version(&conn).unwrap(), 10);
-    migrate_down(&mut conn).unwrap();
-    assert_eq!(get_schema_version(&conn).unwrap(), 9);
-    migrate_down(&mut conn).unwrap();
+    // Migrate down from latest to v8
+    assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+    // Migrate down one at a time until we reach v8
+    while get_schema_version(&conn).unwrap() > 8 {
+        migrate_down(&mut conn).unwrap();
+    }
     assert_eq!(get_schema_version(&conn).unwrap(), 8);
 
     migrate_down(&mut conn).unwrap();
@@ -1181,8 +1171,9 @@ fn test_migration_v9_schema_version_is_9() {
 
     let version = get_schema_version(&conn).unwrap();
     assert_eq!(
-        version, 10,
-        "schema_version should be 10 after all migrations"
+        version, CURRENT_SCHEMA_VERSION,
+        "schema_version should be {} after all migrations",
+        CURRENT_SCHEMA_VERSION
     );
 }
 

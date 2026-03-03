@@ -249,6 +249,7 @@ Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:
 | ------------------------- | ------------------------------ | -------------------- |
 | {e.g., empty input}       | {Common source of panics}      | {Return empty/error} |
 | {e.g., Unicode expansion} | {ß → ss changes string length} | {Handle correctly}   |
+| Feature implemented but not wired into production call path | All unit tests pass but feature has no effect at runtime | Integration test verifies observable behavior change from production entry point |
 
 ---
 

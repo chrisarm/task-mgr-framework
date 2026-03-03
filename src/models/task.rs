@@ -231,6 +231,10 @@ pub struct Task {
     /// Note explaining why this task was escalated to a higher-tier model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_note: Option<String>,
+
+    /// Cargo test filter strings that must pass before task can be completed
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tests: Vec<String>,
 }
 
 impl Task {
@@ -260,6 +264,7 @@ impl Task {
             model: None,
             difficulty: None,
             escalation_note: None,
+            required_tests: Vec::new(),
         }
     }
 
@@ -331,6 +336,13 @@ impl TryFrom<&Row<'_>> for Task {
             model: row.get("model").ok().flatten(),
             difficulty: row.get("difficulty").ok().flatten(),
             escalation_note: row.get("escalation_note").ok().flatten(),
+            required_tests: {
+                let json_str: Option<String> = row.get("required_tests").ok().flatten();
+                match json_str {
+                    Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            },
         })
     }
 }
