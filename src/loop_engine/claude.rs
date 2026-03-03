@@ -1671,4 +1671,409 @@ mod tests {
         let truncated = truncate_chars(s, 3);
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
+
+    // --- TEST-001: Comprehensive tests for parse_stream_json_lines ---
+
+    /// AC: Parameterized — multiple message type combinations produce correct output.
+    #[rstest]
+    #[case(
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]},"model":"m","error":null}"#,
+        "Hello",
+        ""
+    )]
+    #[case(
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"result data","is_error":false}]}}"#,
+        "",
+        "[Result: result data]"
+    )]
+    #[case(r#"{"type":"system","subtype":"init","data":{}}"#, "", "")]
+    fn test_parse_stream_json_message_types(
+        #[case] line: &str,
+        #[case] expected_in_conv: &str,
+        #[case] expected_result_contains: &str,
+    ) {
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line));
+        let conv_str = conv.unwrap_or_default();
+        if !expected_in_conv.is_empty() {
+            assert!(
+                conv_str.contains(expected_in_conv),
+                "Expected '{}' in conversation, got: '{}'",
+                expected_in_conv,
+                conv_str
+            );
+        }
+        if !expected_result_contains.is_empty() {
+            assert!(
+                conv_str.contains(expected_result_contains),
+                "Expected '{}' in conversation, got: '{}'",
+                expected_result_contains,
+                conv_str
+            );
+        }
+        if expected_in_conv.is_empty() && expected_result_contains.is_empty() {
+            assert!(
+                conv_str.is_empty(),
+                "Expected no conversation content for this message type, got: '{}'",
+                conv_str
+            );
+        }
+    }
+
+    /// AC: Interleaved assistant/user/system messages — only relevant ones extracted.
+    #[test]
+    fn test_parse_stream_json_interleaved_messages() {
+        let lines = [
+            r#"{"type":"system","subtype":"init","data":{}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Step 1"}]},"model":"m","error":null}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"file content","is_error":false}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Step 2"}]},"model":"m","error":null}"#,
+            r#"{"type":"system","subtype":"other","data":{"ignored":true}}"#,
+            r#"{"type":"result","subtype":"success","result":"<completed>X</completed>","session_id":"s1"}"#,
+        ];
+        let (output, conv) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "<completed>X</completed>");
+        let conv = conv.expect("conversation should be Some");
+        assert!(
+            conv.contains("Step 1"),
+            "First assistant text should appear"
+        );
+        assert!(
+            conv.contains("Step 2"),
+            "Second assistant text should appear"
+        );
+        assert!(
+            conv.contains("[Result: file content]"),
+            "Tool result should appear"
+        );
+        assert!(
+            !conv.contains("ignored"),
+            "System messages must not appear in conversation"
+        );
+    }
+
+    /// AC: Truncation at exactly MAX_TOOL_USE_CHARS boundary (500 chars) — not off-by-one.
+    #[test]
+    fn test_parse_stream_json_tool_use_truncation_at_500_boundary() {
+        // Build an input value that serializes to exactly 500 chars
+        // The input field is serialized with to_string(), so "{"content":"<500 a's>"}"
+        // We want the serialized form to be exactly 500 chars → find what value achieves that
+        // {"content":"..."} = 13 overhead chars → fill 487 chars with 'a'
+        let input_value_487 = "a".repeat(487);
+        let block_exactly_500 = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read",
+                "input": {"content": input_value_487}}]},
+            "model": "m",
+            "error": null
+        })
+        .to_string();
+        let (_, conv) = parse_stream_json_lines(std::iter::once(block_exactly_500.as_str()));
+        let conv = conv.unwrap();
+        // The input serializes to exactly 500 chars or less → not truncated
+        assert!(conv.contains("[Tool: Read]"));
+        // The input string in the conversation should be present fully
+        assert!(
+            conv.contains(&input_value_487[..10]),
+            "Short-enough input should not be truncated"
+        );
+
+        // Now build one that's 501 chars → should be truncated
+        let input_value_488 = "a".repeat(488);
+        let block_501 = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Read",
+                "input": {"content": input_value_488}}]},
+            "model": "m",
+            "error": null
+        })
+        .to_string();
+        // The serialized input JSON is now 501 chars — should be truncated to 500
+        let (_, conv2) = parse_stream_json_lines(std::iter::once(block_501.as_str()));
+        let conv2 = conv2.unwrap();
+        assert!(conv2.contains("[Tool: Read]"));
+        // The full 488-char value inside {"content":"..."} must be truncated
+        // so the conversation line must be at most 500 chars of input plus "[Tool: Read] \n"
+        let tool_line = conv2
+            .lines()
+            .find(|l| l.contains("[Tool: Read]"))
+            .expect("should have tool line");
+        // The suffix after "[Tool: Read] " is the truncated input_str
+        let input_part = tool_line.trim_start_matches("[Tool: Read] ");
+        assert!(
+            input_part.len() <= MAX_TOOL_USE_CHARS,
+            "Input part must be <= {} chars, got {}",
+            MAX_TOOL_USE_CHARS,
+            input_part.len()
+        );
+    }
+
+    /// AC: Truncation at exactly MAX_TOOL_RESULT_CHARS boundary (1000 chars) — not off-by-one.
+    #[test]
+    fn test_parse_stream_json_tool_result_truncation_at_1000_boundary() {
+        // Exactly 1000 chars → not truncated
+        let content_1000 = "b".repeat(1000);
+        let line_exact = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                "content": content_1000, "is_error": false}]}
+        })
+        .to_string();
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line_exact.as_str()));
+        let conv = conv.unwrap();
+        assert!(
+            conv.contains(&content_1000),
+            "1000-char result should not be truncated"
+        );
+
+        // 1001 chars → truncated
+        let content_1001 = "c".repeat(1001);
+        let line_over = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+                "content": content_1001, "is_error": false}]}
+        })
+        .to_string();
+        let (_, conv2) = parse_stream_json_lines(std::iter::once(line_over.as_str()));
+        let conv2 = conv2.unwrap();
+        // Should NOT contain the full 1001 chars
+        assert!(
+            !conv2.contains(&content_1001),
+            "1001-char result must be truncated"
+        );
+        // But should contain the first 1000 chars
+        assert!(
+            conv2.contains(&content_1001[..1000]),
+            "First 1000 chars of result should be present"
+        );
+    }
+
+    /// AC: Unicode truncation preserves char boundaries for tool_result content.
+    #[test]
+    fn test_parse_stream_json_unicode_truncation_preserves_char_boundaries() {
+        // Build a string of 1001 Unicode chars (each 3 bytes in UTF-8) to exceed MAX_TOOL_RESULT_CHARS
+        // We want char count > 1000 but byte count much higher
+        let unicode_str: String = "α".repeat(1001); // α is 2 bytes each
+        let line = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "u1",
+                "content": unicode_str, "is_error": false}]}
+        })
+        .to_string();
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line.as_str()));
+        let conv = conv.unwrap();
+        // Must be valid UTF-8 (no split mid-codepoint)
+        assert!(
+            std::str::from_utf8(conv.as_bytes()).is_ok(),
+            "Conversation must be valid UTF-8 after truncation"
+        );
+        // Should contain [Result:
+        assert!(conv.contains("[Result:"));
+        // The result content inside must not be longer than 1000 chars
+        let result_line = conv
+            .lines()
+            .find(|l| l.starts_with("[Result:"))
+            .expect("should have result line");
+        // Strip prefix "[Result: " and suffix "]"
+        let content_part = result_line
+            .strip_prefix("[Result: ")
+            .unwrap_or("")
+            .strip_suffix(']')
+            .unwrap_or(result_line);
+        assert!(
+            content_part.chars().count() <= MAX_TOOL_RESULT_CHARS,
+            "Unicode content must be truncated to {} chars",
+            MAX_TOOL_RESULT_CHARS
+        );
+    }
+
+    /// AC: Very large conversation (>50K chars) truncated correctly.
+    #[test]
+    fn test_parse_stream_json_very_large_conversation_truncated() {
+        // Each block produces ~10_001 chars in conversation ("x"*10000 + "\n")
+        // 6 blocks = ~60_006 chars > MAX_CONVERSATION_CHARS (50_000)
+        let big_text = "x".repeat(10_000);
+        let block = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": big_text}]},
+            "model": "m",
+            "error": null
+        })
+        .to_string();
+        let lines: Vec<String> = std::iter::repeat(block).take(6).collect();
+        let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
+        let conv = conv.expect("should have conversation");
+        assert!(
+            conv.len() <= MAX_CONVERSATION_CHARS,
+            "Large conversation must be capped at {} chars, got {}",
+            MAX_CONVERSATION_CHARS,
+            conv.len()
+        );
+        // Must still be valid UTF-8
+        assert!(std::str::from_utf8(conv.as_bytes()).is_ok());
+    }
+
+    /// AC: Multiple assistant messages accumulate correctly.
+    #[test]
+    fn test_parse_stream_json_multiple_assistant_messages_accumulate() {
+        let make_assistant = |text: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": text}]},
+                "model": "m",
+                "error": null
+            })
+            .to_string()
+        };
+        let lines = [
+            make_assistant("First message"),
+            make_assistant("Second message"),
+            make_assistant("Third message"),
+        ];
+        let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
+        let conv = conv.expect("should have conversation");
+        assert!(
+            conv.contains("First message"),
+            "First message should be in conversation"
+        );
+        assert!(
+            conv.contains("Second message"),
+            "Second message should be in conversation"
+        );
+        assert!(
+            conv.contains("Third message"),
+            "Third message should be in conversation"
+        );
+        // All three messages in order
+        let pos1 = conv.find("First message").unwrap();
+        let pos2 = conv.find("Second message").unwrap();
+        let pos3 = conv.find("Third message").unwrap();
+        assert!(
+            pos1 < pos2 && pos2 < pos3,
+            "Messages should appear in order"
+        );
+    }
+
+    /// AC: Assistant message with error field (string) produces [Error: ...] in conversation.
+    #[rstest]
+    #[case(
+        r#"{"type":"assistant","message":{"content":[]},"model":"m","error":"rate limit exceeded"}"#,
+        "[Error: rate limit exceeded]"
+    )]
+    #[case(
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"unreachable"}]},"model":"m","error":{"message":"network timeout"}}"#,
+        "[Error: network timeout]"
+    )]
+    #[case(
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"visible"}]},"model":"m","error":null}"#,
+        "visible"
+    )]
+    fn test_parse_stream_json_assistant_error_field(
+        #[case] line: &str,
+        #[case] expected_in_conv: &str,
+    ) {
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line));
+        let conv = conv.expect("should have conversation");
+        assert!(
+            conv.contains(expected_in_conv),
+            "Expected '{}' in conversation, got: '{}'",
+            expected_in_conv,
+            conv
+        );
+    }
+
+    /// AC: When error is present, assistant content blocks are NOT included.
+    #[test]
+    fn test_parse_stream_json_error_suppresses_content_blocks() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"should not appear"}]},"model":"m","error":"something broke"}"#;
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line));
+        let conv = conv.expect("should have conversation");
+        assert!(
+            conv.contains("[Error: something broke]"),
+            "Error must appear in conversation"
+        );
+        assert!(
+            !conv.contains("should not appear"),
+            "Content blocks must be suppressed when error is present"
+        );
+    }
+
+    /// AC: result with subtype=error is handled — output extracted from result field.
+    #[rstest]
+    #[case(
+        r#"{"type":"result","subtype":"error","result":"fatal error occurred","session_id":"s"}"#,
+        "fatal error occurred"
+    )]
+    #[case(
+        r#"{"type":"result","subtype":"success","result":"<completed>T-1</completed>","session_id":"s"}"#,
+        "<completed>T-1</completed>"
+    )]
+    #[case(
+        r#"{"type":"result","subtype":"error","result":null,"session_id":"s"}"#,
+        ""
+    )]
+    fn test_parse_stream_json_result_subtypes(#[case] line: &str, #[case] expected_output: &str) {
+        let (output, _) = parse_stream_json_lines(std::iter::once(line));
+        assert_eq!(
+            output, expected_output,
+            "Output should be extracted from result field regardless of subtype"
+        );
+    }
+
+    /// AC: Empty lines iterator produces empty output and None conversation.
+    #[test]
+    fn test_parse_stream_json_empty_input() {
+        let (output, conv) = parse_stream_json_lines(std::iter::empty());
+        assert_eq!(output, "");
+        assert!(conv.is_none());
+    }
+
+    /// AC: User message with non-tool_result content types are skipped gracefully.
+    #[test]
+    fn test_parse_stream_json_user_non_tool_result_skipped() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"user text"}]}}"#;
+        let (_, conv) = parse_stream_json_lines(std::iter::once(line));
+        // "text" type in user messages is not tool_result — should be skipped
+        assert!(
+            conv.is_none(),
+            "Non-tool_result user content must not add to conversation"
+        );
+    }
+
+    /// AC: truncate_chars at exact boundary — no off-by-one.
+    #[rstest]
+    #[case("hello", 5, "hello")] // exact boundary — keep all
+    #[case("hello!", 5, "hello")] // one over boundary — truncate
+    #[case("hi", 5, "hi")] // under boundary — keep all
+    #[case("", 5, "")] // empty string
+    #[case("abcde", 0, "")] // zero max_chars
+    fn test_truncate_chars_boundary(
+        #[case] input: &str,
+        #[case] max_chars: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            truncate_chars(input, max_chars),
+            expected,
+            "truncate_chars({:?}, {}) should be {:?}",
+            input,
+            max_chars,
+            expected
+        );
+    }
+
+    /// AC: truncate_chars with Unicode at boundary preserves char boundaries.
+    #[rstest]
+    #[case("αβγδε", 3, "αβγ")] // 3-char boundary in 2-byte chars
+    #[case("こんにちは", 4, "こんにち")] // 4-char boundary in 3-byte chars
+    #[case("🎉🎊🎈", 2, "🎉🎊")] // 4-byte emoji boundary
+    fn test_truncate_chars_unicode_boundary(
+        #[case] input: &str,
+        #[case] max_chars: usize,
+        #[case] expected: &str,
+    ) {
+        let result = truncate_chars(input, max_chars);
+        assert_eq!(result, expected);
+        // Must be valid UTF-8 (no split mid-codepoint)
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
 }
