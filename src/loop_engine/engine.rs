@@ -442,6 +442,7 @@ pub fn run_iteration(
         Some(params.project_root),
         effective_model.as_deref(),
         Some(timeout_config),
+        false,
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
@@ -459,7 +460,7 @@ pub fn run_iteration(
             files_modified: task_files,
             should_stop: false,
             output: claude_result.output,
-            effective_model: effective_model,
+            effective_model,
         });
     }
 

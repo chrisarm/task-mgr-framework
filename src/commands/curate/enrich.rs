@@ -231,7 +231,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         let batch_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
         let prompt = build_enrich_prompt(&batch_items);
 
-        let claude_result = match claude::spawn_claude(&prompt, None, None, None, None) {
+        let claude_result = match claude::spawn_claude(&prompt, None, None, None, None, false) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
@@ -336,12 +336,9 @@ fn apply_proposals_in_transaction(
         let current_task_types = learning.applies_to_task_types.as_deref();
         let current_errors = learning.applies_to_errors.as_deref();
 
-        if let Some(edit_params) = proposal_to_edit_params(
-            current_files,
-            current_task_types,
-            current_errors,
-            proposal,
-        ) {
+        if let Some(edit_params) =
+            proposal_to_edit_params(current_files, current_task_types, current_errors, proposal)
+        {
             edit_learning(&tx, proposal.learning_id, edit_params)?;
             enriched += 1;
         }
@@ -409,12 +406,8 @@ mod tests {
         let existing_errors = vec!["E0308".to_string()];
         // All three fields exist, proposal has no tags → None
         let proposal = make_proposal(&[], &[], &["E0277"], &[]);
-        let result = proposal_to_edit_params(
-            Some(&[]),
-            Some(&[]),
-            Some(&existing_errors),
-            &proposal,
-        );
+        let result =
+            proposal_to_edit_params(Some(&[]), Some(&[]), Some(&existing_errors), &proposal);
         assert!(
             result.is_none(),
             "should return None when no NULL fields and no tags"
@@ -438,8 +431,7 @@ mod tests {
         let types = vec!["FEAT-".to_string()];
         let errors = vec!["E0308".to_string()];
         let proposal = make_proposal(&["ignored"], &["ignored"], &["ignored"], &[]);
-        let result =
-            proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), &proposal);
+        let result = proposal_to_edit_params(Some(&files), Some(&types), Some(&errors), &proposal);
         assert!(result.is_none());
     }
 

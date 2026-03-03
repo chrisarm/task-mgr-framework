@@ -610,7 +610,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         let eligible_ids: Vec<i64> = eligible.iter().map(|i| i.id).collect();
         let prompt = build_dedup_prompt(&eligible, params.threshold);
 
-        let claude_result = match spawn_claude(&prompt, None, None, None, None) {
+        let claude_result = match spawn_claude(&prompt, None, None, None, None, false) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(

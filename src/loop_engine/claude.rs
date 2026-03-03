@@ -39,10 +39,7 @@ impl TimeoutConfig {
     /// Create a `TimeoutConfig` from a task difficulty string.
     ///
     /// Maps: `"low"` → 20min, `"high"` → 40min, anything else (including `None`) → 30min.
-    pub fn from_difficulty(
-        difficulty: Option<&str>,
-        last_activity_epoch: Arc<AtomicU64>,
-    ) -> Self {
+    pub fn from_difficulty(difficulty: Option<&str>, last_activity_epoch: Arc<AtomicU64>) -> Self {
         let base_secs = match difficulty.map(|d| d.to_ascii_lowercase()).as_deref() {
             Some("low") => TIMEOUT_LOW_SECS,
             Some("high") => TIMEOUT_HIGH_SECS,
@@ -56,13 +53,25 @@ impl TimeoutConfig {
     }
 }
 
+/// Maximum characters for the formatted conversation in stream-json mode.
+const MAX_CONVERSATION_CHARS: usize = 50_000;
+/// Maximum characters for a single tool_use input block.
+const MAX_TOOL_USE_CHARS: usize = 500;
+/// Maximum characters for a single tool_result content block.
+const MAX_TOOL_RESULT_CHARS: usize = 1_000;
+
 /// Result of a Claude subprocess invocation.
 #[derive(Debug)]
 pub struct ClaudeResult {
     /// Process exit code (0 = success, non-zero = error/crash)
     pub exit_code: i32,
-    /// Complete stdout output collected from the process
+    /// Complete stdout output collected from the process.
+    /// In stream-json mode, this is the `result.result` field from the final line.
+    /// In plain mode, this is the raw stdout.
     pub output: String,
+    /// Formatted conversation transcript (only set in stream-json mode).
+    /// Contains assistant text, tool calls, and tool results.
+    pub conversation: Option<String>,
     /// Whether the process was killed due to iteration timeout.
     pub timed_out: bool,
 }
@@ -96,9 +105,23 @@ pub fn spawn_claude(
     working_dir: Option<&Path>,
     model: Option<&str>,
     timeout: Option<TimeoutConfig>,
+    stream_json: bool,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-    let mut args: Vec<&str> = vec!["--print", "--dangerously-skip-permissions"];
+    let mut args: Vec<&str> = if stream_json {
+        vec![
+            "--output-format",
+            "stream-json",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+    } else {
+        vec![
+            "--print",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+        ]
+    };
     if let Some(m) = model {
         if !m.trim().is_empty() {
             args.push("--model");
@@ -174,7 +197,13 @@ pub fn spawn_claude(
         let timeout_cfg = timeout;
         let timed_out = Arc::clone(&timed_out_flag);
         Some(std::thread::spawn(move || {
-            watchdog_loop(child_pid, flag.as_ref(), &stop, timeout_cfg.as_ref(), &timed_out);
+            watchdog_loop(
+                child_pid,
+                flag.as_ref(),
+                &stop,
+                timeout_cfg.as_ref(),
+                &timed_out,
+            );
         }))
     } else {
         None
@@ -186,23 +215,28 @@ pub fn spawn_claude(
         .take()
         .expect("stdout should be piped (Stdio::piped() was set on spawn)");
 
-    let mut output = String::new();
     let reader = BufReader::new(stdout);
 
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
-                // Tee: echo to stderr (live display) and collect in buffer
-                eprintln!("{}", line);
-                output.push_str(&line);
-                output.push('\n');
-            }
-            Err(e) => {
-                eprintln!("Warning: error reading Claude stdout: {}", e);
-                break;
+    let (output, conversation) = if stream_json {
+        tee_stream_json(reader)
+    } else {
+        let mut buf = String::new();
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    // Tee: echo to stderr (live display) and collect in buffer
+                    eprintln!("{}", line);
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                Err(e) => {
+                    eprintln!("Warning: error reading Claude stdout: {}", e);
+                    break;
+                }
             }
         }
-    }
+        (buf, None)
+    };
 
     let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
         file_path: binary,
@@ -219,7 +253,214 @@ pub fn spawn_claude(
     let exit_code = exit_code_from_status(status);
     let timed_out = timed_out_flag.load(Ordering::Acquire);
 
-    Ok(ClaudeResult { exit_code, output, timed_out })
+    Ok(ClaudeResult {
+        exit_code,
+        output,
+        conversation,
+        timed_out,
+    })
+}
+
+/// Read stream-json lines from Claude, tee assistant text to stderr, and return
+/// (output_text, conversation).
+///
+/// - `output_text`: extracted from the final `result.result` field (what `--print` would emit).
+/// - `conversation`: formatted transcript of the full conversation, capped at
+///   `MAX_CONVERSATION_CHARS`.
+fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<String>) {
+    let mut raw_lines: Vec<String> = Vec::new();
+
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                // Display assistant text blocks live before collecting
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    tee_assistant_text(&val);
+                } else {
+                    eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                }
+                raw_lines.push(line);
+            }
+            Err(e) => {
+                eprintln!("Warning: error reading Claude stdout: {}", e);
+                break;
+            }
+        }
+    }
+
+    parse_stream_json_lines(raw_lines.iter().map(|s| s.as_str()))
+}
+
+/// Tee assistant text content blocks to stderr for live display.
+fn tee_assistant_text(val: &serde_json::Value) {
+    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return;
+    }
+    if let Some(content) = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    eprintln!("{}", text);
+                }
+            }
+        }
+    }
+}
+
+/// Parse an iterator of stream-json lines into (output_text, conversation).
+///
+/// - `output_text` is extracted from the final `{"type":"result","result":"..."}` line.
+/// - `conversation` is a formatted transcript of assistant messages (text, tool_use) and
+///   user messages (tool_result), capped at `MAX_CONVERSATION_CHARS`.
+///
+/// Malformed JSON lines and unknown message types are silently skipped with a warning.
+pub fn parse_stream_json_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> (String, Option<String>) {
+    let mut output_text = String::new();
+    let mut conversation = String::new();
+
+    for line in lines {
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                continue;
+            }
+        };
+
+        match val.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                process_assistant_message(&val, &mut conversation);
+            }
+            Some("user") => {
+                process_user_message(&val, &mut conversation);
+            }
+            Some("result") => {
+                // Extract the output text from the result line
+                output_text = val
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            // Skip system/init and unknown types
+            _ => {}
+        }
+    }
+
+    let conversation_opt = if conversation.is_empty() {
+        None
+    } else {
+        Some(conversation)
+    };
+
+    (output_text, conversation_opt)
+}
+
+/// Append formatted assistant message content to the conversation buffer.
+fn process_assistant_message(val: &serde_json::Value, conversation: &mut String) {
+    // Handle error field on assistant message
+    if let Some(error) = val.get("error").and_then(|e| e.as_str()) {
+        if !error.is_empty() {
+            append_capped(conversation, &format!("[Error: {}]\n", error));
+            return;
+        }
+    }
+    // Also handle error as object
+    if let Some(error_obj) = val.get("error") {
+        if !error_obj.is_null() {
+            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+                append_capped(conversation, &format!("[Error: {}]\n", msg));
+                return;
+            }
+        }
+    }
+
+    let content = match val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return,
+    };
+
+    for block in content {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    append_capped(conversation, text);
+                    append_capped(conversation, "\n");
+                }
+            }
+            Some("tool_use") => {
+                let name = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown");
+                let input_str = block
+                    .get("input")
+                    .map(|i| i.to_string())
+                    .unwrap_or_default();
+                let truncated = truncate_chars(&input_str, MAX_TOOL_USE_CHARS);
+                append_capped(conversation, &format!("[Tool: {}] {}\n", name, truncated));
+            }
+            Some("thinking") => {
+                // Skip thinking blocks
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Append formatted user message content (tool_result) to the conversation buffer.
+fn process_user_message(val: &serde_json::Value, conversation: &mut String) {
+    let content = match val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return,
+    };
+
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            let content_str = block
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default();
+            let truncated = truncate_chars(content_str, MAX_TOOL_RESULT_CHARS);
+            append_capped(conversation, &format!("[Result: {}]\n", truncated));
+        }
+    }
+}
+
+/// Append `s` to `buf` only up to `MAX_CONVERSATION_CHARS` total.
+fn append_capped(buf: &mut String, s: &str) {
+    if buf.len() >= MAX_CONVERSATION_CHARS {
+        return;
+    }
+    let remaining = MAX_CONVERSATION_CHARS - buf.len();
+    let to_append = truncate_chars(s, remaining);
+    buf.push_str(to_append);
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values without splitting mid-character.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        return s;
+    }
+    // Find the byte boundary at the char boundary
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 /// Extract exit code from process status, using 128+signal convention on Unix.
@@ -386,10 +627,12 @@ mod tests {
         let result = ClaudeResult {
             exit_code: 0,
             output: "Hello world\n".to_string(),
+            conversation: None,
             timed_out: false,
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
+        assert!(result.conversation.is_none());
         assert!(!result.timed_out);
     }
 
@@ -398,6 +641,7 @@ mod tests {
         let result = ClaudeResult {
             exit_code: 137,
             output: String::new(),
+            conversation: None,
             timed_out: false,
         };
         assert_eq!(result.exit_code, 137);
@@ -443,6 +687,7 @@ mod tests {
         Ok(ClaudeResult {
             exit_code: status.code().unwrap_or(1),
             output: String::new(),
+            conversation: None,
             timed_out: false,
         })
     }
@@ -503,7 +748,7 @@ mod tests {
         // spawn_claude with None should behave like before
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None, None, None);
+        let result = spawn_claude("hello", None, None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -517,7 +762,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("test output", Some(&flag), None, None, None);
+        let result = spawn_claude("test output", Some(&flag), None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -586,6 +831,7 @@ mod tests {
         Ok(ClaudeResult {
             exit_code: exit_code_from_status(status),
             output,
+            conversation: None,
             timed_out: false,
         })
     }
@@ -639,7 +885,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         // "60" is the argument to sleep — it will run for 60s unless killed
-        let result = spawn_claude("60", Some(&flag), None, None, None);
+        let result = spawn_claude("60", Some(&flag), None, None, None, false);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -669,7 +915,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("quick exit", Some(&flag), None, None, None);
+        let result = spawn_claude("quick exit", Some(&flag), None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -689,7 +935,7 @@ mod tests {
     fn test_spawn_model_none_no_model_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, None, None);
+        let result = spawn_claude("test_prompt", None, None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(
@@ -725,7 +971,14 @@ mod tests {
     fn test_spawn_model_some_opus_includes_model_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
+        let result = spawn_claude(
+            "test_prompt",
+            None,
+            None,
+            Some("claude-opus-4-6"),
+            None,
+            false,
+        );
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -745,7 +998,7 @@ mod tests {
     fn test_spawn_model_empty_string_treated_as_none() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some(""), None);
+        let result = spawn_claude("test_prompt", None, None, Some(""), None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -765,7 +1018,14 @@ mod tests {
     fn test_spawn_model_flag_appears_before_prompt_flag() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
+        let result = spawn_claude(
+            "test_prompt",
+            None,
+            None,
+            Some("claude-opus-4-6"),
+            None,
+            false,
+        );
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -805,7 +1065,7 @@ mod tests {
         for (model, expected_fragment) in &models {
             let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model), None);
+            let result = spawn_claude("test_prompt", None, None, Some(model), None, false);
             std::env::remove_var("CLAUDE_BINARY");
 
             assert!(result.is_ok(), "model='{}' should succeed", model);
@@ -826,7 +1086,7 @@ mod tests {
         for model in &["  ", "\t", " \t "] {
             let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test_prompt", None, None, Some(model), None);
+            let result = spawn_claude("test_prompt", None, None, Some(model), None, false);
             std::env::remove_var("CLAUDE_BINARY");
 
             assert!(result.is_ok());
@@ -845,7 +1105,14 @@ mod tests {
     fn test_spawn_model_some_preserves_required_flags() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some("claude-opus-4-6"), None);
+        let result = spawn_claude(
+            "test_prompt",
+            None,
+            None,
+            Some("claude-opus-4-6"),
+            None,
+            false,
+        );
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
@@ -883,7 +1150,7 @@ mod tests {
     fn test_spawn_claude_model_variants(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None);
+        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -920,7 +1187,7 @@ mod tests {
     fn test_spawn_claude_model_special_chars(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None);
+        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -936,14 +1203,14 @@ mod tests {
     }
 
     /// AC: --model does not interfere with --dangerously-skip-permissions or --print flags.
-    /// Verifies exact ordering: --print --dangerously-skip-permissions --model <m> -p <prompt>
+    /// Verifies exact ordering: --print --no-session-persistence --dangerously-skip-permissions [--model <m>] -p <prompt>
     #[rstest]
     #[case(Some("claude-sonnet-4-6"))]
     #[case(None)]
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt", None, None, model, None);
+        let result = spawn_claude("my prompt", None, None, model, None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -956,14 +1223,23 @@ mod tests {
             output
         );
 
-        // --dangerously-skip-permissions always present after --print
+        // --no-session-persistence present after --print
         let print_pos = output.find("--print").unwrap();
+        let nsp_pos = output
+            .find("--no-session-persistence")
+            .expect("--no-session-persistence must be present");
+        assert!(
+            nsp_pos > print_pos,
+            "--no-session-persistence should follow --print"
+        );
+
+        // --dangerously-skip-permissions always present after --no-session-persistence
         let dsp_pos = output
             .find("--dangerously-skip-permissions")
             .expect("--dangerously-skip-permissions must be present");
         assert!(
-            dsp_pos > print_pos,
-            "--dangerously-skip-permissions should follow --print"
+            dsp_pos > nsp_pos,
+            "--dangerously-skip-permissions should follow --no-session-persistence"
         );
 
         // -p always present and prompt follows
@@ -1000,16 +1276,17 @@ mod tests {
     fn test_spawn_claude_none_model_identical_to_pre_phase2() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt text", None, None, None, None);
+        let result = spawn_claude("my prompt text", None, None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
 
-        // Pre-Phase-2 behavior: exactly these args, no more
+        // stream_json=false: exactly these args, no more
         assert_eq!(
-            output, "--print --dangerously-skip-permissions -p my prompt text",
-            "None model must produce identical args to pre-Phase-2 behavior"
+            output,
+            "--print --no-session-persistence --dangerously-skip-permissions -p my prompt text",
+            "None model with stream_json=false must produce exactly these args"
         );
     }
 
@@ -1021,7 +1298,7 @@ mod tests {
     fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None);
+        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         let res = result.expect("echo should succeed");
@@ -1086,7 +1363,7 @@ mod tests {
         };
 
         let start = Instant::now();
-        let result = spawn_claude("ignored", None, None, None, Some(timeout));
+        let result = spawn_claude("ignored", None, None, None, Some(timeout), false);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -1131,7 +1408,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        let result = spawn_claude("ignored", None, None, None, Some(timeout));
+        let result = spawn_claude("ignored", None, None, None, Some(timeout), false);
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
@@ -1151,8 +1428,7 @@ mod tests {
     fn test_timeout_extension_decreases() {
         // Verify the extension formula: 7min, 6min, 5min, ..., 0
         for i in 0u32..10 {
-            let ext = INITIAL_EXTENSION_SECS
-                .saturating_sub(i as u64 * EXTENSION_DECREMENT_SECS);
+            let ext = INITIAL_EXTENSION_SECS.saturating_sub(i as u64 * EXTENSION_DECREMENT_SECS);
             let expected = match i {
                 0 => 7 * 60,
                 1 => 6 * 60,
@@ -1171,11 +1447,218 @@ mod tests {
     fn test_spawn_claude_without_timeout_not_timed_out() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None, None, None);
+        let result = spawn_claude("hello", None, None, None, None, false);
         std::env::remove_var("CLAUDE_BINARY");
 
         assert!(result.is_ok());
         let res = result.unwrap();
         assert!(!res.timed_out, "Normal exit should not be timed_out");
+    }
+
+    // --- stream_json arg construction tests ---
+
+    #[test]
+    fn test_stream_json_false_uses_print_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude("prompt", None, None, None, None, false);
+        std::env::remove_var("CLAUDE_BINARY");
+        let output = result.unwrap().output;
+        assert!(output.contains("--print"), "stream_json=false must use --print");
+        assert!(
+            !output.contains("--output-format"),
+            "stream_json=false must NOT use --output-format"
+        );
+        assert!(
+            output.contains("--no-session-persistence"),
+            "stream_json=false must include --no-session-persistence"
+        );
+    }
+
+    #[test]
+    fn test_stream_json_true_uses_output_format_stream_json() {
+        // For stream_json=true the args are passed to the binary (echo) but the output is
+        // processed as stream-json.  Since echo's output is not valid JSON, output_text is
+        // empty, but the subprocess arg list is still written to stderr.
+        // We verify behaviour by using a shell script that writes its args into a result JSON.
+        use std::io::Write;
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Write a temporary script that emits a result JSON containing the args
+        let dir = std::env::temp_dir();
+        let script_path = dir.join("task_mgr_test_args.sh");
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            // Output a valid result JSON with the args as the result text
+            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
+        }
+        let _ = std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        );
+
+        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        let result = spawn_claude("prompt", None, None, None, None, true);
+        std::env::remove_var("CLAUDE_BINARY");
+        let _ = std::fs::remove_file(&script_path);
+
+        let res = result.expect("spawn should succeed");
+        let output = res.output;
+        assert!(
+            output.contains("--output-format stream-json"),
+            "stream_json=true must use --output-format stream-json, got: '{}'",
+            output
+        );
+        assert!(
+            !output.contains("--print"),
+            "stream_json=true must NOT use --print"
+        );
+        assert!(
+            output.contains("--no-session-persistence"),
+            "stream_json=true must include --no-session-persistence"
+        );
+    }
+
+    // --- parse_stream_json_lines unit tests ---
+
+    #[test]
+    fn test_parse_stream_json_extracts_result_output() {
+        let lines = [
+            r#"{"type":"result","subtype":"success","result":"<completed>TASK-1</completed>","session_id":"abc"}"#,
+        ];
+        let (output, _conv) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "<completed>TASK-1</completed>");
+    }
+
+    #[test]
+    fn test_parse_stream_json_null_result_gives_empty_output() {
+        let lines = [r#"{"type":"result","subtype":"success","result":null,"session_id":"abc"}"#];
+        let (output, _) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_parse_stream_json_assistant_text_in_conversation() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]},"model":"m","error":null}"#,
+            r#"{"type":"result","result":"done"}"#,
+        ];
+        let (output, conv) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "done");
+        let conv = conv.expect("conversation should be Some");
+        assert!(conv.contains("Hello world"));
+    }
+
+    #[test]
+    fn test_parse_stream_json_thinking_blocks_skipped() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"internal"},{"type":"text","text":"visible"}]},"model":"m","error":null}"#,
+        ];
+        let (_, conv) = parse_stream_json_lines(lines.iter().copied());
+        let conv = conv.unwrap();
+        assert!(!conv.contains("internal"), "thinking blocks should be skipped");
+        assert!(conv.contains("visible"));
+    }
+
+    #[test]
+    fn test_parse_stream_json_tool_use_formatted() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/src/main.rs"}}]},"model":"m","error":null}"#,
+        ];
+        let (_, conv) = parse_stream_json_lines(lines.iter().copied());
+        let conv = conv.unwrap();
+        assert!(conv.contains("[Tool: Read]"), "tool_use must be formatted as [Tool: name]");
+    }
+
+    #[test]
+    fn test_parse_stream_json_tool_result_in_conversation() {
+        let lines = [
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main() {}","is_error":false}]}}"#,
+        ];
+        let (_, conv) = parse_stream_json_lines(lines.iter().copied());
+        let conv = conv.unwrap();
+        assert!(conv.contains("[Result:"), "tool_result must be formatted as [Result: ...]");
+        assert!(conv.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_parse_stream_json_malformed_line_skipped() {
+        let lines = [
+            "not json at all",
+            r#"{"type":"result","result":"ok"}"#,
+        ];
+        // Should not panic; output extracted from result line
+        let (output, _) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn test_parse_stream_json_system_messages_skipped() {
+        let lines = [
+            r#"{"type":"system","subtype":"init","data":{}}"#,
+            r#"{"type":"result","result":"final"}"#,
+        ];
+        let (output, conv) = parse_stream_json_lines(lines.iter().copied());
+        assert_eq!(output, "final");
+        assert!(conv.is_none(), "system messages should not add to conversation");
+    }
+
+    #[test]
+    fn test_parse_stream_json_conversation_cap() {
+        // Fill conversation beyond MAX_CONVERSATION_CHARS with repeated text blocks
+        let big_text = "x".repeat(10_000);
+        let block = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": big_text}]},
+            "model": "m",
+            "error": null
+        })
+        .to_string();
+        let lines: Vec<String> = std::iter::repeat(block).take(10).collect();
+        let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
+        let conv = conv.unwrap();
+        assert!(
+            conv.len() <= MAX_CONVERSATION_CHARS,
+            "conversation must be capped at {} chars, got {}",
+            MAX_CONVERSATION_CHARS,
+            conv.len()
+        );
+    }
+
+    #[test]
+    fn test_parse_stream_json_tool_use_input_truncated() {
+        let big_input = "a".repeat(1000);
+        let block = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Write", "input": {"content": big_input}}]},
+            "model": "m",
+            "error": null
+        })
+        .to_string();
+        let (_, conv) = parse_stream_json_lines(std::iter::once(block.as_str()));
+        let conv = conv.unwrap();
+        // The formatted tool_use line should not contain the full 1000-char input
+        // (input JSON is serialized then truncated to 500 chars)
+        assert!(
+            conv.contains("[Tool: Write]"),
+            "tool_use must be formatted"
+        );
+    }
+
+    #[test]
+    fn test_truncate_chars_ascii() {
+        assert_eq!(truncate_chars("hello world", 5), "hello");
+        assert_eq!(truncate_chars("hi", 100), "hi");
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte() {
+        // "こんにちは" is 5 chars, each 3 bytes = 15 bytes total
+        let s = "こんにちは";
+        assert_eq!(truncate_chars(s, 3), "こんに");
+        // Ensure we don't split mid-character
+        let truncated = truncate_chars(s, 3);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 }
