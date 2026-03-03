@@ -503,3 +503,14 @@
 - **Note**: FEAT-004 was listed as completed dependency in prompt but JSON shows passes: false. engine.rs:445 still passes stream_json: false.
 - **Learnings:** truncate_chars byte-length fast path is conservative for multi-byte Unicode but never incorrect
 ---
+
+## 2026-03-03 - 2367d40c-REFACTOR-REVIEW-1
+- Reviewed claude.rs (600 lines production, 1060 lines tests) for DRY, complexity, coupling
+- **spawn_claude (161 lines)**: Long but linear orchestration. Two code paths (stream-json vs text) are a clean 20-line branch; bulk is shared setup/teardown. NOT worth splitting into submodule — shared process management code dominates.
+- **process_assistant_message (54 lines)**: Over 30-line guideline. Error-handling preamble checks two error shapes (string and object) — 16 lines extractable to `extract_error_text(val) -> Option<String>`.
+- **tee_assistant_text + process_assistant_message**: Both navigate `message.content[]` for text blocks — minor duplication (~8 lines JSON navigation). Could unify by having tee_assistant_text delegate to a shared iterator.
+- **No DRY violations** between stream-json and text tee paths — cleanly separated.
+- **No coupling issues**: Only 1 external consumer (curate/mod.rs imports spawn_claude). Stream-json parsing functions are logically distinct from process management but co-location in a ~600-line file is acceptable.
+- **Created REFACTOR-1-001** (priority 40): Extract error-handling helper and unify assistant text navigation. Added to MILESTONE-1 dependsOn.
+- **Flagged but acceptable**: spawn_claude at 161 lines — orchestration function, splitting would scatter the flow.
+---

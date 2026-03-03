@@ -126,10 +126,7 @@ pub fn check_pause_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
 /// too — otherwise the stop signal persists across subsequent runs).
 /// When `prefix` is `None`: removes global `.stop` and `.pause`.
 pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
-    let mut files_to_remove = vec![
-        tasks_dir.join(STOP_FILE),
-        tasks_dir.join(PAUSE_FILE),
-    ];
+    let mut files_to_remove = vec![tasks_dir.join(STOP_FILE), tasks_dir.join(PAUSE_FILE)];
     if let Some(p) = prefix {
         files_to_remove.push(tasks_dir.join(format!("{STOP_FILE}-{p}")));
         files_to_remove.push(tasks_dir.join(format!("{PAUSE_FILE}-{p}")));
