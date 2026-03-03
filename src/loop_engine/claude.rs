@@ -2061,9 +2061,12 @@ mod tests {
             let _ = std::fs::remove_file(&script_path);
             result.expect("spawn should succeed").output
         } else {
-            spawn_claude_echo("test-prompt", None, model, stream_json)
-                .expect("spawn should succeed")
-                .output
+            // Call spawn_claude directly — ENV_MUTEX is already held by this function.
+            // Using spawn_claude_echo here would deadlock (std::sync::Mutex is not reentrant).
+            std::env::set_var("CLAUDE_BINARY", "echo");
+            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
+            std::env::remove_var("CLAUDE_BINARY");
+            result.expect("spawn should succeed").output
         };
 
         if expect_print {
