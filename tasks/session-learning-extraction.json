@@ -573,7 +573,7 @@
       "estimatedEffort": "medium",
       "id": "REFACTOR-2-002",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 41,
       "synergyWith": [
         "REFACTOR-2-001"
@@ -600,8 +600,9 @@
       "description": "Extract helper for creating temp shell script that outputs stream-json result wrapping args. Pattern duplicated 3x.",
       "estimatedEffort": "low",
       "id": "REFACTOR-2-003",
+      "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 42,
       "synergyWith": [
         "REFACTOR-2-002"
