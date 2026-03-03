@@ -2154,4 +2154,80 @@ mod tests {
         // Must be valid UTF-8 (no split mid-codepoint)
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
+
+    // --- INT-001: Integration tests using mock_stream_json.sh ---
+
+    /// Helper: run spawn_claude with CLAUDE_BINARY pointing to mock_stream_json.sh.
+    fn spawn_claude_mock_stream_json(stream_json: bool) -> TaskMgrResult<ClaudeResult> {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Locate the fixture relative to CARGO_MANIFEST_DIR
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let script = format!("{}/tests/fixtures/mock_stream_json.sh", manifest_dir);
+        std::env::set_var("CLAUDE_BINARY", &script);
+        let result = spawn_claude("ignored_prompt", None, None, None, None, stream_json);
+        std::env::remove_var("CLAUDE_BINARY");
+        result
+    }
+
+    /// AC: ClaudeResult.output contains the result text from stream-json mode.
+    #[test]
+    fn test_integration_stream_json_output_contains_result_text() {
+        let result = spawn_claude_mock_stream_json(true);
+        let res = result.expect("spawn_claude should succeed with mock_stream_json.sh");
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(
+            res.output, "<completed>TASK-001</completed>",
+            "output should be the result field from the final stream-json line, got: '{}'",
+            res.output
+        );
+    }
+
+    /// AC: ClaudeResult.conversation contains formatted conversation with [Tool: ...] entries.
+    #[test]
+    fn test_integration_stream_json_conversation_contains_tool_entries() {
+        let result = spawn_claude_mock_stream_json(true);
+        let res = result.expect("spawn_claude should succeed with mock_stream_json.sh");
+        let conv = res
+            .conversation
+            .expect("conversation should be Some in stream-json mode");
+        assert!(
+            conv.contains("[Tool: Read]"),
+            "conversation must contain [Tool: Read] entry, got: '{}'",
+            conv
+        );
+        assert!(
+            conv.contains("Let me read the file."),
+            "conversation must contain assistant text, got: '{}'",
+            conv
+        );
+        assert!(
+            conv.contains("The file contains a main function."),
+            "conversation must contain second assistant text, got: '{}'",
+            conv
+        );
+        assert!(
+            conv.contains("[Result:"),
+            "conversation must contain tool result entry, got: '{}'",
+            conv
+        );
+    }
+
+    /// AC: Fallback when mock outputs plain text (stream_json=false mode).
+    /// In plain mode, conversation is None and output contains the raw stdout lines.
+    #[test]
+    fn test_integration_plain_mode_fallback() {
+        let result = spawn_claude_mock_stream_json(false);
+        let res = result.expect("spawn_claude should succeed with mock_stream_json.sh");
+        assert_eq!(res.exit_code, 0);
+        // In plain mode, raw JSON lines are collected verbatim into output
+        assert!(
+            res.output.contains("stream-json") || res.output.contains("type"),
+            "plain mode output should contain raw JSON lines, got: '{}'",
+            res.output
+        );
+        assert!(
+            res.conversation.is_none(),
+            "plain mode must not produce a conversation"
+        );
+    }
 }
