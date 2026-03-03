@@ -123,6 +123,15 @@ pub enum TaskMgrError {
         task_id: String,
     },
 
+    /// Required tests did not pass for task completion.
+    #[error("Cannot complete task '{task_id}': required tests failed: {failed_tests}\n\nHint: Fix the failing tests, or use --force to override.")]
+    RequiredTestsFailed {
+        /// Task identifier
+        task_id: String,
+        /// Comma-separated list of failed test filters
+        failed_tests: String,
+    },
+
     /// Unsafe path detected (potential path traversal attack).
     #[error("Unsafe path in {context}: '{path}' - {reason}")]
     UnsafePath {

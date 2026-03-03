@@ -236,11 +236,19 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
         .map(serde_json::to_string)
         .transpose()?;
 
+    // Serialize required_tests as JSON array (NULL if empty)
+    let required_tests = if story.required_tests.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&story.required_tests)?)
+    };
+
     conn.execute(
         r#"INSERT INTO tasks
            (id, title, description, priority, status, notes, acceptance_criteria,
-            review_scope, severity, source_review, model, difficulty, escalation_note)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            review_scope, severity, source_review, model, difficulty, escalation_note,
+            required_tests)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             story.id,
             story.title,
@@ -255,6 +263,7 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             story.model,
             story.difficulty,
             story.escalation_note,
+            required_tests,
         ],
     )?;
 
@@ -318,6 +327,13 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
         .map(serde_json::to_string)
         .transpose()?;
 
+    // Serialize required_tests as JSON array (NULL if empty)
+    let required_tests = if story.required_tests.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&story.required_tests)?)
+    };
+
     // Note: We don't update status from passes here - the task may have been
     // completed in the DB since the JSON was written. We only update metadata.
     conn.execute(
@@ -325,6 +341,7 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
            title = ?, description = ?, priority = ?, notes = ?,
            acceptance_criteria = ?, review_scope = ?, severity = ?,
            source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
+           required_tests = ?,
            updated_at = datetime('now')
            WHERE id = ?"#,
         rusqlite::params![
@@ -339,6 +356,7 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             story.model,
             story.difficulty,
             story.escalation_note,
+            required_tests,
             story.id,
         ],
     )?;

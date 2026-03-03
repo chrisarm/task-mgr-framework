@@ -594,6 +594,7 @@ mod tests {
             model: None,
             difficulty: None,
             escalation_note: None,
+            required_tests: vec![],
         };
 
         let summary = TaskSummary::from(&task);
