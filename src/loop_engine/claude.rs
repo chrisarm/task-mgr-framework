@@ -621,6 +621,20 @@ mod tests {
     // when cargo test runs threads in parallel.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    /// Test helper: run spawn_claude with CLAUDE_BINARY=echo under ENV_MUTEX.
+    fn spawn_claude_echo(
+        prompt: &str,
+        signal: Option<&SignalFlag>,
+        model: Option<&str>,
+        stream_json: bool,
+    ) -> TaskMgrResult<ClaudeResult> {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLAUDE_BINARY", "echo");
+        let result = spawn_claude(prompt, signal, None, model, None, stream_json);
+        std::env::remove_var("CLAUDE_BINARY");
+        result
+    }
+
     // --- AC: ClaudeResult struct has expected fields ---
 
     #[test]
@@ -747,10 +761,7 @@ mod tests {
     #[test]
     fn test_spawn_without_signal_flag() {
         // spawn_claude with None should behave like before
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("hello", None, None, false);
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -760,11 +771,8 @@ mod tests {
     #[test]
     fn test_spawn_with_signal_flag_no_signal() {
         // spawn_claude with a SignalFlag that is NOT signaled should work normally
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("test output", Some(&flag), None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test output", Some(&flag), None, false);
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -913,11 +921,8 @@ mod tests {
     #[test]
     fn test_watchdog_does_not_interfere_with_normal_exit() {
         // If the child exits normally, the watchdog should stop cleanly
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
         let flag = SignalFlag::new();
-        let result = spawn_claude("quick exit", Some(&flag), None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("quick exit", Some(&flag), None, false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -934,10 +939,7 @@ mod tests {
     /// pre-model behavior.
     #[test]
     fn test_spawn_model_none_no_model_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test_prompt", None, None, false);
 
         assert!(
             result.is_ok(),
@@ -970,17 +972,7 @@ mod tests {
     /// model=Some("claude-opus-4-6") → --model flag present with correct value in echoed args.
     #[test]
     fn test_spawn_model_some_opus_includes_model_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude(
-            "test_prompt",
-            None,
-            None,
-            Some("claude-opus-4-6"),
-            None,
-            false,
-        );
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -997,10 +989,7 @@ mod tests {
     /// Guards against naively passing --model '' to the Claude CLI.
     #[test]
     fn test_spawn_model_empty_string_treated_as_none() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test_prompt", None, None, Some(""), None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test_prompt", None, Some(""), false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -1017,17 +1006,7 @@ mod tests {
     /// Rejects implementations that append --model after the prompt flag.
     #[test]
     fn test_spawn_model_flag_appears_before_prompt_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude(
-            "test_prompt",
-            None,
-            None,
-            Some("claude-opus-4-6"),
-            None,
-            false,
-        );
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -1052,17 +1031,7 @@ mod tests {
     /// --print and --dangerously-skip-permissions must be present regardless of model value.
     #[test]
     fn test_spawn_model_some_preserves_required_flags() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude(
-            "test_prompt",
-            None,
-            None,
-            Some("claude-opus-4-6"),
-            None,
-            false,
-        );
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -1097,10 +1066,7 @@ mod tests {
     #[case("claude-haiku-4-5-20251001")]
     #[case("my-custom-model")]
     fn test_spawn_claude_model_variants(#[case] model: &str) {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test prompt", None, Some(model), false);
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1134,10 +1100,7 @@ mod tests {
     #[case("model.with.dots")]
     #[case("model-with_mixed.chars-v2")]
     fn test_spawn_claude_model_special_chars(#[case] model: &str) {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test prompt", None, Some(model), false);
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1157,10 +1120,7 @@ mod tests {
     #[case(Some("claude-sonnet-4-6"))]
     #[case(None)]
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt", None, None, model, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("my prompt", None, model, false);
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1223,10 +1183,7 @@ mod tests {
     /// Exact string comparison to verify no extra args are added.
     #[test]
     fn test_spawn_claude_none_model_identical_to_pre_phase2() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("my prompt text", None, None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("my prompt text", None, None, false);
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1245,10 +1202,7 @@ mod tests {
     #[case("\t")]
     #[case(" \t ")]
     fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("test prompt", None, None, Some(model), None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("test prompt", None, Some(model), false);
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1281,6 +1235,26 @@ mod tests {
         // Case insensitive
         let high2 = TimeoutConfig::from_difficulty(Some("HIGH"), Arc::clone(&activity));
         assert_eq!(high2.base_timeout, Duration::from_secs(40 * 60));
+    }
+
+    /// Helper: create a script that emits a stream-json result line containing all CLI args.
+    /// The script prints `{"type":"result","result":"<args>"}` so the stream-json parser
+    /// returns the args as the output text.  `name` is used to make the filename unique.
+    /// Returns the absolute path to the created script.
+    fn make_stream_json_result_script(name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let script_path = std::env::temp_dir().join(format!("task_mgr_test_{name}.sh"));
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
+        }
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        script_path
     }
 
     /// Helper: create a script that sleeps for 120s, ignoring all CLI args.
@@ -1394,10 +1368,7 @@ mod tests {
 
     #[test]
     fn test_spawn_claude_without_timeout_not_timed_out() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("hello", None, None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("hello", None, None, false);
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -1408,10 +1379,7 @@ mod tests {
 
     #[test]
     fn test_stream_json_false_uses_print_flag() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("prompt", None, None, None, None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("prompt", None, None, false);
         let output = result.unwrap().output;
         assert!(
             output.contains("--print"),
@@ -1433,23 +1401,9 @@ mod tests {
         // processed as stream-json.  Since echo's output is not valid JSON, output_text is
         // empty, but the subprocess arg list is still written to stderr.
         // We verify behaviour by using a shell script that writes its args into a result JSON.
-        use std::io::Write;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Write a temporary script that emits a result JSON containing the args
-        let dir = std::env::temp_dir();
-        let script_path = dir.join("task_mgr_test_args.sh");
-        {
-            let mut f = std::fs::File::create(&script_path).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            // Output a valid result JSON with the args as the result text
-            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
-        }
-        let _ = std::fs::set_permissions(
-            &script_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        );
-
+        let script_path = make_stream_json_result_script("args");
         std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
         let result = spawn_claude("prompt", None, None, None, None, true);
         std::env::remove_var("CLAUDE_BINARY");
@@ -1992,10 +1946,7 @@ mod tests {
     /// AC: stream_json=false with a model — --print, --no-session-persistence, and --model all present.
     #[test]
     fn test_stream_json_false_with_model_has_print_and_model() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude("prompt", None, None, Some("claude-opus-4-6"), None, false);
-        std::env::remove_var("CLAUDE_BINARY");
+        let result = spawn_claude_echo("prompt", None, Some("claude-opus-4-6"), false);
         let output = result.unwrap().output;
         assert!(
             output.contains("--print"),
@@ -2025,21 +1976,9 @@ mod tests {
     /// --dangerously-skip-permissions, --model <model>, -p <prompt>
     #[test]
     fn test_stream_json_true_with_model_and_timeout_arg_ordering() {
-        use std::io::Write;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-        let dir = std::env::temp_dir();
-        let script_path = dir.join("task_mgr_test_stream_model_timeout.sh");
-        {
-            let mut f = std::fs::File::create(&script_path).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
-        }
-        let _ = std::fs::set_permissions(
-            &script_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        );
-
+        let script_path = make_stream_json_result_script("stream_model_timeout");
         let timeout = TimeoutConfig::from_difficulty(Some("medium"), Arc::new(AtomicU64::new(0)));
         std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
         let result = spawn_claude(
@@ -2060,8 +1999,9 @@ mod tests {
         let pos_output_format = output
             .find("--output-format stream-json")
             .expect("--output-format stream-json must be present");
-        let pos_prompt_flag =
-            output.find(" -p ").expect("' -p ' (prompt flag with spaces) must be present");
+        let pos_prompt_flag = output
+            .find(" -p ")
+            .expect("' -p ' (prompt flag with spaces) must be present");
         assert!(
             pos_output_format < pos_prompt_flag,
             "--output-format stream-json must appear before -p"
@@ -2109,35 +2049,21 @@ mod tests {
         #[case] expect_print: bool,
         #[case] expect_output_format: bool,
     ) {
-        use std::io::Write;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let output = if stream_json {
             // Need a script that emits valid result JSON so the stream-json parser yields args
-            let dir = std::env::temp_dir();
-            let script_path = dir.join(format!(
-                "task_mgr_test_4callers_{}.sh",
-                model.unwrap_or("none")
-            ));
-            {
-                let mut f = std::fs::File::create(&script_path).unwrap();
-                writeln!(f, "#!/bin/sh").unwrap();
-                writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
-            }
-            let _ = std::fs::set_permissions(
-                &script_path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o755),
-            );
+            let script_path =
+                make_stream_json_result_script(&format!("4callers_{}", model.unwrap_or("none")));
             std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
             let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
             std::env::remove_var("CLAUDE_BINARY");
             let _ = std::fs::remove_file(&script_path);
             result.expect("spawn should succeed").output
         } else {
-            std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
-            std::env::remove_var("CLAUDE_BINARY");
-            result.expect("spawn should succeed").output
+            spawn_claude_echo("test-prompt", None, model, stream_json)
+                .expect("spawn should succeed")
+                .output
         };
 
         if expect_print {
