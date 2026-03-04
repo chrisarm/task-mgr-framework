@@ -8,7 +8,7 @@
 //! Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
 use std::path::Path;
 
-use crate::loop_engine::config::{CrashType, IterationOutcome};
+use crate::loop_engine::config::{CrashType, IterationOutcome, KeyDecision, KeyDecisionOption};
 
 // --- Exit Code Classification ---
 // Maps raw i32 exit codes to typed CrashType variants.
@@ -112,6 +112,114 @@ fn is_rate_limited(output: &str) -> bool {
         || output_lower.contains("usage")
             && output_lower.contains("limit")
             && output_lower.contains("reached")
+}
+
+// --- Key Decision Extraction ---
+
+/// Extract all `<key-decision>` blocks from Claude output.
+///
+/// Returns a `Vec<KeyDecision>` with one entry per valid block. Blocks are
+/// skipped if they are malformed (missing closing tag, empty title or
+/// description, or zero valid `<option>` tags).
+pub fn extract_key_decisions(output: &str) -> Vec<KeyDecision> {
+    let open_tag = "<key-decision>";
+    let close_tag = "</key-decision>";
+    let mut results = Vec::new();
+    let mut remaining = output;
+
+    while let Some(start) = remaining.find(open_tag) {
+        let after_open = &remaining[start + open_tag.len()..];
+        match after_open.find(close_tag) {
+            None => break, // malformed: no closing tag — skip rest
+            Some(end) => {
+                let block = &after_open[..end];
+                if let Some(kd) = parse_key_decision_block(block) {
+                    results.push(kd);
+                }
+                remaining = &after_open[end + close_tag.len()..];
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse a single `<key-decision>` block (content between open/close tags).
+///
+/// Returns `None` if the block is missing required fields or has no valid options.
+fn parse_key_decision_block(block: &str) -> Option<KeyDecision> {
+    let title = extract_inner(block, "<title>", "</title>")?
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+
+    let description = extract_inner(block, "<description>", "</description>")?
+        .trim()
+        .to_string();
+    if description.is_empty() {
+        return None;
+    }
+
+    let options = extract_options(block);
+    if options.is_empty() {
+        return None;
+    }
+
+    Some(KeyDecision {
+        title,
+        description,
+        options,
+    })
+}
+
+/// Extract the trimmed inner text between `open` and `close` tags (first occurrence).
+///
+/// Returns `None` if either tag is absent.
+fn extract_inner<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = text.find(open)? + open.len();
+    let end = start + text[start..].find(close)?;
+    Some(&text[start..end])
+}
+
+/// Extract all `<option label="...">description</option>` entries from a block.
+///
+/// Options with a missing or empty label attribute are skipped.
+fn extract_options(block: &str) -> Vec<KeyDecisionOption> {
+    let open_prefix = "<option label=\"";
+    let mut options = Vec::new();
+    let mut remaining = block;
+
+    while let Some(attr_start) = remaining.find(open_prefix) {
+        let after_attr = &remaining[attr_start + open_prefix.len()..];
+        // Find closing quote of label attribute
+        let Some(label_end) = after_attr.find('"') else {
+            break;
+        };
+        let label = after_attr[..label_end].trim().to_string();
+
+        // Advance past `label="...">`
+        let after_label_quote = &after_attr[label_end + 1..];
+        let Some(tag_close) = after_label_quote.find('>') else {
+            break;
+        };
+        let content_start = &after_label_quote[tag_close + 1..];
+
+        // Find the closing </option>
+        let Some(content_end) = content_start.find("</option>") else {
+            break;
+        };
+        let description = content_start[..content_end].trim().to_string();
+
+        if !label.is_empty() {
+            options.push(KeyDecisionOption { label, description });
+        }
+
+        remaining = &content_start[content_end + "</option>".len()..];
+    }
+
+    options
 }
 
 /// Check if Claude's output reports a specific task as already complete.
@@ -1018,5 +1126,119 @@ mod tests {
     fn test_already_complete_no_prefix() {
         let output = "Task FEAT-001 is already done. Nothing to do.";
         assert!(is_task_reported_already_complete(output, "FEAT-001", None));
+    }
+
+    // ======================================================================
+    // extract_key_decisions tests (KDP-FEAT-002)
+    // ======================================================================
+
+    fn make_kd(title: &str, description: &str, options: &[(&str, &str)]) -> String {
+        let opts: String = options
+            .iter()
+            .map(|(l, d)| format!("<option label=\"{}\">{}</option>", l, d))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "<key-decision>\n<title>{}</title>\n<description>{}</description>\n{}\n</key-decision>",
+            title, description, opts
+        )
+    }
+
+    #[test]
+    fn test_one_well_formed_key_decision() {
+        let output = make_kd(
+            "Auth Strategy",
+            "Choose how users authenticate",
+            &[
+                ("A: JWT", "Stateless, scales well"),
+                ("B: Session", "Simpler but stateful"),
+            ],
+        );
+        let result = extract_key_decisions(&output);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Auth Strategy");
+        assert_eq!(result[0].description, "Choose how users authenticate");
+        assert_eq!(result[0].options.len(), 2);
+        assert_eq!(result[0].options[0].label, "A: JWT");
+        assert_eq!(result[0].options[0].description, "Stateless, scales well");
+        assert_eq!(result[0].options[1].label, "B: Session");
+    }
+
+    #[test]
+    fn test_two_key_decisions_returns_two() {
+        let a = make_kd(
+            "Decision A",
+            "Desc A",
+            &[("A: One", "opt1"), ("B: Two", "opt2")],
+        );
+        let b = make_kd("Decision B", "Desc B", &[("C: Three", "opt3")]);
+        let output = format!("{}\n{}", a, b);
+        let result = extract_key_decisions(&output);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].title, "Decision A");
+        assert_eq!(result[1].title, "Decision B");
+    }
+
+    #[test]
+    fn test_no_key_decision_tags_returns_empty() {
+        let output = "Some normal Claude output with no key decision tags.";
+        assert_eq!(extract_key_decisions(output), vec![]);
+    }
+
+    #[test]
+    fn test_malformed_missing_close_tag_returns_empty() {
+        let output = "<key-decision>\n<title>Something</title>\n<description>Desc</description>\n<option label=\"A: Foo\">bar</option>\n";
+        // No </key-decision>
+        assert_eq!(extract_key_decisions(output), vec![]);
+    }
+
+    #[test]
+    fn test_empty_title_skipped() {
+        let output = make_kd("", "Desc", &[("A: Foo", "bar")]);
+        assert_eq!(extract_key_decisions(&output), vec![]);
+    }
+
+    #[test]
+    fn test_zero_valid_options_skipped() {
+        // Option has empty label — should be skipped, leaving zero valid options
+        let output = "<key-decision>\n<title>T</title>\n<description>D</description>\n<option label=\"\">something</option>\n</key-decision>";
+        assert_eq!(extract_key_decisions(output), vec![]);
+    }
+
+    #[test]
+    fn test_option_label_and_description_extracted() {
+        let output = make_kd(
+            "Storage",
+            "Pick storage engine",
+            &[
+                ("A: SQLite", "Simple embedded"),
+                ("B: Postgres", "Full-featured"),
+            ],
+        );
+        let result = extract_key_decisions(&output);
+        assert_eq!(result[0].options[0].label, "A: SQLite");
+        assert_eq!(result[0].options[0].description, "Simple embedded");
+        assert_eq!(result[0].options[1].label, "B: Postgres");
+        assert_eq!(result[0].options[1].description, "Full-featured");
+    }
+
+    #[test]
+    fn test_whitespace_trimmed_from_fields() {
+        let output = "<key-decision>\n<title>  Trimmed  </title>\n<description>  also trimmed  </description>\n<option label=\"  A: x  \">  trimmed desc  </option>\n</key-decision>";
+        let result = extract_key_decisions(output);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Trimmed");
+        assert_eq!(result[0].description, "also trimmed");
+        // Label attribute is trimmed too
+        assert_eq!(result[0].options[0].label, "A: x");
+        assert_eq!(result[0].options[0].description, "trimmed desc");
+    }
+
+    #[test]
+    fn test_analyze_output_not_modified_by_key_decision_tag() {
+        // A key-decision tag in output should NOT change IterationOutcome
+        let output = make_kd("DB Choice", "Which DB?", &[("A: SQLite", "easy")]);
+        let result = analyze_output(&output, 0, &test_dir());
+        assert_eq!(result, IterationOutcome::Stale);
     }
 }
