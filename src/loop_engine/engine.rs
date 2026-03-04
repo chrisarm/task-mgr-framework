@@ -39,6 +39,7 @@ use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::{
     check_git_for_task_completion, reconcile_external_git_completions,
 };
+use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
@@ -48,7 +49,6 @@ use crate::loop_engine::prd_reconcile::{
 };
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
-use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status::read_task_prefix_from_prd;
