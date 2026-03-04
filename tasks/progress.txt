@@ -1127,3 +1127,24 @@
 - Imported key_decisions_db module; inserted each decision with warning-only on DB error
 - **Learnings:** Python script useful for bulk line insertions when sed/replace_all can't handle varying indentation. Always run `cargo check` before `cargo fmt` to catch missing fields first.
 ---
+
+## 2026-03-03 - KDP-FEAT-007
+- Added `build_key_decision_section()` to prompt.rs as a trimmable section
+- Added REVIEW/VERIFY task ID detection for extra emphasis
+- Added session-start deferred decision display in engine.rs (Step 12.7)
+- Graceful handling of missing table (pre-v12 DB) via non-fatal Err branch
+- **Learnings:** The session-start insert point (between Step 12.5 and Step 13) was exactly where noted. Pattern: match on Ok/Err for graceful degradation is consistent with other DB calls in engine.rs.
+---
+
+## 2026-03-03 - KDP-FEAT-008
+- Added Step 4.7 "Architectural Decision Points" to .claude/commands/prd.md between Step 4.5 and Step 5
+- High-impact decisions → stop and prompt with lettered options; lower-impact → document with [ARCH DECISION] tag in Section 7
+- Files changed: .claude/commands/prd.md
+---
+
+## 2026-03-03 - KDP-REVIEW-001
+- **BUG FOUND & FIXED**: Prompt format mismatch in `build_key_decision_section()` — prompt told Claude to emit `<option><label>...</label><description>...</description></option>` but parser expects `<option label="...">description</option>`. All key decisions would have been silently dropped. Fixed prompt to match parser.
+- All other checks passed: no unwrap() in production paths (engine.rs:1698 is safe after len==1 guard), all SQL parameterized, all errors propagated with map_err, yes_mode and signal exits handled, no dead code warnings.
+- Files changed: `src/loop_engine/prompt.rs`
+- **Learnings:** Always verify that instruction format matches parser format end-to-end.
+---

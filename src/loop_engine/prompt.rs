@@ -396,8 +396,8 @@ fn build_key_decision_section(task_id: &str) -> String {
          <key-decision>\n\
            <title>Short descriptive title</title>\n\
            <description>Why this decision matters and what the trade-offs are</description>\n\
-           <option><label>Option A</label><description>Trade-offs for A</description></option>\n\
-           <option><label>Option B</label><description>Trade-offs for B</description></option>\n\
+           <option label=\"Option A\">Trade-offs for A</option>\n\
+           <option label=\"Option B\">Trade-offs for B</option>\n\
          </key-decision>\n\
          ```\n\n\
          Only emit this for genuine architectural forks. Skip trivial implementation details.\n\n"
