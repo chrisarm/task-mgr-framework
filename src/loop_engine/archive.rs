@@ -832,21 +832,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        // Insert metadata
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'feat/my-feature', 'FEAT')",
-            [],
-        )
-        .unwrap();
-
-        // Insert a task that is NOT done
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Test task', 1, 'todo')",
-            [],
-        )
-        .unwrap();
-
+        insert_prd(&conn, 1, "test-project", "feat/my-feature", Some("FEAT"));
+        insert_task(&conn, "FEAT-001", "Test task", 1, "todo");
         drop(conn);
 
         let result = run_archive(dir.path(), false).unwrap();
@@ -859,19 +846,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'feat/my-feature', 'FEAT')",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Test task', 1, 'done')",
-            [],
-        )
-        .unwrap();
-
+        insert_prd(&conn, 1, "test-project", "feat/my-feature", Some("FEAT"));
+        insert_task(&conn, "FEAT-001", "Test task", 1, "done");
         drop(conn);
 
         // Create tasks dir with files
@@ -894,19 +870,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'ralph/test-branch', 'FEAT')",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Done task', 1, 'done')",
-            [],
-        )
-        .unwrap();
-
+        insert_prd(&conn, 1, "test-project", "ralph/test-branch", Some("FEAT"));
+        insert_task(&conn, "FEAT-001", "Done task", 1, "done");
         drop(conn);
 
         // Create tasks dir with files
@@ -959,19 +924,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Done', 1, 'done')",
-            [],
-        )
-        .unwrap();
-
+        insert_prd(&conn, 1, "test-project", "main", Some("FEAT"));
+        insert_task(&conn, "FEAT-001", "Done", 1, "done");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -999,12 +953,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "test-project", "main", None);
         // No tasks at all
         drop(conn);
 
@@ -1021,18 +970,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('FEAT-001', 'Done', 1, 'done')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "test-project", "main", Some("FEAT"));
+        insert_task(&conn, "FEAT-001", "Done", 1, "done");
 
         // Record a learning in the database
         let params = RecordLearningParams {
@@ -1088,26 +1027,15 @@ mod tests {
         let conn = setup_db(dir.path());
 
         // Insert prd_files entries (simulating what init would do)
+        // Note: no branch/prefix here — project-only PRD
         conn.execute(
             "INSERT INTO prd_metadata (id, project) VALUES (1, 'model-selection')",
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-phase1.json', 'task_list')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-phase1-prompt.md', 'prompt')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'prd-model-selection.md', 'prd')",
-            [],
-        )
-        .unwrap();
+        insert_prd_file(&conn, 1, "prd-model-phase1.json", "task_list");
+        insert_prd_file(&conn, 1, "prd-model-phase1-prompt.md", "prompt");
+        insert_prd_file(&conn, 1, "prd-model-selection.md", "prd");
 
         // Create the files on disk
         let tasks_dir = dir.path();
@@ -1139,29 +1067,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'T')",
-            [],
-        )
-        .unwrap();
-
+        insert_prd(&conn, 1, "test-project", "main", Some("T"));
         // Mix of done, skipped, and irrelevant — all terminal
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-001', 'Done', 1, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-002', 'Skipped', 2, 'skipped')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-003', 'Irrelevant', 3, 'irrelevant')",
-            [],
-        )
-        .unwrap();
+        insert_task(&conn, "T-001", "Done", 1, "done");
+        insert_task(&conn, "T-002", "Skipped", 2, "skipped");
+        insert_task(&conn, "T-003", "Irrelevant", 3, "irrelevant");
 
         // PRD should be considered completed (all tasks terminal, scoped to prefix "T")
         assert!(is_prd_completed_by_prefix(&conn, "T").unwrap());
@@ -1189,12 +1099,54 @@ mod tests {
         conn
     }
 
+    fn insert_prd(
+        conn: &rusqlite::Connection,
+        id: i64,
+        project: &str,
+        branch: &str,
+        prefix: Option<&str>,
+    ) {
+        match prefix {
+            Some(p) => conn.execute(
+                "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, project, branch, p],
+            ),
+            None => conn.execute(
+                "INSERT INTO prd_metadata (id, project, branch_name) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, project, branch],
+            ),
+        }
+        .unwrap();
+    }
+
+    fn insert_task(
+        conn: &rusqlite::Connection,
+        id: &str,
+        title: &str,
+        priority: i64,
+        status: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, title, priority, status],
+        )
+        .unwrap();
+    }
+
+    fn insert_prd_file(conn: &rusqlite::Connection, prd_id: i64, path: &str, file_type: &str) {
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (?1, ?2, ?3)",
+            rusqlite::params![prd_id, path, file_type],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_prefix_all_done_returns_true() {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Task 2', 2, 'done')", []).unwrap();
+        insert_task(&conn, "P1-US-001", "Task 1", 1, "done");
+        insert_task(&conn, "P1-US-002", "Task 2", 2, "done");
 
         assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
     }
@@ -1203,8 +1155,8 @@ mod tests {
     fn test_prefix_one_todo_returns_false() {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Task 2', 2, 'todo')", []).unwrap();
+        insert_task(&conn, "P1-US-001", "Task 1", 1, "done");
+        insert_task(&conn, "P1-US-002", "Task 2", 2, "todo");
 
         assert!(!is_prd_completed_by_prefix(&conn, "P1").unwrap());
     }
@@ -1214,7 +1166,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
         // Tasks exist but under a different prefix
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P2-US-001', 'Task 1', 1, 'done')", []).unwrap();
+        insert_task(&conn, "P2-US-001", "Task 1", 1, "done");
 
         assert!(!is_prd_completed_by_prefix(&conn, "P1").unwrap());
     }
@@ -1224,9 +1176,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
         // P1 tasks: all done
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
+        insert_task(&conn, "P1-US-001", "Task 1", 1, "done");
         // P10 tasks: still todo — must NOT be included in the P1 check
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P10-US-001', 'Task 2', 2, 'todo')", []).unwrap();
+        insert_task(&conn, "P10-US-001", "Task 2", 2, "todo");
 
         // P1 should be completed (its tasks are all done)
         assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
@@ -1238,9 +1190,9 @@ mod tests {
     fn test_prefix_mixed_terminal_states_returns_true() {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Done', 1, 'done')", []).unwrap();
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Skipped', 2, 'skipped')", []).unwrap();
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-003', 'Irrelevant', 3, 'irrelevant')", []).unwrap();
+        insert_task(&conn, "P1-US-001", "Done", 1, "done");
+        insert_task(&conn, "P1-US-002", "Skipped", 2, "skipped");
+        insert_task(&conn, "P1-US-003", "Irrelevant", 3, "irrelevant");
 
         assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
     }
@@ -1253,9 +1205,9 @@ mod tests {
         let conn = setup_db(dir.path());
 
         // P1 tasks: all done
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Done', 1, 'done')", []).unwrap();
+        insert_task(&conn, "P1-US-001", "Done", 1, "done");
         // P2 tasks: still in progress
-        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P2-US-001', 'In progress', 1, 'in_progress')", []).unwrap();
+        insert_task(&conn, "P2-US-001", "In progress", 1, "in_progress");
 
         // Prefix-scoped check correctly distinguishes the two PRDs:
         assert!(
@@ -1273,23 +1225,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
         conn.execute(
             "INSERT INTO prd_metadata (id, project) VALUES (1, 'test-project')",
             [],
         )
         .unwrap();
-
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-001', 'Done', 1, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('T-002', 'Todo', 2, 'todo')",
-            [],
-        )
-        .unwrap();
+        insert_task(&conn, "T-001", "Done", 1, "done");
+        insert_task(&conn, "T-002", "Todo", 2, "todo");
 
         // PRD should NOT be considered completed (todo task remains)
         assert!(!is_prd_completed_by_prefix(&conn, "T").unwrap());
@@ -1371,26 +1313,10 @@ mod tests {
     /// Insert two PRDs' worth of tasks: PA-001/PA-002 (done) and PB-001/PB-002
     /// (in_progress/todo) so tests can assert scoped deletion.
     fn setup_two_prds(conn: &rusqlite::Connection) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task 1', 1, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-002', 'PA Task 2', 2, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task 1', 1, 'in_progress')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-002', 'PB Task 2', 2, 'todo')",
-            [],
-        )
-        .unwrap();
+        insert_task(conn, "PA-001", "PA Task 1", 1, "done");
+        insert_task(conn, "PA-002", "PA Task 2", 2, "done");
+        insert_task(conn, "PB-001", "PB Task 1", 1, "in_progress");
+        insert_task(conn, "PB-002", "PB Task 2", 2, "todo");
     }
 
     #[test]
@@ -1655,35 +1581,13 @@ mod tests {
     /// PRD-A (prefix "PA", branch "feat/branch-a"): tasks PA-001/PA-002 — both done.
     /// PRD-B (prefix "PB", branch "feat/branch-b"): task PB-001 — in_progress.
     fn setup_two_prd_metadata_with_tasks(conn: &rusqlite::Connection) {
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (2, 'project-b', 'feat/branch-b', 'PB')",
-            [],
-        )
-        .unwrap();
+        insert_prd(conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_prd(conn, 2, "project-b", "feat/branch-b", Some("PB"));
         // PA tasks: complete
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task 1', 1, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-002', 'PA Task 2', 2, 'done')",
-            [],
-        )
-        .unwrap();
+        insert_task(conn, "PA-001", "PA Task 1", 1, "done");
+        insert_task(conn, "PA-002", "PA Task 2", 2, "done");
         // PB task: incomplete
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task 1', 1, 'in_progress')",
-            [],
-        )
-        .unwrap();
+        insert_task(conn, "PB-001", "PB Task 1", 1, "in_progress");
     }
 
     /// Two PRDs, one complete: only the complete PRD's files are archived.
@@ -1694,20 +1598,9 @@ mod tests {
         let conn = setup_db(dir.path());
         setup_two_prd_metadata_with_tasks(&conn);
 
-        // Register PA's file in prd_files
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) \
-             VALUES (1, 'project-a.json', 'task_list')",
-            [],
-        )
-        .unwrap();
-        // Register PB's file in prd_files
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) \
-             VALUES (2, 'project-b.json', 'task_list')",
-            [],
-        )
-        .unwrap();
+        // Register PA's and PB's files in prd_files
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        insert_prd_file(&conn, 2, "project-b.json", "task_list");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
