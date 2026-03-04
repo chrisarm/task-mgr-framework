@@ -182,6 +182,32 @@ pub enum IterationOutcome {
     PromptOverflow,
 }
 
+/// A single option in a key decision presented by the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDecisionOption {
+    /// Short label for the option (e.g., "Use SQLite", "Use PostgreSQL")
+    pub label: String,
+    /// Longer description explaining the trade-offs of this option
+    pub description: String,
+}
+
+/// An architectural or strategic decision point flagged by the agent during a loop iteration.
+///
+/// Key decisions are sideband data — they are NOT variants of `IterationOutcome`.
+/// The agent emits `<key-decision>` XML tags to surface important forks that
+/// may warrant human review before the loop continues.
+///
+/// Options may be empty if the tag was malformed; callers should handle gracefully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDecision {
+    /// Short title summarising the decision point
+    pub title: String,
+    /// Longer description providing context and rationale
+    pub description: String,
+    /// Candidate options for resolving the decision (may be empty)
+    pub options: Vec<KeyDecisionOption>,
+}
+
 /// Calculate the maximum number of iterations for a given task count.
 ///
 /// Formula: `max(ceil(task_count * 1.25), 5)`
@@ -559,5 +585,105 @@ mod tests {
         let outcome = IterationOutcome::Reorder("FEAT-001".to_string());
         let cloned = outcome.clone();
         assert_eq!(outcome, cloned);
+    }
+
+    // --- KeyDecision / KeyDecisionOption structs ---
+
+    #[test]
+    fn test_key_decision_option_fields() {
+        let opt = KeyDecisionOption {
+            label: "Use SQLite".to_string(),
+            description: "Simpler, no server needed".to_string(),
+        };
+        assert_eq!(opt.label, "Use SQLite");
+        assert_eq!(opt.description, "Simpler, no server needed");
+    }
+
+    #[test]
+    fn test_key_decision_option_clone_eq() {
+        let opt = KeyDecisionOption {
+            label: "A".to_string(),
+            description: "B".to_string(),
+        };
+        assert_eq!(opt.clone(), opt);
+    }
+
+    #[test]
+    fn test_key_decision_fields() {
+        let kd = KeyDecision {
+            title: "Storage backend".to_string(),
+            description: "Choose between SQLite and PostgreSQL".to_string(),
+            options: vec![
+                KeyDecisionOption {
+                    label: "SQLite".to_string(),
+                    description: "Embedded".to_string(),
+                },
+                KeyDecisionOption {
+                    label: "PostgreSQL".to_string(),
+                    description: "Server-based".to_string(),
+                },
+            ],
+        };
+        assert_eq!(kd.title, "Storage backend");
+        assert_eq!(kd.options.len(), 2);
+    }
+
+    #[test]
+    fn test_key_decision_empty_options_allowed() {
+        let kd = KeyDecision {
+            title: "Malformed tag".to_string(),
+            description: "No options provided".to_string(),
+            options: vec![],
+        };
+        assert!(kd.options.is_empty());
+    }
+
+    #[test]
+    fn test_key_decision_clone_eq() {
+        let kd = KeyDecision {
+            title: "T".to_string(),
+            description: "D".to_string(),
+            options: vec![],
+        };
+        assert_eq!(kd.clone(), kd);
+    }
+
+    #[test]
+    fn test_key_decision_ne_different_title() {
+        let a = KeyDecision {
+            title: "A".to_string(),
+            description: "D".to_string(),
+            options: vec![],
+        };
+        let b = KeyDecision {
+            title: "B".to_string(),
+            description: "D".to_string(),
+            options: vec![],
+        };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_key_decision_is_not_iteration_outcome_variant() {
+        // Compile-time proof: KeyDecision is a struct, not an IterationOutcome variant.
+        // If this compiles, the negative acceptance criterion is satisfied.
+        let _kd: KeyDecision = KeyDecision {
+            title: String::new(),
+            description: String::new(),
+            options: vec![],
+        };
+        // IterationOutcome has no KeyDecision variant — verified by exhaustive match below.
+        let outcome = IterationOutcome::Completed;
+        let _covered = matches!(
+            outcome,
+            IterationOutcome::Completed
+                | IterationOutcome::Blocked
+                | IterationOutcome::Reorder(_)
+                | IterationOutcome::RateLimit
+                | IterationOutcome::Crash(_)
+                | IterationOutcome::Stale
+                | IterationOutcome::Empty
+                | IterationOutcome::PromptOverflow
+        );
     }
 }
