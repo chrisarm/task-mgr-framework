@@ -1,4 +1,18 @@
 
+## 2026-03-03 - p4-refactor-TEST-INIT-001
+- P4 baseline verified: 2264 tests passed, 0 failed, 7 ignored (matches P3 final state)
+- cargo clippy -- -D warnings: zero warnings
+- cargo fmt --check: clean
+- Tier 4 file line counts:
+  complete.rs=912, curate/mod.rs=736, learnings.rs=731, run.rs=724, review.rs=708,
+  recall.rs=685, batch.rs=680, error.rs=661, irrelevant.rs=640, bandit.rs=636,
+  history.rs=635, model.rs=622, learning.rs=616, stats.rs=611, models/run.rs=608,
+  list.rs=606, models/task.rs=608 (total Tier 4: 11419 lines)
+- Phase 3 guidance.rs confirmed: EXISTS at src/loop_engine/guidance.rs
+- scripts/claude-loop.sh: 556 lines
+- **Learnings:** P4 baseline matches P3 final exactly — ready to proceed
+---
+
 ## 2026-03-03 - p3-refactor-LEARN-002
 - Final pass on P4 tasks after complete Phase 3
 - Updated ASSESS-014 notes: added full P1-P3 extraction scorecard (5+4+1 extractions, 0+1+2 EXPLICIT_SKIPs), P4 baseline test count (2264)
