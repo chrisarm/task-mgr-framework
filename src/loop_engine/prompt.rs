@@ -22,8 +22,12 @@ use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::context;
 use crate::loop_engine::model;
+use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
 use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
+};
+use crate::loop_engine::prompt_sections::synergy::{
+    build_synergy_section, resolve_synergy_cluster_model,
 };
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 
@@ -39,7 +43,6 @@ const TOTAL_PROMPT_BUDGET: usize = 80_000;
 
 /// Byte budget for the base prompt.md template content.
 const BASE_PROMPT_BUDGET: usize = 16_000;
-
 
 /// Result of building a prompt for one iteration.
 #[derive(Debug)]
@@ -364,20 +367,6 @@ fn append_steering(prompt: &mut String, steering_path: &Path) {
 }
 
 /// Build a dependency summaries section string.
-fn build_dependency_section(conn: &Connection, task_id: &str) -> String {
-    let deps = match get_completed_dependencies(conn, task_id) {
-        Ok(deps) if !deps.is_empty() => deps,
-        _ => return String::new(),
-    };
-
-    let mut section = String::from("## Completed Dependencies\n\n");
-    for (dep_id, dep_title) in &deps {
-        section.push_str(&format!("- **{}**: {}\n", dep_id, dep_title));
-    }
-    section.push('\n');
-    section
-}
-
 /// Append dependency completion summaries for the current task.
 ///
 /// For each completed dependsOn task: includes title + key acceptance criteria
@@ -385,51 +374,6 @@ fn build_dependency_section(conn: &Connection, task_id: &str) -> String {
 #[cfg(test)]
 fn append_dependency_summaries(prompt: &mut String, conn: &Connection, task_id: &str) {
     prompt.push_str(&build_dependency_section(conn, task_id));
-}
-
-/// Get completed dependency task IDs and titles for a task.
-fn get_completed_dependencies(
-    conn: &Connection,
-    task_id: &str,
-) -> TaskMgrResult<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.title FROM tasks t
-         INNER JOIN task_relationships tr ON tr.related_id = t.id
-         WHERE tr.task_id = ?1
-           AND tr.rel_type = 'dependsOn'
-           AND t.status = 'done'
-         ORDER BY t.id",
-    )?;
-
-    let deps: Vec<(String, String)> = stmt
-        .query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-
-    Ok(deps)
-}
-
-/// Build a synergy context section string.
-fn build_synergy_section(conn: &Connection, task_id: &str, run_id: Option<&str>) -> String {
-    let run_id = match run_id {
-        Some(rid) => rid,
-        None => return String::new(),
-    };
-
-    let synergies = match get_synergy_tasks_in_run(conn, task_id, run_id) {
-        Ok(s) if !s.is_empty() => s,
-        _ => return String::new(),
-    };
-
-    let mut section = String::from("## Synergy Tasks (completed this run)\n\n");
-    for (syn_id, syn_title, syn_commit) in &synergies {
-        section.push_str(&format!("- **{}**: {}", syn_id, syn_title));
-        if let Some(commit) = syn_commit {
-            section.push_str(&format!(" (commit: {})", commit));
-        }
-        section.push('\n');
-    }
-    section.push('\n');
-    section
 }
 
 /// Append synergy task context for completed synergy tasks in the current run.
@@ -441,33 +385,6 @@ fn append_synergy_context(
     run_id: Option<&str>,
 ) {
     prompt.push_str(&build_synergy_section(conn, task_id, run_id));
-}
-
-/// Get synergy tasks that were completed in the current run.
-fn get_synergy_tasks_in_run(
-    conn: &Connection,
-    task_id: &str,
-    run_id: &str,
-) -> TaskMgrResult<Vec<(String, String, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.title, r.last_commit
-         FROM tasks t
-         INNER JOIN task_relationships tr ON tr.related_id = t.id
-         LEFT JOIN run_tasks rt ON rt.task_id = t.id AND rt.run_id = ?2
-         LEFT JOIN runs r ON r.run_id = rt.run_id
-         WHERE tr.task_id = ?1
-           AND tr.rel_type = 'synergyWith'
-           AND t.status = 'done'
-         ORDER BY t.id",
-    )?;
-
-    let results: Vec<(String, String, Option<String>)> = stmt
-        .query_map(rusqlite::params![task_id, run_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<Result<_, _>>()?;
-
-    Ok(results)
 }
 
 /// Build a JSON representation of the task for inclusion in the prompt.
@@ -581,73 +498,6 @@ fn build_escalation_section(base_prompt_path: &Path, resolved_model: Option<&str
     }
 }
 
-/// Resolve the model for a synergy cluster (the selected task + its pending synergyWith partners).
-///
-/// 1. Resolves the primary task's model via `model::resolve_task_model()`.
-/// 2. Queries pending (todo/in_progress) synergyWith partners' model and difficulty.
-/// 3. Resolves each partner via `model::resolve_task_model()`.
-/// 4. Combines all resolved models via `model::resolve_iteration_model()` (highest tier wins).
-/// 5. Normalizes `Some("")` to `None`.
-///
-/// When no synergyWith partners exist, the cluster is just the selected task.
-pub fn resolve_synergy_cluster_model(
-    conn: &Connection,
-    task_id: &str,
-    task_model: Option<&str>,
-    task_difficulty: Option<&str>,
-    default_model: Option<&str>,
-) -> Option<String> {
-    // Resolve the primary task's model
-    let primary_model = model::resolve_task_model(task_model, task_difficulty, default_model);
-
-    // Query pending synergyWith partners' model and difficulty
-    let synergy_models = get_synergy_partner_models(conn, task_id, default_model);
-
-    // Combine: primary task + all synergy partners
-    let mut all_models = vec![primary_model];
-    all_models.extend(synergy_models);
-
-    // Select highest tier across the cluster
-    let resolved = model::resolve_iteration_model(&all_models);
-
-    // Normalize Some("") to None
-    resolved.filter(|m| !m.trim().is_empty())
-}
-
-/// Query pending synergyWith partners and resolve each one's model.
-fn get_synergy_partner_models(
-    conn: &Connection,
-    task_id: &str,
-    default_model: Option<&str>,
-) -> Vec<Option<String>> {
-    let mut stmt = match conn.prepare(
-        "SELECT t.model, t.difficulty
-         FROM tasks t
-         INNER JOIN task_relationships tr ON tr.related_id = t.id
-         WHERE tr.task_id = ?1
-           AND tr.rel_type = 'synergyWith'
-           AND t.status IN ('todo', 'in_progress')",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = match stmt.query_map([task_id], |row| {
-        let partner_model: Option<String> = row.get("model")?;
-        let partner_difficulty: Option<String> = row.get("difficulty")?;
-        Ok(model::resolve_task_model(
-            partner_model.as_deref(),
-            partner_difficulty.as_deref(),
-            default_model,
-        ))
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
-
-    rows.filter_map(|r| r.ok()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,7 +560,6 @@ mod tests {
 
     // ===== Unit tests for helper functions (original) =====
 
-
     #[test]
     fn test_append_steering_missing_file() {
         let mut prompt = String::new();
@@ -741,8 +590,6 @@ mod tests {
         assert!(prompt.is_empty(), "Empty steering file should be no-op");
     }
 
-
-
     #[test]
     fn test_append_base_prompt_with_content() {
         let temp_dir = TempDir::new().unwrap();
@@ -764,7 +611,6 @@ mod tests {
             "Missing prompt file should be no-op (with warning)"
         );
     }
-
 
     #[test]
     fn test_build_task_json_basic() {
@@ -1937,12 +1783,6 @@ pub enum ApiError {
 
     // --- record_shown_learnings with actual learnings ---
 
-
-
-
-
-
-
     // --- Steering edge cases ---
 
     #[test]
@@ -2001,96 +1841,6 @@ pub enum ApiError {
         let mut prompt = String::new();
         append_base_prompt(&mut prompt, &path);
         assert!(!prompt.ends_with("\n\n"), "Should not double-add newline");
-    }
-
-    // --- get_completed_dependencies edge cases ---
-
-    #[test]
-    fn test_get_completed_dependencies_none_done() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "DEP-001", "Still in progress", "in_progress", 1);
-        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
-        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
-
-        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
-        assert!(deps.is_empty(), "In-progress deps should not be listed");
-    }
-
-    #[test]
-    fn test_get_completed_dependencies_ignores_synergy_relationships() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "SYN-001", "Synergy task", "done", 1);
-        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
-        // Only synergyWith, NOT dependsOn
-        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
-
-        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
-        assert!(
-            deps.is_empty(),
-            "Synergy relationships should not appear in dependency summaries"
-        );
-    }
-
-    #[test]
-    fn test_get_completed_dependencies_ordered_by_id() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "DEP-C", "Dep C", "done", 3);
-        insert_task(&conn, "DEP-A", "Dep A", "done", 1);
-        insert_task(&conn, "DEP-B", "Dep B", "done", 2);
-        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
-        insert_relationship(&conn, "TASK-001", "DEP-C", "dependsOn");
-        insert_relationship(&conn, "TASK-001", "DEP-A", "dependsOn");
-        insert_relationship(&conn, "TASK-001", "DEP-B", "dependsOn");
-
-        let deps = get_completed_dependencies(&conn, "TASK-001").unwrap();
-        assert_eq!(deps.len(), 3);
-        assert_eq!(deps[0].0, "DEP-A", "Should be ordered by ID");
-        assert_eq!(deps[1].0, "DEP-B");
-        assert_eq!(deps[2].0, "DEP-C");
-    }
-
-    // --- get_synergy_tasks_in_run edge cases ---
-
-    #[test]
-    fn test_get_synergy_tasks_in_run_no_commit() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
-        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
-        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
-        insert_run(&conn, "run-001");
-        insert_run_task(&conn, "run-001", "SYN-001", 1);
-        // Note: no last_commit set on the run
-
-        let results = get_synergy_tasks_in_run(&conn, "TASK-001", "run-001").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "SYN-001");
-        assert!(
-            results[0].2.is_none(),
-            "Commit should be None when run has no last_commit"
-        );
-    }
-
-    #[test]
-    fn test_get_synergy_tasks_in_run_nonexistent_run() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
-        insert_task(&conn, "TASK-001", "Main task", "todo", 10);
-        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
-
-        let results = get_synergy_tasks_in_run(&conn, "TASK-001", "nonexistent-run").unwrap();
-        // The LEFT JOIN means no run_tasks match, so no results with run data,
-        // but the synergy task itself is still done. The query filters by run_id
-        // in the LEFT JOIN clause, so SYN-001 will still appear (run-related columns will be NULL).
-        // Actually, let's verify the actual behavior:
-        // The query LEFT JOINs run_tasks ON task_id AND run_id, so if run doesn't exist,
-        // rt.* will be NULL but the row still appears because of LEFT JOIN.
-        // This is acceptable behavior — the task is still listed as a synergy task.
-        assert!(results.len() <= 1, "Should return at most 1 synergy task");
     }
 
     // --- TEST-001: project_root separation in BuildPromptParams routing ---
@@ -3088,8 +2838,6 @@ pub enum ApiError {
     }
 
     // ===== Prompt size budget tests =====
-
-
 
     #[test]
     fn test_append_base_prompt_truncation_over_budget() {

@@ -4,7 +4,9 @@
 //! Shared utilities (e.g. `truncate_to_budget`) live in this module
 //! and are available to all section builders via `pub(crate)`.
 
+pub mod dependencies;
 pub mod learnings;
+pub mod synergy;
 
 /// Truncate a string to fit within a byte budget.
 ///
