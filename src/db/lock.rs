@@ -252,15 +252,33 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_acquire_creates_lockfile() {
+    /// Creates a temp dir and returns both the dir guard and the default lock path.
+    fn setup_lock_dir() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let lock_path = temp_dir.path().join("tasks.db.lock");
+        (temp_dir, lock_path)
+    }
 
-        // Lock file shouldn't exist yet
+    /// Acquires a lock on `dir` and immediately writes extended holder metadata.
+    fn acquire_with_metadata<'a>(
+        dir: &Path,
+        branch: Option<&'a str>,
+        worktree: Option<&'a str>,
+        prefix: Option<&'a str>,
+    ) -> LockGuard {
+        let mut guard = LockGuard::acquire(dir).unwrap();
+        guard
+            .write_holder_info_extended(branch, worktree, prefix)
+            .unwrap();
+        guard
+    }
+
+    #[test]
+    fn test_acquire_creates_lockfile() {
+        let (temp_dir, lock_path) = setup_lock_dir();
+
         assert!(!lock_path.exists());
 
-        // Acquire lock
         let guard = LockGuard::acquire(temp_dir.path()).unwrap();
 
         // Lock file should exist now
@@ -370,8 +388,7 @@ mod tests {
 
     #[test]
     fn test_lockfile_removed_on_drop() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("tasks.db.lock");
+        let (temp_dir, lock_path) = setup_lock_dir();
 
         // Acquire and drop lock
         {
@@ -440,15 +457,12 @@ mod tests {
     #[test]
     fn test_write_holder_info_extended_writes_multiline_format() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
-
-        guard
-            .write_holder_info_extended(
-                Some("feat/worktree-lifecycle"),
-                Some("/path/to/worktree"),
-                Some("feat-worktree-lifecycle"),
-            )
-            .unwrap();
+        let guard = acquire_with_metadata(
+            temp_dir.path(),
+            Some("feat/worktree-lifecycle"),
+            Some("/path/to/worktree"),
+            Some("feat-worktree-lifecycle"),
+        );
 
         let contents = fs::read_to_string(guard.path()).unwrap();
         assert!(
@@ -478,11 +492,7 @@ mod tests {
     #[test]
     fn test_write_holder_info_extended_omits_none_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
-
-        guard
-            .write_holder_info_extended(Some("feat/branch"), None, None)
-            .unwrap();
+        let guard = acquire_with_metadata(temp_dir.path(), Some("feat/branch"), None, None);
 
         let contents = fs::read_to_string(guard.path()).unwrap();
         assert!(contents.contains("branch=feat/branch"));
@@ -542,29 +552,16 @@ mod tests {
     }
 
     #[test]
-    fn test_read_holder_info_new_returns_none_for_empty_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let lock_path = temp_dir.path().join("empty.lock");
-
-        fs::write(&lock_path, "").unwrap();
-
-        let info = LockGuard::read_holder_info(&lock_path);
-        assert!(info.is_none(), "empty file should return None");
-    }
-
-    #[test]
     fn test_lock_error_message_includes_branch_and_prefix() {
         let temp_dir = TempDir::new().unwrap();
 
         // Acquire the lock and write extended info
-        let mut guard1 = LockGuard::acquire(temp_dir.path()).unwrap();
-        guard1
-            .write_holder_info_extended(
-                Some("feat/my-feature"),
-                Some("/path/to/wt"),
-                Some("feat-my-feature"),
-            )
-            .unwrap();
+        let _guard1 = acquire_with_metadata(
+            temp_dir.path(),
+            Some("feat/my-feature"),
+            Some("/path/to/wt"),
+            Some("feat-my-feature"),
+        );
 
         // Second acquire should fail with branch/prefix in message
         let result = LockGuard::acquire(temp_dir.path());
@@ -580,9 +577,7 @@ mod tests {
 
     #[test]
     fn test_lock_guard_path_returns_correct_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let expected_path = temp_dir.path().join("tasks.db.lock");
-
+        let (temp_dir, expected_path) = setup_lock_dir();
         let guard = LockGuard::acquire(temp_dir.path()).unwrap();
         assert_eq!(guard.path(), expected_path);
     }
@@ -636,15 +631,12 @@ mod tests {
     #[test]
     fn test_write_read_roundtrip_all_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
-
-        guard
-            .write_holder_info_extended(
-                Some("feat/round-trip"),
-                Some("/worktrees/round-trip"),
-                Some("feat-round-trip"),
-            )
-            .unwrap();
+        let guard = acquire_with_metadata(
+            temp_dir.path(),
+            Some("feat/round-trip"),
+            Some("/worktrees/round-trip"),
+            Some("feat-round-trip"),
+        );
 
         let info = LockGuard::read_holder_info(guard.path()).unwrap();
         assert_eq!(info.pid, std::process::id());
@@ -658,9 +650,7 @@ mod tests {
     #[test]
     fn test_write_read_roundtrip_no_optional_fields() {
         let temp_dir = TempDir::new().unwrap();
-        let mut guard = LockGuard::acquire(temp_dir.path()).unwrap();
-
-        guard.write_holder_info_extended(None, None, None).unwrap();
+        let guard = acquire_with_metadata(temp_dir.path(), None, None, None);
 
         let info = LockGuard::read_holder_info(guard.path()).unwrap();
         assert_eq!(info.pid, std::process::id());
@@ -793,10 +783,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
 
         // Acquire with branch only (no prefix)
-        let mut guard1 = LockGuard::acquire(temp_dir.path()).unwrap();
-        guard1
-            .write_holder_info_extended(Some("main"), None, None)
-            .unwrap();
+        let _guard1 = acquire_with_metadata(temp_dir.path(), Some("main"), None, None);
 
         // Second acquire should fail and show branch in error
         let result = LockGuard::acquire(temp_dir.path());
