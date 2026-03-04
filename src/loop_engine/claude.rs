@@ -111,6 +111,7 @@ pub fn spawn_claude(
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<&str> = if stream_json {
         vec![
+            "--verbose",
             "--output-format",
             "stream-json",
             "--no-session-persistence",
