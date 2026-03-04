@@ -1,4 +1,12 @@
 
+## 2026-03-03 - p3-refactor-LEARN-001
+- Updated P4 ASSESS-014 notes with P3 learnings: prod/test line split check, PRD assumption verification, EXPLICIT_SKIP as expected dominant outcome
+- Updated P4 REFACTOR-014 notes: added P3 learning about checking prod/test split before extracting
+- P3 summary: 2/3 files EXPLICIT_SKIP (oauth.rs, main.rs), 1 extraction (SessionGuidance → guidance.rs)
+- Key P3 patterns for P4: (1) file size ≠ complexity when bulk is tests, (2) PRD assumptions need verification, (3) flat idiomatic patterns shouldn't be split for modularity's sake
+- **Learnings:** P4 tasks were already well-aligned with P3 outcomes — EXPLICIT_SKIP was already expected as dominant. Minor note additions sufficed.
+---
+
 ## 2026-03-03 - p3-refactor-REFACTOR-012
 - EXPLICIT_SKIP: main.rs has 34 match arms, each a clean 5-30 line block. Flat match is idiomatic Rust CLI dispatch.
 - No centralized DB setup block exists (PRD assumption was wrong — open_connection is called per-arm).

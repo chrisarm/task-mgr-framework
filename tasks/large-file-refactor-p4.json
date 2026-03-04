@@ -96,7 +96,7 @@
       "priority": 6,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "This is the core Phase 4 deliverable. Exploration suggests: complete.rs has HIGH SRP violations (dependency checking, test running, completion logic, run tracking all mixed). model.rs has 50 functions but may be cohesive (model resolution is a single domain). error.rs is structural (error enum + constructors — expected in Rust). Most command files (learnings, review, recall, history, stats, list) are single-command handlers with high test ratios — likely cohesive. bandit.rs is a pure algorithm. batch.rs is well-scoped. Model files (learning.rs, run.rs, task.rs) are entity definitions with DB parsing.",
+      "notes": "This is the core Phase 4 deliverable. P3 learnings to apply: (1) Always check prod vs test line split — oauth.rs was 857L but only ~197L production; high test ratios mean the file is NOT complex, just well-tested. (2) PRD assumptions about file contents can be wrong — read before judging. (3) EXPLICIT_SKIP was the dominant P3 outcome (2/3 files) — expect similar for P4 command files with high test ratios. Exploration suggests: complete.rs has HIGH SRP violations (dependency checking, test running, completion logic, run tracking all mixed). model.rs has 50 functions but may be cohesive (model resolution is a single domain). error.rs is structural (error enum + constructors — expected in Rust). Most command files (learnings, review, recall, history, stats, list) are single-command handlers with high test ratios — likely cohesive. bandit.rs is a pure algorithm. batch.rs is well-scoped. Model files (learning.rs, run.rs, task.rs) are entity definitions with DB parsing.",
       "qualityDimensions": {
         "correctness": ["Each file actually read before judging — no assumptions from line count alone", "All external callers identified for any extraction candidates"],
         "performance": ["No runtime impact — this is assessment only"],
@@ -156,7 +156,7 @@
       "priority": 8,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "This task depends on ASSESS-014's findings. complete.rs (912L) has the highest line count in Tier 4 and exploration found multiple concerns: completion logic, dependency validation, test execution, run tracking. The dependency validation functions (get_unsatisfied_deps, check_dependencies_satisfied, are_dependencies_satisfied) are called from engine.rs and other command files — they form a natural extraction unit. However, the agent should verify this from the ASSESS-014 output before proceeding.",
+      "notes": "This task depends on ASSESS-014's findings. complete.rs (912L) has the highest line count in Tier 4 and exploration found multiple concerns: completion logic, dependency validation, test execution, run tracking. The dependency validation functions (get_unsatisfied_deps, check_dependencies_satisfied, are_dependencies_satisfied) are called from engine.rs and other command files — they form a natural extraction unit. However, the agent should verify this from the ASSESS-014 output before proceeding. P3 learning: check prod/test split first — if complete.rs is mostly tests like oauth.rs was, extraction may not be warranted despite high line count.",
       "qualityDimensions": {
         "correctness": ["Test count identical before and after", "All external callers compile with updated imports"],
         "performance": ["No runtime impact"],
