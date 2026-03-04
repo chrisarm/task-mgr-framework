@@ -740,14 +740,27 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         Some(p) => format!("loop-{p}.lock"),
         None => "loop.lock".to_string(),
     };
+    let prd_display = run_config.prd_file.display();
     let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, &lock_name) {
         Ok(guard) => guard,
         Err(e) => {
             match &pre_lock_prefix {
                 Some(p) => {
-                    eprintln!("Error: another loop is already running for PRD prefix {p}. {e}")
+                    eprintln!(
+                        "Error: cannot start loop for {prd_display} — another loop is already running (prefix={p}). {e}"
+                    );
+                    eprintln!(
+                        "Hint: Each PRD gets its own lock file (loop-{{prefix}}.lock). If the other PRD is still running, wait for it to finish."
+                    );
                 }
-                None => eprintln!("Error: another loop is already running on this database. {e}"),
+                None => {
+                    eprintln!(
+                        "Error: cannot start loop for {prd_display} — another loop is already running on the global lock. {e}"
+                    );
+                    eprintln!(
+                        "Hint: Each PRD uses its own lock file (loop-{{prefix}}.lock). If both PRDs lack taskPrefix, they collide on the global lock."
+                    );
+                }
             }
             return LoopResult {
                 exit_code: 1,
