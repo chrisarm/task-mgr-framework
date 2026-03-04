@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
-use rusqlite::OptionalExtension;
-
 use crate::db::open_connection;
 use crate::db::prefix::make_like_pattern;
 use crate::TaskMgrResult;
@@ -50,9 +48,9 @@ pub struct ArchivedItem {
 pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     let conn = open_connection(dir)?;
 
-    // Get project info from prd_metadata
-    let project_info = get_project_info(&conn)?;
-    let Some(info) = project_info else {
+    // Get all PRDs from prd_metadata
+    let all_prds = query_all_prds(&conn)?;
+    if all_prds.is_empty() {
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
@@ -60,7 +58,9 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
             dry_run,
             message: "No PRD metadata found in database.".to_string(),
         });
-    };
+    }
+    // For now, use the first PRD for single-PRD archive behaviour
+    let info = &all_prds[0];
 
     // Check if PRD is fully completed
     if !is_prd_completed(&conn)? {
@@ -77,7 +77,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     }
 
     // Derive archive folder name from branch
-    let branch_slug = strip_branch_prefix(&info.branch.unwrap_or_default());
+    let branch_slug = strip_branch_prefix(&info.branch.clone().unwrap_or_default());
     let date_str = Local::now().format("%Y-%m-%d").to_string();
     let archive_folder_name = if branch_slug.is_empty() {
         date_str.clone()
@@ -174,29 +174,34 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     })
 }
 
-/// Project info from prd_metadata.
-struct PrdInfo {
-    project: String,
-    branch: Option<String>,
+/// A single row from the prd_metadata table.
+pub struct PrdRecord {
+    pub id: i64,
+    pub project: String,
+    pub branch: Option<String>,
+    pub task_prefix: Option<String>,
 }
 
-/// Get project info from prd_metadata table.
-fn get_project_info(conn: &rusqlite::Connection) -> TaskMgrResult<Option<PrdInfo>> {
+/// Return all rows from prd_metadata ordered by id.
+pub fn query_all_prds(conn: &rusqlite::Connection) -> TaskMgrResult<Vec<PrdRecord>> {
     let mut stmt = conn
-        .prepare("SELECT project, branch_name FROM prd_metadata WHERE id = 1")
+        .prepare("SELECT id, project, branch_name, task_prefix FROM prd_metadata ORDER BY id")
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    let result = stmt
-        .query_row([], |row| {
-            Ok(PrdInfo {
-                project: row.get(0)?,
-                branch: row.get(1)?,
+    let records = stmt
+        .query_map([], |row| {
+            Ok(PrdRecord {
+                id: row.get(0)?,
+                project: row.get(1)?,
+                branch: row.get(2)?,
+                task_prefix: row.get(3)?,
             })
         })
-        .optional()
+        .map_err(crate::TaskMgrError::DatabaseError)?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    Ok(result)
+    Ok(records)
 }
 
 /// Check if all tasks in the PRD are in a terminal state.
