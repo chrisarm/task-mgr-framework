@@ -25,6 +25,8 @@ pub mod prompt_sections;
 pub mod signals;
 pub mod stale;
 pub mod status;
+pub mod status_display;
+pub mod status_queries;
 pub mod usage;
 pub mod worktree;
 
