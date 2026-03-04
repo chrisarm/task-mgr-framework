@@ -16,7 +16,7 @@ use crate::loop_engine::model;
 /// Warnings are printed to stderr for read failures (but not for missing files).
 ///
 /// The template is loaded fresh each call (not cached) to allow hot-editing.
-pub fn load_escalation_template(base_prompt_path: &Path) -> Option<String> {
+pub(crate) fn load_escalation_template(base_prompt_path: &Path) -> Option<String> {
     let parent = base_prompt_path.parent().unwrap_or_else(|| Path::new("."));
     let template_path = parent.join("scripts").join("escalation-policy.md");
 

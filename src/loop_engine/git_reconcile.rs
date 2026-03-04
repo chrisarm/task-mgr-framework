@@ -182,7 +182,6 @@ pub(crate) fn contains_task_id(text: &str, task_id: &str) -> bool {
 pub(crate) fn check_git_for_task_completion(
     project_root: &Path,
     task_id: &str,
-    _task_prefix: Option<&str>,
     scan_depth: usize,
 ) -> Option<String> {
     use std::process::Command;
@@ -357,7 +356,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: SEC-H005-completed - Add feature");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", 7);
         assert!(
             result.is_some(),
             "Should find task ID with -completed suffix in commit message"
@@ -369,7 +368,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: sec-h005-Completed lowercase");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", 7);
         assert!(result.is_some(), "Should find task ID case-insensitively");
     }
 
@@ -378,7 +377,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: unrelated commit");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "SEC-H005", 7);
         assert!(
             result.is_none(),
             "Should return None when task ID not in commit"
@@ -390,7 +389,7 @@ mod tests {
         let temp_dir = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(temp_dir.path(), "feat: TASK-001-completed test");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", 7);
         assert!(result.is_some());
         let hash = result.unwrap();
         assert_eq!(hash.len(), 40, "Should return full commit hash");
@@ -411,7 +410,7 @@ mod tests {
         git_commit(temp_dir.path(), "fix: adjust config formatting");
         git_commit(temp_dir.path(), "chore: update lockfile");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", 7);
         assert!(
             result.is_some(),
             "Should find task ID in earlier commit (not just HEAD)"
@@ -433,7 +432,7 @@ mod tests {
             .output()
             .expect("create commit with body");
 
-        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", None, 7);
+        let result = check_git_for_task_completion(temp_dir.path(), "TASK-001", 7);
         assert!(result.is_some(), "Should find task ID in commit body");
     }
 
@@ -447,7 +446,7 @@ mod tests {
             "feat: P3-FEAT-001-completed - Implement CallSupervisor",
         );
 
-        let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", None, 7);
+        let result = check_git_for_task_completion(repo.path(), "P3-FEAT-001", 7);
         assert!(
             result.is_some(),
             "Git detection should return Some for matching commit — loop increments counter by 1"
@@ -461,7 +460,7 @@ mod tests {
         git_commit(repo.path(), "feat: FIX-001 implement feature");
 
         let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"), 7);
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
         assert!(
             result.is_none(),
             "Should NOT match bare ID without -completed suffix"
@@ -477,7 +476,7 @@ mod tests {
         );
 
         let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", Some("aeb10a1f"), 7);
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
         assert!(
             result.is_some(),
             "Should match full ID with -completed suffix"
@@ -494,7 +493,7 @@ mod tests {
         );
 
         let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-002", Some("aeb10a1f"), 7);
+            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-002", 7);
         assert!(
             result.is_none(),
             "Mention in body without -completed suffix should NOT match"
@@ -507,7 +506,7 @@ mod tests {
         let repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(repo.path(), "feat: P9-FEAT-001 Phase 9 complete");
 
-        let result = check_git_for_task_completion(repo.path(), "FEAT-001", None, 7);
+        let result = check_git_for_task_completion(repo.path(), "FEAT-001", 7);
         assert!(
             result.is_none(),
             "P9-FEAT-001 must not match FEAT-001 in git detection"

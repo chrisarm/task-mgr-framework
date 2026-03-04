@@ -1,8 +1,8 @@
-/// Shared test helpers for loop_engine test modules.
-///
-/// Consolidates duplicated test setup code (setup_test_db, insert_test_learning,
-/// and common DB insert helpers) used across feedback.rs, calibrate.rs, prompt.rs,
-/// and engine.rs tests.
+//! Shared test helpers for loop_engine test modules.
+//!
+//! Consolidates duplicated test setup code (setup_test_db, insert_test_learning,
+//! and common DB insert helpers) used across feedback.rs, calibrate.rs, prompt.rs,
+//! and engine.rs tests.
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 

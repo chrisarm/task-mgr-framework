@@ -73,7 +73,7 @@ fn get_synergy_tasks_in_run(
 /// 5. Normalizes `Some("")` to `None`.
 ///
 /// When no synergyWith partners exist, the cluster is just the selected task.
-pub fn resolve_synergy_cluster_model(
+pub(crate) fn resolve_synergy_cluster_model(
     conn: &Connection,
     task_id: &str,
     task_model: Option<&str>,

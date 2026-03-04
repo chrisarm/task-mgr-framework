@@ -11,7 +11,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 
 use super::env::{get_current_branch, prompt_user_yn};
 
-/// Silently ignores errors (best-effort cleanup).
+/// Silently ignore errors (best-effort cleanup).
 fn cleanup_empty_dir(path: &Path) {
     if path.exists() {
         if let Ok(mut entries) = std::fs::read_dir(path) {
@@ -22,8 +22,7 @@ fn cleanup_empty_dir(path: &Path) {
     }
 }
 
-///
-/// Replaces `/`, spaces, and other problematic characters with `-`.
+/// Replace `/`, spaces, and other problematic characters with `-`.
 fn sanitize_branch_name(branch_name: &str) -> String {
     branch_name
         .chars()
@@ -34,8 +33,7 @@ fn sanitize_branch_name(branch_name: &str) -> String {
         .collect()
 }
 
-///
-/// Returns `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`
+/// Return `{repo-parent}/{repo-name}-worktrees/{sanitized-branch-name}/`.
 pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> PathBuf {
     let repo_name = project_root
         .file_name()
@@ -69,8 +67,7 @@ fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
     Ok(git_dir.contains("/worktrees/") || git_dir.contains("\\worktrees\\"))
 }
 
-///
-/// Returns a list of (worktree_path, branch_name) tuples.
+/// Return a list of (worktree_path, branch_name) tuples.
 pub(crate) fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)> {
     let mut worktrees = Vec::new();
     let mut current_path: Option<PathBuf> = None;
@@ -97,8 +94,7 @@ pub(crate) fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)
     worktrees
 }
 
-///
-/// Creates a worktree at `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`
+/// Create a worktree at `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`
 /// if one doesn't already exist for this branch.
 ///
 /// # Arguments
@@ -328,6 +324,7 @@ pub fn ensure_worktree(
     Ok(worktree_path)
 }
 
+/// Remove a git worktree.
 ///
 /// Returns `Ok(true)` if the worktree was removed, `Ok(false)` if skipped due to
 /// uncommitted changes, and `Err` if the path does not exist or git commands fail.
@@ -660,7 +657,6 @@ detached
     // --- TEST-INIT-001: remove_worktree() and early exit cleanup ---
 
     #[test]
-
     fn test_remove_worktree_clean_returns_true_and_path_removed() {
         let tmp = setup_git_repo_with_file();
 
@@ -687,7 +683,6 @@ detached
     }
 
     #[test]
-
     fn test_remove_worktree_dirty_returns_false_and_path_preserved() {
         let tmp = setup_git_repo_with_file();
 
@@ -716,7 +711,6 @@ detached
     }
 
     #[test]
-
     fn test_remove_worktree_removes_empty_parent_dir() {
         let tmp = setup_git_repo_with_file();
 
@@ -741,7 +735,6 @@ detached
     }
 
     #[test]
-
     fn test_remove_worktree_non_empty_parent_dir_preserved() {
         let tmp = setup_git_repo_with_file();
 
@@ -769,7 +762,6 @@ detached
 
     // Known-bad discriminator: non-existent path is an error, not Ok(true)
     #[test]
-
     fn test_remove_worktree_non_existent_path_returns_error() {
         let tmp = setup_git_repo_with_file();
 

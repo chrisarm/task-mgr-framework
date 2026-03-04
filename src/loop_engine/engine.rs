@@ -1236,7 +1236,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     if let Some(commit_hash) = check_git_for_task_completion(
                         &working_root,
                         task_id,
-                        task_prefix.as_deref(),
                         run_config.config.git_scan_depth,
                     ) {
                         // Mark task done in DB

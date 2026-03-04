@@ -58,7 +58,6 @@ pub(crate) fn parse_completed_tasks(output: &str) -> Vec<String> {
 pub(crate) fn check_output_for_task_completion(
     output: &str,
     task_id: &str,
-    _task_prefix: Option<&str>,
 ) -> bool {
     let pattern = format!("[{}]", task_id);
     output.contains(&pattern)
@@ -100,7 +99,7 @@ pub(crate) fn scan_output_for_completed_tasks(
         .unwrap_or_default();
 
     for task_id in task_ids {
-        if check_output_for_task_completion(output, &task_id, task_prefix) {
+        if check_output_for_task_completion(output, &task_id) {
             completed.push(task_id);
         }
     }
@@ -147,25 +146,25 @@ mod tests {
     fn test_check_output_finds_task_id_in_brackets() {
         let output =
             "Some output\nfeat: [FEAT-005] Implement Tool Declarations module\nMore output";
-        assert!(check_output_for_task_completion(output, "FEAT-005", None));
+        assert!(check_output_for_task_completion(output, "FEAT-005"));
     }
 
     #[test]
     fn test_check_output_returns_false_when_not_found() {
         let output = "Some output without any task references";
-        assert!(!check_output_for_task_completion(output, "FEAT-005", None));
+        assert!(!check_output_for_task_completion(output, "FEAT-005"));
     }
 
     #[test]
     fn test_check_output_requires_brackets() {
         // Task ID without brackets should NOT match
         let output = "feat: FEAT-005 Implement something";
-        assert!(!check_output_for_task_completion(output, "FEAT-005", None));
+        assert!(!check_output_for_task_completion(output, "FEAT-005"));
     }
 
     #[test]
     fn test_check_output_empty_output() {
-        assert!(!check_output_for_task_completion("", "FEAT-005", None));
+        assert!(!check_output_for_task_completion("", "FEAT-005"));
     }
 
     #[test]
@@ -173,7 +172,7 @@ mod tests {
         // Output has "[FIX-001]", DB ID is "aeb10a1f-FIX-001" — should NOT match
         let output = "feat: [FIX-001] Fix the bug";
         assert!(
-            !check_output_for_task_completion(output, "aeb10a1f-FIX-001", Some("aeb10a1f")),
+            !check_output_for_task_completion(output, "aeb10a1f-FIX-001"),
             "Should NOT match base ID without prefix in brackets"
         );
     }

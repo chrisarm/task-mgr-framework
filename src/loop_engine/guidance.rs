@@ -4,7 +4,7 @@
 //! pause/resume cycles. It is conceptually separate from signal file
 //! handling (stop/pause file checks) which lives in `signals.rs`.
 
-use chrono;
+use chrono::Utc;
 
 /// Accumulated session guidance from `.pause` interactions.
 ///
@@ -69,7 +69,7 @@ impl SessionGuidance {
             return String::new();
         }
 
-        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
         let mut result = format!("\n## {} - Session Guidance\n", timestamp);
 
         for entry in &self.entries {

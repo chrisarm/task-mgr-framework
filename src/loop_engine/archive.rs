@@ -15,6 +15,8 @@ use rusqlite::OptionalExtension;
 use crate::db::open_connection;
 use crate::TaskMgrResult;
 
+pub use super::archive_display::format_text;
+
 /// Result of the archive command.
 #[derive(Debug, Serialize)]
 pub struct ArchiveResult {
