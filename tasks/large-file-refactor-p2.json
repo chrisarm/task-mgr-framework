@@ -445,7 +445,7 @@
       "id": "REFACTOR-1-002",
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 18,
       "synergyWith": [
         "REFACTOR-1-001"
@@ -474,7 +474,7 @@
       "id": "LEARN-001",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 19,
       "synergyWith": [],
       "title": "Update Phase 3 tasks based on Phase 2 extraction learnings",
