@@ -1,4 +1,21 @@
 
+## 2026-03-03 - p4-refactor-LEARN-002
+- Final learnings summary for entire large file refactor (4 phases)
+- **Files extracted across all phases:** 15 new modules total
+  - P1 (Tier 1, 2600-4500L): 9 modules from engine.rs, prompt.rs, env.rs
+  - P2 (Tier 2, 1000-2300L): 4 modules from claude.rs, calibrate.rs (archive.rs SKIP)
+  - P3 (Tier 3, 780-860L): 1 module from signals.rs (oauth.rs, main.rs SKIP)
+  - P4 (Tier 4, 596-912L): 1 module from complete.rs (14 COHESIVE, 1 MONITOR, 1 DEPRECATED)
+- **Files skipped:** 18 total (0 + 1 + 2 + 15 across phases)
+- **Total line reduction:** engine.rs 4544→2546, prompt.rs 3753→2990, env.rs 2688→1631, plus smaller reductions in claude.rs, calibrate.rs, signals.rs, complete.rs
+- **Test count:** baseline 2262 → final 2271 (net +9 from new tests added during extractions)
+- Curated learnings written to tasks/long-term-learnings.md covering: extraction thresholds, visibility patterns, test movement, annotation preservation, PRD assumption corrections
+- Key finding: SKIP rate increases with decreasing file size (P1: 0%, P2: 20%, P3: 67%, P4: 88%)
+- Key finding: PRD assumptions were wrong for 6 files — always read before judging
+- Files changed: tasks/progress.txt, tasks/long-term-learnings.md (new)
+- **Learnings:** The most valuable refactoring output is not the extractions themselves but the documented patterns for future refactoring decisions.
+---
+
 ## 2026-03-03 - p4-refactor-LEARN-001
 - Reviewed ASSESS-014/015 findings and compared to REFACTOR-014 expectations
 - ASSESS-014 found 2 EXTRACT targets (complete.rs, curate/mod.rs) vs 1 expected pre-assessment
