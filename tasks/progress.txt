@@ -543,3 +543,26 @@
 - Completed dependencies: TEST-INIT-001/002, FEAT-001/002/003/004, CODE-REVIEW-1, REFACTOR-REVIEW-1, REFACTOR-1-001
 - **Learnings:** Structured acceptance criteria table makes milestone gates fast and thorough
 ---
+
+## 2026-03-03 - p1-refactor-TEST-INIT-001
+- **Baseline pre-extraction state verified**
+- cargo test: 2262 passed; 0 failed; 7 ignored (total across all test suites)
+- cargo clippy -- -D warnings: CLEAN (zero warnings)
+- cargo fmt --check: CLEAN
+- Module count: 23 pub mod declarations in src/loop_engine/mod.rs
+- Test function count in engine.rs: 105 fn test_ functions
+- Baseline line counts:
+  - src/loop_engine/engine.rs: 4544 lines
+  - src/loop_engine/prompt.rs: 3753 lines
+  - src/loop_engine/env.rs: 2688 lines
+  - Total: 10985 lines
+- Constants audit:
+  - engine.rs: MAX_CONSECUTIVE_REORDERS (line 52) — internal to engine.rs
+  - prompt.rs: TASK_CONTEXT_BUDGET (28), SOURCE_CONTEXT_BUDGET (31), TOTAL_PROMPT_BUDGET (35), BASE_PROMPT_BUDGET (38), LEARNINGS_BUDGET (41) — all internal to prompt.rs
+  - env.rs: no constants
+- #[allow] annotations audit:
+  - engine.rs:757: #[allow(unused_assignments)] — must be preserved when code at that line is extracted
+  - prompt.rs: none
+  - env.rs: none
+- **Learnings:** Baseline captured. All checks green. Ready for extractions.
+---
