@@ -124,7 +124,16 @@ pub fn defer_decision(conn: &Connection, id: i64) -> TaskMgrResult<()> {
 /// Map a rusqlite row to a `StoredKeyDecision`.
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredKeyDecision> {
     let options_json: String = row.get(6)?;
-    let options: Vec<KeyDecisionOption> = serde_json::from_str(&options_json).unwrap_or_default();
+    let options: Vec<KeyDecisionOption> = match serde_json::from_str(&options_json) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!(
+                "Warning: malformed options JSON in key_decisions row, defaulting to empty: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
 
     Ok(StoredKeyDecision {
         id: row.get(0)?,

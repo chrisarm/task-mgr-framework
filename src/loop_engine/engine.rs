@@ -1697,7 +1697,7 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
             if trimmed.len() == 1 {
                 let ch = trimmed.chars().next().unwrap();
                 if ch.is_ascii_alphabetic() {
-                    let idx = (ch as u8).wrapping_sub(b'a') as usize;
+                    let idx = (ch.to_ascii_lowercase() as u8).wrapping_sub(b'a') as usize;
                     if let Some(opt) = decision.options.get(idx) {
                         let resolution = format!("{}: {}", opt.label, opt.description);
                         if let Err(e) =
@@ -1720,7 +1720,7 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
     }
 }
 
-/// Install SIGINT and SIGTERM handlers that set the signal flag.
+/// Install SIGINT, SIGTERM, and SIGQUIT handlers that set the signal flag.
 ///
 /// Uses `signal-hook` to register OS-level signal handlers that set an
 /// `AtomicBool` directly from signal context — no async polling needed.
@@ -1733,14 +1733,17 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
 
     #[cfg(unix)]
     {
-        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::consts::{SIGINT, SIGQUIT, SIGTERM};
 
         // First signal sets the flag; second signal restores default (immediate kill)
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
         }
-        if let Err(e) = signal_hook::flag::register(SIGTERM, flag) {
+        if let Err(e) = signal_hook::flag::register(SIGTERM, flag.clone()) {
             eprintln!("Warning: failed to install SIGTERM handler: {}", e);
+        }
+        if let Err(e) = signal_hook::flag::register(SIGQUIT, flag) {
+            eprintln!("Warning: failed to install SIGQUIT handler: {}", e);
         }
     }
 
