@@ -199,46 +199,9 @@ pub fn show_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::create_schema;
-    use rusqlite::params;
+    use crate::loop_engine::test_utils::{insert_prd_metadata, insert_task, setup_test_db};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, rusqlite::Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = crate::db::open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_prd_metadata(
-        conn: &rusqlite::Connection,
-        project: &str,
-        branch: Option<&str>,
-        desc: Option<&str>,
-    ) {
-        conn.execute(
-            r#"INSERT OR REPLACE INTO prd_metadata (id, project, branch_name, description)
-               VALUES (1, ?, ?, ?)"#,
-            params![project, branch, desc],
-        )
-        .unwrap();
-    }
-
-    fn insert_task(
-        conn: &rusqlite::Connection,
-        id: &str,
-        title: &str,
-        status: &str,
-        priority: i64,
-    ) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
 
     // --- show_status tests ---
 
@@ -463,13 +426,6 @@ mod tests {
     #[test]
     fn test_show_status_prefix_filter_suppresses_prd_summaries() {
         let (_temp_dir, conn) = setup_test_db();
-        // Add columns that migrations would add (test DB uses base schema only)
-        conn.execute_batch(
-            "ALTER TABLE prd_metadata ADD COLUMN task_prefix TEXT;
-             ALTER TABLE prd_metadata ADD COLUMN external_git_repo TEXT;
-             ALTER TABLE prd_metadata ADD COLUMN default_model TEXT;",
-        )
-        .unwrap();
         insert_task(&conn, "abc123-FEAT-001", "A feat", "done", 10);
         insert_task(&conn, "def456-FEAT-001", "B feat", "todo", 10);
         drop(conn);

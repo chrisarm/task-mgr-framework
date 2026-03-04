@@ -47,6 +47,21 @@ pub fn insert_test_learning(conn: &Connection, title: &str) -> i64 {
     record_learning(conn, params).unwrap().learning_id
 }
 
+/// Insert prd_metadata into the test database.
+pub fn insert_prd_metadata(
+    conn: &Connection,
+    project: &str,
+    branch: Option<&str>,
+    desc: Option<&str>,
+) {
+    conn.execute(
+        r#"INSERT OR REPLACE INTO prd_metadata (id, project, branch_name, description)
+           VALUES (1, ?, ?, ?)"#,
+        params![project, branch, desc],
+    )
+    .unwrap();
+}
+
 /// Insert a task into the test database.
 pub fn insert_task(conn: &Connection, id: &str, title: &str, status: &str, priority: i32) {
     conn.execute(

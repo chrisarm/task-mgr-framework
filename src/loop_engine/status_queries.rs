@@ -272,47 +272,10 @@ pub(crate) fn format_remaining(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::create_schema;
-    use crate::db::open_connection;
-    use rusqlite::params;
+    use crate::loop_engine::test_utils::{insert_prd_metadata, insert_task, setup_test_db};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, rusqlite::Connection) {
-        let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
-        (temp_dir, conn)
-    }
-
-    fn insert_prd_metadata(
-        conn: &rusqlite::Connection,
-        project: &str,
-        branch: Option<&str>,
-        desc: Option<&str>,
-    ) {
-        conn.execute(
-            r#"INSERT OR REPLACE INTO prd_metadata (id, project, branch_name, description)
-               VALUES (1, ?, ?, ?)"#,
-            params![project, branch, desc],
-        )
-        .unwrap();
-    }
-
-    fn insert_task(
-        conn: &rusqlite::Connection,
-        id: &str,
-        title: &str,
-        status: &str,
-        priority: i64,
-    ) {
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, ?, ?)",
-            params![id, title, status, priority],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn test_query_project_info_no_metadata() {
