@@ -1,4 +1,20 @@
 
+## 2026-03-03 - p4-refactor-LEARN-001
+- Reviewed ASSESS-014/015 findings and compared to REFACTOR-014 expectations
+- ASSESS-014 found 2 EXTRACT targets (complete.rs, curate/mod.rs) vs 1 expected pre-assessment
+- REFACTOR-014 extracted dependency_checker.rs from complete.rs — done and reviewed
+- Two additional extraction candidates identified but NOT pursued:
+  1. test_validator.rs from complete.rs (check_required_tests_pass) — single function, tightly coupled to completion flow
+  2. dedup.rs from curate/mod.rs (LLM dedup orchestration) — would require careful test separation, marginal SRP benefit
+- Decision: document both as MONITOR, not add REFACTOR-014B/C tasks. Phase 4 is assessment-focused; these extractions have diminishing returns.
+- ASSESS-015: claude-loop.sh confirmed DEPRECATED as expected — no surprises
+- Reviews (CODE-REVIEW-1, REFACTOR-REVIEW-1): no issues found, extraction was clean
+- Updated LEARN-001 and MILESTONE-1 notes in task JSON
+- Files changed: tasks/large-file-refactor-p4.json, tasks/progress.txt
+- Test count: 2271 (unchanged — no code changes in this task)
+- **Learnings:** Assessment-heavy phases yield few extractions; EXPLICIT_SKIP / MONITOR rate increases as file sizes decrease (P1: 0/5 skips, P2: 1/5, P3: 2/3, P4: 15/17 no-action). The curate/mod.rs extraction is the strongest remaining candidate if future growth occurs.
+---
+
 ## 2026-03-03 - p4-refactor-CODE-REVIEW-1
 - Reviewed all Phase 4 assessments and the dependency_checker extraction
 - 17/17 Tier 4 files documented: 14 COHESIVE, 1 MONITOR, 2 EXTRACT
