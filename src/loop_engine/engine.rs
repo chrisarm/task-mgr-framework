@@ -1064,6 +1064,31 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 12.7: Display any deferred key decisions from previous sessions
+    match key_decisions_db::get_all_pending_decisions(&conn) {
+        Ok(decisions) if !decisions.is_empty() => {
+            eprintln!(
+                "\n\x1b[33m⚑ {} deferred key decision(s) from previous sessions:\x1b[0m",
+                decisions.len()
+            );
+            for d in &decisions {
+                let task_ctx = d
+                    .task_id
+                    .as_deref()
+                    .map(|t| format!(" [task: {}]", t))
+                    .unwrap_or_default();
+                eprintln!("  • {}{}", d.title, task_ctx);
+                eprintln!("    {}", d.description);
+            }
+            eprintln!();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Non-fatal: pre-v12 DB won't have this table
+            eprintln!("Note: could not query deferred key decisions: {}", e);
+        }
+    }
+
     // Step 13: Install signal handler
     let signal_flag = SignalFlag::new();
     setup_signal_handler(signal_flag.clone());

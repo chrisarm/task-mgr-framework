@@ -289,6 +289,14 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
+    let key_decision_section = build_key_decision_section(&task_output.id);
+    let key_decision_section = try_fit_section(
+        key_decision_section,
+        "Key Decision Instructions",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
     // ============================================================
     // Assembly: concatenate in display order
     // ============================================================
@@ -306,6 +314,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     prompt.push_str(&completion_section);
     prompt.push_str(&escalation_section);
     prompt.push_str(&reorder_instr_section);
+    prompt.push_str(&key_decision_section);
     prompt.push_str(&base_prompt_section);
 
     Ok(Some(PromptResult {
@@ -358,6 +367,41 @@ fn build_steering_section(steering_path: &Path) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Build the key-decision instruction section.
+///
+/// Explains the `<key-decision>` XML tag format to Claude. For tasks whose ID
+/// contains "REVIEW" or "VERIFY", adds extra emphasis on architectural alternatives.
+/// This is a trimmable (non-critical) section.
+fn build_key_decision_section(task_id: &str) -> String {
+    let is_review = task_id.contains("REVIEW") || task_id.contains("VERIFY");
+
+    let review_emphasis = if is_review {
+        "\n\nFor this task (code review / verification), **actively look for architectural \
+         alternatives** and flag any decision forks where a different approach would have \
+         significant long-term impact on maintainability, performance, or correctness.\n"
+    } else {
+        ""
+    };
+
+    format!(
+        "## Key Decision Points\n\n\
+         If you discover an important architectural decision during this task — a fork in \
+         the road where different choices have significant long-term consequences — emit a \
+         `<key-decision>` tag so it can be reviewed and stored for follow-up.\n\
+         {review_emphasis}\n\
+         **Format:**\n\
+         ```xml\n\
+         <key-decision>\n\
+           <title>Short descriptive title</title>\n\
+           <description>Why this decision matters and what the trade-offs are</description>\n\
+           <option><label>Option A</label><description>Trade-offs for A</description></option>\n\
+           <option><label>Option B</label><description>Trade-offs for B</description></option>\n\
+         </key-decision>\n\
+         ```\n\n\
+         Only emit this for genuine architectural forks. Skip trivial implementation details.\n\n"
+    )
 }
 
 /// Append steering.md content to the prompt if the file exists.
