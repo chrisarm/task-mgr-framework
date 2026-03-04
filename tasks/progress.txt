@@ -1,4 +1,13 @@
 
+## 2026-03-03 - p3-refactor-LEARN-002
+- Final pass on P4 tasks after complete Phase 3
+- Updated ASSESS-014 notes: added full P1-P3 extraction scorecard (5+4+1 extractions, 0+1+2 EXPLICIT_SKIPs), P4 baseline test count (2264)
+- Updated REFACTOR-014 notes: added P3 extraction size context (~70L prod + ~130L tests for guidance.rs), threshold guidance for EXPLICIT_SKIP on small prod code
+- P3 final outcomes: oauth.rs EXPLICIT_SKIP (197L prod/660L tests), main.rs EXPLICIT_SKIP (flat idiomatic match), signals.rs extracted guidance.rs (~70L prod)
+- EXPLICIT_SKIP rate trend: P1=0/5, P2=1/5, P3=2/3 — expect high skip rate in P4 Tier 4 files
+- **Learnings:** P4 tasks were already well-prepared from LEARN-001. Key addition: extraction scorecard across all phases gives P4 agent context on project-wide patterns.
+---
+
 ## 2026-03-03 - p3-refactor-LEARN-001
 - Updated P4 ASSESS-014 notes with P3 learnings: prod/test line split check, PRD assumption verification, EXPLICIT_SKIP as expected dominant outcome
 - Updated P4 REFACTOR-014 notes: added P3 learning about checking prod/test split before extracting
