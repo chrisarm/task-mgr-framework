@@ -1,4 +1,142 @@
 
+## 2026-03-03 - p4-refactor-ASSESS-014
+- Assessed all 17 Tier 4 files for SRP violations. Verdicts: 14 COHESIVE, 1 MONITOR, 2 EXTRACT.
+- Test count unchanged: 2264 passed (assessment only, no code changes)
+
+### complete.rs — EXTRACT
+- Lines: 912 / prod ~540 / test ~372
+- Responsibilities: task completion orchestration, dependency checking (get_unsatisfied_deps, are_dependencies_satisfied, check_dependencies_satisfied), test validation (check_required_tests_pass spawns `cargo test`), run tracking updates, text formatting
+- Rationale: Mixes 3+ distinct concerns — dependency validation and test-running are self-contained capabilities reusable outside completion flow. External callers: engine.rs calls complete(); are_dependencies_satisfied used in next-task selection.
+- Action: Extract dependency checking fns → `src/commands/dependency_checker.rs`; extract test runner fn → `src/commands/test_validator.rs`
+
+### curate/mod.rs — EXTRACT
+- Lines: 736 / prod ~480 / test ~256
+- Responsibilities: retirement candidate identification/archiving, unretirement restoration, enrichment candidate discovery, cluster merging with union aggregation, LLM-driven deduplication orchestration, reason building
+- Rationale: Mixes curation lifecycle (retire/unretire/enrich) with LLM orchestration (dedup). The dedup logic with external LLM calls is a separate concern from data lifecycle management.
+- Action: Extract dedup+merge functions → `src/commands/curate/dedup.rs`; keep retire/unretire/enrich in mod.rs
+
+### learnings.rs — COHESIVE
+- Lines: 731 / prod ~450 / test ~281
+- Responsibilities: learnings list query, filtering by retirement status, pagination, text formatting
+- Rationale: Single purpose — list active learnings with summary stats. Filtering and pagination are implementation details of that goal.
+- Action: No action needed
+
+### run.rs (commands) — COHESIVE
+- Lines: 724 / prod ~460 / test ~264
+- Responsibilities: run lifecycle (begin/update/end), row parsing, text formatting per lifecycle event
+- Rationale: All functions serve a single purpose: manage the run lifecycle state machine. No extraneous functionality.
+- Action: No action needed
+
+### review.rs — COHESIVE
+- Lines: 708 / prod ~420 / test ~288
+- Responsibilities: blocked/skipped task querying, bulk unblocking, individual task resolution, text formatting
+- Rationale: Core purpose is "review and resolve blocked/skipped tasks." All sub-concerns tightly coupled to that goal.
+- Action: No action needed
+
+### recall.rs — COHESIVE
+- Lines: 685 / prod ~420 / test ~265
+- Responsibilities: CLI parameter conversion, recall orchestration, result assembly, text formatting
+- Rationale: Single purpose — recall learnings and format output. Parameter conversion is a thin adapter layer.
+- Action: No action needed
+
+### batch.rs — MONITOR
+- Lines: 680 / prod ~410 / test ~270
+- Responsibilities: glob expansion/sorting, prompt file derivation/validation, worktree cleanup, sequential PRD execution and result aggregation, .stop signal checking
+- Rationale: Primary concern is "batch execute PRDs sequentially." Worktree cleanup is legitimate but could grow; monitor for complexity. No extraction warranted now.
+- Action: Monitor for growth — extract worktree cleanup if it grows beyond current ~50L scope
+
+### error.rs — COHESIVE
+- Lines: 661 / prod ~420 / test ~241
+- Responsibilities: error type definitions (TaskMgrError enum), error factory methods, path safety validation, Display trait formatting
+- Rationale: Module owns "error representation and construction." 661 lines of error definitions is expected in Rust — not a problem. Path validation is security context for a specific variant.
+- Action: No action needed
+
+### irrelevant.rs — COHESIVE
+- Lines: 640 / prod ~380 / test ~260
+- Responsibilities: single-task irrelevancy marking, bulk transaction coordination, run task tracking updates, text formatting
+- Rationale: Core purpose is "mark tasks as irrelevant with audit trail." Run task updates are implementation details, not a separate concern.
+- Action: No action needed
+
+### bandit.rs — COHESIVE
+- Lines: 636 / prod ~390 / test ~246
+- Responsibilities: confidence weighting, sliding window management, UCB score calculation, learning stats recording, learning ranking
+- Rationale: Pure UCB algorithm — all functions are tightly coupled algorithm components serving one purpose.
+- Action: No action needed
+
+### history.rs — COHESIVE
+- Lines: 635 / prod ~380 / test ~255
+- Responsibilities: run history querying, run detail querying, task stats aggregation, text formatting
+- Rationale: Core purpose is "display run history with task stats." All functions contribute to that single goal.
+- Action: No action needed
+
+### model.rs (loop_engine) — COHESIVE
+- Lines: 622 / prod ~370 / test ~252
+- Responsibilities: model tier classification, per-task model resolution, per-iteration model selection, model escalation
+- Rationale: 50 functions justified — all serve single purpose of "determine which Claude model to use." Pure decision logic, no I/O.
+- Action: No action needed
+
+### learning.rs (models) — COHESIVE
+- Lines: 616 / prod ~370 / test ~246
+- Responsibilities: LearningOutcome enum, Confidence enum, Learning struct+methods, optional JSON array parsing, row deserialization
+- Rationale: Module owns "the Learning domain model." Enums, parsing, and deserialization are inseparable from model definition.
+- Action: No action needed
+
+### stats.rs — COHESIVE
+- Lines: 611 / prod ~370 / test ~241
+- Responsibilities: task count aggregation, learning count aggregation, active run querying, run task completion stats, global iteration querying, result assembly, text formatting
+- Rationale: Single purpose — summarize project progress via aggregate statistics. Multiple query functions are sub-concerns of that goal.
+- Action: No action needed
+
+### run.rs (models) — COHESIVE
+- Lines: 608 / prod ~360 / test ~248
+- Responsibilities: RunStatus enum and transitions, Run struct and methods, row deserialization
+- Rationale: Module owns "the Run domain model." Status transitions and deserialization are required implementation details.
+- Action: No action needed
+
+### list.rs — COHESIVE
+- Lines: 606 / prod ~360 / test ~246
+- Responsibilities: task list querying, result filtering and assembly, text formatting
+- Rationale: Single purpose — list tasks with filters. Querying, filtering, and formatting are tightly coupled sub-concerns.
+- Action: No action needed
+
+### task.rs (models) — COHESIVE
+- Lines: 608 / prod ~360 / test ~248
+- Responsibilities: TaskStatus enum and transitions, Task struct and methods, row deserialization
+- Rationale: Module owns "the Task domain model." All code is essential to model definition.
+- Action: No action needed
+
+### claude-loop.sh — DEPRECATED
+- Lines: 556
+- Responsibilities: Claude Code loop entry point, configuration, max_iterations handling, PRD/prompt file setup
+- Rationale: Superseded by Rust loop engine. README.md:227 confirms "replaced the external claude-loop.sh script." docs/ARCHITECTURE.md:29 describes it as "original... 1,455 lines of bash."
+- Action: DEPRECATED — document in assessment; no removal unless explicitly requested
+
+### Summary Table
+
+| File | Lines | Prod | Test | Verdict |
+|------|-------|------|------|---------|
+| complete.rs | 912 | ~540 | ~372 | EXTRACT |
+| curate/mod.rs | 736 | ~480 | ~256 | EXTRACT |
+| learnings.rs | 731 | ~450 | ~281 | COHESIVE |
+| run.rs (cmds) | 724 | ~460 | ~264 | COHESIVE |
+| review.rs | 708 | ~420 | ~288 | COHESIVE |
+| recall.rs | 685 | ~420 | ~265 | COHESIVE |
+| batch.rs | 680 | ~410 | ~270 | MONITOR |
+| error.rs | 661 | ~420 | ~241 | COHESIVE |
+| irrelevant.rs | 640 | ~380 | ~260 | COHESIVE |
+| bandit.rs | 636 | ~390 | ~246 | COHESIVE |
+| history.rs | 635 | ~380 | ~255 | COHESIVE |
+| model.rs (engine) | 622 | ~370 | ~252 | COHESIVE |
+| learning.rs (models) | 616 | ~370 | ~246 | COHESIVE |
+| stats.rs | 611 | ~370 | ~241 | COHESIVE |
+| models/run.rs | 608 | ~360 | ~248 | COHESIVE |
+| list.rs | 606 | ~360 | ~246 | COHESIVE |
+| models/task.rs | 608 | ~360 | ~248 | COHESIVE |
+| claude-loop.sh | 556 | — | — | DEPRECATED |
+
+- **Learnings:** EXPLICIT_SKIP rate confirmed high as predicted (14/17 COHESIVE + 1 MONITOR). Only 2 files warrant extraction (complete.rs dependency checking + test running; curate/mod.rs LLM dedup). error.rs at 661L is NOT a problem — structural error definitions are idiomatic Rust.
+---
+
 ## 2026-03-03 - p4-refactor-TEST-INIT-001
 - P4 baseline verified: 2264 tests passed, 0 failed, 7 ignored (matches P3 final state)
 - cargo clippy -- -D warnings: zero warnings

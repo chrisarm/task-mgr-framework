@@ -1,11 +1,21 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "large-file-refactor",
-  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "Phase 4: Assess Tier 4 files (596-912 lines) for SRP violations and extract where warranted. Also assess claude-loop.sh status. Most files are expected to be 'no action needed' — this phase is primarily documentation and assessment with one likely extraction (complete.rs).",
-  "taskPrefix": "p4-refactor",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "Test count is identical before and after any extraction (run `cargo test 2>&1 | grep 'test result'`)",
+      "No breaking changes to existing public APIs — re-export if necessary",
+      "Every new module file has a //! module doc comment",
+      "EXPLICIT_SKIP decisions documented in tasks/progress.txt with rationale"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -22,32 +32,18 @@
       "Tests move with their tested functions — never orphan a test"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "Test count is identical before and after any extraction (run `cargo test 2>&1 | grep 'test result'`)",
-      "No breaking changes to existing public APIs — re-export if necessary",
-      "Every new module file has a //! module doc comment",
-      "EXPLICIT_SKIP decisions documented in tasks/progress.txt with rationale"
-    ]
-  },
+  "project": "task-mgr",
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "p4-refactor",
   "userStories": [
     {
-      "id": "TEST-INIT-001",
-      "title": "Baseline test count and verify post-Phase-3 state",
-      "description": "Capture baseline test count after Phase 3 and verify all checks pass.",
       "acceptanceCriteria": [
         "Run `cargo test 2>&1 | grep 'test result'` and record counts in progress.txt",
         "Run `cargo clippy -- -D warnings` and confirm zero warnings",
@@ -56,35 +52,37 @@
         "Verify Phase 3 modules exist (guidance.rs or documented EXPLICIT_SKIP)",
         "Record line count for scripts/claude-loop.sh"
       ],
-      "priority": 1,
-      "estimatedEffort": "low",
-      "passes": false,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Capture baseline test count after Phase 3 and verify all checks pass.",
       "edgeCases": [
         "Phase 3 may have left EXPLICIT_SKIP outcomes — document which extractions were skipped",
         "Some tests may be #[ignore] — count separately",
         "Line counts may differ from PRD estimates if earlier phases touched these files"
       ],
-      "invariants": [
-        "Total test count must not decrease after any extraction",
-        "Zero clippy warnings maintained throughout"
-      ],
+      "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Phase 3 left broken state",
           "expectedBehavior": "Document in progress.txt, proceed only if cargo test passes"
         }
       ],
-      "touchesFiles": ["tasks/progress.txt"],
-      "dependsOn": [],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Total test count must not decrease after any extraction",
+        "Zero clippy warnings maintained throughout"
+      ],
+      "modifiesBehavior": false,
+      "passes": true,
+      "priority": 1,
       "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Baseline test count and verify post-Phase-3 state",
+      "touchesFiles": [
+        "tasks/progress.txt"
+      ]
     },
     {
-      "id": "ASSESS-014",
-      "title": "Assess all Tier 4 files for SRP violations",
-      "description": "Systematically read each Tier 4 file, document its responsibilities, and determine whether extraction is warranted. For each file: (1) count production vs test lines, (2) list distinct responsibilities, (3) judge SRP compliance, (4) document 'no action needed' or identify specific extraction targets. Expected outcome: most files are cohesive for their scope; complete.rs (912L) and possibly model.rs (622L, 50 functions) are the main candidates.",
       "acceptanceCriteria": [
         "Each of the 17 Tier 4 files has a documented assessment in progress.txt",
         "Assessment format per file: file path, line count (prod/test split), responsibilities listed, SRP verdict (COHESIVE / EXTRACT / MONITOR), rationale",
@@ -93,28 +91,40 @@
         "Assessment specifically addresses: complete.rs (dependency checking + test running mixed with completion), model.rs (50 functions — justified?), error.rs (structural — is 661 lines of error definitions a problem?)",
         "Summary table of all 17 files with verdicts appended to progress.txt"
       ],
-      "priority": 6,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "This is the core Phase 4 deliverable. P3 learnings to apply: (1) Always check prod vs test line split — oauth.rs was 857L but only ~197L production; high test ratios mean the file is NOT complex, just well-tested. (2) PRD assumptions about file contents can be wrong — read before judging. (3) EXPLICIT_SKIP was the dominant P3 outcome (2/3 files) — expect similar for P4 command files with high test ratios. Exploration suggests: complete.rs has HIGH SRP violations (dependency checking, test running, completion logic, run tracking all mixed). model.rs has 50 functions but may be cohesive (model resolution is a single domain). error.rs is structural (error enum + constructors — expected in Rust). Most command files (learnings, review, recall, history, stats, list) are single-command handlers with high test ratios — likely cohesive. bandit.rs is a pure algorithm. batch.rs is well-scoped. Model files (learning.rs, run.rs, task.rs) are entity definitions with DB parsing. Full P1-P3 extraction scorecard: P1 extracted 5 modules from engine.rs (git_reconcile, output_parsing, prd_reconcile, prompt_sections, worktree), P2 extracted 4 modules (watchdog, status_queries, status_display, calibrate_math) + 1 EXPLICIT_SKIP (detection.rs), P3 extracted 1 module (guidance from signals.rs) + 2 EXPLICIT_SKIPs (oauth.rs, main.rs). EXPLICIT_SKIP rate increased each phase (0/5 → 1/5 → 2/3) as files got smaller. P4 baseline test count: 2264 passed.",
-      "qualityDimensions": {
-        "correctness": ["Each file actually read before judging — no assumptions from line count alone", "All external callers identified for any extraction candidates"],
-        "performance": ["No runtime impact — this is assessment only"],
-        "style": ["Assessment documented clearly and concisely in progress.txt", "Verdicts are actionable: COHESIVE (no action), EXTRACT (with specific plan), MONITOR (watch for growth)"]
-      },
-      "touchesFiles": [
-        "tasks/progress.txt"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["ASSESS-015"],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Systematically read each Tier 4 file, document its responsibilities, and determine whether extraction is warranted. For each file: (1) count production vs test lines, (2) list distinct responsibilities, (3) judge SRP compliance, (4) document 'no action needed' or identify specific extraction targets. Expected outcome: most files are cohesive for their scope; complete.rs (912L) and possibly model.rs (622L, 50 functions) are the main candidates.",
+      "estimatedEffort": "medium",
+      "id": "ASSESS-014",
+      "modifiesBehavior": false,
+      "notes": "This is the core Phase 4 deliverable. P3 learnings to apply: (1) Always check prod vs test line split — oauth.rs was 857L but only ~197L production; high test ratios mean the file is NOT complex, just well-tested. (2) PRD assumptions about file contents can be wrong — read before judging. (3) EXPLICIT_SKIP was the dominant P3 outcome (2/3 files) — expect similar for P4 command files with high test ratios. Exploration suggests: complete.rs has HIGH SRP violations (dependency checking, test running, completion logic, run tracking all mixed). model.rs has 50 functions but may be cohesive (model resolution is a single domain). error.rs is structural (error enum + constructors — expected in Rust). Most command files (learnings, review, recall, history, stats, list) are single-command handlers with high test ratios — likely cohesive. bandit.rs is a pure algorithm. batch.rs is well-scoped. Model files (learning.rs, run.rs, task.rs) are entity definitions with DB parsing. Full P1-P3 extraction scorecard: P1 extracted 5 modules from engine.rs (git_reconcile, output_parsing, prd_reconcile, prompt_sections, worktree), P2 extracted 4 modules (watchdog, status_queries, status_display, calibrate_math) + 1 EXPLICIT_SKIP (detection.rs), P3 extracted 1 module (guidance from signals.rs) + 2 EXPLICIT_SKIPs (oauth.rs, main.rs). EXPLICIT_SKIP rate increased each phase (0/5 → 1/5 → 2/3) as files got smaller. P4 baseline test count: 2264 passed.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "Each file actually read before judging — no assumptions from line count alone",
+          "All external callers identified for any extraction candidates"
+        ],
+        "performance": [
+          "No runtime impact — this is assessment only"
+        ],
+        "style": [
+          "Assessment documented clearly and concisely in progress.txt",
+          "Verdicts are actionable: COHESIVE (no action), EXTRACT (with specific plan), MONITOR (watch for growth)"
+        ]
+      },
+      "synergyWith": [
+        "ASSESS-015"
+      ],
+      "title": "Assess all Tier 4 files for SRP violations",
+      "touchesFiles": [
+        "tasks/progress.txt"
+      ]
     },
     {
-      "id": "ASSESS-015",
-      "title": "Assess claude-loop.sh status and deprecate if unused",
-      "description": "Determine if scripts/claude-loop.sh is still actively used or has been superseded by the Rust loop engine. Search for references in: README, docs/, CI configs, Makefile, other scripts, src/ code. If superseded: add a deprecation comment header. If still used: document in which scenarios.",
       "acceptanceCriteria": [
         "Grep results for 'claude-loop' across entire repo documented in progress.txt",
         "Usage verdict: ACTIVE (document scenarios) or DEPRECATED (add comment header)",
@@ -122,29 +132,39 @@
         "If deprecated: note in progress.txt which docs reference it and whether doc updates are needed (but do NOT update docs in this task)",
         "cargo test still passes (script changes don't affect Rust tests)"
       ],
-      "priority": 7,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Determine if scripts/claude-loop.sh is still actively used or has been superseded by the Rust loop engine. Search for references in: README, docs/, CI configs, Makefile, other scripts, src/ code. If superseded: add a deprecation comment header. If still used: document in which scenarios.",
       "estimatedEffort": "low",
-      "passes": false,
+      "id": "ASSESS-015",
+      "modifiesBehavior": false,
       "notes": "Exploration found: README.md says it 'replaced the external claude-loop.sh script'. docs/INTEGRATION.md has a 'Reference Implementation' section. docs/ARCHITECTURE.md describes it as 'original... 1,455 lines of bash' (now 556 lines). This is very likely DEPRECATED. The agent should verify and mark accordingly.",
+      "passes": false,
+      "priority": 7,
       "qualityDimensions": {
-        "correctness": ["All references found — grep for 'claude-loop', 'claude_loop', 'loop.sh'"],
-        "performance": ["No runtime impact"],
-        "style": ["Deprecation comment is clear and explains what replaces it"]
+        "correctness": [
+          "All references found — grep for 'claude-loop', 'claude_loop', 'loop.sh'"
+        ],
+        "performance": [
+          "No runtime impact"
+        ],
+        "style": [
+          "Deprecation comment is clear and explains what replaces it"
+        ]
       },
+      "synergyWith": [
+        "ASSESS-014"
+      ],
+      "title": "Assess claude-loop.sh status and deprecate if unused",
       "touchesFiles": [
         "scripts/claude-loop.sh",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["ASSESS-014"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-014",
-      "title": "Extract from complete.rs if assessment warrants",
-      "description": "If ASSESS-014 confirmed complete.rs has extractable responsibilities, perform the extraction. Likely candidates: dependency validation (get_unsatisfied_deps, check_dependencies_satisfied, are_dependencies_satisfied) → dependency_checker.rs. If assessment says 'no action needed', output EXPLICIT_SKIP.",
       "acceptanceCriteria": [
         "Either: identified functions extracted to new module, complete.rs imports them, mod.rs updated, external callers updated, tests moved",
         "Or: EXPLICIT_SKIP documented in progress.txt — assessment found no clean extraction boundary despite multiple concerns",
@@ -153,30 +173,41 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 8,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "ASSESS-014"
+      ],
+      "description": "If ASSESS-014 confirmed complete.rs has extractable responsibilities, perform the extraction. Likely candidates: dependency validation (get_unsatisfied_deps, check_dependencies_satisfied, are_dependencies_satisfied) → dependency_checker.rs. If assessment says 'no action needed', output EXPLICIT_SKIP.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-014",
+      "modifiesBehavior": false,
       "notes": "This task depends on ASSESS-014's findings. complete.rs (912L) has the highest line count in Tier 4 and exploration found multiple concerns: completion logic, dependency validation, test execution, run tracking. The dependency validation functions (get_unsatisfied_deps, check_dependencies_satisfied, are_dependencies_satisfied) are called from engine.rs and other command files — they form a natural extraction unit. However, the agent should verify this from the ASSESS-014 output before proceeding. P3 learning: check prod/test split first — if complete.rs is mostly tests like oauth.rs was, extraction may not be warranted despite high line count. P3 final note: even when extraction is warranted, the actual extraction (guidance.rs) was ~70 lines of production code + ~130 lines of tests — very small. If complete.rs prod/test split shows <300L production, EXPLICIT_SKIP is likely correct.",
+      "passes": false,
+      "priority": 8,
       "qualityDimensions": {
-        "correctness": ["Test count identical before and after", "All external callers compile with updated imports"],
-        "performance": ["No runtime impact"],
-        "style": ["pub(crate) for extracted functions", "//! module doc comment", "Alphabetical mod declaration if new module created"]
+        "correctness": [
+          "Test count identical before and after",
+          "All external callers compile with updated imports"
+        ],
+        "performance": [
+          "No runtime impact"
+        ],
+        "style": [
+          "pub(crate) for extracted functions",
+          "//! module doc comment",
+          "Alphabetical mod declaration if new module created"
+        ]
       },
+      "synergyWith": [],
+      "title": "Extract from complete.rs if assessment warrants",
       "touchesFiles": [
         "src/commands/complete.rs",
         "src/commands/mod.rs",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["ASSESS-014"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review Phase 4 assessments and any extractions",
-      "description": "Review assessment quality and any extraction for correctness.",
       "acceptanceCriteria": [
         "All 17 Tier 4 files have documented assessments",
         "Assessment verdicts are justified (not just 'looks fine')",
@@ -186,46 +217,52 @@
         "Test count matches baseline",
         "Any issues found have CODE-FIX-xxx tasks added to JSON"
       ],
-      "priority": 13,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "ASSESS-014",
+        "ASSESS-015",
+        "REFACTOR-014"
+      ],
+      "description": "Review assessment quality and any extraction for correctness.",
       "estimatedEffort": "low",
+      "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "Phase 4 is mostly assessment — review focuses on documentation quality and completeness, plus any extraction correctness.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review Phase 4 assessments and any extractions",
       "touchesFiles": [
         "tasks/progress.txt",
         "src/commands/complete.rs"
-      ],
-      "dependsOn": ["ASSESS-014", "ASSESS-015", "REFACTOR-014"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-1",
-      "title": "Review Phase 4 for refactoring opportunities",
-      "description": "Check any extracted code for DRY violations, consistency with Phases 1-3 patterns.",
       "acceptanceCriteria": [
         "Extraction patterns consistent with earlier phases (if any extraction was done)",
         "Assessment documentation is clear and actionable",
         "Any issues have REFACTOR-1-xxx tasks added to JSON"
       ],
-      "priority": 17,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "Lightweight review — Phase 4 is mostly documentation. If no extraction was done, verify skip decisions and mark complete.",
-      "touchesFiles": [],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Check any extracted code for DRY violations, consistency with Phases 1-3 patterns.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Lightweight review — Phase 4 is mostly documentation. If no extraction was done, verify skip decisions and mark complete.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review Phase 4 for refactoring opportunities",
+      "touchesFiles": []
     },
     {
-      "id": "LEARN-001",
-      "title": "Update remaining Phase 4 tasks based on assessment learnings",
-      "description": "Review assessment findings from ASSESS-014 and ASSESS-015. Update REFACTOR-014 if assessment revealed different extraction targets than expected. Update remaining P4 tasks (reviews, milestones) based on scope of actual changes.",
       "acceptanceCriteria": [
         "Read ASSESS-014 findings from progress.txt",
         "Update REFACTOR-014 notes/AC if assessment findings differ from expectations",
@@ -233,24 +270,27 @@
         "Document updates in progress.txt",
         "Commit: 'chore: LEARN-001 - Update P4 tasks with assessment learnings'"
       ],
-      "priority": 19,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Review assessment findings from ASSESS-014 and ASSESS-015. Update REFACTOR-014 if assessment revealed different extraction targets than expected. Update remaining P4 tasks (reviews, milestones) based on scope of actual changes.",
       "estimatedEffort": "low",
+      "id": "LEARN-001",
       "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
       "passes": false,
+      "priority": 19,
+      "synergyWith": [],
+      "title": "Update remaining Phase 4 tasks based on assessment learnings",
       "touchesFiles": [
         "tasks/large-file-refactor-p4.json",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-1",
-      "title": "Phase 4 complete — all Tier 4 assessments done",
-      "description": "Gate: all assessments complete, any extractions done, reviewed.",
       "acceptanceCriteria": [
         "ASSESS-014 passes: all 17 files assessed with verdicts",
         "ASSESS-015 passes: claude-loop.sh status resolved",
@@ -261,22 +301,30 @@
         "cargo clippy -- -D warnings passes",
         "cargo fmt --check passes"
       ],
-      "priority": 20,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "ASSESS-014", "ASSESS-015", "REFACTOR-014", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "LEARN-001"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001",
+        "ASSESS-014",
+        "ASSESS-015",
+        "REFACTOR-014",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1",
+        "LEARN-001"
+      ],
+      "description": "Gate: all assessments complete, any extractions done, reviewed.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 4 complete — all Tier 4 assessments done",
+      "touchesFiles": []
     },
     {
-      "id": "VERIFY-001",
-      "title": "Final verification — all checks pass",
-      "description": "Run complete verification suite.",
       "acceptanceCriteria": [
         "cargo build succeeds",
         "cargo test passes — count matches baseline",
@@ -284,22 +332,24 @@
         "cargo fmt --check passes",
         "All assessment documentation is in progress.txt"
       ],
-      "priority": 90,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Run complete verification suite.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": []
     },
     {
-      "id": "LEARN-002",
-      "title": "Final learnings summary for entire large file refactor",
-      "description": "With all 4 phases complete, produce a final summary of learnings across the entire refactor. Document: which extraction patterns worked best, which files benefited most, which EXPLICIT_SKIPs were correct in hindsight, and recommendations for future refactoring. Update tasks/long-term-learnings.md with curated patterns.",
       "acceptanceCriteria": [
         "Summary of all 4 phases written to progress.txt: files extracted, files skipped, total line reduction",
         "Curated learnings added to tasks/long-term-learnings.md under a 'Large File Refactoring' section",
@@ -307,41 +357,50 @@
         "Document: which PRD assumptions were wrong and what exploration revealed instead",
         "Commit: 'chore: LEARN-002 - Final refactor learnings summary'"
       ],
-      "priority": 97,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "With all 4 phases complete, produce a final summary of learnings across the entire refactor. Document: which extraction patterns worked best, which files benefited most, which EXPLICIT_SKIPs were correct in hindsight, and recommendations for future refactoring. Update tasks/long-term-learnings.md with curated patterns.",
       "estimatedEffort": "low",
+      "id": "LEARN-002",
       "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
       "passes": false,
+      "priority": 97,
+      "synergyWith": [],
+      "title": "Final learnings summary for entire large file refactor",
       "touchesFiles": [
         "tasks/progress.txt",
         "tasks/long-term-learnings.md"
-      ],
-      "dependsOn": ["VERIFY-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-FINAL",
-      "title": "Phase 4 Large File Refactor — ready for merge",
-      "description": "All Phase 4 assessments complete, verified. Branch ready for merge.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "All tasks have passes: true",
         "Branch is clean — no uncommitted changes",
         "All 4 phases of large file refactor complete on this branch"
       ],
-      "priority": 99,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["VERIFY-001", "LEARN-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "VERIFY-001",
+        "LEARN-002"
+      ],
+      "description": "All Phase 4 assessments complete, verified. Branch ready for merge.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 4 Large File Refactor — ready for merge",
+      "touchesFiles": []
     }
-  ]
+  ],
+  "version": "1.0"
 }
