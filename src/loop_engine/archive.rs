@@ -74,13 +74,14 @@ pub struct ArchivedItem {
 
 /// Run the archive command.
 ///
-/// Scans the DB for fully-completed PRDs (all tasks done), moves their
-/// associated files to `tasks/archive/YYYY-MM-DD-<branch>/`, and extracts
-/// learnings from `progress.txt` into `tasks/learnings.md`.
+/// Iterates all PRDs in prd_metadata. For each: skips PRDs with NULL
+/// task_prefix or incomplete tasks; archives completed PRDs by moving their
+/// files to `tasks/archive/YYYY-MM-DD-<branch>/` and clearing DB data.
+/// Extracts learnings from `progress.txt` once after all PRDs are processed
+/// (only when at least one PRD was archived). Never moves `progress.txt`.
 pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     let mut conn = open_connection(dir)?;
 
-    // Get all PRDs from prd_metadata
     let all_prds = query_all_prds(&conn)?;
     if all_prds.is_empty() {
         return Ok(ArchiveResult {
@@ -93,136 +94,159 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
             prds_skipped: Vec::new(),
         });
     }
-    // For now, use the first PRD for single-PRD archive behaviour
-    let info = &all_prds[0];
-
-    // Check if PRD is fully completed (scoped to its task prefix)
-    let prefix = info.task_prefix.as_deref().unwrap_or("");
-    if !is_prd_completed_by_prefix(&conn, prefix)? {
-        return Ok(ArchiveResult {
-            archived: Vec::new(),
-            learnings_extracted: 0,
-            tasks_cleared: 0,
-            dry_run,
-            message: format!(
-                "PRD '{}' is not fully completed. Only completed PRDs can be archived.",
-                info.project
-            ),
-            prds_archived: Vec::new(),
-            prds_skipped: vec![PrdSkipReason {
-                prd_id: info.id,
-                project: info.project.clone(),
-                reason: "Not fully completed".to_string(),
-            }],
-        });
-    }
-
-    // Derive archive folder name from branch
-    let branch_slug = strip_branch_prefix(&info.branch.clone().unwrap_or_default());
-    let date_str = Local::now().format("%Y-%m-%d").to_string();
-    let archive_folder_name = if branch_slug.is_empty() {
-        date_str.clone()
-    } else {
-        format!("{}-{}", date_str, branch_slug)
-    };
 
     let tasks_dir = dir.join("tasks");
-    let archive_dir = tasks_dir.join("archive").join(&archive_folder_name);
+    let date_str = Local::now().format("%Y-%m-%d").to_string();
 
-    // Extract learnings from progress.txt BEFORE moving files
-    let progress_path = tasks_dir.join("progress.txt");
-    let learnings_count = if progress_path.exists() {
-        let learnings = extract_learnings_from_progress(&progress_path)?;
-        if !learnings.is_empty() && !dry_run {
-            append_learnings_to_file(&tasks_dir.join("learnings.md"), &learnings)?;
+    let mut archived_items: Vec<ArchivedItem> = Vec::new();
+    let mut prds_archived: Vec<PrdArchiveSummary> = Vec::new();
+    let mut prds_skipped: Vec<PrdSkipReason> = Vec::new();
+    let mut total_tasks_cleared: usize = 0;
+
+    for prd in &all_prds {
+        // Skip PRDs with NULL task_prefix — cannot scope by prefix
+        let prefix = match prd.task_prefix.as_deref() {
+            None => {
+                prds_skipped.push(PrdSkipReason {
+                    prd_id: prd.id,
+                    project: prd.project.clone(),
+                    reason: "No task prefix — cannot determine completion".to_string(),
+                });
+                continue;
+            }
+            Some(p) => p,
+        };
+
+        // Skip incomplete PRDs
+        if !is_prd_completed_by_prefix(&conn, prefix)? {
+            prds_skipped.push(PrdSkipReason {
+                prd_id: prd.id,
+                project: prd.project.clone(),
+                reason: "Not fully completed".to_string(),
+            });
+            continue;
         }
-        learnings.len()
+
+        // Derive per-PRD archive folder from the PRD's own branch name
+        let branch_slug = strip_branch_prefix(&prd.branch.clone().unwrap_or_default());
+        let archive_folder_name = if branch_slug.is_empty() {
+            date_str.clone()
+        } else {
+            format!("{}-{}", date_str, branch_slug)
+        };
+        let archive_dir = tasks_dir.join("archive").join(&archive_folder_name);
+
+        // Discover files for this PRD (progress.txt is handled separately, never moved)
+        let files_to_archive = discover_archivable_files(&conn, &tasks_dir, prd.id, &prd.project)?;
+
+        let mut prd_items: Vec<ArchivedItem> = Vec::new();
+        for source in &files_to_archive {
+            let file_name = source
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Never move progress.txt
+            if file_name == "progress.txt" {
+                continue;
+            }
+
+            let dest = archive_dir.join(&file_name);
+            prd_items.push(ArchivedItem {
+                source: source
+                    .strip_prefix(&tasks_dir)
+                    .unwrap_or(source)
+                    .display()
+                    .to_string(),
+                destination: format!("archive/{}/{}", archive_folder_name, file_name),
+            });
+
+            if !dry_run {
+                fs::create_dir_all(&archive_dir).map_err(|e| {
+                    crate::TaskMgrError::io_error(
+                        archive_dir.display().to_string(),
+                        "creating archive directory",
+                        e,
+                    )
+                })?;
+                fs::rename(source, &dest).map_err(|e| {
+                    crate::TaskMgrError::io_error(
+                        source.display().to_string(),
+                        "moving file to archive",
+                        e,
+                    )
+                })?;
+            }
+        }
+
+        // Count tasks scoped to this prefix before clearing
+        let like_pattern = make_like_pattern(prefix);
+        let task_count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                rusqlite::params![like_pattern],
+                |row| row.get(0),
+            )
+            .map_err(crate::TaskMgrError::DatabaseError)?;
+
+        if !dry_run && !prd_items.is_empty() {
+            clear_prd_data(&mut conn, prd.id, prefix)?;
+        }
+
+        prds_archived.push(PrdArchiveSummary {
+            prd_id: prd.id,
+            project: prd.project.clone(),
+            task_prefix: prefix.to_string(),
+            archive_folder: archive_folder_name,
+            files_archived: prd_items.len(),
+            tasks_cleared: task_count,
+        });
+        total_tasks_cleared += task_count;
+        archived_items.extend(prd_items);
+    }
+
+    // Extract learnings once, only when at least one PRD was archived
+    let learnings_count = if !prds_archived.is_empty() {
+        let progress_path = tasks_dir.join("progress.txt");
+        if progress_path.exists() {
+            let learnings = extract_learnings_from_progress(&progress_path)?;
+            if !learnings.is_empty() && !dry_run {
+                append_learnings_to_file(&tasks_dir.join("learnings.md"), &learnings)?;
+            }
+            learnings.len()
+        } else {
+            0
+        }
     } else {
         0
     };
 
-    // Discover files to archive (prefer prd_files table, fall back to project name)
-    let files_to_archive = discover_archivable_files(&conn, &tasks_dir, info.id, &info.project)?;
-
-    let mut archived_items = Vec::new();
-    for source in &files_to_archive {
-        let file_name = source
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let dest = archive_dir.join(&file_name);
-
-        archived_items.push(ArchivedItem {
-            source: source
-                .strip_prefix(&tasks_dir)
-                .unwrap_or(source)
-                .display()
-                .to_string(),
-            destination: format!("archive/{}/{}", archive_folder_name, file_name),
-        });
-
-        if !dry_run {
-            fs::create_dir_all(&archive_dir).map_err(|e| {
-                crate::TaskMgrError::io_error(
-                    archive_dir.display().to_string(),
-                    "creating archive directory",
-                    e,
-                )
-            })?;
-
-            fs::rename(source, &dest).map_err(|e| {
-                crate::TaskMgrError::io_error(
-                    source.display().to_string(),
-                    "moving file to archive",
-                    e,
-                )
-            })?;
-        }
-    }
-
-    // Count tasks before clearing (for reporting)
-    let task_count: usize = conn
-        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    // Clear task data from DB after archiving files (preserving learnings)
-    if !dry_run && !archived_items.is_empty() {
-        clear_prd_data(&mut conn, info.id, prefix)?;
-    }
-
-    let action = if dry_run { "Would archive" } else { "Archived" };
-    let clear_action = if dry_run { "Would clear" } else { "Cleared" };
-    let message = if archived_items.is_empty() {
-        format!("No archivable files found for project '{}'.", info.project)
-    } else {
+    let message = if prds_archived.is_empty() {
+        // Keep "not fully completed" wording for backward-compatible messaging
         format!(
-            "{} {} file(s) to archive/{}. {} learning(s) extracted. {} {} task(s) from database.",
-            action,
-            archived_items.len(),
-            archive_folder_name,
-            learnings_count,
-            clear_action,
-            task_count
+            "{} PRD(s) not fully completed. Nothing archived.",
+            prds_skipped.len()
         )
-    };
-
-    let prd_summary = PrdArchiveSummary {
-        prd_id: info.id,
-        project: info.project.clone(),
-        task_prefix: prefix.to_string(),
-        archive_folder: archive_folder_name,
-        files_archived: archived_items.len(),
-        tasks_cleared: task_count,
+    } else {
+        let action = if dry_run { "Would archive" } else { "Archived" };
+        format!(
+            "{} {} PRD(s), {} file(s). {} learning(s) extracted. Cleared {} task(s) from database.",
+            action,
+            prds_archived.len(),
+            archived_items.len(),
+            learnings_count,
+            total_tasks_cleared,
+        )
     };
 
     Ok(ArchiveResult {
         archived: archived_items,
         learnings_extracted: learnings_count,
-        tasks_cleared: task_count,
+        tasks_cleared: total_tasks_cleared,
         dry_run,
         message,
-        prds_archived: vec![prd_summary],
-        prds_skipped: Vec::new(),
+        prds_archived,
+        prds_skipped,
     })
 }
 
