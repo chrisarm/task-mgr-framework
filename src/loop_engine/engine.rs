@@ -940,6 +940,56 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         run_config.source_root.clone()
     };
 
+    // Step 8.4: Ensure task files exist in the worktree.
+    // If using a worktree, copy PRD JSON, prompt, and PRD markdown from source_root
+    // if they don't already exist in the worktree.
+    if working_root != run_config.source_root {
+        let canonical_source = run_config
+            .source_root
+            .canonicalize()
+            .unwrap_or_else(|_| run_config.source_root.clone());
+
+        let copy_if_missing = |src: &Path| {
+            if let Ok(rel) = src.strip_prefix(&canonical_source) {
+                let dest = working_root.join(rel);
+                if !dest.exists() && src.exists() {
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::copy(src, &dest) {
+                        eprintln!(
+                            "Warning: failed to copy {} to worktree: {}",
+                            rel.display(),
+                            e
+                        );
+                    } else {
+                        eprintln!("Copied {} to worktree", rel.display());
+                    }
+                }
+            }
+        };
+
+        // PRD JSON (task list)
+        copy_if_missing(&paths.prd_file);
+
+        // Prompt file
+        copy_if_missing(&paths.prompt_file);
+
+        // PRD markdown (from prdFile field in JSON, if present)
+        if let Ok(content) = std::fs::read_to_string(&paths.prd_file) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str()) {
+                    let prd_md_path = paths
+                        .prd_file
+                        .parent()
+                        .unwrap_or(&paths.prd_file)
+                        .join(prd_md);
+                    copy_if_missing(&prd_md_path);
+                }
+            }
+        }
+    }
+
     // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
     // Claude edits the worktree copy, so hash checks and re-imports must use that path.
     // paths.prd_file is canonicalized by resolve_paths(); canonicalize source_root too
