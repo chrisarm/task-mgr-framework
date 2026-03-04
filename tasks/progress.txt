@@ -1,4 +1,14 @@
 
+## 2026-03-03 - p3-refactor-REFACTOR-011
+- EXPLICIT_SKIP: oauth.rs production code is ~197 lines (7 functions). Splitting ~100L storage from ~100L refresh creates two tiny modules with no meaningful maintainability gain.
+- Verified: PRD's assumed browser/PKCE/callback server code does not exist in oauth.rs.
+- Production functions: credentials_path, read_credentials, write_credentials_atomic, is_token_expiring, refresh_token, ensure_valid_token, sanitize_oauth_error.
+- ~660 of 857 lines are tests — file size is not a complexity problem.
+- Test count: before=2264, after=2264 (no changes made)
+- cargo clippy -- -D warnings: zero warnings (no changes made)
+- **Learnings:** When a large file's bulk is tests, not production code, EXPLICIT_SKIP avoids artificial module fragmentation.
+---
+
 ## 2026-03-03 - p3-refactor-TEST-INIT-001
 - P3 baseline verified: 2264 tests passed, 0 failed, 7 ignored
 - cargo clippy -- -D warnings: zero warnings

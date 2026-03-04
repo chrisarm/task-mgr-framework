@@ -1,11 +1,20 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "large-file-refactor",
-  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "Phase 3: Decompose Tier 3 files (oauth.rs 857L, main.rs 836L, signals.rs 781L). Continues on the same branch. Note: exploration revealed US-009 and US-010 are smaller than PRD anticipated — oauth.rs has no browser/PKCE/server code, and main.rs has no centralized DB setup block. P2 completion verified: all 5 Tier 2 extractions done (watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, archive_display.rs; detection.rs EXPLICIT_SKIP with section markers). P2 final test count: 2264 passed.",
-  "taskPrefix": "p3-refactor",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "Test count is identical before and after extraction (run `cargo test 2>&1 | grep 'test result'`)",
+      "No breaking changes to existing public APIs — re-export if necessary",
+      "Every new module file has a //! module doc comment"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -22,31 +31,18 @@
       "Use pub(crate) for internal APIs, pub only for cross-crate visibility"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "Test count is identical before and after extraction (run `cargo test 2>&1 | grep 'test result'`)",
-      "No breaking changes to existing public APIs — re-export if necessary",
-      "Every new module file has a //! module doc comment"
-    ]
-  },
+  "project": "task-mgr",
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "p3-refactor",
   "userStories": [
     {
-      "id": "TEST-INIT-001",
-      "title": "Baseline test count and verify post-Phase-2 state",
-      "description": "Capture baseline test count after Phase 2 and verify all checks pass.",
       "acceptanceCriteria": [
         "Run `cargo test 2>&1 | grep 'test result'` and record counts in progress.txt",
         "Run `cargo clippy -- -D warnings` and confirm zero warnings",
@@ -54,51 +50,71 @@
         "Record baseline line counts: `wc -l src/loop_engine/oauth.rs src/main.rs src/loop_engine/signals.rs`",
         "Verify Phase 2 modules exist (watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs)"
       ],
-      "priority": 1,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "P2 final baseline: 2264 tests passed, 0 failed, 7 ignored. P2 added watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, archive_display.rs. detection.rs was reorganized in-place (EXPLICIT_SKIP). Verify all P2 modules exist before starting P3 extractions. P2 test count went 2262→2264 (2 new tests added in status modules).",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Capture baseline test count after Phase 2 and verify all checks pass.",
       "edgeCases": [
         "Phase 2 may not be fully complete — document which modules exist",
         "Some tests may be #[ignore] — count separately",
         "P2 added 2 tests (status modules) — baseline is 2264 not 2262"
       ],
-      "invariants": [
-        "Total test count must not decrease after any extraction",
-        "Zero clippy warnings maintained throughout"
-      ],
+      "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Phase 2 left broken state",
           "expectedBehavior": "Document in progress.txt, proceed only if cargo test passes"
         }
       ],
-      "touchesFiles": ["tasks/progress.txt"],
-      "dependsOn": [],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Total test count must not decrease after any extraction",
+        "Zero clippy warnings maintained throughout"
+      ],
+      "modifiesBehavior": false,
+      "notes": "P2 final baseline: 2264 tests passed, 0 failed, 7 ignored. P2 added watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, archive_display.rs. detection.rs was reorganized in-place (EXPLICIT_SKIP). Verify all P2 modules exist before starting P3 extractions. P2 test count went 2262→2264 (2 new tests added in status modules).",
+      "passes": true,
+      "priority": 1,
       "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Baseline test count and verify post-Phase-2 state",
+      "touchesFiles": [
+        "tasks/progress.txt"
+      ]
     },
     {
-      "id": "REFACTOR-011",
-      "title": "Split oauth.rs token storage from refresh flow",
-      "description": "Exploration revealed oauth.rs has NO browser/PKCE/callback server code — the PRD's 3-file split is not applicable. The file is 857 lines but ~660 are tests. Production code is ~197 lines with only 7 functions. The viable split is: token_store.rs (credentials_path, read_credentials, write_credentials_atomic, is_token_expiring — pure storage) vs oauth.rs (refresh_token, ensure_valid_token, sanitize_oauth_error — refresh flow). Alternatively, if the production code is only ~197 lines, document 'EXPLICIT_SKIP: production code is 197 lines, split not warranted' and mark complete.",
       "acceptanceCriteria": [
         "Either: token_store.rs created with storage functions (credentials_path, read_credentials, write_credentials_atomic, is_token_expiring), Credentials struct, and their tests; oauth.rs keeps refresh_token, ensure_valid_token, TokenResult enum; mod.rs updated; external callers (engine.rs, usage.rs) import paths updated",
         "Or: EXPLICIT_SKIP documented in progress.txt — production code is ~197 lines, only tests are large, split adds overhead without meaningful maintainability gain",
         "In either case: cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 6,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Exploration revealed oauth.rs has NO browser/PKCE/callback server code — the PRD's 3-file split is not applicable. The file is 857 lines but ~660 are tests. Production code is ~197 lines with only 7 functions. The viable split is: token_store.rs (credentials_path, read_credentials, write_credentials_atomic, is_token_expiring — pure storage) vs oauth.rs (refresh_token, ensure_valid_token, sanitize_oauth_error — refresh flow). Alternatively, if the production code is only ~197 lines, document 'EXPLICIT_SKIP: production code is 197 lines, split not warranted' and mark complete.",
       "estimatedEffort": "low",
-      "passes": false,
+      "id": "REFACTOR-011",
+      "modifiesBehavior": false,
       "notes": "oauth.rs is 857 lines but 660 are tests. The 7 production functions total ~197 lines. The PRD assumed browser/PKCE/server code existed — it doesn't. Splitting ~100 lines of storage from ~100 lines of refresh creates two tiny modules. The agent should make a pragmatic call. External callers: engine.rs (ensure_valid_token), usage.rs (credentials_path, read_credentials, is_token_expiring, refresh_token). P2 LEARNING: detection.rs (1013L, ~18L extractable) was EXPLICIT_SKIP with section markers — same pragmatic pattern applies here. With only ~197L production code, EXPLICIT_SKIP is the strongly recommended outcome.",
+      "passes": false,
+      "priority": 6,
       "qualityDimensions": {
-        "correctness": ["Test count identical before and after", "External callers compile without changes or with updated imports"],
-        "performance": ["No runtime impact"],
-        "style": ["Pragmatic decision documented", "If extracted: //! module doc comments"]
+        "correctness": [
+          "Test count identical before and after",
+          "External callers compile without changes or with updated imports"
+        ],
+        "performance": [
+          "No runtime impact"
+        ],
+        "style": [
+          "Pragmatic decision documented",
+          "If extracted: //! module doc comments"
+        ]
       },
+      "synergyWith": [],
+      "title": "Split oauth.rs token storage from refresh flow",
       "touchesFiles": [
         "src/loop_engine/oauth.rs",
         "src/loop_engine/token_store.rs",
@@ -106,17 +122,9 @@
         "src/loop_engine/engine.rs",
         "src/loop_engine/usage.rs",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-012",
-      "title": "Extract main.rs command dispatch into grouped helpers",
-      "description": "main.rs has a single 773-line match statement with 34 command arms. There is no centralized DB setup to extract (the PRD assumption was wrong — open_connection is called per-arm). The `run` subcommand handler is only ~30 lines. The real opportunity is grouping related command arms into dispatch helper functions in commands/ modules. Approach: (1) Group related arms into helper functions (e.g., learning commands, loop/batch commands, admin commands). (2) Each helper takes &Cli and the specific command variant. (3) main.rs becomes a thin dispatcher calling these helpers. Alternative: document EXPLICIT_SKIP if the match statement, while large, is already well-organized and each arm is a clear 5-20 line block.",
       "acceptanceCriteria": [
         "Either: Command arms grouped into dispatch helpers (e.g., dispatch_learning_commands, dispatch_loop_commands) in appropriate commands/ modules; main.rs match arms reduced to single-line helper calls; main.rs under 400 lines",
         "Or: EXPLICIT_SKIP documented — each arm is already a clean 5-20 line block, no helper extraction warranted; document in progress.txt with rationale",
@@ -125,30 +133,40 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 7,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "main.rs has a single 773-line match statement with 34 command arms. There is no centralized DB setup to extract (the PRD assumption was wrong — open_connection is called per-arm). The `run` subcommand handler is only ~30 lines. The real opportunity is grouping related command arms into dispatch helper functions in commands/ modules. Approach: (1) Group related arms into helper functions (e.g., learning commands, loop/batch commands, admin commands). (2) Each helper takes &Cli and the specific command variant. (3) main.rs becomes a thin dispatcher calling these helpers. Alternative: document EXPLICIT_SKIP if the match statement, while large, is already well-organized and each arm is a clear 5-20 line block.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-012",
+      "modifiesBehavior": false,
       "notes": "main.rs has NO #[cfg(test)] module — no tests to move. get_project_root (L33-50) calls git rev-parse, used by Loop/Batch/Worktrees arms only. The 34 command arms are individually small (5-30 lines each) but collectively make main.rs hard to navigate. The PRD's goal of 'main.rs as thin routing layer' is achieved by grouping arms into dispatch helpers. This is a judgment call — flat match statements are idiomatic in Rust CLIs. P2 LEARNING: detection.rs was successfully reorganized in-place with section markers (// --- Section ---) instead of extraction. Consider section markers as an alternative to dispatch helpers if arms are already clean 5-20 line blocks — this is lower risk and idiomatic for Rust CLI match statements. EXPLICIT_SKIP with section markers is a valid P3 outcome.",
+      "passes": false,
+      "priority": 7,
       "qualityDimensions": {
-        "correctness": ["No tests to move (main.rs has no test module)", "All CLI commands produce identical output"],
-        "performance": ["No runtime impact"],
-        "style": ["Grouping follows existing command module structure", "Each dispatch helper is a single-responsibility function"]
+        "correctness": [
+          "No tests to move (main.rs has no test module)",
+          "All CLI commands produce identical output"
+        ],
+        "performance": [
+          "No runtime impact"
+        ],
+        "style": [
+          "Grouping follows existing command module structure",
+          "Each dispatch helper is a single-responsibility function"
+        ]
       },
+      "synergyWith": [],
+      "title": "Extract main.rs command dispatch into grouped helpers",
       "touchesFiles": [
         "src/main.rs",
         "src/commands/mod.rs",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-013",
-      "title": "Extract SessionGuidance from signals.rs to guidance.rs",
-      "description": "Move SessionGuidance struct and its impl block (~70 lines, L22-93) from signals.rs to a new src/loop_engine/guidance.rs module. SessionGuidance accumulates interactive stdin guidance during pause events — it is conceptually separate from signal file handling (stop/pause file checks). Also move GuidanceEntry (private struct, L28). Keep in signals.rs: SignalFlag, check_stop_signal, check_pause_signal, cleanup_signal_files, cleanup_deadline_files, handle_pause, stop_file_path, pause_file_path. Note: handle_pause (L153) takes &mut SessionGuidance — after extraction it imports from guidance.rs.",
       "acceptanceCriteria": [
         "guidance.rs contains: SessionGuidance struct, GuidanceEntry struct, all SessionGuidance methods (new, add, format_for_prompt, is_empty, format_for_recording)",
         "guidance.rs has //! module doc comment",
@@ -161,39 +179,43 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 8,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Move SessionGuidance struct and its impl block (~70 lines, L22-93) from signals.rs to a new src/loop_engine/guidance.rs module. SessionGuidance accumulates interactive stdin guidance during pause events — it is conceptually separate from signal file handling (stop/pause file checks). Also move GuidanceEntry (private struct, L28). Keep in signals.rs: SignalFlag, check_stop_signal, check_pause_signal, cleanup_signal_files, cleanup_deadline_files, handle_pause, stop_file_path, pause_file_path. Note: handle_pause (L153) takes &mut SessionGuidance — after extraction it imports from guidance.rs.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-013",
+      "modifiesBehavior": false,
       "notes": "PRD US-012 names target as 'steering.rs' — renamed to guidance.rs because exploration found NO steering.md file parsing in signals.rs. SessionGuidance accumulates interactive stdin guidance, not file-based steering. SessionGuidance is imported by name in engine.rs (L44: `use ...signals::{self, SessionGuidance, SignalFlag}`). After extraction, engine.rs imports SessionGuidance from guidance and SignalFlag from signals. handle_pause in signals.rs takes &mut SessionGuidance — it will import from super::guidance::SessionGuidance. The ~130 lines of SessionGuidance tests (L309-441) move; the remaining ~350 lines of signal tests stay. P2 LEARNINGS: (1) Re-export pattern (status.rs re-exports structs from status_queries/status_display) avoids changing external callers — consider re-exporting SessionGuidance from signals.rs if many callers import it. (2) Use pub(crate) for internal APIs, pub only for cross-crate. (3) Line numbers shift after P2 extractions — verify actual line numbers before editing. (4) Private `use` imports in parent module are NOT accessible via `use super::*` in test submodule — must add explicit imports in moved test code. (5) Struct fields must be pub(crate) if moved functions access them from a different module.",
+      "passes": false,
+      "priority": 8,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "SessionGuidance tests pass in new location",
           "handle_pause still works with imported SessionGuidance"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub for SessionGuidance (used outside loop_engine via engine.rs)",
           "//! module doc comment",
           "Alphabetical mod declaration"
         ]
       },
+      "synergyWith": [],
+      "title": "Extract SessionGuidance from signals.rs to guidance.rs",
       "touchesFiles": [
         "src/loop_engine/signals.rs",
         "src/loop_engine/guidance.rs",
         "src/loop_engine/mod.rs",
         "src/loop_engine/engine.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review Phase 3 extractions for quality and correctness",
-      "description": "Review all Phase 3 tasks for correct visibility, no orphaned tests, no unused imports, module doc comments, integration wiring.",
       "acceptanceCriteria": [
         "Each new module has //! doc comment (if created)",
         "No unused imports in modified files",
@@ -202,49 +224,55 @@
         "EXPLICIT_SKIP decisions are well-reasoned and documented",
         "Any issues found have CODE-FIX-xxx tasks added to JSON"
       ],
-      "priority": 13,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-011",
+        "REFACTOR-012",
+        "REFACTOR-013"
+      ],
+      "description": "Review all Phase 3 tasks for correct visibility, no orphaned tests, no unused imports, module doc comments, integration wiring.",
       "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified. P2 LEARNING: P2 code review found minor issues (wrong doc comment style, misplaced import) that were fixed in-place without CODE-FIX tasks. Reserve CODE-FIX tasks for issues requiring significant changes. Also verify pub vs pub(crate) consistency — P2 found TimeoutConfig was pub when it should have been pub(crate). P2 FINAL: Scope reviews to branch-changed code only — prevents scope creep while catching real issues.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review Phase 3 extractions for quality and correctness",
       "touchesFiles": [
         "src/loop_engine/oauth.rs",
         "src/loop_engine/token_store.rs",
         "src/loop_engine/signals.rs",
         "src/loop_engine/guidance.rs",
         "src/main.rs"
-      ],
-      "dependsOn": ["REFACTOR-011", "REFACTOR-012", "REFACTOR-013"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-1",
-      "title": "Review Phase 3 for refactoring opportunities",
-      "description": "Check for DRY violations, consistency with Phase 1/2 extraction patterns.",
       "acceptanceCriteria": [
         "Extraction patterns consistent with earlier phases",
         "No duplicated test helpers",
         "Any issues have REFACTOR-1-xxx tasks added to JSON"
       ],
-      "priority": 17,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "P2 LEARNING: The #1 refactoring finding in P2 was duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata duplicated in status_queries.rs vs status.rs). Check that any new P3 modules use shared test_utils.rs rather than duplicating helpers. Also check for format_remaining-style misplacement (display fn kept with query caller rather than display module).",
-      "touchesFiles": [],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Check for DRY violations, consistency with Phase 1/2 extraction patterns.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "P2 LEARNING: The #1 refactoring finding in P2 was duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata duplicated in status_queries.rs vs status.rs). Check that any new P3 modules use shared test_utils.rs rather than duplicating helpers. Also check for format_remaining-style misplacement (display fn kept with query caller rather than display module).",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review Phase 3 for refactoring opportunities",
+      "touchesFiles": []
     },
     {
-      "id": "LEARN-001",
-      "title": "Update Phase 4 tasks based on Phase 3 learnings",
-      "description": "Review progress.txt for Phase 3 patterns. Update tasks/large-file-refactor-p4.json: Phase 3 covers small files where EXPLICIT_SKIP is common — these patterns directly inform Phase 4's assessment-heavy approach. Update P4 assessment criteria, expected verdicts, and notes based on what was learned about small-file pragmatism.",
       "acceptanceCriteria": [
         "Read progress.txt for all Phase 3 learnings",
         "Review each Phase 4 task and update based on learnings",
@@ -252,24 +280,27 @@
         "Document which P4 tasks were updated and why in progress.txt",
         "Commit: 'chore: LEARN-001 - Update P4 tasks with P3 learnings'"
       ],
-      "priority": 19,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Review progress.txt for Phase 3 patterns. Update tasks/large-file-refactor-p4.json: Phase 3 covers small files where EXPLICIT_SKIP is common — these patterns directly inform Phase 4's assessment-heavy approach. Update P4 assessment criteria, expected verdicts, and notes based on what was learned about small-file pragmatism.",
       "estimatedEffort": "low",
+      "id": "LEARN-001",
       "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
       "passes": false,
+      "priority": 19,
+      "synergyWith": [],
+      "title": "Update Phase 4 tasks based on Phase 3 learnings",
       "touchesFiles": [
         "tasks/large-file-refactor-p4.json",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-1",
-      "title": "Phase 3 complete — all Tier 3 tasks done",
-      "description": "Gate: all 3 extraction/assessment tasks complete, reviewed.",
       "acceptanceCriteria": [
         "All REFACTOR-011, REFACTOR-012, REFACTOR-013 have passes: true",
         "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx)",
@@ -279,85 +310,100 @@
         "cargo fmt --check passes",
         "If REFACTOR-013 extracted guidance.rs: signals.rs under 700 lines (baseline: 781L). If REFACTOR-013 was EXPLICIT_SKIP: signals.rs line count documented in progress.txt"
       ],
-      "priority": 20,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "REFACTOR-011", "REFACTOR-012", "REFACTOR-013", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "LEARN-001"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001",
+        "REFACTOR-011",
+        "REFACTOR-012",
+        "REFACTOR-013",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1",
+        "LEARN-001"
+      ],
+      "description": "Gate: all 3 extraction/assessment tasks complete, reviewed.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 3 complete — all Tier 3 tasks done",
+      "touchesFiles": []
     },
     {
-      "id": "INT-001",
-      "title": "Integration verification — full CLI smoke test",
-      "description": "Verify all CLI commands work after Phase 3.",
       "acceptanceCriteria": [
         "cargo build --release succeeds",
         "cargo test passes (full suite)",
         "task-mgr --help works",
         "Core CLI commands work (init, list, next, complete, stats)"
       ],
-      "priority": 55,
-      "estimatedEffort": "low",
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Verify all CLI commands work after Phase 3.",
+      "estimatedEffort": "low",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration verification — full CLI smoke test",
+      "touchesFiles": []
     },
     {
-      "id": "REFACTOR-REVIEW-3",
-      "title": "Final review — Phase 3 module structure",
-      "description": "Final review of all Phase 3 changes.",
       "acceptanceCriteria": [
         "No TODO/FIXME from extraction process",
         "No dead code",
         "Import paths clean",
         "Any issues have REFACTOR-3-xxx tasks added to JSON"
       ],
-      "priority": 65,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["INT-001"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Final review of all Phase 3 changes.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final review — Phase 3 module structure",
+      "touchesFiles": []
     },
     {
-      "id": "VERIFY-001",
-      "title": "Final verification — all checks pass",
-      "description": "Complete verification suite.",
       "acceptanceCriteria": [
         "cargo build succeeds",
         "cargo test passes — count matches baseline",
         "cargo clippy -- -D warnings passes",
         "cargo fmt --check passes"
       ],
-      "priority": 90,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Complete verification suite.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": []
     },
     {
-      "id": "LEARN-002",
-      "title": "Final update to Phase 4 tasks based on complete Phase 3",
-      "description": "With Phase 3 complete, do a final pass on tasks/large-file-refactor-p4.json. Update assessment expectations based on full Phases 1-3 experience. Especially relevant: which files actually benefited from extraction vs which were better left alone.",
       "acceptanceCriteria": [
         "Review all Phase 3 findings including EXPLICIT_SKIP decisions",
         "Update P4 ASSESS-014 expected verdicts based on extraction experience",
@@ -365,41 +411,52 @@
         "Document updates in progress.txt",
         "Commit: 'chore: LEARN-002 - Final P4 task updates from P3 completion'"
       ],
-      "priority": 97,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "With Phase 3 complete, do a final pass on tasks/large-file-refactor-p4.json. Update assessment expectations based on full Phases 1-3 experience. Especially relevant: which files actually benefited from extraction vs which were better left alone.",
       "estimatedEffort": "low",
+      "id": "LEARN-002",
       "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
       "passes": false,
+      "priority": 97,
+      "synergyWith": [],
+      "title": "Final update to Phase 4 tasks based on complete Phase 3",
       "touchesFiles": [
         "tasks/large-file-refactor-p4.json",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-FINAL",
-      "title": "Phase 3 Large File Refactor — ready for merge",
-      "description": "All Phase 3 tasks complete, verified.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "REFACTOR-REVIEW-3 passes (and any spawned tasks)",
         "All tasks have passes: true",
         "Branch is clean"
       ],
-      "priority": 99,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "touchesFiles": [],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3", "LEARN-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3",
+        "LEARN-002"
+      ],
+      "description": "All Phase 3 tasks complete, verified.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 3 Large File Refactor — ready for merge",
+      "touchesFiles": []
     }
-  ]
+  ],
+  "version": "1.0"
 }
