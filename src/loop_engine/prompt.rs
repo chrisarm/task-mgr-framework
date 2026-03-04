@@ -18,11 +18,14 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::commands::next;
-use crate::commands::next::output::{LearningSummaryOutput, NextResult};
+use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};
-use crate::learnings::bandit;
 use crate::loop_engine::context;
 use crate::loop_engine::model;
+use crate::loop_engine::prompt_sections::learnings::{
+    build_learnings_section, record_shown_learnings,
+};
+use crate::loop_engine::prompt_sections::truncate_to_budget;
 
 /// Byte budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
@@ -37,8 +40,6 @@ const TOTAL_PROMPT_BUDGET: usize = 80_000;
 /// Byte budget for the base prompt.md template content.
 const BASE_PROMPT_BUDGET: usize = 16_000;
 
-/// Byte budget for the serialized learnings JSON block.
-const LEARNINGS_BUDGET: usize = 4_000;
 
 /// Result of building a prompt for one iteration.
 #[derive(Debug)]
@@ -346,24 +347,6 @@ fn try_fit_section(
 ///
 /// Returns the list of learning IDs that were shown (for feedback tracking).
 /// Errors are logged but don't prevent prompt building.
-fn record_shown_learnings(
-    conn: &Connection,
-    learnings: &[LearningSummaryOutput],
-    iteration: i64,
-) -> Vec<i64> {
-    let mut shown_ids = Vec::with_capacity(learnings.len());
-    for learning in learnings {
-        shown_ids.push(learning.id);
-        if let Err(e) = bandit::record_learning_shown(conn, learning.id, iteration) {
-            eprintln!(
-                "Warning: failed to record learning {} as shown: {}",
-                learning.id, e
-            );
-        }
-    }
-    shown_ids
-}
-
 /// Build a steering section string from the steering.md file.
 fn build_steering_section(steering_path: &Path) -> String {
     match fs::read_to_string(steering_path) {
@@ -527,27 +510,6 @@ fn build_task_json(
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
 }
 
-/// Build a learnings section string.
-fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> String {
-    if learnings.is_empty() {
-        return String::new();
-    }
-
-    let learnings_json =
-        serde_json::to_string_pretty(learnings).unwrap_or_else(|_| "[]".to_string());
-    let learnings_json = truncate_to_budget(&learnings_json, LEARNINGS_BUDGET);
-    format!(
-        "## Relevant Learnings\n\n```json\n{}\n```\n\n",
-        learnings_json
-    )
-}
-
-/// Append learnings to the prompt.
-#[cfg(test)]
-fn append_learnings(prompt: &mut String, learnings: &[LearningSummaryOutput]) {
-    prompt.push_str(&build_learnings_section(learnings));
-}
-
 /// Build a base prompt section string from the template file.
 fn build_base_prompt_section(base_prompt_path: &Path) -> String {
     match fs::read_to_string(base_prompt_path) {
@@ -686,17 +648,6 @@ fn get_synergy_partner_models(
     rows.filter_map(|r| r.ok()).collect()
 }
 
-/// Truncate a string to fit within a byte budget.
-fn truncate_to_budget(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
-        text.to_string()
-    } else {
-        let safe_end = text.floor_char_boundary(budget);
-        let truncated = &text[..safe_end];
-        format!("{}...\n[truncated to {} bytes]", truncated, budget)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,27 +710,6 @@ mod tests {
 
     // ===== Unit tests for helper functions (original) =====
 
-    #[test]
-    fn test_truncate_to_budget_within_limit() {
-        let text = "short text";
-        let result = truncate_to_budget(text, 100);
-        assert_eq!(result, "short text");
-    }
-
-    #[test]
-    fn test_truncate_to_budget_exceeds_limit() {
-        let text = "a".repeat(5000);
-        let result = truncate_to_budget(&text, 100);
-        assert!(result.len() < 200);
-        assert!(result.contains("[truncated to 100 bytes]"));
-    }
-
-    #[test]
-    fn test_truncate_to_budget_exact_limit() {
-        let text = "abcde";
-        let result = truncate_to_budget(text, 5);
-        assert_eq!(result, "abcde");
-    }
 
     #[test]
     fn test_append_steering_missing_file() {
@@ -811,30 +741,7 @@ mod tests {
         assert!(prompt.is_empty(), "Empty steering file should be no-op");
     }
 
-    #[test]
-    fn test_append_learnings_empty() {
-        let mut prompt = String::new();
-        append_learnings(&mut prompt, &[]);
-        assert!(prompt.is_empty(), "No learnings should produce no section");
-    }
 
-    #[test]
-    fn test_append_learnings_with_content() {
-        let learnings = vec![LearningSummaryOutput {
-            id: 1,
-            title: "Test Learning".to_string(),
-            outcome: "pattern".to_string(),
-            confidence: "high".to_string(),
-            content: Some("Use X instead of Y".to_string()),
-            applies_to_files: None,
-            applies_to_task_types: None,
-        }];
-
-        let mut prompt = String::new();
-        append_learnings(&mut prompt, &learnings);
-        assert!(prompt.contains("## Relevant Learnings"));
-        assert!(prompt.contains("Test Learning"));
-    }
 
     #[test]
     fn test_append_base_prompt_with_content() {
@@ -858,12 +765,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_record_shown_learnings_empty() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let ids = record_shown_learnings(&conn, &[], 1);
-        assert!(ids.is_empty());
-    }
 
     #[test]
     fn test_build_task_json_basic() {
@@ -2036,139 +1937,11 @@ pub enum ApiError {
 
     // --- record_shown_learnings with actual learnings ---
 
-    #[test]
-    fn test_record_shown_learnings_tracks_ids() {
-        let (_temp_dir, conn) = setup_test_db();
 
-        let id1 = insert_test_learning(&conn, "Learning A");
-        let id2 = insert_test_learning(&conn, "Learning B");
 
-        let learnings = vec![
-            LearningSummaryOutput {
-                id: id1,
-                title: "Learning A".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "medium".to_string(),
-                content: Some("Content A".to_string()),
-                applies_to_files: None,
-                applies_to_task_types: None,
-            },
-            LearningSummaryOutput {
-                id: id2,
-                title: "Learning B".to_string(),
-                outcome: "success".to_string(),
-                confidence: "high".to_string(),
-                content: Some("Content B".to_string()),
-                applies_to_files: None,
-                applies_to_task_types: None,
-            },
-        ];
 
-        let ids = record_shown_learnings(&conn, &learnings, 5);
 
-        assert_eq!(ids.len(), 2, "Should return 2 shown IDs");
-        assert_eq!(ids[0], id1, "First ID should match");
-        assert_eq!(ids[1], id2, "Second ID should match");
-    }
 
-    #[test]
-    fn test_record_shown_learnings_graceful_on_invalid_id() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        // Learning ID 99999 doesn't exist, but record_learning_shown should
-        // either succeed (no-op) or log warning and continue
-        let learnings = vec![LearningSummaryOutput {
-            id: 99999,
-            title: "Ghost learning".to_string(),
-            outcome: "pattern".to_string(),
-            confidence: "low".to_string(),
-            content: None,
-            applies_to_files: None,
-            applies_to_task_types: None,
-        }];
-
-        // Should not panic
-        let ids = record_shown_learnings(&conn, &learnings, 1);
-        assert_eq!(
-            ids.len(),
-            1,
-            "Should still return the ID even if DB op fails"
-        );
-        assert_eq!(ids[0], 99999);
-    }
-
-    // --- Truncation edge cases ---
-
-    #[test]
-    fn test_truncate_to_budget_zero() {
-        let result = truncate_to_budget("hello", 0);
-        assert!(
-            result.contains("[truncated to 0 bytes]"),
-            "Zero budget should truncate"
-        );
-    }
-
-    #[test]
-    fn test_truncate_to_budget_one_char() {
-        let result = truncate_to_budget("hello", 1);
-        assert!(result.starts_with('h'));
-        assert!(result.contains("[truncated to 1 bytes]"));
-    }
-
-    #[test]
-    fn test_truncate_to_budget_empty_string() {
-        let result = truncate_to_budget("", 100);
-        assert_eq!(result, "", "Empty string within budget returns empty");
-    }
-
-    #[test]
-    fn test_truncate_to_budget_multibyte_utf8_no_panic() {
-        // "café" = 5 chars, 6 bytes (é is 2 bytes: 0xC3 0xA9)
-        let text = "café";
-        assert_eq!(text.len(), 5); // 5 bytes
-                                   // Budget 4 falls after 'f' but before 'é' starts — safe
-        let result = truncate_to_budget(text, 4);
-        assert!(result.contains("[truncated to 4 bytes]"));
-        assert!(result.starts_with("caf"));
-        // Budget 3 falls mid-way — would panic with naive slicing if é started at byte 3
-        let result = truncate_to_budget(text, 3);
-        assert!(result.contains("[truncated to 3 bytes]"));
-    }
-
-    #[test]
-    fn test_truncate_to_budget_emoji_no_panic() {
-        // Each emoji is 4 bytes
-        let text = "🍕🍔🌮🍣";
-        assert_eq!(text.len(), 16); // 4 emoji × 4 bytes
-                                    // Budget 5 falls mid-second emoji (byte 5 is inside 🍔)
-        let result = truncate_to_budget(text, 5);
-        assert!(result.contains("[truncated to 5 bytes]"));
-        // Should contain only first emoji (4 bytes), not a partial second
-        assert!(result.starts_with("🍕"));
-        assert!(!result.starts_with("🍕🍔"));
-    }
-
-    #[test]
-    fn test_truncate_to_budget_cjk_no_panic() {
-        // CJK characters are 3 bytes each
-        let text = "你好世界";
-        assert_eq!(text.len(), 12); // 4 chars × 3 bytes
-                                    // Budget 4 falls mid-second character (byte 4 is inside 好)
-        let result = truncate_to_budget(text, 4);
-        assert!(result.contains("[truncated to 4 bytes]"));
-        assert!(result.starts_with("你"));
-    }
-
-    #[test]
-    fn test_truncate_to_budget_mixed_ascii_and_multibyte() {
-        let text = "hello 世界!";
-        // h(1) e(1) l(1) l(1) o(1) (1) 世(3) 界(3) !(1) = 13 bytes
-        assert_eq!(text.len(), 13);
-        // Budget 7 = just past the space, before 世 starts (byte 6 is space, 7 is mid-世)
-        let result = truncate_to_budget(text, 7);
-        assert!(result.contains("[truncated to 7 bytes]"));
-        assert!(result.starts_with("hello "));
-    }
 
     // --- Steering edge cases ---
 
@@ -2228,41 +2001,6 @@ pub enum ApiError {
         let mut prompt = String::new();
         append_base_prompt(&mut prompt, &path);
         assert!(!prompt.ends_with("\n\n"), "Should not double-add newline");
-    }
-
-    // --- Learnings formatting ---
-
-    #[test]
-    fn test_append_learnings_multiple() {
-        let learnings = vec![
-            LearningSummaryOutput {
-                id: 1,
-                title: "First Learning".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "high".to_string(),
-                content: Some("Content 1".to_string()),
-                applies_to_files: Some(vec!["src/*.rs".to_string()]),
-                applies_to_task_types: None,
-            },
-            LearningSummaryOutput {
-                id: 2,
-                title: "Second Learning".to_string(),
-                outcome: "failure".to_string(),
-                confidence: "medium".to_string(),
-                content: None,
-                applies_to_files: None,
-                applies_to_task_types: Some(vec!["FEAT-".to_string()]),
-            },
-        ];
-
-        let mut prompt = String::new();
-        append_learnings(&mut prompt, &learnings);
-
-        assert!(prompt.contains("## Relevant Learnings"));
-        assert!(prompt.contains("```json"));
-        assert!(prompt.contains("First Learning"));
-        assert!(prompt.contains("Second Learning"));
-        assert!(prompt.contains("Content 1"));
     }
 
     // --- get_completed_dependencies edge cases ---
@@ -3351,69 +3089,7 @@ pub enum ApiError {
 
     // ===== Prompt size budget tests =====
 
-    #[test]
-    fn test_append_learnings_truncation_over_budget() {
-        // 5 learnings with ~2KB content each → ~10KB total, exceeds LEARNINGS_BUDGET (4K)
-        let learnings: Vec<LearningSummaryOutput> = (0..5)
-            .map(|i| LearningSummaryOutput {
-                id: i,
-                title: format!("Learning {}", i),
-                outcome: "pattern".to_string(),
-                confidence: "high".to_string(),
-                content: Some("x".repeat(2000)),
-                applies_to_files: None,
-                applies_to_task_types: None,
-            })
-            .collect();
 
-        let mut prompt = String::new();
-        append_learnings(&mut prompt, &learnings);
-
-        assert!(
-            prompt.contains("## Relevant Learnings"),
-            "Should have learnings section header"
-        );
-        assert!(
-            prompt.contains("[truncated to"),
-            "Learnings JSON should be truncated when exceeding budget"
-        );
-        // The learnings JSON content should be limited to approximately LEARNINGS_BUDGET
-        // (plus the header/footer overhead)
-        let json_start = prompt.find("```json\n").unwrap() + 8;
-        let json_end = prompt.rfind("\n```").unwrap();
-        let json_section = &prompt[json_start..json_end];
-        assert!(
-            json_section.len() <= LEARNINGS_BUDGET + 100,
-            "Learnings JSON section ({} bytes) should be within budget ({} + overhead)",
-            json_section.len(),
-            LEARNINGS_BUDGET
-        );
-    }
-
-    #[test]
-    fn test_append_learnings_under_budget_not_truncated() {
-        let learnings = vec![LearningSummaryOutput {
-            id: 1,
-            title: "Small learning".to_string(),
-            outcome: "pattern".to_string(),
-            confidence: "high".to_string(),
-            content: Some("Use X".to_string()),
-            applies_to_files: None,
-            applies_to_task_types: None,
-        }];
-
-        let mut prompt = String::new();
-        append_learnings(&mut prompt, &learnings);
-
-        assert!(
-            !prompt.contains("[truncated to"),
-            "Small learnings should not be truncated"
-        );
-        assert!(
-            prompt.contains("Small learning"),
-            "Content should be preserved"
-        );
-    }
 
     #[test]
     fn test_append_base_prompt_truncation_over_budget() {
