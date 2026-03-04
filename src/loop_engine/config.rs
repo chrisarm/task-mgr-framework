@@ -183,7 +183,7 @@ pub enum IterationOutcome {
 }
 
 /// A single option in a key decision presented by the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyDecisionOption {
     /// Short label for the option (e.g., "Use SQLite", "Use PostgreSQL")
     pub label: String,

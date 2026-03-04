@@ -11,6 +11,7 @@
 //! - `learnings` - Learnings and learning_tags tables
 //! - `metadata` - PRD metadata and global state tables
 
+pub mod key_decisions;
 mod learnings;
 mod metadata;
 mod runs;
