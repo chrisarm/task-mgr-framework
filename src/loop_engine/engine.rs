@@ -24,6 +24,7 @@ use rusqlite::Connection;
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
+use crate::db::schema::key_decisions as key_decisions_db;
 use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
@@ -140,6 +141,8 @@ pub struct IterationResult {
     /// Effective model used for this iteration (post-crash-escalation).
     /// None for early exits (signal, rate-limit, etc.).
     pub effective_model: Option<String>,
+    /// Number of key decisions extracted and stored this iteration.
+    pub key_decisions_count: u32,
 }
 
 /// Mutable context carried between iterations.
@@ -200,6 +203,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -213,6 +217,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -242,6 +247,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -270,6 +276,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -328,6 +335,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
 
@@ -373,6 +381,7 @@ pub fn run_iteration(
                             should_stop: false,
                             output: String::new(),
                             effective_model: None,
+                            key_decisions_count: 0,
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -396,6 +405,7 @@ pub fn run_iteration(
                     should_stop: false,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
         }
@@ -471,6 +481,7 @@ pub fn run_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
+            key_decisions_count: 0,
         });
     }
 
@@ -485,6 +496,7 @@ pub fn run_iteration(
             should_stop: true,
             output: claude_result.output,
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -510,6 +522,7 @@ pub fn run_iteration(
                 should_stop: true,
                 output: String::new(),
                 effective_model: None,
+                key_decisions_count: 0,
             });
         }
     }
@@ -581,6 +594,7 @@ pub fn run_iteration(
         should_stop,
         output: claude_output,
         effective_model,
+        key_decisions_count: 0,
     })
 }
 
@@ -1182,6 +1196,26 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             result.effective_model.as_deref(),
         );
 
+        // Extract and store key decisions (non-fatal: DB errors are warnings only)
+        let key_decisions = detection::extract_key_decisions(&result.output);
+        let mut kd_count: u32 = 0;
+        for decision in &key_decisions {
+            match key_decisions_db::insert_key_decision(
+                &conn,
+                &run_id,
+                result.task_id.as_deref(),
+                i64::from(iteration),
+                decision,
+            ) {
+                Ok(_) => kd_count += 1,
+                Err(e) => eprintln!(
+                    "Warning: failed to store key decision '{}': {}",
+                    decision.title, e
+                ),
+            }
+        }
+        result.key_decisions_count = kd_count;
+
         // Track last claimed task for cleanup on exit
         last_claimed_task = result.task_id.clone();
         if matches!(result.outcome, IterationOutcome::Completed) {
@@ -1719,6 +1753,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         should_stop: true,
         output: String::new(),
         effective_model: None,
+        key_decisions_count: 0,
     }
 }
 
@@ -1794,6 +1829,7 @@ mod tests {
             should_stop: false,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);
