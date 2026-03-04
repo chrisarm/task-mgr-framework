@@ -8,8 +8,11 @@ use std::process::Command;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::commands::dependency_checker::check_dependencies_satisfied;
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
+
+pub use crate::commands::dependency_checker::are_dependencies_satisfied;
 
 /// Result of completing a single task.
 #[derive(Debug, Clone, Serialize)]
@@ -112,66 +115,6 @@ pub fn complete(
         run_id: run_id.map(String::from),
         commit: commit.map(String::from),
     })
-}
-
-/// Returns unsatisfied dependency IDs for a task.
-///
-/// Queries `task_relationships` for `dependsOn` entries, then checks if each
-/// dependency is `done` or `irrelevant`. Returns only the IDs that are NOT
-/// in a terminal state.
-fn get_unsatisfied_deps(conn: &Connection, task_id: &str) -> TaskMgrResult<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT related_id FROM task_relationships WHERE task_id = ? AND rel_type = 'dependsOn'",
-    )?;
-    let dep_ids: Vec<String> = stmt
-        .query_map([task_id], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let mut unsatisfied = Vec::new();
-    for dep_id in &dep_ids {
-        let status: Option<String> = conn
-            .query_row("SELECT status FROM tasks WHERE id = ?", [dep_id], |row| {
-                row.get(0)
-            })
-            .ok();
-        match status.as_deref() {
-            Some("done") | Some("irrelevant") => {} // satisfied
-            _ => unsatisfied.push(dep_id.clone()),  // not done, missing, or other status
-        }
-    }
-
-    Ok(unsatisfied)
-}
-
-/// Check whether all `dependsOn` dependencies for a task are satisfied.
-///
-/// Returns `true` if the task has no dependencies, or all dependencies are
-/// `done` or `irrelevant`. **Fail-closed**: returns `false` on query errors.
-pub fn are_dependencies_satisfied(conn: &Connection, task_id: &str) -> bool {
-    match get_unsatisfied_deps(conn, task_id) {
-        Ok(unsatisfied) => unsatisfied.is_empty(),
-        Err(e) => {
-            eprintln!(
-                "Warning: dependency check failed for task {}, assuming unsatisfied: {}",
-                task_id, e
-            );
-            false
-        }
-    }
-}
-
-/// Gate task completion on dependency satisfaction.
-///
-/// Returns `Ok(())` if all dependencies are met, or `Err(DependencyNotSatisfied)`
-/// with the list of unsatisfied dependency IDs.
-fn check_dependencies_satisfied(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
-    let unsatisfied = get_unsatisfied_deps(conn, task_id)?;
-    if unsatisfied.is_empty() {
-        Ok(())
-    } else {
-        Err(TaskMgrError::dependency_not_satisfied(task_id, unsatisfied))
-    }
 }
 
 /// Check that all required tests pass for a task.
@@ -873,22 +816,6 @@ mod tests {
         let result = complete(&mut conn, &["TASK-001".to_string()], None, None, false);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().completed_count, 1);
-    }
-
-    #[test]
-    fn test_are_dependencies_satisfied_returns_correct_bool() {
-        let (_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "DEP-001", "todo");
-        insert_test_task(&conn, "DEP-002", "done");
-        insert_test_task(&conn, "TASK-001", "in_progress");
-        insert_relationship(&conn, "TASK-001", "DEP-001", "dependsOn");
-        insert_relationship(&conn, "TASK-001", "DEP-002", "dependsOn");
-
-        // DEP-001 is still todo, so not satisfied
-        assert!(!are_dependencies_satisfied(&conn, "TASK-001"));
-
-        // No deps → satisfied
-        assert!(are_dependencies_satisfied(&conn, "DEP-001"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
+use crate::commands::dependency_checker;
 use crate::db::prefix::prefix_and;
 use crate::loop_engine::output_parsing::strip_task_prefix;
 use crate::TaskMgrResult;
@@ -258,7 +259,7 @@ pub(crate) fn reconcile_passes_with_db(
             }
 
             if passing_ids.contains(task_id.as_str()) {
-                if !complete_cmd::are_dependencies_satisfied(conn, task_id) {
+                if !dependency_checker::are_dependencies_satisfied(conn, task_id) {
                     continue;
                 }
                 if let Ok(1) = conn.execute(
