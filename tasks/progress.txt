@@ -628,3 +628,12 @@
 - No REFACTOR-3-xxx tasks needed — structure is clean
 - Test count: 2262 passed, 0 failed
 ---
+
+## 2026-03-03 - p1-refactor-LEARN-002
+- Final P2 task update based on complete Phase 1
+- **Key correction**: claude.rs is 2272L (not 1181L as P2 originally estimated). Updated description, REFACTOR-006 notes, and MILESTONE-1 targets.
+- MILESTONE-1 "claude.rs under 800L" target → "under 1900L" (watchdog extraction removes ~400-600L, not enough for 800L)
+- Updated TEST-INIT-001 notes with P1 final test counts, actual file sizes (engine.rs 2546L, prompt.rs 2990L, env.rs 1631L), and 7 key P1 learnings
+- Applied REFACTOR-REVIEW-3 findings: noted tee_stream_json double-parse issue in REFACTOR-006 notes for scope awareness
+- Verified P1 modules exist: git_reconcile.rs (1043L), output_parsing.rs (410L), prd_reconcile.rs (553L), worktree.rs (1068L), prompt_sections/ (5 files, 853L)
+---

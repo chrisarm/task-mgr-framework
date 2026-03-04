@@ -4,7 +4,7 @@
   "model": "claude-sonnet-4-6",
   "branchName": "large-file-refactor",
   "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
-  "description": "Phase 2: Decompose Tier 2 loop_engine files (claude.rs 1181L, status.rs 1236L, archive.rs 1213L, calibrate.rs 1568L, detection.rs 1013L). Mechanical extraction — no behavior changes. Continues on the same branch as Phase 1.",
+  "description": "Phase 2: Decompose Tier 2 loop_engine files (claude.rs 2272L, status.rs 1236L, archive.rs 1213L, calibrate.rs 1568L, detection.rs 1013L). Mechanical extraction — no behavior changes. Continues on the same branch as Phase 1. Note: claude.rs is larger than originally estimated due to stream-json additions during P1 development.",
   "taskPrefix": "p2-refactor",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
@@ -60,7 +60,7 @@
       "priority": 1,
       "estimatedEffort": "low",
       "passes": false,
-      "notes": "Phase 2 starts from the post-Phase-1 state. Every subsequent extraction must match this baseline test count exactly. P1 baseline for reference: 2262 passed, 0 failed, 7 ignored; 23 pub mod declarations in mod.rs. P1 learning: also audit pub(super) visibility patterns — P1 found that some fns needed pub(crate) after extraction.",
+      "notes": "Phase 2 starts from the post-Phase-1 state. Every subsequent extraction must match this baseline test count exactly. P1 final state: 2262 passed, 0 failed, 7 ignored; mod.rs has pub mod declarations for P1 modules (git_reconcile, output_parsing, prd_reconcile, prompt_sections, worktree). P1 learnings to apply: (1) pub(crate) for extracted private fns, (2) re-export patterns for moved public types, (3) #[allow] annotation preservation, (4) line number shifting during batch removals, (5) cfg(unix) paired blocks stay together, (6) constants stay in original file, (7) check for duplicate test helpers (P1 found setup_git_repo duplicated). Actual P1 file sizes: engine.rs 2546L (from 4525L), prompt.rs 2990L (from ~3800L), env.rs 1631L (from ~2600L).",
       "edgeCases": [
         "Phase 1 may have left pending cleanup — verify no leftover TODOs in engine.rs, prompt.rs, env.rs",
         "Some tests may be #[ignore] — count those separately",
@@ -105,7 +105,7 @@
       "priority": 6,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "spawn_claude calls watchdog_loop by spawning a thread — the interface is the function signature. After extraction, claude.rs calls watchdog::watchdog_loop(...) in the spawned thread. TimeoutConfig is used by engine.rs directly (line 435) — so it must be pub, and engine.rs import path changes from claude::TimeoutConfig to watchdog::TimeoutConfig. The #[cfg(unix)] test helpers (lines 605, 625, 665, 1073, 1105) that test watchdog behavior should move too. P1 learnings: (1) Preserve any #[allow] annotations when moving code. (2) Use pub(crate) for internal fns, pub only for cross-module (TimeoutConfig needs pub since engine.rs uses it). (3) Line numbers shift after each removal — verify line numbers before each edit. (4) Keep #[cfg(unix)]/#[cfg(not(unix))] pairs together (P1 kept platform pairs in worktree.rs successfully).",
+      "notes": "spawn_claude calls watchdog_loop by spawning a thread — the interface is the function signature. After extraction, claude.rs calls watchdog::watchdog_loop(...) in the spawned thread. TimeoutConfig is used by engine.rs directly (line 435) — so it must be pub, and engine.rs import path changes from claude::TimeoutConfig to watchdog::TimeoutConfig. The #[cfg(unix)] test helpers (lines 605, 625, 665, 1073, 1105) that test watchdog behavior should move too. P1 learnings: (1) Preserve any #[allow] annotations when moving code. (2) Use pub(crate) for internal fns, pub only for cross-module (TimeoutConfig needs pub since engine.rs uses it). (3) Line numbers shift after each removal — verify line numbers before each edit. (4) Keep #[cfg(unix)]/#[cfg(not(unix))] pairs together (P1 kept platform pairs in worktree.rs successfully). UPDATED from P1 completion: claude.rs is 2272L (not 1181L as originally estimated). TimeoutConfig at line 29, watchdog_loop at lines 563/625 (unix/non-unix), kill_process_group at line 521, exit_code_from_status at line 499. Watchdog extraction removes ~400-600L (functions + associated tests). Post-extraction target: ~1700-1900L. P1 REFACTOR-REVIEW-3 also found tee_stream_json double-parse issue — unrelated to watchdog extraction but worth noting for scope awareness.",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -402,9 +402,9 @@
         "cargo clippy -- -D warnings passes",
         "cargo fmt --check passes",
         "No dead code warnings for any new module",
-        "claude.rs under 800 lines (watchdog extracted)",
-        "status.rs under 900 lines (queries ~224L + display ~134L extracted)",
-        "calibrate.rs under 1500 lines (math ~100L extracted)"
+        "claude.rs under 1900 lines (watchdog extracted ~400-600L from 2272L; original 800L target was based on incorrect 1181L estimate)",
+        "status.rs under 900 lines (queries ~224L + display ~134L extracted from 1236L)",
+        "calibrate.rs under 1500 lines (math ~100L extracted from 1568L)"
       ],
       "priority": 20,
       "estimatedEffort": "low",
