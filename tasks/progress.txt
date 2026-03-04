@@ -747,6 +747,24 @@
 - **No CODE-FIX tasks needed** — issues found were minor and fixed in-place
 ---
 
+## 2026-03-03 - p2-refactor-LEARN-001
+- Updated large-file-refactor-p3.json with Phase 2 learnings
+- **Tasks updated:**
+  - TEST-INIT-001: Added P2 final baseline (2264 tests), P2 module list, edge case about test count shift
+  - REFACTOR-011 (oauth.rs): Added detection.rs EXPLICIT_SKIP precedent — strongly recommended skip for ~197L production code
+  - REFACTOR-012 (main.rs): Added section markers as alternative approach (detection.rs pattern), EXPLICIT_SKIP as valid outcome
+  - REFACTOR-013 (signals.rs): Added 5 P2 learnings: re-export pattern, pub(crate) visibility, line number verification, test import gotcha, struct field visibility
+  - CODE-REVIEW-1: Added P2 pattern of fixing minor issues in-place, pub(crate) audit note
+  - REFACTOR-REVIEW-1: Added notes about duplicate test helpers being #1 P2 refactoring finding
+  - REFACTOR-011/012/013: Removed false conflictsWith (they touch different files; P2 learned conflictsWith should mean "touches same lines/structs")
+- **Key P2 patterns applied to P3:**
+  1. EXPLICIT_SKIP with section markers is a valid outcome for small files (detection.rs precedent)
+  2. Re-export pattern avoids changing external callers (status.rs precedent)
+  3. Duplicate test helpers are the main refactoring risk
+  4. Line numbers shift after prior phase extractions — always verify before editing
+  5. Test count baseline is 2264 (not 2262) after P2 added 2 status module tests
+---
+
 ## 2026-03-03 - p2-refactor-REFACTOR-REVIEW-1
 - Reviewed watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs
 - **Issue 1 (REFACTOR-1-001)**: Duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata) in status_queries.rs and status.rs — should use shared test_utils.rs

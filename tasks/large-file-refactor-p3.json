@@ -57,9 +57,11 @@
       "priority": 1,
       "estimatedEffort": "low",
       "passes": false,
+      "notes": "P2 final baseline: 2264 tests passed, 0 failed, 7 ignored. P2 added watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, archive_display.rs. detection.rs was reorganized in-place (EXPLICIT_SKIP). Verify all P2 modules exist before starting P3 extractions. P2 test count went 2262→2264 (2 new tests added in status modules).",
       "edgeCases": [
         "Phase 2 may not be fully complete — document which modules exist",
-        "Some tests may be #[ignore] — count separately"
+        "Some tests may be #[ignore] — count separately",
+        "P2 added 2 tests (status modules) — baseline is 2264 not 2262"
       ],
       "invariants": [
         "Total test count must not decrease after any extraction",
@@ -91,7 +93,7 @@
       "priority": 6,
       "estimatedEffort": "low",
       "passes": false,
-      "notes": "oauth.rs is 857 lines but 660 are tests. The 7 production functions total ~197 lines. The PRD assumed browser/PKCE/server code existed — it doesn't. Splitting ~100 lines of storage from ~100 lines of refresh creates two tiny modules. The agent should make a pragmatic call. External callers: engine.rs (ensure_valid_token), usage.rs (credentials_path, read_credentials, is_token_expiring, refresh_token).",
+      "notes": "oauth.rs is 857 lines but 660 are tests. The 7 production functions total ~197 lines. The PRD assumed browser/PKCE/server code existed — it doesn't. Splitting ~100 lines of storage from ~100 lines of refresh creates two tiny modules. The agent should make a pragmatic call. External callers: engine.rs (ensure_valid_token), usage.rs (credentials_path, read_credentials, is_token_expiring, refresh_token). P2 LEARNING: detection.rs (1013L, ~18L extractable) was EXPLICIT_SKIP with section markers — same pragmatic pattern applies here. With only ~197L production code, EXPLICIT_SKIP is the strongly recommended outcome.",
       "qualityDimensions": {
         "correctness": ["Test count identical before and after", "External callers compile without changes or with updated imports"],
         "performance": ["No runtime impact"],
@@ -108,7 +110,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-012", "REFACTOR-013"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -126,7 +128,7 @@
       "priority": 7,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "main.rs has NO #[cfg(test)] module — no tests to move. get_project_root (L33-50) calls git rev-parse, used by Loop/Batch/Worktrees arms only. The 34 command arms are individually small (5-30 lines each) but collectively make main.rs hard to navigate. The PRD's goal of 'main.rs as thin routing layer' is achieved by grouping arms into dispatch helpers. This is a judgment call — flat match statements are idiomatic in Rust CLIs.",
+      "notes": "main.rs has NO #[cfg(test)] module — no tests to move. get_project_root (L33-50) calls git rev-parse, used by Loop/Batch/Worktrees arms only. The 34 command arms are individually small (5-30 lines each) but collectively make main.rs hard to navigate. The PRD's goal of 'main.rs as thin routing layer' is achieved by grouping arms into dispatch helpers. This is a judgment call — flat match statements are idiomatic in Rust CLIs. P2 LEARNING: detection.rs was successfully reorganized in-place with section markers (// --- Section ---) instead of extraction. Consider section markers as an alternative to dispatch helpers if arms are already clean 5-20 line blocks — this is lower risk and idiomatic for Rust CLI match statements. EXPLICIT_SKIP with section markers is a valid P3 outcome.",
       "qualityDimensions": {
         "correctness": ["No tests to move (main.rs has no test module)", "All CLI commands produce identical output"],
         "performance": ["No runtime impact"],
@@ -140,7 +142,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-011", "REFACTOR-013"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -162,7 +164,7 @@
       "priority": 8,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "PRD US-012 names target as 'steering.rs' — renamed to guidance.rs because exploration found NO steering.md file parsing in signals.rs. SessionGuidance accumulates interactive stdin guidance, not file-based steering. SessionGuidance is imported by name in engine.rs (L44: `use ...signals::{self, SessionGuidance, SignalFlag}`). After extraction, engine.rs imports SessionGuidance from guidance and SignalFlag from signals. handle_pause in signals.rs takes &mut SessionGuidance — it will import from super::guidance::SessionGuidance. The ~130 lines of SessionGuidance tests (L309-441) move; the remaining ~350 lines of signal tests stay.",
+      "notes": "PRD US-012 names target as 'steering.rs' — renamed to guidance.rs because exploration found NO steering.md file parsing in signals.rs. SessionGuidance accumulates interactive stdin guidance, not file-based steering. SessionGuidance is imported by name in engine.rs (L44: `use ...signals::{self, SessionGuidance, SignalFlag}`). After extraction, engine.rs imports SessionGuidance from guidance and SignalFlag from signals. handle_pause in signals.rs takes &mut SessionGuidance — it will import from super::guidance::SessionGuidance. The ~130 lines of SessionGuidance tests (L309-441) move; the remaining ~350 lines of signal tests stay. P2 LEARNINGS: (1) Re-export pattern (status.rs re-exports structs from status_queries/status_display) avoids changing external callers — consider re-exporting SessionGuidance from signals.rs if many callers import it. (2) Use pub(crate) for internal APIs, pub only for cross-crate. (3) Line numbers shift after P2 extractions — verify actual line numbers before editing. (4) Private `use` imports in parent module are NOT accessible via `use super::*` in test submodule — must add explicit imports in moved test code. (5) Struct fields must be pub(crate) if moved functions access them from a different module.",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -185,7 +187,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-011", "REFACTOR-012"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -204,7 +206,7 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified.",
+      "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified. P2 LEARNING: P2 code review found minor issues (wrong doc comment style, misplaced import) that were fixed in-place without CODE-FIX tasks. Reserve CODE-FIX tasks for issues requiring significant changes. Also verify pub vs pub(crate) consistency — P2 found TimeoutConfig was pub when it should have been pub(crate).",
       "touchesFiles": [
         "src/loop_engine/oauth.rs",
         "src/loop_engine/token_store.rs",
@@ -231,6 +233,7 @@
       "estimatedEffort": "low",
       "model": "claude-opus-4-6",
       "passes": false,
+      "notes": "P2 LEARNING: The #1 refactoring finding in P2 was duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata duplicated in status_queries.rs vs status.rs). Check that any new P3 modules use shared test_utils.rs rather than duplicating helpers. Also check for format_remaining-style misplacement (display fn kept with query caller rather than display module).",
       "touchesFiles": [],
       "dependsOn": ["CODE-REVIEW-1"],
       "synergyWith": [],
