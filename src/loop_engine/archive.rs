@@ -356,6 +356,23 @@ fn clear_task_data(conn: &rusqlite::Connection) -> TaskMgrResult<()> {
     Ok(())
 }
 
+/// Clear task data scoped to a single PRD prefix.
+///
+/// Deletes tasks matching `{prefix}-%`, their run_task entries (via CASCADE),
+/// and runs that become orphaned (no remaining run_tasks). Preserves tasks
+/// from other prefixes, all learnings, and global_state counters unless this
+/// is the last prefix — in which case counters are reset. Also NULLs
+/// `global_state.last_task_id` if it references a now-deleted task.
+///
+/// Returns the number of tasks deleted.
+#[allow(dead_code)]
+fn clear_prd_data_for_prefix(conn: &rusqlite::Connection, prefix: &str) -> TaskMgrResult<usize> {
+    // TODO: implement scoped deletion for multi-PRD support (FEAT task)
+    let _ = prefix;
+    let _ = conn;
+    Ok(0)
+}
+
 /// Extract learnings from progress.txt.
 ///
 /// Looks for lines matching `**Learnings:**` and collects the bullet points
@@ -1224,5 +1241,313 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prd, "prd-model-selection.md");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for clear_prd_data_for_prefix
+    // -----------------------------------------------------------------------
+
+    /// Insert two PRDs' worth of tasks: PA-001/PA-002 (done) and PB-001/PB-002
+    /// (in_progress/todo) so tests can assert scoped deletion.
+    fn setup_two_prds(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task 1', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-002', 'PA Task 2', 2, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task 1', 1, 'in_progress')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-002', 'PB Task 2', 2, 'todo')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_clear_prd_a_leaves_prd_b_intact() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let pa_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pa_count, 0, "PRD A tasks should be deleted");
+
+        let pb_in_progress: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'PB-001' AND status = 'in_progress'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pb_in_progress, 1, "PRD B in_progress task must survive");
+
+        let pb_todo: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = 'PB-002' AND status = 'todo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pb_todo, 1, "PRD B todo task must survive");
+    }
+
+    #[test]
+    fn test_clear_prd_a_leaves_learnings_intact() {
+        use crate::learnings::crud::{record_learning, RecordLearningParams};
+        use crate::models::{Confidence, LearningOutcome};
+
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        let params = RecordLearningParams {
+            outcome: LearningOutcome::Success,
+            title: "Survives PRD clear".to_string(),
+            content: "This learning must not be deleted".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::High,
+        };
+        record_learning(&conn, params).unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "Learnings must survive PRD clear");
+    }
+
+    #[test]
+    fn test_clear_prd_a_deletes_orphaned_runs() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Run that only references PA tasks — will be orphaned after clear
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-a-only', 'completed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) VALUES ('run-a-only', 'PA-001', 'completed', 1)",
+            [],
+        )
+        .unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE run_id = 'run-a-only'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 0, "Orphaned run should be deleted");
+    }
+
+    #[test]
+    fn test_clear_prd_a_preserves_shared_runs() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Run that references tasks from both PRDs
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-shared', 'completed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) VALUES ('run-shared', 'PA-001', 'completed', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) VALUES ('run-shared', 'PB-001', 'completed', 2)",
+            [],
+        )
+        .unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        // Run must survive because PB-001 still references it
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE run_id = 'run-shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1, "Shared run must be preserved");
+
+        // The PA run_task entry should be gone
+        let rt_pa: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_tasks WHERE run_id = 'run-shared' AND task_id = 'PA-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rt_pa, 0, "PA run_task entry should be removed");
+    }
+
+    #[test]
+    fn test_global_state_counters_not_reset_while_other_prd_remains() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        conn.execute(
+            "UPDATE global_state SET iteration_counter = 42 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Clear PA only — PB still has tasks, so counters must NOT reset
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let counter: i64 = conn
+            .query_row(
+                "SELECT iteration_counter FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            counter, 42,
+            "Counter must not reset while another PRD's tasks remain"
+        );
+    }
+
+    #[test]
+    fn test_global_state_counters_reset_when_last_prd_cleared() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        conn.execute(
+            "UPDATE global_state SET iteration_counter = 42 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data_for_prefix(&conn, "PB").unwrap();
+
+        let counter: i64 = conn
+            .query_row(
+                "SELECT iteration_counter FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            counter, 0,
+            "Counter must reset when the last PRD is cleared"
+        );
+    }
+
+    #[test]
+    fn test_global_state_last_task_id_nulled_if_deleted() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        conn.execute(
+            "UPDATE global_state SET last_task_id = 'PA-001' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let last_task: Option<String> = conn
+            .query_row(
+                "SELECT last_task_id FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            last_task.is_none(),
+            "last_task_id must be NULL after the referenced task is deleted"
+        );
+    }
+
+    #[test]
+    fn test_global_state_last_task_id_preserved_if_from_other_prd() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        conn.execute(
+            "UPDATE global_state SET last_task_id = 'PB-001' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+
+        let last_task: Option<String> = conn
+            .query_row(
+                "SELECT last_task_id FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_task.as_deref(),
+            Some("PB-001"),
+            "last_task_id referencing another PRD's task must be preserved"
+        );
+    }
+
+    /// Known-bad discriminator: a naive `DELETE FROM tasks` without a WHERE
+    /// clause destroys all PRDs. This test documents the catastrophic outcome
+    /// to confirm the scoped `clear_prd_data_for_prefix` must never do this.
+    #[test]
+    fn test_discriminator_unscoped_delete_destroys_other_prds() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Simulate the naive (bad) global delete
+        conn.execute("DELETE FROM tasks", []).unwrap();
+
+        // PB tasks are gone — this is the outcome the scoped function must prevent
+        let pb_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'PB-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            pb_count, 0,
+            "Naive DELETE FROM tasks destroys all PRDs — \
+             this is the anti-pattern clear_prd_data_for_prefix must avoid"
+        );
     }
 }
