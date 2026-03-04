@@ -64,7 +64,7 @@ pub struct ClaudeResult {
 ///
 /// Returns `TaskMgrError::IoError` if the binary is not found or
 /// the process fails to spawn.
-pub fn spawn_claude(
+pub(crate) fn spawn_claude(
     prompt: &str,
     signal_flag: Option<&SignalFlag>,
     working_dir: Option<&Path>,

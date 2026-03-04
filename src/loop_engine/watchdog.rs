@@ -20,20 +20,20 @@ pub(crate) const EXTENSION_DECREMENT_SECS: u64 = 60;
 
 /// Configuration for per-iteration timeout with activity-based extensions.
 #[derive(Clone)]
-pub struct TimeoutConfig {
+pub(crate) struct TimeoutConfig {
     /// Maximum time allowed for the iteration.
-    pub base_timeout: Duration,
+    pub(crate) base_timeout: Duration,
     /// First activity extension amount (decreases by `EXTENSION_DECREMENT_SECS` each use).
-    pub initial_extension: Duration,
+    pub(crate) initial_extension: Duration,
     /// Shared epoch timestamp of last file activity from the monitor thread.
-    pub last_activity_epoch: Arc<AtomicU64>,
+    pub(crate) last_activity_epoch: Arc<AtomicU64>,
 }
 
 impl TimeoutConfig {
     /// Create a `TimeoutConfig` from a task difficulty string.
     ///
     /// Maps: `"low"` → 20min, `"high"` → 40min, anything else (including `None`) → 30min.
-    pub fn from_difficulty(difficulty: Option<&str>, last_activity_epoch: Arc<AtomicU64>) -> Self {
+    pub(crate) fn from_difficulty(difficulty: Option<&str>, last_activity_epoch: Arc<AtomicU64>) -> Self {
         let base_secs = match difficulty.map(|d| d.to_ascii_lowercase()).as_deref() {
             Some("low") => TIMEOUT_LOW_SECS,
             Some("high") => TIMEOUT_HIGH_SECS,
@@ -141,7 +141,7 @@ pub(crate) fn watchdog_loop(
             let current_activity = tc.last_activity_epoch.load(Ordering::Acquire);
             if current_activity > last_seen_activity {
                 last_seen_activity = current_activity;
-                let ext_secs = INITIAL_EXTENSION_SECS
+                let ext_secs = tc.initial_extension.as_secs()
                     .saturating_sub(extensions_used as u64 * EXTENSION_DECREMENT_SECS);
                 if ext_secs > 0 {
                     let remaining = dl.saturating_duration_since(Instant::now());

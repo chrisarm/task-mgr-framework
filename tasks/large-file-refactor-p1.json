@@ -808,7 +808,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Gate before merge to main.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "synergyWith": [],
       "timeoutSecs": 1800,

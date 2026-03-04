@@ -383,7 +383,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
-      "passes": false,
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "title": "Review Phase 2 extractions for refactoring opportunities",
@@ -402,17 +402,23 @@
         "All tests pass with cargo test",
         "No duplicate test helper definitions remain across status_queries.rs and status.rs"
       ],
-      "batchWith": ["REFACTOR-1-002"],
+      "batchWith": [
+        "REFACTOR-1-002"
+      ],
       "conflictsWith": [],
-      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
       "description": "Consolidate duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata) from status_queries.rs and status.rs into the shared test_utils.rs module. Both modules currently define identical copies of these helpers.",
       "estimatedEffort": "low",
       "id": "REFACTOR-1-001",
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 18,
-      "synergyWith": ["REFACTOR-1-002"],
+      "synergyWith": [
+        "REFACTOR-1-002"
+      ],
       "title": "Deduplicate test helpers in status modules",
       "touchesFiles": [
         "src/loop_engine/test_utils.rs",
@@ -427,9 +433,13 @@
         "All callers still compile (engine.rs, claude.rs)",
         "cargo clippy -- -D warnings passes"
       ],
-      "batchWith": ["REFACTOR-1-001"],
+      "batchWith": [
+        "REFACTOR-1-001"
+      ],
       "conflictsWith": [],
-      "dependsOn": ["REFACTOR-REVIEW-1"],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
       "description": "TimeoutConfig in watchdog.rs uses pub visibility but should be pub(crate) for consistency with Phase 1 extraction patterns. The crate has no public API.",
       "estimatedEffort": "low",
       "id": "REFACTOR-1-002",
@@ -437,7 +447,9 @@
       "modifiesBehavior": false,
       "passes": false,
       "priority": 18,
-      "synergyWith": ["REFACTOR-1-001"],
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
       "title": "Narrow TimeoutConfig visibility to pub(crate)",
       "touchesFiles": [
         "src/loop_engine/watchdog.rs"
