@@ -572,11 +572,7 @@ mod tests {
         .unwrap();
 
         // Insert a run so complete_cmd works
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -630,11 +626,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -717,11 +709,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -783,11 +771,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -843,11 +827,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -914,11 +894,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -965,11 +941,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -1011,11 +983,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),
@@ -1059,11 +1027,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
-            [],
-        )
-        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
 
         let count = reconcile_external_git_completions(
             ext_repo.path(),

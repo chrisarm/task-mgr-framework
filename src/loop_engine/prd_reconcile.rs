@@ -397,13 +397,11 @@ mod tests {
 
     #[test]
     fn test_reconcile_passes_resolves_dependency_chains() {
-        use crate::db::{create_schema, open_connection};
+        use crate::loop_engine::test_utils::setup_test_db;
         use std::io::Write;
 
         // Set up DB with A → B → C dependency chain, all todo
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
-        create_schema(&conn).unwrap();
+        let (temp_dir, conn) = setup_test_db();
 
         // Insert tasks in reverse order (C, B, A) to stress ordering
         for (id, status) in &[("C", "todo"), ("B", "todo"), ("A", "todo")] {
