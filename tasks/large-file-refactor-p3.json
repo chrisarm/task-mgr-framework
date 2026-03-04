@@ -327,7 +327,7 @@
       "id": "MILESTONE-1",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
