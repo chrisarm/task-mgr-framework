@@ -17,24 +17,51 @@ use crate::TaskMgrResult;
 use super::status::{DashboardTaskCounts, DeadlineInfo, PendingTask, ProjectInfo};
 use super::DEADLINE_FILE_PREFIX;
 
+/// PRD hints read from the JSON file before lock acquisition.
+pub struct PrdHints {
+    pub task_prefix: Option<String>,
+    pub branch_name: Option<String>,
+}
+
+/// Read `taskPrefix` and `branchName` from a PRD JSON file in a single pass.
+///
+/// Returns `PrdHints { task_prefix: None, branch_name: None }` if the file is
+/// unreadable or not valid JSON.
+pub fn read_prd_hints(prd_path: &Path) -> PrdHints {
+    let Some(content) = fs::read_to_string(prd_path).ok() else {
+        return PrdHints {
+            task_prefix: None,
+            branch_name: None,
+        };
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return PrdHints {
+            task_prefix: None,
+            branch_name: None,
+        };
+    };
+    PrdHints {
+        task_prefix: json
+            .get("taskPrefix")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        branch_name: json
+            .get("branchName")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
 /// Read the `taskPrefix` field from a PRD JSON file.
 pub fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
-    let content = fs::read_to_string(prd_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("taskPrefix")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    read_prd_hints(prd_path).task_prefix
 }
 
 /// Read the `branchName` field from a PRD JSON file.
 ///
 /// Returns `None` if the file is unreadable, not valid JSON, or the field is absent.
 pub fn read_branch_name_from_prd(prd_path: &Path) -> Option<String> {
-    let content = fs::read_to_string(prd_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("branchName")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    read_prd_hints(prd_path).branch_name
 }
 
 /// Query project metadata from prd_metadata table.
@@ -411,6 +438,49 @@ mod tests {
     #[test]
     fn test_format_remaining_hours_and_minutes() {
         assert_eq!(format_remaining(5400), "1h 30m remaining");
+    }
+
+    #[test]
+    fn test_read_prd_hints_both_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        fs::write(
+            &prd_path,
+            r#"{"branchName": "feat/my-branch", "taskPrefix": "abc123"}"#,
+        )
+        .unwrap();
+        let hints = read_prd_hints(&prd_path);
+        assert_eq!(hints.task_prefix, Some("abc123".to_string()));
+        assert_eq!(hints.branch_name, Some("feat/my-branch".to_string()));
+    }
+
+    #[test]
+    fn test_read_prd_hints_prefix_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        fs::write(&prd_path, r#"{"taskPrefix": "abc123"}"#).unwrap();
+        let hints = read_prd_hints(&prd_path);
+        assert_eq!(hints.task_prefix, Some("abc123".to_string()));
+        assert_eq!(hints.branch_name, None);
+    }
+
+    #[test]
+    fn test_read_prd_hints_missing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("nonexistent.json");
+        let hints = read_prd_hints(&prd_path);
+        assert_eq!(hints.task_prefix, None);
+        assert_eq!(hints.branch_name, None);
+    }
+
+    #[test]
+    fn test_read_prd_hints_invalid_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("bad.json");
+        fs::write(&prd_path, "not json").unwrap();
+        let hints = read_prd_hints(&prd_path);
+        assert_eq!(hints.task_prefix, None);
+        assert_eq!(hints.branch_name, None);
     }
 
     #[test]

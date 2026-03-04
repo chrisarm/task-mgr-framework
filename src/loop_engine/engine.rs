@@ -53,8 +53,7 @@ use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
-use crate::loop_engine::status::read_task_prefix_from_prd;
-use crate::loop_engine::status_queries::read_branch_name_from_prd;
+use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
 use crate::loop_engine::worktree;
@@ -713,18 +712,21 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
     // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
     // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
-    let pre_lock_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file)
+    // Read both hints in a single file parse.
+    let prd_hints = read_prd_hints(&run_config.prd_file);
+    let pre_lock_branch = prd_hints.branch_name;
+    let pre_lock_prefix: Option<String> = prd_hints
+        .task_prefix
         .or_else(|| {
             // taskPrefix absent: derive deterministic prefix from branchName + filename,
             // using the same formula as PrefixMode::Auto in init so lock files match
             // across restarts.
-            let branch = read_branch_name_from_prd(&run_config.prd_file);
             let filename = run_config
                 .prd_file
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            Some(generate_prefix(branch.as_deref(), filename))
+            Some(generate_prefix(pre_lock_branch.as_deref(), filename))
         })
         .and_then(|p| {
             // Only use prefix if it is safe for filenames
@@ -825,9 +827,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
     }
 
-    // Step 6.55: Read task prefix from PRD JSON before initial recovery so the
-    // recovery query can be scoped to this PRD's tasks only.
-    let early_task_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file);
+    // Step 6.55: Reuse the prefix already determined at step 4.5 — no second file read.
+    // pre_lock_prefix holds either the PRD's explicit taskPrefix or the deterministic
+    // auto-generated value (same algorithm as init), so it matches after step 5 runs.
+    let early_task_prefix: Option<String> = pre_lock_prefix.clone();
 
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
     // Safe because we hold the exclusive loop lock — no other loop can be running.
