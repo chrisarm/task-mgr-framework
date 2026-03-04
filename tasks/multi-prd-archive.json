@@ -806,7 +806,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Full test coverage achieved, test code refactored.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -832,7 +832,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "Run the full test suite to ensure no regressions outside archive module.",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration test: full archive workflow on real DB",
@@ -863,6 +863,32 @@
       "priority": 65,
       "synergyWith": [],
       "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "run_archive body is under 30 lines (per-PRD loop extracted to helper)",
+        "Extracted helper has clear inputs/outputs",
+        "All tests pass after refactoring"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Extract the per-PRD processing loop body from run_archive (~170 lines) into an archive_single_prd helper function.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-3-001",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "run_archive is ~170 lines. The per-PRD loop body (prefix check, completion check, file discovery, file moves, task counting, DB clear) should be a separate function. clear_prd_data (~100 lines) is sequential SQL in a transaction — acceptable as-is.",
+      "passes": false,
+      "priority": 70,
+      "status": "todo",
+      "synergyWith": [],
+      "title": "Extract per-PRD loop body from run_archive into helper",
       "touchesFiles": [
         "src/loop_engine/archive.rs"
       ]

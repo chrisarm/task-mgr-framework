@@ -1114,3 +1114,14 @@
 - Added all three to MILESTONE-2 dependsOn
 - **Learnings:** setup_db() helper was introduced mid-development; older tests weren't migrated. Always retrofit existing tests when adding shared helpers.
 ---
+
+## 2026-03-04 - multi-archive-REFACTOR-REVIEW-3
+- Reviewed all code in archive.rs for DRY violations, complexity, coupling, clarity
+- **Fixed**: 7 tests used raw SQL instead of insert_prd/insert_task/insert_prd_file helpers — converted to use helpers consistently
+- **Finding**: run_archive is ~170 lines — per-PRD loop body should be extracted to a helper
+- **Finding**: clear_prd_data is ~100 lines but is sequential SQL in a transaction — acceptable as-is
+- **Added**: REFACTOR-3-001 task to extract per-PRD loop body from run_archive
+- No code duplication in production code; helpers are well-factored
+- All 69 archive tests pass, clippy clean, fmt clean
+- **Learnings:** Test helper consistency matters — always use available helpers instead of inline SQL to keep tests DRY and maintainable.
+---

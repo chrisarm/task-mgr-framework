@@ -1028,11 +1028,7 @@ mod tests {
 
         // Insert prd_files entries (simulating what init would do)
         // Note: no branch/prefix here — project-only PRD
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project) VALUES (1, 'model-selection')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "model-selection", "", None);
         insert_prd_file(&conn, 1, "prd-model-phase1.json", "task_list");
         insert_prd_file(&conn, 1, "prd-model-phase1-prompt.md", "prompt");
         insert_prd_file(&conn, 1, "prd-model-selection.md", "prd");
@@ -1225,11 +1221,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project) VALUES (1, 'test-project')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "test-project", "", None);
         insert_task(&conn, "T-001", "Done", 1, "done");
         insert_task(&conn, "T-002", "Todo", 2, "todo");
 
@@ -1684,17 +1676,8 @@ mod tests {
         let conn = setup_db(dir.path());
 
         // PRD with no task_prefix
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (1, 'legacy-project', 'feat/legacy', NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('L-001', 'Legacy Task', 1, 'done')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "legacy-project", "feat/legacy", None);
+        insert_task(&conn, "L-001", "Legacy Task", 1, "done");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -1744,12 +1727,7 @@ mod tests {
         let conn = setup_db(dir.path());
         setup_two_prd_metadata_with_tasks(&conn);
 
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) \
-             VALUES (1, 'project-a.json', 'task_list')",
-            [],
-        )
-        .unwrap();
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -1787,23 +1765,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task', 1, 'done')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO prd_files (prd_id, file_path, file_type) \
-             VALUES (1, 'project-a.json', 'task_list')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -1942,17 +1906,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (1, 'project-a', 'main', 'PA')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'Incomplete', 1, 'todo')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "project-a", "main", Some("PA"));
+        insert_task(&conn, "PA-001", "Incomplete", 1, "todo");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -2081,17 +2036,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
-             VALUES (1, 'project-a', '', 'PA')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'Task', 1, 'done')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "project-a", "", Some("PA"));
+        insert_task(&conn, "PA-001", "Task", 1, "done");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
@@ -2117,19 +2063,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let conn = setup_db(dir.path());
-
-        conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'ghost-project', 'main', 'GP')",
-            [],
-        )
-        .unwrap();
+        insert_prd(&conn, 1, "ghost-project", "main", Some("GP"));
 
         // All tasks done, but no files exist on disk
-        conn.execute(
-            "INSERT INTO tasks (id, title, priority, status) VALUES ('GP-001', 'Done task', 1, 'done')",
-            [],
-        )
-        .unwrap();
+        insert_task(&conn, "GP-001", "Done task", 1, "done");
 
         drop(conn);
 
