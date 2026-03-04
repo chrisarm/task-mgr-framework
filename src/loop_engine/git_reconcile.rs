@@ -11,7 +11,7 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::db::prefix::prefix_and;
-use crate::loop_engine::engine::update_prd_task_passes;
+use crate::loop_engine::prd_reconcile::update_prd_task_passes;
 
 /// Scan recent commits in an external git repo for task completion evidence.
 ///
