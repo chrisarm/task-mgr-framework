@@ -696,3 +696,63 @@
 - **Test count**: before=2262, after=2262
 - **Learnings**: When moving tests that call the extracted function, add `use crate::loop_engine::archive::ArchivedItem` (sibling struct) to the new test module's imports — `use super::*` only brings in the display module's own scope.
 ---
+
+## 2026-03-03 - p2-refactor-REFACTOR-007
+- Extracted query functions to status_queries.rs (read_task_prefix_from_prd, query_project_info, query_dashboard_task_counts, query_pending_tasks, query_distinct_prefixes, read_active_lock_prefix, read_deadline_info, read_single_deadline, prd_basename_from_path, format_remaining)
+- Extracted render functions to status_display.rs (format_text, progress_bar, status_icon)
+- Structs (DashboardResult, ProjectInfo, DashboardTaskCounts, DeadlineInfo, PendingTask, PrdSummary) remain in status.rs with re-exports
+- Files changed: status.rs, status_display.rs (new), status_queries.rs (new), mod.rs
+- Test count: before=2262, after=2264 (2 new tests added in new modules)
+- **Learnings:** format_remaining kept in status_queries (only called from read_single_deadline there) rather than status_display — avoids query→display dependency. Re-exports in status.rs means handlers.rs and engine.rs need no import path changes.
+---
+
+## 2026-03-03 - p2-refactor-REFACTOR-006
+- Extracted watchdog functions from claude.rs to new watchdog.rs module
+- Moved: TimeoutConfig (pub struct+impl), exit_code_from_status (pub(crate)), kill_process_group (#[cfg(unix)] pub(crate)), watchdog_loop (both cfg variants pub(crate))
+- Moved constants: TIMEOUT_LOW/MEDIUM/HIGH_SECS, INITIAL_EXTENSION_SECS (pub(crate)), EXTENSION_DECREMENT_SECS (pub(crate))
+- Moved associated tests: exit_code tests, timeout_config tests, timeout integration tests
+- Files changed: watchdog.rs (new), claude.rs, mod.rs, engine.rs
+- Test count: before=2264, after=2264 (unchanged)
+- **Learnings:** (1) Private `use` imports in parent module are NOT accessible via `use super::*` in test submodule — must add explicit imports. (2) watchdog.rs tests calling spawn_claude create a circular dependency concern but it works since claude.rs is a sibling module, not a dependency of watchdog. (3) cargo fmt catches style issues not caught by clippy — always run both.
+---
+
+## 2026-03-03 - p2-refactor-REFACTOR-009
+- Extracted compute_correlation, adjust_weight, clamp_weight, clamp_negative_weight to calibrate_math.rs
+- Moved WEIGHT_LOWER_BOUND/WEIGHT_UPPER_BOUND constants with the functions (only used there)
+- TaskOutcome struct stays in calibrate.rs as pub(crate) with pub(crate) fields
+- Associated tests moved to calibrate_math.rs #[cfg(test)]
+- Test count: 2264 unit (unchanged), all green, 0 clippy warnings
+- **Learnings:** When moving functions that access struct fields, the fields themselves must also be pub(crate) — not just the struct.
+---
+
+## 2026-03-03 - p2-refactor-REFACTOR-010
+- detection.rs is 1013 lines (under 1100 threshold) — reorganized in-place
+- Added section markers: // --- Exit Code Classification --- and // --- Output String Analysis ---
+- Moved categorize_crash above analyze_output to co-locate with its section header
+- Extraction to exit_codes.rs not warranted: 6-line function with single caller
+- Decision documented in progress.txt as required by AC
+- Test count: before=2264, after=2264
+- **Learnings:** When AC gives a decision heuristic (line count threshold), apply it literally and document the decision in progress.txt.
+---
+
+## 2026-03-03 - p2-refactor-CODE-REVIEW-1
+- Reviewed all 5 Phase 2 extractions (watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, detection.rs)
+- Fixed: detection.rs used `///` instead of `//!` for module doc comment
+- Fixed: archive.rs had `use rusqlite::OptionalExtension` placed at line 397 instead of with top-level imports
+- Verified: all modules have //! doc comments, no unused imports, no orphaned tests, no dead code warnings
+- Verified: mod.rs declares all 5 modules in alphabetical order
+- Verified: external callers (engine.rs, handlers.rs) have correct import paths
+- Observation: `pub` vs `pub(crate)` matches existing codebase convention (claude.rs uses `pub`)
+- Test count: before=2264, after=2264
+- **No CODE-FIX tasks needed** — issues found were minor and fixed in-place
+---
+
+## 2026-03-03 - p2-refactor-REFACTOR-REVIEW-1
+- Reviewed watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs
+- **Issue 1 (REFACTOR-1-001)**: Duplicated test helpers (setup_test_db, insert_task, insert_prd_metadata) in status_queries.rs and status.rs — should use shared test_utils.rs
+- **Issue 2 (REFACTOR-1-002)**: TimeoutConfig in watchdog.rs uses `pub` visibility but should be `pub(crate)` for consistency with Phase 1 patterns
+- **Not worth a task**: format_remaining() in status_queries.rs is a display concern but moving it would require changing DeadlineInfo population in read_single_deadline — too coupled for the minor benefit
+- Import graph is clean, no circular dependencies
+- All modules have //! doc comments, mod.rs declarations are alphabetical
+- calibrate_math.rs depends on calibrate::TaskOutcome (acceptable upward dep for extracted math)
+---
