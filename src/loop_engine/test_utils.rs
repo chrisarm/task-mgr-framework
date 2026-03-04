@@ -145,3 +145,40 @@ pub fn setup_git_repo() -> TempDir {
         .expect("initial commit");
     temp_dir
 }
+
+/// Set up a temporary git repository with a committed file for worktree testing.
+///
+/// Like `setup_git_repo()` but uses `-b main` and commits a real file (`file.txt`).
+/// Worktree tests need a real committed file so they can create dirty states.
+pub fn setup_git_repo_with_file() -> TempDir {
+    use std::process::Command;
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git config name");
+    std::fs::write(temp_dir.path().join("file.txt"), "content").expect("write file");
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("git commit");
+    temp_dir
+}

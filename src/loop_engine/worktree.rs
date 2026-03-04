@@ -392,39 +392,9 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::test_utils::setup_git_repo_with_file;
     use std::fs;
     use std::process::Command;
-
-    fn setup_git_repo() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git init");
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git config email");
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git config name");
-        std::fs::write(tmp.path().join("file.txt"), "content").expect("write");
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git add");
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git commit");
-        tmp
-    }
 
     #[test]
     fn test_sanitize_branch_name_replaces_slashes() {
@@ -525,7 +495,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_creates_new_worktree() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a new worktree for a new branch
         let result = ensure_worktree(tmp.path(), "feature/test-wt", true);
@@ -553,7 +523,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_reuses_existing_worktree() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree
         let result1 = ensure_worktree(tmp.path(), "feature/reuse-test", true);
@@ -573,7 +543,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_for_existing_branch() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a branch without a worktree
         Command::new("git")
@@ -597,7 +567,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_path_contains_sanitized_branch_name() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         let result = ensure_worktree(tmp.path(), "feature/nested/branch", true);
         assert!(result.is_ok());
@@ -615,7 +585,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_from_inside_correct_worktree_returns_same_path() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree
         let result1 = ensure_worktree(tmp.path(), "feature/inside-test", true);
@@ -639,7 +609,7 @@ detached
 
     #[test]
     fn test_ensure_worktree_from_inside_wrong_worktree_fails() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree
         let result1 = ensure_worktree(tmp.path(), "feature/wt-one", true);
@@ -663,7 +633,7 @@ detached
 
     #[test]
     fn test_is_inside_worktree_false_for_main_repo() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         let result = is_inside_worktree(tmp.path());
         assert!(result.is_ok());
@@ -675,7 +645,7 @@ detached
 
     #[test]
     fn test_is_inside_worktree_true_for_actual_worktree() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree
         let result1 = ensure_worktree(tmp.path(), "feature/detect-test", true);
@@ -692,7 +662,7 @@ detached
     #[test]
 
     fn test_remove_worktree_clean_returns_true_and_path_removed() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree to remove
         let wt_path =
@@ -719,7 +689,7 @@ detached
     #[test]
 
     fn test_remove_worktree_dirty_returns_false_and_path_preserved() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a worktree
         let wt_path =
@@ -748,7 +718,7 @@ detached
     #[test]
 
     fn test_remove_worktree_removes_empty_parent_dir() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a single worktree (will be the only one in the parent dir)
         let wt_path =
@@ -773,7 +743,7 @@ detached
     #[test]
 
     fn test_remove_worktree_non_empty_parent_dir_preserved() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create two worktrees in the same parent dir
         let wt1 = ensure_worktree(tmp.path(), "feature/wt-alpha", true).expect("create wt1");
@@ -801,7 +771,7 @@ detached
     #[test]
 
     fn test_remove_worktree_non_existent_path_returns_error() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         let nonexistent = tmp.path().join("does-not-exist");
         assert!(!nonexistent.exists(), "Path should not exist for this test");
@@ -821,7 +791,7 @@ detached
         //
         // To trigger git worktree add failure: use a branch name containing ".."
         // which git forbids in ref names (ref name rules: no consecutive dots).
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // "feature/bad..ref" contains ".." which git rejects as an invalid ref name.
         // The parent dir {repo}-worktrees/ will be created by ensure_worktree
@@ -857,7 +827,7 @@ detached
     /// should refuse and return Ok(false) (skip with warning).
     #[test]
     fn test_remove_worktree_staged_changes_returns_false() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         let wt_path =
             ensure_worktree(tmp.path(), "feature/staged-changes", true).expect("create worktree");
@@ -906,7 +876,7 @@ detached
     /// but git may still have it in its worktree list). The path no longer exists on disk.
     #[test]
     fn test_remove_worktree_out_of_band_delete_returns_error() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Create a real worktree first so git knows about it
         let wt_path =
@@ -933,7 +903,7 @@ detached
     /// other than worktrees). cleanup_empty_dir is best-effort and must not remove non-empty dirs.
     #[test]
     fn test_remove_worktree_parent_with_extra_file_not_removed() {
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         let wt_path =
             ensure_worktree(tmp.path(), "feature/wt-with-sibling", true).expect("create worktree");
@@ -1016,7 +986,7 @@ detached
         ];
 
         for case in cases {
-            let tmp = setup_git_repo();
+            let tmp = setup_git_repo_with_file();
             let branch = format!("feature/state-test-{}", case.name.replace([':', ' '], "-"));
             let wt_path = ensure_worktree(tmp.path(), &branch, true)
                 .unwrap_or_else(|e| panic!("[{}] create worktree: {:?}", case.name, e));
@@ -1060,7 +1030,7 @@ detached
         // This is difficult to trigger deterministically (requires a mid-operation
         // failure). The test validates the behavior via state inspection: after a
         // forced failure, `git worktree list` should not contain stale entries.
-        let tmp = setup_git_repo();
+        let tmp = setup_git_repo_with_file();
 
         // Simulate partial failure: create the worktree directory with content so
         // git worktree add refuses it (git rejects non-empty target directories).
