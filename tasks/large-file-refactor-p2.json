@@ -1,0 +1,545 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "large-file-refactor",
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "description": "Phase 2: Decompose Tier 2 loop_engine files (claude.rs 1181L, status.rs 1236L, archive.rs 1213L, calibrate.rs 1568L, detection.rs 1013L). Mechanical extraction — no behavior changes. Continues on the same branch as Phase 1.",
+  "taskPrefix": "p2-refactor",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Map call graphs and test associations before moving any code",
+      "2. FUNCTIONING CODE - Extraction compiles and all existing tests pass",
+      "3. CORRECTNESS - No orphaned tests, no broken imports, identical test count",
+      "4. CODE QUALITY - Module doc comments, pub(crate) visibility, alphabetical mod declarations",
+      "5. POLISH - Clean up unused imports in source file after extraction"
+    ],
+    "principles": [
+      "Move complete call chains together — if A calls B, extract both to same module",
+      "Tests move with their tested functions — never orphan a test",
+      "Verify cargo test count before and after each extraction",
+      "Use pub(crate) for internal APIs, pub only for cross-crate visibility"
+    ]
+  },
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "Test count is identical before and after extraction (run `cargo test 2>&1 | grep 'test result'`)",
+      "No breaking changes to existing public APIs — re-export if necessary",
+      "Every new module file has a //! module doc comment"
+    ]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
+    }
+  },
+  "userStories": [
+    {
+      "id": "TEST-INIT-001",
+      "title": "Baseline test count and verify post-Phase-1 state",
+      "description": "Capture the baseline test count after Phase 1 extractions and verify all checks pass. This is the reference point for Phase 2.",
+      "acceptanceCriteria": [
+        "Run `cargo test 2>&1 | grep 'test result'` and record exact counts in progress.txt",
+        "Run `cargo clippy -- -D warnings` and confirm zero warnings",
+        "Run `cargo fmt --check` and confirm clean",
+        "Record baseline line counts: `wc -l src/loop_engine/claude.rs src/loop_engine/status.rs src/loop_engine/archive.rs src/loop_engine/calibrate.rs src/loop_engine/detection.rs`",
+        "Audit constants: grep for `const ` in all 5 target files — record which are used by functions being extracted",
+        "Audit #[allow] annotations in all 5 target files",
+        "Verify Phase 1 modules exist: git_reconcile.rs, output_parsing.rs, prd_reconcile.rs, prompt_sections/, worktree.rs",
+        "Audit #[cfg(unix)] / #[cfg(not(unix))] paired blocks in claude.rs — record line numbers and pairing in progress.txt"
+      ],
+      "priority": 1,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Phase 2 starts from the post-Phase-1 state. Every subsequent extraction must match this baseline test count exactly.",
+      "edgeCases": [
+        "Phase 1 may have left pending cleanup — verify no leftover TODOs in engine.rs, prompt.rs, env.rs",
+        "Some tests may be #[ignore] — count those separately",
+        "If Phase 1 is not yet complete on the branch, document which Phase 1 tasks are done"
+      ],
+      "invariants": [
+        "Total test count must not decrease after any extraction",
+        "Zero clippy warnings must be maintained throughout"
+      ],
+      "failureModes": [
+        {
+          "cause": "Phase 1 left broken state on branch",
+          "expectedBehavior": "Document in progress.txt and proceed only if cargo test passes"
+        }
+      ],
+      "touchesFiles": ["tasks/progress.txt"],
+      "dependsOn": [],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-006",
+      "title": "Extract watchdog from claude.rs to watchdog.rs",
+      "description": "Move subprocess timeout monitoring and process kill logic from claude.rs to a new src/loop_engine/watchdog.rs module. Functions to extract: watchdog_loop (lines 290-349 unix, 351-384 non-unix), kill_process_group (line 248), exit_code_from_status (line 226), TimeoutConfig struct and from_difficulty (line 42). Keep in claude.rs: spawn_claude (the public entry point). The two #[cfg(unix)] inline blocks inside spawn_claude (lines 124-133 setpgid, lines 159-166 tcsetpgrp) stay with spawn since they are spawn setup, not watchdog logic.",
+      "acceptanceCriteria": [
+        "watchdog.rs contains: TimeoutConfig (struct + from_difficulty), watchdog_loop (both #[cfg] variants), kill_process_group, exit_code_from_status",
+        "watchdog.rs has //! module doc comment",
+        "All platform-specific #[cfg(unix)] / #[cfg(not(unix))] paired blocks for watchdog stay together in watchdog.rs",
+        "The two #[cfg(unix)] inline blocks inside spawn_claude (setpgid, tcsetpgrp) remain in claude.rs",
+        "claude.rs imports TimeoutConfig and watchdog_loop from watchdog module",
+        "spawn_claude remains in claude.rs as the public entry point — external callers (engine.rs, curate/enrich.rs, learnings/ingestion/mod.rs) need no changes",
+        "External callers of TimeoutConfig (engine.rs:435) updated to import from watchdog",
+        "Grep for all `TimeoutConfig` usages across codebase and update any additional import paths",
+        "Associated tests moved to watchdog.rs #[cfg(test)] module",
+        "mod.rs updated with `pub mod watchdog;` in alphabetical order",
+        "cargo test count matches baseline",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "priority": 6,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "spawn_claude calls watchdog_loop by spawning a thread — the interface is the function signature. After extraction, claude.rs calls watchdog::watchdog_loop(...) in the spawned thread. TimeoutConfig is used by engine.rs directly (line 435) — so it must be pub, and engine.rs import path changes from claude::TimeoutConfig to watchdog::TimeoutConfig. The #[cfg(unix)] test helpers (lines 605, 625, 665, 1073, 1105) that test watchdog behavior should move too.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count identical before and after",
+          "Platform-specific pairs (#[cfg(unix)] + #[cfg(not(unix))]) both present in watchdog.rs",
+          "No orphaned test helpers — unix test primitives move with watchdog tests"
+        ],
+        "performance": ["No runtime impact"],
+        "style": [
+          "pub(crate) for watchdog_loop and kill_process_group; pub for TimeoutConfig (used outside loop_engine)",
+          "//! module doc comment on watchdog.rs",
+          "Alphabetical mod declaration"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/engine.rs"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["REFACTOR-007", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-007",
+      "title": "Split status.rs queries from rendering",
+      "description": "Separate data-fetching functions from formatting functions in status.rs. Option A: create status/ subdirectory with queries.rs and display.rs. Option B: create two flat files status_queries.rs and status_display.rs. Keep show_status orchestrator in status.rs (or status/mod.rs). Query functions (lines 198-421): read_task_prefix_from_prd, query_project_info, query_dashboard_task_counts, query_pending_tasks, query_distinct_prefixes, read_active_lock_prefix, read_deadline_info, read_single_deadline, prd_basename_from_path. Render functions (lines 432-566): format_text, format_remaining, progress_bar, status_icon.",
+      "acceptanceCriteria": [
+        "Query functions separated from render functions into distinct modules",
+        "show_status orchestrator imports from both modules",
+        "Each new module has //! doc comment",
+        "External callers updated: main.rs (show_status), engine.rs (read_task_prefix_from_prd), handlers.rs (DashboardResult, format_text)",
+        "Structs (DashboardResult, ProjectInfo, TaskCounts, PendingTask, DeadlineInfo) remain in status.rs and are re-exported; both status_queries.rs and status_display.rs import from super",
+        "Associated tests moved with their functions",
+        "mod.rs updated",
+        "cargo test count matches baseline",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "priority": 7,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Prefer flat files (status_queries.rs + status_display.rs) since there are only 2 modules — no need for a subdirectory. The structs (DashboardResult etc.) are used by both layers and by external callers (handlers.rs) — keep them in status.rs and re-export, or move to a shared types location. format_text is pub and called from handlers.rs — its path must remain accessible. read_task_prefix_from_prd is pub and called from engine.rs.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count identical before and after",
+          "All external callers compile without path changes (use re-exports if needed)",
+          "Structs accessible to both query and render modules"
+        ],
+        "performance": ["No runtime impact"],
+        "style": [
+          "Query functions: take Connection or Path, return data structs",
+          "Render functions: take data structs, return String — pure, no I/O",
+          "//! module doc comments"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/status.rs",
+        "src/loop_engine/status_queries.rs",
+        "src/loop_engine/status_display.rs",
+        "src/loop_engine/mod.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["REFACTOR-006", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-008",
+      "title": "Document archive.rs learning pipeline and extract formatting",
+      "description": "US-008 (deduplicate archive learning extraction) investigation revealed that archive.rs::extract_learnings_from_progress and learnings/ingestion/mod.rs::extract_learnings_from_output are NOT duplicates — they serve different pipelines (markdown progress parsing vs LLM-based extraction). Instead: (1) Document this architectural finding in progress.txt. (2) Extract the formatting/display functions from archive.rs to reduce its size. Functions to extract: format_text (line 173, ~65 lines), and any helper formatters. Keep the core archive logic (run_archive, discovery, clearing, learning extraction) together since they form a cohesive pipeline.",
+      "acceptanceCriteria": [
+        "Document in progress.txt: archive.rs learning extraction vs learnings/ingestion are separate pipelines (different inputs, different outputs, not duplicates)",
+        "format_text and any formatting helpers extracted to a separate location (archive_display.rs or inline into handlers.rs if it's the only consumer besides main.rs)",
+        "Core archive pipeline (run_archive, extract_learnings_from_progress, append_learnings_to_file, discover/clear functions) remains cohesive in archive.rs",
+        "PRD US-008 superseded — document that archive.rs extract_learnings_from_progress and learnings/ingestion extract_learnings_from_output are separate pipelines (markdown parsing vs LLM extraction, different inputs/outputs). No deduplication needed. PRD open question #2 resolved.",
+        "External callers updated: handlers.rs (ArchiveResult, format_text)",
+        "If splitting: verify all external callers compile before committing",
+        "Associated tests moved with extracted functions",
+        "cargo test count matches baseline",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "priority": 8,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "This task is smaller than originally scoped. The PRD assumed code duplication between archive.rs and learnings/ingestion/, but exploration showed they serve different purposes: archive parses formatted markdown from progress.txt, ingestion uses an LLM on raw Claude output. The main extraction opportunity is format_text (~65 lines) which reduces archive.rs but isn't a major win. If archive.rs is under 1200 lines after documentation only, output 'EXPLICIT_SKIP: archive.rs under 1200 lines, format_text extraction not warranted' in progress.txt and mark complete.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count identical before and after",
+          "Learning extraction pipeline not disrupted"
+        ],
+        "performance": ["No runtime impact"],
+        "style": [
+          "//! module doc comment if new file created",
+          "Document architectural finding clearly"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/archive_display.rs",
+        "src/loop_engine/mod.rs",
+        "src/handlers.rs",
+        "tasks/progress.txt"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-009", "REFACTOR-010"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-009",
+      "title": "Extract calibrate.rs statistical math to calibrate_math.rs",
+      "description": "Move pure statistical computation functions from calibrate.rs to a new src/loop_engine/calibrate_math.rs module. Functions to extract: compute_correlation (line 365, ~40 lines — Pearson-like point-biserial correlation), adjust_weight (line 405), clamp_weight (line 63), clamp_negative_weight (line 70), and the clamp_to_bounds method on SelectionWeights (line 52). Keep in calibrate.rs: all DB query functions, orchestrators (recalibrate_weights, compute_calibrated_weights), store_weights, load_* functions, and the SelectionWeights struct definition.",
+      "acceptanceCriteria": [
+        "calibrate_math.rs contains: compute_correlation, adjust_weight, clamp_weight, clamp_negative_weight",
+        "calibrate_math.rs has //! module doc comment",
+        "SelectionWeights::clamp_to_bounds method stays in calibrate.rs (it's a method on the struct) but calls clamp_weight/clamp_negative_weight from calibrate_math",
+        "calibrate.rs imports from calibrate_math — no logic duplication",
+        "TaskOutcome struct accessible to calibrate_math (either stays in calibrate.rs with pub(crate) or moves to calibrate_math)",
+        "Associated tests for pure math functions moved to calibrate_math.rs #[cfg(test)]",
+        "mod.rs updated with `pub mod calibrate_math;`",
+        "cargo test count matches baseline",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "compute_correlation takes &[TaskOutcome] — the TaskOutcome struct must be visible to calibrate_math.rs. Options: (1) keep TaskOutcome in calibrate.rs as pub(crate), import in calibrate_math; (2) move TaskOutcome to calibrate_math since it's a data-only struct used primarily by the math functions. Prefer option 1 since TaskOutcome is populated by DB queries in calibrate.rs. The SelectionWeights struct stays in calibrate.rs since it's used by external callers (selection.rs, engine.rs).",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count identical before and after",
+          "Pure math functions are truly pure — no Connection parameter, no I/O",
+          "External callers (selection.rs, engine.rs) compile without changes"
+        ],
+        "performance": ["No runtime impact"],
+        "style": [
+          "Pure functions in calibrate_math — no side effects, easily unit testable",
+          "//! module doc comment",
+          "pub(crate) visibility for extracted functions"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/calibrate.rs",
+        "src/loop_engine/calibrate_math.rs",
+        "src/loop_engine/mod.rs"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-010"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-010",
+      "title": "Extract detection.rs exit-code classification",
+      "description": "Move exit-code classification from detection.rs to improve separation. The only pure exit-code function is categorize_crash (line 100, ~18 lines) which maps i32 → CrashType. All other functions are output-string analyzers. Given the small extraction size, consider whether a separate module is warranted vs. just improving internal organization with doc comments and section markers. If extracting: create exit_codes.rs with categorize_crash and the CrashType enum. If not extracting: add clear section markers (// --- Exit Code Classification --- and // --- Output String Analysis ---) and document the decision.",
+      "acceptanceCriteria": [
+        "Either: categorize_crash and CrashType extracted to exit_codes.rs with //! doc comment, detection.rs imports them, mod.rs updated, tests moved",
+        "Or: detection.rs reorganized with clear section markers and doc comments, decision documented in progress.txt as 'extraction not warranted — single 18-line function'",
+        "Decision heuristic: if detection.rs is under 1100 lines, reorganize in-place; if over, extract to exit_codes.rs",
+        "In either case: cargo test count matches baseline",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "priority": 10,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "This is the smallest extraction in Phase 2. categorize_crash is 18 lines and has one caller (analyze_output in the same file). The CrashType enum is used by engine.rs (via IterationOutcome). Creating a whole module for 18 lines + an enum may be over-engineering. The agent should make a judgment call: if the team values consistent extraction patterns, do it; if pragmatism wins, organize in-place and document. Either outcome satisfies the AC.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count identical before and after",
+          "CrashType enum accessible to all current consumers"
+        ],
+        "performance": ["No runtime impact"],
+        "style": [
+          "Pragmatic decision documented either way",
+          "If extracted: //! module doc comment"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/exit_codes.rs",
+        "src/loop_engine/mod.rs",
+        "tasks/progress.txt"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-009"],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review all Phase 2 extractions for quality and correctness",
+      "description": "Review all 5 extraction tasks for: correct visibility, no orphaned tests, no unused imports, module doc comments present, consistent patterns, integration wiring.",
+      "acceptanceCriteria": [
+        "Each new module has //! doc comment",
+        "No unused imports in source files after extractions",
+        "All pub(crate) functions accessible from their callers",
+        "No dead code warnings from cargo clippy",
+        "Test count matches baseline from TEST-INIT-001",
+        "Platform-specific blocks in watchdog.rs are correctly paired",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "priority": 13,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "touchesFiles": [
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/status_queries.rs",
+        "src/loop_engine/status_display.rs",
+        "src/loop_engine/calibrate_math.rs",
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/status.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/calibrate.rs",
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/mod.rs"
+      ],
+      "dependsOn": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review Phase 2 extractions for refactoring opportunities",
+      "description": "Check for DRY violations, unnecessary coupling, duplicated test helpers across new modules, and consistency with Phase 1 extraction patterns.",
+      "acceptanceCriteria": [
+        "No duplicated test helper code across new modules",
+        "Import graph is clean",
+        "Extraction patterns consistent with Phase 1 modules (git_reconcile.rs, output_parsing.rs, etc.)",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "priority": 17,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "touchesFiles": [
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/status_queries.rs",
+        "src/loop_engine/status_display.rs",
+        "src/loop_engine/calibrate_math.rs"
+      ],
+      "dependsOn": ["CODE-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "LEARN-001",
+      "title": "Update Phase 3 tasks based on Phase 2 extraction learnings",
+      "description": "Review progress.txt for patterns discovered during Phase 2. Update tasks/large-file-refactor-p3.json: adjust notes, add edge cases, update touchesFiles if Phase 2 changed structure, refine AC based on what worked. Phase 2 covers smaller files than Phase 1 — patterns around EXPLICIT_SKIP decisions and small-file pragmatism are especially relevant for Phase 3.",
+      "acceptanceCriteria": [
+        "Read progress.txt for all Phase 2 learnings",
+        "Review each Phase 3 task and update based on learnings",
+        "If Phase 2 established new patterns (e.g., section markers vs extraction for small files), ensure P3 tasks reflect this",
+        "Document which P3 tasks were updated and why in progress.txt",
+        "Commit: 'chore: LEARN-001 - Update P3 tasks with P2 learnings'"
+      ],
+      "priority": 19,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": [
+        "tasks/large-file-refactor-p3.json",
+        "tasks/progress.txt"
+      ],
+      "dependsOn": ["CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-1",
+      "title": "Phase 2 complete — all Tier 2 extractions done",
+      "description": "Gate checkpoint: all 5 extraction tasks complete, reviewed, and refactored.",
+      "acceptanceCriteria": [
+        "All REFACTOR-006 through REFACTOR-010 have passes: true",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "cargo test count matches baseline from TEST-INIT-001",
+        "cargo clippy -- -D warnings passes",
+        "cargo fmt --check passes",
+        "No dead code warnings for any new module",
+        "claude.rs under 800 lines (watchdog extracted)",
+        "status.rs under 900 lines (queries ~224L + display ~134L extracted)",
+        "calibrate.rs under 1500 lines (math ~100L extracted)"
+      ],
+      "priority": 20,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Gate — verify all criteria. Run full cargo test suite. Count lines with wc -l.",
+      "touchesFiles": [],
+      "dependsOn": ["TEST-INIT-001", "REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "LEARN-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "INT-001",
+      "title": "Integration verification — full CLI smoke test",
+      "description": "Verify all CLI commands still work after Phase 2 extractions.",
+      "acceptanceCriteria": [
+        "cargo build --release succeeds",
+        "cargo test passes (full suite)",
+        "task-mgr --help works",
+        "task-mgr status works (exercises status_queries + status_display)",
+        "No regression in loop engine — spawn_claude still callable from all external sites"
+      ],
+      "priority": 55,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final review — Phase 2 module structure and quality",
+      "description": "Final review of all Phase 2 extractions for consistency, dead code, and overall module quality.",
+      "acceptanceCriteria": [
+        "Module structure consistent across all new files",
+        "No TODO or FIXME from extraction process",
+        "No dead code in source files",
+        "Import paths clean",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "priority": 65,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "For each issue: add REFACTOR-3-xxx (priority 66-80), add to MILESTONE-FINAL dependsOn.",
+      "touchesFiles": [
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/status_queries.rs",
+        "src/loop_engine/status_display.rs",
+        "src/loop_engine/calibrate_math.rs",
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/status.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/calibrate.rs",
+        "src/loop_engine/detection.rs"
+      ],
+      "dependsOn": ["INT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "VERIFY-001",
+      "title": "Final verification — all checks pass",
+      "description": "Run complete verification suite.",
+      "acceptanceCriteria": [
+        "cargo build succeeds",
+        "cargo test passes — count matches baseline",
+        "cargo clippy -- -D warnings passes",
+        "cargo fmt --check passes",
+        "wc -l confirms file size targets met"
+      ],
+      "priority": 90,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "LEARN-002",
+      "title": "Final update to Phase 3 tasks based on complete Phase 2",
+      "description": "With Phase 2 fully complete, do a final pass on tasks/large-file-refactor-p3.json. Update based on actual file sizes, EXPLICIT_SKIP patterns established, and any unexpected issues from integration testing.",
+      "acceptanceCriteria": [
+        "Review REFACTOR-REVIEW-3 findings and apply to P3 tasks",
+        "Update P3 task notes with relevant Phase 2 patterns",
+        "Document updates in progress.txt",
+        "Commit: 'chore: LEARN-002 - Final P3 task updates from P2 completion'"
+      ],
+      "priority": 97,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": [
+        "tasks/large-file-refactor-p3.json",
+        "tasks/progress.txt"
+      ],
+      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-FINAL",
+      "title": "Phase 2 Large File Refactor — ready for merge",
+      "description": "All Phase 2 extractions complete, reviewed, verified.",
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All tasks have passes: true",
+        "Branch is clean"
+      ],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3", "LEARN-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    }
+  ]
+}
