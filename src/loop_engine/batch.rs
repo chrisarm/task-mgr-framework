@@ -579,37 +579,8 @@ mod tests {
 
     // --- cleanup_worktree_after_prd tests ---
 
-    /// Helper: initialize a temporary git repo with an initial commit.
     fn init_test_repo_for_batch() -> (TempDir, std::path::PathBuf) {
-        let tmp = TempDir::new().expect("create temp dir");
-        let repo = tmp.path().to_path_buf();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo)
-            .output()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&repo)
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(&repo)
-            .output()
-            .ok();
-        fs::write(repo.join("README.md"), "# Test").expect("write README");
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&repo)
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&repo)
-            .output()
-            .expect("git commit");
-        (tmp, repo)
+        crate::loop_engine::test_utils::init_test_repo()
     }
 
     #[test]
