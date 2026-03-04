@@ -1187,3 +1187,11 @@
 - All 69 archive tests pass, clippy clean, fmt clean
 - **Learnings:** Test helper consistency matters — always use available helpers instead of inline SQL to keep tests DRY and maintainable.
 ---
+
+## 2026-03-04 - lockfix-FEAT-001
+- Made `generate_prefix()` pub in src/commands/init/mod.rs
+- Added `read_branch_name_from_prd()` to status_queries.rs (mirrors read_task_prefix_from_prd)
+- Updated `pre_lock_prefix` in engine.rs step 4.5 with `.or_else()` fallback to generate_prefix
+- Added 5 unit tests (3 in status_queries, 2 in engine)
+- **Learnings:** `generate_prefix` was `fn` (private); needed `pub fn`. Engine imports use `status` re-exports for some helpers but `status_queries` is also pub-accessible directly.
+---
