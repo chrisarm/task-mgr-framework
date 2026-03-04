@@ -820,6 +820,21 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 6.7: Auto-retire stale learnings at session start so recall quality
+    // is high from the first task. Uses default thresholds (90 days, 10 shows, 5% rate).
+    match crate::commands::curate::curate_retire(&conn, Default::default()) {
+        Ok(result) if result.learnings_retired > 0 => {
+            eprintln!(
+                "Auto-retired {} stale learning(s) at session start",
+                result.learnings_retired
+            );
+        }
+        Ok(_) => {} // nothing to retire
+        Err(e) => {
+            eprintln!("Warning: auto-retire learnings failed: {} (continuing)", e);
+        }
+    }
+
     // Step 7: Read PRD metadata for branch name, task count, and external repo
     let prd_metadata = match read_prd_metadata(&conn, early_task_prefix.as_deref()) {
         Ok(meta) => meta,
