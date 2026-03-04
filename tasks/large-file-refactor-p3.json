@@ -140,11 +140,11 @@
       ],
       "description": "main.rs has a single 773-line match statement with 34 command arms. There is no centralized DB setup to extract (the PRD assumption was wrong — open_connection is called per-arm). The `run` subcommand handler is only ~30 lines. The real opportunity is grouping related command arms into dispatch helper functions in commands/ modules. Approach: (1) Group related arms into helper functions (e.g., learning commands, loop/batch commands, admin commands). (2) Each helper takes &Cli and the specific command variant. (3) main.rs becomes a thin dispatcher calling these helpers. Alternative: document EXPLICIT_SKIP if the match statement, while large, is already well-organized and each arm is a clear 5-20 line block.",
       "estimatedEffort": "medium",
+      "explicitSkip": "EXPLICIT_SKIP: 34 match arms are each clean 5-30 line blocks. Flat match is idiomatic Rust CLI dispatch. No centralized DB setup to extract (PRD assumption wrong). Dispatch helpers would add indirection without reducing complexity. No test module to move. Documented in progress.txt.",
       "id": "REFACTOR-012",
       "modifiesBehavior": false,
       "notes": "main.rs has NO #[cfg(test)] module — no tests to move. get_project_root (L33-50) calls git rev-parse, used by Loop/Batch/Worktrees arms only. The 34 command arms are individually small (5-30 lines each) but collectively make main.rs hard to navigate. The PRD's goal of 'main.rs as thin routing layer' is achieved by grouping arms into dispatch helpers. This is a judgment call — flat match statements are idiomatic in Rust CLIs. P2 LEARNING: detection.rs was successfully reorganized in-place with section markers (// --- Section ---) instead of extraction. Consider section markers as an alternative to dispatch helpers if arms are already clean 5-20 line blocks — this is lower risk and idiomatic for Rust CLI match statements. EXPLICIT_SKIP with section markers is a valid P3 outcome.",
       "passes": true,
-      "explicitSkip": "EXPLICIT_SKIP: 34 match arms are each clean 5-30 line blocks. Flat match is idiomatic Rust CLI dispatch. No centralized DB setup to extract (PRD assumption wrong). Dispatch helpers would add indirection without reducing complexity. No test module to move. Documented in progress.txt.",
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -238,7 +238,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified. P2 LEARNING: P2 code review found minor issues (wrong doc comment style, misplaced import) that were fixed in-place without CODE-FIX tasks. Reserve CODE-FIX tasks for issues requiring significant changes. Also verify pub vs pub(crate) consistency — P2 found TimeoutConfig was pub when it should have been pub(crate). P2 FINAL: Scope reviews to branch-changed code only — prevents scope creep while catching real issues.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "synergyWith": [],
       "title": "Review Phase 3 extractions for quality and correctness",
