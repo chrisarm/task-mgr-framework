@@ -784,3 +784,13 @@
 - No dead code warnings in any new module
 - **Learnings:** claude.rs 1900L target was tight due to stream-json addition in Phase 1; 31 lines over is acceptable
 ---
+
+## 2026-03-03 - p2-refactor-REFACTOR-REVIEW-3
+- Final review of all 9 Phase 2 extracted modules
+- Files reviewed: watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, claude.rs, status.rs, archive.rs, calibrate.rs, detection.rs
+- All modules have //! doc comments, proper pub(crate) visibility, no TODO/FIXME, no dead code
+- Module declarations in mod.rs are alphabetical
+- Test count: 2264 passed, 0 failed
+- Clippy: zero warnings, fmt: clean
+- **No issues found** — no REFACTOR-3-xxx tasks needed
+---
