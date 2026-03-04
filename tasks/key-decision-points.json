@@ -1,0 +1,225 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "feat/key-decision-points",
+  "description": "Add key decision point discovery and prompting to loop engine and PRD skill",
+  "taskPrefix": "KDP",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases before coding",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works",
+      "3. CORRECTNESS - Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Each task delivers working code + tests together",
+      "Follow existing patterns — reorder tag extraction is the template for key-decision extraction",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "globalAcceptanceCriteria": {
+    "description": "Apply to ALL tasks",
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing APIs"
+    ]
+  },
+  "userStories": [
+    {
+      "id": "FEAT-001",
+      "title": "Add KeyDecision struct to config.rs",
+      "description": "Add the KeyDecision data struct alongside existing IterationOutcome/CrashType.\n\nDO: Define a clean struct with title, description, options fields. Options should be Vec<KeyDecisionOption> where each option has label and description.\nDO NOT: Add this to IterationOutcome enum — key decisions are sideband data, not outcomes.\n\nEdge cases:\n- Options list could be empty (malformed tag) — handle gracefully\n- Title/description could be very long — no truncation needed, just store as-is",
+      "acceptanceCriteria": [
+        "Positive: KeyDecision struct with fields: title (String), description (String), options (Vec<KeyDecisionOption>)",
+        "Positive: KeyDecisionOption struct with fields: label (String), description (String)",
+        "Positive: Both structs derive Debug, Clone, PartialEq, Eq",
+        "Negative: KeyDecision is NOT a variant of IterationOutcome — it's a separate struct"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "Pattern to follow: CrashType and IterationOutcome in src/loop_engine/config.rs. Keep it simple — just data structs, no methods needed yet.",
+      "touchesFiles": ["src/loop_engine/config.rs"],
+      "dependsOn": []
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Add extract_key_decisions() to detection.rs with tests",
+      "description": "Parse <key-decision> XML tags from Claude output, returning Vec<KeyDecision>.\n\nTag format:\n```xml\n<key-decision>\n<title>Short title</title>\n<description>Why this matters</description>\n<option label=\"A: Name\">Tradeoff description</option>\n<option label=\"B: Name\">Tradeoff description</option>\n</key-decision>\n```\n\nDO: Use simple string-based extraction like extract_reorder_task_id(). Support multiple <key-decision> blocks per output. Trim whitespace from extracted fields.\nDO NOT: Add regex dependency. Don't modify analyze_output() — this is a separate function called independently.\n\nEdge cases:\n- No <key-decision> tags → empty vec\n- Malformed tags (missing closing, missing inner tags) → skip that block\n- Multiple tags in one output → extract all\n- Empty title or description → skip that block\n- Options with no label → skip that option\n- Zero valid options after parsing → skip that block",
+      "acceptanceCriteria": [
+        "Positive: fn extract_key_decisions(output: &str) -> Vec<KeyDecision> is pub",
+        "Unit test: output with one well-formed <key-decision> returns vec of length 1 with correct title, description, and options",
+        "Unit test: output with two <key-decision> blocks returns vec of length 2",
+        "Unit test: output with no <key-decision> tags returns empty vec",
+        "Unit test: malformed tag (missing </key-decision>) returns empty vec",
+        "Unit test: tag with empty <title></title> returns empty vec (skipped)",
+        "Unit test: tag with zero valid <option> tags returns empty vec (skipped)",
+        "Unit test: options have label extracted from label attribute and description from inner text",
+        "Negative: does NOT modify analyze_output() or IterationOutcome",
+        "Known-bad: parsing that only finds first tag would miss subsequent ones — test with 2+ tags"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Model after extract_reorder_task_id() in src/loop_engine/detection.rs:71-86. Use string find/split, not regex. Import KeyDecision and KeyDecisionOption from config.rs.",
+      "touchesFiles": ["src/loop_engine/detection.rs"],
+      "dependsOn": ["FEAT-001"]
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Add key_decisions DB table via migration v12",
+      "description": "Create migration v12 adding key_decisions table to tasks.db.\n\nSchema:\n```sql\nCREATE TABLE key_decisions (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id TEXT NOT NULL REFERENCES runs(run_id),\n    task_id TEXT REFERENCES tasks(id),\n    iteration INTEGER NOT NULL,\n    title TEXT NOT NULL,\n    description TEXT NOT NULL,\n    options TEXT NOT NULL,\n    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved', 'deferred')),\n    resolution TEXT,\n    resolved_at TEXT,\n    created_at TEXT NOT NULL DEFAULT (datetime('now'))\n);\n```\n\nDO: Follow exact pattern of v11.rs. Include indexes on run_id and status. Include down_sql that drops the table.\nDO NOT: Forget to register in migrations/mod.rs and bump CURRENT_SCHEMA_VERSION to 12.",
+      "acceptanceCriteria": [
+        "Positive: src/db/migrations/v12.rs exists with MIGRATION static",
+        "Positive: up_sql creates key_decisions table with all columns and CHECK constraint",
+        "Positive: up_sql creates idx_key_decisions_run_id and idx_key_decisions_status indexes",
+        "Positive: down_sql drops table and indexes",
+        "Positive: migrations/mod.rs imports v12 and adds &v12::MIGRATION to MIGRATIONS array",
+        "Positive: CURRENT_SCHEMA_VERSION updated to 12",
+        "Unit test: migration up creates table (can INSERT a row)",
+        "Unit test: migration down drops table",
+        "Negative: options column stores JSON but is typed TEXT (SQLite has no JSON type)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Pattern: src/db/migrations/v11.rs is the template. Register in src/db/migrations/mod.rs — add `mod v12;` and append `&v12::MIGRATION` to MIGRATIONS. Bump CURRENT_SCHEMA_VERSION from 11 to 12.",
+      "touchesFiles": ["src/db/migrations/v12.rs", "src/db/migrations/mod.rs"],
+      "dependsOn": []
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Add key_decisions DB operations module",
+      "description": "Create src/db/schema/key_decisions.rs with insert, query, and update functions.\n\nDO: Follow patterns from src/db/schema/learnings.rs and runs.rs. Use parameterized queries. Serialize options as JSON via serde_json.\nDO NOT: Add create_table DDL here — that's in the migration. Don't add to create_schema() since the table is migration-only.\n\nFunctions needed:\n- insert_key_decision(conn, run_id, task_id, iteration, decision) -> Result<i64>\n- get_pending_decisions(conn, run_id) -> Result<Vec<StoredKeyDecision>>\n- get_all_pending_decisions(conn) -> Result<Vec<StoredKeyDecision>> (across all runs, for resurface)\n- resolve_decision(conn, id, resolution) -> Result<()>\n- defer_decision(conn, id) -> Result<()>",
+      "acceptanceCriteria": [
+        "Positive: src/db/schema/key_decisions.rs exists with all 5 functions",
+        "Positive: insert_key_decision serializes options as JSON text",
+        "Positive: get_pending_decisions filters by run_id AND status IN ('pending', 'deferred')",
+        "Positive: get_all_pending_decisions filters by status IN ('pending', 'deferred') across all runs",
+        "Positive: resolve_decision sets status='resolved', resolution=text, resolved_at=datetime('now')",
+        "Positive: defer_decision sets status='deferred'",
+        "Positive: StoredKeyDecision struct includes id, run_id, task_id, iteration, title, description, options, status, created_at",
+        "Positive: src/db/schema/mod.rs updated to include pub mod key_decisions",
+        "Negative: no create_table in this module — table comes from migration v12",
+        "Negative: no unwrap() — use map_err(TaskMgrError::DatabaseError)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "Follow patterns from src/db/schema/learnings.rs for query structure. Register module in src/db/schema/mod.rs. StoredKeyDecision should deserialize options from JSON text back to Vec<KeyDecisionOption>. Reuse KeyDecisionOption from loop_engine::config or define a parallel DB struct.",
+      "touchesFiles": ["src/db/schema/key_decisions.rs", "src/db/schema/mod.rs"],
+      "dependsOn": ["FEAT-003"]
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Wire key-decision extraction into iteration loop",
+      "description": "After analyze_output() in run_iteration(), call extract_key_decisions() and store results in DB.\n\nDO: Call extract_key_decisions() on result.output after the iteration completes. Insert each decision into DB via insert_key_decision(). Add key_decisions field to IterationResult so the engine can track count per session.\nDO NOT: Change IterationOutcome based on key decisions. Don't stop/pause the loop.\n\nEdge cases:\n- DB insert fails → log warning, continue (non-fatal)\n- No key decisions in output → no-op\n- Multiple decisions in one iteration → insert all",
+      "acceptanceCriteria": [
+        "Positive: extract_key_decisions() called on result.output in the post-iteration section of run_loop()",
+        "Positive: each extracted KeyDecision is inserted via insert_key_decision()",
+        "Positive: DB errors on insert are logged as warnings, not fatal",
+        "Positive: iteration number and current task_id passed to insert_key_decision()",
+        "Negative: IterationOutcome is NOT modified by key decisions",
+        "Negative: Loop does NOT stop or pause when key decisions are found",
+        "Failure mode: if insert fails, log warning and continue — never abort loop for a key decision"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "Integration point is in engine.rs run_loop(), around line 1162 (after progress logging, before task completion checks). The conn and run_id are available in scope. Use result.output and iteration variable. task_id is result.task_id.as_deref().",
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["FEAT-002", "FEAT-004"]
+    },
+    {
+      "id": "FEAT-006",
+      "title": "Add session-end key decision prompting",
+      "description": "After the main loop exits but before the final banner, query pending decisions and prompt user.\n\nDO: Insert between Step 19 (end run) and Step 22 (final banner) in run_loop(). Query get_pending_decisions(conn, run_id). For each, display a banner with title, description, lettered options, plus a 'Skip (defer)' option. Read stdin for user choice. Call resolve_decision() or defer_decision().\nDO NOT: Prompt in yes_mode — auto-defer all decisions when running non-interactively. Don't block on SIGINT exits (exit_code 130).\n\nEdge cases:\n- No pending decisions → skip entirely (no banner)\n- User enters invalid input → re-prompt\n- User enters empty line → defer that decision\n- yes_mode → auto-defer all\n- SIGINT exit → skip prompting entirely",
+      "acceptanceCriteria": [
+        "Positive: pending decisions queried after loop ends, before final banner",
+        "Positive: each decision displayed with title, description, lettered options (A, B, C...), plus 'Skip' option",
+        "Positive: user input reads from stdin, resolves or defers the decision",
+        "Positive: in yes_mode, all decisions auto-deferred without prompting",
+        "Positive: on SIGINT exit (exit_code 130), skip prompting entirely",
+        "Positive: empty input or 'skip' defers the decision",
+        "Positive: banner uses box-drawing characters consistent with display module style",
+        "Negative: does NOT prompt when there are no pending decisions",
+        "Negative: does NOT block on signal exits"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "Insert around engine.rs line 1500 (after Step 20, before Step 21 cleanup). Use the existing stdin reading pattern from worktree cleanup prompt (line 1517-1519). Display functions should go in display.rs if there's one, or inline in engine.rs. Check exit_code != 130 before prompting.",
+      "touchesFiles": ["src/loop_engine/engine.rs"],
+      "dependsOn": ["FEAT-005"]
+    },
+    {
+      "id": "FEAT-007",
+      "title": "Add key-decision instruction to prompt builder and resurface deferred decisions at session start",
+      "description": "Two changes:\n\n1. In prompt.rs build_prompt(), add a trimmable section explaining the <key-decision> tag format to Claude. For CODE-REVIEW and VERIFY tasks, add emphasis to actively look for architectural alternatives.\n\n2. In engine.rs run_loop(), after Step 12 (begin run) and before Step 15 (banner), query get_all_pending_decisions() and display any deferred decisions from previous sessions.\n\nDO: Add key-decision instructions as a trimmable section (like steering/guidance). Check task_id prefix to detect review tasks. Display deferred decisions at startup with their context.\nDO NOT: Make the key-decision instruction a critical section — it's nice-to-have context, not essential.",
+      "acceptanceCriteria": [
+        "Positive: build_prompt() includes key-decision tag format explanation as a trimmable section",
+        "Positive: for tasks with id containing 'REVIEW' or 'VERIFY', extra emphasis added to look for architectural alternatives",
+        "Positive: trimmable section includes the exact XML tag format with example",
+        "Positive: at session start, deferred decisions from any previous run are displayed",
+        "Positive: if no deferred decisions exist, nothing is printed at startup",
+        "Negative: key-decision instruction is NOT a critical section — can be trimmed if budget tight",
+        "Negative: does NOT crash if key_decisions table doesn't exist yet (pre-v12 DB)"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Prompt builder integration point: src/loop_engine/prompt.rs around line 191+ where trimmable sections are built. Follow the pattern of steering/guidance sections. For session-start display: insert in engine.rs around line 1040 (after reconciliation, before signal handler). Wrap DB query in a match to gracefully handle missing table.",
+      "touchesFiles": ["src/loop_engine/prompt.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["FEAT-005"]
+    },
+    {
+      "id": "FEAT-008",
+      "title": "Update PRD skill to prompt on architectural decision points",
+      "description": "Add Step 4.7 to .claude/commands/prd.md between Step 4.5 (Define Public Contracts) and Step 5 (Generate PRD).\n\nDO: Add clear instruction that when 2+ viable approaches exist with no clear winner:\n- High-impact (affects PRD structure, multiple user stories, fundamental design): STOP and ask user inline with lettered options\n- Lower-impact (implementation detail): Document in Section 7 Open Questions with [ARCH DECISION] tag\nDO NOT: Change any existing steps. Don't restructure the PRD template.",
+      "acceptanceCriteria": [
+        "Positive: Step 4.7 'Architectural Decision Points' added between Step 4.5 and Step 5",
+        "Positive: clear guidance on high-impact vs lower-impact decision classification",
+        "Positive: high-impact decisions trigger inline user prompt with lettered options",
+        "Positive: lower-impact decisions documented in Section 7 with [ARCH DECISION] tag",
+        "Positive: guidance text includes example of when to stop vs when to document",
+        "Negative: no existing steps modified or renumbered",
+        "Negative: PRD template structure in Step 5 unchanged"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "File: .claude/commands/prd.md. Insert after the Step 4.5 section (around line 182) and before Step 5 (line 184). Keep concise — ~15-20 lines. Follow the formatting style of existing steps (###, bold keywords, bullet points).",
+      "touchesFiles": [".claude/commands/prd.md"],
+      "dependsOn": []
+    },
+    {
+      "id": "REVIEW-001",
+      "title": "Code review + final verification",
+      "description": "Review all implementation for quality, security, integration wiring. Run full test suite.\n\nDO: Check every new function for error handling, check callers still work, verify no dead code. Verify extract_key_decisions() handles all edge cases. Verify DB operations use parameterized queries. Verify engine integration doesn't break existing flow.\nDO NOT: Skip the integration wiring check — verify key decisions flow end-to-end from detection → DB → session-end prompt.",
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: extract_key_decisions() tests cover all edge cases listed in FEAT-002",
+        "Positive: v12 migration tested up and down",
+        "Positive: DB operations use parameterized queries (no SQL injection)",
+        "Positive: session-end prompting gracefully handles yes_mode and signal exits",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings for new code",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-98"
+      ],
+      "priority": 99,
+      "passes": false,
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'.",
+      "touchesFiles": [
+        "src/loop_engine/config.rs",
+        "src/loop_engine/detection.rs",
+        "src/db/migrations/v12.rs",
+        "src/db/migrations/mod.rs",
+        "src/db/schema/key_decisions.rs",
+        "src/db/schema/mod.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prompt.rs",
+        ".claude/commands/prd.md"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "FEAT-008"]
+    }
+  ]
+}
