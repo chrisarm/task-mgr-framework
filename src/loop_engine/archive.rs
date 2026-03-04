@@ -102,7 +102,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     };
 
     // Discover files to archive (prefer prd_files table, fall back to project name)
-    let files_to_archive = discover_archivable_files(&conn, &tasks_dir, &info.project)?;
+    let files_to_archive = discover_archivable_files(&conn, &tasks_dir, info.id, &info.project)?;
 
     let mut archived_items = Vec::new();
     for source in &files_to_archive {
@@ -252,16 +252,16 @@ fn strip_branch_prefix(branch: &str) -> String {
 ///
 /// Prefers the `prd_files` table (v6+) for accurate file discovery.
 /// Falls back to project-name-based guessing for pre-v6 databases.
-/// Always includes `progress.txt` if it exists (not tracked in prd_files).
 fn discover_archivable_files(
     conn: &rusqlite::Connection,
     tasks_dir: &Path,
+    prd_id: i64,
     project: &str,
 ) -> TaskMgrResult<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     // Try prd_files table first (v6+ databases)
-    let prd_file_paths = query_prd_files(conn);
+    let prd_file_paths = query_prd_files(conn, prd_id);
 
     if !prd_file_paths.is_empty() {
         // Use paths from the database
@@ -287,21 +287,16 @@ fn discover_archivable_files(
         }
     }
 
-    // Always include progress.txt (not tracked in prd_files)
-    let progress_path = tasks_dir.join("progress.txt");
-    if progress_path.exists() {
-        files.push(progress_path);
-    }
-
     Ok(files)
 }
 
-/// Query the prd_files table for file paths. Returns empty vec if table doesn't exist.
-fn query_prd_files(conn: &rusqlite::Connection) -> Vec<String> {
+/// Query the prd_files table for file paths scoped to a specific PRD.
+/// Returns empty vec if table doesn't exist or has no rows for this prd_id.
+fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> Vec<String> {
     let result: Result<Vec<String>, rusqlite::Error> = (|| {
-        let mut stmt = conn.prepare("SELECT file_path FROM prd_files WHERE prd_id = 1")?;
+        let mut stmt = conn.prepare("SELECT file_path FROM prd_files WHERE prd_id = ?")?;
         let paths = stmt
-            .query_map([], |row| row.get(0))?
+            .query_map(rusqlite::params![prd_id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(paths)
     })();
@@ -605,8 +600,8 @@ mod tests {
         fs::write(tasks_dir.join("progress.txt"), "# Progress").unwrap();
         fs::write(tasks_dir.join("unrelated.txt"), "other").unwrap();
 
-        let files = discover_archivable_files(&conn, tasks_dir, "my-project").unwrap();
-        assert_eq!(files.len(), 4);
+        let files = discover_archivable_files(&conn, tasks_dir, 1, "my-project").unwrap();
+        assert_eq!(files.len(), 3);
 
         let filenames: Vec<String> = files
             .iter()
@@ -615,7 +610,7 @@ mod tests {
         assert!(filenames.contains(&"my-project.json".to_string()));
         assert!(filenames.contains(&"my-project-prompt.md".to_string()));
         assert!(filenames.contains(&"prd-my-project.md".to_string()));
-        assert!(filenames.contains(&"progress.txt".to_string()));
+        assert!(!filenames.contains(&"progress.txt".to_string()));
         assert!(!filenames.contains(&"unrelated.txt".to_string()));
     }
 
@@ -626,7 +621,7 @@ mod tests {
         crate::db::create_schema(&conn).unwrap();
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
-        let files = discover_archivable_files(&conn, dir.path(), "nonexistent").unwrap();
+        let files = discover_archivable_files(&conn, dir.path(), 1, "nonexistent").unwrap();
         assert!(files.is_empty());
     }
 
@@ -970,7 +965,7 @@ mod tests {
         // (prd_files takes precedence over project-name guessing)
         fs::write(tasks_dir.join("model-selection.json"), "{}").unwrap();
 
-        let files = discover_archivable_files(&conn, tasks_dir, "model-selection").unwrap();
+        let files = discover_archivable_files(&conn, tasks_dir, 1, "model-selection").unwrap();
 
         let filenames: Vec<String> = files
             .iter()
