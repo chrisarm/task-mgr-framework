@@ -1,11 +1,11 @@
-/// Output detection engine for analyzing Claude subprocess results.
-///
-/// Determines the `IterationOutcome` by inspecting the Claude process's
-/// stdout output and exit code. Checks for completion signals, blockers,
-/// reorder requests, rate-limit errors, crashes, and empty output.
-///
-/// Priority order (highest to lowest):
-/// Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
+//! Output detection engine for analyzing Claude subprocess results.
+//!
+//! Determines the `IterationOutcome` by inspecting the Claude process's
+//! stdout output and exit code. Checks for completion signals, blockers,
+//! reorder requests, rate-limit errors, crashes, and empty output.
+//!
+//! Priority order (highest to lowest):
+//! Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
 use std::path::Path;
 
 use crate::loop_engine::config::{CrashType, IterationOutcome};

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
+use rusqlite::OptionalExtension;
+
 use crate::db::open_connection;
 use crate::TaskMgrResult;
 
@@ -392,9 +394,6 @@ fn append_learnings_to_file(path: &Path, learnings: &[String]) -> TaskMgrResult<
 
     Ok(())
 }
-
-// Import optional() for rusqlite
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
