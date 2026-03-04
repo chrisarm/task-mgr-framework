@@ -28,6 +28,7 @@ pub mod status;
 pub mod status_display;
 pub mod status_queries;
 pub mod usage;
+pub mod watchdog;
 pub mod worktree;
 
 #[cfg(test)]

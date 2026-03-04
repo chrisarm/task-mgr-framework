@@ -52,6 +52,7 @@ use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status::read_task_prefix_from_prd;
 use crate::loop_engine::usage::{self, UsageCheckResult};
+use crate::loop_engine::watchdog;
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
 use crate::TaskMgrResult;
@@ -440,7 +441,7 @@ pub fn run_iteration(
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
     let monitor_handle = monitor::start_monitor(params.project_root);
-    let timeout_config = claude::TimeoutConfig::from_difficulty(
+    let timeout_config = watchdog::TimeoutConfig::from_difficulty(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
