@@ -218,10 +218,39 @@ pub(crate) fn query_distinct_prefixes(conn: &Connection) -> TaskMgrResult<Vec<St
     Ok(prefixes)
 }
 
-/// Read the active loop lock and return the prefix of the lock holder, if any.
-pub(crate) fn read_active_lock_prefix(dir: &Path) -> Option<String> {
-    let lock_path = dir.join("loop.lock");
-    LockGuard::read_holder_info(&lock_path).and_then(|info| info.prefix)
+/// Read active loop locks and return the prefixes of all lock holders.
+///
+/// Scans for per-prefix lock files (`loop-{prefix}.lock`) as well as the
+/// legacy global `loop.lock`. Returns an empty vec if no active locks found.
+pub(crate) fn read_active_lock_prefixes(dir: &Path) -> Vec<String> {
+    let mut prefixes = Vec::new();
+
+    // Check per-prefix lock files: loop-*.lock
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("loop-") && name_str.ends_with(".lock") {
+                if let Some(info) = LockGuard::read_holder_info(&entry.path()) {
+                    if let Some(p) = info.prefix {
+                        prefixes.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check legacy global lock file
+    let global_lock = dir.join("loop.lock");
+    if let Some(info) = LockGuard::read_holder_info(&global_lock) {
+        if let Some(p) = info.prefix {
+            if !prefixes.contains(&p) {
+                prefixes.push(p);
+            }
+        }
+    }
+
+    prefixes
 }
 
 /// Read deadline info from .deadline-* files in the tasks directory.
@@ -566,5 +595,66 @@ mod tests {
         assert!(result.expired);
         assert_eq!(result.seconds_remaining, 0);
         assert_eq!(result.time_remaining, "expired");
+    }
+
+    #[test]
+    fn test_read_active_lock_prefixes_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let prefixes = read_active_lock_prefixes(temp_dir.path());
+        assert!(prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_read_active_lock_prefixes_finds_per_prefix_locks() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        // Write per-prefix lock files with prefix metadata
+        fs::write(
+            dir.join("loop-abc123.lock"),
+            "100@testhost\nprefix=abc123\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("loop-def456.lock"),
+            "200@testhost\nprefix=def456\n",
+        )
+        .unwrap();
+
+        let prefixes = read_active_lock_prefixes(dir);
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains(&"abc123".to_string()));
+        assert!(prefixes.contains(&"def456".to_string()));
+    }
+
+    #[test]
+    fn test_read_active_lock_prefixes_includes_global_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        // Write a global loop.lock with prefix metadata
+        fs::write(dir.join("loop.lock"), "100@testhost\nprefix=global1\n").unwrap();
+
+        let prefixes = read_active_lock_prefixes(dir);
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0], "global1");
+    }
+
+    #[test]
+    fn test_read_active_lock_prefixes_no_duplicate_from_global() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        // Both per-prefix and global lock with same prefix
+        fs::write(
+            dir.join("loop-abc123.lock"),
+            "100@testhost\nprefix=abc123\n",
+        )
+        .unwrap();
+        fs::write(dir.join("loop.lock"), "100@testhost\nprefix=abc123\n").unwrap();
+
+        let prefixes = read_active_lock_prefixes(dir);
+        assert_eq!(prefixes.len(), 1, "should deduplicate: {:?}", prefixes);
+        assert_eq!(prefixes[0], "abc123");
     }
 }

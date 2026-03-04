@@ -12,7 +12,7 @@ use crate::TaskMgrResult;
 
 use super::status_queries::{
     query_dashboard_task_counts, query_distinct_prefixes, query_pending_tasks, query_project_info,
-    read_active_lock_prefix, read_deadline_info, read_task_prefix_from_prd as _read_task_prefix,
+    read_active_lock_prefixes, read_deadline_info, read_task_prefix_from_prd as _read_task_prefix,
 };
 
 // Re-export public API used by external callers.
@@ -158,7 +158,7 @@ pub fn show_status(
     let prd_summaries = if task_prefix.is_none() {
         let prefixes = query_distinct_prefixes(&conn)?;
         if prefixes.len() >= 2 {
-            let active_lock_prefix = read_active_lock_prefix(dir);
+            let active_lock_prefixes = read_active_lock_prefixes(dir);
             prefixes
                 .into_iter()
                 .map(|p| {
@@ -168,7 +168,7 @@ pub fn show_status(
                     } else {
                         0.0
                     };
-                    let active_lock = active_lock_prefix.as_deref() == Some(&p);
+                    let active_lock = active_lock_prefixes.iter().any(|lp| lp == &p);
                     Ok(PrdSummary {
                         prefix: p,
                         total: counts.total,

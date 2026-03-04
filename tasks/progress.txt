@@ -1,4 +1,17 @@
 
+## 2026-03-04 - lockfix-REFACTOR-003
+- Fixed stale comment at step 6.6 claiming "no other loop can be running" — now reflects per-prefix concurrency
+- Moved lock enrichment (write_holder_info_extended) from step 7.1 to step 4.55, immediately after lock acquisition, eliminating redundant late write
+- Replaced `read_active_lock_prefix()` (checked only global `loop.lock`) with `read_active_lock_prefixes()` that scans for all `loop-{prefix}.lock` files — fixes status dashboard showing wrong active lock state
+- Updated LOCK_HINT_NO_PID to not hardcode `tasks.db.lock` path
+- Removed stale `todo!()` stub comment from prefix.rs module doc
+- Updated lock.rs module doc to reference `loop-{prefix}.lock` instead of just `loop.lock`
+- Fixed duplicate "Step 7.1" label (enrichment + reconcile were both labeled 7.1)
+- Added 4 new tests for read_active_lock_prefixes
+- Files changed: engine.rs, status_queries.rs, status.rs, lock.rs, prefix.rs, error.rs
+- **Learnings:** When upgrading from single-lock to multi-lock, search for all code that reads lock state (not just writes) — the status dashboard was still reading only the old global lock file.
+---
+
 ## 2026-03-03 - KDP-FEAT-006
 - Added `prompt_pending_key_decisions()` to engine.rs, called between step 21.5 and step 22
 - In yes_mode: auto-defers all pending decisions; on exit_code 130: skips entirely
@@ -1194,4 +1207,22 @@
 - Updated `pre_lock_prefix` in engine.rs step 4.5 with `.or_else()` fallback to generate_prefix
 - Added 5 unit tests (3 in status_queries, 2 in engine)
 - **Learnings:** `generate_prefix` was `fn` (private); needed `pub fn`. Engine imports use `status` re-exports for some helpers but `status_queries` is also pub-accessible directly.
+---
+
+## 2026-03-04 - lockfix-REFACTOR-001
+- Added `PrdHints` struct and `read_prd_hints()` to status_queries.rs (single file parse returns both task_prefix and branch_name)
+- Made `read_task_prefix_from_prd` and `read_branch_name_from_prd` thin wrappers delegating to `read_prd_hints`
+- Updated engine.rs step 4.5: single `read_prd_hints` call, extracted `pre_lock_branch` before moving `task_prefix`
+- Updated engine.rs step 6.55: replaced `read_task_prefix_from_prd` re-read with `pre_lock_prefix.clone()`
+- Added 4 unit tests for `read_prd_hints` (both fields, prefix only, missing file, invalid JSON)
+- Files changed: src/loop_engine/status_queries.rs, src/loop_engine/engine.rs
+- **Learnings:** When consuming a struct field via `.or_else()`, extract the second field first to avoid partial-move errors in the closure. The `let branch = hints.branch_name; hints.task_prefix.or_else(|| use branch)` pattern works cleanly.
+---
+
+## 2026-03-04 - lockfix-REFACTOR-002
+- Updated lock conflict error messages in engine.rs lines 743-767
+- Both branches (prefix and global lock) now include PRD filename via `prd_display`
+- Added hint lines explaining per-prefix lock file behavior
+- Files changed: src/loop_engine/engine.rs
+- **Learnings:** `run_config.prd_file.display()` cleanly provides the PRD path for error messages; `{e}` from LockGuard already contains holder info (pid@host prefix=...) so no extra parsing needed
 ---

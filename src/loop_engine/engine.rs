@@ -769,6 +769,19 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     };
 
+    // Step 4.55: Enrich lock file with prefix/branch immediately after acquisition.
+    // pre_lock_prefix and pre_lock_branch are already known from step 4.5.
+    if let Err(e) = loop_lock.write_holder_info_extended(
+        pre_lock_branch.as_deref(),
+        run_config.working_root.to_str(),
+        pre_lock_prefix.as_deref(),
+    ) {
+        eprintln!(
+            "Warning: failed to write extended lock metadata: {} (continuing)",
+            e
+        );
+    }
+
     // Step 4.6: Detect branch change (archive previous PRD if branch switched)
     match branch::detect_branch_change(
         &run_config.source_root,
@@ -846,8 +859,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let early_task_prefix: Option<String> = pre_lock_prefix.clone();
 
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
-    // Safe because we hold the exclusive loop lock — no other loop can be running.
-    // Scoped by prefix so concurrent loops on different PRDs don't reset each other.
+    // Safe because we hold the per-prefix loop lock — no other loop with the same
+    // prefix can be running. (Loops on different prefixes CAN run concurrently.)
+    // Recovery is scoped by prefix so concurrent loops don't reset each other.
     let (recovery_pfx_clause, recovery_pfx_param) = prefix_and(early_task_prefix.as_deref());
     let recovery_sql = format!(
         "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
@@ -909,18 +923,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let mut paths = paths;
     if let Some(ref pfx) = task_prefix {
         paths.progress_file = paths.tasks_dir.join(format!("progress-{}.txt", pfx));
-    }
-
-    // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
-    if let Err(e) = loop_lock.write_holder_info_extended(
-        branch_name.as_deref(),
-        run_config.working_root.to_str(),
-        task_prefix.as_deref(),
-    ) {
-        eprintln!(
-            "Warning: failed to write extended lock metadata: {} (continuing)",
-            e
-        );
     }
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.

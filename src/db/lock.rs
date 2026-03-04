@@ -5,7 +5,7 @@
 //!
 //! Two lock types are supported:
 //! - `acquire()` — short-lived per-command lock (`tasks.db.lock`)
-//! - `acquire_named()` — long-lived named lock (e.g. `loop.lock` held for hours)
+//! - `acquire_named()` — long-lived named lock (e.g. `loop-{prefix}.lock` held for hours)
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use fs2::FileExt;
