@@ -83,6 +83,8 @@ mod tests {
             message:
                 "Would archive 1 file(s) to archive/2026-02-05-feature. 2 learning(s) extracted."
                     .to_string(),
+            prds_archived: Vec::new(),
+            prds_skipped: Vec::new(),
         };
 
         let text = format_text(&result);
@@ -103,6 +105,8 @@ mod tests {
             dry_run: false,
             message: "Archived 1 file(s) to archive/2026-02-05-feature. 0 learning(s) extracted."
                 .to_string(),
+            prds_archived: Vec::new(),
+            prds_skipped: Vec::new(),
         };
 
         let text = format_text(&result);
@@ -119,6 +123,8 @@ mod tests {
             tasks_cleared: 0,
             dry_run: false,
             message: "No archivable files found.".to_string(),
+            prds_archived: Vec::new(),
+            prds_skipped: Vec::new(),
         };
 
         let text = format_text(&result);

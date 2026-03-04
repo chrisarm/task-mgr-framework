@@ -29,6 +29,38 @@ pub struct ArchiveResult {
     pub dry_run: bool,
     /// Human-readable message
     pub message: String,
+    /// Per-PRD archive summaries for successfully archived PRDs
+    pub prds_archived: Vec<PrdArchiveSummary>,
+    /// Per-PRD skip reasons for PRDs that were not archived
+    pub prds_skipped: Vec<PrdSkipReason>,
+}
+
+/// Summary of a single PRD that was successfully archived.
+#[derive(Debug, Serialize)]
+pub struct PrdArchiveSummary {
+    /// Database ID of the PRD
+    pub prd_id: i64,
+    /// Project name
+    pub project: String,
+    /// Task prefix (e.g. "PA")
+    pub task_prefix: String,
+    /// Archive folder name (relative to tasks/archive/)
+    pub archive_folder: String,
+    /// Number of files moved to the archive folder
+    pub files_archived: usize,
+    /// Number of tasks cleared from the database
+    pub tasks_cleared: usize,
+}
+
+/// Reason a PRD was skipped during archiving.
+#[derive(Debug, Serialize)]
+pub struct PrdSkipReason {
+    /// Database ID of the PRD
+    pub prd_id: i64,
+    /// Project name
+    pub project: String,
+    /// Human-readable reason for skipping
+    pub reason: String,
 }
 
 /// A single archived item (file moved or would-be-moved).
@@ -57,6 +89,8 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
             tasks_cleared: 0,
             dry_run,
             message: "No PRD metadata found in database.".to_string(),
+            prds_archived: Vec::new(),
+            prds_skipped: Vec::new(),
         });
     }
     // For now, use the first PRD for single-PRD archive behaviour
@@ -74,6 +108,12 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
                 "PRD '{}' is not fully completed. Only completed PRDs can be archived.",
                 info.project
             ),
+            prds_archived: Vec::new(),
+            prds_skipped: vec![PrdSkipReason {
+                prd_id: info.id,
+                project: info.project.clone(),
+                reason: "Not fully completed".to_string(),
+            }],
         });
     }
 
@@ -166,12 +206,23 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
         )
     };
 
+    let prd_summary = PrdArchiveSummary {
+        prd_id: info.id,
+        project: info.project.clone(),
+        task_prefix: prefix.to_string(),
+        archive_folder: archive_folder_name,
+        files_archived: archived_items.len(),
+        tasks_cleared: task_count,
+    };
+
     Ok(ArchiveResult {
         archived: archived_items,
         learnings_extracted: learnings_count,
         tasks_cleared: task_count,
         dry_run,
         message,
+        prds_archived: vec![prd_summary],
+        prds_skipped: Vec::new(),
     })
 }
 
@@ -701,6 +752,8 @@ mod tests {
             tasks_cleared: 0,
             dry_run: true,
             message: "test".to_string(),
+            prds_archived: Vec::new(),
+            prds_skipped: Vec::new(),
         };
 
         assert_eq!(result.archived.len(), 1);
@@ -708,6 +761,38 @@ mod tests {
         assert!(result.dry_run);
         assert_eq!(result.archived[0].source, "a.json");
         assert_eq!(result.archived[0].destination, "archive/dir/a.json");
+        assert!(result.prds_archived.is_empty());
+        assert!(result.prds_skipped.is_empty());
+    }
+
+    #[test]
+    fn test_prd_archive_summary_fields() {
+        let summary = PrdArchiveSummary {
+            prd_id: 42,
+            project: "my-project".to_string(),
+            task_prefix: "MP".to_string(),
+            archive_folder: "2026-03-03-my-branch".to_string(),
+            files_archived: 3,
+            tasks_cleared: 10,
+        };
+        assert_eq!(summary.prd_id, 42);
+        assert_eq!(summary.project, "my-project");
+        assert_eq!(summary.task_prefix, "MP");
+        assert_eq!(summary.archive_folder, "2026-03-03-my-branch");
+        assert_eq!(summary.files_archived, 3);
+        assert_eq!(summary.tasks_cleared, 10);
+    }
+
+    #[test]
+    fn test_prd_skip_reason_fields() {
+        let skip = PrdSkipReason {
+            prd_id: 7,
+            project: "other-project".to_string(),
+            reason: "Not fully completed".to_string(),
+        };
+        assert_eq!(skip.prd_id, 7);
+        assert_eq!(skip.project, "other-project");
+        assert_eq!(skip.reason, "Not fully completed");
     }
 
     #[test]
