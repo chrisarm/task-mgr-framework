@@ -189,7 +189,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
             )
             .map_err(crate::TaskMgrError::DatabaseError)?;
 
-        if !dry_run && !prd_items.is_empty() {
+        if !dry_run {
             clear_prd_data(&mut conn, prd.id, prefix)?;
         }
 
@@ -2017,6 +2017,67 @@ mod tests {
             pb_count, 0,
             "Naive DELETE FROM tasks destroys all PRDs — \
              this is the anti-pattern clear_prd_data_for_prefix must avoid"
+        );
+    }
+
+    /// A completed PRD with no discoverable files on disk should still have its
+    /// DB data cleared (tasks + prd_metadata row deleted).
+    #[test]
+    fn test_run_archive_completed_prd_no_files_clears_db() {
+        let dir = TempDir::new().unwrap();
+
+        let mut conn = crate::db::open_connection(dir.path()).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'ghost-project', 'main', 'GP')",
+            [],
+        )
+        .unwrap();
+
+        // All tasks done, but no files exist on disk
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('GP-001', 'Done task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // No files created on disk — prd_items will be empty
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // PRD should still be reported as archived (zero files is fine)
+        assert_eq!(result.prds_archived.len(), 1);
+        assert_eq!(result.prds_archived[0].files_archived, 0);
+        assert_eq!(result.prds_archived[0].tasks_cleared, 1);
+        assert_eq!(result.tasks_cleared, 1);
+
+        // DB data must be cleared even though no files were moved
+        let conn = crate::db::open_connection(dir.path()).unwrap();
+        let task_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'GP-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            task_count, 0,
+            "DB tasks should be cleared for completed PRD with no files"
+        );
+
+        let meta_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prd_metadata WHERE task_prefix = 'GP'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            meta_count, 0,
+            "prd_metadata row should be deleted for completed PRD with no files"
         );
     }
 }
