@@ -1,4 +1,14 @@
 
+## 2026-03-03 - p2-refactor-LEARN-002
+- Final pass on P3 tasks after P2 completion
+- Updated P3 description: signals.rs line count corrected 784→781L, added P2 completion summary
+- Updated CODE-REVIEW-1 notes: added P2 final learning about scoping reviews to branch-changed code
+- Updated MILESTONE-1 AC: signals.rs baseline is 781L
+- Verified actual file sizes: oauth.rs 857L, main.rs 836L, signals.rs 781L — all match P3 task notes
+- P3 tasks already well-prepared from LEARN-001; minimal updates needed
+- **Learnings:** P3 task notes were comprehensive from LEARN-001 — final pass was lightweight
+---
+
 ## 2026-03-03 - 2367d40c-REFACTOR-REVIEW-3
 - Reviewed all code changed on this branch: claude.rs (2233 lines), engine.rs, ingestion/mod.rs, extraction.rs, curate/mod.rs, curate/enrich.rs
 - **Issue 1 (REFACTOR-3-001)**: `tee_stream_json` double-parses each JSON line — once for live display (`tee_assistant_text`), then raw strings go to `parse_stream_json_lines` which parses again. Fix: parse once, pass `Value` objects to both consumers. Priority 67, added to VERIFY-001 and MILESTONE-FINAL dependsOn.
@@ -793,4 +803,12 @@
 - Test count: 2264 passed, 0 failed
 - Clippy: zero warnings, fmt: clean
 - **No issues found** — no REFACTOR-3-xxx tasks needed
+---
+
+## 2026-03-03 - p2-refactor-VERIFY-001
+- Final verification suite: all 5 acceptance criteria pass
+- cargo build: success, clippy: 0 warnings, fmt: clean
+- Tests: 2410 passed, 0 failed, 9 ignored
+- File sizes confirmed: status.rs 439L, calibrate.rs 1135L, new modules total 1658L
+- **Learnings:** None — clean verification run
 ---

@@ -4,7 +4,7 @@
   "model": "claude-sonnet-4-6",
   "branchName": "large-file-refactor",
   "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
-  "description": "Phase 3: Decompose Tier 3 files (oauth.rs 857L, main.rs 836L, signals.rs 784L). Continues on the same branch. Note: exploration revealed US-009 and US-010 are smaller than PRD anticipated — oauth.rs has no browser/PKCE/server code, and main.rs has no centralized DB setup block.",
+  "description": "Phase 3: Decompose Tier 3 files (oauth.rs 857L, main.rs 836L, signals.rs 781L). Continues on the same branch. Note: exploration revealed US-009 and US-010 are smaller than PRD anticipated — oauth.rs has no browser/PKCE/server code, and main.rs has no centralized DB setup block. P2 completion verified: all 5 Tier 2 extractions done (watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs, archive_display.rs; detection.rs EXPLICIT_SKIP with section markers). P2 final test count: 2264 passed.",
   "taskPrefix": "p3-refactor",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
@@ -206,7 +206,7 @@
       "estimatedEffort": "medium",
       "model": "claude-opus-4-6",
       "passes": false,
-      "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified. P2 LEARNING: P2 code review found minor issues (wrong doc comment style, misplaced import) that were fixed in-place without CODE-FIX tasks. Reserve CODE-FIX tasks for issues requiring significant changes. Also verify pub vs pub(crate) consistency — P2 found TimeoutConfig was pub when it should have been pub(crate).",
+      "notes": "Some Phase 3 tasks may result in EXPLICIT_SKIP rather than extraction. Review that skip decisions are justified. P2 LEARNING: P2 code review found minor issues (wrong doc comment style, misplaced import) that were fixed in-place without CODE-FIX tasks. Reserve CODE-FIX tasks for issues requiring significant changes. Also verify pub vs pub(crate) consistency — P2 found TimeoutConfig was pub when it should have been pub(crate). P2 FINAL: Scope reviews to branch-changed code only — prevents scope creep while catching real issues.",
       "touchesFiles": [
         "src/loop_engine/oauth.rs",
         "src/loop_engine/token_store.rs",
@@ -277,7 +277,7 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes",
         "cargo fmt --check passes",
-        "If REFACTOR-013 extracted guidance.rs: signals.rs under 700 lines. If REFACTOR-013 was EXPLICIT_SKIP: signals.rs line count documented in progress.txt"
+        "If REFACTOR-013 extracted guidance.rs: signals.rs under 700 lines (baseline: 781L). If REFACTOR-013 was EXPLICIT_SKIP: signals.rs line count documented in progress.txt"
       ],
       "priority": 20,
       "estimatedEffort": "low",
