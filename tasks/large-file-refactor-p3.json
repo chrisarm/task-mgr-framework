@@ -350,7 +350,7 @@
       "estimatedEffort": "low",
       "id": "INT-001",
       "modifiesBehavior": false,
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "synergyWith": [],
       "title": "Integration verification — full CLI smoke test",
