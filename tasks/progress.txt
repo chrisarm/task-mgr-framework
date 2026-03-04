@@ -637,3 +637,50 @@
 - Applied REFACTOR-REVIEW-3 findings: noted tee_stream_json double-parse issue in REFACTOR-006 notes for scope awareness
 - Verified P1 modules exist: git_reconcile.rs (1043L), output_parsing.rs (410L), prd_reconcile.rs (553L), worktree.rs (1068L), prompt_sections/ (5 files, 853L)
 ---
+
+## 2026-03-03 - p2-refactor-TEST-INIT-001
+### Phase 2 Baseline — Post-Phase-1 State
+
+**Test counts (baseline):**
+- Main crate: 2262 passed, 0 failed, 7 ignored
+- Integration/other suites: 41+17+7+18+7+20+9+9+6+7+5+15+7 = 168 passed across subcrates
+- Zero failures, clippy clean, fmt clean
+
+**Line counts (target files):**
+- claude.rs:    2272 lines  (task estimated 1181 — actual is 2x due to stream-json additions in P1 dev)
+- status.rs:    1236 lines
+- archive.rs:   1213 lines
+- calibrate.rs: 1568 lines
+- detection.rs: 1013 lines
+
+**Constants audit:**
+- claude.rs: TIMEOUT_LOW_SECS, TIMEOUT_MEDIUM_SECS, TIMEOUT_HIGH_SECS, INITIAL_EXTENSION_SECS, EXTENSION_DECREMENT_SECS (lines 21-25) — used by TimeoutConfig::from_difficulty → move with watchdog.rs extraction
+- claude.rs: MAX_CONVERSATION_BYTES (58), MAX_TOOL_USE_BYTES (60), MAX_TOOL_RESULT_BYTES (62) — used by spawn_claude → stay in claude.rs
+- claude.rs: GRACE_PERIOD, GRACE_POLL (522-523), POLL_INTERVAL (570, 632) — local test/watchdog consts → stay with their functions
+- calibrate.rs: MIN_TASKS_FOR_CALIBRATION (19), WEIGHT_LOWER_BOUND (22), WEIGHT_UPPER_BOUND (25) — used by DB/orchestrator fns → stay in calibrate.rs
+- calibrate.rs: ADJUSTMENT_FACTOR (202) — local const in fn → stays with fn
+
+**#[allow] annotations:** None found in any of the 5 target files.
+
+**Phase 1 modules verified present:**
+- git_reconcile.rs ✓
+- output_parsing.rs ✓
+- prd_reconcile.rs ✓
+- prompt_sections/ (dependencies.rs, escalation.rs, learnings.rs, mod.rs, synergy.rs) ✓
+- worktree.rs ✓
+
+**#[cfg(unix)] / #[cfg(not(unix))] blocks in claude.rs:**
+- Line 149: #[cfg(unix)] — inline block inside spawn_claude (setpgid)
+- Line 184: #[cfg(unix)] — inline block inside spawn_claude (tcsetpgrp)
+- Line 505: #[cfg(unix)] — inline block (likely in watchdog/kill fn)
+- Line 520: #[cfg(unix)] — top-level fn definition (watchdog_loop unix variant)
+- Line 562: #[cfg(unix)] — top-level fn definition (watchdog_loop unix helper)
+- Line 624: #[cfg(not(unix))] — top-level fn definition (watchdog_loop non-unix variant)
+- Lines 891, 911, 951: #[cfg(unix)] — in test module
+- Lines 1304, 1336: #[cfg(unix)] — in test module
+- Pairing: unix (520+562) + non-unix (624) form the paired watchdog_loop; lines 149/184 stay in spawn_claude
+
+**Learnings for P2:**
+- claude.rs is 2272L not 1181L — milestone targets need adjustment
+- No #[allow] annotations to preserve in target files
+- Timeout constants (lines 21-25) should move with TimeoutConfig into watchdog.rs
