@@ -129,7 +129,6 @@ fn archive_single_prd(
         if file_name == "progress.txt" {
             continue;
         }
-        let dest = archive_dir.join(&file_name);
         items.push(ArchivedItem {
             source: source
                 .strip_prefix(tasks_dir)
@@ -138,7 +137,18 @@ fn archive_single_prd(
                 .to_string(),
             destination: format!("archive/{}/{}", archive_folder_name, file_name),
         });
-        if !dry_run {
+    }
+
+    let task_count = if dry_run {
+        let like_pattern = make_like_pattern(prefix);
+        conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            rusqlite::params![like_pattern],
+            |row| row.get::<_, usize>(0),
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?
+    } else {
+        if !items.is_empty() {
             fs::create_dir_all(&archive_dir).map_err(|e| {
                 crate::TaskMgrError::io_error(
                     archive_dir.display().to_string(),
@@ -146,28 +156,20 @@ fn archive_single_prd(
                     e,
                 )
             })?;
-            fs::rename(source, &dest).map_err(|e| {
-                crate::TaskMgrError::io_error(
-                    source.display().to_string(),
-                    "moving file to archive",
-                    e,
-                )
-            })?;
+            for item in &items {
+                let source = tasks_dir.join(&item.source);
+                let dest = archive_dir.join(source.file_name().unwrap_or_default());
+                fs::rename(&source, &dest).map_err(|e| {
+                    crate::TaskMgrError::io_error(
+                        source.display().to_string(),
+                        "moving file to archive",
+                        e,
+                    )
+                })?;
+            }
         }
-    }
-
-    let like_pattern = make_like_pattern(prefix);
-    let task_count: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
-            rusqlite::params![like_pattern],
-            |row| row.get(0),
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    if !dry_run {
-        clear_prd_data(conn, prd.id, prefix)?;
-    }
+        clear_prd_data(conn, prd.id, prefix)?
+    };
 
     Ok(PrdArchiveOutcome::Archived {
         summary: PrdArchiveSummary {
@@ -272,6 +274,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
 }
 
 /// A single row from the prd_metadata table.
+#[derive(Debug)]
 pub struct PrdRecord {
     pub id: i64,
     pub project: String,
@@ -357,7 +360,7 @@ fn discover_archivable_files(
     let mut files = Vec::new();
 
     // Try prd_files table first (v6+ databases)
-    let prd_file_paths = query_prd_files(conn, prd_id);
+    let prd_file_paths = query_prd_files(conn, prd_id)?;
 
     if !prd_file_paths.is_empty() {
         // Use paths from the database
@@ -387,17 +390,27 @@ fn discover_archivable_files(
 }
 
 /// Query the prd_files table for file paths scoped to a specific PRD.
-/// Returns empty vec if table doesn't exist or has no rows for this prd_id.
-fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> Vec<String> {
-    let result: Result<Vec<String>, rusqlite::Error> = (|| {
-        let mut stmt = conn.prepare("SELECT file_path FROM prd_files WHERE prd_id = ?")?;
-        let paths = stmt
-            .query_map(rusqlite::params![prd_id], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(paths)
-    })();
+/// Returns empty vec if table doesn't exist (pre-v6 databases).
+/// Propagates other database errors.
+fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> TaskMgrResult<Vec<String>> {
+    let mut stmt = match conn.prepare("SELECT file_path FROM prd_files WHERE prd_id = ?") {
+        Ok(s) => s,
+        Err(e) => {
+            // Table may not exist in pre-v6 databases — treat as empty
+            if e.to_string().contains("no such table") {
+                return Ok(Vec::new());
+            }
+            return Err(crate::TaskMgrError::DatabaseError(e));
+        }
+    };
 
-    result.unwrap_or_default()
+    let paths = stmt
+        .query_map(rusqlite::params![prd_id], |row| row.get(0))
+        .map_err(crate::TaskMgrError::DatabaseError)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    Ok(paths)
 }
 
 /// Clear task data scoped to a single PRD.
@@ -1106,6 +1119,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Tests for query_all_prds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_query_all_prds_empty_table() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        let prds = query_all_prds(&conn).unwrap();
+        assert!(prds.is_empty());
+    }
+
+    #[test]
+    fn test_query_all_prds_returns_ordered_by_id() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        insert_prd(&conn, 3, "project-c", "main", Some("PC"));
+        insert_prd(&conn, 1, "project-a", "feat/a", Some("PA"));
+        insert_prd(&conn, 2, "project-b", "feat/b", None);
+
+        let prds = query_all_prds(&conn).unwrap();
+        assert_eq!(prds.len(), 3);
+        assert_eq!(prds[0].id, 1);
+        assert_eq!(prds[1].id, 2);
+        assert_eq!(prds[2].id, 3);
+    }
+
+    #[test]
+    fn test_query_all_prds_handles_null_fields() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "project-a", "main", None);
+
+        let prds = query_all_prds(&conn).unwrap();
+        assert_eq!(prds.len(), 1);
+        assert_eq!(prds[0].project, "project-a");
+        assert!(prds[0].task_prefix.is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // Tests for is_prd_completed_by_prefix
     // -----------------------------------------------------------------------
 
@@ -1320,12 +1372,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests for clear_prd_data_for_prefix
+    // Tests for clear_prd_data
     // -----------------------------------------------------------------------
 
     /// Insert two PRDs' worth of tasks: PA-001/PA-002 (done) and PB-001/PB-002
     /// (in_progress/todo) so tests can assert scoped deletion.
     fn setup_two_prds(conn: &rusqlite::Connection) {
+        insert_prd(conn, 1, "project-a", "feat/a", Some("PA"));
+        insert_prd(conn, 2, "project-b", "feat/b", Some("PB"));
         insert_task(conn, "PA-001", "PA Task 1", 1, "done");
         insert_task(conn, "PA-002", "PA Task 2", 2, "done");
         insert_task(conn, "PB-001", "PB Task 1", 1, "in_progress");

@@ -74,11 +74,12 @@ fn format_archived_prd(
     ));
     out.push_str(&format!("  Archive folder: {}\n", summary.archive_folder));
 
-    // Collect files belonging to this PRD by matching destination path
+    // Collect files belonging to this PRD by matching destination path prefix
+    let dest_prefix = format!("archive/{}/", summary.archive_folder);
     let prd_files: Vec<_> = result
         .archived
         .iter()
-        .filter(|item| item.destination.contains(summary.archive_folder.as_str()))
+        .filter(|item| item.destination.starts_with(&dest_prefix))
         .collect();
 
     for item in &prd_files {
