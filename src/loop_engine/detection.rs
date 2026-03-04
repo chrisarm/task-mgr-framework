@@ -10,6 +10,24 @@ use std::path::Path;
 
 use crate::loop_engine::config::{CrashType, IterationOutcome};
 
+// --- Exit Code Classification ---
+// Maps raw i32 exit codes to typed CrashType variants.
+// Only `categorize_crash` lives here; it is called exclusively by `analyze_output` below.
+// Extraction to a separate module was considered but not warranted: the function is 6 lines
+// and has a single caller in this file. Section markers provide adequate separation.
+
+/// Categorize a crash by its exit code.
+fn categorize_crash(exit_code: i32) -> CrashType {
+    match exit_code {
+        137 => CrashType::OomOrKilled,
+        139 => CrashType::Segfault,
+        _ => CrashType::RuntimeError,
+    }
+}
+
+// --- Output String Analysis ---
+// All functions below inspect Claude's stdout text to classify the iteration outcome.
+
 /// Analyze Claude subprocess output and exit code to determine iteration outcome.
 ///
 /// Checks output patterns in priority order:
@@ -94,15 +112,6 @@ fn is_rate_limited(output: &str) -> bool {
         || output_lower.contains("usage")
             && output_lower.contains("limit")
             && output_lower.contains("reached")
-}
-
-/// Categorize a crash by its exit code.
-fn categorize_crash(exit_code: i32) -> CrashType {
-    match exit_code {
-        137 => CrashType::OomOrKilled,
-        139 => CrashType::Segfault,
-        _ => CrashType::RuntimeError,
-    }
 }
 
 /// Check if Claude's output reports a specific task as already complete.
