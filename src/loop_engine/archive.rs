@@ -46,7 +46,7 @@ pub struct ArchivedItem {
 /// associated files to `tasks/archive/YYYY-MM-DD-<branch>/`, and extracts
 /// learnings from `progress.txt` into `tasks/learnings.md`.
 pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
-    let conn = open_connection(dir)?;
+    let mut conn = open_connection(dir)?;
 
     // Get all PRDs from prd_metadata
     let all_prds = query_all_prds(&conn)?;
@@ -147,7 +147,7 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
 
     // Clear task data from DB after archiving files (preserving learnings)
     if !dry_run && !archived_items.is_empty() {
-        clear_task_data(&conn)?;
+        clear_prd_data(&mut conn, info.id, prefix)?;
     }
 
     let action = if dry_run { "Would archive" } else { "Archived" };
@@ -304,49 +304,114 @@ fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> Vec<String> {
     result.unwrap_or_default()
 }
 
-/// Clear task data from the database, preserving learnings.
+/// Clear task data scoped to a single PRD.
 ///
-/// Deletes from: run_tasks, runs, task_relationships, task_files, tasks,
-/// prd_files, prd_metadata. Resets global_state counters.
-/// Preserves: learnings, learning_tags.
-fn clear_task_data(conn: &rusqlite::Connection) -> TaskMgrResult<()> {
-    conn.execute("DELETE FROM run_tasks", [])
+/// Wraps all deletions in a single transaction. Deletes tasks matching
+/// `{prefix}-%` and all dependent data (run_tasks, orphaned runs,
+/// task_relationships, task_files). Also removes prd_files and prd_metadata
+/// for the given `prd_id`. NULLs out dangling `global_state` references, and
+/// resets `iteration_counter` only when no tasks remain across all PRDs.
+///
+/// Returns the number of tasks deleted.
+fn clear_prd_data(
+    conn: &mut rusqlite::Connection,
+    prd_id: i64,
+    prefix: &str,
+) -> TaskMgrResult<usize> {
+    let pattern = make_like_pattern(prefix);
+
+    let tx = conn
+        .transaction()
         .map_err(crate::TaskMgrError::DatabaseError)?;
-    conn.execute("DELETE FROM runs", [])
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-    conn.execute("DELETE FROM task_relationships", [])
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-    conn.execute("DELETE FROM task_files", [])
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-    conn.execute("DELETE FROM tasks", [])
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-    // prd_files may not exist in pre-v6 databases
-    let _ = conn.execute("DELETE FROM prd_files", []);
-    conn.execute("DELETE FROM prd_metadata", [])
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-    conn.execute(
-        "UPDATE global_state SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL, updated_at = datetime('now') WHERE id = 1",
+
+    // 1. Delete run_tasks for this prefix
+    tx.execute(
+        "DELETE FROM run_tasks WHERE task_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 2. Delete orphaned runs (no remaining run_tasks reference them)
+    tx.execute(
+        "DELETE FROM runs WHERE NOT EXISTS \
+         (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id)",
         [],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
-    Ok(())
-}
 
-/// Clear task data scoped to a single PRD prefix.
-///
-/// Deletes tasks matching `{prefix}-%`, their run_task entries (via CASCADE),
-/// and runs that become orphaned (no remaining run_tasks). Preserves tasks
-/// from other prefixes, all learnings, and global_state counters unless this
-/// is the last prefix — in which case counters are reset. Also NULLs
-/// `global_state.last_task_id` if it references a now-deleted task.
-///
-/// Returns the number of tasks deleted.
-#[allow(dead_code)]
-fn clear_prd_data_for_prefix(conn: &rusqlite::Connection, prefix: &str) -> TaskMgrResult<usize> {
-    // TODO: implement scoped deletion for multi-PRD support (FEAT task)
-    let _ = prefix;
-    let _ = conn;
-    Ok(0)
+    // 3. Delete task_relationships touching this prefix
+    tx.execute(
+        "DELETE FROM task_relationships \
+         WHERE task_id LIKE ? ESCAPE '\\' OR related_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern, pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 4. Delete task_files for this prefix
+    tx.execute(
+        "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 5. Delete tasks and capture the count for reporting
+    let deleted = tx
+        .execute(
+            "DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            rusqlite::params![pattern],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 6. Delete prd_files for this PRD (may not exist in pre-v6 databases)
+    let _ = tx.execute(
+        "DELETE FROM prd_files WHERE prd_id = ?",
+        rusqlite::params![prd_id],
+    );
+
+    // 7. Delete prd_metadata row
+    tx.execute(
+        "DELETE FROM prd_metadata WHERE id = ?",
+        rusqlite::params![prd_id],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 8. NULL out last_task_id if the referenced task no longer exists
+    tx.execute(
+        "UPDATE global_state SET last_task_id = NULL \
+         WHERE id = 1 AND last_task_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = global_state.last_task_id)",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 9. NULL out last_run_id if the referenced run no longer exists
+    tx.execute(
+        "UPDATE global_state SET last_run_id = NULL \
+         WHERE id = 1 AND last_run_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.run_id = global_state.last_run_id)",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 10. Reset counters only when no tasks remain across all PRDs
+    let remaining: i64 = tx
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    if remaining == 0 {
+        tx.execute(
+            "UPDATE global_state \
+             SET iteration_counter = 0, last_task_id = NULL, last_run_id = NULL, \
+                 updated_at = datetime('now') \
+             WHERE id = 1",
+            [],
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+    }
+
+    tx.commit().map_err(crate::TaskMgrError::DatabaseError)?;
+
+    Ok(deleted)
 }
 
 /// Extract learnings from progress.txt.
@@ -1247,10 +1312,10 @@ mod tests {
     #[test]
     fn test_clear_prd_a_leaves_prd_b_intact() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let pa_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%'", [], |r| {
@@ -1284,7 +1349,7 @@ mod tests {
         use crate::models::{Confidence, LearningOutcome};
 
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         let params = RecordLearningParams {
@@ -1303,7 +1368,7 @@ mod tests {
         };
         record_learning(&conn, params).unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
@@ -1314,7 +1379,7 @@ mod tests {
     #[test]
     fn test_clear_prd_a_deletes_orphaned_runs() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         // Run that only references PA tasks — will be orphaned after clear
@@ -1329,7 +1394,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let run_count: i64 = conn
             .query_row(
@@ -1344,7 +1409,7 @@ mod tests {
     #[test]
     fn test_clear_prd_a_preserves_shared_runs() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         // Run that references tasks from both PRDs
@@ -1364,7 +1429,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         // Run must survive because PB-001 still references it
         let run_count: i64 = conn
@@ -1390,7 +1455,7 @@ mod tests {
     #[test]
     fn test_global_state_counters_not_reset_while_other_prd_remains() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         conn.execute(
@@ -1400,7 +1465,7 @@ mod tests {
         .unwrap();
 
         // Clear PA only — PB still has tasks, so counters must NOT reset
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let counter: i64 = conn
             .query_row(
@@ -1418,7 +1483,7 @@ mod tests {
     #[test]
     fn test_global_state_counters_reset_when_last_prd_cleared() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         conn.execute(
@@ -1427,8 +1492,8 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
-        clear_prd_data_for_prefix(&conn, "PB").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        clear_prd_data(&mut conn, 2, "PB").unwrap();
 
         let counter: i64 = conn
             .query_row(
@@ -1446,7 +1511,7 @@ mod tests {
     #[test]
     fn test_global_state_last_task_id_nulled_if_deleted() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         conn.execute(
@@ -1455,7 +1520,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let last_task: Option<String> = conn
             .query_row(
@@ -1473,7 +1538,7 @@ mod tests {
     #[test]
     fn test_global_state_last_task_id_preserved_if_from_other_prd() {
         let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
+        let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
         conn.execute(
@@ -1482,7 +1547,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data_for_prefix(&conn, "PA").unwrap();
+        clear_prd_data(&mut conn, 1, "PA").unwrap();
 
         let last_task: Option<String> = conn
             .query_row(
