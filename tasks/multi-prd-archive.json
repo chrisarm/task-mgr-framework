@@ -1,11 +1,18 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "feat/multi-prd-archive",
-  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "Update the archive command to iterate all PRDs by task_prefix and archive completed ones independently, with scoped DB cleanup and per-PRD reporting.",
-  "taskPrefix": "multi-archive",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -21,29 +28,18 @@
       "Handle Option/Result explicitly; avoid unwrap() in production code"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "No breaking changes to existing APIs unless explicitly required"
-    ]
-  },
+  "project": "task-mgr",
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "multi-archive",
   "userStories": [
     {
-      "id": "TEST-INIT-001",
-      "title": "Initial tests for per-prefix completion check",
-      "description": "Write tests for is_prd_completed_by_prefix() BEFORE implementation. Must verify prefix scoping, zero-task handling, and terminal state logic.",
       "acceptanceCriteria": [
         "Test: prefix with all tasks done returns true",
         "Test: prefix with one todo task returns false",
@@ -53,34 +49,41 @@
         "Known-bad discriminator: test that rejects global (non-prefix-scoped) completion check",
         "Test file compiles (tests may fail until implementation)"
       ],
-      "priority": 1,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "TDD: Write before implementation. Use make_like_pattern from crate::db::prefix. Tests go in archive.rs #[cfg(test)] module.",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for is_prd_completed_by_prefix() BEFORE implementation. Must verify prefix scoping, zero-task handling, and terminal state logic.",
       "edgeCases": [
         "NULL task_prefix: function should not be called with empty string — caller skips these",
         "Prefix P1 must not match P10 tasks (dash separator prevents cross-prefix contamination)",
         "All tasks in terminal states (done/skipped/irrelevant) = completed",
         "Zero matching tasks = not completed (metadata exists but tasks deleted)"
       ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "LIKE pattern without dash separator",
+          "expectedBehavior": "Must use prefix-% not prefix% to avoid cross-prefix matching"
+        }
+      ],
+      "id": "TEST-INIT-001",
       "invariants": [
         "is_prd_completed_by_prefix returns false when total == 0",
         "is_prd_completed_by_prefix returns true only when non_terminal == 0 AND total > 0"
       ],
-      "failureModes": [
-        {"cause": "LIKE pattern without dash separator", "expectedBehavior": "Must use prefix-% not prefix% to avoid cross-prefix matching"}
+      "modifiesBehavior": false,
+      "notes": "TDD: Write before implementation. Use make_like_pattern from crate::db::prefix. Tests go in archive.rs #[cfg(test)] module.",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [
+        "TEST-INIT-002"
       ],
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": [],
-      "synergyWith": ["TEST-INIT-002"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Initial tests for per-prefix completion check",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "TEST-INIT-002",
-      "title": "Initial tests for scoped PRD data cleanup",
-      "description": "Write tests for clear_prd_data() BEFORE implementation. Must verify only the target PRD's data is deleted, other PRDs' data is preserved, and learnings survive.",
       "acceptanceCriteria": [
         "Test: after clearing PRD A, PRD B's tasks remain with correct statuses",
         "Test: after clearing PRD A, learnings table is untouched",
@@ -91,35 +94,45 @@
         "Known-bad discriminator: test that rejects DELETE FROM tasks without WHERE clause",
         "Test file compiles"
       ],
-      "priority": 2,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "TDD: Write before implementation. Set up two PRDs with prefixed task IDs. Verify scoped deletion.",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for clear_prd_data() BEFORE implementation. Must verify only the target PRD's data is deleted, other PRDs' data is preserved, and learnings survive.",
       "edgeCases": [
         "Run shared between two PRDs: only delete run_tasks for archived prefix, keep run if other tasks reference it",
         "global_state.last_task_id points to a task being deleted: must NULL it out",
         "Last PRD archived: reset global_state counters entirely"
       ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Unscoped DELETE FROM tasks (no WHERE clause)",
+          "expectedBehavior": "Only tasks matching prefix are deleted"
+        },
+        {
+          "cause": "Transaction not used — crash after partial deletion",
+          "expectedBehavior": "All-or-nothing cleanup per PRD"
+        }
+      ],
+      "id": "TEST-INIT-002",
       "invariants": [
         "Learnings table row count never decreases during archive",
         "Tasks from non-archived PRDs are never modified",
         "prd_metadata rows for non-archived PRDs are never deleted"
       ],
-      "failureModes": [
-        {"cause": "Unscoped DELETE FROM tasks (no WHERE clause)", "expectedBehavior": "Only tasks matching prefix are deleted"},
-        {"cause": "Transaction not used — crash after partial deletion", "expectedBehavior": "All-or-nothing cleanup per PRD"}
+      "modifiesBehavior": false,
+      "notes": "TDD: Write before implementation. Set up two PRDs with prefixed task IDs. Verify scoped deletion.",
+      "passes": false,
+      "priority": 2,
+      "synergyWith": [
+        "TEST-INIT-001"
       ],
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": [],
-      "synergyWith": ["TEST-INIT-001"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Initial tests for scoped PRD data cleanup",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "TEST-INIT-003",
-      "title": "Initial tests for multi-PRD archive flow",
-      "description": "Write tests for the top-level run_archive() with multiple PRDs. Must verify per-PRD iteration, skip reasons, and file archiving.",
       "acceptanceCriteria": [
         "Test: two PRDs, one complete — only complete PRD archived",
         "Test: two PRDs, both complete — both archived to separate folders",
@@ -129,59 +142,81 @@
         "Test: progress.txt is never moved (stays in place after archive)",
         "Test file compiles"
       ],
-      "priority": 3,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "TDD: Write before implementation. These test the rewritten run_archive() top-level function.",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for the top-level run_archive() with multiple PRDs. Must verify per-PRD iteration, skip reasons, and file archiving.",
       "edgeCases": [
         "PRD with NULL task_prefix skipped with informative reason",
         "progress.txt never moved even when PRDs are archived",
         "prd_files empty for a PRD: falls back to project-name guessing"
       ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Archive folder name collision (same branch, same day)",
+          "expectedBehavior": "fs::create_dir_all handles existing dirs; files overwritten"
+        }
+      ],
+      "id": "TEST-INIT-003",
       "invariants": [
         "archived field is flattened union of all per-PRD items",
         "prds_archived.len() + prds_skipped.len() == total PRDs in DB"
       ],
-      "failureModes": [
-        {"cause": "Archive folder name collision (same branch, same day)", "expectedBehavior": "fs::create_dir_all handles existing dirs; files overwritten"}
+      "modifiesBehavior": false,
+      "notes": "TDD: Write before implementation. These test the rewritten run_archive() top-level function.",
+      "passes": false,
+      "priority": 3,
+      "synergyWith": [
+        "TEST-INIT-001",
+        "TEST-INIT-002"
       ],
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": [],
-      "synergyWith": ["TEST-INIT-001", "TEST-INIT-002"],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Initial tests for multi-PRD archive flow",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-001",
-      "title": "Add PrdRecord struct and query_all_prds helper",
-      "description": "Replace the singleton PrdInfo struct with PrdRecord (id, project, branch, task_prefix). Add query_all_prds() that returns all rows from prd_metadata. Remove get_project_info().",
       "acceptanceCriteria": [
         "PrdRecord struct has id: i64, project: String, branch: Option<String>, task_prefix: Option<String>",
         "query_all_prds returns Vec<PrdRecord> with all rows from prd_metadata",
         "get_project_info removed (replaced by query_all_prds)",
         "PrdInfo struct removed"
       ],
-      "priority": 6,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Use existing OptionalExtension import. Query: SELECT id, project, branch_name, task_prefix FROM prd_metadata ORDER BY id",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003"],
-      "synergyWith": ["FEAT-002"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003"
+      ],
+      "description": "Replace the singleton PrdInfo struct with PrdRecord (id, project, branch, task_prefix). Add query_all_prds() that returns all rows from prd_metadata. Remove get_project_info().",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
       "modifiesBehavior": true,
+      "notes": "Use existing OptionalExtension import. Query: SELECT id, project, branch_name, task_prefix FROM prd_metadata ORDER BY id",
+      "passes": false,
+      "priority": 6,
       "qualityDimensions": {
-        "correctness": ["Must handle empty prd_metadata table gracefully (return empty Vec)"],
-        "performance": ["Single query, no N+1"],
-        "style": ["Follow existing archive.rs patterns: private struct, map_err(TaskMgrError::DatabaseError)"]
-      }
+        "correctness": [
+          "Must handle empty prd_metadata table gracefully (return empty Vec)"
+        ],
+        "performance": [
+          "Single query, no N+1"
+        ],
+        "style": [
+          "Follow existing archive.rs patterns: private struct, map_err(TaskMgrError::DatabaseError)"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Add PrdRecord struct and query_all_prds helper",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-002",
-      "title": "Implement is_prd_completed_by_prefix",
-      "description": "Add is_prd_completed_by_prefix(conn, prefix) that checks if all tasks matching the prefix are in terminal states. Remove old is_prd_completed(). Use make_like_pattern from crate::db::prefix.",
       "acceptanceCriteria": [
         "Function uses make_like_pattern(prefix) for LIKE pattern",
         "Returns false when total tasks == 0 (zero matching tasks)",
@@ -189,26 +224,39 @@
         "Old is_prd_completed() function removed",
         "ESCAPE '\\\\' clause present in both queries"
       ],
-      "priority": 7,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Import crate::db::prefix::make_like_pattern. Two queries: total count and non-terminal count, both scoped by LIKE pattern.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-001"],
-      "synergyWith": ["FEAT-003"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add is_prd_completed_by_prefix(conn, prefix) that checks if all tasks matching the prefix are in terminal states. Remove old is_prd_completed(). Use make_like_pattern from crate::db::prefix.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
       "modifiesBehavior": true,
+      "notes": "Import crate::db::prefix::make_like_pattern. Two queries: total count and non-terminal count, both scoped by LIKE pattern.",
+      "passes": true,
+      "priority": 7,
       "qualityDimensions": {
-        "correctness": ["Must use ESCAPE clause to prevent LIKE wildcard injection", "Dash separator in pattern prevents cross-prefix contamination"],
-        "performance": ["Two simple COUNT queries — no joins needed"],
-        "style": ["Reuse make_like_pattern — do not reimplement LIKE escaping"]
-      }
+        "correctness": [
+          "Must use ESCAPE clause to prevent LIKE wildcard injection",
+          "Dash separator in pattern prevents cross-prefix contamination"
+        ],
+        "performance": [
+          "Two simple COUNT queries — no joins needed"
+        ],
+        "style": [
+          "Reuse make_like_pattern — do not reimplement LIKE escaping"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "Implement is_prd_completed_by_prefix",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-003",
-      "title": "Update file discovery to accept prd_id parameter",
-      "description": "Update query_prd_files to accept prd_id: i64 instead of hardcoding 1. Update discover_archivable_files to accept prd_id. Remove progress.txt inclusion from file discovery.",
       "acceptanceCriteria": [
         "query_prd_files accepts prd_id: i64 parameter",
         "SQL uses WHERE prd_id = ? with parameterized binding",
@@ -216,26 +264,39 @@
         "progress.txt is no longer appended to discovered files",
         "Fallback to project-name guessing still works when prd_files is empty"
       ],
-      "priority": 8,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Minimal change: add prd_id param to both functions, update SQL, remove progress.txt line.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-001"],
-      "synergyWith": ["FEAT-002"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Update query_prd_files to accept prd_id: i64 instead of hardcoding 1. Update discover_archivable_files to accept prd_id. Remove progress.txt inclusion from file discovery.",
+      "estimatedEffort": "low",
+      "id": "FEAT-003",
       "modifiesBehavior": true,
+      "notes": "Minimal change: add prd_id param to both functions, update SQL, remove progress.txt line.",
+      "passes": true,
+      "priority": 8,
       "qualityDimensions": {
-        "correctness": ["Parameterized SQL binding (no string interpolation for prd_id)", "progress.txt must never be included in per-PRD file discovery"],
-        "performance": ["No change from current"],
-        "style": ["Follow existing pattern: query_prd_files returns Vec<String>"]
-      }
+        "correctness": [
+          "Parameterized SQL binding (no string interpolation for prd_id)",
+          "progress.txt must never be included in per-PRD file discovery"
+        ],
+        "performance": [
+          "No change from current"
+        ],
+        "style": [
+          "Follow existing pattern: query_prd_files returns Vec<String>"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Update file discovery to accept prd_id parameter",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-004",
-      "title": "Implement clear_prd_data with transaction",
-      "description": "Add clear_prd_data(conn, prd_id, prefix) that deletes only the specified PRD's data in a transaction. Remove old clear_task_data(). Handle orphan runs with NOT EXISTS, and NULL out dangling global_state references.",
       "acceptanceCriteria": [
         "All deletions wrapped in conn.transaction()",
         "Deletes run_tasks WHERE task_id LIKE prefix pattern",
@@ -250,26 +311,39 @@
         "Old clear_task_data() removed",
         "Uses conn as &mut Connection for transaction support"
       ],
-      "priority": 9,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Use rusqlite::Connection::transaction(). Use make_like_pattern for prefix scoping. The NOT EXISTS subquery: DELETE FROM runs WHERE NOT EXISTS (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id)",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Add clear_prd_data(conn, prd_id, prefix) that deletes only the specified PRD's data in a transaction. Remove old clear_task_data(). Handle orphan runs with NOT EXISTS, and NULL out dangling global_state references.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
       "modifiesBehavior": true,
+      "notes": "Use rusqlite::Connection::transaction(). Use make_like_pattern for prefix scoping. The NOT EXISTS subquery: DELETE FROM runs WHERE NOT EXISTS (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id)",
+      "passes": true,
+      "priority": 9,
       "qualityDimensions": {
-        "correctness": ["Transaction wrapping is mandatory — partial deletion is never acceptable", "Orphan run detection must use NOT EXISTS (not NOT IN)", "Dangling global_state references must be NULLed"],
-        "performance": ["NOT EXISTS instead of NOT IN for orphan run cleanup"],
-        "style": ["map_err(TaskMgrError::DatabaseError) on each execute", "Transaction commit at end"]
-      }
+        "correctness": [
+          "Transaction wrapping is mandatory — partial deletion is never acceptable",
+          "Orphan run detection must use NOT EXISTS (not NOT IN)",
+          "Dangling global_state references must be NULLed"
+        ],
+        "performance": [
+          "NOT EXISTS instead of NOT IN for orphan run cleanup"
+        ],
+        "style": [
+          "map_err(TaskMgrError::DatabaseError) on each execute",
+          "Transaction commit at end"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Implement clear_prd_data with transaction",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-005",
-      "title": "Add PrdArchiveSummary, PrdSkipReason to ArchiveResult",
-      "description": "Add new types PrdArchiveSummary and PrdSkipReason. Add prds_archived and prds_skipped fields to ArchiveResult. Keep existing fields for backward compat.",
       "acceptanceCriteria": [
         "PrdArchiveSummary has: prd_id, project, task_prefix, archive_folder, files_archived, tasks_cleared",
         "PrdSkipReason has: prd_id, project, reason",
@@ -277,26 +351,38 @@
         "Existing ArchiveResult fields (archived, learnings_extracted, tasks_cleared, dry_run, message) preserved",
         "All new structs derive Debug, Serialize"
       ],
-      "priority": 10,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Additive change — no breaking impact on callers.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-001"],
-      "synergyWith": ["FEAT-006"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add new types PrdArchiveSummary and PrdSkipReason. Add prds_archived and prds_skipped fields to ArchiveResult. Keep existing fields for backward compat.",
+      "estimatedEffort": "low",
+      "id": "FEAT-005",
       "modifiesBehavior": false,
+      "notes": "Additive change — no breaking impact on callers.",
+      "passes": true,
+      "priority": 10,
       "qualityDimensions": {
-        "correctness": ["Existing fields must not be removed or renamed"],
-        "performance": ["N/A"],
-        "style": ["Derive Debug, Serialize on all new structs"]
-      }
+        "correctness": [
+          "Existing fields must not be removed or renamed"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "Derive Debug, Serialize on all new structs"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "title": "Add PrdArchiveSummary, PrdSkipReason to ArchiveResult",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-006",
-      "title": "Rewrite run_archive for per-PRD iteration",
-      "description": "Rewrite run_archive() to iterate all PRDs, check each by prefix, archive completed ones, skip others. Keep the same public signature. Handle learnings extraction once. Build ArchiveResult with per-PRD breakdowns.",
       "acceptanceCriteria": [
         "Iterates all PRDs from query_all_prds()",
         "Skips PRDs with NULL task_prefix (adds to prds_skipped)",
@@ -309,26 +395,44 @@
         "Public signature unchanged: run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult>",
         "Connection opened as mut internally for transaction support"
       ],
-      "priority": 11,
-      "estimatedEffort": "high",
-      "passes": false,
-      "notes": "This is the core rewrite. open_connection returns owned Connection, so just declare it mut. Per-PRD loop: check prefix, check completion, discover files, move files, clear data.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005"],
-      "synergyWith": ["FEAT-007"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Rewrite run_archive() to iterate all PRDs, check each by prefix, archive completed ones, skip others. Keep the same public signature. Handle learnings extraction once. Build ArchiveResult with per-PRD breakdowns.",
+      "estimatedEffort": "high",
+      "id": "FEAT-006",
       "modifiesBehavior": true,
+      "notes": "This is the core rewrite. open_connection returns owned Connection, so just declare it mut. Per-PRD loop: check prefix, check completion, discover files, move files, clear data.",
+      "passes": true,
+      "priority": 11,
       "qualityDimensions": {
-        "correctness": ["Must not archive incomplete PRDs", "Must not move progress.txt", "Must extract learnings only once and only when at least one PRD archived"],
-        "performance": ["Exit early if prd_metadata is empty"],
-        "style": ["Keep public signature unchanged", "Follow existing archive.rs error handling patterns"]
-      }
+        "correctness": [
+          "Must not archive incomplete PRDs",
+          "Must not move progress.txt",
+          "Must extract learnings only once and only when at least one PRD archived"
+        ],
+        "performance": [
+          "Exit early if prd_metadata is empty"
+        ],
+        "style": [
+          "Keep public signature unchanged",
+          "Follow existing archive.rs error handling patterns"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-007"
+      ],
+      "title": "Rewrite run_archive for per-PRD iteration",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "FEAT-007",
-      "title": "Update format_text for per-PRD reporting",
-      "description": "Update format_text() to show per-PRD archive/skip status with reasons, file lists per PRD, and summary counts.",
       "acceptanceCriteria": [
         "Shows each archived PRD with project name, prefix, and archive folder",
         "Shows each skipped PRD with reason (incomplete, no prefix)",
@@ -337,26 +441,38 @@
         "Dry-run mode uses Would prefixes",
         "Empty result still shows informative message"
       ],
-      "priority": 12,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "Extend existing format_text. Add per-PRD section before file list.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-005"],
-      "synergyWith": ["FEAT-006"],
       "batchWith": [],
       "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Update format_text() to show per-PRD archive/skip status with reasons, file lists per PRD, and summary counts.",
+      "estimatedEffort": "low",
+      "id": "FEAT-007",
       "modifiesBehavior": true,
+      "notes": "Extend existing format_text. Add per-PRD section before file list.",
+      "passes": true,
+      "priority": 12,
       "qualityDimensions": {
-        "correctness": ["Must handle empty archived and skipped lists gracefully"],
-        "performance": ["N/A"],
-        "style": ["Match existing format_text patterns: action verbs change based on dry_run"]
-      }
+        "correctness": [
+          "Must handle empty archived and skipped lists gracefully"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "Match existing format_text patterns: action verbs change based on dry_run"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "title": "Update format_text for per-PRD reporting",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review implementation for quality, security, and integration wiring",
-      "description": "Review all FEAT-xxx implementation for code quality, error handling, security, and integration wiring.",
       "acceptanceCriteria": [
         "No unwrap() in production code paths",
         "All errors properly propagated with context via map_err",
@@ -368,22 +484,57 @@
         "Integration: run_archive still callable from main.rs and branch.rs without changes",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
-      "priority": 13,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review all FEAT-xxx implementation for code quality, error handling, security, and integration wiring.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review implementation for quality, security, and integration wiring",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-1",
-      "title": "Review implementation for refactoring opportunities",
-      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues.",
+      "acceptanceCriteria": [
+        "clear_prd_data called for all completed PRDs regardless of file count",
+        "Completed PRD with zero discoverable files still has DB data cleaned up",
+        "Test: completed PRD with no files on disk still clears DB data",
+        "Existing tests still pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Fix: clear_prd_data is gated by !prd_items.is_empty() at line 192. A completed PRD with zero files on disk will be reported as archived but DB data persists, causing re-processing on next run. Change condition to always clear DB data for completed PRDs.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-001",
+      "modifiesBehavior": true,
+      "notes": "Line 192: change `if !dry_run && !prd_items.is_empty()` to `if !dry_run`. Add test for completed PRD with no discoverable files.",
+      "passes": false,
+      "priority": 14,
+      "synergyWith": [],
+      "title": "Fix: clear_prd_data skipped when completed PRD has no files",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
       "acceptanceCriteria": [
         "No code duplication (DRY principle)",
         "Functions under 30 lines (flag complex ones)",
@@ -391,22 +542,26 @@
         "Code is easy to change and extend",
         "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
       ],
-      "priority": 17,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. If no issues, mark passes:true with 'No refactoring needed'.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. If no issues, mark passes:true with 'No refactoring needed'.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "MILESTONE-1",
-      "title": "Initial tests pass, implementation reviewed and wired in",
-      "description": "Gate: all initial tests pass, implementation complete, code reviewed, refactored.",
       "acceptanceCriteria": [
         "All TEST-INIT-xxx tests pass",
         "All FEAT-xxx tasks complete",
@@ -417,23 +572,39 @@
         "cargo test --lib loop_engine::archive — all pass",
         "No dead code warnings for new code"
       ],
-      "priority": 20,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "TEST-INIT-003", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006", "FEAT-007", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "TEST-INIT-003",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "CODE-REVIEW-1",
+        "CODE-FIX-001",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Gate: all initial tests pass, implementation complete, code reviewed, refactored.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Initial tests pass, implementation reviewed and wired in",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "TEST-001",
-      "title": "Comprehensive tests for multi-PRD archive scenarios",
-      "description": "Expand test coverage: error handling, parameterized tests, boundary values, complex multi-PRD scenarios.",
       "acceptanceCriteria": [
         "Test: three PRDs — one complete, one incomplete, one no prefix — correct archival and skip reasons",
         "Test: PRD with prd_files entries AND fallback (verify prd_files takes precedence)",
@@ -445,21 +616,27 @@
         "Test: JSON serialization of new ArchiveResult fields",
         "80%+ coverage for new/modified functions"
       ],
-      "priority": 25,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Comprehensive tests after MILESTONE-1. May spawn IMPL-FIX-xxx if gaps found.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-002"],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage: error handling, parameterized tests, boundary values, complex multi-PRD scenarios.",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Comprehensive tests after MILESTONE-1. May spawn IMPL-FIX-xxx if gaps found.",
+      "passes": false,
+      "priority": 25,
+      "synergyWith": [
+        "TEST-002"
+      ],
+      "title": "Comprehensive tests for multi-PRD archive scenarios",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "TEST-002",
-      "title": "Update existing archive tests for multi-PRD compatibility",
-      "description": "Update the 20+ existing tests to work with the rewritten multi-PRD archive implementation. Tests that relied on singleton prd_metadata or global task checks need prefixed IDs.",
       "acceptanceCriteria": [
         "All existing test_run_archive_* tests updated with task_prefix and prefixed task IDs",
         "test_run_archive_no_metadata still works (empty table)",
@@ -473,87 +650,109 @@
         "All format_text tests updated for new ArchiveResult fields",
         "No test regressions"
       ],
-      "priority": 28,
-      "estimatedEffort": "high",
-      "passes": false,
-      "notes": "This is a large task — updating 20+ existing tests. Each test needs: 1) task_prefix on prd_metadata INSERT, 2) prefixed task IDs, 3) new ArchiveResult fields in assertions. Consider using /ralph-loop for iterative refinement.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": ["TEST-001"],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Update the 20+ existing tests to work with the rewritten multi-PRD archive implementation. Tests that relied on singleton prd_metadata or global task checks need prefixed IDs.",
+      "estimatedEffort": "high",
+      "id": "TEST-002",
+      "modifiesBehavior": false,
+      "notes": "This is a large task — updating 20+ existing tests. Each test needs: 1) task_prefix on prd_metadata INSERT, 2) prefixed task IDs, 3) new ArchiveResult fields in assertions. Consider using /ralph-loop for iterative refinement.",
+      "passes": false,
+      "priority": 28,
+      "synergyWith": [
+        "TEST-001"
+      ],
+      "title": "Update existing archive tests for multi-PRD compatibility",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-2",
-      "title": "Review test code for refactoring opportunities",
-      "description": "Analyze test code for duplication, helper extraction, and clarity.",
       "acceptanceCriteria": [
         "No duplicated test setup code (extract helpers for DB setup with multiple PRDs)",
         "Helper functions for common patterns (e.g., insert_prd_with_prefix, insert_prefixed_task)",
         "Test names clearly describe what is tested",
         "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
       ],
-      "priority": 39,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "For each issue found: 1) Add REFACTOR-2-xxx task (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["TEST-001", "TEST-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002"
+      ],
+      "description": "Analyze test code for duplication, helper extraction, and clarity.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: 1) Add REFACTOR-2-xxx task (priority 40-44), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON.",
+      "passes": false,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "MILESTONE-2",
-      "title": "Full test coverage achieved, test code refactored",
-      "description": "Gate: comprehensive tests pass, test code reviewed and refactored.",
       "acceptanceCriteria": [
         "All TEST-xxx tests pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
         "cargo test --lib loop_engine::archive — all pass",
         "No test regressions from existing tests"
       ],
-      "priority": 50,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Full test coverage achieved, test code refactored.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["MILESTONE-1", "TEST-001", "TEST-002", "REFACTOR-REVIEW-2"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Gate: comprehensive tests pass, test code reviewed and refactored.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "passes": false,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Full test coverage achieved, test code refactored",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "INT-001",
-      "title": "Integration test: full archive workflow on real DB",
-      "description": "End-to-end integration test verifying the archive command works with the actual task-mgr binary. Test dry-run output, actual archival, and verify DB state after.",
       "acceptanceCriteria": [
         "cargo test passes for all archive tests",
         "Full cargo test suite passes (no regressions in other modules)",
         "cargo clippy -- -D warnings passes",
         "cargo fmt --check passes"
       ],
-      "priority": 55,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Run the full test suite to ensure no regressions outside archive module.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["MILESTONE-2"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "End-to-end integration test verifying the archive command works with the actual task-mgr binary. Test dry-run output, actual archival, and verify DB state after.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "Run the full test suite to ensure no regressions outside archive module.",
+      "passes": false,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration test: full archive workflow on real DB",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-3",
-      "title": "Final refactoring review for maintainability",
-      "description": "Comprehensive review of all code for DRY violations, complexity, coupling, and code clarity.",
       "acceptanceCriteria": [
         "No code duplication across implementation and tests",
         "All functions under 30 lines or documented exceptions",
@@ -561,22 +760,26 @@
         "Code follows existing archive.rs patterns",
         "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
       ],
-      "priority": 65,
-      "estimatedEffort": "medium",
-      "model": "claude-opus-4-6",
-      "passes": false,
-      "notes": "Final opportunity to improve code before merge.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["INT-001"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all code for DRY violations, complexity, coupling, and code clarity.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge.",
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "VERIFY-001",
-      "title": "Final verification - all checks pass",
-      "description": "Final verification: full test suite, clippy, fmt, no regressions.",
       "acceptanceCriteria": [
         "cargo test — all pass",
         "cargo clippy -- -D warnings — clean",
@@ -584,23 +787,28 @@
         "task-mgr archive --dry-run on test DB shows correct per-PRD output",
         "No dead code warnings"
       ],
-      "priority": 90,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Final gate before merge.",
-      "touchesFiles": ["src/loop_engine/archive.rs"],
-      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Final verification: full test suite, clippy, fmt, no regressions.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification - all checks pass",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
     },
     {
-      "id": "MILESTONE-FINAL",
-      "title": "Ready for merge",
-      "description": "All acceptance criteria met, ready for merge to main.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
@@ -608,18 +816,25 @@
         "No warnings",
         "Ready for merge"
       ],
-      "priority": 99,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Final gate.",
-      "touchesFiles": [],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "All acceptance criteria met, ready for merge to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Ready for merge",
+      "touchesFiles": []
     }
-  ]
+  ],
+  "version": "1.0"
 }

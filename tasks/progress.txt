@@ -1086,3 +1086,19 @@
 - No REFACTOR-1-xxx tasks needed
 - **Learnings:** Phase 4 extraction was minimal (1 file) and well-executed; assessment-heavy phases produce clean reviews
 ---
+
+## 2026-03-03 - multi-archive-TEST-INIT-002
+- Added stub `clear_prd_data_for_prefix(conn, prefix) -> TaskMgrResult<usize>` with `#[allow(dead_code)]`
+- Added `setup_two_prds()` helper inserting PA-001/PA-002 (done) and PB-001/PB-002 (in_progress/todo)
+- 9 new tests: scoped delete, learnings survival, orphaned/shared run handling, global_state counter logic, last_task_id NULL/preserve, discriminator test
+- 5 tests fail as expected (stub is no-op); 42 pass
+- **Learnings:** run_tasks has ON DELETE CASCADE from tasks — stub tests verify post-delete state correctly without needing to manually delete run_tasks
+---
+
+## 2026-03-04 - multi-archive-CODE-REVIEW-1
+- Reviewed all FEAT-001 through FEAT-007 implementation
+- All acceptance criteria pass: no unwrap() in production, proper error propagation, transaction usage, make_like_pattern used, ESCAPE clauses present, integration wiring intact
+- Quality checks: cargo fmt ✓, cargo clippy ✓, 60/60 tests pass
+- **Issue found:** Line 192 gates clear_prd_data with `!prd_items.is_empty()` — completed PRD with no files on disk won't have DB data cleaned up. Added CODE-FIX-001 task.
+- **Learnings:** Review found one logic bug in the guard condition for DB cleanup. The file-existence check should not gate DB cleanup for completed PRDs.
+---
