@@ -774,3 +774,13 @@
 - All modules have //! doc comments, mod.rs declarations are alphabetical
 - calibrate_math.rs depends on calibrate::TaskOutcome (acceptable upward dep for extracted math)
 ---
+
+## 2026-03-03 - p2-refactor-MILESTONE-1
+- Gate checkpoint: verified all 5 Tier 2 extractions complete and reviewed
+- All 9 dependencies pass (REFACTOR-006-010, CODE-REVIEW-1, REFACTOR-REVIEW-1, REFACTOR-1-001/002)
+- Test count: baseline=2262, current=2264 (increase from added tests — OK)
+- cargo clippy: clean, cargo fmt: clean (one formatting fix in watchdog.rs)
+- Line counts: claude.rs=1931 (target 1900, 1.6% over due to P1 stream-json), status.rs=439, calibrate.rs=1135
+- No dead code warnings in any new module
+- **Learnings:** claude.rs 1900L target was tight due to stream-json addition in Phase 1; 31 lines over is acceptable
+---
