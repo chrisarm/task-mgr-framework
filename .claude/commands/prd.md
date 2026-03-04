@@ -181,6 +181,25 @@ Before generating the PRD, define the public interfaces this change introduces o
 
 > **Scope**: Only document public-facing interfaces (module APIs, HTTP endpoints, GenServer calls, PubSub topics). Internal helpers are implementation details for `/tasks`.
 
+### Step 4.7: Architectural Decision Points
+
+When 2+ viable approaches exist with **no clear winner**, classify and handle as follows:
+
+- **High-impact** (affects PRD structure, spans multiple user stories, or is a fundamental design choice — e.g., "event-sourced vs. CRUD model", "sync vs. async API"): **STOP and ask the user inline** with lettered options before continuing.
+
+  Example prompt format:
+  > **Architectural Decision**: [brief description of the fork]
+  > A) [Option A — one sentence]
+  > B) [Option B — one sentence]
+  > Which approach should this PRD use?
+
+- **Lower-impact** (implementation detail that doesn't change the PRD shape — e.g., "which hashing library", "pagination strategy"): **Continue writing the PRD** and document the open question in Section 7 (Open Questions) with the `[ARCH DECISION]` tag.
+
+  Example entry:
+  > `[ARCH DECISION]` Cache invalidation strategy: Option A (TTL-based) vs Option B (event-driven). Recommend A for simplicity; revisit if throughput becomes a concern.
+
+**Do not** invent a winner when the trade-offs are genuinely balanced — ask or document instead.
+
 ### Step 5: Generate the PRD
 
 Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:

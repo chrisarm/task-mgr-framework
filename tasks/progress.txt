@@ -1,4 +1,11 @@
 
+## 2026-03-03 - KDP-FEAT-006
+- Added `prompt_pending_key_decisions()` to engine.rs, called between step 21.5 and step 22
+- In yes_mode: auto-defers all pending decisions; on exit_code 130: skips entirely
+- Interactive: box-drawing banner, lettered options, empty/skip defers, invalid re-prompts
+- **Learnings:** stdin.read_line unavailable → defer gracefully; options.len() - 1 as u8 is safe since decisions always have ≥1 option from extraction logic
+---
+
 ## 2026-03-03 - p4-refactor-LEARN-002
 - Final learnings summary for entire large file refactor (4 phases)
 - **Files extracted across all phases:** 15 new modules total
@@ -1085,4 +1092,59 @@
 - Assessment documentation verified: clear verdicts for all 17 Tier 4 files + claude-loop.sh
 - No REFACTOR-1-xxx tasks needed
 - **Learnings:** Phase 4 extraction was minimal (1 file) and well-executed; assessment-heavy phases produce clean reviews
+---
+## 2026-03-03 - KDP-FEAT-001
+- Added KeyDecisionOption and KeyDecision structs to src/loop_engine/config.rs after IterationOutcome
+- Added 8 tests covering fields, clone/eq, empty options, and negative proof that KeyDecision is not an IterationOutcome variant
+- Also ran cargo fmt which fixed unrelated whitespace in git_reconcile.rs and output_parsing.rs
+- **Learnings:** cargo fmt --check will catch pre-existing fmt issues in other files; safe to just run cargo fmt first
+---
+
+## 2026-03-03 - KDP-FEAT-002
+- Added `extract_key_decisions(output: &str) -> Vec<KeyDecision>` to `src/loop_engine/detection.rs`
+- Added helpers: `parse_key_decision_block`, `extract_inner`, `extract_options`
+- 10 unit tests covering: one block, two blocks, no tags, missing close tag, empty title, zero options, option label/desc extraction, whitespace trimming, no effect on analyze_output
+- **Learnings:** String-slicing loop (`remaining = &remaining[new_pos..]`) works cleanly for multi-block extraction. `extract_inner` returns a `&str` slice which avoids allocation before trim/to_string.
+---
+
+## 2026-03-03 - KDP-FEAT-003
+- Created src/db/migrations/v12.rs with key_decisions table (FK to runs, TEXT options column for JSON)
+- Registered v12 in migrations/mod.rs, bumped CURRENT_SCHEMA_VERSION to 12
+- Unit tests: up creates table (INSERT works), down drops table, options is TEXT
+- **Learnings:** FK constraints require parent row insertion in tests; pattern from schema/tests.rs shows `INSERT INTO runs (run_id)` first
+---
+
+## 2026-03-03 - KDP-FEAT-004
+- Created src/db/schema/key_decisions.rs with StoredKeyDecision struct and 5 CRUD functions
+- Added `pub mod key_decisions` to src/db/schema/mod.rs
+- Added `serde::Serialize, serde::Deserialize` to KeyDecisionOption in config.rs (needed for JSON serialization)
+- **Learnings:** FK constraints in tests — use None for task_id unless you also insert the task row. The tasks table has FK on task_id; passing a non-existent task_id causes ConstraintViolation.
+---
+
+## 2026-03-03 - KDP-FEAT-005
+- Wired extract_key_decisions() into run_loop() post-iteration section
+- Added key_decisions_count: u32 field to IterationResult (initialized to 0 on all 12 struct literals)
+- Imported key_decisions_db module; inserted each decision with warning-only on DB error
+- **Learnings:** Python script useful for bulk line insertions when sed/replace_all can't handle varying indentation. Always run `cargo check` before `cargo fmt` to catch missing fields first.
+---
+
+## 2026-03-03 - KDP-FEAT-007
+- Added `build_key_decision_section()` to prompt.rs as a trimmable section
+- Added REVIEW/VERIFY task ID detection for extra emphasis
+- Added session-start deferred decision display in engine.rs (Step 12.7)
+- Graceful handling of missing table (pre-v12 DB) via non-fatal Err branch
+- **Learnings:** The session-start insert point (between Step 12.5 and Step 13) was exactly where noted. Pattern: match on Ok/Err for graceful degradation is consistent with other DB calls in engine.rs.
+---
+
+## 2026-03-03 - KDP-FEAT-008
+- Added Step 4.7 "Architectural Decision Points" to .claude/commands/prd.md between Step 4.5 and Step 5
+- High-impact decisions → stop and prompt with lettered options; lower-impact → document with [ARCH DECISION] tag in Section 7
+- Files changed: .claude/commands/prd.md
+---
+
+## 2026-03-03 - KDP-REVIEW-001
+- **BUG FOUND & FIXED**: Prompt format mismatch in `build_key_decision_section()` — prompt told Claude to emit `<option><label>...</label><description>...</description></option>` but parser expects `<option label="...">description</option>`. All key decisions would have been silently dropped. Fixed prompt to match parser.
+- All other checks passed: no unwrap() in production paths (engine.rs:1698 is safe after len==1 guard), all SQL parameterized, all errors propagated with map_err, yes_mode and signal exits handled, no dead code warnings.
+- Files changed: `src/loop_engine/prompt.rs`
+- **Learnings:** Always verify that instruction format matches parser format end-to-end.
 ---

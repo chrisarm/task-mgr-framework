@@ -24,6 +24,7 @@ use rusqlite::Connection;
 use crate::commands::complete as complete_cmd;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
+use crate::db::schema::key_decisions as key_decisions_db;
 use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
@@ -140,6 +141,8 @@ pub struct IterationResult {
     /// Effective model used for this iteration (post-crash-escalation).
     /// None for early exits (signal, rate-limit, etc.).
     pub effective_model: Option<String>,
+    /// Number of key decisions extracted and stored this iteration.
+    pub key_decisions_count: u32,
 }
 
 /// Mutable context carried between iterations.
@@ -200,6 +203,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -213,6 +217,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -242,6 +247,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -270,6 +276,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -328,6 +335,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
 
@@ -373,6 +381,7 @@ pub fn run_iteration(
                             should_stop: false,
                             output: String::new(),
                             effective_model: None,
+                            key_decisions_count: 0,
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -396,6 +405,7 @@ pub fn run_iteration(
                     should_stop: false,
                     output: String::new(),
                     effective_model: None,
+                    key_decisions_count: 0,
                 });
             }
         }
@@ -471,6 +481,7 @@ pub fn run_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
+            key_decisions_count: 0,
         });
     }
 
@@ -485,6 +496,7 @@ pub fn run_iteration(
             should_stop: true,
             output: claude_result.output,
             effective_model: None,
+            key_decisions_count: 0,
         });
     }
 
@@ -510,6 +522,7 @@ pub fn run_iteration(
                 should_stop: true,
                 output: String::new(),
                 effective_model: None,
+                key_decisions_count: 0,
             });
         }
     }
@@ -581,6 +594,7 @@ pub fn run_iteration(
         should_stop,
         output: claude_output,
         effective_model,
+        key_decisions_count: 0,
     })
 }
 
@@ -1100,6 +1114,31 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 12.7: Display any deferred key decisions from previous sessions
+    match key_decisions_db::get_all_pending_decisions(&conn) {
+        Ok(decisions) if !decisions.is_empty() => {
+            eprintln!(
+                "\n\x1b[33m⚑ {} deferred key decision(s) from previous sessions:\x1b[0m",
+                decisions.len()
+            );
+            for d in &decisions {
+                let task_ctx = d
+                    .task_id
+                    .as_deref()
+                    .map(|t| format!(" [task: {}]", t))
+                    .unwrap_or_default();
+                eprintln!("  • {}{}", d.title, task_ctx);
+                eprintln!("    {}", d.description);
+            }
+            eprintln!();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Non-fatal: pre-v12 DB won't have this table
+            eprintln!("Note: could not query deferred key decisions: {}", e);
+        }
+    }
+
     // Step 13: Install signal handler
     let signal_flag = SignalFlag::new();
     setup_signal_handler(signal_flag.clone());
@@ -1231,6 +1270,26 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             &result.files_modified,
             result.effective_model.as_deref(),
         );
+
+        // Extract and store key decisions (non-fatal: DB errors are warnings only)
+        let key_decisions = detection::extract_key_decisions(&result.output);
+        let mut kd_count: u32 = 0;
+        for decision in &key_decisions {
+            match key_decisions_db::insert_key_decision(
+                &conn,
+                &run_id,
+                result.task_id.as_deref(),
+                i64::from(iteration),
+                decision,
+            ) {
+                Ok(_) => kd_count += 1,
+                Err(e) => eprintln!(
+                    "Warning: failed to store key decision '{}': {}",
+                    decision.title, e
+                ),
+            }
+        }
+        result.key_decisions_count = kd_count;
 
         // Track last claimed task for cleanup on exit
         last_claimed_task = result.task_id.clone();
@@ -1597,6 +1656,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 21.7: Prompt user to resolve pending key decisions (skip on SIGINT or yes_mode)
+    if exit_code != 130 {
+        prompt_pending_key_decisions(&conn, &run_id, run_config.config.yes_mode);
+    }
+
     // Step 22: Print final banner
     let total_elapsed = start_time.elapsed().as_secs();
     display::print_final_banner(
@@ -1612,7 +1676,101 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     }
 }
 
-/// Install SIGINT and SIGTERM handlers that set the signal flag.
+/// Query pending key decisions for the run and prompt the user to resolve or defer each.
+///
+/// In yes_mode, all decisions are auto-deferred without prompting.
+/// This function is a no-op when there are no pending decisions.
+fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool) {
+    let decisions = match key_decisions_db::get_pending_decisions(conn, run_id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Warning: failed to query pending key decisions: {}", e);
+            return;
+        }
+    };
+
+    if decisions.is_empty() {
+        return;
+    }
+
+    if yes_mode {
+        for decision in &decisions {
+            if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
+                eprintln!("Warning: failed to defer decision {}: {}", decision.id, e);
+            }
+        }
+        eprintln!(
+            "Auto-deferred {} key decision(s) (yes_mode).",
+            decisions.len()
+        );
+        return;
+    }
+
+    eprintln!(
+        "\n╔══════════════════════════════════════════════════╗\
+         \n║         KEY DECISIONS REQUIRING YOUR INPUT        ║\
+         \n╚══════════════════════════════════════════════════╝"
+    );
+
+    for decision in &decisions {
+        loop {
+            eprintln!("\n┌─ Decision: {}", decision.title);
+            eprintln!("│  {}", decision.description);
+            eprintln!("│");
+            for (i, opt) in decision.options.iter().enumerate() {
+                let letter = (b'A' + i as u8) as char;
+                eprintln!("│  {}) {} — {}", letter, opt.label, opt.description);
+            }
+            eprintln!("│  S) Skip (defer to next session)");
+            eprint!("└─ Your choice: ");
+
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                // stdin unavailable — defer
+                eprintln!("\nWarning: could not read stdin, deferring decision.");
+                let _ = key_decisions_db::defer_decision(conn, decision.id);
+                break;
+            }
+
+            let trimmed = input.trim().to_lowercase();
+
+            if trimmed.is_empty() || trimmed == "s" || trimmed == "skip" {
+                if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
+                    eprintln!("Warning: failed to defer decision: {}", e);
+                } else {
+                    eprintln!("Decision deferred.");
+                }
+                break;
+            }
+
+            // Try to map single letter to option index
+            if trimmed.len() == 1 {
+                let ch = trimmed.chars().next().unwrap();
+                if ch.is_ascii_alphabetic() {
+                    let idx = (ch.to_ascii_lowercase() as u8).wrapping_sub(b'a') as usize;
+                    if let Some(opt) = decision.options.get(idx) {
+                        let resolution = format!("{}: {}", opt.label, opt.description);
+                        if let Err(e) =
+                            key_decisions_db::resolve_decision(conn, decision.id, &resolution)
+                        {
+                            eprintln!("Warning: failed to resolve decision: {}", e);
+                        } else {
+                            eprintln!("Decision resolved: {}", resolution);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            eprintln!(
+                "Invalid choice — enter a letter (A–{}) or S to skip.",
+                (b'A' + decision.options.len() as u8 - 1) as char
+            );
+        }
+    }
+}
+
+/// Install SIGINT, SIGTERM, and SIGQUIT handlers that set the signal flag.
 ///
 /// Uses `signal-hook` to register OS-level signal handlers that set an
 /// `AtomicBool` directly from signal context — no async polling needed.
@@ -1625,14 +1783,17 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
 
     #[cfg(unix)]
     {
-        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::consts::{SIGINT, SIGQUIT, SIGTERM};
 
         // First signal sets the flag; second signal restores default (immediate kill)
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
         }
-        if let Err(e) = signal_hook::flag::register(SIGTERM, flag) {
+        if let Err(e) = signal_hook::flag::register(SIGTERM, flag.clone()) {
             eprintln!("Warning: failed to install SIGTERM handler: {}", e);
+        }
+        if let Err(e) = signal_hook::flag::register(SIGQUIT, flag) {
+            eprintln!("Warning: failed to install SIGQUIT handler: {}", e);
         }
     }
 
@@ -1769,6 +1930,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         should_stop: true,
         output: String::new(),
         effective_model: None,
+        key_decisions_count: 0,
     }
 }
 
@@ -1844,6 +2006,7 @@ mod tests {
             should_stop: false,
             output: String::new(),
             effective_model: None,
+            key_decisions_count: 0,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);

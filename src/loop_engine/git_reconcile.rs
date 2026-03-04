@@ -459,8 +459,7 @@ mod tests {
         let repo = crate::loop_engine::test_utils::setup_git_repo();
         git_commit(repo.path(), "feat: FIX-001 implement feature");
 
-        let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
+        let result = check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
         assert!(
             result.is_none(),
             "Should NOT match bare ID without -completed suffix"
@@ -475,8 +474,7 @@ mod tests {
             "feat: aeb10a1f-FIX-001-completed - Fix the bug",
         );
 
-        let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
+        let result = check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-001", 7);
         assert!(
             result.is_some(),
             "Should match full ID with -completed suffix"
@@ -492,8 +490,7 @@ mod tests {
             "feat: some work\n\nThis prepares for aeb10a1f-FIX-002",
         );
 
-        let result =
-            check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-002", 7);
+        let result = check_git_for_task_completion(repo.path(), "aeb10a1f-FIX-002", 7);
         assert!(
             result.is_none(),
             "Mention in body without -completed suffix should NOT match"
