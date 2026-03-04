@@ -1526,6 +1526,329 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Tests for multi-PRD run_archive() top-level flow
+    // -----------------------------------------------------------------------
+
+    /// Insert two PRDs into prd_metadata with task_prefix set.
+    /// PRD-A (prefix "PA", branch "feat/branch-a"): tasks PA-001/PA-002 — both done.
+    /// PRD-B (prefix "PB", branch "feat/branch-b"): task PB-001 — in_progress.
+    fn setup_two_prd_metadata_with_tasks(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (2, 'project-b', 'feat/branch-b', 'PB')",
+            [],
+        )
+        .unwrap();
+        // PA tasks: complete
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task 1', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-002', 'PA Task 2', 2, 'done')",
+            [],
+        )
+        .unwrap();
+        // PB task: incomplete
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task 1', 1, 'in_progress')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Two PRDs, one complete: only the complete PRD's files are archived.
+    /// The incomplete PRD's files must remain untouched.
+    #[test]
+    fn test_multi_prd_only_complete_prd_archived() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prd_metadata_with_tasks(&conn);
+
+        // Register PA's file in prd_files
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        // Register PB's file in prd_files
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (2, 'project-b.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // PA should be archived
+        assert!(
+            !result.archived.is_empty(),
+            "At least one file should be archived"
+        );
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            archived_sources.iter().any(|s| s.contains("project-a")),
+            "project-a.json should be archived"
+        );
+
+        // PB file must remain (incomplete)
+        assert!(
+            tasks_dir.join("project-b.json").exists(),
+            "project-b.json must not be moved (PB is incomplete)"
+        );
+    }
+
+    /// Two PRDs, both complete: files for each PRD archived to their own folders.
+    #[test]
+    fn test_multi_prd_both_complete_archived_to_separate_folders() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (2, 'project-b', 'feat/branch-b', 'PB')",
+            [],
+        )
+        .unwrap();
+        // Both PA and PB complete
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (2, 'project-b.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // Both files should be archived
+        assert_eq!(
+            result.archived.len(),
+            2,
+            "Both PRD files should be archived"
+        );
+
+        // Each should go to a separate folder (branch-a vs branch-b)
+        let dests: Vec<&str> = result
+            .archived
+            .iter()
+            .map(|a| a.destination.as_str())
+            .collect();
+        assert!(
+            dests.iter().any(|d| d.contains("branch-a")),
+            "project-a should archive to branch-a folder"
+        );
+        assert!(
+            dests.iter().any(|d| d.contains("branch-b")),
+            "project-b should archive to branch-b folder"
+        );
+
+        // Both source files should be gone
+        assert!(!tasks_dir.join("project-a.json").exists());
+        assert!(!tasks_dir.join("project-b.json").exists());
+    }
+
+    /// A PRD with NULL task_prefix is skipped (can't scope by prefix).
+    #[test]
+    fn test_multi_prd_null_task_prefix_skipped() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        // PRD with no task_prefix
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'legacy-project', 'feat/legacy', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('L-001', 'Legacy Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("legacy-project.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // The NULL-prefix PRD should be skipped — file must NOT be moved
+        assert!(
+            tasks_dir.join("legacy-project.json").exists(),
+            "PRD with NULL task_prefix must not be archived"
+        );
+        // Result should contain a skip reason, not an archive entry for this file
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources
+                .iter()
+                .any(|s| s.contains("legacy-project")),
+            "legacy-project.json must not appear in archived list"
+        );
+    }
+
+    /// No PRD metadata: returns empty result with informative message.
+    #[test]
+    fn test_multi_prd_no_metadata_returns_empty_with_message() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        drop(conn);
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        assert!(result.archived.is_empty());
+        assert_eq!(result.tasks_cleared, 0);
+        assert!(
+            result.message.contains("No PRD metadata") || result.message.contains("no PRD"),
+            "Message should indicate no PRD metadata found, got: {}",
+            result.message
+        );
+    }
+
+    /// dry_run=true: no files are moved, no DB rows are deleted.
+    #[test]
+    fn test_multi_prd_dry_run_no_changes() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        setup_two_prd_metadata_with_tasks(&conn);
+
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), true).unwrap();
+
+        assert!(result.dry_run, "dry_run flag must be true in result");
+
+        // Files must NOT be moved
+        assert!(
+            tasks_dir.join("project-a.json").exists(),
+            "project-a.json must not be moved in dry_run"
+        );
+        assert!(
+            tasks_dir.join("project-b.json").exists(),
+            "project-b.json must not be moved in dry_run"
+        );
+
+        // DB must not be touched: PA tasks still exist
+        let conn = crate::db::open_connection(dir.path()).unwrap();
+        let pa_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(pa_count, 2, "PA tasks must not be deleted in dry_run");
+    }
+
+    /// progress.txt is never moved — it stays in place even after a successful archive.
+    #[test]
+    fn test_multi_prd_progress_txt_never_moved() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) \
+             VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("progress.txt"), "## PA-001\n- Done.\n---\n").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // Archive should succeed
+        assert!(
+            !result.archived.is_empty(),
+            "Archive should produce results"
+        );
+
+        // progress.txt must remain in tasks/
+        assert!(
+            tasks_dir.join("progress.txt").exists(),
+            "progress.txt must never be moved to the archive"
+        );
+
+        // progress.txt must NOT appear in the archived list
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources.iter().any(|s| s.contains("progress.txt")),
+            "progress.txt must not appear in archived items"
+        );
+    }
+
     /// Known-bad discriminator: a naive `DELETE FROM tasks` without a WHERE
     /// clause destroys all PRDs. This test documents the catastrophic outcome
     /// to confirm the scoped `clear_prd_data_for_prefix` must never do this.
