@@ -60,11 +60,12 @@
       "priority": 1,
       "estimatedEffort": "low",
       "passes": false,
-      "notes": "Phase 2 starts from the post-Phase-1 state. Every subsequent extraction must match this baseline test count exactly.",
+      "notes": "Phase 2 starts from the post-Phase-1 state. Every subsequent extraction must match this baseline test count exactly. P1 baseline for reference: 2262 passed, 0 failed, 7 ignored; 23 pub mod declarations in mod.rs. P1 learning: also audit pub(super) visibility patterns — P1 found that some fns needed pub(crate) after extraction.",
       "edgeCases": [
         "Phase 1 may have left pending cleanup — verify no leftover TODOs in engine.rs, prompt.rs, env.rs",
         "Some tests may be #[ignore] — count those separately",
-        "If Phase 1 is not yet complete on the branch, document which Phase 1 tasks are done"
+        "If Phase 1 is not yet complete on the branch, document which Phase 1 tasks are done",
+        "P1 learning: check for duplicate test helpers (e.g. setup_git_repo was duplicated in worktree.rs vs test_utils.rs)"
       ],
       "invariants": [
         "Total test count must not decrease after any extraction",
@@ -104,7 +105,7 @@
       "priority": 6,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "spawn_claude calls watchdog_loop by spawning a thread — the interface is the function signature. After extraction, claude.rs calls watchdog::watchdog_loop(...) in the spawned thread. TimeoutConfig is used by engine.rs directly (line 435) — so it must be pub, and engine.rs import path changes from claude::TimeoutConfig to watchdog::TimeoutConfig. The #[cfg(unix)] test helpers (lines 605, 625, 665, 1073, 1105) that test watchdog behavior should move too.",
+      "notes": "spawn_claude calls watchdog_loop by spawning a thread — the interface is the function signature. After extraction, claude.rs calls watchdog::watchdog_loop(...) in the spawned thread. TimeoutConfig is used by engine.rs directly (line 435) — so it must be pub, and engine.rs import path changes from claude::TimeoutConfig to watchdog::TimeoutConfig. The #[cfg(unix)] test helpers (lines 605, 625, 665, 1073, 1105) that test watchdog behavior should move too. P1 learnings: (1) Preserve any #[allow] annotations when moving code. (2) Use pub(crate) for internal fns, pub only for cross-module (TimeoutConfig needs pub since engine.rs uses it). (3) Line numbers shift after each removal — verify line numbers before each edit. (4) Keep #[cfg(unix)]/#[cfg(not(unix))] pairs together (P1 kept platform pairs in worktree.rs successfully).",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -127,7 +128,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-007", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -148,7 +149,7 @@
       "priority": 7,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "Prefer flat files (status_queries.rs + status_display.rs) since there are only 2 modules — no need for a subdirectory. The structs (DashboardResult etc.) are used by both layers and by external callers (handlers.rs) — keep them in status.rs and re-export, or move to a shared types location. format_text is pub and called from handlers.rs — its path must remain accessible. read_task_prefix_from_prd is pub and called from engine.rs.",
+      "notes": "Prefer flat files (status_queries.rs + status_display.rs) since there are only 2 modules — no need for a subdirectory. The structs (DashboardResult etc.) are used by both layers and by external callers (handlers.rs) — keep them in status.rs and re-export, or move to a shared types location. format_text is pub and called from handlers.rs — its path must remain accessible. read_task_prefix_from_prd is pub and called from engine.rs. P1 learnings: (1) P1 used re-exports successfully (prompt.rs re-exports PromptResult, BuildPromptParams used by engine.rs). Follow same pattern for DashboardResult etc. (2) Import graph must remain a clean DAG — no cycles between status_queries and status_display. (3) Constants stay in their original file (prompt.rs kept TASK_CONTEXT_BUDGET etc.).",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -174,7 +175,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-006", "REFACTOR-008", "REFACTOR-009", "REFACTOR-010"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -195,7 +196,7 @@
       "priority": 8,
       "estimatedEffort": "low",
       "passes": false,
-      "notes": "This task is smaller than originally scoped. The PRD assumed code duplication between archive.rs and learnings/ingestion/, but exploration showed they serve different purposes: archive parses formatted markdown from progress.txt, ingestion uses an LLM on raw Claude output. The main extraction opportunity is format_text (~65 lines) which reduces archive.rs but isn't a major win. If archive.rs is under 1200 lines after documentation only, output 'EXPLICIT_SKIP: archive.rs under 1200 lines, format_text extraction not warranted' in progress.txt and mark complete.",
+      "notes": "This task is smaller than originally scoped. The PRD assumed code duplication between archive.rs and learnings/ingestion/, but exploration showed they serve different purposes: archive parses formatted markdown from progress.txt, ingestion uses an LLM on raw Claude output. The main extraction opportunity is format_text (~65 lines) which reduces archive.rs but isn't a major win. If archive.rs is under 1200 lines after documentation only, output 'EXPLICIT_SKIP: archive.rs under 1200 lines, format_text extraction not warranted' in progress.txt and mark complete. P1 learning: P1 had similar pragmatic skip decisions — small extractions (<50 lines) were documented but not extracted.",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -217,7 +218,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-009", "REFACTOR-010"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -238,7 +239,7 @@
       "priority": 9,
       "estimatedEffort": "medium",
       "passes": false,
-      "notes": "compute_correlation takes &[TaskOutcome] — the TaskOutcome struct must be visible to calibrate_math.rs. Options: (1) keep TaskOutcome in calibrate.rs as pub(crate), import in calibrate_math; (2) move TaskOutcome to calibrate_math since it's a data-only struct used primarily by the math functions. Prefer option 1 since TaskOutcome is populated by DB queries in calibrate.rs. The SelectionWeights struct stays in calibrate.rs since it's used by external callers (selection.rs, engine.rs).",
+      "notes": "compute_correlation takes &[TaskOutcome] — the TaskOutcome struct must be visible to calibrate_math.rs. Options: (1) keep TaskOutcome in calibrate.rs as pub(crate), import in calibrate_math; (2) move TaskOutcome to calibrate_math since it's a data-only struct used primarily by the math functions. Prefer option 1 since TaskOutcome is populated by DB queries in calibrate.rs. The SelectionWeights struct stays in calibrate.rs since it's used by external callers (selection.rs, engine.rs). P1 learnings: (1) Constants stay in their original file — calibrate.rs constants should remain there. (2) P1 kept shared types in the parent module (prompt.rs kept PromptResult) — follow same pattern for TaskOutcome/SelectionWeights. (3) Verify line numbers before each edit — they shift after removals.",
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -260,7 +261,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-010"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {
@@ -298,7 +299,7 @@
       "dependsOn": ["TEST-INIT-001"],
       "synergyWith": [],
       "batchWith": [],
-      "conflictsWith": ["REFACTOR-006", "REFACTOR-007", "REFACTOR-008", "REFACTOR-009"],
+      "conflictsWith": [],
       "modifiesBehavior": false
     },
     {

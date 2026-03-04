@@ -544,6 +544,26 @@
 - **Learnings:** Structured acceptance criteria table makes milestone gates fast and thorough
 ---
 
+## 2026-03-03 - p1-refactor-LEARN-001
+- Updated P2 JSON (large-file-refactor-p2.json) with P1 extraction learnings
+- **Tasks updated:**
+  - TEST-INIT-001: Added P1 baseline numbers for reference, added edge case about duplicate test helpers
+  - REFACTOR-006 (watchdog): Added notes on #[allow] preservation, visibility patterns, line number shifting, cfg pair handling
+  - REFACTOR-007 (status split): Added notes on re-export pattern, DAG import graph, constants staying in place
+  - REFACTOR-008 (archive): Added note on pragmatic skip pattern from P1
+  - REFACTOR-009 (calibrate_math): Added notes on constants, shared types pattern, line number verification
+  - All REFACTOR-006 through 010: Removed false conflictsWith (they touch different files, sequential workflow handles ordering)
+- **Key P1 learnings applied:**
+  1. pub(crate) for internal fns, pub only for cross-module APIs
+  2. Constants stay in their original file
+  3. Shared types stay in parent module with re-exports
+  4. Line numbers shift after removals — verify before each edit
+  5. Preserve #[allow] annotations when moving code
+  6. Keep #[cfg(unix)]/#[cfg(not(unix))] pairs together
+  7. Watch for duplicate test helpers across modules
+- **Learnings:** conflictsWith should mean "touches same lines/structs" not "same phase" — P1's sequential workflow already prevents parallel execution
+---
+
 ## 2026-03-03 - p1-refactor-TEST-INIT-001
 - **Baseline pre-extraction state verified**
 - cargo test: 2262 passed; 0 failed; 7 ignored (total across all test suites)
