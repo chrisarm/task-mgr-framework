@@ -1,4 +1,13 @@
 
+## 2026-03-03 - p4-refactor-ASSESS-015
+- Assessed claude-loop.sh status: DEPRECATED
+- References found: README.md:227 ("replaced the external claude-loop.sh script"), docs/ARCHITECTURE.md:29 ("original 1,455 lines of bash"), docs/INTEGRATION.md:249-263 (Reference Implementation section), tasks/archive/prd-model-selection.md (historical reference)
+- Verdict: DEPRECATED — superseded by Rust loop engine (src/loop_engine/). Script is referenced only as historical context and reference implementation in docs.
+- Action taken: Added deprecation comment header to scripts/claude-loop.sh
+- Doc updates needed: docs/INTEGRATION.md references it as an active reference implementation (lines 249-263, 395, 602) — should be updated to note deprecated status, but NOT done in this task per acceptance criteria.
+- Test count: 2264 passed (no Rust code changed)
+---
+
 ## 2026-03-03 - p4-refactor-ASSESS-014
 - Assessed all 17 Tier 4 files for SRP violations. Verdicts: 14 COHESIVE, 1 MONITOR, 2 EXTRACT.
 - Test count unchanged: 2264 passed (assessment only, no code changes)

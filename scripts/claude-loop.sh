@@ -1,4 +1,5 @@
 #!/bin/bash
+# DEPRECATED: Superseded by Rust loop engine (src/loop_engine/). Kept as reference implementation.
 # Claude Code Loop with task-mgr integration
 #
 # Usage: ./claude-loop.sh [max_iterations] [prd_file] [prompt_file]
