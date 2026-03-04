@@ -15,6 +15,7 @@ pub mod feedback;
 pub mod git_reconcile;
 pub mod model;
 pub mod monitor;
+pub mod output_parsing;
 pub mod oauth;
 pub mod progress;
 pub mod prompt;
