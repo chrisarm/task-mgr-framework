@@ -353,6 +353,34 @@ mod tests {
         crate::loop_engine::test_utils::init_test_repo()
     }
 
+    /// Set up a temp dir, git repo, and .task-mgr db dir in one call.
+    /// Returns (tmp, repo_path, db_dir_path).
+    fn setup_worktree_test_env() -> (TempDir, PathBuf, PathBuf) {
+        let (tmp, repo) = init_test_repo();
+        let db_dir = tmp.path().join(".task-mgr");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+        (tmp, repo, db_dir)
+    }
+
+    /// Create a git branch and add a worktree at `wt_path` checked out to `branch`.
+    fn create_test_worktree(repo: &Path, wt_path: &Path, branch: &str) {
+        Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repo)
+            .output()
+            .expect("git branch");
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_path.to_str().expect("valid path"),
+                branch,
+            ])
+            .current_dir(repo)
+            .output()
+            .expect("git worktree add");
+    }
+
     /// Write a lock file that claims the given worktree path is locked.
     /// Does NOT hold an flock — useful for testing stale lock detection.
     fn write_lock_file(lock_path: &Path, worktree_path: &str) {
@@ -550,9 +578,7 @@ mod tests {
 
     #[test]
     fn test_list_shows_correct_branch_path_lock_status() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         let result = list(&db_dir, &repo).expect("list should succeed");
         assert!(
@@ -580,9 +606,7 @@ mod tests {
 
     #[test]
     fn test_list_shows_locked_when_lock_file_present() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         // Write a lock file claiming the repo path is active, with an actual flock
         let repo_str = repo.to_string_lossy().to_string();
@@ -602,27 +626,11 @@ mod tests {
 
     #[test]
     fn test_prune_skips_locked_worktrees() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         // Create a second worktree
         let wt_path = tmp.path().join("feat-wt");
-        Command::new("git")
-            .args(["branch", "feat/test-prune"])
-            .current_dir(&repo)
-            .output()
-            .expect("git branch");
-        Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                wt_path.to_str().expect("valid path"),
-                "feat/test-prune",
-            ])
-            .current_dir(&repo)
-            .output()
-            .expect("git worktree add");
+        create_test_worktree(&repo, &wt_path, "feat/test-prune");
 
         // Lock the worktree via a lock file with actual flock
         let wt_str = wt_path.to_string_lossy().to_string();
@@ -653,26 +661,10 @@ mod tests {
 
     #[test]
     fn test_remove_by_branch_name() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         let wt_path = tmp.path().join("remove-branch-wt");
-        Command::new("git")
-            .args(["branch", "feat/remove-test"])
-            .current_dir(&repo)
-            .output()
-            .expect("git branch");
-        Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                wt_path.to_str().expect("valid path"),
-                "feat/remove-test",
-            ])
-            .current_dir(&repo)
-            .output()
-            .expect("git worktree add");
+        create_test_worktree(&repo, &wt_path, "feat/remove-test");
 
         assert!(wt_path.exists(), "worktree should exist before remove");
 
@@ -688,26 +680,10 @@ mod tests {
 
     #[test]
     fn test_remove_by_path() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         let wt_path = tmp.path().join("remove-path-wt");
-        Command::new("git")
-            .args(["branch", "feat/remove-by-path"])
-            .current_dir(&repo)
-            .output()
-            .expect("git branch");
-        Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                wt_path.to_str().expect("valid path"),
-                "feat/remove-by-path",
-            ])
-            .current_dir(&repo)
-            .output()
-            .expect("git worktree add");
+        create_test_worktree(&repo, &wt_path, "feat/remove-by-path");
 
         assert!(wt_path.exists(), "worktree should exist before remove");
 
@@ -722,26 +698,10 @@ mod tests {
 
     #[test]
     fn test_remove_locked_worktree_returns_error() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (tmp, repo, db_dir) = setup_worktree_test_env();
 
         let wt_path = tmp.path().join("locked-wt");
-        Command::new("git")
-            .args(["branch", "feat/locked-remove"])
-            .current_dir(&repo)
-            .output()
-            .expect("git branch");
-        Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                wt_path.to_str().expect("valid path"),
-                "feat/locked-remove",
-            ])
-            .current_dir(&repo)
-            .output()
-            .expect("git worktree add");
+        create_test_worktree(&repo, &wt_path, "feat/locked-remove");
 
         // Lock the worktree with actual flock
         let wt_str = wt_path.to_string_lossy().to_string();
@@ -759,9 +719,7 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent_target_returns_error() {
-        let (tmp, repo) = init_test_repo();
-        let db_dir = tmp.path().join(".task-mgr");
-        fs::create_dir_all(&db_dir).expect("create db dir");
+        let (_tmp, repo, db_dir) = setup_worktree_test_env();
 
         let result = remove(&db_dir, &repo, "nonexistent-branch");
         assert!(result.is_err());
