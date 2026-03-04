@@ -1400,3 +1400,204 @@ fn test_doctor_json_format() {
         "Doctor JSON should have summary or issues"
     );
 }
+
+// ============================================================================
+// Integration tests: archive command with real binary
+// ============================================================================
+
+/// Setup: init P1 (all tasks done) and P2 (tasks incomplete) in a temp dir.
+/// Returns (TempDir, dir_str) — caller must keep TempDir alive.
+///
+/// Fixtures are copied into tasks/ inside the temp dir so the archive command
+/// can move them (avoids cross-device link errors from /tmp vs project dir).
+fn setup_archive_test_dir() -> (TempDir, String) {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_string();
+
+    // Create tasks/ directory and copy fixtures into it
+    let tasks_dir = temp_dir.path().join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let p1_src = manifest_dir.join("tests/fixtures/prd_p1_alpha.json");
+    let p2_src = manifest_dir.join("tests/fixtures/prd_p2_beta.json");
+    let p1_dest = tasks_dir.join("prd_p1_alpha.json");
+    let p2_dest = tasks_dir.join("prd_p2_beta.json");
+    fs::copy(&p1_src, &p1_dest).unwrap();
+    fs::copy(&p2_src, &p2_dest).unwrap();
+
+    // Init P1 (alpha-project) from the local copy
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["init", "--from-json", p1_dest.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Init P2 (beta-project) with --append from the local copy
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["init", "--append", "--from-json", p2_dest.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Mark all P1 tasks as done directly in DB
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id LIKE 'P1-%'", [])
+            .unwrap();
+    }
+
+    // Leave P2 tasks as-is (todo / default state — incomplete)
+
+    (temp_dir, dir)
+}
+
+#[test]
+fn test_archive_dry_run_shows_p1_archived_p2_skipped() {
+    let (temp_dir, dir) = setup_archive_test_dir();
+    let _keep = &temp_dir;
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["archive", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+
+    // Dry-run header must be present (matches "Dry Run", "dry run", "DRY RUN")
+    assert!(
+        text.to_lowercase().contains("dry run"),
+        "dry-run output must mention dry run mode: {text}"
+    );
+
+    // P1 should be shown as archived (or would-be archived)
+    assert!(
+        text.contains("P1") || text.contains("alpha"),
+        "dry-run output must mention P1/alpha: {text}"
+    );
+
+    // P2 should be shown as skipped
+    assert!(
+        text.contains("P2")
+            || text.contains("beta")
+            || text.contains("skip")
+            || text.contains("Skip"),
+        "dry-run output must mention P2/beta as skipped: {text}"
+    );
+
+    // Verify no DB changes: P1 tasks still in tasks table
+    let db_path = temp_dir.path().join("tasks.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let p1_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        p1_count > 0,
+        "dry-run must not remove P1 tasks from DB (found {p1_count})"
+    );
+}
+
+#[test]
+fn test_archive_actual_archives_p1_leaves_p2() {
+    let (temp_dir, dir) = setup_archive_test_dir();
+    let _keep = &temp_dir;
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["archive"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+
+    // P1 must appear as archived
+    assert!(
+        text.contains("P1") || text.contains("alpha"),
+        "archive output must mention P1/alpha: {text}"
+    );
+
+    let db_path = temp_dir.path().join("tasks.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // P1 tasks must be cleared from the DB after archiving
+    let p1_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        p1_count, 0,
+        "P1 tasks must be cleared from DB after archive"
+    );
+
+    // P2 tasks must remain intact
+    let p2_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        p2_count > 0,
+        "P2 tasks must remain in DB after archiving only P1 (found {p2_count})"
+    );
+}
+
+#[test]
+fn test_archive_json_format_structure() {
+    let (temp_dir, dir) = setup_archive_test_dir();
+    let _keep = &temp_dir;
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["archive", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_str(&String::from_utf8(output).unwrap())
+        .expect("archive --format json must produce valid JSON");
+
+    assert!(
+        json.get("archived").is_some(),
+        "JSON must have 'archived' field: {json}"
+    );
+    assert!(
+        json.get("prds_archived").is_some(),
+        "JSON must have 'prds_archived' field: {json}"
+    );
+    assert!(
+        json.get("prds_skipped").is_some(),
+        "JSON must have 'prds_skipped' field: {json}"
+    );
+
+    let prds_archived = json["prds_archived"].as_array().unwrap();
+    assert_eq!(
+        prds_archived.len(),
+        1,
+        "Exactly 1 PRD (P1) should be archived"
+    );
+    assert_eq!(
+        prds_archived[0]["task_prefix"].as_str().unwrap(),
+        "P1",
+        "Archived PRD must be P1"
+    );
+
+    let prds_skipped = json["prds_skipped"].as_array().unwrap();
+    assert_eq!(
+        prds_skipped.len(),
+        1,
+        "Exactly 1 PRD (P2) should be skipped"
+    );
+}
