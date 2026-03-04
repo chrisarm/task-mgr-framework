@@ -1581,6 +1581,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 21.7: Prompt user to resolve pending key decisions (skip on SIGINT or yes_mode)
+    if exit_code != 130 {
+        prompt_pending_key_decisions(&conn, &run_id, run_config.config.yes_mode);
+    }
+
     // Step 22: Print final banner
     let total_elapsed = start_time.elapsed().as_secs();
     display::print_final_banner(
@@ -1593,6 +1598,100 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     LoopResult {
         exit_code,
         worktree_path: actual_worktree_path,
+    }
+}
+
+/// Query pending key decisions for the run and prompt the user to resolve or defer each.
+///
+/// In yes_mode, all decisions are auto-deferred without prompting.
+/// This function is a no-op when there are no pending decisions.
+fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool) {
+    let decisions = match key_decisions_db::get_pending_decisions(conn, run_id) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Warning: failed to query pending key decisions: {}", e);
+            return;
+        }
+    };
+
+    if decisions.is_empty() {
+        return;
+    }
+
+    if yes_mode {
+        for decision in &decisions {
+            if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
+                eprintln!("Warning: failed to defer decision {}: {}", decision.id, e);
+            }
+        }
+        eprintln!(
+            "Auto-deferred {} key decision(s) (yes_mode).",
+            decisions.len()
+        );
+        return;
+    }
+
+    eprintln!(
+        "\n╔══════════════════════════════════════════════════╗\
+         \n║         KEY DECISIONS REQUIRING YOUR INPUT        ║\
+         \n╚══════════════════════════════════════════════════╝"
+    );
+
+    for decision in &decisions {
+        loop {
+            eprintln!("\n┌─ Decision: {}", decision.title);
+            eprintln!("│  {}", decision.description);
+            eprintln!("│");
+            for (i, opt) in decision.options.iter().enumerate() {
+                let letter = (b'A' + i as u8) as char;
+                eprintln!("│  {}) {} — {}", letter, opt.label, opt.description);
+            }
+            eprintln!("│  S) Skip (defer to next session)");
+            eprint!("└─ Your choice: ");
+
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                // stdin unavailable — defer
+                eprintln!("\nWarning: could not read stdin, deferring decision.");
+                let _ = key_decisions_db::defer_decision(conn, decision.id);
+                break;
+            }
+
+            let trimmed = input.trim().to_lowercase();
+
+            if trimmed.is_empty() || trimmed == "s" || trimmed == "skip" {
+                if let Err(e) = key_decisions_db::defer_decision(conn, decision.id) {
+                    eprintln!("Warning: failed to defer decision: {}", e);
+                } else {
+                    eprintln!("Decision deferred.");
+                }
+                break;
+            }
+
+            // Try to map single letter to option index
+            if trimmed.len() == 1 {
+                let ch = trimmed.chars().next().unwrap();
+                if ch.is_ascii_alphabetic() {
+                    let idx = (ch as u8).wrapping_sub(b'a') as usize;
+                    if let Some(opt) = decision.options.get(idx) {
+                        let resolution = format!("{}: {}", opt.label, opt.description);
+                        if let Err(e) =
+                            key_decisions_db::resolve_decision(conn, decision.id, &resolution)
+                        {
+                            eprintln!("Warning: failed to resolve decision: {}", e);
+                        } else {
+                            eprintln!("Decision resolved: {}", resolution);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            eprintln!(
+                "Invalid choice — enter a letter (A–{}) or S to skip.",
+                (b'A' + decision.options.len() as u8 - 1) as char
+            );
+        }
     }
 }
 
