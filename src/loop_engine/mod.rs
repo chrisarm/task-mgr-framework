@@ -3,6 +3,7 @@ pub mod archive_display;
 pub mod batch;
 pub mod branch;
 pub mod calibrate;
+pub mod calibrate_math;
 pub mod claude;
 pub mod config;
 pub mod context;
