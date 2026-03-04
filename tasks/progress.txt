@@ -1,4 +1,13 @@
 
+## 2026-03-03 - p3-refactor-TEST-INIT-001
+- P3 baseline verified: 2264 tests passed, 0 failed, 7 ignored
+- cargo clippy -- -D warnings: zero warnings
+- cargo fmt --check: clean
+- Line counts: oauth.rs=857L, main.rs=836L, signals.rs=781L
+- P2 modules confirmed: watchdog.rs, status_queries.rs, status_display.rs, calibrate_math.rs all exist
+- **Learnings:** Baseline matches P2 final state exactly; P3 ready to proceed
+---
+
 ## 2026-03-03 - p2-refactor-LEARN-002
 - Final pass on P3 tasks after P2 completion
 - Updated P3 description: signals.rs line count corrected 784→781L, added P2 completion summary
