@@ -98,7 +98,7 @@
       "id": "REFACTOR-011",
       "modifiesBehavior": false,
       "notes": "oauth.rs is 857 lines but 660 are tests. The 7 production functions total ~197 lines. The PRD assumed browser/PKCE/server code existed — it doesn't. Splitting ~100 lines of storage from ~100 lines of refresh creates two tiny modules. The agent should make a pragmatic call. External callers: engine.rs (ensure_valid_token), usage.rs (credentials_path, read_credentials, is_token_expiring, refresh_token). P2 LEARNING: detection.rs (1013L, ~18L extractable) was EXPLICIT_SKIP with section markers — same pragmatic pattern applies here. With only ~197L production code, EXPLICIT_SKIP is the strongly recommended outcome.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -143,7 +143,8 @@
       "id": "REFACTOR-012",
       "modifiesBehavior": false,
       "notes": "main.rs has NO #[cfg(test)] module — no tests to move. get_project_root (L33-50) calls git rev-parse, used by Loop/Batch/Worktrees arms only. The 34 command arms are individually small (5-30 lines each) but collectively make main.rs hard to navigate. The PRD's goal of 'main.rs as thin routing layer' is achieved by grouping arms into dispatch helpers. This is a judgment call — flat match statements are idiomatic in Rust CLIs. P2 LEARNING: detection.rs was successfully reorganized in-place with section markers (// --- Section ---) instead of extraction. Consider section markers as an alternative to dispatch helpers if arms are already clean 5-20 line blocks — this is lower risk and idiomatic for Rust CLI match statements. EXPLICIT_SKIP with section markers is a valid P3 outcome.",
-      "passes": false,
+      "passes": true,
+      "explicitSkip": "EXPLICIT_SKIP: 34 match arms are each clean 5-30 line blocks. Flat match is idiomatic Rust CLI dispatch. No centralized DB setup to extract (PRD assumption wrong). Dispatch helpers would add indirection without reducing complexity. No test module to move. Documented in progress.txt.",
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -189,7 +190,7 @@
       "id": "REFACTOR-013",
       "modifiesBehavior": false,
       "notes": "PRD US-012 names target as 'steering.rs' — renamed to guidance.rs because exploration found NO steering.md file parsing in signals.rs. SessionGuidance accumulates interactive stdin guidance, not file-based steering. SessionGuidance is imported by name in engine.rs (L44: `use ...signals::{self, SessionGuidance, SignalFlag}`). After extraction, engine.rs imports SessionGuidance from guidance and SignalFlag from signals. handle_pause in signals.rs takes &mut SessionGuidance — it will import from super::guidance::SessionGuidance. The ~130 lines of SessionGuidance tests (L309-441) move; the remaining ~350 lines of signal tests stay. P2 LEARNINGS: (1) Re-export pattern (status.rs re-exports structs from status_queries/status_display) avoids changing external callers — consider re-exporting SessionGuidance from signals.rs if many callers import it. (2) Use pub(crate) for internal APIs, pub only for cross-crate. (3) Line numbers shift after P2 extractions — verify actual line numbers before editing. (4) Private `use` imports in parent module are NOT accessible via `use super::*` in test submodule — must add explicit imports in moved test code. (5) Struct fields must be pub(crate) if moved functions access them from a different module.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [

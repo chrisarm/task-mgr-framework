@@ -1,4 +1,15 @@
 
+## 2026-03-03 - p3-refactor-REFACTOR-012
+- EXPLICIT_SKIP: main.rs has 34 match arms, each a clean 5-30 line block. Flat match is idiomatic Rust CLI dispatch.
+- No centralized DB setup block exists (PRD assumption was wrong — open_connection is called per-arm).
+- get_project_root() (L33-50) is small and only used by Loop/Batch/Worktrees arms — no benefit moving it.
+- Grouping arms into dispatch helpers would add indirection without reducing complexity; section markers considered but flat structure is already navigable.
+- No test module in main.rs — nothing to move.
+- Test count: before=2264, after=2264 (no changes made)
+- cargo clippy -- -D warnings: zero warnings (no changes made)
+- **Learnings:** A flat match with 34 clean arms is more maintainable than 34 arms dispatching to 4-6 helper functions with their own imports and arg threading.
+---
+
 ## 2026-03-03 - p3-refactor-REFACTOR-011
 - EXPLICIT_SKIP: oauth.rs production code is ~197 lines (7 functions). Splitting ~100L storage from ~100L refresh creates two tiny modules with no meaningful maintainability gain.
 - Verified: PRD's assumed browser/PKCE/callback server code does not exist in oauth.rs.
