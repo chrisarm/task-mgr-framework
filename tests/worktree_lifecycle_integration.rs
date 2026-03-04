@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 use task_mgr::db::lock::LockGuard;
 use task_mgr::loop_engine::display::{format_session_banner, SessionBannerHints};
-use task_mgr::loop_engine::env::{ensure_worktree, remove_worktree};
+use task_mgr::loop_engine::worktree::{ensure_worktree, remove_worktree};
 
 // ============================================================================
 // Test 1: Lock file contains branch/worktree/prefix metadata

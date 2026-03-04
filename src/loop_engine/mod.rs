@@ -24,6 +24,7 @@ pub mod signals;
 pub mod stale;
 pub mod status;
 pub mod usage;
+pub mod worktree;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopRunConfig};
-use crate::loop_engine::env;
 use crate::loop_engine::signals;
+use crate::loop_engine::worktree;
 
 /// Result of a batch run.
 #[derive(Debug)]
@@ -161,7 +161,7 @@ fn cleanup_worktree_after_prd(
     };
 
     if should_remove {
-        match env::remove_worktree(project_root, wt_path) {
+        match worktree::remove_worktree(project_root, wt_path) {
             Ok(true) => eprintln!("Removed worktree: {}", wt_path.display()),
             Ok(false) => eprintln!(
                 "Warning: worktree has uncommitted changes, kept: {}",

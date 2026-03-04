@@ -52,6 +52,7 @@ use crate::loop_engine::signals::{self, SessionGuidance, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status::read_task_prefix_from_prd;
 use crate::loop_engine::usage::{self, UsageCheckResult};
+use crate::loop_engine::worktree;
 use crate::models::RunStatus;
 use crate::TaskMgrResult;
 
@@ -902,8 +903,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let working_root = if let Some(ref branch) = branch_name {
         if run_config.config.use_worktrees {
             // Create or reuse worktree for this branch
-            match env::ensure_worktree(&run_config.source_root, branch, run_config.config.yes_mode)
-            {
+            match worktree::ensure_worktree(
+                &run_config.source_root,
+                branch,
+                run_config.config.yes_mode,
+            ) {
                 Ok(wt_path) => {
                     actual_worktree_path = Some(wt_path.clone());
                     wt_path
@@ -1527,7 +1531,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         };
 
         if should_cleanup {
-            match env::remove_worktree(&run_config.source_root, wt_path) {
+            match worktree::remove_worktree(&run_config.source_root, wt_path) {
                 Ok(true) => eprintln!("Worktree '{}' removed.", wt_path.display()),
                 Ok(false) => eprintln!(
                     "Warning: worktree '{}' has uncommitted changes — not removed.",

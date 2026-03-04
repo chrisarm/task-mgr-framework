@@ -10,7 +10,7 @@ use fs2::FileExt;
 
 use crate::db::LockGuard;
 use crate::error::{TaskMgrError, TaskMgrResult};
-use crate::loop_engine::env::{parse_worktree_list, remove_worktree};
+use crate::loop_engine::worktree::{parse_worktree_list, remove_worktree};
 
 /// Status of a worktree's active lock.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

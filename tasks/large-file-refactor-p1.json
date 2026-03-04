@@ -1,11 +1,20 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "large-file-refactor",
-  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "Phase 1: Decompose the three largest loop_engine files (engine.rs 4525L, prompt.rs 3753L, env.rs 2688L) into focused single-responsibility modules. Mechanical extraction only — no behavior changes.",
-  "taskPrefix": "p1-refactor",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "Test count is identical before and after extraction (run `cargo test 2>&1 | grep 'test result'`)",
+      "No breaking changes to existing public APIs — re-export if necessary",
+      "Every new module file has a //! module doc comment"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
@@ -22,31 +31,18 @@
       "Use pub(crate) for internal APIs, pub only for cross-crate visibility"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "These criteria apply to ALL implementation tasks",
-    "criteria": [
-      "Rust: No warnings in `cargo check` output",
-      "Rust: No warnings in `cargo clippy` output",
-      "Rust: All tests pass with `cargo test`",
-      "Rust: `cargo fmt --check` passes",
-      "Test count is identical before and after extraction (run `cargo test 2>&1 | grep 'test result'`)",
-      "No breaking changes to existing public APIs — re-export if necessary",
-      "Every new module file has a //! module doc comment"
-    ]
-  },
+  "project": "task-mgr",
   "reviewGuidelines": {
     "priorityGuidelines": {
       "critical": "1-10: Blocks further work, fix immediately",
       "high": "11-20: Fix before phase completion",
-      "medium": "21-50: Fix in current phase if time permits",
-      "low": "51-99: Defer to hardening phase"
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "p1-refactor",
   "userStories": [
     {
-      "id": "TEST-INIT-001",
-      "title": "Baseline test count and verify pre-extraction state",
-      "description": "Before any extraction, capture the baseline test count and verify all checks pass. This creates the reference point for validating that no tests are lost during extractions.",
       "acceptanceCriteria": [
         "Run `cargo test 2>&1 | grep 'test result'` and record exact pass/fail/ignore counts in progress.txt",
         "Run `cargo clippy -- -D warnings` and confirm zero warnings",
@@ -57,36 +53,38 @@
         "Audit constants: `grep -n 'const ' src/loop_engine/engine.rs src/loop_engine/prompt.rs src/loop_engine/env.rs` — record which constants are used by functions being extracted",
         "Audit #[allow] annotations: `grep -n '#\\[allow' src/loop_engine/engine.rs src/loop_engine/prompt.rs src/loop_engine/env.rs` — record any suppressed warnings that must be preserved in extracted modules"
       ],
-      "priority": 1,
-      "estimatedEffort": "low",
-      "passes": false,
-      "notes": "This is the pre-flight check. Every subsequent extraction must match this baseline test count exactly.",
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Before any extraction, capture the baseline test count and verify all checks pass. This creates the reference point for validating that no tests are lost during extractions.",
       "edgeCases": [
         "Some tests may be #[ignore] — count those separately",
         "Integration tests in tests/ directory must also be counted",
         "Flaky tests that pass intermittently — run cargo test twice to confirm stable count"
       ],
-      "invariants": [
-        "Total test count must not decrease after any extraction",
-        "Zero clippy warnings must be maintained throughout"
-      ],
+      "estimatedEffort": "low",
       "failureModes": [
         {
           "cause": "Test count changes between runs due to flaky tests",
           "expectedBehavior": "Run 3 times, use consistent count; document any flaky tests"
         }
       ],
-      "touchesFiles": ["tasks/progress.txt"],
-      "dependsOn": [],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Total test count must not decrease after any extraction",
+        "Zero clippy warnings must be maintained throughout"
+      ],
+      "modifiesBehavior": false,
+      "notes": "This is the pre-flight check. Every subsequent extraction must match this baseline test count exactly.",
+      "passes": true,
+      "priority": 1,
       "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      "title": "Baseline test count and verify pre-extraction state",
+      "touchesFiles": [
+        "tasks/progress.txt"
+      ]
     },
     {
-      "id": "REFACTOR-001",
-      "title": "Extract git reconciliation from engine.rs to git_reconcile.rs",
-      "description": "Move git-based task completion detection functions from engine.rs to a new src/loop_engine/git_reconcile.rs module. Functions: reconcile_external_git_completions (line 2015), check_git_for_task_completion (line 2174), contains_task_id (line 2140). These are all module-private (fn, not pub) and only called within engine.rs. Move their associated tests too (11 contains_task_id tests at lines 3792-3882+4143, 4 reconcile tests at 3310/3889/3947/4017, 4 git_completion tests at 3376/3390/3406/4073).",
       "acceptanceCriteria": [
         "git_reconcile.rs contains: reconcile_external_git_completions, check_git_for_task_completion, contains_task_id",
         "git_reconcile.rs has //! module doc comment explaining its responsibility",
@@ -97,10 +95,23 @@
         "cargo test count matches baseline from TEST-INIT-001",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 6,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-004A",
+        "REFACTOR-004B",
+        "REFACTOR-004C",
+        "REFACTOR-005"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Move git-based task completion detection functions from engine.rs to a new src/loop_engine/git_reconcile.rs module. Functions: reconcile_external_git_completions (line 2015), check_git_for_task_completion (line 2174), contains_task_id (line 2140). These are all module-private (fn, not pub) and only called within engine.rs. Move their associated tests too (11 contains_task_id tests at lines 3792-3882+4143, 4 reconcile tests at 3310/3889/3947/4017, 4 git_completion tests at 3376/3390/3406/4073).",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-001",
+      "modifiesBehavior": false,
       "notes": "contains_task_id is called by both reconcile_external_git_completions and check_git_for_task_completion — all three must move together. reconcile_external_git_completions also calls update_prd_task_passes — at extraction time this function still lives in engine.rs, so git_reconcile.rs should import it via `super::update_prd_task_passes` or `crate::loop_engine::engine::update_prd_task_passes`. After REFACTOR-003 moves it to prd_reconcile.rs, the import path will need updating — but that is REFACTOR-003's responsibility, not this task's. Also calls complete_cmd::complete from crate::commands::complete.",
+      "passes": true,
+      "priority": 6,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after extraction",
@@ -116,21 +127,18 @@
           "Alphabetical mod declaration in mod.rs"
         ]
       },
+      "synergyWith": [
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "title": "Extract git reconciliation from engine.rs to git_reconcile.rs",
       "touchesFiles": [
         "src/loop_engine/engine.rs",
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["REFACTOR-002", "REFACTOR-003"],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-004A", "REFACTOR-004B", "REFACTOR-004C", "REFACTOR-005"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-002",
-      "title": "Extract output parsing from engine.rs to output_parsing.rs",
-      "description": "Move task completion output parsing functions from engine.rs to a new src/loop_engine/output_parsing.rs module. Functions: strip_task_prefix (line 1913), parse_completed_tasks (line 1927), check_output_for_task_completion (line 1955), scan_output_for_completed_tasks (line 1969). All are module-private. Move their associated tests too (6 parse_completed tests at lines 4161-4203, 4 scan_output tests, 1 check_output test).",
       "acceptanceCriteria": [
         "output_parsing.rs contains: strip_task_prefix, parse_completed_tasks, check_output_for_task_completion, scan_output_for_completed_tasks",
         "output_parsing.rs has //! module doc comment",
@@ -141,38 +149,50 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 7,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-004A",
+        "REFACTOR-004B",
+        "REFACTOR-004C",
+        "REFACTOR-005"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Move task completion output parsing functions from engine.rs to a new src/loop_engine/output_parsing.rs module. Functions: strip_task_prefix (line 1913), parse_completed_tasks (line 1927), check_output_for_task_completion (line 1955), scan_output_for_completed_tasks (line 1969). All are module-private. Move their associated tests too (6 parse_completed tests at lines 4161-4203, 4 scan_output tests, 1 check_output test).",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-002",
+      "modifiesBehavior": false,
       "notes": "scan_output_for_completed_tasks calls check_output_for_task_completion internally — they must stay together. strip_task_prefix is also called by update_prd_task_passes (moving to prd_reconcile in REFACTOR-003). Make strip_task_prefix pub(crate) so prd_reconcile can import it later. scan_output_for_completed_tasks uses rusqlite::Connection and prefix_and from crate::db.",
+      "passes": true,
+      "priority": 7,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "All 11 tests pass in new location",
           "strip_task_prefix accessible to both engine.rs and future prd_reconcile.rs"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub(crate) visibility",
           "//! module doc comment",
           "Alphabetical mod declaration"
         ]
       },
+      "synergyWith": [
+        "REFACTOR-001",
+        "REFACTOR-003"
+      ],
+      "title": "Extract output parsing from engine.rs to output_parsing.rs",
       "touchesFiles": [
         "src/loop_engine/engine.rs",
         "src/loop_engine/output_parsing.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": ["REFACTOR-001", "REFACTOR-003"],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-004A", "REFACTOR-004B", "REFACTOR-004C", "REFACTOR-005"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-003",
-      "title": "Extract PRD reconciliation from engine.rs to prd_reconcile.rs",
-      "description": "Move PRD metadata and pass reconciliation functions from engine.rs to a new src/loop_engine/prd_reconcile.rs module. Functions: read_prd_metadata (line 1549), update_prd_task_passes (line 1723), mark_task_done (line 1789), reconcile_passes_with_db (line 1811), hash_file (line 2227). Move associated tests (1 test for update_prd_task_passes, 3 for reconcile_passes_with_db).",
       "acceptanceCriteria": [
         "prd_reconcile.rs contains: read_prd_metadata, update_prd_task_passes, mark_task_done, reconcile_passes_with_db, hash_file",
         "prd_reconcile.rs has //! module doc comment",
@@ -186,40 +206,52 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 8,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-004A",
+        "REFACTOR-004B",
+        "REFACTOR-004C",
+        "REFACTOR-005"
+      ],
+      "dependsOn": [
+        "REFACTOR-002"
+      ],
+      "description": "Move PRD metadata and pass reconciliation functions from engine.rs to a new src/loop_engine/prd_reconcile.rs module. Functions: read_prd_metadata (line 1549), update_prd_task_passes (line 1723), mark_task_done (line 1789), reconcile_passes_with_db (line 1811), hash_file (line 2227). Move associated tests (1 test for update_prd_task_passes, 3 for reconcile_passes_with_db).",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-003",
+      "modifiesBehavior": false,
       "notes": "update_prd_task_passes calls strip_task_prefix which now lives in output_parsing.rs (from REFACTOR-002). mark_task_done calls update_prd_task_passes (internal to this module) and complete_cmd::complete. reconcile_passes_with_db calls complete_cmd::are_dependencies_satisfied. IMPORTANT: read_prd_metadata returns a PrdMetadata struct — grep for 'struct PrdMetadata' to locate its definition. If defined in engine.rs: move it to prd_reconcile.rs and add re-export `pub(crate) use prd_reconcile::PrdMetadata` in engine.rs (or mod.rs) so existing callers still compile. After REFACTOR-003, update git_reconcile.rs import of update_prd_task_passes to point to prd_reconcile instead of engine.",
+      "passes": true,
+      "priority": 8,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "All 4 tests pass in new location",
           "PrdMetadata struct accessible wherever needed"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub(crate) visibility",
           "//! module doc comment",
           "Alphabetical mod declaration"
         ]
       },
+      "synergyWith": [
+        "REFACTOR-001",
+        "REFACTOR-002"
+      ],
+      "title": "Extract PRD reconciliation from engine.rs to prd_reconcile.rs",
       "touchesFiles": [
         "src/loop_engine/engine.rs",
         "src/loop_engine/prd_reconcile.rs",
         "src/loop_engine/output_parsing.rs",
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["REFACTOR-002"],
-      "synergyWith": ["REFACTOR-001", "REFACTOR-002"],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-004A", "REFACTOR-004B", "REFACTOR-004C", "REFACTOR-005"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-004A",
-      "title": "Create prompt_sections/ scaffold and extract learnings.rs",
-      "description": "Create the prompt_sections/ subdirectory structure and extract the first section builder. Create: prompt_sections/mod.rs (with //! doc comment, re-exports, truncate_to_budget shared utility). Extract learnings.rs with: build_learnings_section, record_shown_learnings. Move truncate_to_budget to prompt_sections/mod.rs (shared by learnings and base_prompt). Move associated learnings tests. Keep everything else in prompt.rs for now.",
       "acceptanceCriteria": [
         "prompt_sections/ directory exists with mod.rs and learnings.rs",
         "Each file has //! module doc comment",
@@ -232,38 +264,46 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 9,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Create the prompt_sections/ subdirectory structure and extract the first section builder. Create: prompt_sections/mod.rs (with //! doc comment, re-exports, truncate_to_budget shared utility). Extract learnings.rs with: build_learnings_section, record_shown_learnings. Move truncate_to_budget to prompt_sections/mod.rs (shared by learnings and base_prompt). Move associated learnings tests. Keep everything else in prompt.rs for now.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-004A",
+      "modifiesBehavior": false,
       "notes": "First of 3 prompt extraction tasks (split from original REFACTOR-004 which was too large for one iteration). This establishes the subdirectory structure. truncate_to_budget is used by both learnings and base_prompt sections — putting it in prompt_sections/mod.rs avoids duplication. Test helpers that create DB fixtures are shared across many tests — they may need to stay in prompt.rs tests or be imported via crate path.",
+      "passes": false,
+      "priority": 9,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "build_prompt integration tests still work from prompt.rs"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "Subdirectory pattern matches commands/next/ and commands/curate/",
           "pub(crate) for internal functions",
           "Each file under 500 lines"
         ]
       },
+      "synergyWith": [],
+      "title": "Create prompt_sections/ scaffold and extract learnings.rs",
       "touchesFiles": [
         "src/loop_engine/prompt.rs",
         "src/loop_engine/prompt_sections/mod.rs",
         "src/loop_engine/prompt_sections/learnings.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-001", "REFACTOR-002", "REFACTOR-003"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-004B",
-      "title": "Extract synergy.rs and dependencies.rs to prompt_sections/",
-      "description": "Extract the synergy and dependency section builders from prompt.rs into the prompt_sections/ subdirectory. synergy.rs: build_synergy_section, get_synergy_tasks_in_run, resolve_synergy_cluster_model (pub), get_synergy_partner_models. dependencies.rs: build_dependency_section, get_completed_dependencies. Move associated tests with each.",
       "acceptanceCriteria": [
         "prompt_sections/synergy.rs and prompt_sections/dependencies.rs created with //! doc comments",
         "resolve_synergy_cluster_model is pub (called from prompt.rs build_prompt)",
@@ -273,38 +313,46 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 10,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "dependsOn": [
+        "REFACTOR-004A"
+      ],
+      "description": "Extract the synergy and dependency section builders from prompt.rs into the prompt_sections/ subdirectory. synergy.rs: build_synergy_section, get_synergy_tasks_in_run, resolve_synergy_cluster_model (pub), get_synergy_partner_models. dependencies.rs: build_dependency_section, get_completed_dependencies. Move associated tests with each.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-004B",
+      "modifiesBehavior": false,
       "notes": "Second of 3 prompt extraction tasks. resolve_synergy_cluster_model is pub and called only from prompt.rs build_prompt — it belongs in synergy.rs. get_synergy_partner_models is called by resolve_synergy_cluster_model.",
+      "passes": false,
+      "priority": 10,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "All synergy and dependency tests pass in new location"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub for resolve_synergy_cluster_model",
           "pub(crate) for other internal functions",
           "Each file under 500 lines"
         ]
       },
+      "synergyWith": [],
+      "title": "Extract synergy.rs and dependencies.rs to prompt_sections/",
       "touchesFiles": [
         "src/loop_engine/prompt.rs",
         "src/loop_engine/prompt_sections/mod.rs",
         "src/loop_engine/prompt_sections/synergy.rs",
         "src/loop_engine/prompt_sections/dependencies.rs"
-      ],
-      "dependsOn": ["REFACTOR-004A"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-001", "REFACTOR-002", "REFACTOR-003"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-004C",
-      "title": "Extract escalation.rs and finalize prompt.rs cleanup",
-      "description": "Extract the escalation section builder from prompt.rs and do final cleanup. escalation.rs: build_escalation_section, load_escalation_template (pub). After extraction, verify prompt.rs contains only: build_prompt orchestrator, try_fit_section, build_task_json, build_base_prompt_section, build_steering_section, PromptResult and BuildPromptParams structs, and integration tests.",
       "acceptanceCriteria": [
         "prompt_sections/escalation.rs created with //! doc comment",
         "load_escalation_template is pub (used outside prompt module)",
@@ -316,37 +364,45 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 11,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "dependsOn": [
+        "REFACTOR-004B"
+      ],
+      "description": "Extract the escalation section builder from prompt.rs and do final cleanup. escalation.rs: build_escalation_section, load_escalation_template (pub). After extraction, verify prompt.rs contains only: build_prompt orchestrator, try_fit_section, build_task_json, build_base_prompt_section, build_steering_section, PromptResult and BuildPromptParams structs, and integration tests.",
       "estimatedEffort": "medium",
-      "passes": false,
+      "id": "REFACTOR-004C",
+      "modifiesBehavior": false,
       "notes": "Third and final prompt extraction task. After this, prompt.rs should be under 1800 lines. load_escalation_template is pub — called from outside the prompt module.",
+      "passes": false,
+      "priority": 11,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
           "All prompt-related tests pass",
           "build_prompt integration tests still work"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub for load_escalation_template",
           "prompt.rs is now a clean orchestrator under 1800 lines"
         ]
       },
+      "synergyWith": [],
+      "title": "Extract escalation.rs and finalize prompt.rs cleanup",
       "touchesFiles": [
         "src/loop_engine/prompt.rs",
         "src/loop_engine/prompt_sections/mod.rs",
         "src/loop_engine/prompt_sections/escalation.rs"
-      ],
-      "dependsOn": ["REFACTOR-004B"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-001", "REFACTOR-002", "REFACTOR-003"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-005",
-      "title": "Extract worktree lifecycle from env.rs to worktree.rs",
-      "description": "Move worktree management functions from env.rs to a new src/loop_engine/worktree.rs module. Functions: cleanup_empty_dir (line 15), sanitize_branch_name (line 183), compute_worktree_path (line 196), is_inside_worktree (line 210), parse_worktree_list (line 233), ensure_worktree (line 280), remove_worktree (line 498). Move their associated tests (~35 worktree-related test functions spanning lines 2020-2688). Note: parse_worktree_list and remove_worktree are imported by commands/worktrees.rs — update that import path.",
       "acceptanceCriteria": [
         "worktree.rs contains all 7 worktree functions listed above",
         "worktree.rs has //! module doc comment",
@@ -361,10 +417,25 @@
         "cargo test count matches baseline",
         "cargo clippy -- -D warnings passes"
       ],
-      "priority": 12,
+      "batchWith": [],
+      "conflictsWith": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003",
+        "REFACTOR-004A",
+        "REFACTOR-004B",
+        "REFACTOR-004C"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Move worktree management functions from env.rs to a new src/loop_engine/worktree.rs module. Functions: cleanup_empty_dir (line 15), sanitize_branch_name (line 183), compute_worktree_path (line 196), is_inside_worktree (line 210), parse_worktree_list (line 233), ensure_worktree (line 280), remove_worktree (line 498). Move their associated tests (~35 worktree-related test functions spanning lines 2020-2688). Note: parse_worktree_list and remove_worktree are imported by commands/worktrees.rs — update that import path.",
       "estimatedEffort": "high",
-      "passes": false,
+      "id": "REFACTOR-005",
+      "modifiesBehavior": false,
       "notes": "External callers to update: (1) engine.rs line 879 env::ensure_worktree → worktree::ensure_worktree, (2) engine.rs line 1504 env::remove_worktree → worktree::remove_worktree, (3) batch.rs line 164 env::remove_worktree → worktree::remove_worktree, (4) commands/worktrees.rs line 13 import path change. ensure_worktree calls env::get_current_branch and env::prompt_user_yn — these stay in env.rs, so worktree.rs will need to import from env. Also document findings on commands/worktrees.rs overlap (minor — both invoke `git worktree list --porcelain` independently but share the parser).",
+      "passes": false,
+      "priority": 12,
       "qualityDimensions": {
         "correctness": [
           "Test count identical before and after",
@@ -372,7 +443,9 @@
           "commands/worktrees.rs compiles with updated import paths",
           "engine.rs and batch.rs compile with updated import paths"
         ],
-        "performance": ["No runtime impact"],
+        "performance": [
+          "No runtime impact"
+        ],
         "style": [
           "pub(crate) and pub visibility matches original",
           "//! module doc comment",
@@ -380,6 +453,8 @@
           "Document overlap findings in progress.txt"
         ]
       },
+      "synergyWith": [],
+      "title": "Extract worktree lifecycle from env.rs to worktree.rs",
       "touchesFiles": [
         "src/loop_engine/env.rs",
         "src/loop_engine/worktree.rs",
@@ -387,17 +462,9 @@
         "src/loop_engine/engine.rs",
         "src/loop_engine/batch.rs",
         "src/commands/worktrees.rs"
-      ],
-      "dependsOn": ["TEST-INIT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": ["REFACTOR-001", "REFACTOR-002", "REFACTOR-003", "REFACTOR-004A", "REFACTOR-004B", "REFACTOR-004C"],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "CODE-REVIEW-1",
-      "title": "Review all Phase 1 extractions for quality and correctness",
-      "description": "Review all 5 extraction tasks for: correct visibility (pub/pub(crate)), no orphaned tests, no unused imports, module doc comments present, consistent patterns across all new modules, and integration wiring (all import paths updated).",
       "acceptanceCriteria": [
         "Each new module has //! doc comment",
         "No unused imports in engine.rs, prompt.rs, env.rs after extractions",
@@ -406,11 +473,25 @@
         "Test count matches baseline from TEST-INIT-001",
         "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
       ],
-      "priority": 13,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003",
+        "REFACTOR-004C",
+        "REFACTOR-005"
+      ],
+      "description": "Review all 5 extraction tasks for: correct visibility (pub/pub(crate)), no orphaned tests, no unused imports, module doc comments present, consistent patterns across all new modules, and integration wiring (all import paths updated).",
       "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add a CODE-FIX-xxx task to the JSON (priority 14-16), 2) Add CODE-FIX-xxx to MILESTONE-1 dependsOn array, 3) Commit the JSON changes. Mark CODE-REVIEW-1 as passes:true once review is complete and all tasks are added.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review all Phase 1 extractions for quality and correctness",
       "touchesFiles": [
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/output_parsing.rs",
@@ -425,45 +506,39 @@
         "src/loop_engine/prompt.rs",
         "src/loop_engine/env.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["REFACTOR-001", "REFACTOR-002", "REFACTOR-003", "REFACTOR-004C", "REFACTOR-005"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "REFACTOR-REVIEW-1",
-      "title": "Review extractions for refactoring opportunities",
-      "description": "Analyze the extracted modules for DRY violations, unnecessary coupling, and maintainability. Check: are there shared helpers that should be in a common location? Are test fixtures duplicated across new modules? Is the import graph clean (no tangled dependencies)?",
       "acceptanceCriteria": [
         "No duplicated test helper code across new modules",
         "Import graph is clean — no module imports from more than 3 sibling modules",
         "Shared utilities (like prefix_and, test DB setup) are in appropriate shared locations",
         "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
       ],
-      "priority": 17,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze the extracted modules for DRY violations, unnecessary coupling, and maintainability. Check: are there shared helpers that should be in a common location? Are test fixtures duplicated across new modules? Is the import graph clean (no tangled dependencies)?",
       "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add a REFACTOR-1-xxx task to the JSON (priority 18-19), 2) Add REFACTOR-1-xxx to MILESTONE-1 dependsOn array, 3) Commit the JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review extractions for refactoring opportunities",
       "touchesFiles": [
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/output_parsing.rs",
         "src/loop_engine/prd_reconcile.rs",
         "src/loop_engine/prompt_sections/mod.rs",
         "src/loop_engine/worktree.rs"
-      ],
-      "dependsOn": ["CODE-REVIEW-1"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "LEARN-001",
-      "title": "Update Phase 2 tasks based on Phase 1 extraction learnings",
-      "description": "Review progress.txt and long-term-learnings.md for patterns discovered during Phase 1 extractions. Update tasks/large-file-refactor-p2.json to incorporate learnings: adjust notes, add edge cases discovered, update touchesFiles if Phase 1 changed file structure, refine acceptance criteria based on what worked/didn't work. Also update remaining Phase 1 tasks (INT-001, reviews) if needed.",
       "acceptanceCriteria": [
         "Read progress.txt for all Phase 1 learnings",
         "Review each Phase 2 task and update notes/AC based on learnings (e.g., if pub(super) audit was important in P1, ensure P2 tasks mention it)",
@@ -471,25 +546,28 @@
         "Document which P2 tasks were updated and why in progress.txt",
         "Commit updated P2 JSON: 'chore: LEARN-001 - Update P2 tasks with P1 learnings'"
       ],
-      "priority": 19,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Review progress.txt and long-term-learnings.md for patterns discovered during Phase 1 extractions. Update tasks/large-file-refactor-p2.json to incorporate learnings: adjust notes, add edge cases discovered, update touchesFiles if Phase 1 changed file structure, refine acceptance criteria based on what worked/didn't work. Also update remaining Phase 1 tasks (INT-001, reviews) if needed.",
       "estimatedEffort": "low",
+      "id": "LEARN-001",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "This task bridges phases — learnings from extraction patterns, visibility gotchas, test movement issues, and mod.rs conventions should flow forward to Phase 2.",
+      "passes": false,
+      "priority": 19,
+      "synergyWith": [],
+      "title": "Update Phase 2 tasks based on Phase 1 extraction learnings",
       "touchesFiles": [
         "tasks/large-file-refactor-p2.json",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-1",
-      "title": "Phase 1 complete — all Tier 1 extractions done",
-      "description": "Gate checkpoint: all 5 extractions complete, reviewed, and refactored. Test count matches baseline. Ready for merge or next phase.",
       "acceptanceCriteria": [
         "All REFACTOR-001 through REFACTOR-005 have passes: true",
         "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
@@ -503,23 +581,35 @@
         "env.rs is under 2300 lines",
         "All new modules have //! doc comments"
       ],
-      "priority": 20,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "This is a gate — verify all criteria before marking passes:true. Run full cargo test suite. Count lines in modified files with `wc -l`.",
-      "touchesFiles": [],
-      "dependsOn": ["TEST-INIT-001", "REFACTOR-001", "REFACTOR-002", "REFACTOR-003", "REFACTOR-004A", "REFACTOR-004B", "REFACTOR-004C", "REFACTOR-005", "CODE-REVIEW-1", "REFACTOR-REVIEW-1", "LEARN-001"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "TEST-INIT-001",
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003",
+        "REFACTOR-004A",
+        "REFACTOR-004B",
+        "REFACTOR-004C",
+        "REFACTOR-005",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1",
+        "LEARN-001"
+      ],
+      "description": "Gate checkpoint: all 5 extractions complete, reviewed, and refactored. Test count matches baseline. Ready for merge or next phase.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "This is a gate — verify all criteria before marking passes:true. Run full cargo test suite. Count lines in modified files with `wc -l`.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 complete — all Tier 1 extractions done",
+      "touchesFiles": []
     },
     {
-      "id": "INT-001",
-      "title": "Integration verification — full CLI command smoke test",
-      "description": "Verify that all CLI commands still work correctly after the extractions. Run task-mgr with various subcommands to ensure nothing is broken at the integration level.",
       "acceptanceCriteria": [
         "cargo build --release succeeds",
         "cargo test passes (full suite)",
@@ -527,21 +617,23 @@
         "task-mgr init, list, show, next, complete, stats subcommands produce expected output (smoke test against test DB)",
         "No regression in loop engine functionality — if integration tests exist, they pass"
       ],
-      "priority": 55,
-      "estimatedEffort": "medium",
-      "passes": false,
-      "notes": "Focus on verifying the mechanical extractions didn't break anything at the integration level. The unit tests should catch most issues, but this is a belt-and-suspenders check.",
-      "touchesFiles": [],
-      "dependsOn": ["MILESTONE-1"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Verify that all CLI commands still work correctly after the extractions. Run task-mgr with various subcommands to ensure nothing is broken at the integration level.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "Focus on verifying the mechanical extractions didn't break anything at the integration level. The unit tests should catch most issues, but this is a belt-and-suspenders check.",
+      "passes": false,
+      "priority": 55,
+      "synergyWith": [],
+      "title": "Integration verification — full CLI command smoke test",
+      "touchesFiles": []
     },
     {
-      "id": "REFACTOR-REVIEW-3",
-      "title": "Final review — overall module structure and quality",
-      "description": "Final review of the entire extraction. Check the overall module structure is clean, consistent, and maintainable. Verify no leftover TODO comments, no dead code, and the module graph makes sense.",
       "acceptanceCriteria": [
         "Module structure is consistent across all new files",
         "No TODO or FIXME comments left from extraction process",
@@ -549,11 +641,21 @@
         "Import paths are clean — no unnecessary re-exports",
         "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
       ],
-      "priority": 65,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Final review of the entire extraction. Check the overall module structure is clean, consistent, and maintainable. Verify no leftover TODO comments, no dead code, and the module graph makes sense.",
       "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
       "model": "claude-opus-4-6",
-      "passes": false,
+      "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add a REFACTOR-3-xxx task (priority 66-80), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON changes.",
+      "passes": false,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final review — overall module structure and quality",
       "touchesFiles": [
         "src/loop_engine/git_reconcile.rs",
         "src/loop_engine/output_parsing.rs",
@@ -564,17 +666,9 @@
         "src/loop_engine/prompt.rs",
         "src/loop_engine/env.rs",
         "src/loop_engine/mod.rs"
-      ],
-      "dependsOn": ["INT-001"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "VERIFY-001",
-      "title": "Final verification — all checks pass",
-      "description": "Run the complete verification suite one final time to confirm everything is green.",
       "acceptanceCriteria": [
         "cargo build succeeds",
         "cargo test passes — count matches baseline",
@@ -582,65 +676,79 @@
         "cargo fmt --check passes",
         "wc -l confirms file size targets met"
       ],
-      "priority": 90,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Final gate before merge.",
-      "touchesFiles": [],
-      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Run the complete verification suite one final time to confirm everything is green.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": []
     },
     {
-      "id": "LEARN-002",
-      "title": "Final update to Phase 2 tasks based on complete Phase 1",
-      "description": "With Phase 1 fully complete (including integration testing and final review), do a final pass on tasks/large-file-refactor-p2.json. Update based on: actual file sizes post-extraction, any unexpected patterns, integration issues found, and final review findings.",
       "acceptanceCriteria": [
         "Review REFACTOR-REVIEW-3 findings and apply relevant patterns to P2 tasks",
         "Update P2 MILESTONE-1 line count targets if Phase 1 actual sizes differ from estimates",
         "Document updates in progress.txt",
         "Commit: 'chore: LEARN-002 - Final P2 task updates from P1 completion'"
       ],
-      "priority": 97,
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "With Phase 1 fully complete (including integration testing and final review), do a final pass on tasks/large-file-refactor-p2.json. Update based on: actual file sizes post-extraction, any unexpected patterns, integration issues found, and final review findings.",
       "estimatedEffort": "low",
+      "id": "LEARN-002",
       "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
       "passes": false,
+      "priority": 97,
+      "synergyWith": [],
+      "title": "Final update to Phase 2 tasks based on complete Phase 1",
       "touchesFiles": [
         "tasks/large-file-refactor-p2.json",
         "tasks/progress.txt"
-      ],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
-      "synergyWith": [],
-      "batchWith": [],
-      "conflictsWith": [],
-      "modifiesBehavior": false
+      ]
     },
     {
-      "id": "MILESTONE-FINAL",
-      "title": "Phase 1 Large File Refactor — ready for merge",
-      "description": "All Phase 1 extractions complete, reviewed, verified. Branch is ready to merge to main.",
       "acceptanceCriteria": [
         "VERIFY-001 passes",
         "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
         "All tasks have passes: true",
         "Branch is clean — no uncommitted changes"
       ],
-      "priority": 99,
-      "estimatedEffort": "low",
-      "model": "claude-opus-4-6",
-      "timeoutSecs": 1800,
-      "passes": false,
-      "notes": "Gate before merge to main.",
-      "touchesFiles": [],
-      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3", "LEARN-002"],
-      "synergyWith": [],
       "batchWith": [],
       "conflictsWith": [],
-      "modifiesBehavior": false
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3",
+        "LEARN-002"
+      ],
+      "description": "All Phase 1 extractions complete, reviewed, verified. Branch is ready to merge to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Gate before merge to main.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Phase 1 Large File Refactor — ready for merge",
+      "touchesFiles": []
     }
-  ]
+  ],
+  "version": "1.0"
 }
