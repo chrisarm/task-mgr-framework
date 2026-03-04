@@ -101,7 +101,7 @@ impl_text_formattable!(EnrichResult, format_enrich_text);
 impl_text_formattable!(DedupResult, format_dedup_text);
 impl_text_formattable!(
     crate::loop_engine::archive::ArchiveResult,
-    crate::loop_engine::archive::format_text
+    crate::loop_engine::archive_display::format_text
 );
 impl_text_formattable!(
     crate::loop_engine::status::DashboardResult,

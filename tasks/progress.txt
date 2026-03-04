@@ -684,3 +684,15 @@
 - claude.rs is 2272L not 1181L — milestone targets need adjustment
 - No #[allow] annotations to preserve in target files
 - Timeout constants (lines 21-25) should move with TimeoutConfig into watchdog.rs
+
+## 2026-03-03 - p2-refactor-REFACTOR-008
+- **Architectural finding (PRD US-008 resolved)**: `archive.rs::extract_learnings_from_progress` and `learnings/ingestion/mod.rs::extract_learnings_from_output` are NOT duplicates:
+  - `archive.rs`: parses formatted markdown headings from `progress.txt` → appends to `learnings.md` file (markdown pipeline)
+  - `ingestion/mod.rs`: LLM-based extraction from raw Claude output → stores in DB (LLM pipeline)
+  - Different inputs, different outputs, different purposes — no deduplication needed. PRD open question #2 resolved.
+- **Extracted**: `format_text` (~57 lines) + 3 associated tests → `archive_display.rs`
+- **Files changed**: `archive.rs` (removed format_text + 3 tests), `archive_display.rs` (new), `mod.rs` (added archive_display), `handlers.rs` (updated import path)
+- **archive.rs**: 1213 → 1099 lines
+- **Test count**: before=2262, after=2262
+- **Learnings**: When moving tests that call the extracted function, add `use crate::loop_engine::archive::ArchivedItem` (sibling struct) to the new test module's imports — `use super::*` only brings in the display module's own scope.
+---

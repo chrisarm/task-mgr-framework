@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod archive_display;
 pub mod batch;
 pub mod branch;
 pub mod calibrate;
