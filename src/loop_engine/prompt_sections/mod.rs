@@ -5,6 +5,7 @@
 //! and are available to all section builders via `pub(crate)`.
 
 pub mod dependencies;
+pub mod escalation;
 pub mod learnings;
 pub mod synergy;
 
