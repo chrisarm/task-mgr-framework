@@ -729,9 +729,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tasks_dir = dir.path();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         // Create some files
         fs::write(tasks_dir.join("my-project.json"), "{}").unwrap();
@@ -757,9 +755,7 @@ mod tests {
     #[test]
     fn test_discover_archivable_files_none_exist() {
         let dir = TempDir::new().unwrap();
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         let files = discover_archivable_files(&conn, dir.path(), 1, "nonexistent").unwrap();
         assert!(files.is_empty());
@@ -824,10 +820,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Create DB with schema but no metadata
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
-        drop(conn);
+        drop(setup_db(dir.path()));
 
         let result = run_archive(dir.path(), false).unwrap();
         assert!(result.archived.is_empty());
@@ -838,9 +831,7 @@ mod tests {
     fn test_run_archive_incomplete_prd() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         // Insert metadata
         conn.execute(
@@ -867,9 +858,7 @@ mod tests {
     fn test_run_archive_dry_run_completed_prd() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'feat/my-feature', 'FEAT')",
@@ -904,9 +893,7 @@ mod tests {
     fn test_run_archive_actual_move() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'ralph/test-branch', 'FEAT')",
@@ -971,9 +958,7 @@ mod tests {
     fn test_run_archive_with_learnings() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
@@ -1013,9 +998,7 @@ mod tests {
     fn test_run_archive_no_tasks() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
@@ -1037,9 +1020,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
@@ -1104,9 +1085,7 @@ mod tests {
     fn test_prd_files_drives_discovery() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         // Insert prd_files entries (simulating what init would do)
         conn.execute(
@@ -1159,9 +1138,7 @@ mod tests {
     fn test_skipped_and_irrelevant_tasks_are_terminal() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'T')",
@@ -1295,9 +1272,7 @@ mod tests {
     fn test_skipped_task_blocks_archive_when_mixed_with_todo() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project) VALUES (1, 'test-project')",
@@ -2325,9 +2300,7 @@ mod tests {
     fn test_run_archive_completed_prd_no_files_clears_db() {
         let dir = TempDir::new().unwrap();
 
-        let mut conn = crate::db::open_connection(dir.path()).unwrap();
-        crate::db::create_schema(&conn).unwrap();
-        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        let conn = setup_db(dir.path());
 
         conn.execute(
             "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'ghost-project', 'main', 'GP')",
