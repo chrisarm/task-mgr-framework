@@ -577,3 +577,12 @@
 - Test count: 2262 (matches baseline)
 - No issues found — no CODE-FIX tasks needed
 ---
+
+## 2026-03-03 - REFACTOR-REVIEW-1
+- Analyzed all 9 extracted module files for DRY violations, coupling, and import graph
+- **Import graph**: Clean DAG, no cycles. Max 2 sibling imports per module. git_reconcile→prd_reconcile→output_parsing is a strict chain.
+- **DRY issue 1**: git_reconcile.rs has 9 inline INSERT INTO runs statements; should use test_utils::insert_run(). prd_reconcile.rs has 1 test bypassing setup_test_db() (missing run_migrations). → Created REFACTOR-1-001
+- **DRY issue 2**: worktree.rs duplicates setup_git_repo() locally (25 lines) with intentional behavioral differences (needs committed file). → Created REFACTOR-1-002
+- **Clean**: No tangled dependencies, no circular imports, prefix_and usage is consistent
+- Added REFACTOR-1-001 and REFACTOR-1-002 to MILESTONE-1 dependsOn
+---
