@@ -26,6 +26,17 @@ pub fn read_task_prefix_from_prd(prd_path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Read the `branchName` field from a PRD JSON file.
+///
+/// Returns `None` if the file is unreadable, not valid JSON, or the field is absent.
+pub fn read_branch_name_from_prd(prd_path: &Path) -> Option<String> {
+    let content = fs::read_to_string(prd_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("branchName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Query project metadata from prd_metadata table.
 ///
 /// When `task_prefix` is provided, queries `WHERE task_prefix = ?` to select the
@@ -400,6 +411,36 @@ mod tests {
     #[test]
     fn test_format_remaining_hours_and_minutes() {
         assert_eq!(format_remaining(5400), "1h 30m remaining");
+    }
+
+    #[test]
+    fn test_read_branch_name_from_prd_with_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        fs::write(
+            &prd_path,
+            r#"{"branchName": "feat/my-branch", "taskPrefix": "abc123"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_branch_name_from_prd(&prd_path),
+            Some("feat/my-branch".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_branch_name_from_prd_without_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        fs::write(&prd_path, r#"{"taskPrefix": "abc123"}"#).unwrap();
+        assert_eq!(read_branch_name_from_prd(&prd_path), None);
+    }
+
+    #[test]
+    fn test_read_branch_name_from_prd_missing_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("nonexistent.json");
+        assert_eq!(read_branch_name_from_prd(&prd_path), None);
     }
 
     #[test]

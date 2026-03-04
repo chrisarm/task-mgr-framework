@@ -132,7 +132,7 @@ fn write_prefix_to_json(json_path: &Path, prefix: &str) -> TaskMgrResult<()> {
 ///
 /// When `branch_name` is `None` or empty, the hash input is `":" + filename`,
 /// which is still deterministic per-file.
-fn generate_prefix(branch_name: Option<&str>, filename: &str) -> String {
+pub fn generate_prefix(branch_name: Option<&str>, filename: &str) -> String {
     let branch = match branch_name {
         Some(b) if !b.is_empty() => b,
         _ => "",
