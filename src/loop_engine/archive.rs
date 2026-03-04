@@ -62,8 +62,9 @@ pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
     // For now, use the first PRD for single-PRD archive behaviour
     let info = &all_prds[0];
 
-    // Check if PRD is fully completed
-    if !is_prd_completed(&conn)? {
+    // Check if PRD is fully completed (scoped to its task prefix)
+    let prefix = info.task_prefix.as_deref().unwrap_or("");
+    if !is_prd_completed_by_prefix(&conn, prefix)? {
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
@@ -204,32 +205,7 @@ pub fn query_all_prds(conn: &rusqlite::Connection) -> TaskMgrResult<Vec<PrdRecor
     Ok(records)
 }
 
-/// Check if all tasks in the PRD are in a terminal state.
-///
-/// A PRD is archivable when no tasks are `todo`, `in_progress`, or `blocked`.
-/// Terminal states: `done`, `skipped`, `irrelevant`.
-fn is_prd_completed(conn: &rusqlite::Connection) -> TaskMgrResult<bool> {
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    if total == 0 {
-        return Ok(false);
-    }
-
-    let non_terminal: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status IN ('todo', 'in_progress', 'blocked')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    Ok(non_terminal == 0)
-}
-
 /// Check if all tasks belonging to a specific prefix are in a terminal state.
-#[allow(dead_code)]
 ///
 /// A prefix is archivable when it has at least one task AND no tasks are
 /// `todo`, `in_progress`, or `blocked`. Terminal states: `done`, `skipped`,
@@ -699,7 +675,7 @@ mod tests {
 
         // Insert metadata
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'feat/my-feature')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'feat/my-feature', 'FEAT')",
             [],
         )
         .unwrap();
@@ -727,7 +703,7 @@ mod tests {
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'feat/my-feature')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'feat/my-feature', 'FEAT')",
             [],
         )
         .unwrap();
@@ -764,7 +740,7 @@ mod tests {
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'ralph/test-branch')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'ralph/test-branch', 'FEAT')",
             [],
         )
         .unwrap();
@@ -831,7 +807,7 @@ mod tests {
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
             [],
         )
         .unwrap();
@@ -897,7 +873,7 @@ mod tests {
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'FEAT')",
             [],
         )
         .unwrap();
@@ -1019,7 +995,7 @@ mod tests {
         crate::db::migrations::run_migrations(&mut conn).unwrap();
 
         conn.execute(
-            "INSERT INTO prd_metadata (id, project, branch_name) VALUES (1, 'test-project', 'main')",
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) VALUES (1, 'test-project', 'main', 'T')",
             [],
         )
         .unwrap();
@@ -1041,8 +1017,8 @@ mod tests {
         )
         .unwrap();
 
-        // PRD should be considered completed
-        assert!(is_prd_completed(&conn).unwrap());
+        // PRD should be considered completed (all tasks terminal, scoped to prefix "T")
+        assert!(is_prd_completed_by_prefix(&conn, "T").unwrap());
 
         drop(conn);
 
@@ -1123,11 +1099,10 @@ mod tests {
         assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
     }
 
-    /// Known-bad discriminator: the global (non-prefix-scoped) is_prd_completed()
-    /// incorrectly returns true even when only one PRD is complete while another has
-    /// pending tasks. is_prd_completed_by_prefix() must scope to the prefix.
+    /// Discriminator: prefix-scoped check correctly distinguishes two PRDs
+    /// when one is complete and the other has pending tasks.
     #[test]
-    fn test_discriminator_global_check_is_insufficient() {
+    fn test_discriminator_prefix_scoped_check_distinguishes_prds() {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
@@ -1135,9 +1110,6 @@ mod tests {
         conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Done', 1, 'done')", []).unwrap();
         // P2 tasks: still in progress
         conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P2-US-001', 'In progress', 1, 'in_progress')", []).unwrap();
-
-        // Global check is false (there IS a non-terminal task globally)
-        assert!(!is_prd_completed(&conn).unwrap());
 
         // Prefix-scoped check correctly distinguishes the two PRDs:
         assert!(
@@ -1176,7 +1148,7 @@ mod tests {
         .unwrap();
 
         // PRD should NOT be considered completed (todo task remains)
-        assert!(!is_prd_completed(&conn).unwrap());
+        assert!(!is_prd_completed_by_prefix(&conn, "T").unwrap());
     }
 
     #[test]
