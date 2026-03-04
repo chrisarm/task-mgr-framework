@@ -2020,6 +2020,305 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // NEW TESTS: three-PRD scenario, learnings-on-skip-all, JSON serialization,
+    // archive folder naming end-to-end
+    // -----------------------------------------------------------------------
+
+    /// Three PRDs: one complete (PA), one incomplete (PB), one with NULL
+    /// task_prefix (PC). Verifies:
+    ///   - Only PA is archived
+    ///   - PB is skipped with "Not fully completed" reason
+    ///   - PC is skipped with "No task prefix" reason
+    ///   - prds_archived.len() == 1, prds_skipped.len() == 2
+    #[test]
+    fn test_three_prds_complete_incomplete_no_prefix() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        // PA: complete
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'feat/branch-a', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'PA Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+
+        // PB: incomplete
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (2, 'project-b', 'feat/branch-b', 'PB')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PB-001', 'PB Task', 1, 'in_progress')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (2, 'project-b.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+
+        // PC: NULL task_prefix
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (3, 'project-c', 'feat/branch-c', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (3, 'project-c.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-c.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        // Only PA archived
+        assert_eq!(result.prds_archived.len(), 1, "Only PA should be archived");
+        assert_eq!(result.prds_archived[0].task_prefix, "PA");
+
+        // PB and PC skipped
+        assert_eq!(result.prds_skipped.len(), 2, "PB and PC should be skipped");
+
+        let skip_reasons: Vec<&str> = result
+            .prds_skipped
+            .iter()
+            .map(|s| s.reason.as_str())
+            .collect();
+        assert!(
+            skip_reasons
+                .iter()
+                .any(|r| r.contains("Not fully completed")),
+            "PB skip reason should mention not completed"
+        );
+        assert!(
+            skip_reasons.iter().any(|r| r.contains("No task prefix")),
+            "PC skip reason should mention no task prefix"
+        );
+
+        // PA file moved, PB and PC files remain
+        assert!(
+            !tasks_dir.join("project-a.json").exists(),
+            "PA file should be archived"
+        );
+        assert!(
+            tasks_dir.join("project-b.json").exists(),
+            "PB file must stay"
+        );
+        assert!(
+            tasks_dir.join("project-c.json").exists(),
+            "PC file must stay"
+        );
+    }
+
+    /// When ALL PRDs are skipped (none archived), learnings must NOT be extracted.
+    #[test]
+    fn test_learnings_not_extracted_when_all_prds_skipped() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'main', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'Incomplete', 1, 'todo')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("progress.txt"),
+            "## PA-001\n- **Learnings:** Should not be extracted.\n---\n",
+        )
+        .unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        assert_eq!(result.prds_archived.len(), 0, "No PRDs archived");
+        assert_eq!(
+            result.learnings_extracted, 0,
+            "Learnings must not be extracted when nothing archived"
+        );
+
+        // learnings.md must NOT be created
+        assert!(
+            !tasks_dir.join("learnings.md").exists(),
+            "learnings.md must not be created when nothing archived"
+        );
+    }
+
+    /// JSON serialization round-trip for ArchiveResult and its nested types.
+    #[test]
+    fn test_archive_result_json_serialization() {
+        let result = ArchiveResult {
+            archived: vec![ArchivedItem {
+                source: "project-a.json".to_string(),
+                destination: "archive/2026-03-04-branch-a/project-a.json".to_string(),
+            }],
+            learnings_extracted: 2,
+            tasks_cleared: 5,
+            dry_run: false,
+            message: "Archived 1 PRD(s), 1 file(s).".to_string(),
+            prds_archived: vec![PrdArchiveSummary {
+                prd_id: 1,
+                project: "project-a".to_string(),
+                task_prefix: "PA".to_string(),
+                archive_folder: "2026-03-04-branch-a".to_string(),
+                files_archived: 1,
+                tasks_cleared: 5,
+            }],
+            prds_skipped: vec![PrdSkipReason {
+                prd_id: 2,
+                project: "project-b".to_string(),
+                reason: "Not fully completed".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&result).expect("serialization must succeed");
+
+        // Key fields present in JSON
+        assert!(json.contains("\"archived\""));
+        assert!(json.contains("\"learnings_extracted\":2"));
+        assert!(json.contains("\"tasks_cleared\":5"));
+        assert!(json.contains("\"dry_run\":false"));
+        assert!(json.contains("\"prds_archived\""));
+        assert!(json.contains("\"prds_skipped\""));
+        assert!(json.contains("\"task_prefix\":\"PA\""));
+        assert!(json.contains("\"prd_id\":2"));
+        assert!(json.contains("\"reason\":\"Not fully completed\""));
+    }
+
+    /// Archive folder naming: feat/ prefix stripped, ralph/ stripped, no prefix unchanged.
+    #[test]
+    fn test_archive_folder_naming_various_branch_prefixes() {
+        // feat/ stripped
+        assert!(
+            strip_branch_prefix("feat/my-feature") == "my-feature",
+            "feat/ should be stripped"
+        );
+        // ralph/ stripped
+        assert!(
+            strip_branch_prefix("ralph/my-feature") == "my-feature",
+            "ralph/ should be stripped"
+        );
+        // no prefix: returned as-is
+        assert!(
+            strip_branch_prefix("main") == "main",
+            "branch without prefix should be returned as-is"
+        );
+        // empty branch → archive_folder_name uses date only
+        assert!(
+            strip_branch_prefix("") == "",
+            "empty branch should return empty string"
+        );
+    }
+
+    /// End-to-end: archive folder uses branch_name with feat/ stripped.
+    #[test]
+    fn test_archive_folder_uses_stripped_branch_name() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', 'feat/cool-feature', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (1, 'project-a.json', 'task_list')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        assert_eq!(result.prds_archived.len(), 1);
+        let folder = &result.prds_archived[0].archive_folder;
+        assert!(
+            folder.contains("cool-feature"),
+            "archive folder should contain stripped branch name 'cool-feature', got: {}",
+            folder
+        );
+        assert!(
+            !folder.contains("feat/"),
+            "archive folder must not contain 'feat/' prefix, got: {}",
+            folder
+        );
+    }
+
+    /// End-to-end: archive folder uses date only when branch_name is empty.
+    #[test]
+    fn test_archive_folder_date_only_when_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, branch_name, task_prefix) \
+             VALUES (1, 'project-a', '', 'PA')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES ('PA-001', 'Task', 1, 'done')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false).unwrap();
+
+        assert_eq!(result.prds_archived.len(), 1);
+        let folder = &result.prds_archived[0].archive_folder;
+        // Should be just a date like "2026-03-04"
+        assert!(
+            !folder.ends_with('-'),
+            "archive folder must not end with hyphen when branch is empty, got: {}",
+            folder
+        );
+    }
+
     /// A completed PRD with no discoverable files on disk should still have its
     /// DB data cleared (tasks + prd_metadata row deleted).
     #[test]

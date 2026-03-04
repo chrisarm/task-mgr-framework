@@ -288,6 +288,109 @@ mod tests {
         assert!(text.contains("Would extract 3 learning(s)"));
     }
 
+    /// All PRDs skipped: summary shows "0 of N PRD(s) archived".
+    #[test]
+    fn test_format_text_all_skipped_shows_zero_archived() {
+        let result = make_result(
+            vec![],
+            vec![],
+            vec![
+                PrdSkipReason {
+                    prd_id: 1,
+                    project: "project-a".to_string(),
+                    reason: "Not fully completed".to_string(),
+                },
+                PrdSkipReason {
+                    prd_id: 2,
+                    project: "project-b".to_string(),
+                    reason: "No task prefix — cannot determine completion".to_string(),
+                },
+            ],
+            false,
+            "2 PRD(s) not fully completed. Nothing archived.",
+            0,
+        );
+        let text = format_text(&result);
+        assert!(
+            text.contains("Summary: 0 of 2 PRD(s) archived"),
+            "all-skipped summary incorrect: {}",
+            text
+        );
+        assert!(text.contains("Skipped: Not fully completed"));
+        assert!(text.contains("Skipped: No task prefix"));
+        // Learnings line must NOT appear when none extracted
+        assert!(
+            !text.contains("learning(s)"),
+            "no learnings line expected: {}",
+            text
+        );
+    }
+
+    /// Mixed: one PRD archived, one skipped. Verifies both sections present
+    /// and summary counts are correct.
+    #[test]
+    fn test_format_text_mixed_archived_and_skipped() {
+        let result = make_result(
+            vec![ArchivedItem {
+                source: "project-a.json".to_string(),
+                destination: "archive/2026-03-04-branch-a/project-a.json".to_string(),
+            }],
+            vec![PrdArchiveSummary {
+                prd_id: 1,
+                project: "project-a".to_string(),
+                task_prefix: "PA".to_string(),
+                archive_folder: "2026-03-04-branch-a".to_string(),
+                files_archived: 1,
+                tasks_cleared: 3,
+            }],
+            vec![PrdSkipReason {
+                prd_id: 2,
+                project: "project-b".to_string(),
+                reason: "Not fully completed".to_string(),
+            }],
+            false,
+            "",
+            2,
+        );
+        let text = format_text(&result);
+
+        // Archived section
+        assert!(
+            text.contains("PRD: project-a (prefix: PA)"),
+            "archived PRD header missing"
+        );
+        assert!(
+            text.contains("Moved project-a.json"),
+            "moved file line missing"
+        );
+        assert!(
+            text.contains("Cleared 3 task(s)"),
+            "task clear count missing"
+        );
+
+        // Skipped section
+        assert!(
+            text.contains("PRD: project-b"),
+            "skipped PRD header missing"
+        );
+        assert!(
+            text.contains("Skipped: Not fully completed"),
+            "skip reason missing"
+        );
+
+        // Summary
+        assert!(
+            text.contains("Summary: 1 of 2 PRD(s) archived"),
+            "summary count incorrect"
+        );
+
+        // Learnings
+        assert!(
+            text.contains("Extracted 2 learning(s)"),
+            "learnings line missing"
+        );
+    }
+
     // Legacy compatibility: existing tests that use the old ArchiveResult shape
     // (prds_archived/prds_skipped empty) still work via the empty-PRD path.
     #[test]
