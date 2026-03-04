@@ -15,6 +15,7 @@ pub mod engine;
 pub mod env;
 pub mod feedback;
 pub mod git_reconcile;
+pub mod guidance;
 pub mod model;
 pub mod monitor;
 pub mod oauth;
