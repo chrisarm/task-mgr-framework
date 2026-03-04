@@ -13,6 +13,7 @@ use serde::Serialize;
 use rusqlite::OptionalExtension;
 
 use crate::db::open_connection;
+use crate::db::prefix::make_like_pattern;
 use crate::TaskMgrResult;
 
 pub use super::archive_display::format_text;
@@ -215,6 +216,39 @@ fn is_prd_completed(conn: &rusqlite::Connection) -> TaskMgrResult<bool> {
         .query_row(
             "SELECT COUNT(*) FROM tasks WHERE status IN ('todo', 'in_progress', 'blocked')",
             [],
+            |row| row.get(0),
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    Ok(non_terminal == 0)
+}
+
+/// Check if all tasks belonging to a specific prefix are in a terminal state.
+#[allow(dead_code)]
+///
+/// A prefix is archivable when it has at least one task AND no tasks are
+/// `todo`, `in_progress`, or `blocked`. Terminal states: `done`, `skipped`,
+/// `irrelevant`. Uses a LIKE pattern with dash separator so prefix "P1" does
+/// not match tasks belonging to prefix "P10".
+fn is_prd_completed_by_prefix(conn: &rusqlite::Connection, prefix: &str) -> TaskMgrResult<bool> {
+    let pattern = make_like_pattern(prefix);
+
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            rusqlite::params![pattern],
+            |row| row.get(0),
+        )
+        .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    if total == 0 {
+        return Ok(false);
+    }
+
+    let non_terminal: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND status IN ('todo', 'in_progress', 'blocked')",
+            rusqlite::params![pattern],
             |row| row.get(0),
         )
         .map_err(crate::TaskMgrError::DatabaseError)?;
@@ -998,6 +1032,100 @@ mod tests {
         let result = run_archive(dir.path(), false).unwrap();
         assert_eq!(result.tasks_cleared, 3);
         assert!(!result.archived.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for is_prd_completed_by_prefix
+    // -----------------------------------------------------------------------
+
+    fn setup_db(dir: &std::path::Path) -> rusqlite::Connection {
+        let mut conn = crate::db::open_connection(dir).unwrap();
+        crate::db::create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_prefix_all_done_returns_true() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Task 2', 2, 'done')", []).unwrap();
+
+        assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
+    }
+
+    #[test]
+    fn test_prefix_one_todo_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Task 2', 2, 'todo')", []).unwrap();
+
+        assert!(!is_prd_completed_by_prefix(&conn, "P1").unwrap());
+    }
+
+    #[test]
+    fn test_prefix_zero_matching_tasks_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        // Tasks exist but under a different prefix
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P2-US-001', 'Task 1', 1, 'done')", []).unwrap();
+
+        assert!(!is_prd_completed_by_prefix(&conn, "P1").unwrap());
+    }
+
+    #[test]
+    fn test_prefix_p1_does_not_match_p10_tasks() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        // P1 tasks: all done
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Task 1', 1, 'done')", []).unwrap();
+        // P10 tasks: still todo — must NOT be included in the P1 check
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P10-US-001', 'Task 2', 2, 'todo')", []).unwrap();
+
+        // P1 should be completed (its tasks are all done)
+        assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
+        // P10 should NOT be completed (has a todo task)
+        assert!(!is_prd_completed_by_prefix(&conn, "P10").unwrap());
+    }
+
+    #[test]
+    fn test_prefix_mixed_terminal_states_returns_true() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Done', 1, 'done')", []).unwrap();
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-002', 'Skipped', 2, 'skipped')", []).unwrap();
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-003', 'Irrelevant', 3, 'irrelevant')", []).unwrap();
+
+        assert!(is_prd_completed_by_prefix(&conn, "P1").unwrap());
+    }
+
+    /// Known-bad discriminator: the global (non-prefix-scoped) is_prd_completed()
+    /// incorrectly returns true even when only one PRD is complete while another has
+    /// pending tasks. is_prd_completed_by_prefix() must scope to the prefix.
+    #[test]
+    fn test_discriminator_global_check_is_insufficient() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        // P1 tasks: all done
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P1-US-001', 'Done', 1, 'done')", []).unwrap();
+        // P2 tasks: still in progress
+        conn.execute("INSERT INTO tasks (id, title, priority, status) VALUES ('P2-US-001', 'In progress', 1, 'in_progress')", []).unwrap();
+
+        // Global check is false (there IS a non-terminal task globally)
+        assert!(!is_prd_completed(&conn).unwrap());
+
+        // Prefix-scoped check correctly distinguishes the two PRDs:
+        assert!(
+            is_prd_completed_by_prefix(&conn, "P1").unwrap(),
+            "P1 should be complete"
+        );
+        assert!(
+            !is_prd_completed_by_prefix(&conn, "P2").unwrap(),
+            "P2 should not be complete"
+        );
     }
 
     #[test]
