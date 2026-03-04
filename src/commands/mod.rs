@@ -24,8 +24,8 @@
 
 pub mod apply_learning;
 pub mod complete;
-pub mod dependency_checker;
 pub mod curate;
+pub mod dependency_checker;
 pub mod doctor;
 pub mod export;
 pub mod fail;
