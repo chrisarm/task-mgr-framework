@@ -1,10 +1,16 @@
 {
-  "version": "1.0",
-  "project": "task-mgr",
-  "model": "claude-sonnet-4-6",
   "branchName": "fix/concurrent-loop-lock",
   "description": "Fix timing bug where first-run PRDs without taskPrefix collide on global loop.lock instead of using per-prefix lock files. Compute the deterministic prefix before lock acquisition, then refactor duplicate JSON reads and redundant prefix lookups.",
-  "taskPrefix": "lockfix",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing APIs unless required"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most",
     "hierarchy": [
@@ -19,20 +25,10 @@
       "Handle Option/Result explicitly; avoid unwrap() in production code"
     ]
   },
-  "globalAcceptanceCriteria": {
-    "description": "Apply to ALL tasks",
-    "criteria": [
-      "Rust: No warnings from cargo check or cargo clippy",
-      "Rust: All tests pass with cargo test",
-      "Rust: cargo fmt --check passes",
-      "No breaking changes to existing APIs unless required"
-    ]
-  },
+  "project": "task-mgr",
+  "taskPrefix": "lockfix",
   "userStories": [
     {
-      "id": "FEAT-001",
-      "title": "Compute deterministic prefix before lock acquisition",
-      "description": "Fix the timing bug in engine.rs step 4.5 where pre_lock_prefix falls back to None (and thus loop.lock) when the PRD JSON lacks a taskPrefix field.\n\nThe fix has three parts:\n1. Make generate_prefix() public in src/commands/init/mod.rs (line 135: change fn to pub fn)\n2. Add read_branch_name_from_prd() helper in src/loop_engine/status_queries.rs (mirrors existing read_task_prefix_from_prd but reads branchName)\n3. Update pre_lock_prefix computation in src/loop_engine/engine.rs (lines 714-722) to fall back to generate_prefix() when taskPrefix is absent\n\nDO:\n- Use the exact same prefix derivation as PrefixMode::Auto in init: md5(branchName + \":\" + filename)[..8]\n- Read branchName from the PRD JSON using lightweight serde_json::Value (same pattern as read_task_prefix_from_prd)\n- Chain with .or_else() so explicit taskPrefix is still preferred when present\n- Keep validate_prefix() check on the result\n\nDO NOT:\n- Parse the full PrdFile struct (too heavy for pre-lock phase)\n- Remove or change the loop.lock fallback entirely — it should still exist for truly unreadable PRD files\n- Change the generate_prefix algorithm (must stay identical to init's version)\n- Add any new dependencies\n\nEdge cases:\n- PRD file unreadable: read_branch_name_from_prd returns None, generate_prefix(\"\", filename) still produces valid hash\n- branchName absent from JSON: same as above\n- taskPrefix already present: or_else branch never runs, existing behavior preserved\n- Generated prefix always passes validate_prefix (hex chars only)\n\nKnown-bad to guard against:\n- If the fallback prefix differs from what init() generates, the lock file name won't match across restarts. The prefix MUST be computed identically: md5(branch:filename)[..8].",
       "acceptanceCriteria": [
         "Positive: generate_prefix is now pub in src/commands/init/mod.rs",
         "Positive: read_branch_name_from_prd exists in status_queries.rs and reads branchName field",
@@ -45,21 +41,21 @@
         "Known-bad: if the fallback computes a DIFFERENT hash than init's generate_prefix, two loops for the same PRD would use different lock files across restarts. Test must verify the hash matches by calling generate_prefix directly and comparing.",
         "Failure mode: if PRD file is completely unreadable (permissions, missing), pre_lock_prefix falls back to None and uses loop.lock — this is acceptable and preserves backward compatibility"
       ],
-      "priority": 1,
-      "passes": true,
+      "dependsOn": [],
+      "description": "Fix the timing bug in engine.rs step 4.5 where pre_lock_prefix falls back to None (and thus loop.lock) when the PRD JSON lacks a taskPrefix field.\n\nThe fix has three parts:\n1. Make generate_prefix() public in src/commands/init/mod.rs (line 135: change fn to pub fn)\n2. Add read_branch_name_from_prd() helper in src/loop_engine/status_queries.rs (mirrors existing read_task_prefix_from_prd but reads branchName)\n3. Update pre_lock_prefix computation in src/loop_engine/engine.rs (lines 714-722) to fall back to generate_prefix() when taskPrefix is absent\n\nDO:\n- Use the exact same prefix derivation as PrefixMode::Auto in init: md5(branchName + \":\" + filename)[..8]\n- Read branchName from the PRD JSON using lightweight serde_json::Value (same pattern as read_task_prefix_from_prd)\n- Chain with .or_else() so explicit taskPrefix is still preferred when present\n- Keep validate_prefix() check on the result\n\nDO NOT:\n- Parse the full PrdFile struct (too heavy for pre-lock phase)\n- Remove or change the loop.lock fallback entirely — it should still exist for truly unreadable PRD files\n- Change the generate_prefix algorithm (must stay identical to init's version)\n- Add any new dependencies\n\nEdge cases:\n- PRD file unreadable: read_branch_name_from_prd returns None, generate_prefix(\"\", filename) still produces valid hash\n- branchName absent from JSON: same as above\n- taskPrefix already present: or_else branch never runs, existing behavior preserved\n- Generated prefix always passes validate_prefix (hex chars only)\n\nKnown-bad to guard against:\n- If the fallback prefix differs from what init() generates, the lock file name won't match across restarts. The prefix MUST be computed identically: md5(branch:filename)[..8].",
+      "id": "FEAT-001",
       "notes": "Key functions to reuse:\n- read_task_prefix_from_prd (status_queries.rs:21) — pattern to follow for read_branch_name_from_prd\n- generate_prefix (init/mod.rs:135) — make pub, call from engine.rs\n- validate_prefix (db/prefix.rs) — already imported in engine.rs\n\nThe engine.rs import block will need: use crate::commands::init::generate_prefix; and the new read_branch_name_from_prd from status_queries.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [],
+      "title": "Compute deterministic prefix before lock acquisition",
       "touchesFiles": [
         "src/commands/init/mod.rs",
         "src/loop_engine/status_queries.rs",
         "src/loop_engine/engine.rs"
-      ],
-      "dependsOn": [],
-      "synergyWith": []
+      ]
     },
     {
-      "id": "REFACTOR-001",
-      "title": "Consolidate duplicate PRD JSON reads into single read_prd_hints()",
-      "description": "Currently read_task_prefix_from_prd and the new read_branch_name_from_prd each independently read + parse the same JSON file. Consolidate into a single function that parses once and returns both fields.\n\nDO:\n- Create read_prd_hints(prd_path) -> PrdHints in status_queries.rs that returns a struct with task_prefix: Option<String> and branch_name: Option<String>\n- Keep the lightweight serde_json::Value approach (not full PrdFile deserialization)\n- Update all callers: engine.rs step 4.5 (pre_lock_prefix), engine.rs step 6.55 (early_task_prefix), and status.rs if it calls read_task_prefix_from_prd\n- Keep read_task_prefix_from_prd as a thin wrapper calling read_prd_hints().task_prefix for backward compatibility with external callers\n\nDO NOT:\n- Remove read_task_prefix_from_prd if it has callers outside engine.rs (check first)\n- Change return types in ways that break callers\n- Parse more fields than needed\n\nEdge cases:\n- JSON parse failure: returns PrdHints { task_prefix: None, branch_name: None }\n- File unreadable: same as above",
       "acceptanceCriteria": [
         "Positive: read_prd_hints returns both taskPrefix and branchName from a single file read",
         "Positive: read_task_prefix_from_prd still works (delegates to read_prd_hints or remains as thin wrapper)",
@@ -70,39 +66,43 @@
         "Negative: no double file reads for the same PRD in a single run_loop execution",
         "Negative: must NOT break callers of read_task_prefix_from_prd (check status.rs, engine.rs)"
       ],
-      "priority": 2,
-      "passes": false,
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Currently read_task_prefix_from_prd and the new read_branch_name_from_prd each independently read + parse the same JSON file. Consolidate into a single function that parses once and returns both fields.\n\nDO:\n- Create read_prd_hints(prd_path) -> PrdHints in status_queries.rs that returns a struct with task_prefix: Option<String> and branch_name: Option<String>\n- Keep the lightweight serde_json::Value approach (not full PrdFile deserialization)\n- Update all callers: engine.rs step 4.5 (pre_lock_prefix), engine.rs step 6.55 (early_task_prefix), and status.rs if it calls read_task_prefix_from_prd\n- Keep read_task_prefix_from_prd as a thin wrapper calling read_prd_hints().task_prefix for backward compatibility with external callers\n\nDO NOT:\n- Remove read_task_prefix_from_prd if it has callers outside engine.rs (check first)\n- Change return types in ways that break callers\n- Parse more fields than needed\n\nEdge cases:\n- JSON parse failure: returns PrdHints { task_prefix: None, branch_name: None }\n- File unreadable: same as above",
+      "id": "REFACTOR-001",
       "notes": "Callers of read_task_prefix_from_prd to check:\n- engine.rs:715 (step 4.5 — pre_lock_prefix)\n- engine.rs:816 (step 6.55 — early_task_prefix)\n- status.rs or status_queries.rs (dashboard rendering)\n\nThe PrdHints struct should be minimal:\nstruct PrdHints { task_prefix: Option<String>, branch_name: Option<String> }\n\nFor step 6.55, the pre_lock_prefix computed at step 4.5 can be reused directly since it's the same value (or the generated fallback, which init will also generate).",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [],
+      "title": "Consolidate duplicate PRD JSON reads into single read_prd_hints()",
       "touchesFiles": [
         "src/loop_engine/status_queries.rs",
         "src/loop_engine/engine.rs"
-      ],
-      "dependsOn": ["FEAT-001"],
-      "synergyWith": []
+      ]
     },
     {
-      "id": "REFACTOR-002",
-      "title": "Improve lock conflict error messages with PRD file context",
-      "description": "When a lock conflict occurs, the error message should include which PRD file the user was trying to run and which PRD holds the lock, making it easier to diagnose multi-PRD conflicts.\n\nDO:\n- Include the PRD filename in the error message at engine.rs lines 730-735\n- When the lock holder info includes a prefix, suggest that the user check if the other PRD is still running\n- Add a hint about per-prefix locking: 'Each PRD uses its own lock file. If both PRDs lack taskPrefix, they collide on the global lock.'\n\nDO NOT:\n- Change the lock file format\n- Change LockGuard or HolderInfo APIs\n- Add interactive prompts",
       "acceptanceCriteria": [
         "Positive: error message includes the PRD filename the user tried to run",
         "Positive: error message includes the holder's prefix when available",
         "Positive: hint explains that different PRDs should use different lock files",
         "Negative: no changes to LockGuard, HolderInfo, or lock file format"
       ],
-      "priority": 3,
-      "passes": false,
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "When a lock conflict occurs, the error message should include which PRD file the user was trying to run and which PRD holds the lock, making it easier to diagnose multi-PRD conflicts.\n\nDO:\n- Include the PRD filename in the error message at engine.rs lines 730-735\n- When the lock holder info includes a prefix, suggest that the user check if the other PRD is still running\n- Add a hint about per-prefix locking: 'Each PRD uses its own lock file. If both PRDs lack taskPrefix, they collide on the global lock.'\n\nDO NOT:\n- Change the lock file format\n- Change LockGuard or HolderInfo APIs\n- Add interactive prompts",
+      "id": "REFACTOR-002",
       "notes": "The PRD filename is available as run_config.prd_file. The holder info is available in the error message from LockGuard. Just need to format the eprintln! calls better.\n\nExample improved message:\nError: cannot start loop for tasks/message-archival.json — another loop is already running (300546@arcomp2 prefix=fee28acc)\nHint: Each PRD gets its own lock file (loop-{prefix}.lock). If this PRD just had its first run, the prefix was auto-generated and should now allow concurrent execution on retry.",
+      "passes": true,
+      "priority": 3,
+      "synergyWith": [],
+      "title": "Improve lock conflict error messages with PRD file context",
       "touchesFiles": [
         "src/loop_engine/engine.rs"
-      ],
-      "dependsOn": ["FEAT-001"],
-      "synergyWith": []
+      ]
     },
     {
-      "id": "REFACTOR-003",
-      "title": "Discover and address additional refactoring opportunities in lock/engine code",
-      "description": "Deep review of the locking, engine startup, and concurrent loop code paths to find additional refactoring opportunities beyond REFACTOR-001 and REFACTOR-002. Look broadly at lock.rs, engine.rs steps 4-8, status_queries.rs, and prefix.rs.\n\nDO:\n- Read through engine.rs run_loop() steps 4.5 through 8.5 for dead code, redundant operations, unclear naming\n- Read lock.rs for opportunities to simplify lock lifecycle, improve Drop impl, or reduce code duplication\n- Read prefix.rs for any prefix-related logic that could be consolidated\n- Check if the comment at step 6.6 ('Safe because we hold the exclusive loop lock — no other loop can be running') is still accurate now that concurrent per-prefix loops ARE possible\n- Look for stale comments that reference 'loop.lock' as the only lock file\n- Fix any issues found in-place — this is an implement task, not just a discovery task\n- Add/update tests for any changes made\n\nDO NOT:\n- Refactor outside the lock/engine/prefix scope (stay focused)\n- Make purely cosmetic changes (variable renames without functional benefit)\n- Change public APIs unless clearly broken\n- Spend more than one iteration — make targeted, high-value improvements\n\nAreas to investigate:\n1. Step 6.6 recovery comment says 'no other loop can be running' — with per-prefix locks, OTHER loops CAN be running. The recovery is scoped by prefix, but the comment is misleading.\n2. Lock enrichment at step 7.1 writes prefix to lock file AFTER init — but pre_lock_prefix was already computed. Could enrich immediately at step 4.5.\n3. Are there any places where 'loop.lock' string literal appears that should reference the per-prefix pattern?\n4. The error hint at error.rs mentions 'remove the lockfile' — should it mention the per-prefix filename?",
       "acceptanceCriteria": [
         "Positive: All stale comments about single-loop-only updated to reflect per-prefix concurrency",
         "Positive: Any redundant operations identified and eliminated",
@@ -111,24 +111,28 @@
         "Negative: No changes to public APIs",
         "Negative: No changes outside lock/engine/prefix scope"
       ],
-      "priority": 4,
-      "passes": false,
+      "dependsOn": [
+        "FEAT-001",
+        "REFACTOR-001",
+        "REFACTOR-002"
+      ],
+      "description": "Deep review of the locking, engine startup, and concurrent loop code paths to find additional refactoring opportunities beyond REFACTOR-001 and REFACTOR-002. Look broadly at lock.rs, engine.rs steps 4-8, status_queries.rs, and prefix.rs.\n\nDO:\n- Read through engine.rs run_loop() steps 4.5 through 8.5 for dead code, redundant operations, unclear naming\n- Read lock.rs for opportunities to simplify lock lifecycle, improve Drop impl, or reduce code duplication\n- Read prefix.rs for any prefix-related logic that could be consolidated\n- Check if the comment at step 6.6 ('Safe because we hold the exclusive loop lock — no other loop can be running') is still accurate now that concurrent per-prefix loops ARE possible\n- Look for stale comments that reference 'loop.lock' as the only lock file\n- Fix any issues found in-place — this is an implement task, not just a discovery task\n- Add/update tests for any changes made\n\nDO NOT:\n- Refactor outside the lock/engine/prefix scope (stay focused)\n- Make purely cosmetic changes (variable renames without functional benefit)\n- Change public APIs unless clearly broken\n- Spend more than one iteration — make targeted, high-value improvements\n\nAreas to investigate:\n1. Step 6.6 recovery comment says 'no other loop can be running' — with per-prefix locks, OTHER loops CAN be running. The recovery is scoped by prefix, but the comment is misleading.\n2. Lock enrichment at step 7.1 writes prefix to lock file AFTER init — but pre_lock_prefix was already computed. Could enrich immediately at step 4.5.\n3. Are there any places where 'loop.lock' string literal appears that should reference the per-prefix pattern?\n4. The error hint at error.rs mentions 'remove the lockfile' — should it mention the per-prefix filename?",
+      "id": "REFACTOR-003",
       "model": "claude-opus-4-6",
       "notes": "Files to review:\n- src/db/lock.rs (full file — 918 lines)\n- src/loop_engine/engine.rs (steps 4.5 through 8.5, ~lines 706-900)\n- src/db/prefix.rs (full file — 126 lines)\n- src/error.rs (lines 59-174 — lock error hints)\n- src/loop_engine/status_queries.rs (full file)\n\nThis task uses Opus because it requires broad code comprehension and judgment about what's worth refactoring.",
+      "passes": true,
+      "priority": 4,
+      "synergyWith": [],
+      "title": "Discover and address additional refactoring opportunities in lock/engine code",
       "touchesFiles": [
         "src/db/lock.rs",
         "src/loop_engine/engine.rs",
         "src/db/prefix.rs",
         "src/error.rs",
         "src/loop_engine/status_queries.rs"
-      ],
-      "dependsOn": ["FEAT-001", "REFACTOR-001", "REFACTOR-002"],
-      "synergyWith": []
+      ]
     },
     {
-      "id": "REVIEW-001",
-      "title": "Code review + final verification",
-      "description": "Review all implementation for quality, security, and correctness.\n\nDO: Verify the prefix computation in engine.rs matches init/mod.rs exactly. Verify all existing lock tests still pass. Verify read_prd_hints follows the same error-handling pattern as the original functions. Verify no double file reads remain.\nDO NOT: Skip checking that generate_prefix is truly pub (not pub(crate)). Don't skip checking that the import paths compile.",
       "acceptanceCriteria": [
         "Positive: All new code reachable from production entry points (engine.rs run_loop calls the new fallback)",
         "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
@@ -139,16 +143,25 @@
         "Negative: No dead code warnings for new code",
         "If issues found: FIX-xxx tasks added to JSON with priority 50-98"
       ],
-      "priority": 99,
-      "passes": false,
+      "dependsOn": [
+        "FEAT-001",
+        "REFACTOR-001",
+        "REFACTOR-002",
+        "REFACTOR-003"
+      ],
+      "description": "Review all implementation for quality, security, and correctness.\n\nDO: Verify the prefix computation in engine.rs matches init/mod.rs exactly. Verify all existing lock tests still pass. Verify read_prd_hints follows the same error-handling pattern as the original functions. Verify no double file reads remain.\nDO NOT: Skip checking that generate_prefix is truly pub (not pub(crate)). Don't skip checking that the import paths compile.",
+      "id": "REVIEW-001",
       "model": "claude-opus-4-6",
-      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'.",
+      "notes": "Clean review — all acceptance criteria verified, no issues found.",
+      "passes": true,
+      "priority": 99,
+      "title": "Code review + final verification",
       "touchesFiles": [
         "src/commands/init/mod.rs",
         "src/loop_engine/status_queries.rs",
         "src/loop_engine/engine.rs"
-      ],
-      "dependsOn": ["FEAT-001", "REFACTOR-001", "REFACTOR-002", "REFACTOR-003"]
+      ]
     }
-  ]
+  ],
+  "version": "1.0"
 }

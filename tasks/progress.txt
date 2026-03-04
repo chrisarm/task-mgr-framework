@@ -1226,3 +1226,16 @@
 - Files changed: src/loop_engine/engine.rs
 - **Learnings:** `run_config.prd_file.display()` cleanly provides the PRD path for error messages; `{e}` from LockGuard already contains holder info (pid@host prefix=...) so no extra parsing needed
 ---
+
+## 2026-03-04 - lockfix-REVIEW-001
+- **Review**: All 7 acceptance criteria verified and passing
+- **Findings**: No issues — clean review
+- Key verifications:
+  - `generate_prefix` is `pub` (init/mod.rs:135)
+  - `read_prd_hints` does single JSON parse, returns both fields (status_queries.rs:30-53)
+  - engine.rs step 4.5 calls `read_prd_hints` once; step 6.55 reuses `pre_lock_prefix.clone()`
+  - No `unwrap()` in new production code (line 1780 is pre-existing and safe)
+  - cargo fmt/clippy/test all clean
+  - Error messages include PRD filename and prefix context
+- **Learnings:** Review tasks benefit from reading acceptance criteria as a checklist — forces systematic verification rather than skimming.
+---
