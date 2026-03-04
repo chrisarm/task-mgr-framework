@@ -661,7 +661,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "This is a large task — updating 20+ existing tests. Each test needs: 1) task_prefix on prd_metadata INSERT, 2) prefixed task IDs, 3) new ArchiveResult fields in assertions. Consider using /ralph-loop for iterative refinement.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "synergyWith": [
         "TEST-001"
@@ -700,6 +700,69 @@
     },
     {
       "acceptanceCriteria": [
+        "All older tests (pre-line-1208) use setup_db() instead of manual open_connection/create_schema/run_migrations",
+        "No remaining inline DB initialization in test functions (except setup_db itself)",
+        "All tests still pass after migration"
+      ],
+      "batchWith": ["REFACTOR-2-002"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "description": "Migrate older archive tests to use the setup_db() helper instead of manually calling open_connection/create_schema/run_migrations.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "Tests affected: test_run_archive_no_metadata, test_run_archive_incomplete_prd, test_run_archive_dry_run_completed_prd, test_run_archive_actual_move, test_run_archive_with_learnings, test_run_archive_no_tasks, test_run_archive_preserves_learnings, test_skipped_and_irrelevant_tasks_are_terminal, test_run_archive_completed_prd_no_files_clears_db",
+      "passes": false,
+      "priority": 40,
+      "synergyWith": ["REFACTOR-2-002"],
+      "title": "Migrate older tests to use setup_db() helper",
+      "touchesFiles": ["src/loop_engine/archive.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "insert_prd(conn, id, project, branch, prefix) helper exists",
+        "insert_task(conn, id, title, priority, status) helper exists",
+        "insert_prd_file(conn, prd_id, path, file_type) helper exists",
+        "At least 10 manual INSERT statements replaced with helper calls",
+        "All tests still pass"
+      ],
+      "batchWith": ["REFACTOR-2-001"],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-REVIEW-2"],
+      "description": "Extract insert_prd, insert_task, and insert_prd_file helper functions to eliminate repeated SQL INSERT boilerplate across ~12 tests.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "notes": "These helpers should accept parameters and call conn.execute() internally. Update setup_two_prds() and setup_two_prd_metadata_with_tasks() to use them too.",
+      "passes": false,
+      "priority": 41,
+      "synergyWith": ["REFACTOR-2-001"],
+      "title": "Extract insert_prd/insert_task/insert_prd_file helpers",
+      "touchesFiles": ["src/loop_engine/archive.rs"]
+    },
+    {
+      "acceptanceCriteria": [
+        "test_three_prds_complete_incomplete_no_prefix setup reduced by at least 50%",
+        "test_multi_prd_both_complete_archived_to_separate_folders setup uses helpers",
+        "No test exceeds 60 lines total (setup + assertions)",
+        "All tests still pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": ["REFACTOR-2-001", "REFACTOR-2-002"],
+      "description": "Simplify verbose multi-PRD test setup by composing the new helpers (insert_prd, insert_task, insert_prd_file) to replace long inline SQL blocks.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-003",
+      "modifiesBehavior": false,
+      "notes": "Focus on the longest tests: test_three_prds_complete_incomplete_no_prefix (~100 lines), test_multi_prd_both_complete_archived_to_separate_folders (~75 lines), test_archive_folder_uses_stripped_branch_name (~40 lines).",
+      "passes": false,
+      "priority": 42,
+      "synergyWith": [],
+      "title": "Simplify multi-PRD test setup with composed helpers",
+      "touchesFiles": ["src/loop_engine/archive.rs"]
+    },
+    {
+      "acceptanceCriteria": [
         "All TEST-xxx tests pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
         "cargo test --lib loop_engine::archive — all pass",
@@ -711,7 +774,10 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
       "description": "Gate: comprehensive tests pass, test code reviewed and refactored.",
       "estimatedEffort": "medium",

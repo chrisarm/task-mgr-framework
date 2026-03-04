@@ -1102,3 +1102,15 @@
 - **Issue found:** Line 192 gates clear_prd_data with `!prd_items.is_empty()` — completed PRD with no files on disk won't have DB data cleaned up. Added CODE-FIX-001 task.
 - **Learnings:** Review found one logic bug in the guard condition for DB cleanup. The file-existence check should not gate DB cleanup for completed PRDs.
 ---
+
+## 2026-03-04 - multi-archive-REFACTOR-REVIEW-2
+- Reviewed test code (lines 567-2382) for duplication, helper extraction, and clarity
+- Found 3 refactoring opportunities:
+  1. Older tests (pre-line-1208) don't use setup_db() helper — 9 tests affected
+  2. No insert_prd/insert_task/insert_prd_file helpers — ~12 tests have repeated SQL INSERT boilerplate
+  3. Multi-PRD tests have verbose inline setup (100+ lines) that could be composed from helpers
+- Test names are clear and descriptive — no issues found
+- Created REFACTOR-2-001 (p40), REFACTOR-2-002 (p41), REFACTOR-2-003 (p42)
+- Added all three to MILESTONE-2 dependsOn
+- **Learnings:** setup_db() helper was introduced mid-development; older tests weren't migrated. Always retrofit existing tests when adding shared helpers.
+---
