@@ -55,10 +55,7 @@ pub(crate) fn parse_completed_tasks(output: &str) -> Vec<String> {
 /// Fallback for when Claude commits in a different repo than the working directory.
 /// Looks for the task ID in brackets, e.g. `[FEAT-005]` in a commit message.
 /// Requires full prefixed ID — no base ID fallback.
-pub(crate) fn check_output_for_task_completion(
-    output: &str,
-    task_id: &str,
-) -> bool {
+pub(crate) fn check_output_for_task_completion(output: &str, task_id: &str) -> bool {
     let pattern = format!("[{}]", task_id);
     output.contains(&pattern)
 }
