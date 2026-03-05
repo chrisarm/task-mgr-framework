@@ -294,8 +294,8 @@ pub struct ResolvedPaths {
 ///
 /// - `prd_file` must exist (error if not found)
 /// - `prompt_file`: if `None`, derived from PRD filename by replacing `.json` with `-prompt.md`
-/// - `progress_file` defaults to `tasks/progress.txt`; when `prefix` is `Some("P1")` it becomes
-///   `tasks/progress-P1.txt` (per-PRD progress isolation)
+/// - `progress_file` placed in the same directory as the PRD file; defaults to `progress.txt`,
+///   or `progress-P1.txt` when `prefix` is `Some("P1")` (per-PRD progress isolation)
 ///
 /// # Errors
 ///

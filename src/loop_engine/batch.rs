@@ -73,7 +73,7 @@ fn expand_glob(pattern: &str) -> TaskMgrResult<Vec<PathBuf>> {
 /// Derive prompt file path from PRD file path.
 ///
 /// Strips `.json` extension and appends `-prompt.md`.
-/// e.g., `tasks/my-prd.json` → `tasks/my-prd-prompt.md`
+/// e.g., `.task-mgr/tasks/my-prd.json` → `.task-mgr/tasks/my-prd-prompt.md`
 fn derive_prompt_file(prd_file: &Path) -> PathBuf {
     let stem = prd_file
         .file_stem()
@@ -361,34 +361,34 @@ mod tests {
 
     #[test]
     fn test_derive_prompt_file_basic() {
-        let prd = PathBuf::from("tasks/my-prd.json");
+        let prd = PathBuf::from(".task-mgr/tasks/my-prd.json");
         let prompt = derive_prompt_file(&prd);
-        assert_eq!(prompt, PathBuf::from("tasks/my-prd-prompt.md"));
+        assert_eq!(prompt, PathBuf::from(".task-mgr/tasks/my-prd-prompt.md"));
     }
 
     #[test]
     fn test_derive_prompt_file_nested_path() {
-        let prd = PathBuf::from("/home/user/project/tasks/phase-1.json");
+        let prd = PathBuf::from("/home/user/project/.task-mgr/tasks/phase-1.json");
         let prompt = derive_prompt_file(&prd);
         assert_eq!(
             prompt,
-            PathBuf::from("/home/user/project/tasks/phase-1-prompt.md")
+            PathBuf::from("/home/user/project/.task-mgr/tasks/phase-1-prompt.md")
         );
     }
 
     #[test]
     fn test_derive_prompt_file_no_extension() {
-        let prd = PathBuf::from("tasks/my-prd");
+        let prd = PathBuf::from(".task-mgr/tasks/my-prd");
         let prompt = derive_prompt_file(&prd);
-        assert_eq!(prompt, PathBuf::from("tasks/my-prd-prompt.md"));
+        assert_eq!(prompt, PathBuf::from(".task-mgr/tasks/my-prd-prompt.md"));
     }
 
     #[test]
     fn test_derive_prompt_file_double_extension() {
         // file_stem() returns "my-prd.test" for "my-prd.test.json"
-        let prd = PathBuf::from("tasks/my-prd.test.json");
+        let prd = PathBuf::from(".task-mgr/tasks/my-prd.test.json");
         let prompt = derive_prompt_file(&prd);
-        assert_eq!(prompt, PathBuf::from("tasks/my-prd.test-prompt.md"));
+        assert_eq!(prompt, PathBuf::from(".task-mgr/tasks/my-prd.test-prompt.md"));
     }
 
     #[test]
