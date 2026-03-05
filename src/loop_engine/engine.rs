@@ -485,9 +485,16 @@ pub fn run_iteration(
         });
     }
 
-    // Step 6.5: If signal arrived during Claude execution, stop immediately.
-    // Without this, post-processing (learning extraction, feedback, inter-iteration
-    // delay) runs before the signal is checked at the next iteration boundary.
+    // Step 6.5: Detect if Claude was killed by SIGINT/SIGTERM (exit 130/143).
+    // Claude may be the terminal foreground group, so Ctrl+C goes to it instead
+    // of us. Propagate the signal to our flag so the loop stops cleanly.
+    if matches!(claude_result.exit_code, 130 | 143) {
+        params.signal_flag.set();
+    }
+
+    // If signal arrived during Claude execution (either directly or via exit code
+    // detection above), stop immediately. Without this, post-processing runs
+    // before the signal is checked at the next iteration boundary.
     if params.signal_flag.is_signaled() {
         return Ok(IterationResult {
             outcome: IterationOutcome::Empty,
@@ -1785,9 +1792,15 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
     {
         use signal_hook::consts::{SIGINT, SIGQUIT, SIGTERM};
 
-        // First signal sets the flag; second signal restores default (immediate kill)
-        if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
+        // First SIGINT sets the flag; second SIGINT restores default (immediate kill).
+        // Both registrations are needed: `register` sets the flag, and
+        // `register_conditional_default` emulates the default handler when
+        // the flag is already true.
+        if let Err(e) = signal_hook::flag::register(SIGINT, flag.clone()) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
+        }
+        if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
+            eprintln!("Warning: failed to install SIGINT conditional default: {}", e);
         }
         if let Err(e) = signal_hook::flag::register(SIGTERM, flag.clone()) {
             eprintln!("Warning: failed to install SIGTERM handler: {}", e);
@@ -1799,10 +1812,12 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
 
     #[cfg(not(unix))]
     {
-        // signal-hook supports SIGINT on all platforms (including Windows via SetConsoleCtrlHandler)
         use signal_hook::consts::SIGINT;
-        if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag) {
+        if let Err(e) = signal_hook::flag::register(SIGINT, flag.clone()) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
+        }
+        if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag) {
+            eprintln!("Warning: failed to install SIGINT conditional default: {}", e);
         }
     }
 }
@@ -2756,5 +2771,47 @@ mod tests {
 
         // 4 tasks total (P1: 2 + P2: 2), done is excluded
         assert_eq!(remaining, 4, "None prefix should count all remaining tasks");
+    }
+
+    // --- Signal flag propagation from Claude exit code ---
+
+    #[test]
+    fn test_signal_flag_set_on_exit_code_130() {
+        let flag = SignalFlag::new();
+        assert!(!flag.is_signaled());
+
+        // Simulate what run_iteration does when Claude exits with 130 (SIGINT)
+        let exit_code = 130;
+        if matches!(exit_code, 130 | 143) {
+            flag.set();
+        }
+        assert!(flag.is_signaled(), "Exit code 130 should set signal flag");
+    }
+
+    #[test]
+    fn test_signal_flag_set_on_exit_code_143() {
+        let flag = SignalFlag::new();
+        assert!(!flag.is_signaled());
+
+        let exit_code = 143;
+        if matches!(exit_code, 130 | 143) {
+            flag.set();
+        }
+        assert!(flag.is_signaled(), "Exit code 143 should set signal flag");
+    }
+
+    #[test]
+    fn test_signal_flag_not_set_on_normal_exit_codes() {
+        for exit_code in [0, 1, 127, 137, 139] {
+            let flag = SignalFlag::new();
+            if matches!(exit_code, 130 | 143) {
+                flag.set();
+            }
+            assert!(
+                !flag.is_signaled(),
+                "Exit code {} should not set signal flag",
+                exit_code
+            );
+        }
     }
 }

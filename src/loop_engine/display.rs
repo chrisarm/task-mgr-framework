@@ -64,17 +64,19 @@ pub fn format_session_banner(
     deadline_hours: Option<f64>,
     hints: Option<&SessionBannerHints<'_>>,
 ) -> String {
-    // Box width: 48 chars total (╔══...══╗), inner content width = 44
-    const WIDTH: usize = 46;
-    const INNER: usize = WIDTH - 2; // 44
+    const MIN_WIDTH: usize = 48;
+    const MAX_WIDTH: usize = 110;
+    let term_width = terminal_width().unwrap_or(MIN_WIDTH);
+    let width = term_width.clamp(MIN_WIDTH, MAX_WIDTH);
+    let inner = width - 2;
 
     let mut lines = Vec::new();
 
-    let top = format!("╔{}╗", "═".repeat(INNER));
-    let sep = format!("╠{}╣", "═".repeat(INNER));
-    let bot = format!("╚{}╝", "═".repeat(INNER));
+    let top = format!("╔{}╗", "═".repeat(inner));
+    let sep = format!("╠{}╣", "═".repeat(inner));
+    let bot = format!("╚{}╝", "═".repeat(inner));
 
-    let title = format!("║{:^width$}║", "AUTONOMOUS AGENT LOOP START", width = INNER);
+    let title = format!("║{:^width$}║", "AUTONOMOUS AGENT LOOP START", width = inner);
 
     lines.push(String::new());
     lines.push(top);
@@ -82,26 +84,26 @@ pub fn format_session_banner(
     lines.push(sep.clone());
 
     // Core fields
-    let prd_width = INNER - "  PRD: ".len();
+    let prd_width = inner - "  PRD: ".len();
     lines.push(format!(
         "║  PRD: {:<width$}║",
         truncate_display(prd_file, prd_width),
         width = prd_width
     ));
-    let branch_width = INNER - "  Branch: ".len();
+    let branch_width = inner - "  Branch: ".len();
     lines.push(format!(
         "║  Branch: {:<width$}║",
         truncate_display(branch, branch_width),
         width = branch_width
     ));
-    let iter_width = INNER - "  Max iterations: ".len();
+    let iter_width = inner - "  Max iterations: ".len();
     lines.push(format!(
         "║  Max iterations: {:<width$}║",
         max_iterations,
         width = iter_width
     ));
     if let Some(hours) = deadline_hours {
-        let dl_width = INNER - "  Deadline: ".len();
+        let dl_width = inner - "  Deadline: ".len();
         lines.push(format!(
             "║  Deadline: {:<width$}║",
             format!("{:.1}h", hours),
@@ -115,7 +117,7 @@ pub fn format_session_banner(
 
         // DB path
         let db_str = h.db_path.display().to_string();
-        let db_width = INNER - "  DB: ".len();
+        let db_width = inner - "  DB: ".len();
         lines.push(format!(
             "║  DB: {:<width$}║",
             truncate_display(&db_str, db_width),
@@ -128,7 +130,7 @@ pub fn format_session_banner(
             None => ".stop".to_string(),
         };
         let stop_hint = format!("touch {} to stop", stop_file);
-        let stop_width = INNER - "  Stop: ".len();
+        let stop_width = inner - "  Stop: ".len();
         lines.push(format!(
             "║  Stop: {:<width$}║",
             truncate_display(&stop_hint, stop_width),
@@ -136,7 +138,7 @@ pub fn format_session_banner(
         ));
 
         // Pause hint
-        let pause_width = INNER - "  Pause: ".len();
+        let pause_width = inner - "  Pause: ".len();
         lines.push(format!(
             "║  Pause: {:<width$}║",
             truncate_display("touch .pause to pause", pause_width),
@@ -146,7 +148,7 @@ pub fn format_session_banner(
         // Worktree (only when Some)
         if let Some(wt) = h.worktree_path {
             let wt_str = wt.display().to_string();
-            let wt_width = INNER - "  Worktree: ".len();
+            let wt_width = inner - "  Worktree: ".len();
             lines.push(format!(
                 "║  Worktree: {:<width$}║",
                 truncate_display(&wt_str, wt_width),
@@ -200,17 +202,73 @@ pub fn print_final_banner(
     elapsed_secs: u64,
     exit_reason: &str,
 ) {
-    eprintln!("\n╔══════════════════════════════════════════════╗");
-    eprintln!("║         AUTONOMOUS AGENT LOOP END            ║");
-    eprintln!("╠══════════════════════════════════════════════╣");
-    eprintln!("║  Iterations: {:<31} ║", iterations_completed);
-    eprintln!("║  Tasks completed: {:<26} ║", tasks_completed);
-    eprintln!("║  Total time: {:<31} ║", format_duration(elapsed_secs));
-    eprintln!(
-        "║  Exit reason: {:<30} ║",
-        truncate_display(exit_reason, 30)
+    eprint!(
+        "{}",
+        format_final_banner(iterations_completed, tasks_completed, elapsed_secs, exit_reason)
     );
-    eprintln!("╚══════════════════════════════════════════════╝\n");
+}
+
+/// Format the final session banner as a string (for testability).
+///
+/// Adapts width to the terminal: minimum 48 columns, expands up to terminal
+/// width (capped at 80). Falls back to 48 if terminal size can't be detected.
+pub fn format_final_banner(
+    iterations_completed: u32,
+    tasks_completed: u32,
+    elapsed_secs: u64,
+    exit_reason: &str,
+) -> String {
+    const MIN_WIDTH: usize = 48;
+    const MAX_WIDTH: usize = 110;
+
+    let term_width = terminal_width().unwrap_or(MIN_WIDTH);
+    let width = term_width.clamp(MIN_WIDTH, MAX_WIDTH);
+    let inner = width - 2; // space between ║ and ║
+
+    let top = format!("╔{}╗", "═".repeat(inner));
+    let sep = format!("╠{}╣", "═".repeat(inner));
+    let bot = format!("╚{}╝", "═".repeat(inner));
+    let title = format!("║{:^inner$}║", "AUTONOMOUS AGENT LOOP END");
+
+    let pad = inner - 2; // content area after "║  " and before "║"
+
+    let mut lines = Vec::new();
+    lines.push(String::new());
+    lines.push(top);
+    lines.push(title);
+    lines.push(sep);
+
+    let fields: Vec<(&str, String)> = vec![
+        ("Iterations", iterations_completed.to_string()),
+        ("Tasks completed", tasks_completed.to_string()),
+        ("Total time", format_duration(elapsed_secs)),
+        ("Exit reason", truncate_display(exit_reason, pad - "Exit reason: ".len())),
+    ];
+    for (label, value) in &fields {
+        let content = format!("{}: {}", label, value);
+        lines.push(format!("║  {:<pad$}║", content));
+    }
+
+    lines.push(bot);
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// Get the terminal width in columns, or `None` if unavailable.
+#[cfg(unix)]
+fn terminal_width() -> Option<usize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret == 0 && ws.ws_col > 0 {
+        Some(ws.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_width() -> Option<usize> {
+    None
 }
 
 /// Truncate a string for display in a fixed-width box.

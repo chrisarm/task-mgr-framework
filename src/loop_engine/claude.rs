@@ -108,17 +108,12 @@ pub(crate) fn spawn_claude(
     }
 
     // Put child in its own process group so we can kill the entire tree on signal.
-    // This also prevents Claude from receiving terminal SIGINT directly — the
-    // watchdog thread is solely responsible for termination.
+    // kill(-child_pid, sig) targets the group. The watchdog thread monitors the
+    // signal flag and escalates: SIGTERM → 3s grace → SIGKILL.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
+        cmd.process_group(0);
     }
 
     let mut child = cmd.spawn().map_err(|e| {
@@ -139,20 +134,6 @@ pub(crate) fn spawn_claude(
 
     // Extract PID before starting watchdog — no race condition
     let child_pid = child.id();
-
-    // Reclaim foreground process group so Ctrl+C delivers SIGINT to us.
-    // Claude's pre_exec setpgid(0,0) puts it in its own group, but Claude
-    // Code (Node.js) may call tcsetpgrp() during init to become the
-    // foreground group. Without this, SIGINT from Ctrl+C goes to Claude's
-    // group and task-mgr's signal handler never fires.
-    #[cfg(unix)]
-    {
-        unsafe {
-            let our_pgid = libc::getpgrp();
-            // stderr is inherited (connected to terminal); stdin=null, stdout=piped
-            libc::tcsetpgrp(libc::STDERR_FILENO, our_pgid);
-        }
-    }
 
     // Start watchdog thread if signal handling or timeout is requested
     let stop_watchdog = Arc::new(AtomicBool::new(false));
