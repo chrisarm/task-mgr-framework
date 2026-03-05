@@ -199,10 +199,12 @@ pub fn print_final_banner(
     tasks_completed: u32,
     elapsed_secs: u64,
     exit_reason: &str,
+    prd_file: &str,
 ) {
     eprintln!("\n╔══════════════════════════════════════════════╗");
     eprintln!("║         AUTONOMOUS AGENT LOOP END            ║");
     eprintln!("╠══════════════════════════════════════════════╣");
+    eprintln!("║  PRD: {:<37} ║", truncate_display(prd_file, 37));
     eprintln!("║  Iterations: {:<31} ║", iterations_completed);
     eprintln!("║  Tasks completed: {:<26} ║", tasks_completed);
     eprintln!("║  Total time: {:<31} ║", format_duration(elapsed_secs));
@@ -316,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_print_final_banner_no_panic() {
-        print_final_banner(10, 5, 3600, "all tasks complete");
+        print_final_banner(10, 5, 3600, "all tasks complete", "my-prd");
     }
 
     // --- TEST-INIT-003: format_session_banner() with hints ---

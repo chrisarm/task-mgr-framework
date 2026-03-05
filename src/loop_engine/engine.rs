@@ -1700,6 +1700,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         tasks_completed,
         total_elapsed,
         &exit_reason,
+        &prd_basename,
     );
 
     LoopResult {
