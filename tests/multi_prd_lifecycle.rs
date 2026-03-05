@@ -12,10 +12,12 @@
 use std::fs;
 use tempfile::TempDir;
 
-use task_mgr::commands::init::{self, PrefixMode};
+use task_mgr::commands::init::{self, generate_prefix, PrefixMode};
 use task_mgr::commands::next::selection::select_next_task;
+use task_mgr::db::prefix::validate_prefix;
 use task_mgr::db::{open_connection, LockGuard};
 use task_mgr::loop_engine::signals::check_stop_signal;
+use task_mgr::loop_engine::status_queries::read_prd_hints;
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -337,4 +339,185 @@ fn test_single_prd_no_prefix_backwards_compat() {
         sel.task.is_some(),
         "select_next_task(None) should work without prefix"
     );
+}
+
+// ============================================================================
+// AC: auto-generated prefix is consistent between engine pre-lock path and init()
+// ============================================================================
+
+/// Verifies that the engine's pre-lock prefix computation (read_prd_hints + generate_prefix)
+/// produces the same prefix that init(PrefixMode::Auto) writes back to the JSON file.
+/// This is the critical invariant for lock file naming to match task IDs.
+#[test]
+fn test_autogen_prefix_consistent_between_engine_and_init() {
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = temp_dir.path().join("auto-prefix-test.json");
+
+    // PRD with branchName but NO taskPrefix — forces auto-generation
+    let prd_json = serde_json::json!({
+        "project": "prefix-consistency-test",
+        "branchName": "feat/auto-prefix-test",
+        "userStories": [
+            {
+                "id": "TASK-001",
+                "title": "Auto prefix test task",
+                "description": "Verifies prefix consistency",
+                "priority": 10,
+                "status": "todo",
+                "passes": false,
+                "acceptanceCriteria": ["prefix matches"],
+                "dependsOn": [],
+                "batchWith": [],
+                "conflictsWith": []
+            }
+        ]
+    });
+    fs::write(&prd_path, serde_json::to_string_pretty(&prd_json).unwrap()).unwrap();
+
+    // Step 1: Simulate engine pre-lock computation
+    let hints = read_prd_hints(&prd_path);
+    assert!(
+        hints.task_prefix.is_none(),
+        "PRD should have no taskPrefix before init"
+    );
+    assert_eq!(
+        hints.branch_name.as_deref(),
+        Some("feat/auto-prefix-test"),
+        "PRD should have branchName"
+    );
+
+    let filename = prd_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap();
+    let engine_prefix = generate_prefix(hints.branch_name.as_deref(), filename);
+    assert!(
+        validate_prefix(&engine_prefix).is_ok(),
+        "Engine-generated prefix must be valid: {}",
+        engine_prefix
+    );
+
+    // Step 2: Run init with PrefixMode::Auto
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    // Step 3: Read back the taskPrefix that init wrote to JSON
+    let updated_hints = read_prd_hints(&prd_path);
+    let init_prefix = updated_hints
+        .task_prefix
+        .expect("init should have written taskPrefix back to JSON");
+    assert_eq!(
+        engine_prefix, init_prefix,
+        "Engine prefix and init-written prefix must match"
+    );
+
+    // Step 4: Verify task IDs in DB use the same prefix
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let task_id: String = conn
+        .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        task_id.starts_with(&format!("{}-", engine_prefix)),
+        "Task ID '{}' should start with '{}-'",
+        task_id,
+        engine_prefix
+    );
+
+    // Step 5: Verify the lock file name is acquirable and consistent
+    let lock_name = format!("loop-{}.lock", engine_prefix);
+    let _guard = LockGuard::acquire_named(temp_dir.path(), &lock_name)
+        .expect("Should acquire lock with engine-computed prefix name");
+    assert!(temp_dir.path().join(&lock_name).exists());
+}
+
+/// Edge case: PRD with no branchName AND no taskPrefix.
+/// Both engine and init must still produce the same deterministic prefix
+/// derived solely from the filename.
+#[test]
+fn test_autogen_prefix_consistent_without_branch_name() {
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = temp_dir.path().join("no-branch-prd.json");
+
+    // PRD with neither branchName nor taskPrefix
+    let prd_json = serde_json::json!({
+        "project": "no-branch-prefix-test",
+        "userStories": [
+            {
+                "id": "TASK-001",
+                "title": "No-branch test task",
+                "description": "Tests prefix when branchName is absent",
+                "priority": 10,
+                "status": "todo",
+                "passes": false,
+                "acceptanceCriteria": ["prefix matches"],
+                "dependsOn": [],
+                "batchWith": [],
+                "conflictsWith": []
+            }
+        ]
+    });
+    fs::write(&prd_path, serde_json::to_string_pretty(&prd_json).unwrap()).unwrap();
+
+    // Engine pre-lock computation with no branch name
+    let hints = read_prd_hints(&prd_path);
+    assert!(hints.task_prefix.is_none());
+    assert!(hints.branch_name.is_none());
+
+    let filename = prd_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap();
+    let engine_prefix = generate_prefix(None, filename);
+    assert!(
+        validate_prefix(&engine_prefix).is_ok(),
+        "Prefix from None branch must be valid: {}",
+        engine_prefix
+    );
+
+    // Run init
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    // Verify consistency
+    let updated_hints = read_prd_hints(&prd_path);
+    let init_prefix = updated_hints
+        .task_prefix
+        .expect("init should have written taskPrefix back to JSON");
+    assert_eq!(
+        engine_prefix, init_prefix,
+        "Engine prefix (no branch) and init-written prefix must match"
+    );
+
+    // Verify task ID uses the prefix
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let task_id: String = conn
+        .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        task_id.starts_with(&format!("{}-", engine_prefix)),
+        "Task ID '{}' should start with '{}-'",
+        task_id,
+        engine_prefix
+    );
+
+    // Verify lock file consistency
+    let lock_name = format!("loop-{}.lock", engine_prefix);
+    let _guard = LockGuard::acquire_named(temp_dir.path(), &lock_name)
+        .expect("Should acquire lock with no-branch prefix name");
 }
