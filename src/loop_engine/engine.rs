@@ -701,8 +701,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     };
 
-    // Step 4: Ensure directories exist (in source_root)
-    if let Err(e) = env::ensure_directories(&run_config.source_root) {
+    // Step 4: Ensure directories exist (in db_dir)
+    if let Err(e) = env::ensure_directories(&run_config.db_dir) {
         eprintln!("Error creating directories: {}", e);
         return LoopResult {
             exit_code: 1,

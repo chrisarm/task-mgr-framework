@@ -238,7 +238,7 @@ pub async fn run_batch(
     };
 
     // Step 3: Resolve tasks dir for .stop signal checking
-    let tasks_dir = project_root.join("tasks");
+    let tasks_dir = dir.join("tasks");
 
     // Step 4: Run each PRD sequentially
     let mut results = Vec::with_capacity(pairs.len());
