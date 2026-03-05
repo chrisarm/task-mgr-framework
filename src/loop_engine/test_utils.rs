@@ -4,6 +4,7 @@
 //! and common DB insert helpers) used across feedback.rs, calibrate.rs, prompt.rs,
 //! and engine.rs tests.
 use rusqlite::{params, Connection};
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::db::migrations::run_migrations;
@@ -130,35 +131,54 @@ pub fn insert_run_task(conn: &Connection, run_id: &str, task_id: &str, iteration
     .unwrap();
 }
 
-/// Set up a temporary git repository for testing.
+/// Initialize a temporary git repository with a single commit.
 ///
-/// Creates a temp directory with git init, user config, and an initial commit.
-/// Returns the TempDir which must be kept alive for the duration of the test.
-pub fn setup_git_repo() -> TempDir {
+/// Creates a temp directory with `git init -b main`, user config, a README.md,
+/// and an initial commit. Returns `(TempDir, PathBuf)` — the TempDir must be
+/// kept alive for the duration of the test to prevent the directory from being
+/// deleted.
+pub fn init_test_repo() -> (TempDir, PathBuf) {
+    use std::fs;
     use std::process::Command;
 
-    let temp_dir = TempDir::new().expect("create temp dir");
+    let tmp = TempDir::new().expect("create temp dir");
+    let repo = tmp.path().to_path_buf();
     Command::new("git")
-        .args(["init"])
-        .current_dir(temp_dir.path())
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
         .output()
         .expect("git init");
     Command::new("git")
         .args(["config", "user.email", "test@test.com"])
-        .current_dir(temp_dir.path())
+        .current_dir(&repo)
         .output()
         .expect("git config email");
     Command::new("git")
         .args(["config", "user.name", "Test"])
-        .current_dir(temp_dir.path())
+        .current_dir(&repo)
         .output()
         .expect("git config name");
+    fs::write(repo.join("README.md"), "# Test").expect("write README");
     Command::new("git")
-        .args(["commit", "--allow-empty", "-m", "Initial commit"])
-        .current_dir(temp_dir.path())
+        .args(["add", "."])
+        .current_dir(&repo)
         .output()
-        .expect("initial commit");
-    temp_dir
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit");
+    (tmp, repo)
+}
+
+/// Set up a temporary git repository for testing.
+///
+/// Delegates to [`init_test_repo`] and returns only the TempDir for callers
+/// that access the path via `tmp.path()`.
+pub fn setup_git_repo() -> TempDir {
+    let (tmp, _) = init_test_repo();
+    tmp
 }
 
 /// Set up a temporary git repository with a committed file for worktree testing.

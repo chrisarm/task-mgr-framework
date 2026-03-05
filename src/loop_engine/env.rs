@@ -835,37 +835,8 @@ mod tests {
 
     // --- TEST-INIT-002: ensure_branch with dirty tree and edge cases ---
 
-    /// Helper: set up a git repo with an initial commit.
-    /// Returns the TempDir (holds the repo lifetime).
     fn setup_git_repo() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git init");
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git config email");
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git config name");
-        fs::write(tmp.path().join("file.txt"), "content").expect("write");
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git add");
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(tmp.path())
-            .output()
-            .expect("git commit");
-        tmp
+        crate::loop_engine::test_utils::setup_git_repo()
     }
 
     #[test]
