@@ -202,7 +202,7 @@ When 2+ viable approaches exist with **no clear winner**, classify and handle as
 
 ### Step 5: Generate the PRD
 
-Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:
+Create a markdown file at `.task-mgr/tasks/prd-{feature-name}.md` with this structure:
 
 ```markdown
 # PRD: {Feature Title}
@@ -415,7 +415,7 @@ After creating the PRD, provide:
 
 1. File path where PRD was saved
 2. Brief summary of what was documented
-3. Suggested next step: `/tasks tasks/prd-{feature-name}.md`
+3. Suggested next step: `/tasks .task-mgr/tasks/prd-{feature-name}.md`
 
 ## Example
 
@@ -444,12 +444,12 @@ User: A, B, C
 Claude: *explores codebase for existing theme patterns*
 *generates PRD*
 
-Created: tasks/prd-dark-mode.md
+Created: .task-mgr/tasks/prd-dark-mode.md
 
 Summary: PRD for dark mode toggle with MVP scope (OS preference + manual override),
 accessible from settings and header quick-toggle, synced to user account.
 
-Next step: Run `/tasks tasks/prd-dark-mode.md` to generate the task breakdown.
+Next step: Run `/tasks .task-mgr/tasks/prd-dark-mode.md` to generate the task breakdown.
 ```
 
 ## Notes

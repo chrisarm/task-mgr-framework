@@ -701,8 +701,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     };
 
-    // Step 4: Ensure directories exist (in source_root)
-    if let Err(e) = env::ensure_directories(&run_config.source_root) {
+    // Step 4: Ensure directories exist (in db_dir)
+    if let Err(e) = env::ensure_directories(&run_config.db_dir) {
         eprintln!("Error creating directories: {}", e);
         return LoopResult {
             exit_code: 1,
@@ -1800,7 +1800,10 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
         }
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag.clone()) {
-            eprintln!("Warning: failed to install SIGINT conditional default: {}", e);
+            eprintln!(
+                "Warning: failed to install SIGINT conditional default: {}",
+                e
+            );
         }
         if let Err(e) = signal_hook::flag::register(SIGTERM, flag.clone()) {
             eprintln!("Warning: failed to install SIGTERM handler: {}", e);
@@ -1817,7 +1820,10 @@ fn setup_signal_handler(signal_flag: SignalFlag) {
             eprintln!("Warning: failed to install SIGINT handler: {}", e);
         }
         if let Err(e) = signal_hook::flag::register_conditional_default(SIGINT, flag) {
-            eprintln!("Warning: failed to install SIGINT conditional default: {}", e);
+            eprintln!(
+                "Warning: failed to install SIGINT conditional default: {}",
+                e
+            );
         }
     }
 }

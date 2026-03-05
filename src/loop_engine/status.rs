@@ -367,7 +367,7 @@ mod tests {
         fs::write(tasks_dir.join(".deadline-prd-b"), future_epoch.to_string()).unwrap();
 
         // When prd_file is specified, only read that deadline
-        let prd_path = Path::new("tasks/prd-a.json");
+        let prd_path = Path::new(".task-mgr/tasks/prd-a.json");
         let result = show_status(temp_dir.path(), Some(prd_path), false, None).unwrap();
         let deadline = result.deadline.unwrap();
         assert_eq!(deadline.prd_basename, "prd-a");

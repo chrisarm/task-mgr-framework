@@ -11,6 +11,6 @@ The Ralph loop database is at `.task-mgr/tasks.db` (relative to the project/work
 
 ## Task Files
 
-- PRD task lists: `tasks/<prd-name>.json`
-- Loop prompts: `tasks/<prd-name>-prompt.md`
-- Progress log: `tasks/progress.txt`
+- PRD task lists: `.task-mgr/tasks/<prd-name>.json`
+- Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
+- Progress log: `.task-mgr/tasks/progress.txt`

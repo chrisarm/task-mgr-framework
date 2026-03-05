@@ -1830,7 +1830,7 @@ mod scoped_import_tests {
         assert_eq!(id1, id2, "upsert must return the existing row id, not 0");
 
         // The returned id must be valid for FK-constrained inserts
-        insert_prd_file(&conn, id2, "tasks/test.json", "task_list")
+        insert_prd_file(&conn, id2, ".task-mgr/tasks/test.json", "task_list")
             .expect("insert_prd_file must succeed with upserted prd_id");
     }
 
@@ -1843,10 +1843,10 @@ mod scoped_import_tests {
         let (_dir, conn) = setup_migrated_db();
         let prd = make_prd("proj", Some("PX"));
         let prd_id = insert_prd_metadata(&conn, &prd, None).unwrap();
-        insert_prd_file(&conn, prd_id, "tasks/prd.json", "task_list").unwrap();
+        insert_prd_file(&conn, prd_id, ".task-mgr/tasks/prd.json", "task_list").unwrap();
         let stored_prd_id: i64 = conn
             .query_row(
-                "SELECT prd_id FROM prd_files WHERE file_path='tasks/prd.json'",
+                "SELECT prd_id FROM prd_files WHERE file_path='.task-mgr/tasks/prd.json'",
                 [],
                 |r| r.get(0),
             )

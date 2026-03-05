@@ -1,0 +1,207 @@
+{
+  "branchName": "feat/move-tasks-dir",
+  "description": "Move tasks/ directory under .task-mgr/tasks/ so all task artifacts live alongside the database",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing APIs unless required"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases before coding",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works",
+      "3. CORRECTNESS - Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Each task delivers working code + tests together",
+      "Test boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "taskPrefix": "MTD",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: resolve_paths() places progress file in same dir as PRD (prd_absolute.parent())",
+        "Positive: ensure_directories() creates db_dir/tasks/ and db_dir/tasks/archive/",
+        "Unit test: resolve_paths with PRD at .task-mgr/tasks/prd.json places progress at .task-mgr/tasks/progress.txt",
+        "Unit test: resolve_paths with prefix 'P1' places progress at .task-mgr/tasks/progress-P1.txt",
+        "Unit test: ensure_directories(db_dir) creates db_dir/tasks/ and db_dir/tasks/archive/",
+        "Negative: ensure_directories must NOT create a tasks/ dir at project root",
+        "Known-bad: if progress_file still uses project_dir.join(\"tasks\"), test with PRD in a different dir would show progress file in wrong location"
+      ],
+      "dependsOn": [],
+      "description": "Update resolve_paths() and ensure_directories() in src/loop_engine/env.rs to use the DB directory (.task-mgr) as the base for task paths instead of project root.\n\nDO:\n- Change resolve_paths() progress file derivation from project_dir.join(\"tasks\") to prd_absolute.parent().unwrap_or(project_dir) — derive from PRD location\n- Change ensure_directories() parameter from project_dir to db_dir, use db_dir.join(\"tasks\") internally\n- Update the doc comments to reflect the new semantics\n- Update all env.rs unit tests that assert progress file paths or tasks dir paths\n\nDO NOT:\n- Change the resolve_paths() function signature (no new parameters needed)\n- Break the tasks_dir derivation at line 374 (prd_absolute.parent()) — it already works correctly\n- Touch test cases that use tmp.path().join(\"tasks\") — those are temp dir structure and stay as-is\n\nEdge cases:\n- When prd_absolute.parent() is None (shouldn't happen with absolute paths, but handle gracefully)\n- When db_dir doesn't exist yet (ensure_directories should create it)\n\nKnown-bad to guard against:\n- If progress file is still derived from project_dir.join(\"tasks\"), it would write to ./tasks/ instead of .task-mgr/tasks/, creating orphaned progress files",
+      "id": "MTD-001",
+      "notes": "Key functions: resolve_paths (env.rs:303), ensure_directories (env.rs:393). The ResolvedPaths struct (env.rs:282) has tasks_dir which is already derived from prd_absolute.parent() — no change needed there. Only the progress_file derivation at line 371 and ensure_directories body at line 394 need changing.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [],
+      "title": "Core path resolution changes in env.rs",
+      "touchesFiles": [
+        "src/loop_engine/env.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: engine.rs passes db_dir to ensure_directories()",
+        "Positive: batch.rs uses dir.join(\"tasks\") for signal file checking",
+        "Positive: Existing batch tests still pass",
+        "Negative: ensure_directories must NOT receive source_root anymore",
+        "Known-bad: if batch.rs still uses project_root.join(\"tasks\"), .stop files would be checked in wrong directory"
+      ],
+      "dependsOn": [
+        "MTD-001"
+      ],
+      "description": "Update the callers of ensure_directories() and the tasks_dir computation in batch.rs to use db_dir.\n\nDO:\n- engine.rs:705: Change ensure_directories(&run_config.source_root) to ensure_directories(&run_config.db_dir)\n- batch.rs:241: Change project_root.join(\"tasks\") to dir.join(\"tasks\") (dir parameter is already the db_dir)\n- Update any tests in these files that assert on tasks_dir paths\n\nDO NOT:\n- Change the resolve_paths() call in engine.rs:685 — it still receives source_root for PRD resolution, and PRD paths will be .task-mgr/tasks/prd.json which resolves correctly via project_dir.join(prd_file)\n- Add new parameters to existing function signatures\n\nEdge cases:\n- batch.rs uses tasks_dir for .stop signal file checking — ensure signal files are found at new location",
+      "id": "MTD-002",
+      "notes": "engine.rs LoopRunConfig has both source_root and db_dir fields. batch.rs run_batch() already receives dir parameter (db_dir) alongside project_root. The dir parameter is what we want for tasks_dir.",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [],
+      "title": "Update callers in engine.rs and batch.rs",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All cli/tests.rs tests pass with new .task-mgr/tasks/ paths",
+        "Positive: All display.rs tests pass with new paths",
+        "Positive: All init/tests.rs tests pass with updated DB paths",
+        "Negative: No remaining hardcoded \"tasks/\" prefix in test CLI arguments (should be .task-mgr/tasks/)",
+        "Unit test: cargo test --lib passes for all updated test files"
+      ],
+      "dependsOn": [
+        "MTD-001"
+      ],
+      "description": "Update hardcoded test paths in cli/tests.rs and display.rs that reference tasks/ prefix to use .task-mgr/tasks/ prefix.\n\nDO:\n- cli/tests.rs: Update ~24 instances of \"tasks/...\" in Cli::parse_from() calls and ~9 assertion PathBuf::from(\"tasks/...\") to use \".task-mgr/tasks/...\"\n- display.rs: Update ~7 instances of \"tasks/prd.json\" in print_session_banner() and format_session_banner() test calls\n- init/tests.rs: Update ~5 prd_files DB path test values if they use \"tasks/\" prefix\n\nDO NOT:\n- Change non-test code in these files\n- Change test paths that use tmp.path().join(\"tasks\") — those are temp dir relative\n- Change LIKE patterns that use '%prd.json' — those are already portable\n\nEdge cases:\n- Some tests may use \"tasks/\" as both input and expected output — update both consistently",
+      "id": "MTD-003",
+      "notes": "This is primarily a find-and-replace task. In cli/tests.rs, search for Cli::parse_from calls with \"tasks/\" and PathBuf::from(\"tasks/\"). In display.rs, search for \"tasks/prd.json\". In init/tests.rs, search for insert_prd_file and SELECT queries with \"tasks/\".",
+      "passes": true,
+      "priority": 3,
+      "synergyWith": [],
+      "title": "Update CLI and display test paths",
+      "touchesFiles": [
+        "src/cli/tests.rs",
+        "src/loop_engine/display.rs",
+        "src/commands/init/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: .task-mgr/tasks/ directory is NOT gitignored (negation works)",
+        "Positive: .task-mgr/tasks.db IS still gitignored (*.db rule)",
+        "Positive: .task-mgr/tasks/progress*.txt IS gitignored",
+        "Positive: .task-mgr/loop.lock and other runtime files ARE gitignored",
+        "Positive: CLAUDE.md reflects new .task-mgr/tasks/ paths",
+        "Positive: All 3 command docs updated consistently",
+        "Negative: No remaining references to bare 'tasks/' paths in docs (should be .task-mgr/tasks/)"
+      ],
+      "dependsOn": [],
+      "description": "Update .gitignore to allow .task-mgr/tasks/ through negation, update CLAUDE.md and all command reference docs.\n\nDO:\n- .gitignore: Change '.task-mgr/' to '.task-mgr/*', add '!.task-mgr/tasks/', add '.task-mgr/tasks/progress*.txt'\n- Remove old 'tasks/progress*.txt' gitignore line\n- CLAUDE.md: Update task file path references (lines 14-16)\n- .claude/commands/prd.md: Update all tasks/ references to .task-mgr/tasks/\n- .claude/commands/plan-tasks.md: Update all tasks/ references to .task-mgr/tasks/\n- .claude/commands/tasks.md: Update all tasks/ references to .task-mgr/tasks/\n- scripts/rebuild-from-json.sh: Update example paths\n\nDO NOT:\n- Change the .task-mgr/* pattern to anything else — the glob form is required for negation to work\n- Remove the *.db gitignore rule — it's still needed for tasks.db\n\nEdge cases:\n- .gitignore negation only works with glob (*) not directory trailing slash (/)",
+      "id": "MTD-004",
+      "notes": "The .gitignore negation pattern must use .task-mgr/* (glob) instead of .task-mgr/ (directory) for negation to work. Git ignores everything in a directory-ignored path and won't check negations. With glob, individual items are ignored but negations can override.",
+      "passes": true,
+      "priority": 4,
+      "synergyWith": [],
+      "title": "Update gitignore, CLAUDE.md, and command docs",
+      "touchesFiles": [
+        ".gitignore",
+        "CLAUDE.md",
+        ".claude/commands/prd.md",
+        ".claude/commands/plan-tasks.md",
+        ".claude/commands/tasks.md",
+        "scripts/rebuild-from-json.sh"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All files from ./tasks/ now exist under .task-mgr/tasks/",
+        "Positive: .task-mgr/tasks/archive/ has both old archive content and new dated subdirs",
+        "Positive: ./tasks/ directory no longer exists",
+        "Positive: git status shows clean tracking (old files removed, new files added per gitignore rules)",
+        "Negative: No files lost during migration — verify count before and after",
+        "Negative: tasks.db must NOT be under .task-mgr/tasks/ — stays at .task-mgr/tasks.db"
+      ],
+      "dependsOn": [
+        "MTD-004"
+      ],
+      "description": "Move all files from ./tasks/ to .task-mgr/tasks/, merging with existing content in .task-mgr/tasks/archive/.\n\nDO:\n- Move all files from ./tasks/ to .task-mgr/tasks/ (JSON, prompts, PRDs, scripts, learnings, backlog, etc.)\n- Merge ./tasks/archive/ contents with existing .task-mgr/tasks/archive/ (the recent archive run already put dated subdirs there)\n- git rm the old ./tasks/ tracked files\n- git add the new .task-mgr/tasks/ files\n- Remove the empty ./tasks/ directory\n\nDO NOT:\n- Overwrite files in .task-mgr/tasks/archive/ that already exist from the archive run\n- Move tasks.db (it stays at .task-mgr/tasks.db, not .task-mgr/tasks/tasks.db)\n- Delete any files — only move them\n\nEdge cases:\n- Some files exist in both ./tasks/ and .task-mgr/tasks/archive/ — the archive copies are newer and should be kept\n- progress*.txt files should be moved but will be gitignored at the new location",
+      "id": "MTD-005",
+      "notes": "The .task-mgr/tasks/archive/ directory already has dated subdirs from the recent archive run (2026-03-04-*). The ./tasks/archive/ has older flat files. Use rsync or cp -n to merge without overwriting. Check file counts before and after.",
+      "passes": true,
+      "priority": 5,
+      "synergyWith": [],
+      "title": "Physical file migration",
+      "touchesFiles": [
+        "tasks/*",
+        ".task-mgr/tasks/*"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: No production code uses project_root.join(\"tasks\") or source_root.join(\"tasks\")",
+        "Positive: All tasks_dir computations use db_dir (or equivalent .task-mgr path)",
+        "Positive: cargo test passes",
+        "Positive: cargo clippy -- -D warnings passes"
+      ],
+      "dependsOn": [
+        "MTD-001",
+        "MTD-002"
+      ],
+      "description": "Scan entire codebase for any remaining project_dir.join(\"tasks\") or project_root.join(\"tasks\") patterns that should now use db_dir.join(\"tasks\").\n\nDO:\n- Grep for .join(\"tasks\") across all non-test Rust code\n- Verify each occurrence uses the correct base path (db_dir, not project root)\n- Check status_queries.rs read_deadline_info() — it uses dir.join(\"tasks\") which should already be correct (dir = .task-mgr)\n- Verify archive.rs and init/mod.rs still work correctly (they use dir.join(\"tasks\") which is correct)\n\nDO NOT:\n- Change code in test helpers that build temp dir structures with .join(\"tasks\")\n- Introduce new abstractions — just ensure consistency",
+      "id": "MTD-006",
+      "notes": "Key files to verify: env.rs, engine.rs, batch.rs, archive.rs, init/mod.rs, status_queries.rs. The archive and init already use dir.join(\"tasks\") where dir = .task-mgr — those are correct.",
+      "passes": true,
+      "priority": 6,
+      "synergyWith": [],
+      "title": "Review for DRY and consistency",
+      "touchesFiles": [
+        "src/loop_engine/env.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: .gitignore negation verified — git check-ignore .task-mgr/tasks/test.json returns non-ignored",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings for new code",
+        "Negative: No remaining project_dir.join(\"tasks\") in production code",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-98"
+      ],
+      "dependsOn": [
+        "MTD-001",
+        "MTD-002",
+        "MTD-003",
+        "MTD-004",
+        "MTD-005",
+        "MTD-006"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring. Run full test suite.\n\nDO: Check every changed function for error handling, check callers still work, verify no dead code.\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode.",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "Clean review. All acceptance criteria verified: no project_dir.join(\"tasks\") in production code, no unwrap() in production paths, all 2505 tests pass, clippy/fmt clean, gitignore negation works.",
+      "passes": true,
+      "priority": 99,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "all modified files"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
