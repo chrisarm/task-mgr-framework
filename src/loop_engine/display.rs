@@ -345,12 +345,12 @@ mod tests {
 
     #[test]
     fn test_print_session_banner_no_panic() {
-        print_session_banner("tasks/prd.json", "main", 10, Some(2.0), None);
+        print_session_banner(".task-mgr/tasks/prd.json", "main", 10, Some(2.0), None);
     }
 
     #[test]
     fn test_print_session_banner_no_deadline() {
-        print_session_banner("tasks/prd.json", "main", 10, None, None);
+        print_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, None);
     }
 
     #[test]
@@ -394,7 +394,13 @@ mod tests {
             worktree_path: Some(wt),
         };
         // Must not panic and must return a non-empty string
-        let banner = format_session_banner("tasks/prd.json", "main", 10, Some(2.0), Some(&hints));
+        let banner = format_session_banner(
+            ".task-mgr/tasks/prd.json",
+            "main",
+            10,
+            Some(2.0),
+            Some(&hints),
+        );
         assert!(!banner.is_empty(), "banner must be non-empty");
     }
 
@@ -407,7 +413,8 @@ mod tests {
             prefix: None,
             worktree_path: None,
         };
-        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        let banner =
+            format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
         let banner_lower = banner.to_lowercase();
         assert!(
             !banner_lower.contains("worktree"),
@@ -425,7 +432,8 @@ mod tests {
             prefix: Some("P1"),
             worktree_path: None,
         };
-        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        let banner =
+            format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
         assert!(
             banner.contains(".stop-P1"),
             "Banner with prefix 'P1' must contain '.stop-P1' in stop-file hint, got:\n{}",
@@ -442,7 +450,8 @@ mod tests {
             prefix: None,
             worktree_path: None,
         };
-        let banner = format_session_banner("tasks/prd.json", "main", 5, None, Some(&hints));
+        let banner =
+            format_session_banner(".task-mgr/tasks/prd.json", "main", 5, None, Some(&hints));
         // Must contain ".stop" but NOT ".stop-" (no prefix suffix)
         assert!(
             banner.contains(".stop"),
@@ -465,7 +474,8 @@ mod tests {
             prefix: None,
             worktree_path: None,
         };
-        let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));
+        let banner =
+            format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
         assert!(
             banner.contains("tasks.db"),
             "Banner must display the DB path hint, got:\n{}",

@@ -2052,7 +2052,7 @@ fn test_man_pages_defaults() {
 
 #[test]
 fn test_loop_with_prd_file_and_yes() {
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--yes"]);
+    let cli = Cli::parse_from(["task-mgr", "loop", ".task-mgr/tasks/prd.json", "--yes"]);
     match cli.command {
         Commands::Loop {
             prd_file,
@@ -2064,7 +2064,7 @@ fn test_loop_with_prd_file_and_yes() {
             external_repo,
             cleanup_worktree,
         } => {
-            assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
+            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
             assert!(prompt_file.is_none());
             assert!(yes);
             assert!(hours.is_none());
@@ -2082,7 +2082,7 @@ fn test_loop_with_hours() {
     let cli = Cli::parse_from([
         "task-mgr",
         "loop",
-        "tasks/prd.json",
+        ".task-mgr/tasks/prd.json",
         "--hours",
         "4.5",
         "--yes",
@@ -2094,7 +2094,7 @@ fn test_loop_with_hours() {
             yes,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
+            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
             assert_eq!(hours, Some(4.5));
             assert!(yes);
         }
@@ -2107,9 +2107,9 @@ fn test_loop_with_prompt_file() {
     let cli = Cli::parse_from([
         "task-mgr",
         "loop",
-        "tasks/prd.json",
+        ".task-mgr/tasks/prd.json",
         "--prompt-file",
-        "tasks/custom-prompt.md",
+        ".task-mgr/tasks/custom-prompt.md",
         "--yes",
     ]);
     match cli.command {
@@ -2118,8 +2118,11 @@ fn test_loop_with_prompt_file() {
             prompt_file,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
-            assert_eq!(prompt_file, Some(PathBuf::from("tasks/custom-prompt.md")));
+            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert_eq!(
+                prompt_file,
+                Some(PathBuf::from(".task-mgr/tasks/custom-prompt.md"))
+            );
         }
         _ => panic!("Expected Loop command"),
     }
@@ -2127,7 +2130,13 @@ fn test_loop_with_prompt_file() {
 
 #[test]
 fn test_loop_with_verbose() {
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--yes", "--verbose"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--yes",
+        "--verbose",
+    ]);
     match cli.command {
         Commands::Loop { verbose, .. } => {
             assert!(verbose);
@@ -2139,7 +2148,7 @@ fn test_loop_with_verbose() {
 #[test]
 fn test_loop_minimal() {
     // Loop requires prd_file positional arg
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json"]);
+    let cli = Cli::parse_from(["task-mgr", "loop", ".task-mgr/tasks/prd.json"]);
     match cli.command {
         Commands::Loop {
             prd_file,
@@ -2151,7 +2160,7 @@ fn test_loop_minimal() {
             external_repo,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
+            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
             assert!(prompt_file.is_none());
             assert!(!yes);
             assert!(hours.is_none());
@@ -2168,9 +2177,9 @@ fn test_loop_with_all_options() {
     let cli = Cli::parse_from([
         "task-mgr",
         "loop",
-        "tasks/prd.json",
+        ".task-mgr/tasks/prd.json",
         "--prompt-file",
-        "tasks/prompt.md",
+        ".task-mgr/tasks/prompt.md",
         "--yes",
         "--hours",
         "2.0",
@@ -2187,8 +2196,11 @@ fn test_loop_with_all_options() {
             external_repo,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from("tasks/prd.json"));
-            assert_eq!(prompt_file, Some(PathBuf::from("tasks/prompt.md")));
+            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert_eq!(
+                prompt_file,
+                Some(PathBuf::from(".task-mgr/tasks/prompt.md"))
+            );
             assert!(yes);
             assert_eq!(hours, Some(2.0));
             assert!(verbose);
@@ -2204,7 +2216,7 @@ fn test_loop_with_no_worktree() {
     let cli = Cli::parse_from([
         "task-mgr",
         "loop",
-        "tasks/prd.json",
+        ".task-mgr/tasks/prd.json",
         "--yes",
         "--no-worktree",
     ]);
@@ -2221,7 +2233,7 @@ fn test_loop_with_external_repo() {
     let cli = Cli::parse_from([
         "task-mgr",
         "loop",
-        "tasks/prd.json",
+        ".task-mgr/tasks/prd.json",
         "--yes",
         "--external-repo",
         "../restaurant_agent_ex",
@@ -2244,7 +2256,13 @@ fn test_loop_missing_prd_file_fails() {
 #[test]
 fn test_loop_hours_zero() {
     // hours=0 is syntactically valid (semantic validation happens at runtime)
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--hours", "0"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--hours",
+        "0",
+    ]);
     match cli.command {
         Commands::Loop { hours, .. } => {
             assert_eq!(hours, Some(0.0));
@@ -2256,7 +2274,13 @@ fn test_loop_hours_zero() {
 #[test]
 fn test_loop_hours_large() {
     // hours=169 is syntactically valid (semantic validation at runtime, max 168)
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--hours", "169"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--hours",
+        "169",
+    ]);
     match cli.command {
         Commands::Loop { hours, .. } => {
             assert_eq!(hours, Some(169.0));
@@ -2267,7 +2291,13 @@ fn test_loop_hours_large() {
 
 #[test]
 fn test_loop_hours_fractional() {
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "--hours", "0.25"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--hours",
+        "0.25",
+    ]);
     match cli.command {
         Commands::Loop { hours, .. } => {
             assert_eq!(hours, Some(0.25));
@@ -2280,14 +2310,20 @@ fn test_loop_hours_fractional() {
 fn test_loop_hours_negative_fails() {
     // Negative hours should fail to parse as f64 with clap
     // (clap parses -1 as a flag, not a value, so this should fail)
-    let result = Cli::try_parse_from(["task-mgr", "loop", "tasks/prd.json", "--hours", "-1"]);
+    let result = Cli::try_parse_from([
+        "task-mgr",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--hours",
+        "-1",
+    ]);
     // clap may interpret -1 as a flag rather than a value; either error is fine
     assert!(result.is_err());
 }
 
 #[test]
 fn test_loop_short_yes_flag() {
-    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/prd.json", "-y"]);
+    let cli = Cli::parse_from(["task-mgr", "loop", ".task-mgr/tasks/prd.json", "-y"]);
     match cli.command {
         Commands::Loop { yes, .. } => {
             assert!(yes);
@@ -2316,12 +2352,12 @@ fn test_status_no_args() {
 
 #[test]
 fn test_status_with_prd_file() {
-    let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json"]);
+    let cli = Cli::parse_from(["task-mgr", "status", ".task-mgr/tasks/prd.json"]);
     match cli.command {
         Commands::Status {
             prd_file, verbose, ..
         } => {
-            assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert!(!verbose);
         }
         _ => panic!("Expected Status command"),
@@ -2355,12 +2391,12 @@ fn test_status_with_verbose_long() {
 
 #[test]
 fn test_status_with_prd_file_and_verbose() {
-    let cli = Cli::parse_from(["task-mgr", "status", "tasks/prd.json", "-v"]);
+    let cli = Cli::parse_from(["task-mgr", "status", ".task-mgr/tasks/prd.json", "-v"]);
     match cli.command {
         Commands::Status {
             prd_file, verbose, ..
         } => {
-            assert_eq!(prd_file, Some(PathBuf::from("tasks/prd.json")));
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert!(verbose);
         }
         _ => panic!("Expected Status command"),
@@ -2373,7 +2409,7 @@ fn test_status_with_prd_file_and_verbose() {
 
 #[test]
 fn test_batch_with_pattern_and_yes() {
-    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json", "--yes"]);
+    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json", "--yes"]);
     match cli.command {
         Commands::Batch {
             pattern,
@@ -2381,7 +2417,7 @@ fn test_batch_with_pattern_and_yes() {
             yes,
             ..
         } => {
-            assert_eq!(pattern, "tasks/*.json");
+            assert_eq!(pattern, ".task-mgr/tasks/*.json");
             assert!(max_iterations.is_none());
             assert!(yes);
         }
@@ -2391,7 +2427,7 @@ fn test_batch_with_pattern_and_yes() {
 
 #[test]
 fn test_batch_with_max_iterations() {
-    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json", "10", "-y"]);
+    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json", "10", "-y"]);
     match cli.command {
         Commands::Batch {
             pattern,
@@ -2399,7 +2435,7 @@ fn test_batch_with_max_iterations() {
             yes,
             ..
         } => {
-            assert_eq!(pattern, "tasks/*.json");
+            assert_eq!(pattern, ".task-mgr/tasks/*.json");
             assert_eq!(max_iterations, Some(10));
             assert!(yes);
         }
@@ -2410,7 +2446,7 @@ fn test_batch_with_max_iterations() {
 #[test]
 fn test_batch_minimal() {
     // Batch requires pattern positional arg
-    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json"]);
+    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json"]);
     match cli.command {
         Commands::Batch {
             pattern,
@@ -2418,7 +2454,7 @@ fn test_batch_minimal() {
             yes,
             ..
         } => {
-            assert_eq!(pattern, "tasks/*.json");
+            assert_eq!(pattern, ".task-mgr/tasks/*.json");
             assert!(max_iterations.is_none());
             assert!(!yes);
         }
@@ -2437,7 +2473,7 @@ fn test_batch_keep_worktrees_flag() {
     let cli = Cli::parse_from([
         "task-mgr",
         "batch",
-        "tasks/*.json",
+        ".task-mgr/tasks/*.json",
         "--yes",
         "--keep-worktrees",
     ]);
@@ -2456,7 +2492,7 @@ fn test_batch_keep_worktrees_flag() {
 
 #[test]
 fn test_batch_keep_worktrees_defaults_false() {
-    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json"]);
+    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json"]);
     match cli.command {
         Commands::Batch { keep_worktrees, .. } => {
             assert!(!keep_worktrees);
@@ -2467,7 +2503,7 @@ fn test_batch_keep_worktrees_defaults_false() {
 
 #[test]
 fn test_batch_short_yes_flag() {
-    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json", "-y"]);
+    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json", "-y"]);
     match cli.command {
         Commands::Batch { yes, .. } => {
             assert!(yes);
@@ -2521,7 +2557,13 @@ fn test_archive_with_json_format() {
 #[test]
 fn test_loop_with_global_verbose_flag() {
     // Test that the global -v flag doesn't conflict with loop's --verbose
-    let cli = Cli::parse_from(["task-mgr", "-v", "loop", "tasks/prd.json", "--verbose"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "-v",
+        "loop",
+        ".task-mgr/tasks/prd.json",
+        "--verbose",
+    ]);
     assert!(cli.verbose); // global verbose
     match cli.command {
         Commands::Loop { verbose, .. } => {
