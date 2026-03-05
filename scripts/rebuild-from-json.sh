@@ -52,8 +52,8 @@ This is a recovery tool for when the database becomes corrupted or
 out of sync with the canonical JSON file.
 
 Example:
-  $(basename "$0") tasks/my-project.json
-  $(basename "$0") --force tasks/my-project.json
+  $(basename "$0") .task-mgr/tasks/my-project.json
+  $(basename "$0") --force .task-mgr/tasks/my-project.json
 EOF
 }
 

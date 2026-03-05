@@ -3,14 +3,13 @@ target/
 **/*.rs.bk
 
 # Task manager runtime (SQLite databases, locks)
-.task-mgr/
+.task-mgr/*
+!.task-mgr/tasks/
 *.db
+.task-mgr/tasks/progress*.txt
 
 # External project symlinks
 linked_projects/
-
-# Loop progress logs (generated, large)
-tasks/progress*.txt
 
 # IDE/Editor
 .idea/

@@ -5,7 +5,7 @@ Convert a markdown PRD into JSON task list and prompt file for task-mgr loop exe
 ## Usage
 
 ```
-/tasks tasks/prd-{feature}.md
+/tasks .task-mgr/tasks/prd-{feature}.md
 /tasks                          # Will prompt for PRD path
 ```
 
@@ -191,7 +191,7 @@ For Bug Fixes, Enhancements, and Refactors, check if any task modifies existing 
 
 ### Step 5: Create JSON Task File
 
-Generate `tasks/{feature}.json` following this schema:
+Generate `.task-mgr/tasks/{feature}.json` following this schema:
 
 ```json
 {
@@ -298,10 +298,10 @@ Generate `tasks/{feature}.json` following this schema:
 
 ### Step 6: Generate Prompt File
 
-Create `tasks/{feature}-prompt.md` using the template below, replacing placeholders:
+Create `.task-mgr/tasks/{feature}-prompt.md` using the template below, replacing placeholders:
 
 - `{{PROJECT_NAME}}` - Determine from (in order of priority):
-  1. `tasks/project-config.json` field `"project"`
+  1. `.task-mgr/tasks/project-config.json` field `"project"`
   2. `package.json` field `"name"`
   3. `Cargo.toml` field `name` in `[package]`
   4. Current directory name
@@ -373,21 +373,21 @@ These are the files you will read and modify during the loop:
 
 | File                               | Purpose                                                          |
 | ---------------------------------- | ---------------------------------------------------------------- |
-| `tasks/{{FEATURE_NAME}}.json`      | **Task list (PRD)** - Read tasks, mark complete, add new tasks   |
-| `tasks/{{FEATURE_NAME}}-prompt.md` | This prompt file (read-only)                                     |
-| `tasks/progress.txt`               | Progress log - append findings and learnings                     |
-| `tasks/long-term-learnings.md`     | Curated learnings by category (read first)                       |
-| `tasks/learnings.md`               | Raw iteration learnings (auto-appended, needs periodic curation) |
+| `.task-mgr/tasks/{{FEATURE_NAME}}.json`      | **Task list (PRD)** - Read tasks, mark complete, add new tasks   |
+| `.task-mgr/tasks/{{FEATURE_NAME}}-prompt.md` | This prompt file (read-only)                                     |
+| `.task-mgr/tasks/progress.txt`               | Progress log - append findings and learnings                     |
+| `.task-mgr/tasks/long-term-learnings.md`     | Curated learnings by category (read first)                       |
+| `.task-mgr/tasks/learnings.md`               | Raw iteration learnings (auto-appended, needs periodic curation) |
 
-When review tasks add new tasks, they modify `tasks/{{FEATURE_NAME}}.json` directly. The loop re-reads this file each iteration.
+When review tasks add new tasks, they modify `.task-mgr/tasks/{{FEATURE_NAME}}.json` directly. The loop re-reads this file each iteration.
 
 ---
 
 ## Your Task
 
-1. Read the PRD at `tasks/{{FEATURE_NAME}}.json`
-2. Read the progress log at `tasks/progress.txt` (if exists)
-3. Read `tasks/long-term-learnings.md` for curated project patterns (persists across branches)
+1. Read the PRD at `.task-mgr/tasks/{{FEATURE_NAME}}.json`
+2. Read the progress log at `.task-mgr/tasks/progress.txt` (if exists)
+3. Read `.task-mgr/tasks/long-term-learnings.md` for curated project patterns (persists across branches)
 4. Read `CLAUDE.md` for project patterns
 5. Verify you're on the correct branch from PRD `branchName`
 6. **Select the best task** using Smart Task Selection below
@@ -407,7 +407,7 @@ When review tasks add new tasks, they modify `tasks/{{FEATURE_NAME}}.json` direc
 11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
     For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
 12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
-13. Append progress to `tasks/progress.txt` (include approach chosen and any edge cases discovered)
+13. Append progress to `.task-mgr/tasks/progress.txt` (include approach chosen and any edge cases discovered)
 14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 
 ---
@@ -451,7 +451,7 @@ Check if an `ANALYSIS-xxx` task exists for this change:
 
 ### 2. Check Consumer Impact Table
 
-Read `tasks/progress.txt` and find the Consumer Impact Table from the ANALYSIS task:
+Read `.task-mgr/tasks/progress.txt` and find the Consumer Impact Table from the ANALYSIS task:
 
 - If any consumer has `Impact: BREAKS` → the task must be SPLIT
 - If any consumer has `Impact: NEEDS_REVIEW` → verify before implementing
@@ -834,27 +834,27 @@ Integration (55-65) ──► REFACTOR-REVIEW-3 (70) ──► VERIFY (90) ─�
 
 ### Review Task Commits
 
-When a review adds new tasks to `tasks/{{FEATURE_NAME}}.json`:
+When a review adds new tasks to `.task-mgr/tasks/{{FEATURE_NAME}}.json`:
 
 ```bash
 # 1. Edit the JSON file to add new tasks and update milestone dependsOn
 # 2. Commit the JSON changes
-git add tasks/{{FEATURE_NAME}}.json
+git add .task-mgr/tasks/{{FEATURE_NAME}}.json
 git commit -m "chore: [Review ID] - Add refactor tasks"
 
 # 3. Mark review as passes: true in the same JSON file
 # 4. Commit the completion
-git add tasks/{{FEATURE_NAME}}.json
+git add .task-mgr/tasks/{{FEATURE_NAME}}.json
 git commit -m "feat: [Review ID] - Review complete"
 ```
 
-The loop will automatically pick up the new tasks on the next iteration since it re-reads `tasks/{{FEATURE_NAME}}.json` at the start of each iteration.
+The loop will automatically pick up the new tasks on the next iteration since it re-reads `.task-mgr/tasks/{{FEATURE_NAME}}.json` at the start of each iteration.
 
 ---
 
 ## Progress Report Format
 
-APPEND to `tasks/progress.txt`:
+APPEND to `.task-mgr/tasks/progress.txt`:
 
 ```
 ## [Date/Time] - [Story ID]
@@ -870,9 +870,9 @@ APPEND to `tasks/progress.txt`:
 
 **Read curated learnings first:**
 
-- Before starting work, check `tasks/long-term-learnings.md` for project patterns
+- Before starting work, check `.task-mgr/tasks/long-term-learnings.md` for project patterns
 - These are curated, categorized learnings that persist across branches
-- Raw iteration learnings in `tasks/learnings.md` are auto-appended and need periodic curation
+- Raw iteration learnings in `.task-mgr/tasks/learnings.md` are auto-appended and need periodic curation
 
 **Write concise learnings** (1-2 lines each):
 
@@ -1352,8 +1352,8 @@ Report to user:
 
 ```
 Created:
-  - tasks/{feature}.json ({N} tasks)
-  - tasks/{feature}-prompt.md
+  - .task-mgr/tasks/{feature}.json ({N} tasks)
+  - .task-mgr/tasks/{feature}-prompt.md
 
 Task breakdown:
   - {X} implementation tasks
@@ -1362,7 +1362,7 @@ Task breakdown:
 
 Dependency graph validated: OK
 
-To run: task-mgr loop -y tasks/{feature}.json
+To run: task-mgr loop -y .task-mgr/tasks/{feature}.json
 ```
 
 ## Story Sizing Guidelines
@@ -1413,7 +1413,7 @@ For high-effort tasks, consider using `/ralph-loop` to iterate:
 For a PRD about adding date context to prompts:
 
 ```
-tasks/date-context.json:
+.task-mgr/tasks/date-context.json:
   Initial Tests - TDD (priority 1-5):
   - TEST-INIT-001: Initial tests for EnvironmentContext (priority 1)
     └── Likely scenarios: new() populates time fields, format methods return expected strings
