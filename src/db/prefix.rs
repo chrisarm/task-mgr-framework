@@ -11,10 +11,7 @@
 //! would produce an unintended wildcard. `escape_like` handles escaping and
 //! `validate_prefix` provides a front-door guard that rejects dangerous input.
 //!
-//! # Implementation note (FEAT-001)
-//!
-//! Function bodies are `todo!()` stubs. They are replaced in FEAT-001.
-//! Tests in this module are expected to **fail** until that task is complete.
+//! All helper functions are tested in the `tests` module below.
 
 // LIKE escape character used throughout this module.
 const ESCAPE_CHAR: char = '\\';

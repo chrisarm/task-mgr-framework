@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
+use crate::commands::init::generate_prefix;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::schema::key_decisions as key_decisions_db;
@@ -52,7 +53,7 @@ use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
-use crate::loop_engine::status::read_task_prefix_from_prd;
+use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
 use crate::loop_engine::worktree;
@@ -718,8 +719,23 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Read the PRD's taskPrefix BEFORE acquiring the lock so we can use a
     // per-prefix lock file (loop-{prefix}.lock) that allows concurrent loops
     // on different PRDs. Falls back to "loop.lock" when prefix is unknown.
-    let pre_lock_prefix: Option<String> =
-        read_task_prefix_from_prd(&run_config.prd_file).and_then(|p| {
+    // Read both hints in a single file parse.
+    let prd_hints = read_prd_hints(&run_config.prd_file);
+    let pre_lock_branch = prd_hints.branch_name;
+    let pre_lock_prefix: Option<String> = prd_hints
+        .task_prefix
+        .or_else(|| {
+            // taskPrefix absent: derive deterministic prefix from branchName + filename,
+            // using the same formula as PrefixMode::Auto in init so lock files match
+            // across restarts.
+            let filename = run_config
+                .prd_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            Some(generate_prefix(pre_lock_branch.as_deref(), filename))
+        })
+        .and_then(|p| {
             // Only use prefix if it is safe for filenames
             if validate_prefix(&p).is_ok() {
                 Some(p)
@@ -731,14 +747,27 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         Some(p) => format!("loop-{p}.lock"),
         None => "loop.lock".to_string(),
     };
+    let prd_display = run_config.prd_file.display();
     let mut loop_lock = match LockGuard::acquire_named(&run_config.db_dir, &lock_name) {
         Ok(guard) => guard,
         Err(e) => {
             match &pre_lock_prefix {
                 Some(p) => {
-                    eprintln!("Error: another loop is already running for PRD prefix {p}. {e}")
+                    eprintln!(
+                        "Error: cannot start loop for {prd_display} — another loop is already running (prefix={p}). {e}"
+                    );
+                    eprintln!(
+                        "Hint: Each PRD gets its own lock file (loop-{{prefix}}.lock). If the other PRD is still running, wait for it to finish."
+                    );
                 }
-                None => eprintln!("Error: another loop is already running on this database. {e}"),
+                None => {
+                    eprintln!(
+                        "Error: cannot start loop for {prd_display} — another loop is already running on the global lock. {e}"
+                    );
+                    eprintln!(
+                        "Hint: Each PRD uses its own lock file (loop-{{prefix}}.lock). If both PRDs lack taskPrefix, they collide on the global lock."
+                    );
+                }
             }
             return LoopResult {
                 exit_code: 1,
@@ -746,6 +775,19 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             };
         }
     };
+
+    // Step 4.55: Enrich lock file with prefix/branch immediately after acquisition.
+    // pre_lock_prefix and pre_lock_branch are already known from step 4.5.
+    if let Err(e) = loop_lock.write_holder_info_extended(
+        pre_lock_branch.as_deref(),
+        run_config.working_root.to_str(),
+        pre_lock_prefix.as_deref(),
+    ) {
+        eprintln!(
+            "Warning: failed to write extended lock metadata: {} (continuing)",
+            e
+        );
+    }
 
     // Step 4.6: Detect branch change (archive previous PRD if branch switched)
     match branch::detect_branch_change(
@@ -818,13 +860,15 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Warning: failed to run migrations: {} (continuing)", e);
     }
 
-    // Step 6.55: Read task prefix from PRD JSON before initial recovery so the
-    // recovery query can be scoped to this PRD's tasks only.
-    let early_task_prefix: Option<String> = read_task_prefix_from_prd(&run_config.prd_file);
+    // Step 6.55: Reuse the prefix already determined at step 4.5 — no second file read.
+    // pre_lock_prefix holds either the PRD's explicit taskPrefix or the deterministic
+    // auto-generated value (same algorithm as init), so it matches after step 5 runs.
+    let early_task_prefix: Option<String> = pre_lock_prefix.clone();
 
     // Step 6.6: Recover stale in_progress tasks from previous crashed/killed runs.
-    // Safe because we hold the exclusive loop lock — no other loop can be running.
-    // Scoped by prefix so concurrent loops on different PRDs don't reset each other.
+    // Safe because we hold the per-prefix loop lock — no other loop with the same
+    // prefix can be running. (Loops on different prefixes CAN run concurrently.)
+    // Recovery is scoped by prefix so concurrent loops don't reset each other.
     let (recovery_pfx_clause, recovery_pfx_param) = prefix_and(early_task_prefix.as_deref());
     let recovery_sql = format!(
         "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {recovery_pfx_clause}"
@@ -886,18 +930,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let mut paths = paths;
     if let Some(ref pfx) = task_prefix {
         paths.progress_file = paths.tasks_dir.join(format!("progress-{}.txt", pfx));
-    }
-
-    // Step 7.1: Enrich loop lock with branch/worktree/prefix now that metadata is available.
-    if let Err(e) = loop_lock.write_holder_info_extended(
-        branch_name.as_deref(),
-        run_config.working_root.to_str(),
-        task_prefix.as_deref(),
-    ) {
-        eprintln!(
-            "Warning: failed to write extended lock metadata: {} (continuing)",
-            e
-        );
     }
 
     // Step 7.1: Reconcile tasks that have passes: true in PRD but are not done in DB.
@@ -1675,6 +1707,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         tasks_completed,
         total_elapsed,
         &exit_reason,
+        &prd_basename,
     );
 
     LoopResult {
@@ -2001,6 +2034,65 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+
+    // --- pre_lock_prefix fallback tests ---
+
+    #[test]
+    fn test_pre_lock_prefix_fallback_matches_generate_prefix() {
+        use crate::commands::init::generate_prefix;
+        use crate::loop_engine::status_queries::read_branch_name_from_prd;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        // PRD without taskPrefix but with branchName
+        fs::write(
+            &prd_path,
+            r#"{"branchName": "feat/test-branch", "description": "test"}"#,
+        )
+        .unwrap();
+
+        let branch = read_branch_name_from_prd(&prd_path);
+        let filename = prd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let fallback = generate_prefix(branch.as_deref(), filename);
+        // Also verify generate_prefix called directly with the same inputs matches
+        let expected = generate_prefix(Some("feat/test-branch"), "my-prd.json");
+        assert_eq!(fallback, expected);
+    }
+
+    #[test]
+    fn test_pre_lock_prefix_uses_task_prefix_when_present() {
+        use crate::loop_engine::status_queries::read_branch_name_from_prd;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let prd_path = temp_dir.path().join("my-prd.json");
+        fs::write(
+            &prd_path,
+            r#"{"taskPrefix": "abc12345", "branchName": "feat/test"}"#,
+        )
+        .unwrap();
+
+        // When taskPrefix is present, read_task_prefix_from_prd returns it
+        // and or_else branch must not run
+        let task_prefix = crate::loop_engine::status_queries::read_task_prefix_from_prd(&prd_path);
+        assert_eq!(task_prefix, Some("abc12345".to_string()));
+
+        // or_else would only run if task_prefix is None
+        let branch = read_branch_name_from_prd(&prd_path);
+        // verify or_else branch not needed — task_prefix is Some
+        let result = task_prefix.or_else(|| {
+            let b = branch.clone();
+            let filename = prd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            Some(crate::commands::init::generate_prefix(
+                b.as_deref(),
+                filename,
+            ))
+        });
+        assert_eq!(result, Some("abc12345".to_string()));
+    }
 
     // --- IterationContext tests ---
 

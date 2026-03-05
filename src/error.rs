@@ -150,7 +150,7 @@ terminate process with 'kill <PID>' and remove the lockfile.";
 
 /// Default hint for lock errors when no PID is known.
 const LOCK_HINT_NO_PID: &str = "Wait for the other process to finish, or if it's stuck, \
-check for running task-mgr processes and remove the lockfile at .task-mgr/tasks.db.lock.";
+check for running task-mgr processes and remove the lockfile in .task-mgr/.";
 
 /// Default hint for general lock acquisition failures.
 const LOCK_HINT_GENERAL: &str =

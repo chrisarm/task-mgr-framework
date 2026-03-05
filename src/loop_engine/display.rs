@@ -201,6 +201,7 @@ pub fn print_final_banner(
     tasks_completed: u32,
     elapsed_secs: u64,
     exit_reason: &str,
+    prd_file: &str,
 ) {
     eprint!(
         "{}",
@@ -208,7 +209,8 @@ pub fn print_final_banner(
             iterations_completed,
             tasks_completed,
             elapsed_secs,
-            exit_reason
+            exit_reason,
+            prd_file,
         )
     );
 }
@@ -222,6 +224,7 @@ pub fn format_final_banner(
     tasks_completed: u32,
     elapsed_secs: u64,
     exit_reason: &str,
+    prd_file: &str,
 ) -> String {
     const MIN_WIDTH: usize = 48;
     const MAX_WIDTH: usize = 110;
@@ -240,6 +243,7 @@ pub fn format_final_banner(
     let mut lines = vec![String::new(), top, title, sep];
 
     let fields: Vec<(&str, String)> = vec![
+        ("PRD", truncate_display(prd_file, pad - "PRD: ".len())),
         ("Iterations", iterations_completed.to_string()),
         ("Tasks completed", tasks_completed.to_string()),
         ("Total time", format_duration(elapsed_secs)),
@@ -378,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_print_final_banner_no_panic() {
-        print_final_banner(10, 5, 3600, "all tasks complete");
+        print_final_banner(10, 5, 3600, "all tasks complete", "my-prd");
     }
 
     // --- TEST-INIT-003: format_session_banner() with hints ---
