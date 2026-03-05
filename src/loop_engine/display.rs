@@ -204,7 +204,12 @@ pub fn print_final_banner(
 ) {
     eprint!(
         "{}",
-        format_final_banner(iterations_completed, tasks_completed, elapsed_secs, exit_reason)
+        format_final_banner(
+            iterations_completed,
+            tasks_completed,
+            elapsed_secs,
+            exit_reason
+        )
     );
 }
 
@@ -232,17 +237,16 @@ pub fn format_final_banner(
 
     let pad = inner - 2; // content area after "║  " and before "║"
 
-    let mut lines = Vec::new();
-    lines.push(String::new());
-    lines.push(top);
-    lines.push(title);
-    lines.push(sep);
+    let mut lines = vec![String::new(), top, title, sep];
 
     let fields: Vec<(&str, String)> = vec![
         ("Iterations", iterations_completed.to_string()),
         ("Tasks completed", tasks_completed.to_string()),
         ("Total time", format_duration(elapsed_secs)),
-        ("Exit reason", truncate_display(exit_reason, pad - "Exit reason: ".len())),
+        (
+            "Exit reason",
+            truncate_display(exit_reason, pad - "Exit reason: ".len()),
+        ),
     ];
     for (label, value) in &fields {
         let content = format!("{}: {}", label, value);

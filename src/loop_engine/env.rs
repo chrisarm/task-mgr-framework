@@ -363,12 +363,16 @@ pub fn resolve_paths(
         }
     };
 
-    // Resolve progress file — use prefix to isolate per-PRD progress when provided
+    // Resolve progress file — derive from PRD location so it lives alongside the PRD,
+    // use prefix to isolate per-PRD progress when provided
     let progress_filename = match prefix {
         Some(p) => format!("progress-{}.txt", p),
         None => "progress.txt".to_string(),
     };
-    let progress_file = project_dir.join("tasks").join(progress_filename);
+    let progress_file = prd_absolute
+        .parent()
+        .unwrap_or(project_dir)
+        .join(progress_filename);
 
     // Derive tasks directory from PRD location
     let tasks_dir = prd_absolute.parent().unwrap_or(project_dir).to_path_buf();
@@ -383,15 +387,15 @@ pub fn resolve_paths(
 
 /// Ensure required directories exist, creating them if necessary.
 ///
-/// Creates:
-/// - `tasks/` directory
-/// - `tasks/archive/` directory
+/// `db_dir` is the database directory (e.g. `.task-mgr/`). Creates:
+/// - `db_dir/tasks/` directory
+/// - `db_dir/tasks/archive/` directory
 ///
 /// # Errors
 ///
 /// Returns an error if directory creation fails.
-pub fn ensure_directories(project_dir: &Path) -> TaskMgrResult<()> {
-    let tasks_dir = project_dir.join("tasks");
+pub fn ensure_directories(db_dir: &Path) -> TaskMgrResult<()> {
+    let tasks_dir = db_dir.join("tasks");
     let archive_dir = tasks_dir.join("archive");
 
     if !tasks_dir.exists() {
@@ -588,6 +592,42 @@ mod tests {
             .progress_file
             .to_string_lossy()
             .ends_with("progress-ABC.txt"));
+    }
+
+    #[test]
+    fn test_resolve_paths_progress_file_in_prd_dir() {
+        // PRD at db_dir/tasks/prd.json → progress at db_dir/tasks/progress.txt
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let db_dir = tmp.path().join(".task-mgr");
+        let tasks_dir = db_dir.join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+        let prd = tasks_dir.join("prd.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let resolved = resolve_paths(&prd, None, tmp.path(), None).expect("resolve paths");
+        assert_eq!(
+            resolved.progress_file,
+            tasks_dir.canonicalize().unwrap().join("progress.txt"),
+            "progress file should be in same dir as PRD"
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_progress_file_with_prefix_in_prd_dir() {
+        // PRD at db_dir/tasks/prd.json, prefix P1 → progress at db_dir/tasks/progress-P1.txt
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let db_dir = tmp.path().join(".task-mgr");
+        let tasks_dir = db_dir.join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+        let prd = tasks_dir.join("prd.json");
+        fs::write(&prd, "{}").expect("write prd");
+
+        let resolved = resolve_paths(&prd, None, tmp.path(), Some("P1")).expect("resolve paths");
+        assert_eq!(
+            resolved.progress_file,
+            tasks_dir.canonicalize().unwrap().join("progress-P1.txt"),
+            "progress file with prefix should be in same dir as PRD"
+        );
     }
 
     // --- ensure_directories ---
@@ -1011,44 +1051,48 @@ mod tests {
 
     #[test]
     fn test_resolve_paths_progress_file_under_project_root() {
-        // progress.txt should be resolved relative to project_root (project_dir param)
+        // progress.txt should be in the same dir as the PRD (derived from prd_absolute.parent())
         let project_root = tempfile::tempdir().expect("create project root");
         let prd = project_root.path().join("test.json");
         fs::write(&prd, "{}").expect("write prd");
 
         let resolved = resolve_paths(&prd, None, project_root.path(), None).expect("resolve paths");
 
-        // progress.txt should be under project_root/tasks/progress.txt
-        let expected_progress = project_root.path().join("tasks").join("progress.txt");
+        // progress.txt should be alongside the PRD (project_root/progress.txt, not project_root/tasks/)
+        let expected_progress = project_root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("progress.txt");
         assert_eq!(
             resolved.progress_file, expected_progress,
-            "progress.txt should be under project_root/tasks/"
+            "progress.txt should be in same dir as PRD"
         );
     }
 
     #[test]
-    fn test_ensure_directories_creates_tasks_under_project_root_not_db_dir() {
-        // When project_root is passed, tasks/ should be created under project_root
+    fn test_ensure_directories_creates_tasks_under_db_dir_not_project_root() {
+        // ensure_directories(db_dir) should create tasks/ under db_dir, NOT project_root
         let project_root = tempfile::tempdir().expect("create project root");
         let db_dir = tempfile::tempdir().expect("create db dir");
 
-        // Call with project_root
-        ensure_directories(project_root.path()).expect("ensure directories under project_root");
+        // Call with db_dir
+        ensure_directories(db_dir.path()).expect("ensure directories under db_dir");
 
-        // Verify tasks/ exists under project_root
+        // Verify tasks/ exists under db_dir
         assert!(
-            project_root.path().join("tasks").exists(),
-            "tasks/ should exist under project_root"
+            db_dir.path().join("tasks").exists(),
+            "tasks/ should exist under db_dir"
         );
         assert!(
-            project_root.path().join("tasks").join("archive").exists(),
-            "tasks/archive/ should exist under project_root"
+            db_dir.path().join("tasks").join("archive").exists(),
+            "tasks/archive/ should exist under db_dir"
         );
 
-        // Verify tasks/ was NOT created under db_dir
+        // Verify tasks/ was NOT created under project_root
         assert!(
-            !db_dir.path().join("tasks").exists(),
-            "tasks/ should NOT exist under db_dir (was not the target)"
+            !project_root.path().join("tasks").exists(),
+            "tasks/ must NOT be created under project_root"
         );
     }
 
