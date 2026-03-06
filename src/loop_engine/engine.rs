@@ -31,7 +31,7 @@ use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
 use crate::loop_engine::calibrate;
 use crate::loop_engine::claude;
-use crate::loop_engine::config::{self, IterationOutcome, LoopConfig};
+use crate::loop_engine::config::{self, IterationOutcome, LoopConfig, PermissionMode};
 use crate::loop_engine::crash::CrashTracker;
 use crate::loop_engine::deadline;
 use crate::loop_engine::detection;
@@ -62,6 +62,15 @@ use crate::TaskMgrResult;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
 const MAX_CONSECUTIVE_REORDERS: u32 = 2;
+
+/// Deprecation hint displayed at loop start when the claude CLI supports auto mode
+/// but the user is not yet using it. Emitted to stderr once per session.
+pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
+    "\x1b[33m[hint]\x1b[0m ",
+    "The current permission model will be deprecated. ",
+    "Set LOOP_ENABLE_AUTO_MODE=true to switch to auto mode. ",
+    "Your current settings continue to work in the meantime."
+);
 
 /// Parameters for usage API monitoring within an iteration.
 #[derive(Debug, Clone)]
@@ -124,6 +133,8 @@ pub struct IterationParams<'a> {
     pub task_prefix: Option<&'a str>,
     /// Default model from PRD metadata (threaded from run_loop via PrdMetadata).
     pub default_model: Option<&'a str>,
+    /// Permission mode for Claude subprocess invocation.
+    pub permission_mode: &'a PermissionMode,
 }
 
 /// Result of a single iteration.
@@ -464,6 +475,7 @@ pub fn run_iteration(
         effective_model.as_deref(),
         Some(timeout_config),
         true,
+        params.permission_mode,
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
@@ -792,6 +804,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 4.6: Detect branch change (archive previous PRD if branch switched)
     match branch::detect_branch_change(
         &run_config.source_root,
+        &run_config.db_dir,
         &paths.tasks_dir,
         run_config.config.yes_mode,
     ) {
@@ -1190,7 +1203,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         None
     };
 
-    // Step 15: Print session banner
+    // Step 15: Resolve permission mode (needed for banner hint below)
+    let permission_mode = config::permission_mode_from_env();
+
+    // Step 15.5: Print session banner
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");
     let db_path = run_config.db_dir.join("tasks.db");
     let banner_hints = display::SessionBannerHints {
@@ -1205,6 +1221,17 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         run_config.config.hours,
         Some(&banner_hints),
     );
+
+    // Step 15.6: Print auto-mode availability hint if applicable.
+    // Fires when LOOP_AUTO_MODE_AVAILABLE=true and user is NOT already in Auto mode.
+    // Informs the user that the current permission model will be deprecated.
+    if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
+        if config::parse_bool_value(&val) == Some(true)
+            && permission_mode != config::PermissionMode::Auto
+        {
+            eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
+        }
+    }
 
     // Step 16: Build usage params
     let usage_params = UsageParams {
@@ -1280,6 +1307,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             prd_path: Some(paths.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
+            permission_mode: &permission_mode,
         };
 
         let mut result = match run_iteration(&mut ctx, &iteration_params) {
@@ -2911,5 +2939,114 @@ mod tests {
                 exit_code
             );
         }
+    }
+
+    // --- Auto-mode hint condition tests ---
+    // Tests verify the conditional logic that controls when the hint fires.
+    // Uses HINT_ENV_MUTEX to serialise env-var mutations across parallel tests.
+
+    use std::sync::Mutex;
+    static HINT_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Mirrors the inline hint condition in run_loop() so the logic can be unit-tested.
+    fn hint_should_fire(mode: &config::PermissionMode) -> bool {
+        if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
+            config::parse_bool_value(&val) == Some(true) && *mode != config::PermissionMode::Auto
+        } else {
+            false
+        }
+    }
+
+    use super::AUTO_MODE_DEPRECATION_HINT as HINT_MSG;
+
+    #[test]
+    fn test_hint_fires_when_available_true_and_mode_scoped() {
+        let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let mode = config::PermissionMode::text_only();
+        let fires = hint_should_fire(&mode);
+        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        assert!(
+            fires,
+            "Hint should fire when available=true and mode=Scoped"
+        );
+    }
+
+    #[test]
+    fn test_hint_fires_when_available_true_and_mode_dangerous() {
+        let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let mode = config::PermissionMode::Dangerous;
+        let fires = hint_should_fire(&mode);
+        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        assert!(
+            fires,
+            "Hint should fire when available=true and mode=Dangerous"
+        );
+    }
+
+    #[test]
+    fn test_hint_does_not_fire_when_available_unset() {
+        let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        let mode = config::PermissionMode::text_only();
+        assert!(
+            !hint_should_fire(&mode),
+            "Hint must not fire when env var is unset"
+        );
+    }
+
+    #[test]
+    fn test_hint_does_not_fire_when_available_false() {
+        let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "false");
+        let mode = config::PermissionMode::text_only();
+        let fires = hint_should_fire(&mode);
+        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        assert!(!fires, "Hint must not fire when available=false");
+    }
+
+    #[test]
+    fn test_hint_does_not_fire_when_mode_is_auto() {
+        let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let mode = config::PermissionMode::Auto;
+        let fires = hint_should_fire(&mode);
+        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        assert!(!fires, "Hint must not fire when mode is already Auto");
+    }
+
+    #[test]
+    fn test_hint_message_contains_enable_auto_mode_env_var() {
+        assert!(
+            HINT_MSG.contains("LOOP_ENABLE_AUTO_MODE=true"),
+            "Hint must mention LOOP_ENABLE_AUTO_MODE=true env var"
+        );
+    }
+
+    #[test]
+    fn test_hint_message_uses_yellow_ansi_prefix() {
+        // Yellow ANSI escape: \x1b[33m
+        assert!(
+            HINT_MSG.contains("\x1b[33m"),
+            "Hint must use yellow ANSI color code \\x1b[33m"
+        );
+        assert!(HINT_MSG.contains("[hint]"), "Hint must have [hint] prefix");
+    }
+
+    #[test]
+    fn test_hint_message_says_deprecated() {
+        assert!(
+            HINT_MSG.contains("will be deprecated"),
+            "Hint must mention that the permission model will be deprecated"
+        );
+    }
+
+    #[test]
+    fn test_hint_message_says_current_settings_continue() {
+        assert!(
+            HINT_MSG.contains("current settings continue"),
+            "Hint must reassure users that their current settings continue to work"
+        );
     }
 }

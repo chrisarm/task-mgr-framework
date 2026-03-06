@@ -131,7 +131,7 @@ fn parse_env<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// Accepts "true", "1", "yes" (case-insensitive) as true.
 /// Accepts "false", "0", "no" (case-insensitive) as false.
 /// Returns `None` if unrecognized.
-fn parse_bool_value(value: &str) -> Option<bool> {
+pub(crate) fn parse_bool_value(value: &str) -> Option<bool> {
     match value.to_lowercase().as_str() {
         "true" | "1" | "yes" => Some(true),
         "false" | "0" | "no" => Some(false),
@@ -143,6 +143,73 @@ fn parse_bool_value(value: &str) -> Option<bool> {
 /// Returns `None` if the var is missing or unrecognized.
 fn parse_env_bool(key: &str) -> Option<bool> {
     std::env::var(key).ok().and_then(|v| parse_bool_value(&v))
+}
+
+/// Tools allowed for the coding agent in scoped permission mode.
+///
+/// Covers cargo, git, task-mgr CLI, and file operations needed for autonomous
+/// coding tasks. Derived from analysis of scripts/prompt.md.
+pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash(cargo *),Bash(git *),Bash(task-mgr *),Bash(mkdir *),Bash(ls *),Bash(wc *),Bash(head *),Bash(tail *),Bash(cat *),Glob,Grep";
+
+/// Permission mode for Claude subprocess invocation.
+///
+/// Determines which permission flags are passed to `claude` when spawning a
+/// subprocess. `Scoped` is the secure default; `Dangerous` is the legacy
+/// escape hatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Legacy mode: passes `--dangerously-skip-permissions`.
+    /// Enabled by `LOOP_PERMISSION_MODE=dangerous`.
+    Dangerous,
+    /// Scoped mode: passes `--permission-mode dontAsk [--allowedTools <tools>]`.
+    /// Default when no env vars are set.
+    /// `allowed_tools`: when `Some`, passed as `--allowedTools`; when `None`, omitted.
+    Scoped { allowed_tools: Option<String> },
+    /// Auto mode: passes `--enable-auto-mode`.
+    /// Enabled by `LOOP_ENABLE_AUTO_MODE=true`.
+    Auto,
+}
+
+impl PermissionMode {
+    /// Scoped mode with no tool restrictions, for text-only analysis tasks
+    /// (learning extraction, enrichment, deduplication).
+    pub fn text_only() -> Self {
+        Self::Scoped {
+            allowed_tools: None,
+        }
+    }
+}
+
+/// Resolve the permission mode from environment variables.
+///
+/// Resolution order (highest to lowest priority):
+/// 1. `LOOP_PERMISSION_MODE=dangerous` → `Dangerous`
+/// 2. `LOOP_ENABLE_AUTO_MODE=true` → `Auto`
+/// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped { allowed_tools: Some(tools) }`
+/// 4. Default → `Scoped { allowed_tools: Some(CODING_ALLOWED_TOOLS) }`
+///
+/// Unrecognized `LOOP_PERMISSION_MODE` values fall through to the default.
+pub fn permission_mode_from_env() -> PermissionMode {
+    // 1. Dangerous takes absolute precedence.
+    if let Ok(mode) = std::env::var("LOOP_PERMISSION_MODE") {
+        if mode.to_lowercase() == "dangerous" {
+            return PermissionMode::Dangerous;
+        }
+        // Unrecognized values fall through to the default below.
+    }
+
+    // 2. Auto mode — only reached when LOOP_PERMISSION_MODE is not "dangerous".
+    if parse_env_bool("LOOP_ENABLE_AUTO_MODE") == Some(true) {
+        return PermissionMode::Auto;
+    }
+
+    // 3. Scoped default — check for custom tool override.
+    let allowed_tools = std::env::var("LOOP_ALLOWED_TOOLS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(CODING_ALLOWED_TOOLS.to_string()));
+
+    PermissionMode::Scoped { allowed_tools }
 }
 
 /// Types of crashes detected from Claude subprocess exit codes.
@@ -560,6 +627,236 @@ mod tests {
     #[test]
     fn test_parse_env_bool_missing_var_returns_none() {
         assert!(parse_env_bool("TASKMGR_NONEXISTENT_BOOL_49817").is_none());
+    }
+
+    // --- PermissionMode enum ---
+
+    #[test]
+    fn test_permission_mode_dangerous_variant() {
+        let mode = PermissionMode::Dangerous;
+        assert_eq!(mode, PermissionMode::Dangerous);
+    }
+
+    #[test]
+    fn test_permission_mode_auto_variant() {
+        let mode = PermissionMode::Auto;
+        assert_eq!(mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn test_permission_mode_scoped_none() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: None,
+        };
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_scoped_some() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read,Edit".to_string()),
+        };
+        if let PermissionMode::Scoped { allowed_tools } = &mode {
+            assert_eq!(allowed_tools.as_deref(), Some("Read,Edit"));
+        } else {
+            panic!("Expected Scoped variant");
+        }
+    }
+
+    #[test]
+    fn test_permission_mode_variants_distinct() {
+        assert_ne!(PermissionMode::Dangerous, PermissionMode::Auto);
+        assert_ne!(
+            PermissionMode::Dangerous,
+            PermissionMode::Scoped {
+                allowed_tools: None
+            }
+        );
+        assert_ne!(
+            PermissionMode::Auto,
+            PermissionMode::Scoped {
+                allowed_tools: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_clone() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read".to_string()),
+        };
+        assert_eq!(mode.clone(), mode);
+    }
+
+    // --- CODING_ALLOWED_TOOLS constant ---
+
+    #[test]
+    fn test_coding_allowed_tools_contains_required_tools() {
+        let tools = CODING_ALLOWED_TOOLS;
+        for required in &[
+            "Read",
+            "Edit",
+            "Write",
+            "Bash(cargo *)",
+            "Bash(git *)",
+            "Bash(task-mgr *)",
+            "Bash(mkdir *)",
+            "Bash(ls *)",
+            "Bash(wc *)",
+            "Bash(head *)",
+            "Bash(tail *)",
+            "Bash(cat *)",
+            "Glob",
+            "Grep",
+        ] {
+            assert!(
+                tools.contains(required),
+                "CODING_ALLOWED_TOOLS missing '{required}'"
+            );
+        }
+    }
+
+    // --- permission_mode_from_env() ---
+    // These tests mutate environment variables and must be serialised.
+
+    use std::sync::Mutex;
+
+    static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_permission_mode_from_env_default_is_scoped_with_coding_tools() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let mode = permission_mode_from_env();
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_from_env_dangerous_mode() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        assert_eq!(mode, PermissionMode::Dangerous);
+    }
+
+    #[test]
+    fn test_permission_mode_from_env_auto_mode() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        assert_eq!(mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn test_permission_mode_from_env_custom_allowed_tools() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some("Read,Bash".to_string())
+            }
+        );
+    }
+
+    /// Known-bad guard: if auto is checked before dangerous, setting both would
+    /// return Auto instead of Dangerous. Verify Dangerous wins.
+    #[test]
+    fn test_permission_mode_from_env_dangerous_beats_auto() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
+        std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        assert_eq!(mode, PermissionMode::Dangerous);
+    }
+
+    #[test]
+    fn test_permission_mode_from_env_unknown_mode_falls_through_to_scoped() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_PERMISSION_MODE", "unknown");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_coding_tools() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::set_var("LOOP_ALLOWED_TOOLS", "");
+
+        let mode = permission_mode_from_env();
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string())
+            }
+        );
+    }
+
+    // Negative: PermissionMode is NOT a field on LoopConfig — verified at compile time.
+    // The LoopConfig struct has no permission_mode field; this test exists to document
+    // the negative acceptance criterion.
+    #[test]
+    fn test_loop_config_has_no_permission_mode_field() {
+        let config = LoopConfig::default();
+        // If LoopConfig had a permission_mode field, this destructuring would need it.
+        let LoopConfig {
+            max_iterations: _,
+            usage_threshold: _,
+            max_crashes: _,
+            iteration_delay_secs: _,
+            usage_fallback_wait: _,
+            usage_check_enabled: _,
+            yes_mode: _,
+            hours: _,
+            verbose: _,
+            use_worktrees: _,
+            git_scan_depth: _,
+            external_git_scan_depth: _,
+            cleanup_worktree: _,
+        } = config;
+        // Exhaustive destructure compiles only if LoopConfig has exactly these fields.
     }
 
     // --- Clone behavior ---

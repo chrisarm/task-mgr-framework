@@ -312,6 +312,7 @@ mod tests {
             None,
             Some(timeout),
             false,
+            &crate::loop_engine::config::PermissionMode::Dangerous,
         );
         let elapsed = start.elapsed();
 
@@ -366,6 +367,7 @@ mod tests {
             None,
             Some(timeout),
             false,
+            &crate::loop_engine::config::PermissionMode::Dangerous,
         );
         let elapsed = start.elapsed();
 

@@ -386,10 +386,7 @@ fn test_autogen_prefix_consistent_between_engine_and_init() {
         "PRD should have branchName"
     );
 
-    let filename = prd_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap();
+    let filename = prd_path.file_name().and_then(|f| f.to_str()).unwrap();
     let engine_prefix = generate_prefix(hints.branch_name.as_deref(), filename);
     assert!(
         validate_prefix(&engine_prefix).is_ok(),
@@ -471,10 +468,7 @@ fn test_autogen_prefix_consistent_without_branch_name() {
     assert!(hints.task_prefix.is_none());
     assert!(hints.branch_name.is_none());
 
-    let filename = prd_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap();
+    let filename = prd_path.file_name().and_then(|f| f.to_str()).unwrap();
     let engine_prefix = generate_prefix(None, filename);
     assert!(
         validate_prefix(&engine_prefix).is_ok(),
