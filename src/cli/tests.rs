@@ -2412,12 +2412,12 @@ fn test_batch_with_pattern_and_yes() {
     let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json", "--yes"]);
     match cli.command {
         Commands::Batch {
-            pattern,
+            patterns,
             max_iterations,
             yes,
             ..
         } => {
-            assert_eq!(pattern, ".task-mgr/tasks/*.json");
+            assert_eq!(patterns, vec![".task-mgr/tasks/*.json"]);
             assert!(max_iterations.is_none());
             assert!(yes);
         }
@@ -2427,15 +2427,22 @@ fn test_batch_with_pattern_and_yes() {
 
 #[test]
 fn test_batch_with_max_iterations() {
-    let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json", "10", "-y"]);
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        ".task-mgr/tasks/*.json",
+        "-n",
+        "10",
+        "-y",
+    ]);
     match cli.command {
         Commands::Batch {
-            pattern,
+            patterns,
             max_iterations,
             yes,
             ..
         } => {
-            assert_eq!(pattern, ".task-mgr/tasks/*.json");
+            assert_eq!(patterns, vec![".task-mgr/tasks/*.json"]);
             assert_eq!(max_iterations, Some(10));
             assert!(yes);
         }
@@ -2444,17 +2451,37 @@ fn test_batch_with_max_iterations() {
 }
 
 #[test]
+fn test_batch_multiple_patterns() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        "tasks/rag-01.json",
+        "tasks/rag-02.json",
+        "--yes",
+    ]);
+    match cli.command {
+        Commands::Batch {
+            patterns, yes, ..
+        } => {
+            assert_eq!(patterns, vec!["tasks/rag-01.json", "tasks/rag-02.json"]);
+            assert!(yes);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
 fn test_batch_minimal() {
-    // Batch requires pattern positional arg
+    // Batch requires at least one pattern positional arg
     let cli = Cli::parse_from(["task-mgr", "batch", ".task-mgr/tasks/*.json"]);
     match cli.command {
         Commands::Batch {
-            pattern,
+            patterns,
             max_iterations,
             yes,
             ..
         } => {
-            assert_eq!(pattern, ".task-mgr/tasks/*.json");
+            assert_eq!(patterns, vec![".task-mgr/tasks/*.json"]);
             assert!(max_iterations.is_none());
             assert!(!yes);
         }
@@ -2520,8 +2547,9 @@ fn test_batch_short_yes_flag() {
 fn test_archive_defaults() {
     let cli = Cli::parse_from(["task-mgr", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run } => {
+        Commands::Archive { dry_run, all } => {
             assert!(!dry_run);
+            assert!(!all);
         }
         _ => panic!("Expected Archive command"),
     }
@@ -2531,8 +2559,21 @@ fn test_archive_defaults() {
 fn test_archive_with_dry_run() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--dry-run"]);
     match cli.command {
-        Commands::Archive { dry_run } => {
+        Commands::Archive { dry_run, all } => {
             assert!(dry_run);
+            assert!(!all);
+        }
+        _ => panic!("Expected Archive command"),
+    }
+}
+
+#[test]
+fn test_archive_with_all_flag() {
+    let cli = Cli::parse_from(["task-mgr", "archive", "--all"]);
+    match cli.command {
+        Commands::Archive { dry_run, all } => {
+            assert!(!dry_run);
+            assert!(all);
         }
         _ => panic!("Expected Archive command"),
     }
@@ -2542,8 +2583,9 @@ fn test_archive_with_dry_run() {
 fn test_archive_with_json_format() {
     let cli = Cli::parse_from(["task-mgr", "--format", "json", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run } => {
+        Commands::Archive { dry_run, all } => {
             assert!(!dry_run);
+            assert!(!all);
         }
         _ => panic!("Expected Archive command"),
     }
