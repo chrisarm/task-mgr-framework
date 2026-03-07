@@ -267,13 +267,16 @@ Use `--no-worktree` to revert to the old behavior of checking out branches direc
 task-mgr is designed around a 5-phase iterative workflow that takes you from idea to working code:
 
 ```
+  Full workflow (large tasks):
   ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
   │  1. Plan │───▶│  2. PRD  │───▶│ 3. Tasks │───▶│ 4. Build │───▶│ 5. Learn │
-  │          │    │          │    │          │    │          │    │          │
+  │          │    │  /prd    │    │  /tasks  │    │          │    │          │
   │  Explore │    │  Define  │    │  Break   │    │  Execute │    │  Capture │
   │  & Design│    │  Quality │    │  Down &  │    │  Loop or │    │  Lessons │
   └──────────┘    └──────────┘    │  Sequence│    │  Batch   │    └──────────┘
-                                  └──────────┘    └──────────┘
+       │                          └──────────┘    └──────────┘
+       │          Shortcut (small-medium tasks):        ▲
+       └─────────▶ /plan-tasks ─────────────────────────┘
 ```
 
 ### Phase 1: Plan
@@ -302,6 +305,26 @@ This produces:
 - `tasks/batch-mode.json` — Ordered task list with dependencies, quality dimensions, and edge cases per task
 - `tasks/batch-mode-prompt.md` — System prompt for the autonomous agent with codebase context
 
+### Shortcut: `/plan-tasks` (Skip PRD for Small-Medium Work)
+
+For tasks that can be accomplished in 8-10 tasks (1-7 files, clear requirements), `/plan-tasks` combines planning and task generation into one step — skipping the PRD:
+
+```bash
+/plan-tasks "Update archive command to iterate PRDs by prefix and archive completed ones independently"
+```
+
+This explores the codebase, asks clarifying questions to expose hidden assumptions, then directly produces the task JSON and prompt file. Each task includes both positive requirements (what to do) and negative requirements (what not to do), with known-bad discriminators to catch plausible-but-wrong implementations.
+
+Use `/plan-tasks` when:
+- Requirements are clear and scope is bounded
+- A reference implementation or existing pattern exists to follow
+- The change is a refactor, enhancement, or bug fix to existing code
+
+Use `/prd` + `/tasks` when:
+- The task is large (7+ files, architectural decisions, multiple phases)
+- Scope is uncertain and needs crystallizing
+- Multiple stakeholders need to review requirements
+
 ### Phase 4: Build
 
 Run the iterative autonomous loop:
@@ -322,7 +345,7 @@ Learnings accumulate automatically during loop execution. The agent captures wha
 
 ### Setting Up the Skills
 
-The `/prd` and `/tasks` skills are included in this repo at `.claude/commands/`. To make them available in Claude Code:
+The `/prd`, `/tasks`, and `/plan-tasks` skills are included in this repo at `.claude/commands/`. To make them available in Claude Code:
 
 **Option A: Use the repo copies directly** — Claude Code automatically loads skills from `.claude/commands/` in the project root. Just clone the repo and they're available.
 
@@ -331,6 +354,7 @@ The `/prd` and `/tasks` skills are included in this repo at `.claude/commands/`.
 ```bash
 ln -s "$(pwd)/.claude/commands/prd.md" ~/.claude/commands/prd.md
 ln -s "$(pwd)/.claude/commands/tasks.md" ~/.claude/commands/tasks.md
+ln -s "$(pwd)/.claude/commands/plan-tasks.md" ~/.claude/commands/plan-tasks.md
 ```
 
 ## Shell Integration
