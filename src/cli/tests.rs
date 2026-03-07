@@ -2547,9 +2547,10 @@ fn test_batch_short_yes_flag() {
 fn test_archive_defaults() {
     let cli = Cli::parse_from(["task-mgr", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run, all } => {
+        Commands::Archive { dry_run, all, branch } => {
             assert!(!dry_run);
             assert!(!all);
+            assert!(branch.is_none());
         }
         _ => panic!("Expected Archive command"),
     }
@@ -2559,9 +2560,10 @@ fn test_archive_defaults() {
 fn test_archive_with_dry_run() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--dry-run"]);
     match cli.command {
-        Commands::Archive { dry_run, all } => {
+        Commands::Archive { dry_run, all, branch } => {
             assert!(dry_run);
             assert!(!all);
+            assert!(branch.is_none());
         }
         _ => panic!("Expected Archive command"),
     }
@@ -2571,9 +2573,10 @@ fn test_archive_with_dry_run() {
 fn test_archive_with_all_flag() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--all"]);
     match cli.command {
-        Commands::Archive { dry_run, all } => {
+        Commands::Archive { dry_run, all, branch } => {
             assert!(!dry_run);
             assert!(all);
+            assert!(branch.is_none());
         }
         _ => panic!("Expected Archive command"),
     }
@@ -2583,13 +2586,33 @@ fn test_archive_with_all_flag() {
 fn test_archive_with_json_format() {
     let cli = Cli::parse_from(["task-mgr", "--format", "json", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run, all } => {
+        Commands::Archive { dry_run, all, branch } => {
             assert!(!dry_run);
             assert!(!all);
+            assert!(branch.is_none());
         }
         _ => panic!("Expected Archive command"),
     }
     assert_eq!(cli.format, OutputFormat::Json);
+}
+
+#[test]
+fn test_archive_with_branch_flag() {
+    let cli = Cli::parse_from(["task-mgr", "archive", "--branch", "feat/x"]);
+    match cli.command {
+        Commands::Archive { dry_run, all, branch } => {
+            assert!(!dry_run);
+            assert!(!all);
+            assert_eq!(branch, Some("feat/x".to_string()));
+        }
+        _ => panic!("Expected Archive command"),
+    }
+}
+
+#[test]
+fn test_archive_branch_conflicts_with_all() {
+    let result = Cli::try_parse_from(["task-mgr", "archive", "--branch", "feat/x", "--all"]);
+    assert!(result.is_err(), "--branch and --all must conflict");
 }
 
 // =============================================================================

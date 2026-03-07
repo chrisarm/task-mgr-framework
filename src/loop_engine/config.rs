@@ -149,6 +149,13 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 ///
 /// Covers cargo, git, task-mgr CLI, and file operations needed for autonomous
 /// coding tasks. Derived from analysis of scripts/prompt.md.
+///
+/// # Security note
+///
+/// Scoped mode controls Claude CLI permission grants, not a sandbox.
+/// Tools like `Bash(cat *)` and `Bash(git *)` permit arbitrary file
+/// reads and remote pushes respectively. For stricter isolation, use a
+/// container or VM.
 pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash(cargo *),Bash(git *),Bash(task-mgr *),Bash(mkdir *),Bash(ls *),Bash(wc *),Bash(head *),Bash(tail *),Bash(cat *),Glob,Grep";
 
 /// Permission mode for Claude subprocess invocation.
@@ -156,6 +163,15 @@ pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash(cargo *),Bash(git *
 /// Determines which permission flags are passed to `claude` when spawning a
 /// subprocess. `Scoped` is the secure default; `Dangerous` is the legacy
 /// escape hatch.
+///
+/// # Call sites
+///
+/// | Caller                           | Mode                                      |
+/// |----------------------------------|-------------------------------------------|
+/// | `engine::run_loop`               | `permission_mode_from_env()` (env vars)   |
+/// | `curate::enrich`                 | `text_only()` — no tool access needed     |
+/// | `curate::dedup`                  | `text_only()` — no tool access needed     |
+/// | `learnings::ingestion`           | `text_only()` — no tool access needed     |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Legacy mode: passes `--dangerously-skip-permissions`.
@@ -195,7 +211,11 @@ pub fn permission_mode_from_env() -> PermissionMode {
         if mode.to_lowercase() == "dangerous" {
             return PermissionMode::Dangerous;
         }
-        // Unrecognized values fall through to the default below.
+        eprintln!(
+            "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
+             falling back to scoped mode (safe default). Valid values: 'dangerous'.",
+            mode
+        );
     }
 
     // 2. Auto mode — only reached when LOOP_PERMISSION_MODE is not "dangerous".

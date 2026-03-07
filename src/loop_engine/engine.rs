@@ -67,7 +67,7 @@ const MAX_CONSECUTIVE_REORDERS: u32 = 2;
 /// but the user is not yet using it. Emitted to stderr once per session.
 pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
     "\x1b[33m[hint]\x1b[0m ",
-    "The current permission model will be deprecated. ",
+    "The current permission model will be deprecated in a future release. ",
     "Set LOOP_ENABLE_AUTO_MODE=true to switch to auto mode. ",
     "Your current settings continue to work in the meantime."
 );

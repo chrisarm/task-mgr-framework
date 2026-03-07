@@ -777,6 +777,10 @@ EXAMPLES:
         /// Archive completed PRDs from all branches, not just the current one
         #[arg(long)]
         all: bool,
+
+        /// Archive completed PRDs for a specific branch
+        #[arg(long, conflicts_with = "all")]
+        branch: Option<String>,
     },
 
     /// Extract learnings from a Claude output file using LLM analysis

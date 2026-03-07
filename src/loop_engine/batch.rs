@@ -211,8 +211,9 @@ pub async fn run_batch(
         match expand_glob(pattern) {
             Ok(files) => {
                 for file in files {
-                    if seen.insert(file.clone()) {
-                        prd_files.push(file);
+                    let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+                    if seen.insert(canonical.clone()) {
+                        prd_files.push(canonical);
                     }
                 }
             }
@@ -240,14 +241,14 @@ pub async fn run_batch(
 
     // Sort after collecting all files for consistent ordering
     prd_files.sort();
-    // Re-deduplicate after sort (paths may canonicalize differently)
     prd_files.dedup();
 
-    eprintln!(
-        "Batch mode: found {} PRD file(s) matching {} pattern(s)",
-        prd_files.len(),
-        patterns.len()
-    );
+    let pattern_display = if patterns.len() <= 3 {
+        patterns.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ")
+    } else {
+        format!("{} pattern(s)", patterns.len())
+    };
+    eprintln!("Batch mode: found {} PRD file(s) matching {}", prd_files.len(), pattern_display);
 
     // Step 2: Validate all prompt files exist
     let pairs = match validate_prompt_files(&prd_files) {

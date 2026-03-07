@@ -707,9 +707,11 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Archive { dry_run, all } => {
+        Commands::Archive { dry_run, all, branch } => {
             let branch_filter = if all {
                 None
+            } else if let Some(b) = branch {
+                Some(b)
             } else {
                 Some(task_mgr::loop_engine::env::get_current_branch(&cli.dir)?)
             };
