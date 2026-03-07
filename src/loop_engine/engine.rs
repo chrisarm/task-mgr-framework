@@ -39,7 +39,7 @@ use crate::loop_engine::display;
 use crate::loop_engine::env;
 use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::{
-    check_git_for_task_completion, reconcile_external_git_completions,
+    check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
 };
 use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::model;
@@ -1541,6 +1541,25 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         result.outcome = IterationOutcome::Completed;
                         ctx.crash_tracker.record_success();
                         eprintln!("Task {} completed (reported as already done)", task_id);
+                    }
+                }
+
+                // Wrapper commit: if task was completed but no git commit exists
+                // (Claude couldn't commit in scoped permission mode), commit on its behalf.
+                if task_marked_done_this_iteration
+                    && check_git_for_task_completion(
+                        &working_root,
+                        task_id,
+                        run_config.config.git_scan_depth,
+                    )
+                    .is_none()
+                {
+                    if let Some(hash) = wrapper_commit(
+                        &working_root,
+                        task_id,
+                        "loop wrapper commit",
+                    ) {
+                        ctx.last_commit = Some(hash);
                     }
                 }
             }
