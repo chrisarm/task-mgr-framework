@@ -227,6 +227,84 @@ pub(crate) fn check_git_for_task_completion(
     None
 }
 
+/// Commit uncommitted changes on behalf of the subprocess when it couldn't.
+///
+/// In scoped permission mode (`--permission-mode dontAsk`), the Claude subprocess
+/// may be unable to run `git commit` even when `Bash(git:*)` is allowed (e.g. due
+/// to session learnings or format mismatches). This function is called by the loop
+/// engine after detecting task completion when no git commit was made.
+///
+/// Returns `Some(commit_hash)` on success, `None` if nothing to commit or on error.
+pub(crate) fn wrapper_commit(
+    working_root: &Path,
+    task_id: &str,
+    message_suffix: &str,
+) -> Option<String> {
+    use std::process::Command;
+
+    // Check for uncommitted changes
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    let changes = String::from_utf8_lossy(&status.stdout);
+    if changes.trim().is_empty() {
+        return None; // Nothing to commit
+    }
+
+    // Stage all changes
+    let add = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if !add.status.success() {
+        eprintln!(
+            "Warning: wrapper git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+        return None;
+    }
+
+    // Commit with task ID in the message
+    let commit_msg = format!("feat: {}-completed - {}", task_id, message_suffix);
+    let commit = Command::new("git")
+        .args(["commit", "-m", &commit_msg])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if !commit.status.success() {
+        eprintln!(
+            "Warning: wrapper git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+        return None;
+    }
+
+    // Get the commit hash
+    let hash = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(working_root)
+        .output()
+        .ok()?;
+
+    if hash.status.success() {
+        let h = String::from_utf8_lossy(&hash.stdout).trim().to_string();
+        eprintln!(
+            "Wrapper committed changes for task {} ({})",
+            task_id,
+            &h[..7.min(h.len())]
+        );
+        Some(h)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

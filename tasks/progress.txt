@@ -1,0 +1,78 @@
+## 2026-03-05 - PERM-FEAT-001
+- Added PermissionMode enum (Dangerous, Scoped { allowed_tools: Option<String> }, Auto)
+- Added CODING_ALLOWED_TOOLS constant with full tool list
+- Added permission_mode_from_env() with correct precedence: dangerous > auto > scoped default
+- Made parse_bool_value pub(crate)
+- Added 13 unit tests (all pass), including known-bad discriminator for dangerous-beats-auto
+- Files changed: src/loop_engine/config.rs
+- **Learnings:** PERM_ENV_MUTEX defined in config.rs test module (separate from claude.rs ENV_MUTEX). Tests clean up env vars with remove_var after each test even on success path, to avoid state leakage between serialized tests. The exhaustive LoopConfig destructure test is a compile-time proof that PermissionMode is NOT added as a field.
+---
+## 2026-03-05 - PERM-FEAT-002
+- Changed spawn_claude signature: added permission_mode: &PermissionMode as last parameter
+- Changed args from Vec<&str> to Vec<String> (owned strings, no lifetime juggling)
+- Replaced hardcoded --dangerously-skip-permissions with match on permission_mode
+- Dangerous → --dangerously-skip-permissions; Scoped(Some) → --permission-mode dontAsk --allowedTools <t>; Scoped(None) → --permission-mode dontAsk; Auto → --enable-auto-mode
+- spawn_claude_echo unchanged externally (uses Dangerous internally); new spawn_claude_echo_mode for mode-specific tests
+- Updated all direct spawn_claude calls within claude.rs tests
+- Added 6 new permission-mode tests covering all variants, ordering, and negative cases
+- Files changed: src/loop_engine/claude.rs
+- **Learnings:** Keeping spawn_claude_echo signature unchanged (just wiring to Dangerous internally) avoids updating ~15 call sites in the same file. Adding spawn_claude_echo_mode as a parallel helper is cleaner than modifying the existing helper. Callers in other files (engine.rs, curate/, learnings/, watchdog.rs) left broken intentionally per FEAT-003 scope. cmd.args(&Vec<String>) compiles fine since &String: AsRef<OsStr>.
+---
+
+## 2026-03-05 - PERM-FEAT-004
+- Added auto-mode availability hint in run_loop() (engine.rs)
+- Moved permission_mode resolution from Step 16.5 to Step 15 (before banner) so hint can use it at Step 15.6
+- Hint fires when LOOP_AUTO_MODE_AVAILABLE=true AND mode != Auto; uses yellow ANSI \x1b[33m[hint]\x1b[0m prefix
+- Uses config::parse_bool_value for env var parsing (no raw string comparison)
+- Added 8 unit tests in engine.rs test module: 5 condition tests + 3 message-content tests
+- Used HINT_ENV_MUTEX (new static) to serialize env-mutating tests; mirrored hint condition in test helper fn hint_should_fire()
+- Files changed: src/loop_engine/engine.rs
+- **Learnings:** Moving permission_mode resolution before the banner is cleaner than inserting at a position where the variable isn't yet defined. HINT_MSG constant lets message-content tests stay in sync with production code without string duplication.
+---
+
+## 2026-03-05 - PERM-FEAT-005
+- Updated spawn_claude_echo to accept permission_mode: &PermissionMode (merged spawn_claude_echo_mode into it)
+- Updated all ~15 call sites to pass explicit PermissionMode (most use Scoped { CODING_ALLOWED_TOOLS })
+- Updated 6 existing tests: replaced --dangerously-skip-permissions assertions with --permission-mode dontAsk
+- Updated exact-string test to use format!() with CODING_ALLOWED_TOOLS constant
+- Updated ordering test to check --permission-mode position instead of --dangerously-skip-permissions
+- Updated stream_json ordering test (Test 6) to use Scoped mode
+- Updated existing PERM-FEAT-002 tests to call spawn_claude_echo directly
+- Added 4 new named tests: test_permission_mode_dangerous, test_permission_mode_scoped_with_tools, test_permission_mode_scoped_no_tools, test_permission_mode_auto
+- Added CODING_ALLOWED_TOOLS import to test module
+- 91 claude.rs tests pass (up from 87); 2390 lib tests pass
+- Files changed: src/loop_engine/claude.rs
+- **Learnings:** Merging spawn_claude_echo_mode into spawn_claude_echo (adding the parameter) required updating all ~15 call sites but produces cleaner API. The exact-string test needs CODING_ALLOWED_TOOLS as a format constant since it's a long string. Adding CODING_ALLOWED_TOOLS import explicitly to the test module (even with `use super::*`) is cleaner than relying on indirect re-export.
+---
+
+## 2026-03-05 - PERM-FEAT-003
+- Added permission_mode: &'a PermissionMode to IterationParams struct in engine.rs
+- Resolved permission_mode once in run_loop() via config::permission_mode_from_env() before iteration loop
+- Passed params.permission_mode to spawn_claude in run_iteration() (main loop uses env-resolved mode with CODING_ALLOWED_TOOLS)
+- Updated learnings/ingestion/mod.rs, curate/enrich.rs, curate/mod.rs: all pass Scoped { allowed_tools: None } (text-only callers)
+- Updated watchdog.rs tests: both pass PermissionMode::Dangerous (mock binary, no real tool use)
+- Fixed pre-existing format string escaping bug in claude.rs test assertions (braces in literal strings need doubling)
+- Files changed: engine.rs, claude.rs (format fix), watchdog.rs, ingestion/mod.rs, curate/enrich.rs, curate/mod.rs
+- **Learnings:** cargo check passed even before cargo test - format string errors only surface at test compile time. Always run cargo test, not just cargo check, for complete validation.
+---
+
+## 2026-03-05 - PERM-REFACTOR-001
+- Added `PermissionMode::text_only()` constructor in config.rs for text-only callers
+- Updated 3 production callers (ingestion, enrich, curate dedup) to use text_only()
+- Updated 3 engine.rs test sites to use text_only()
+- Added `scoped_coding()` private test helper in claude.rs test module; replaced 17 occurrences of verbose pattern
+- Fixed 3 pre-existing archive CLI tests broken by scope-archive-by-branch feature: added --all flag
+- **Learnings:** When a 3-line enum construction appears 3+ times, an associated constructor eliminates duplication without over-abstracting. Private test helpers are the right scope for test-only helpers (not pub/pub(crate)).
+- **Learnings:** Pre-existing failing tests from merged feature branches (archive tests requiring git) can be fixed with the right flag (--all) rather than mocking a git environment.
+---
+
+## 2026-03-05 - PERM-REVIEW-001
+- Clean review: all acceptance criteria pass, no FIX tasks needed
+- Verified permission_mode flow: config::permission_mode_from_env() (engine.rs:1197) → IterationParams.permission_mode (engine.rs:1302) → spawn_claude (engine.rs:469)
+- Verified text-only callers: ingestion/mod.rs:85, curate/enrich.rs:242, curate/mod.rs:621 all use PermissionMode::text_only()
+- Verified CODING_ALLOWED_TOOLS covers all prompt.md operations (cargo, git, task-mgr, file ops, Glob, Grep)
+- Verified --dangerously-skip-permissions only in doc comments + Dangerous match arm (no stale refs)
+- No unwrap() in production permission code; one safe .expect() on stdout pipe (invariant from Stdio::piped())
+- Quality gate: 0 fmt issues, 0 clippy errors, 2397 tests pass (5 pre-existing test-only warnings)
+- **Learnings:** The full chain (env → run_loop → IterationParams → spawn_claude) ensures permission mode is resolved once and threaded consistently. Text-only callers using PermissionMode::text_only() is clean API design.
+---

@@ -17,6 +17,7 @@ use rusqlite::Connection;
 use crate::learnings::crud::{record_learning, RecordLearningParams};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
+use crate::loop_engine::config::PermissionMode;
 use crate::models::LearningOutcome;
 use crate::TaskMgrResult;
 
@@ -74,7 +75,15 @@ pub fn extract_learnings_from_output(
     let prompt = build_extraction_prompt(output, task_id);
 
     // Spawn Claude for extraction
-    let claude_result = match claude::spawn_claude(&prompt, None, None, None, None, false) {
+    let claude_result = match claude::spawn_claude(
+        &prompt,
+        None,
+        None,
+        None,
+        None,
+        false,
+        &PermissionMode::text_only(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Warning: learning extraction spawn failed: {}", e);

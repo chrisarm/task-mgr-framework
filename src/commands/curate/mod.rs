@@ -23,6 +23,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
 use crate::loop_engine::claude::spawn_claude;
+use crate::loop_engine::config::PermissionMode;
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
 
@@ -610,7 +611,15 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         let eligible_ids: Vec<i64> = eligible.iter().map(|i| i.id).collect();
         let prompt = build_dedup_prompt(&eligible, params.threshold);
 
-        let claude_result = match spawn_claude(&prompt, None, None, None, None, false) {
+        let claude_result = match spawn_claude(
+            &prompt,
+            None,
+            None,
+            None,
+            None,
+            false,
+            &PermissionMode::text_only(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(

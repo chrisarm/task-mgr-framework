@@ -665,7 +665,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         }
 
         Commands::Batch {
-            pattern,
+            patterns,
             max_iterations,
             yes,
             keep_worktrees,
@@ -681,7 +681,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
 
             let result = rt.block_on(async {
                 task_mgr::loop_engine::batch::run_batch(
-                    &pattern,
+                    &patterns,
                     max_iterations,
                     yes,
                     &cli.dir,
@@ -707,8 +707,19 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Archive { dry_run } => {
-            let result = task_mgr::loop_engine::archive::run_archive(&cli.dir, dry_run)?;
+        Commands::Archive { dry_run, all, branch } => {
+            let branch_filter = if all {
+                None
+            } else if let Some(b) = branch {
+                Some(b)
+            } else {
+                Some(task_mgr::loop_engine::env::get_current_branch(&cli.dir)?)
+            };
+            let result = task_mgr::loop_engine::archive::run_archive(
+                &cli.dir,
+                dry_run,
+                branch_filter.as_deref(),
+            )?;
             output_result(&result, cli.format);
             Ok(())
         }

@@ -1,21 +1,15 @@
 #!/bin/bash
 # Fake claude binary for integration tests.
 #
-# Reads the prompt (-p argument), extracts "ID: N" lines, and outputs a valid
-# enrich JSON response with predetermined metadata for each learning ID.
+# Reads the prompt from stdin (matching real claude behaviour when invoked with
+# bare -p flag and prompt piped via stdin), extracts "ID: N" lines, and outputs
+# a valid enrich JSON response with predetermined metadata for each learning ID.
 #
 # Usage (mirrors real claude CLI):
-#   fake_claude.sh --print --dangerously-skip-permissions -p <prompt>
+#   echo "<prompt>" | fake_claude.sh --print --dangerously-skip-permissions -p
 
-prompt=""
-while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "-p" && $# -gt 1 ]]; then
-        prompt="$2"
-        shift 2
-    else
-        shift
-    fi
-done
+# Read the entire prompt from stdin
+prompt="$(cat)"
 
 # Extract IDs from the prompt (format: "ID: N" on its own line after "---")
 output="["

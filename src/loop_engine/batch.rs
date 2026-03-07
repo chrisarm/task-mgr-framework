@@ -178,7 +178,7 @@ fn cleanup_worktree_after_prd(
 
 /// Run multiple PRDs in sequence.
 ///
-/// 1. Expand glob pattern with natural sort
+/// 1. Expand glob patterns with natural sort and deduplication
 /// 2. Derive prompt files from PRD names
 /// 3. Validate ALL prompt files exist before starting
 /// 4. Run each PRD sequentially via `run_loop()`
@@ -187,7 +187,7 @@ fn cleanup_worktree_after_prd(
 ///
 /// # Arguments
 ///
-/// * `pattern` - Glob pattern to match PRD JSON files
+/// * `patterns` - Glob patterns or literal file paths to match PRD JSON files
 /// * `max_iterations` - Optional max iterations per PRD (0 = auto)
 /// * `yes` - Auto-confirm all prompts
 /// * `dir` - Database directory (--dir flag)
@@ -195,7 +195,7 @@ fn cleanup_worktree_after_prd(
 /// * `verbose` - Verbose output
 /// * `keep_worktrees` - Never remove worktrees after PRD completion
 pub async fn run_batch(
-    pattern: &str,
+    patterns: &[String],
     max_iterations: Option<usize>,
     yes: bool,
     dir: &Path,
@@ -203,25 +203,52 @@ pub async fn run_batch(
     verbose: bool,
     keep_worktrees: bool,
 ) -> BatchResult {
-    // Step 1: Expand glob
-    let prd_files = match expand_glob(pattern) {
-        Ok(files) => files,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return BatchResult {
-                succeeded: 0,
-                failed: 1,
-                skipped: 0,
-                results: vec![],
-            };
-        }
-    };
+    // Step 1: Expand all patterns and deduplicate
+    let mut prd_files: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
-    eprintln!(
-        "Batch mode: found {} PRD file(s) matching '{}'",
-        prd_files.len(),
-        pattern
-    );
+    for pattern in patterns {
+        match expand_glob(pattern) {
+            Ok(files) => {
+                for file in files {
+                    let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+                    if seen.insert(canonical.clone()) {
+                        prd_files.push(canonical);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return BatchResult {
+                    succeeded: 0,
+                    failed: 1,
+                    skipped: 0,
+                    results: vec![],
+                };
+            }
+        }
+    }
+
+    if prd_files.is_empty() {
+        eprintln!("Error: no files matched any patterns");
+        return BatchResult {
+            succeeded: 0,
+            failed: 1,
+            skipped: 0,
+            results: vec![],
+        };
+    }
+
+    // Sort after collecting all files for consistent ordering
+    prd_files.sort();
+    prd_files.dedup();
+
+    let pattern_display = if patterns.len() <= 3 {
+        patterns.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ")
+    } else {
+        format!("{} pattern(s)", patterns.len())
+    };
+    eprintln!("Batch mode: found {} PRD file(s) matching {}", prd_files.len(), pattern_display);
 
     // Step 2: Validate all prompt files exist
     let pairs = match validate_prompt_files(&prd_files) {
@@ -388,7 +415,10 @@ mod tests {
         // file_stem() returns "my-prd.test" for "my-prd.test.json"
         let prd = PathBuf::from(".task-mgr/tasks/my-prd.test.json");
         let prompt = derive_prompt_file(&prd);
-        assert_eq!(prompt, PathBuf::from(".task-mgr/tasks/my-prd.test-prompt.md"));
+        assert_eq!(
+            prompt,
+            PathBuf::from(".task-mgr/tasks/my-prd.test-prompt.md")
+        );
     }
 
     #[test]

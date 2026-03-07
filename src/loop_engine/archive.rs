@@ -186,22 +186,44 @@ fn archive_single_prd(
 
 /// Run the archive command.
 ///
-/// Iterates all PRDs in prd_metadata. For each: skips PRDs with NULL
-/// task_prefix or incomplete tasks; archives completed PRDs by moving their
-/// files to `tasks/archive/YYYY-MM-DD-<branch>/` and clearing DB data.
-/// Extracts learnings from `progress.txt` once after all PRDs are processed
-/// (only when at least one PRD was archived). Never moves `progress.txt`.
-pub fn run_archive(dir: &Path, dry_run: bool) -> TaskMgrResult<ArchiveResult> {
+/// When `branch_filter` is `Some(branch)`, only PRDs whose `branch_name`
+/// matches the given branch are considered. When `None`, all PRDs are
+/// processed (equivalent to `--all`).
+///
+/// For each matching PRD: skips PRDs with NULL task_prefix or incomplete
+/// tasks; archives completed PRDs by moving their files to
+/// `tasks/archive/YYYY-MM-DD-<branch>/` and clearing DB data. Extracts
+/// learnings from `progress.txt` once after all PRDs are processed (only
+/// when at least one PRD was archived). Never moves `progress.txt`.
+pub fn run_archive(
+    dir: &Path,
+    dry_run: bool,
+    branch_filter: Option<&str>,
+) -> TaskMgrResult<ArchiveResult> {
     let mut conn = open_connection(dir)?;
 
     let all_prds = query_all_prds(&conn)?;
+    let all_prds: Vec<PrdRecord> = match branch_filter {
+        Some(branch) => all_prds
+            .into_iter()
+            .filter(|prd| prd.branch.as_deref() == Some(branch))
+            .collect(),
+        None => all_prds,
+    };
     if all_prds.is_empty() {
+        let message = match branch_filter {
+            Some(branch) => format!(
+                "No PRD metadata found for branch '{}'. Use --all to archive across all branches.",
+                branch
+            ),
+            None => "No PRD metadata found in database.".to_string(),
+        };
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
             tasks_cleared: 0,
             dry_run,
-            message: "No PRD metadata found in database.".to_string(),
+            message,
             prds_archived: Vec::new(),
             prds_skipped: Vec::new(),
         });
@@ -856,7 +878,7 @@ mod tests {
         // Create DB with schema but no metadata
         drop(setup_db(dir.path()));
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert!(result.archived.is_empty());
         assert!(result.message.contains("No PRD metadata"));
     }
@@ -870,7 +892,7 @@ mod tests {
         insert_task(&conn, "FEAT-001", "Test task", 1, "todo");
         drop(conn);
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert!(result.archived.is_empty());
         assert!(result.message.contains("not fully completed"));
     }
@@ -890,7 +912,7 @@ mod tests {
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
         fs::write(tasks_dir.join("test-project-prompt.md"), "# Prompt").unwrap();
 
-        let result = run_archive(dir.path(), true).unwrap();
+        let result = run_archive(dir.path(), true, None).unwrap();
         assert!(result.dry_run);
         assert_eq!(result.archived.len(), 2);
 
@@ -913,7 +935,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert!(!result.dry_run);
         assert_eq!(result.archived.len(), 1);
 
@@ -971,7 +993,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert_eq!(result.learnings_extracted, 1);
 
         // Verify learnings.md was created
@@ -991,7 +1013,7 @@ mod tests {
         // No tasks at all
         drop(conn);
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert!(result.archived.is_empty());
         assert!(result.message.contains("not fully completed"));
     }
@@ -1031,7 +1053,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert_eq!(result.tasks_cleared, 1);
 
         // Verify learnings survived
@@ -1113,7 +1135,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
         assert_eq!(result.tasks_cleared, 3);
         assert!(!result.archived.is_empty());
     }
@@ -1675,7 +1697,7 @@ mod tests {
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
         fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // PA should be archived
         assert!(
@@ -1715,7 +1737,7 @@ mod tests {
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
         fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // Both files should be archived
         assert_eq!(
@@ -1759,7 +1781,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("legacy-project.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // The NULL-prefix PRD should be skipped — file must NOT be moved
         assert!(
@@ -1784,7 +1806,7 @@ mod tests {
         let conn = setup_db(dir.path());
         drop(conn);
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         assert!(result.archived.is_empty());
         assert_eq!(result.tasks_cleared, 0);
@@ -1810,7 +1832,7 @@ mod tests {
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
         fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), true).unwrap();
+        let result = run_archive(dir.path(), true, None).unwrap();
 
         assert!(result.dry_run, "dry_run flag must be true in result");
 
@@ -1850,7 +1872,7 @@ mod tests {
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
         fs::write(tasks_dir.join("progress.txt"), "## PA-001\n- Done.\n---\n").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // Archive should succeed
         assert!(
@@ -1935,7 +1957,7 @@ mod tests {
         fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
         fs::write(tasks_dir.join("project-c.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // Only PA archived
         assert_eq!(result.prds_archived.len(), 1, "Only PA should be archived");
@@ -1993,7 +2015,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         assert_eq!(result.prds_archived.len(), 0, "No PRDs archived");
         assert_eq!(
@@ -2089,7 +2111,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         assert_eq!(result.prds_archived.len(), 1);
         let folder = &result.prds_archived[0].archive_folder;
@@ -2119,7 +2141,7 @@ mod tests {
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
 
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         assert_eq!(result.prds_archived.len(), 1);
         let folder = &result.prds_archived[0].archive_folder;
@@ -2146,7 +2168,7 @@ mod tests {
         drop(conn);
 
         // No files created on disk — prd_items will be empty
-        let result = run_archive(dir.path(), false).unwrap();
+        let result = run_archive(dir.path(), false, None).unwrap();
 
         // PRD should still be reported as archived (zero files is fine)
         assert_eq!(result.prds_archived.len(), 1);
@@ -2178,6 +2200,109 @@ mod tests {
         assert_eq!(
             meta_count, 0,
             "prd_metadata row should be deleted for completed PRD with no files"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for branch_filter parameter on run_archive()
+    // -----------------------------------------------------------------------
+
+    /// With branch_filter matching one PRD's branch, only that PRD is archived.
+    #[test]
+    fn test_branch_filter_archives_only_matching_branch() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_prd(&conn, 2, "project-b", "feat/branch-b", Some("PB"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        insert_task(&conn, "PB-001", "PB Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        insert_prd_file(&conn, 2, "project-b.json", "task_list");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+
+        // Only archive PRDs on feat/branch-a
+        let result = run_archive(dir.path(), false, Some("feat/branch-a")).unwrap();
+
+        // PA should be archived
+        assert_eq!(
+            result.prds_archived.len(),
+            1,
+            "Only one PRD should be archived"
+        );
+        assert_eq!(result.prds_archived[0].project, "project-a");
+
+        // PB should NOT appear at all (filtered out before processing)
+        assert!(
+            result.prds_skipped.is_empty(),
+            "PB should not appear in skipped list"
+        );
+
+        // project-a.json should be gone, project-b.json should remain
+        assert!(!tasks_dir.join("project-a.json").exists());
+        assert!(
+            tasks_dir.join("project-b.json").exists(),
+            "project-b.json must remain (filtered out by branch)"
+        );
+    }
+
+    /// With branch_filter that matches no PRDs, returns empty with helpful message.
+    #[test]
+    fn test_branch_filter_no_matching_prds() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        drop(conn);
+
+        let result = run_archive(dir.path(), false, Some("main")).unwrap();
+
+        assert!(result.prds_archived.is_empty());
+        assert!(result.prds_skipped.is_empty());
+        assert!(result.archived.is_empty());
+        assert!(
+            result.message.contains("main"),
+            "Message should mention the branch: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("--all"),
+            "Message should suggest --all: {}",
+            result.message
+        );
+    }
+
+    /// With branch_filter=None, all completed PRDs are archived (backward compat).
+    #[test]
+    fn test_branch_filter_none_archives_all() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_prd(&conn, 2, "project-b", "feat/branch-b", Some("PB"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        insert_task(&conn, "PB-001", "PB Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        insert_prd_file(&conn, 2, "project-b.json", "task_list");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("project-b.json"), "{}").unwrap();
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert_eq!(
+            result.prds_archived.len(),
+            2,
+            "Both PRDs should be archived with None filter"
         );
     }
 }

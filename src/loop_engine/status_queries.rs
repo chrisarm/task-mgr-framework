@@ -556,7 +556,10 @@ mod tests {
 
     #[test]
     fn test_prd_basename_no_extension() {
-        assert_eq!(prd_basename_from_path(Path::new(".task-mgr/tasks/my-prd")), "my-prd");
+        assert_eq!(
+            prd_basename_from_path(Path::new(".task-mgr/tasks/my-prd")),
+            "my-prd"
+        );
     }
 
     #[test]

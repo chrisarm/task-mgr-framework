@@ -1460,7 +1460,7 @@ fn test_archive_dry_run_shows_p1_archived_p2_skipped() {
 
     let output = Command::new(cargo_bin("task-mgr"))
         .args(["--dir", &dir])
-        .args(["archive", "--dry-run"])
+        .args(["archive", "--dry-run", "--all"])
         .assert()
         .success()
         .get_output()
@@ -1511,7 +1511,7 @@ fn test_archive_actual_archives_p1_leaves_p2() {
 
     let output = Command::new(cargo_bin("task-mgr"))
         .args(["--dir", &dir])
-        .args(["archive"])
+        .args(["archive", "--all"])
         .assert()
         .success()
         .get_output()
@@ -1559,7 +1559,7 @@ fn test_archive_json_format_structure() {
 
     let output = Command::new(cargo_bin("task-mgr"))
         .args(["--dir", &dir])
-        .args(["archive", "--format", "json"])
+        .args(["archive", "--format", "json", "--all"])
         .assert()
         .success()
         .get_output()

@@ -713,16 +713,21 @@ EXAMPLES:
     task-mgr batch 'tasks/*.json' --yes
 
     # Run with max iterations per PRD
-    task-mgr batch 'tasks/*.json' 10 --yes
+    task-mgr batch 'tasks/*.json' -n 10 --yes
+
+    # Run multiple patterns (or shell-expanded files)
+    task-mgr batch tasks/rag-01.json tasks/rag-02.json --yes
 
     # Keep worktrees after each PRD (default: auto-remove on success)
     task-mgr batch 'tasks/*.json' --yes --keep-worktrees
 ")]
     Batch {
-        /// Glob pattern to match PRD files
-        pattern: String,
+        /// Glob patterns or file paths to match PRD files
+        #[arg(required = true)]
+        patterns: Vec<String>,
 
         /// Maximum iterations per PRD
+        #[arg(short = 'n', long = "max-iterations")]
         max_iterations: Option<usize>,
 
         /// Auto-confirm all prompts
@@ -761,10 +766,21 @@ EXAMPLES:
     },
 
     /// Archive completed PRDs and extract learnings
+    ///
+    /// By default, only archives PRDs belonging to the current git branch.
+    /// Use --all to archive completed PRDs from all branches.
     Archive {
         /// Preview what would be archived without moving files
         #[arg(long)]
         dry_run: bool,
+
+        /// Archive completed PRDs from all branches, not just the current one
+        #[arg(long)]
+        all: bool,
+
+        /// Archive completed PRDs for a specific branch
+        #[arg(long, conflicts_with = "all")]
+        branch: Option<String>,
     },
 
     /// Extract learnings from a Claude output file using LLM analysis

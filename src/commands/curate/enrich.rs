@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use crate::commands::curate::types::{EnrichCandidate, EnrichParams, EnrichProposal, EnrichResult};
 use crate::learnings::{edit_learning, get_learning, get_learning_tags, EditLearningParams};
 use crate::loop_engine::claude;
+use crate::loop_engine::config::PermissionMode;
 use crate::TaskMgrResult;
 
 use std::collections::HashSet;
@@ -231,7 +232,15 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         let batch_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
         let prompt = build_enrich_prompt(&batch_items);
 
-        let claude_result = match claude::spawn_claude(&prompt, None, None, None, None, false) {
+        let claude_result = match claude::spawn_claude(
+            &prompt,
+            None,
+            None,
+            None,
+            None,
+            false,
+            &PermissionMode::text_only(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(

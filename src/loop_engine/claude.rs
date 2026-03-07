@@ -1,6 +1,6 @@
 /// Claude subprocess spawner for the autonomous agent loop.
 ///
-/// Spawns `claude --print --dangerously-skip-permissions -p PROMPT` as a child
+/// Spawns `claude` with permission-mode-aware flags and `-p PROMPT` as a child
 /// process. Tees stdout to stderr (live display) while collecting it into a buffer
 /// for later analysis by the detection engine. Claude's stderr passes through
 /// directly (inherited).
@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::watchdog::{exit_code_from_status, watchdog_loop, TimeoutConfig};
 
@@ -43,7 +44,15 @@ pub struct ClaudeResult {
 
 /// Spawn Claude with the given prompt and collect its output.
 ///
-/// The subprocess runs `<binary> --print --dangerously-skip-permissions -p <prompt>`.
+/// The subprocess runs `<binary> <base-flags> <permission-flags> [-model m] -p <prompt>`.
+/// Base flags are `--print --no-session-persistence` (plain mode) or
+/// `--verbose --output-format stream-json --no-session-persistence` (stream-json mode).
+/// Permission flags are determined by `permission_mode`:
+/// - `Dangerous` → `--dangerously-skip-permissions`
+/// - `Scoped { allowed_tools: Some(t) }` → `--permission-mode dontAsk --allowedTools <t>`
+/// - `Scoped { allowed_tools: None }` → `--permission-mode dontAsk`
+/// - `Auto` → `--enable-auto-mode`
+///
 /// When `model` is `Some(m)` and non-empty, `--model m` is inserted before `-p`.
 /// The binary defaults to `claude` but can be overridden via the `CLAUDE_BINARY`
 /// environment variable (useful for testing with mock scripts).
@@ -71,35 +80,51 @@ pub(crate) fn spawn_claude(
     model: Option<&str>,
     timeout: Option<TimeoutConfig>,
     stream_json: bool,
+    permission_mode: &PermissionMode,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-    let mut args: Vec<&str> = if stream_json {
+    let mut args: Vec<String> = if stream_json {
         vec![
-            "--verbose",
-            "--output-format",
-            "stream-json",
-            "--no-session-persistence",
-            "--dangerously-skip-permissions",
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--no-session-persistence".to_string(),
         ]
     } else {
         vec![
-            "--print",
-            "--no-session-persistence",
-            "--dangerously-skip-permissions",
+            "--print".to_string(),
+            "--no-session-persistence".to_string(),
         ]
     };
-    if let Some(m) = model {
-        if !m.trim().is_empty() {
-            args.push("--model");
-            args.push(m);
+    match permission_mode {
+        PermissionMode::Dangerous => {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        PermissionMode::Scoped { allowed_tools } => {
+            args.push("--permission-mode".to_string());
+            args.push("dontAsk".to_string());
+            if let Some(tools) = allowed_tools {
+                args.push("--allowedTools".to_string());
+                args.push(tools.clone());
+            }
+        }
+        PermissionMode::Auto => {
+            args.push("--enable-auto-mode".to_string());
         }
     }
-    args.push("-p");
-    args.push(prompt);
+    if let Some(m) = model {
+        if !m.trim().is_empty() {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+    }
+    args.push("-p".to_string());
+    // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
+    // limits when prompts are large (e.g. curate dedup with many learnings).
 
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
@@ -131,6 +156,31 @@ pub(crate) fn spawn_claude(
             }
         }
     })?;
+
+    // Write the prompt to stdin and close it so the child can start processing.
+    // This must happen before reading stdout to avoid deadlock.
+    {
+        use std::io::Write;
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("stdin should be piped (Stdio::piped() was set on spawn)");
+        match stdin.write_all(prompt.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // Child closed stdin early (e.g., crashed during startup).
+                // We'll capture its exit code below.
+            }
+            Err(e) => {
+                return Err(TaskMgrError::IoErrorWithContext {
+                    file_path: binary.clone(),
+                    operation: "writing prompt to Claude subprocess stdin".to_string(),
+                    source: e,
+                });
+            }
+        }
+        // stdin is dropped here, closing the pipe
+    }
 
     // Extract PID before starting watchdog — no race condition
     let child_pid = child.id();
@@ -443,6 +493,7 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
     use crate::loop_engine::watchdog::{exit_code_from_status, TimeoutConfig};
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
@@ -453,17 +504,57 @@ mod tests {
     // when cargo test runs threads in parallel.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// Test helper: run spawn_claude with CLAUDE_BINARY=echo under ENV_MUTEX.
+    /// Scoped mode with the full coding tool allowlist. Used in tests that
+    /// need a valid PermissionMode but are testing something else (model flags,
+    /// stream_json, signal handling, etc.).
+    fn scoped_coding() -> PermissionMode {
+        PermissionMode::Scoped {
+            allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string()),
+        }
+    }
+
+    /// Create a script that echoes its CLI args followed by stdin on one line.
+    /// This matches the output format previously produced by `echo` when the prompt
+    /// was passed as a CLI arg: `--print ... -p PROMPT`.
+    fn make_echo_args_stdin_script(name: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("task_mgr_test_{name}_echo_args_stdin.sh"));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+            writeln!(f, r#"echo "$@" "$PROMPT""#).unwrap();
+        }
+        std::fs::set_permissions(
+            &path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        path
+    }
+
+    /// Test helper: run spawn_claude with a mock binary that prints args + stdin.
     fn spawn_claude_echo(
         prompt: &str,
         signal: Option<&SignalFlag>,
         model: Option<&str>,
         stream_json: bool,
+        permission_mode: &PermissionMode,
     ) -> TaskMgrResult<ClaudeResult> {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "echo");
-        let result = spawn_claude(prompt, signal, None, model, None, stream_json);
+        let script = make_echo_args_stdin_script("echo");
+        std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+        let result = spawn_claude(
+            prompt,
+            signal,
+            None,
+            model,
+            None,
+            stream_json,
+            permission_mode,
+        );
         std::env::remove_var("CLAUDE_BINARY");
+        let _ = std::fs::remove_file(&script);
         result
     }
 
@@ -593,7 +684,7 @@ mod tests {
     #[test]
     fn test_spawn_without_signal_flag() {
         // spawn_claude with None should behave like before
-        let result = spawn_claude_echo("hello", None, None, false);
+        let result = spawn_claude_echo("hello", None, None, false, &scoped_coding());
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -604,7 +695,7 @@ mod tests {
     fn test_spawn_with_signal_flag_no_signal() {
         // spawn_claude with a SignalFlag that is NOT signaled should work normally
         let flag = SignalFlag::new();
-        let result = spawn_claude_echo("test output", Some(&flag), None, false);
+        let result = spawn_claude_echo("test output", Some(&flag), None, false, &scoped_coding());
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -682,9 +773,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_watchdog_kills_child_on_signal() {
-        // Spawn a long-running process via spawn_claude with a signal flag
+        // Spawn a long-running process via spawn_claude with a signal flag.
+        // The script drains stdin first (so the stdin write completes), then
+        // sleeps long enough for the watchdog to kill it.
+        use std::io::Write as _;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CLAUDE_BINARY", "sleep");
+        let script_path =
+            std::env::temp_dir().join("task_mgr_test_watchdog_signal_sleep.sh");
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "cat > /dev/null").unwrap();
+            writeln!(f, "sleep 120").unwrap();
+        }
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
         let flag = SignalFlag::new();
 
         // Set the signal flag after a short delay in a background thread
@@ -695,11 +802,19 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        // "60" is the argument to sleep — it will run for 60s unless killed
-        let result = spawn_claude("60", Some(&flag), None, None, None, false);
+        let result = spawn_claude(
+            "ignored",
+            Some(&flag),
+            None,
+            None,
+            None,
+            false,
+            &PermissionMode::Dangerous,
+        );
         let elapsed = start.elapsed();
 
         std::env::remove_var("CLAUDE_BINARY");
+        let _ = std::fs::remove_file(&script_path);
 
         assert!(
             result.is_ok(),
@@ -724,7 +839,7 @@ mod tests {
     fn test_watchdog_does_not_interfere_with_normal_exit() {
         // If the child exits normally, the watchdog should stop cleanly
         let flag = SignalFlag::new();
-        let result = spawn_claude_echo("quick exit", Some(&flag), None, false);
+        let result = spawn_claude_echo("quick exit", Some(&flag), None, false, &scoped_coding());
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -734,6 +849,51 @@ mod tests {
         assert!(!flag.is_signaled());
     }
 
+    // --- EPIPE handling ---
+
+    /// Verify that a child which exits immediately without reading stdin
+    /// triggers the BrokenPipe path (line 170) without causing a panic or error.
+    #[cfg(unix)]
+    #[test]
+    fn test_broken_pipe_on_immediate_exit() {
+        use std::io::Write as _;
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let script_path =
+            std::env::temp_dir().join("task_mgr_test_epipe_immediate_exit.sh");
+        {
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            // Exit immediately without reading stdin — triggers EPIPE on write.
+            writeln!(f, "true").unwrap();
+        }
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+
+        let result = spawn_claude(
+            "this prompt will not be read",
+            None,
+            None,
+            None,
+            None,
+            false,
+            &PermissionMode::Dangerous,
+        );
+
+        std::env::remove_var("CLAUDE_BINARY");
+        let _ = std::fs::remove_file(&script_path);
+
+        assert!(
+            result.is_ok(),
+            "BrokenPipe on stdin write must not surface as an error: {result:?}"
+        );
+        let res = result.unwrap();
+        assert_eq!(res.exit_code, 0, "Script runs `true` which exits 0");
+    }
+
     // --- Tests for --model flag on spawn_claude ---
 
     /// Active: model=None → no --model flag, standard flags present.
@@ -741,7 +901,7 @@ mod tests {
     /// pre-model behavior.
     #[test]
     fn test_spawn_model_none_no_model_flag() {
-        let result = spawn_claude_echo("test_prompt", None, None, false);
+        let result = spawn_claude_echo("test_prompt", None, None, false, &scoped_coding());
 
         assert!(
             result.is_ok(),
@@ -765,8 +925,13 @@ mod tests {
             output
         );
         assert!(
-            output.contains("--dangerously-skip-permissions"),
-            "Must always have --dangerously-skip-permissions, got: '{}'",
+            output.contains("--permission-mode"),
+            "Must always have --permission-mode, got: '{}'",
+            output
+        );
+        assert!(
+            output.contains("dontAsk"),
+            "Must always have dontAsk, got: '{}'",
             output
         );
     }
@@ -774,7 +939,13 @@ mod tests {
     /// model=Some("claude-opus-4-6") → --model flag present with correct value in echoed args.
     #[test]
     fn test_spawn_model_some_opus_includes_model_flag() {
-        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
+        let result = spawn_claude_echo(
+            "test_prompt",
+            None,
+            Some("claude-opus-4-6"),
+            false,
+            &scoped_coding(),
+        );
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -791,7 +962,7 @@ mod tests {
     /// Guards against naively passing --model '' to the Claude CLI.
     #[test]
     fn test_spawn_model_empty_string_treated_as_none() {
-        let result = spawn_claude_echo("test_prompt", None, Some(""), false);
+        let result = spawn_claude_echo("test_prompt", None, Some(""), false, &scoped_coding());
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -808,7 +979,13 @@ mod tests {
     /// Rejects implementations that append --model after the prompt flag.
     #[test]
     fn test_spawn_model_flag_appears_before_prompt_flag() {
-        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
+        let result = spawn_claude_echo(
+            "test_prompt",
+            None,
+            Some("claude-opus-4-6"),
+            false,
+            &scoped_coding(),
+        );
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -830,10 +1007,16 @@ mod tests {
         );
     }
 
-    /// --print and --dangerously-skip-permissions must be present regardless of model value.
+    /// --print and --permission-mode dontAsk must be present regardless of model value.
     #[test]
     fn test_spawn_model_some_preserves_required_flags() {
-        let result = spawn_claude_echo("test_prompt", None, Some("claude-opus-4-6"), false);
+        let result = spawn_claude_echo(
+            "test_prompt",
+            None,
+            Some("claude-opus-4-6"),
+            false,
+            &scoped_coding(),
+        );
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -845,8 +1028,13 @@ mod tests {
             output
         );
         assert!(
-            output.contains("--dangerously-skip-permissions"),
-            "Must always have --dangerously-skip-permissions even with model, got: '{}'",
+            output.contains("--permission-mode"),
+            "Must always have --permission-mode even with model, got: '{}'",
+            output
+        );
+        assert!(
+            output.contains("dontAsk"),
+            "Must always have dontAsk even with model, got: '{}'",
             output
         );
         assert!(
@@ -868,7 +1056,7 @@ mod tests {
     #[case("claude-haiku-4-5-20251001")]
     #[case("my-custom-model")]
     fn test_spawn_claude_model_variants(#[case] model: &str) {
-        let result = spawn_claude_echo("test prompt", None, Some(model), false);
+        let result = spawn_claude_echo("test prompt", None, Some(model), false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -902,7 +1090,7 @@ mod tests {
     #[case("model.with.dots")]
     #[case("model-with_mixed.chars-v2")]
     fn test_spawn_claude_model_special_chars(#[case] model: &str) {
-        let result = spawn_claude_echo("test prompt", None, Some(model), false);
+        let result = spawn_claude_echo("test prompt", None, Some(model), false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -916,13 +1104,13 @@ mod tests {
         );
     }
 
-    /// AC: --model does not interfere with --dangerously-skip-permissions or --print flags.
-    /// Verifies exact ordering: --print --no-session-persistence --dangerously-skip-permissions [--model <m>] -p <prompt>
+    /// AC: --model does not interfere with --permission-mode or --print flags.
+    /// Verifies exact ordering: --print --no-session-persistence --permission-mode dontAsk [--model <m>] -p <prompt>
     #[rstest]
     #[case(Some("claude-sonnet-4-6"))]
     #[case(None)]
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
-        let result = spawn_claude_echo("my prompt", None, model, false);
+        let result = spawn_claude_echo("my prompt", None, model, false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -944,13 +1132,13 @@ mod tests {
             "--no-session-persistence should follow --print"
         );
 
-        // --dangerously-skip-permissions always present after --no-session-persistence
-        let dsp_pos = output
-            .find("--dangerously-skip-permissions")
-            .expect("--dangerously-skip-permissions must be present");
+        // --permission-mode always present after --no-session-persistence
+        let perm_pos = output
+            .find("--permission-mode")
+            .expect("--permission-mode must be present");
         assert!(
-            dsp_pos > nsp_pos,
-            "--dangerously-skip-permissions should follow --no-session-persistence"
+            perm_pos > nsp_pos,
+            "--permission-mode should follow --no-session-persistence"
         );
 
         // -p always present and prompt follows
@@ -961,16 +1149,16 @@ mod tests {
             output
         );
 
-        // If model is present, it must be between --dangerously-skip-permissions and -p
+        // If model is present, it must be between permission flags and -p
         if let Some(m) = model {
             let model_pos = output
                 .find("--model")
                 .expect("--model must be present when model is Some");
             assert!(
-                model_pos > dsp_pos && model_pos < p_pos,
-                "--model (pos {}) must be between --dangerously-skip-permissions (pos {}) and -p (pos {}), got: '{}'",
+                model_pos > perm_pos && model_pos < p_pos,
+                "--model (pos {}) must be between --permission-mode (pos {}) and -p (pos {}), got: '{}'",
                 model_pos,
-                dsp_pos,
+                perm_pos,
                 p_pos,
                 output
             );
@@ -985,15 +1173,18 @@ mod tests {
     /// Exact string comparison to verify no extra args are added.
     #[test]
     fn test_spawn_claude_none_model_identical_to_pre_phase2() {
-        let result = spawn_claude_echo("my prompt text", None, None, false);
+        let result = spawn_claude_echo("my prompt text", None, None, false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
 
         // stream_json=false: exactly these args, no more
+        let expected = format!(
+            "--print --no-session-persistence --permission-mode dontAsk --allowedTools {} -p my prompt text",
+            CODING_ALLOWED_TOOLS
+        );
         assert_eq!(
-            output,
-            "--print --no-session-persistence --dangerously-skip-permissions -p my prompt text",
+            output, expected,
             "None model with stream_json=false must produce exactly these args"
         );
     }
@@ -1004,7 +1195,7 @@ mod tests {
     #[case("\t")]
     #[case(" \t ")]
     fn test_spawn_claude_whitespace_only_model_treated_as_none(#[case] model: &str) {
-        let result = spawn_claude_echo("test prompt", None, Some(model), false);
+        let result = spawn_claude_echo("test prompt", None, Some(model), false, &scoped_coding());
 
         let res = result.expect("echo should succeed");
         let output = res.output.trim();
@@ -1017,9 +1208,9 @@ mod tests {
         );
     }
 
-    /// Helper: create a script that emits a stream-json result line containing all CLI args.
-    /// The script prints `{"type":"result","result":"<args>"}` so the stream-json parser
-    /// returns the args as the output text.  `name` is used to make the filename unique.
+    /// Helper: create a script that emits a stream-json result line containing CLI args + stdin.
+    /// The script prints `{"type":"result","result":"<args> <stdin>"}` so the stream-json
+    /// parser returns the args as the output text.  `name` makes the filename unique.
     /// Returns the absolute path to the created script.
     fn make_stream_json_result_script(name: &str) -> std::path::PathBuf {
         use std::io::Write;
@@ -1027,7 +1218,9 @@ mod tests {
         {
             let mut f = std::fs::File::create(&script_path).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, r#"printf '{{"type":"result","result":"%s"}}\n' "$*""#).unwrap();
+            writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+            writeln!(f, r#"printf '{{"type":"result","result":"%s %s"}}\n' "$*" "$PROMPT""#)
+                .unwrap();
         }
         std::fs::set_permissions(
             &script_path,
@@ -1039,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_spawn_claude_without_timeout_not_timed_out() {
-        let result = spawn_claude_echo("hello", None, None, false);
+        let result = spawn_claude_echo("hello", None, None, false, &scoped_coding());
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -1050,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_stream_json_false_uses_print_flag() {
-        let result = spawn_claude_echo("prompt", None, None, false);
+        let result = spawn_claude_echo("prompt", None, None, false, &scoped_coding());
         let output = result.unwrap().output;
         assert!(
             output.contains("--print"),
@@ -1076,7 +1269,15 @@ mod tests {
 
         let script_path = make_stream_json_result_script("args");
         std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
-        let result = spawn_claude("prompt", None, None, None, None, true);
+        let result = spawn_claude(
+            "prompt",
+            None,
+            None,
+            None,
+            None,
+            true,
+            &PermissionMode::Dangerous,
+        );
         std::env::remove_var("CLAUDE_BINARY");
         let _ = std::fs::remove_file(&script_path);
 
@@ -1624,7 +1825,13 @@ mod tests {
     /// AC: stream_json=false with a model — --print, --no-session-persistence, and --model all present.
     #[test]
     fn test_stream_json_false_with_model_has_print_and_model() {
-        let result = spawn_claude_echo("prompt", None, Some("claude-opus-4-6"), false);
+        let result = spawn_claude_echo(
+            "prompt",
+            None,
+            Some("claude-opus-4-6"),
+            false,
+            &scoped_coding(),
+        );
         let output = result.unwrap().output;
         assert!(
             output.contains("--print"),
@@ -1651,7 +1858,7 @@ mod tests {
     /// AC: stream_json=true with model + timeout — correct arg ordering.
     ///
     /// Expected order: --output-format stream-json, --no-session-persistence,
-    /// --dangerously-skip-permissions, --model <model>, -p <prompt>
+    /// --permission-mode dontAsk, --model <model>, -p <prompt>
     #[test]
     fn test_stream_json_true_with_model_and_timeout_arg_ordering() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1666,6 +1873,7 @@ mod tests {
             Some("claude-sonnet-4-6"),
             Some(timeout),
             true,
+            &scoped_coding(),
         );
         std::env::remove_var("CLAUDE_BINARY");
         let _ = std::fs::remove_file(&script_path);
@@ -1734,16 +1942,34 @@ mod tests {
             let script_path =
                 make_stream_json_result_script(&format!("4callers_{}", model.unwrap_or("none")));
             std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
-            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
+            let result = spawn_claude(
+                "test-prompt",
+                None,
+                None,
+                model,
+                None,
+                stream_json,
+                &PermissionMode::Dangerous,
+            );
             std::env::remove_var("CLAUDE_BINARY");
             let _ = std::fs::remove_file(&script_path);
             result.expect("spawn should succeed").output
         } else {
             // Call spawn_claude directly — ENV_MUTEX is already held by this function.
             // Using spawn_claude_echo here would deadlock (std::sync::Mutex is not reentrant).
-            std::env::set_var("CLAUDE_BINARY", "echo");
-            let result = spawn_claude("test-prompt", None, None, model, None, stream_json);
+            let script = make_echo_args_stdin_script("4callers_echo");
+            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            let result = spawn_claude(
+                "test-prompt",
+                None,
+                None,
+                model,
+                None,
+                stream_json,
+                &PermissionMode::Dangerous,
+            );
             std::env::remove_var("CLAUDE_BINARY");
+            let _ = std::fs::remove_file(&script);
             result.expect("spawn should succeed").output
         };
 
@@ -1843,7 +2069,15 @@ mod tests {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let script = format!("{}/tests/fixtures/mock_stream_json.sh", manifest_dir);
         std::env::set_var("CLAUDE_BINARY", &script);
-        let result = spawn_claude("ignored_prompt", None, None, None, None, stream_json);
+        let result = spawn_claude(
+            "ignored_prompt",
+            None,
+            None,
+            None,
+            None,
+            stream_json,
+            &PermissionMode::Dangerous,
+        );
         std::env::remove_var("CLAUDE_BINARY");
         result
     }
@@ -1909,4 +2143,175 @@ mod tests {
             "plain mode must not produce a conversation"
         );
     }
+
+    // --- PERM-FEAT-002: Permission mode arg construction tests ---
+
+    /// AC: Dangerous mode includes --dangerously-skip-permissions in args.
+    /// Negative: must NOT include --permission-mode or --enable-auto-mode.
+    #[test]
+    fn test_spawn_dangerous_mode_emits_skip_permissions_flag() {
+        let mode = PermissionMode::Dangerous;
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        assert!(
+            output.contains("--dangerously-skip-permissions"),
+            "Dangerous mode must include --dangerously-skip-permissions, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--permission-mode"),
+            "Dangerous mode must NOT include --permission-mode, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--enable-auto-mode"),
+            "Dangerous mode must NOT include --enable-auto-mode, got: '{output}'"
+        );
+    }
+
+    /// AC: Scoped mode includes --permission-mode dontAsk (two separate args).
+    /// Negative: must NOT include --dangerously-skip-permissions.
+    #[test]
+    fn test_spawn_scoped_mode_none_tools_emits_permission_mode_dontask() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: None,
+        };
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        assert!(
+            output.contains("--permission-mode"),
+            "Scoped mode must include --permission-mode, got: '{output}'"
+        );
+        assert!(
+            output.contains("dontAsk"),
+            "Scoped mode must include dontAsk, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--dangerously-skip-permissions"),
+            "Scoped mode must NOT include --dangerously-skip-permissions, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--allowedTools"),
+            "Scoped {{ allowed_tools: None }} must NOT include --allowedTools, got: '{output}'"
+        );
+    }
+
+    /// AC: Scoped with Some(tools) includes --permission-mode dontAsk --allowedTools <tools>.
+    /// Negative: --allowedTools must appear AFTER --permission-mode dontAsk (ordering).
+    #[test]
+    fn test_spawn_scoped_mode_some_tools_emits_allowed_tools() {
+        let tools = "Read,Edit,Write";
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some(tools.to_string()),
+        };
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        assert!(
+            output.contains("--permission-mode"),
+            "Scoped mode must include --permission-mode, got: '{output}'"
+        );
+        assert!(
+            output.contains("dontAsk"),
+            "Scoped mode must include dontAsk, got: '{output}'"
+        );
+        assert!(
+            output.contains("--allowedTools"),
+            "Scoped {{ allowed_tools: Some }} must include --allowedTools, got: '{output}'"
+        );
+        assert!(
+            output.contains(tools),
+            "Scoped mode must include the tools string, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--dangerously-skip-permissions"),
+            "Scoped mode must NOT include --dangerously-skip-permissions, got: '{output}'"
+        );
+
+        // --allowedTools must appear after --permission-mode dontAsk
+        let perm_pos = output.find("--permission-mode").unwrap();
+        let tools_pos = output
+            .find("--allowedTools")
+            .expect("--allowedTools must be present");
+        assert!(
+            tools_pos > perm_pos,
+            "--allowedTools (pos {tools_pos}) must appear AFTER --permission-mode (pos {perm_pos})"
+        );
+    }
+
+    /// AC: Auto mode includes --enable-auto-mode.
+    /// Negative: must NOT include --dangerously-skip-permissions.
+    #[test]
+    fn test_spawn_auto_mode_emits_enable_auto_mode_flag() {
+        let mode = PermissionMode::Auto;
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        assert!(
+            output.contains("--enable-auto-mode"),
+            "Auto mode must include --enable-auto-mode, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--dangerously-skip-permissions"),
+            "Auto mode must NOT include --dangerously-skip-permissions, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--permission-mode"),
+            "Auto mode must NOT include --permission-mode, got: '{output}'"
+        );
+    }
+
+    /// AC: Arg ordering preserved for Scoped mode: base flags → permission flags → [--model] → -p.
+    #[test]
+    fn test_spawn_scoped_mode_arg_ordering() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read,Edit".to_string()),
+        };
+        let result = spawn_claude_echo("my-prompt", None, Some("claude-sonnet-4-6"), false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        // --print must come first
+        assert!(
+            output.starts_with("--print"),
+            "--print must be first, got: '{output}'"
+        );
+
+        let print_pos = output.find("--print").unwrap();
+        let perm_pos = output.find("--permission-mode").unwrap();
+        let model_pos = output.find("--model").unwrap();
+        let p_pos = output.find(" -p ").unwrap();
+
+        assert!(
+            print_pos < perm_pos,
+            "--print must appear before --permission-mode"
+        );
+        assert!(
+            perm_pos < model_pos,
+            "--permission-mode must appear before --model"
+        );
+        assert!(model_pos < p_pos, "--model must appear before -p");
+    }
+
+    /// Known-bad guard: Scoped { allowed_tools: None } must NOT emit --allowedTools ''.
+    /// Passing an empty string is different from omitting the flag entirely.
+    #[test]
+    fn test_spawn_scoped_none_tools_omits_allowed_tools_entirely() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: None,
+        };
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+
+        assert!(
+            !output.contains("--allowedTools"),
+            "Scoped {{ allowed_tools: None }} must NOT emit --allowedTools at all, got: '{}'",
+            output.trim()
+        );
+    }
+
 }

@@ -1,0 +1,250 @@
+{
+  "branchName": "feat/scoped-permissions",
+  "description": "Replace --dangerously-skip-permissions with scoped --allowedTools + --permission-mode dontAsk, add --enable-auto-mode support (disabled by default), and add deprecation hint for auto mode.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy -- -D warnings",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing public APIs"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases before coding",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works",
+      "3. CORRECTNESS - Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Each task delivers working code + tests together",
+      "Test boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "taskPrefix": "PERM",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: PermissionMode enum exists with Dangerous, Scoped { allowed_tools: Option<String> }, Auto variants",
+        "Positive: CODING_ALLOWED_TOOLS constant contains Read,Edit,Write,Bash(cargo *),Bash(git *),Bash(task-mgr *),Bash(mkdir *),Bash(ls *),Bash(wc *),Bash(head *),Bash(tail *),Bash(cat *),Glob,Grep",
+        "Positive: permission_mode_from_env() returns Scoped with CODING_ALLOWED_TOOLS when no env vars set",
+        "Unit test: with LOOP_PERMISSION_MODE=dangerous, permission_mode_from_env() returns Dangerous",
+        "Unit test: with LOOP_ENABLE_AUTO_MODE=true, permission_mode_from_env() returns Auto",
+        "Unit test: with LOOP_ALLOWED_TOOLS=Read,Bash, permission_mode_from_env() returns Scoped { allowed_tools: Some('Read,Bash') }",
+        "Unit test: with both LOOP_PERMISSION_MODE=dangerous AND LOOP_ENABLE_AUTO_MODE=true, returns Dangerous (dangerous wins)",
+        "Unit test: with LOOP_PERMISSION_MODE=unknown, falls through to Scoped default",
+        "Known-bad: if auto mode is checked before dangerous mode, then setting both LOOP_PERMISSION_MODE=dangerous and LOOP_ENABLE_AUTO_MODE=true would incorrectly return Auto instead of Dangerous. Test must set both and verify Dangerous wins.",
+        "Negative: PermissionMode is NOT added as a field on LoopConfig",
+        "Positive: parse_bool_value is made pub(crate) so engine.rs can use it for the deprecation hint"
+      ],
+      "dependsOn": [],
+      "description": "Add the PermissionMode enum to src/loop_engine/config.rs with three variants: Dangerous, Scoped { allowed_tools: Option<String> }, and Auto. Add CODING_ALLOWED_TOOLS constant and permission_mode_from_env() function.\n\nDO: Follow existing config.rs patterns — use parse_env_bool() for LOOP_ENABLE_AUTO_MODE, std::env::var for LOOP_PERMISSION_MODE and LOOP_ALLOWED_TOOLS.\nDO: Derive Debug, Clone, PartialEq, Eq on the enum (matches existing config enums).\nDO: Make parse_bool_value public (currently private, needed by engine.rs for the deprecation hint).\n\nDO NOT: Add PermissionMode to LoopConfig struct — it's resolved per-call-site, not a global config field.\nDO NOT: Add any CLI flags yet — this is env-var-only configuration.\n\nEdge cases:\n- LOOP_PERMISSION_MODE=dangerous takes precedence over LOOP_ENABLE_AUTO_MODE=true (explicit dangerous overrides auto)\n- LOOP_ALLOWED_TOOLS env var overrides the default CODING_ALLOWED_TOOLS constant\n- Unrecognized LOOP_PERMISSION_MODE values fall through to the default (Scoped)\n\nKnown-bad to guard against:\n- Checking LOOP_ENABLE_AUTO_MODE before LOOP_PERMISSION_MODE would let auto mode be accidentally overridden by the default Scoped path. The check order must be: dangerous first, then auto, then scoped default.",
+      "id": "FEAT-001",
+      "notes": "Reuse existing parse_env_bool() at config.rs:144. Follow the same env var naming convention (LOOP_* prefix). The CODING_ALLOWED_TOOLS constant value comes from analysis of scripts/prompt.md — the autonomous agent needs these tools for cargo, git, task-mgr CLI, and file operations. NOTE: env var tests that call std::env::set_var must use the ENV_MUTEX pattern from claude.rs tests to avoid parallel test interference, OR use pure-function tests on parse_bool_value/parse_value instead.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Add PermissionMode enum and env var parsing to config.rs",
+      "touchesFiles": [
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: spawn_claude signature has permission_mode: &PermissionMode as last parameter",
+        "Positive: args Vec is now Vec<String> instead of Vec<&str>",
+        "Positive: Dangerous mode includes --dangerously-skip-permissions in args",
+        "Positive: Scoped mode includes --permission-mode dontAsk in args",
+        "Positive: Scoped with Some(tools) includes --allowedTools <tools> after --permission-mode dontAsk",
+        "Positive: Auto mode includes --enable-auto-mode in args",
+        "Negative: Scoped with None does NOT include --allowedTools in args",
+        "Negative: Scoped mode does NOT include --dangerously-skip-permissions",
+        "Negative: Auto mode does NOT include --dangerously-skip-permissions",
+        "Positive: Existing arg ordering preserved: base flags → permission flags → [--model] → -p <prompt>",
+        "Positive: Code compiles (cargo check) — callers will temporarily break until FEAT-003, but the function itself compiles",
+        "Failure mode: if Command::args() fails with Vec<String>, fall back to .args(args.iter().map(|s| s.as_str())) — but this should not happen since args() accepts IntoIterator<Item: AsRef<OsStr>>"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Change the spawn_claude function signature to accept permission_mode: &PermissionMode as the last parameter. Replace the hardcoded --dangerously-skip-permissions with permission-mode-aware arg construction. Change args from Vec<&str> to Vec<String> to support owned tool list strings.\n\nDO: Match on permission_mode to emit different flags:\n  - Dangerous → --dangerously-skip-permissions\n  - Scoped { allowed_tools: Some(t) } → --permission-mode dontAsk --allowedTools <t>\n  - Scoped { allowed_tools: None } → --permission-mode dontAsk (no --allowedTools)\n  - Auto → --enable-auto-mode\nDO: Keep the existing arg ordering: mode flags → [--model <m>] → -p <prompt>\nDO: Convert model and prompt args to String too for consistency.\n\nDO NOT: Change the function's other behavior (stdout tee, watchdog, process group, etc.)\nDO NOT: Update callers in this task — callers are updated in FEAT-003.\n\nEdge cases:\n- Scoped with None allowed_tools must NOT emit --allowedTools flag at all\n- The --permission-mode and dontAsk are two separate args (not --permission-mode=dontAsk)\n\nKnown-bad to guard against:\n- Passing --allowedTools with an empty string is different from omitting it entirely. Scoped { allowed_tools: None } must omit the flag, not pass --allowedTools ''.",
+      "id": "FEAT-002",
+      "notes": "The function is at src/loop_engine/claude.rs:67-209. Current args construction is lines 76-98. Command::args() at line 101 accepts any IntoIterator<Item: AsRef<OsStr>>, so Vec<String> works directly. Update the doc comments (lines 1-9, 44-66) to reflect the new behavior. Import PermissionMode from config at the top of the file.",
+      "passes": true,
+      "priority": 2,
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "Modify spawn_claude to accept PermissionMode and build args accordingly",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: IterationParams has new field permission_mode: &'a PermissionMode",
+        "Positive: run_loop() calls config::permission_mode_from_env() once and stores the result",
+        "Positive: engine.rs spawn_claude call passes params.permission_mode",
+        "Positive: learnings/ingestion/mod.rs passes &PermissionMode::Scoped { allowed_tools: None }",
+        "Positive: curate/enrich.rs passes &PermissionMode::Scoped { allowed_tools: None }",
+        "Positive: curate/mod.rs passes &PermissionMode::Scoped { allowed_tools: None }",
+        "Positive: watchdog.rs tests pass &PermissionMode::Dangerous",
+        "Positive: cargo check passes with zero errors across all modules",
+        "Negative: main loop caller does NOT pass Scoped { allowed_tools: None } — it must include the coding tools",
+        "Known-bad: passing None tools to the engine.rs caller would compile fine but break all iterations at runtime. Verify engine.rs call uses the permission_mode from env (which defaults to Scoped with CODING_ALLOWED_TOOLS)."
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Update the 4 production call sites and 2 test call sites that invoke spawn_claude to pass the new permission_mode parameter.\n\nDO: Use these permission modes per call site:\n  1. engine.rs:459 (main loop) → pass permission_mode from IterationParams (resolved from env)\n  2. learnings/ingestion/mod.rs:77 → Scoped { allowed_tools: None } (text-only analysis)\n  3. curate/enrich.rs:234 → Scoped { allowed_tools: None } (text-only analysis)\n  4. curate/mod.rs:613 → Scoped { allowed_tools: None } (text-only analysis)\n  5. watchdog.rs test (line 308) → Dangerous (test with mock binary)\n  6. watchdog.rs test (line 362) → Dangerous (test with mock binary)\n\nDO: Add permission_mode: &'a PermissionMode field to IterationParams struct (engine.rs:~94).\nDO: Resolve permission_mode once in run_loop() near Step 15 (~line 1176) using config::permission_mode_from_env(), store it, and pass to IterationParams.\n\nDO NOT: Add the deprecation warning in this task — that's FEAT-004.\n\nEdge cases:\n- The learning/curate callers are text-only (no tool use) — passing Scoped with None ensures they get --permission-mode dontAsk without any --allowedTools, which means Claude operates in pure text-in/text-out mode.\n\nKnown-bad to guard against:\n- If the main loop caller passes Scoped { allowed_tools: None } instead of Scoped { allowed_tools: Some(CODING_ALLOWED_TOOLS) }, Claude won't have access to Read/Edit/Bash and every iteration will fail silently.",
+      "id": "FEAT-003",
+      "notes": "Import paths needed: use crate::loop_engine::config::PermissionMode in curate/enrich.rs, curate/mod.rs, learnings/ingestion/mod.rs. For watchdog.rs tests, import PermissionMode from the parent module. The IterationParams struct is at engine.rs:~94-126. The run_loop() function starts at engine.rs:670.",
+      "passes": true,
+      "priority": 3,
+      "synergyWith": [],
+      "title": "Update all spawn_claude callers with appropriate PermissionMode",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/mod.rs",
+        "src/loop_engine/watchdog.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: When LOOP_AUTO_MODE_AVAILABLE=true and mode is Scoped, hint message prints to stderr",
+        "Positive: Hint includes text about --enable-auto-mode and LOOP_ENABLE_AUTO_MODE=true",
+        "Positive: Hint uses yellow ANSI color code for [hint] prefix",
+        "Negative: When LOOP_AUTO_MODE_AVAILABLE is unset, no hint prints",
+        "Negative: When LOOP_AUTO_MODE_AVAILABLE=false, no hint prints",
+        "Negative: When mode is Auto, no hint prints even with LOOP_AUTO_MODE_AVAILABLE=true",
+        "Positive: Hint is placed between Step 15 (banner) and Step 16 (usage params) in run_loop()"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Add a one-time hint message that prints at loop start when auto mode is available but not enabled. The hint fires when LOOP_AUTO_MODE_AVAILABLE=true is set AND the resolved permission mode is NOT Auto.\n\nDO: Insert the check after Step 15 (session banner, ~line 1176) and before Step 16 (usage params).\nDO: Use eprintln! with yellow ANSI color for the [hint] prefix, matching existing warning patterns.\nDO: Make the hint actionable — tell the user exactly what env var to set.\nDO: Use config::parse_bool_value (now pub(crate) from FEAT-001) to parse the env var.\n\nDO NOT: Print the hint if the user already has auto mode enabled.\nDO NOT: Use any external crate for colored output — raw ANSI codes are fine (eprintln! goes to stderr).\n\nEdge cases:\n- LOOP_AUTO_MODE_AVAILABLE not set → no hint (silent)\n- LOOP_AUTO_MODE_AVAILABLE=false → no hint\n- LOOP_AUTO_MODE_AVAILABLE=true + PermissionMode::Auto → no hint (already enabled)\n- LOOP_AUTO_MODE_AVAILABLE=true + PermissionMode::Dangerous → show hint (they should switch)\n- LOOP_AUTO_MODE_AVAILABLE=true + PermissionMode::Scoped → show hint",
+      "id": "FEAT-004",
+      "notes": "The display::print_session_banner call is at engine.rs:1169-1175. Insert the hint check at ~line 1176. Use config::parse_bool_value(&val) for parsing. The permission_mode variable is already resolved from FEAT-003.",
+      "passes": true,
+      "priority": 4,
+      "synergyWith": [],
+      "title": "Add auto mode deprecation hint in engine.rs",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: spawn_claude_echo accepts permission_mode: &PermissionMode parameter",
+        "Positive: All 6 existing tests pass with updated assertions",
+        "Unit test: test_permission_mode_dangerous — output contains --dangerously-skip-permissions, does NOT contain --permission-mode",
+        "Unit test: test_permission_mode_scoped_with_tools — output contains --permission-mode dontAsk --allowedTools <tools>, does NOT contain --dangerously-skip-permissions",
+        "Unit test: test_permission_mode_scoped_no_tools — output contains --permission-mode dontAsk, does NOT contain --allowedTools, does NOT contain --dangerously-skip-permissions",
+        "Unit test: test_permission_mode_auto — output contains --enable-auto-mode, does NOT contain --dangerously-skip-permissions, does NOT contain --permission-mode",
+        "Positive: Exact-string test updated to new default scoped args format",
+        "Positive: Ordering tests updated to verify permission flags come after --no-session-persistence and before [--model] -p",
+        "Positive: All tests in cargo test --lib loop_engine::claude pass",
+        "Known-bad: if a test still asserts --dangerously-skip-permissions for the default mode, it would pass with the old code but fail with the new code — all such assertions must be updated"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Update all 6 existing tests in claude.rs that assert on --dangerously-skip-permissions, and add new tests covering all PermissionMode variants.\n\nDO: Update spawn_claude_echo helper to accept permission_mode parameter.\nDO: Update existing tests to pass a PermissionMode (most should use Scoped with tools since that's the new default).\nDO: Update assertions from checking --dangerously-skip-permissions to checking --permission-mode dontAsk.\nDO: Update the exact-string test (test_spawn_claude_none_model_identical_to_pre_phase2) to match new arg format.\nDO: Add new tests for each PermissionMode variant.\n\nDO NOT: Change test logic for non-permission-related behavior (model handling, timeout, stream-json, etc.).\n\nExisting tests to update:\n1. test_spawn_model_none_no_model_flag (line 743)\n2. test_spawn_model_some_preserves_required_flags (line 835)\n3. test_spawn_claude_model_does_not_interfere_with_flags (line 924)\n4. test_spawn_claude_none_model_identical_to_pre_phase2 (line 987)\n5. test_stream_json_false_uses_print_flag (line 1052)\n6. test_stream_json_true_with_model_and_timeout_arg_ordering (line 1656)\n\nNew tests to add:\n- test_permission_mode_dangerous_uses_skip_flag\n- test_permission_mode_scoped_with_tools\n- test_permission_mode_scoped_no_tools\n- test_permission_mode_auto\n\nKnown-bad to guard against:\n- The exact-string test (pre_phase2) is the strictest validator. If the new arg format is wrong, this test catches it. Update its expected string carefully.",
+      "id": "FEAT-005",
+      "notes": "The spawn_claude_echo helper is at claude.rs:457-468. The ENV_MUTEX pattern is at claude.rs:454. Tests use CLAUDE_BINARY=echo to capture args. For the exact-string test, the new expected output for Scoped mode with stream_json=false would be: '--print --no-session-persistence --permission-mode dontAsk --allowedTools <tools> -p my prompt text'. For tests that just need to compile and aren't testing permission modes specifically, use &PermissionMode::Scoped { allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string()) } as the default.",
+      "passes": true,
+      "priority": 5,
+      "synergyWith": [],
+      "title": "Update existing spawn_claude tests + add new permission mode tests",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: claude.rs module doc (line 1-9) no longer references --dangerously-skip-permissions as the only mode",
+        "Positive: spawn_claude doc comment documents the permission_mode parameter and its three variants",
+        "Positive: No stale references to --dangerously-skip-permissions as 'always present' in doc comments",
+        "Positive: cargo doc generates clean documentation"
+      ],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Update all doc comments that reference --dangerously-skip-permissions to reflect the new permission model.\n\nDO: Update the module-level doc comment at claude.rs:1-9 to describe the three permission modes.\nDO: Update the spawn_claude function doc comment (claude.rs:44-66) to document the permission_mode parameter.\nDO: Update any references in engine.rs comments that mention the old flag.\n\nDO NOT: Add doc comments to functions you didn't change.\nDO NOT: Change any logic — this is documentation only.",
+      "id": "FEAT-006",
+      "notes": "Search for all occurrences of 'dangerously-skip-permissions' in doc comments (not in match arms or test assertions). Key locations: claude.rs:3, claude.rs:46.",
+      "passes": true,
+      "priority": 6,
+      "synergyWith": [],
+      "title": "Update doc comments and module documentation",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: No duplicated multi-line patterns appearing 3+ times without extraction",
+        "Positive: spawn_claude function remains readable (linear orchestration is OK per learning 328)",
+        "Positive: Test helpers are ergonomic — common cases don't require boilerplate",
+        "Positive: cargo clippy -- -D warnings passes with zero warnings"
+      ],
+      "dependsOn": [
+        "FEAT-006"
+      ],
+      "description": "Review all changes for opportunities to improve code quality.\n\nDO: Check for duplicated PermissionMode::Scoped { allowed_tools: None } construction across callers — if 3+ sites use the same pattern, consider a helper constant or constructor.\nDO: Check function lengths — spawn_claude was already 142 lines; verify the permission match didn't push it over a readability threshold.\nDO: Check test helper ergonomics — if most tests pass the same PermissionMode, consider a default wrapper.\n\nDO NOT: Over-abstract — if the duplication is just 2 lines, a helper isn't worth it.",
+      "id": "REFACTOR-001",
+      "notes": "Learning 328: 'Long linear orchestration functions are acceptable if splitting scatters flow.' Don't split spawn_claude just for line count — it's linear orchestration. But DO extract if the permission match block could be a standalone function for testing.",
+      "passes": true,
+      "priority": 7,
+      "synergyWith": [],
+      "title": "Review for DRY, testability, and code quality",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: permission_mode flows correctly: env → run_loop → IterationParams → spawn_claude",
+        "Positive: CODING_ALLOWED_TOOLS matches what prompt.md instructs the agent to use",
+        "Positive: No stale --dangerously-skip-permissions references in production code or doc comments",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings for new code",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-98"
+      ],
+      "dependsOn": [
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring. Run full test suite.\n\nDO: Check every new function for error handling, check callers still work, verify no dead code.\nDO: Verify the CODING_ALLOWED_TOOLS constant covers all tools the prompt.md instructs Claude to use.\nDO: Verify the env var precedence chain works correctly (dangerous > auto > scoped).\nDO: Check that text-only callers (learning extraction, curate) truly don't need any tools.\nDO: Verify no stale references to --dangerously-skip-permissions in non-test code.\n\nDO NOT: Skip the integration wiring check — verify permission_mode flows from run_loop → IterationParams → spawn_claude.\nDO NOT: Skip checking that the escape hatch (LOOP_PERMISSION_MODE=dangerous) actually works end-to-end.",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'.",
+      "passes": true,
+      "priority": 99,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/engine.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/commands/curate/enrich.rs",
+        "src/commands/curate/mod.rs",
+        "src/loop_engine/watchdog.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
