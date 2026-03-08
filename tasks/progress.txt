@@ -128,3 +128,21 @@
 - **Approach**: Manual review of all 5 files per learning #275 (4-axis checklist)
 - **Learnings:** invalidate_learning is at the 30-line boundary but doesn't warrant splitting — the two branches (downgrade vs retire) share setup code and splitting would add indirection without improving clarity.
 ---
+
+## 2026-03-07 - 12656b00-POLISH-001
+- Added 'Invalidate wrong learnings' guidance to .claude/commands/tasks.md Learnings Guidelines section
+- Added 'Learnings Guidelines' section with matching guidance to tasks/invalidate-learning-prompt.md
+- Both files explain: wrong learnings -> task-mgr invalidate-learning <id>, two-step behavior (Low then retire)
+- **Learnings:** invalidate-learning-prompt.md had no Learnings Guidelines section; added one before Progress Report Format
+---
+
+## 2026-03-07 - 12656b00-REFACTOR-REVIEW-3
+- Final refactoring review across all 6 implementation files, 4 dimensions
+- DRY: No violations. Uses shared test_helpers, existing CRUD layer, standard patterns
+- Complexity: invalidate_learning() ~33 code lines, clear linear flow. format_text() 12 lines. All other touchpoints trivial
+- Coupling: Appropriate — CRUD layer, models, standard error types. Direct SQL for retired_at is documented workaround
+- Maintainability: Comprehensive test coverage (10 unit tests, 5 integration tests), thorough doc comments, follows apply_learning pattern
+- Quality gate: fmt clean, clippy clean, 2402 tests pass (5 pre-existing warnings in unrelated files)
+- No REFACTOR-3-xxx tasks needed — code is clean
+- **Approach**: Manual 4-axis checklist per learning #275
+---
