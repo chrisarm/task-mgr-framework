@@ -884,11 +884,13 @@ APPEND to `.task-mgr/tasks/progress.txt`:
 - Instead of separate entries for FIX-001, FIX-002, FIX-003
 - Write: "FIX-001 through FIX-003: Fixed X by doing Y"
 
-**Invalidate wrong learnings:**
+**Learnings feedback loop (close the loop!):**
 
-- If a learning recalled via `task-mgr recall` turns out to be wrong or harmful, run `task-mgr invalidate-learning <id>` to degrade it
-- First call downgrades confidence to Low; second call (when already Low) retires the learning permanently
-- Use the learning `id` shown in the `recall` output
+- **If a learning helped**: Run `task-mgr apply-learning <id>` to boost its UCB ranking for future iterations
+- **If a learning is wrong**: Run `task-mgr invalidate-learning <id>` to degrade it (first call: confidence -> Low; second call: retires permanently)
+- Use the `id` field from the `## Relevant Learnings` JSON block injected into each iteration's prompt
+- Do not hesitate to invalidate wrong learnings — they waste prompt budget and mislead future iterations
+- **If a learning blocks your task**: Test the claim first (write a small test or experiment). If the learning is wrong, invalidate it and proceed. Learnings are historical observations, not immutable rules — the codebase evolves
 
 ---
 

@@ -156,7 +156,7 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 /// Tools like `Bash(cat:*)` and `Bash(git:*)` permit arbitrary file
 /// reads and remote pushes respectively. For stricter isolation, use a
 /// container or VM.
-pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,NotebookEdit,Agent,LSP,Bash(cargo:*),Bash(git:*),Bash(task-mgr:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(find:*),Bash(rg:*),Bash(sed:*),Bash(cd:*),Bash(ruff:*),Bash(mypy:*),Bash(uv:*),Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(grep:*),Bash(awk:*),Bash(sort:*),Bash(uniq:*),Bash(tr:*),Bash(cut:*),Bash(diff:*),Bash(touch:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(chmod:*),Bash(echo:*),Bash(printf:*),Bash(tee:*),Bash(xargs:*),Bash(jq:*),Bash(yq:*),Bash(curl:*),Bash(wget:*),Bash(docker:*),Bash(docker-compose:*),Bash(tree:*),Bash(which:*),Bash(command:*),Bash(pwd:*),Bash(realpath:*),Bash(dirname:*),Bash(basename:*),Bash(date:*),Bash(stat:*),Bash(env:*),Bash(source:*),Bash(rustup:*),Bash(mix:*),Bash(elixir:*),Bash(iex:*),Bash(hex:*),Bash(rebar3:*),Glob,Grep";
+pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,NotebookEdit,Agent,LSP,Bash(cargo:*),Bash(git:*),Bash(task-mgr:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(find:*),Bash(rg:*),Bash(sed:*),Bash(cd:*),Bash(ruff:*),Bash(mypy:*),Bash(uv:*),Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(grep:*),Bash(awk:*),Bash(sort:*),Bash(uniq:*),Bash(tr:*),Bash(cut:*),Bash(diff:*),Bash(touch:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(chmod:*),Bash(echo:*),Bash(printf:*),Bash(tee:*),Bash(xargs:*),Bash(jq:*),Bash(yq:*),Bash(curl:*),Bash(wget:*),Bash(docker:*),Bash(docker-compose:*),Bash(tree:*),Bash(which:*),Bash(command:*),Bash(pwd:*),Bash(realpath:*),Bash(dirname:*),Bash(basename:*),Bash(date:*),Bash(stat:*),Bash(env:*),Bash(source:*),Bash(rustup:*),Bash(mix:*),Bash(elixir:*),Bash(iex:*),Bash(hex:*),Bash(rebar3:*),Bash(./scripts/*:*),Glob,Grep";
 
 /// Permission mode for Claude subprocess invocation.
 ///
@@ -792,6 +792,7 @@ mod tests {
             "Bash(iex:*)",
             "Bash(hex:*)",
             "Bash(rebar3:*)",
+            "Bash(./scripts/*:*)",
             "Glob",
             "Grep",
         ] {

@@ -24,7 +24,11 @@ pub(crate) fn build_learnings_section(learnings: &[LearningSummaryOutput]) -> St
         serde_json::to_string_pretty(learnings).unwrap_or_else(|_| "[]".to_string());
     let learnings_json = truncate_to_budget(&learnings_json, LEARNINGS_BUDGET);
     format!(
-        "## Relevant Learnings\n\n```json\n{}\n```\n\n",
+        "## Relevant Learnings\n\n\
+         Use `task-mgr apply-learning <id>` if helpful. \
+         Use `task-mgr invalidate-learning <id>` if wrong. \
+         If a learning blocks your task, test the claim before obeying it.\n\n\
+         ```json\n{}\n```\n\n",
         learnings_json
     )
 }

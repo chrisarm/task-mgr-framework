@@ -341,21 +341,55 @@ The loop claims tasks in dependency order, runs Claude Code for each, validates 
 
 ### Phase 5: Learn
 
-Learnings accumulate automatically during loop execution. The agent captures what worked, what didn't, and patterns discovered. These feed into future iterations, making each build cycle more effective.
+Learnings accumulate automatically during loop execution. The agent captures what worked, what didn't, and patterns discovered. These feed into future iterations via UCB bandit ranking.
+
+Use the learnings feedback skills during interactive sessions:
+
+| Skill | Purpose |
+|-------|---------|
+| `/tm-apply` | Confirm a learning was useful (boosts UCB ranking score) |
+| `/tm-learn` | Record a learning (auto-detects outcome type, task context) |
+| `/tm-recall` | Query learnings by task, text, tags, or auto-detect from context |
+| `/tm-invalidate` | Invalidate a wrong learning (two-step: downgrade then retire) |
+| `/tm-status` | Show project status dashboard, task progress, active runs |
+| `/tm-next` | Get next recommended task with scoring breakdown |
+
+When a learning blocks progress (e.g., "tests can't run because service X is down"), the agent is instructed to **test the claim first** — run one test to verify — rather than blindly skipping work based on stale information.
 
 ### Setting Up the Skills
 
-The `/prd`, `/tasks`, and `/plan-tasks` skills are included in this repo at `.claude/commands/`. To make them available in Claude Code:
+All skills are included in this repo at `.claude/commands/`. There are two categories:
+
+**Workflow skills** (`/prd`, `/tasks`, `/plan-tasks`) — used during planning phases:
+
+| Skill | Purpose |
+|-------|---------|
+| `/prd` | Generate structured PRD from rough requirements |
+| `/tasks` | Convert PRD to JSON task list + prompt file |
+| `/plan-tasks` | Combined planning + task generation (skip PRD for small work) |
+
+**Task-mgr skills** (`/tm-apply`, `/tm-learn`, `/tm-recall`, `/tm-invalidate`, `/tm-status`, `/tm-next`) — used during build/learn phases.
 
 **Option A: Use the repo copies directly** — Claude Code automatically loads skills from `.claude/commands/` in the project root. Just clone the repo and they're available.
 
-**Option B: Symlink to your global commands** — If you want the skills available across all projects:
+**Option B: Copy to global commands** — To make skills available across all projects:
 
 ```bash
-ln -s "$(pwd)/.claude/commands/prd.md" ~/.claude/commands/prd.md
-ln -s "$(pwd)/.claude/commands/tasks.md" ~/.claude/commands/tasks.md
-ln -s "$(pwd)/.claude/commands/plan-tasks.md" ~/.claude/commands/plan-tasks.md
+# Workflow skills
+cp .claude/commands/prd.md ~/.claude/commands/
+cp .claude/commands/tasks.md ~/.claude/commands/
+cp .claude/commands/plan-tasks.md ~/.claude/commands/
+
+# Task-mgr skills (recommended for all projects using task-mgr)
+cp .claude/commands/tm-apply.md ~/.claude/commands/
+cp .claude/commands/tm-learn.md ~/.claude/commands/
+cp .claude/commands/tm-recall.md ~/.claude/commands/
+cp .claude/commands/tm-invalidate.md ~/.claude/commands/
+cp .claude/commands/tm-status.md ~/.claude/commands/
+cp .claude/commands/tm-next.md ~/.claude/commands/
 ```
+
+The loop engine warns at startup if task-mgr skills are missing from `~/.claude/commands/` and shows the exact copy commands needed.
 
 ## Shell Integration
 

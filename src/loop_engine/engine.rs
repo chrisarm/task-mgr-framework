@@ -680,9 +680,79 @@ pub struct LoopRunConfig {
 /// - 2: blocked
 /// - 130: SIGINT
 /// - 143: SIGTERM
+
+/// Expected global skills for task-mgr loop workflows.
+///
+/// These skills (`.md` files in `~/.claude/commands/`) provide slash commands
+/// that wrap common task-mgr operations for interactive Claude Code sessions.
+const EXPECTED_GLOBAL_SKILLS: &[&str] = &[
+    "tm-apply",
+    "tm-learn",
+    "tm-recall",
+    "tm-invalidate",
+    "tm-status",
+    "tm-next",
+];
+
+/// Check if task-mgr global Claude Code skills are installed.
+///
+/// Prints a warning with installation instructions if any are missing.
+/// Non-blocking — the loop continues regardless.
+fn check_global_skills(source_root: &Path) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => return, // Can't determine home dir; skip check silently
+    };
+    let global_dir = home.join(".claude").join("commands");
+
+    let missing: Vec<&str> = EXPECTED_GLOBAL_SKILLS
+        .iter()
+        .filter(|name| !global_dir.join(format!("{}.md", name)).exists())
+        .copied()
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    let repo_skill_dir = source_root.join(".claude").join("commands");
+    let has_repo_copies = missing
+        .iter()
+        .any(|name| repo_skill_dir.join(format!("{}.md", name)).exists());
+
+    eprintln!(
+        "Warning: {} task-mgr skill(s) not found in ~/.claude/commands/: {}",
+        missing.len(),
+        missing.join(", ")
+    );
+
+    if has_repo_copies {
+        eprintln!("  Install from this repo:");
+        for name in &missing {
+            let src = repo_skill_dir.join(format!("{}.md", name));
+            if src.exists() {
+                eprintln!(
+                    "    cp {} {}/",
+                    src.display(),
+                    global_dir.display()
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "  These skills provide /tm-learn, /tm-recall, /tm-invalidate, /tm-status, /tm-next"
+        );
+        eprintln!("  See the task-mgr README for installation instructions.");
+    }
+    eprintln!();
+}
+
 pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 1: Load environment
     env::load_env();
+
+    // Step 1.5: Check for global Claude Code skills
+    check_global_skills(&run_config.source_root);
 
     // Step 2: Validate git repo (source_root is the original repo)
     if let Err(e) = env::validate_git_repo(&run_config.source_root) {

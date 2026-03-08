@@ -275,6 +275,52 @@ Indicate which task types benefit from this learning:
 - `TECH` - Technical debt
 - `WARN` - Warning fixes
 
+## Learnings Feedback Loop (IMPORTANT)
+
+The `## Relevant Learnings` section injected into your prompt each iteration contains learnings ranked by a UCB bandit algorithm. **You close the feedback loop** by telling task-mgr which learnings helped and which were wrong.
+
+### When a Learning Helped
+
+If a learning from the `## Relevant Learnings` section was useful for completing your task, confirm it so the bandit ranks it higher next time:
+
+```bash
+task-mgr apply-learning <id>
+```
+
+Use the `id` field from the learning JSON. Do this after you've verified the learning's advice worked.
+
+### When a Learning is Wrong
+
+If a surfaced learning gives wrong advice, outdated information, or causes problems, invalidate it immediately:
+
+```bash
+task-mgr invalidate-learning <id>
+```
+
+**Two-step degradation:**
+- First call: downgrades confidence to Low (still visible but deprioritized)
+- Second call (already Low): retires the learning permanently (excluded from all future recalls)
+
+**When to invalidate:**
+- The learning's advice caused a compile error, test failure, or bug
+- The learning describes a pattern that doesn't apply to the current codebase
+- The learning's root cause analysis is incorrect
+- The workaround is no longer needed (underlying issue was fixed)
+
+**Do not hesitate to invalidate.** Wrong learnings actively harm future iterations by consuming prompt budget and misleading the agent. The two-step degradation protects against accidental data loss.
+
+### Challenging Learnings That Block Progress
+
+If a surfaced learning is preventing you from completing a task — e.g., it claims an approach won't work, or warns against something you need to do — **do not blindly obey it.** Instead:
+
+1. **Test the claim.** Run a single concrete experiment that checks whether the learning still holds. Don't skip an entire category of work based on a learning — run one test and see what actually happens.
+2. **If the learning is wrong:** Invalidate it (`task-mgr invalidate-learning <id>`) and proceed with the task.
+3. **If the learning is right:** Respect it and find an alternative approach. Apply it (`task-mgr apply-learning <id>`).
+
+**Example:** A learning says "Cannot run integration tests — the external service is down." Don't skip all tests. Run one test that hits the service and see if it actually fails. If the service is back up, invalidate the learning and run the full suite.
+
+Learnings are historical observations, not immutable rules. The codebase evolves — dependencies get updated, services come back online, bugs get fixed. A learning that was correct last iteration may be wrong now. **Verify, don't assume.**
+
 ## Project Structure
 
 The task-mgr CLI will be built in `task-mgr/` with this structure:
