@@ -76,3 +76,25 @@
 - Quality gate: 0 fmt issues, 0 clippy errors, 2397 tests pass (5 pre-existing test-only warnings)
 - **Learnings:** The full chain (env → run_loop → IterationParams → spawn_claude) ensures permission mode is resolved once and threaded consistently. Text-only callers using PermissionMode::text_only() is clean API design.
 ---
+
+## 2026-03-07 - 12656b00-FEAT-001
+- Implemented invalidate_learning(): two-step degradation via get_learning + direct SQL retired_at check
+- confidence != Low → edit_learning(confidence: Some(Low)); action='downgraded', new_confidence=Some("low")
+- confidence == Low → UPDATE SET retired_at = datetime('now'); action='retired', new_confidence=None
+- Implemented format_text() for both cases per acceptance criteria
+- Wired up: pub use in commands/mod.rs, CLI variant in commands.rs, match arm in main.rs, impl_text_formattable! in handlers.rs
+- All 2401 tests pass, zero clippy warnings, cargo fmt clean
+- **Learnings:** pub use ordering enforced alphabetically by cargo fmt (import_learnings before init before invalidate_learning before irrelevant). Direct SQL for retired_at is the right pattern when the model struct lacks the field.
+---
+
+## 2026-03-07 - TEST-INIT-001
+- Created src/commands/invalidate_learning.rs with stub functions + 9 tests
+- Added pub mod invalidate_learning to src/commands/mod.rs
+- Tests compile; all 9 fail with `todo!()` as expected per TDD approach
+- 2392 pre-existing tests still pass (no regressions)
+- **Approach chosen**: State-based logic (confidence != Low → downgrade; confidence == Low → retire)
+  matching FEAT-001 spec. Known-bad discriminator tests High→first call returns 'downgraded' not 'retired'.
+- **Learnings**: test_helpers::setup_db/retire_learning are pub(crate) accessible from cfg(test) blocks
+  anywhere in the crate; format function named `format_text` inside module, re-exported as
+  `format_invalidate_learning_text` in mod.rs (matches existing apply_learning pattern).
+---

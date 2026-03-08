@@ -1554,11 +1554,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     )
                     .is_none()
                 {
-                    if let Some(hash) = wrapper_commit(
-                        &working_root,
-                        task_id,
-                        "loop wrapper commit",
-                    ) {
+                    if let Some(hash) =
+                        wrapper_commit(&working_root, task_id, "loop wrapper commit")
+                    {
                         ctx.last_commit = Some(hash);
                     }
                 }

@@ -525,11 +525,8 @@ mod tests {
             writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
             writeln!(f, r#"echo "$@" "$PROMPT""#).unwrap();
         }
-        std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         path
     }
 
@@ -778,8 +775,7 @@ mod tests {
         // sleeps long enough for the watchdog to kill it.
         use std::io::Write as _;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let script_path =
-            std::env::temp_dir().join("task_mgr_test_watchdog_signal_sleep.sh");
+        let script_path = std::env::temp_dir().join("task_mgr_test_watchdog_signal_sleep.sh");
         {
             let mut f = std::fs::File::create(&script_path).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
@@ -858,8 +854,7 @@ mod tests {
     fn test_broken_pipe_on_immediate_exit() {
         use std::io::Write as _;
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let script_path =
-            std::env::temp_dir().join("task_mgr_test_epipe_immediate_exit.sh");
+        let script_path = std::env::temp_dir().join("task_mgr_test_epipe_immediate_exit.sh");
         {
             let mut f = std::fs::File::create(&script_path).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
@@ -1219,8 +1214,11 @@ mod tests {
             let mut f = std::fs::File::create(&script_path).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
             writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
-            writeln!(f, r#"printf '{{"type":"result","result":"%s %s"}}\n' "$*" "$PROMPT""#)
-                .unwrap();
+            writeln!(
+                f,
+                r#"printf '{{"type":"result","result":"%s %s"}}\n' "$*" "$PROMPT""#
+            )
+            .unwrap();
         }
         std::fs::set_permissions(
             &script_path,
@@ -2313,5 +2311,4 @@ mod tests {
             output.trim()
         );
     }
-
 }

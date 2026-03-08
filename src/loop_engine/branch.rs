@@ -37,7 +37,12 @@ use super::LAST_BRANCH_FILE;
 /// # Errors
 ///
 /// Returns an error if git branch detection fails or the user declines in interactive mode.
-pub fn detect_branch_change(dir: &Path, db_dir: &Path, tasks_dir: &Path, yes_mode: bool) -> TaskMgrResult<bool> {
+pub fn detect_branch_change(
+    dir: &Path,
+    db_dir: &Path,
+    tasks_dir: &Path,
+    yes_mode: bool,
+) -> TaskMgrResult<bool> {
     let last_branch_path = tasks_dir.join(LAST_BRANCH_FILE);
 
     // Get current branch
@@ -205,7 +210,8 @@ mod tests {
         let tasks_dir = tmp.path().join("tasks");
         fs::create_dir_all(&tasks_dir).expect("create tasks dir");
 
-        let result = detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
+        let result =
+            detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         assert!(!result, "First run should return false (no change)");
 
         // .last-branch should be created
@@ -220,7 +226,8 @@ mod tests {
         fs::create_dir_all(&tasks_dir).expect("create tasks dir");
         fs::write(tasks_dir.join(LAST_BRANCH_FILE), "main\n").expect("write .last-branch");
 
-        let result = detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
+        let result =
+            detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         assert!(!result, "Same branch should return false");
     }
 
@@ -233,7 +240,8 @@ mod tests {
         // Set .last-branch to a different branch
         fs::write(tasks_dir.join(LAST_BRANCH_FILE), "old-branch\n").expect("write .last-branch");
 
-        let result = detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
+        let result =
+            detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         assert!(result, "Branch change should return true");
 
         // .last-branch should be updated
@@ -313,7 +321,8 @@ mod tests {
         // Empty .last-branch
         fs::write(tasks_dir.join(LAST_BRANCH_FILE), "").expect("write .last-branch");
 
-        let result = detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
+        let result =
+            detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         // Empty string != "main", so this is a branch change
         assert!(result, "Empty .last-branch should trigger change detection");
 
@@ -330,7 +339,8 @@ mod tests {
         // .last-branch with trailing whitespace
         fs::write(tasks_dir.join(LAST_BRANCH_FILE), "  main  \n").expect("write .last-branch");
 
-        let result = detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
+        let result =
+            detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         assert!(!result, "Should trim whitespace and detect same branch");
     }
 

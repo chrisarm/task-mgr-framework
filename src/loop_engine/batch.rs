@@ -244,11 +244,19 @@ pub async fn run_batch(
     prd_files.dedup();
 
     let pattern_display = if patterns.len() <= 3 {
-        patterns.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ")
+        patterns
+            .iter()
+            .map(|p| format!("'{p}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
     } else {
         format!("{} pattern(s)", patterns.len())
     };
-    eprintln!("Batch mode: found {} PRD file(s) matching {}", prd_files.len(), pattern_display);
+    eprintln!(
+        "Batch mode: found {} PRD file(s) matching {}",
+        prd_files.len(),
+        pattern_display
+    );
 
     // Step 2: Validate all prompt files exist
     let pairs = match validate_prompt_files(&prd_files) {

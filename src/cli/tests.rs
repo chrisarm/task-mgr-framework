@@ -2460,9 +2460,7 @@ fn test_batch_multiple_patterns() {
         "--yes",
     ]);
     match cli.command {
-        Commands::Batch {
-            patterns, yes, ..
-        } => {
+        Commands::Batch { patterns, yes, .. } => {
             assert_eq!(patterns, vec!["tasks/rag-01.json", "tasks/rag-02.json"]);
             assert!(yes);
         }
@@ -2547,7 +2545,11 @@ fn test_batch_short_yes_flag() {
 fn test_archive_defaults() {
     let cli = Cli::parse_from(["task-mgr", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             assert!(!dry_run);
             assert!(!all);
             assert!(branch.is_none());
@@ -2560,7 +2562,11 @@ fn test_archive_defaults() {
 fn test_archive_with_dry_run() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--dry-run"]);
     match cli.command {
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             assert!(dry_run);
             assert!(!all);
             assert!(branch.is_none());
@@ -2573,7 +2579,11 @@ fn test_archive_with_dry_run() {
 fn test_archive_with_all_flag() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--all"]);
     match cli.command {
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             assert!(!dry_run);
             assert!(all);
             assert!(branch.is_none());
@@ -2586,7 +2596,11 @@ fn test_archive_with_all_flag() {
 fn test_archive_with_json_format() {
     let cli = Cli::parse_from(["task-mgr", "--format", "json", "archive"]);
     match cli.command {
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             assert!(!dry_run);
             assert!(!all);
             assert!(branch.is_none());
@@ -2600,7 +2614,11 @@ fn test_archive_with_json_format() {
 fn test_archive_with_branch_flag() {
     let cli = Cli::parse_from(["task-mgr", "archive", "--branch", "feat/x"]);
     match cli.command {
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             assert!(!dry_run);
             assert!(!all);
             assert_eq!(branch, Some("feat/x".to_string()));
