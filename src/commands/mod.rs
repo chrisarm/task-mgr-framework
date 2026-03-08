@@ -32,6 +32,7 @@ pub mod fail;
 pub mod history;
 pub mod import_learnings;
 pub mod init;
+pub mod invalidate_learning;
 pub mod irrelevant;
 pub mod learn;
 pub mod learnings;
