@@ -1601,3 +1601,168 @@ fn test_archive_json_format_structure() {
         "Exactly 1 PRD (P2) should be skipped"
     );
 }
+
+// ============================================================================
+// Test: invalidate-learning command
+// ============================================================================
+
+#[test]
+fn test_invalidate_learning_downgrade_text_output() {
+    // AC1: First call on a non-low-confidence learning produces downgrade text output
+    let (temp_dir, learning_id) = setup_dir_with_learning("Useful pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+    let id_str = learning_id.to_string();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["invalidate-learning", &id_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("Invalidated"),
+        "downgrade output must contain 'Invalidated': {text}"
+    );
+    assert!(
+        text.contains("-> low"),
+        "downgrade output must show confidence transition '-> low': {text}"
+    );
+    assert!(
+        text.contains("Useful pattern"),
+        "downgrade output must contain the learning title: {text}"
+    );
+}
+
+#[test]
+fn test_invalidate_learning_retire_text_output() {
+    // AC2: Call on a low-confidence learning produces retire text output
+    let (temp_dir, learning_id) = setup_dir_with_learning("Low confidence pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+    let id_str = learning_id.to_string();
+
+    // Set confidence to Low in DB to simulate already-downgraded state
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET confidence = 'low' WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["invalidate-learning", &id_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("Retired"),
+        "retire output must contain 'Retired': {text}"
+    );
+    assert!(
+        text.contains("low confidence"),
+        "retire output must mention 'low confidence': {text}"
+    );
+    assert!(
+        text.contains("Low confidence pattern"),
+        "retire output must contain the learning title: {text}"
+    );
+}
+
+#[test]
+fn test_invalidate_learning_nonexistent_id_returns_error() {
+    // AC3: Non-existent ID returns non-zero exit code
+    let (temp_dir, _) = setup_dir_with_learning("Some pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["invalidate-learning", "99999"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found").or(predicate::str::contains("99999")));
+}
+
+#[test]
+fn test_invalidate_learning_already_retired_returns_error() {
+    // AC4: Already-retired ID returns non-zero exit code
+    let (temp_dir, learning_id) = setup_dir_with_learning("Retired pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+    let db_path = temp_dir.path().join("tasks.db");
+    let id_str = learning_id.to_string();
+
+    // Retire the learning directly in DB
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [learning_id],
+        )
+        .unwrap();
+    }
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir])
+        .args(["invalidate-learning", &id_str])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("retired")
+                .or(predicate::str::contains("Invalid state"))
+                .or(predicate::str::contains("error")),
+        );
+}
+
+#[test]
+fn test_invalidate_learning_json_format() {
+    // AC5: --format json produces valid JSON with expected fields
+    let (temp_dir, learning_id) = setup_dir_with_learning("JSON test pattern", "pattern");
+    let dir = temp_dir.path().to_str().unwrap();
+    let id_str = learning_id.to_string();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", dir, "--format", "json"])
+        .args(["invalidate-learning", &id_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_str(&String::from_utf8(output).unwrap())
+        .expect("invalidate-learning --format json must produce valid JSON");
+
+    assert!(
+        json.get("learning_id").is_some(),
+        "JSON must have 'learning_id' field"
+    );
+    assert!(json.get("title").is_some(), "JSON must have 'title' field");
+    assert!(
+        json.get("action").is_some(),
+        "JSON must have 'action' field"
+    );
+    assert!(
+        json.get("previous_confidence").is_some(),
+        "JSON must have 'previous_confidence' field"
+    );
+    assert_eq!(
+        json["action"].as_str().unwrap(),
+        "downgraded",
+        "First call on a non-low learning must produce action='downgraded'"
+    );
+    assert_eq!(
+        json["learning_id"].as_i64().unwrap(),
+        learning_id,
+        "JSON learning_id must match the invalidated learning"
+    );
+}
