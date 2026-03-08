@@ -460,6 +460,16 @@ MATCHING BEHAVIOR:
         learning_id: i64,
     },
 
+    /// Invalidate a learning via two-step degradation.
+    ///
+    /// First call: downgrades confidence to Low.
+    /// Second call (already Low): soft-archives via retired_at.
+    #[command(name = "invalidate-learning")]
+    InvalidateLearning {
+        /// ID of the learning to invalidate
+        learning_id: i64,
+    },
+
     /// Return a blocked task to todo status for retry
     Unblock {
         /// Task ID to unblock

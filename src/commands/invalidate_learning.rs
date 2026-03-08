@@ -7,6 +7,9 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::learnings::crud::get_learning;
+use crate::learnings::crud::{edit_learning, EditLearningParams};
+use crate::models::Confidence;
 use crate::TaskMgrResult;
 
 /// Result of invalidating a learning.
@@ -46,9 +49,61 @@ pub fn invalidate_learning(
     conn: &Connection,
     learning_id: i64,
 ) -> TaskMgrResult<InvalidateLearningResult> {
-    let _ = conn;
-    let _ = learning_id;
-    todo!("Implement in FEAT-001")
+    // Fetch the learning; return NotFound if absent
+    let learning = get_learning(conn, learning_id)?
+        .ok_or_else(|| crate::TaskMgrError::learning_not_found(learning_id.to_string()))?;
+
+    // Check retirement status via direct SQL (Learning struct lacks retired_at)
+    let retired_at: Option<String> = conn.query_row(
+        "SELECT retired_at FROM learnings WHERE id = ?1",
+        [learning_id],
+        |row| row.get(0),
+    )?;
+
+    if retired_at.is_some() {
+        return Err(crate::TaskMgrError::invalid_state(
+            "learning",
+            learning_id.to_string(),
+            "not retired",
+            "already retired",
+        ));
+    }
+
+    let previous_confidence = learning.confidence.as_db_str().to_string();
+
+    if learning.confidence != Confidence::Low {
+        // Downgrade: set confidence to Low
+        edit_learning(
+            conn,
+            learning_id,
+            EditLearningParams {
+                confidence: Some(Confidence::Low),
+                ..Default::default()
+            },
+        )?;
+
+        Ok(InvalidateLearningResult {
+            learning_id,
+            title: learning.title,
+            previous_confidence,
+            action: "downgraded".to_string(),
+            new_confidence: Some("low".to_string()),
+        })
+    } else {
+        // Already Low: retire via soft-delete
+        conn.execute(
+            "UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1",
+            [learning_id],
+        )?;
+
+        Ok(InvalidateLearningResult {
+            learning_id,
+            title: learning.title,
+            previous_confidence,
+            action: "retired".to_string(),
+            new_confidence: None,
+        })
+    }
 }
 
 /// Format invalidate-learning result as human-readable text.
@@ -56,8 +111,17 @@ pub fn invalidate_learning(
 /// - Downgrade: `Invalidated learning #ID: "Title" (confidence: prev -> low)`
 /// - Retire:    `Retired learning #ID: "Title" (was already low confidence)`
 pub fn format_text(result: &InvalidateLearningResult) -> String {
-    let _ = result;
-    todo!("Implement in FEAT-001")
+    if result.action == "retired" {
+        format!(
+            "Retired learning #{}: \"{}\" (was already low confidence)",
+            result.learning_id, result.title
+        )
+    } else {
+        format!(
+            "Invalidated learning #{}: \"{}\" (confidence: {} -> low)",
+            result.learning_id, result.title, result.previous_confidence
+        )
+    }
 }
 
 #[cfg(test)]
@@ -98,8 +162,7 @@ mod tests {
     #[test]
     fn test_high_confidence_downgraded() {
         let (_tmp, conn) = setup_db();
-        let rec =
-            record_learning(&conn, make_params("High learning", Confidence::High)).unwrap();
+        let rec = record_learning(&conn, make_params("High learning", Confidence::High)).unwrap();
 
         let result = invalidate_learning(&conn, rec.learning_id).unwrap();
 
@@ -137,8 +200,7 @@ mod tests {
     #[test]
     fn test_low_confidence_retired() {
         let (_tmp, conn) = setup_db();
-        let rec =
-            record_learning(&conn, make_params("Low learning", Confidence::Low)).unwrap();
+        let rec = record_learning(&conn, make_params("Low learning", Confidence::Low)).unwrap();
 
         let result = invalidate_learning(&conn, rec.learning_id).unwrap();
 
@@ -189,7 +251,10 @@ mod tests {
 
         let result = invalidate_learning(&conn, rec.learning_id);
 
-        assert!(result.is_err(), "must return Err for already-retired learning");
+        assert!(
+            result.is_err(),
+            "must return Err for already-retired learning"
+        );
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("Invalid state") || err_str.contains("retired"),
@@ -248,7 +313,8 @@ mod tests {
         assert!(text.contains("7"), "output must contain learning ID");
         assert!(text.contains("Old pattern"), "output must contain title");
         assert!(
-            text.to_lowercase().contains("retired") || text.to_lowercase().contains("low confidence"),
+            text.to_lowercase().contains("retired")
+                || text.to_lowercase().contains("low confidence"),
             "output must mention retirement or low confidence, got: {text}"
         );
     }
@@ -263,8 +329,7 @@ mod tests {
     #[test]
     fn test_known_bad_discriminator_first_call_is_downgraded_not_retired() {
         let (_tmp, conn) = setup_db();
-        let rec =
-            record_learning(&conn, make_params("High confidence", Confidence::High)).unwrap();
+        let rec = record_learning(&conn, make_params("High confidence", Confidence::High)).unwrap();
 
         let result = invalidate_learning(&conn, rec.learning_id).unwrap();
 

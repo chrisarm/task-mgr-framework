@@ -72,6 +72,9 @@ pub use init::{
     format_init_verbose, format_text as format_init_text, init, DryRunDeletePreview, InitResult,
     PrefixMode,
 };
+pub use invalidate_learning::{
+    format_text as format_invalidate_learning_text, invalidate_learning, InvalidateLearningResult,
+};
 pub use irrelevant::{
     format_text as format_irrelevant_text, irrelevant, IrrelevantResult, TaskIrrelevantResult,
 };

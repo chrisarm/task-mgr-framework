@@ -26,13 +26,14 @@ use crate::commands::curate::{
 use crate::commands::{
     format_apply_learning_text, format_begin_text, format_complete_text, format_doctor_text,
     format_end_text, format_export_text, format_fail_text, format_history_detail_text,
-    format_history_text, format_import_learnings_text, format_init_text, format_irrelevant_text,
-    format_learn_text, format_learnings_text, format_list_text, format_migrate_text,
-    format_next_text, format_recall_text, format_reset_text, format_review_text, format_show_text,
-    format_skip_text, format_stats_text, format_status_text, format_unblock_text,
-    format_unskip_text, format_update_text, format_worktrees_text, ApplyLearningResult,
-    BeginResult, CompleteResult, DoctorResult, EndResult, ExportResult, FailResult, HistoryResult,
-    ImportLearningsResult, InitResult, IrrelevantResult, LearnResult, LearningsListResult,
+    format_history_text, format_import_learnings_text, format_init_text,
+    format_invalidate_learning_text, format_irrelevant_text, format_learn_text,
+    format_learnings_text, format_list_text, format_migrate_text, format_next_text,
+    format_recall_text, format_reset_text, format_review_text, format_show_text, format_skip_text,
+    format_stats_text, format_status_text, format_unblock_text, format_unskip_text,
+    format_update_text, format_worktrees_text, ApplyLearningResult, BeginResult, CompleteResult,
+    DoctorResult, EndResult, ExportResult, FailResult, HistoryResult, ImportLearningsResult,
+    InitResult, InvalidateLearningResult, IrrelevantResult, LearnResult, LearningsListResult,
     ListResult, MigrateResult, NextResult, RecallCmdResult, ResetResult, ReviewResult,
     RunDetailResult, ShowResult, SkipResult, StatsResult, StatusResult, UnblockResult,
     UnskipResult, UpdateResult, WorktreesResult,
@@ -99,6 +100,7 @@ impl_text_formattable!(RetireResult, format_retire_text);
 impl_text_formattable!(UnretireResult, format_unretire_text);
 impl_text_formattable!(EnrichResult, format_enrich_text);
 impl_text_formattable!(DedupResult, format_dedup_text);
+impl_text_formattable!(InvalidateLearningResult, format_invalidate_learning_text);
 impl_text_formattable!(
     crate::loop_engine::archive::ArchiveResult,
     crate::loop_engine::archive::format_text

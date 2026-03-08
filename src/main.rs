@@ -12,11 +12,11 @@ use task_mgr::cli::{Cli, Commands, CurateAction, MigrateAction, RunAction, Workt
 use task_mgr::commands::{
     apply_learning, auto_unblock_all, begin, complete, count_resettable_tasks, doctor, end, export,
     fail, format_doctor_verbose, format_init_verbose, format_next_verbose, format_recall_verbose,
-    get_reviewable_tasks, history, history_detail, import_learnings, init, irrelevant, learn, list,
-    list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
-    reset_all_tasks, reset_tasks, show, skip, stats, unblock, unskip, update, worktrees_list,
-    worktrees_prune, worktrees_remove, LearnParams, LearningsListParams, RecallCmdParams,
-    ReviewOptions,
+    get_reviewable_tasks, history, history_detail, import_learnings, init, invalidate_learning,
+    irrelevant, learn, list, list_learnings, migrate_all, migrate_down_cmd, migrate_status,
+    migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks, show, skip, stats, unblock, unskip,
+    update, worktrees_list, worktrees_prune, worktrees_remove, LearnParams, LearningsListParams,
+    RecallCmdParams, ReviewOptions,
 };
 use task_mgr::db::{open_connection, LockGuard};
 use task_mgr::handlers::{
@@ -379,6 +379,14 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
+        Commands::InvalidateLearning { learning_id } => {
+            let _lock = LockGuard::acquire(&cli.dir)?;
+            let conn = open_connection(&cli.dir)?;
+            let result = invalidate_learning(&conn, learning_id)?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
         Commands::Unblock { task_id } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -707,7 +715,11 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::Archive { dry_run, all, branch } => {
+        Commands::Archive {
+            dry_run,
+            all,
+            branch,
+        } => {
             let branch_filter = if all {
                 None
             } else if let Some(b) = branch {
