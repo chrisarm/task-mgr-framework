@@ -107,6 +107,17 @@
 - **Learnings:** impl_text_formattable! macro (no trailing \n) is the standard pattern; ApplyLearningResult's custom impl with \n is the exception for backward compat. The 5 pre-existing warnings (claude.rs, watchdog.rs, worktrees.rs, curate/tests.rs) are unrelated to new code.
 ---
 
+## 2026-03-07 - 12656b00-REFACTOR-REVIEW-2
+- Reviewed test code (10 tests) for duplication, helper extraction, naming clarity
+- 3 helpers already extracted: make_params, get_retired_at, get_confidence_from_db
+- No duplicated setup code (2-line setup varies per test)
+- All test names descriptive and consistent
+- known_bad_discriminator overlap with high_confidence_downgraded is intentional (different purpose)
+- No REFACTOR-2-xxx tasks needed
+- **Approach**: Manual 4-criterion review per acceptance criteria
+- **Learnings:** Test helper extraction has a threshold — 2-line setup that varies in both parameters is better left inline than wrapped in a parameterized helper that barely reduces code.
+---
+
 ## 2026-03-07 - 12656b00-REFACTOR-REVIEW-1
 - Reviewed across 4 dimensions: DRY, complexity, coupling, maintainability
 - DRY: No violations. Uses existing CRUD layer, no duplicated logic
