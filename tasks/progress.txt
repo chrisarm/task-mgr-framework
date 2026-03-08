@@ -146,3 +146,16 @@
 - No REFACTOR-3-xxx tasks needed — code is clean
 - **Approach**: Manual 4-axis checklist per learning #275
 ---
+
+## 2026-03-07 - 12656b00-VERIFY-001
+- Ran full verification suite: cargo fmt --check, cargo check, cargo clippy -- -D warnings, cargo test
+- All 6 acceptance criteria pass:
+  - cargo fmt --check: clean
+  - cargo check: zero warnings
+  - cargo clippy -- -D warnings: clean
+  - cargo test: 2409 lib tests + 7 integration tests pass (1 ignored)
+  - No dead code warnings for invalidate_learning module
+  - task-mgr --help lists `invalidate-learning  Invalidate a learning via two-step degradation`
+- 5 pre-existing test-only warnings in unrelated modules (loop_engine, worktrees, curate/tests) — not from this feature
+- **Approach**: Parallel execution of all 4 cargo commands, then targeted checks for dead code and CLI help
+---
