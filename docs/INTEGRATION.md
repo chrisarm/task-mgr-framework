@@ -246,6 +246,32 @@ task-mgr recall --query "database connection"
 task-mgr recall --tags "rust,error"
 ```
 
+### Invalidating Learnings
+
+When a learning turns out to be wrong or harmful, use `invalidate-learning` to degrade it via two-step degradation:
+
+```bash
+# First call: downgrades confidence to Low (regardless of current level)
+task-mgr invalidate-learning 42
+# Output: Invalidated learning #42: "Title" (confidence: high -> low)
+
+# Second call: retires the learning (soft-archives it)
+task-mgr invalidate-learning 42
+# Output: Retired learning #42: "Title" (was already low confidence)
+
+# JSON output for scripting
+task-mgr --format json invalidate-learning 42
+# {"learning_id":42,"title":"...","previous_confidence":"high","action":"downgraded","new_confidence":"low"}
+```
+
+**Two-step behavior:**
+1. **First invalidation**: Sets confidence to `Low`, keeping the learning visible but deprioritized
+2. **Second invalidation**: Sets `retired_at` timestamp, soft-archiving the learning so it no longer appears in recall results
+
+**Error cases:**
+- Non-existent learning ID returns a `NotFound` error (non-zero exit code)
+- Already-retired learning returns an `InvalidState` error (non-zero exit code)
+
 ## Reference Implementation: claude-loop.sh
 
 The `scripts/claude-loop.sh` script is a complete reference implementation. Key features:
