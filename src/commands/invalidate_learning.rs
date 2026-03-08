@@ -157,6 +157,15 @@ mod tests {
         .unwrap()
     }
 
+    fn get_confidence_from_db(conn: &Connection, learning_id: i64) -> String {
+        conn.query_row(
+            "SELECT confidence FROM learnings WHERE id = ?1",
+            [learning_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     // --- Downgrade tests ---
 
     #[test]
@@ -210,6 +219,21 @@ mod tests {
         assert!(
             get_retired_at(&conn, rec.learning_id).is_some(),
             "retired_at must be set after retirement"
+        );
+    }
+
+    #[test]
+    fn test_db_confidence_reads_low_after_downgrade() {
+        let (_tmp, conn) = setup_db();
+        let rec =
+            record_learning(&conn, make_params("High to downgrade", Confidence::High)).unwrap();
+
+        invalidate_learning(&conn, rec.learning_id).unwrap();
+
+        let db_confidence = get_confidence_from_db(&conn, rec.learning_id);
+        assert_eq!(
+            db_confidence, "low",
+            "confidence column in DB must be 'low' after downgrade, got: {db_confidence}"
         );
     }
 
@@ -313,9 +337,8 @@ mod tests {
         assert!(text.contains("7"), "output must contain learning ID");
         assert!(text.contains("Old pattern"), "output must contain title");
         assert!(
-            text.to_lowercase().contains("retired")
-                || text.to_lowercase().contains("low confidence"),
-            "output must mention retirement or low confidence, got: {text}"
+            text.contains("Retired") && text.contains("low confidence"),
+            "output must contain 'Retired' and 'low confidence', got: {text}"
         );
     }
 
