@@ -285,7 +285,7 @@
       "model": "claude-sonnet-4-6",
       "modifiesBehavior": false,
       "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in. Next set of tasks updated.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "timeoutSecs": 1800,
@@ -314,8 +314,8 @@
       "estimatedEffort": "medium",
       "id": "TEST-001",
       "modifiesBehavior": false,
-      "notes": "These tests complement TEST-INIT-001 by verifying error message content, struct field values in detail, and database state after operations. Use assert_eq! for string outputs.",
-      "passes": false,
+      "notes": "Complete. Added test_db_confidence_reads_low_after_downgrade (queries DB confidence column directly) and strengthened test_format_text_retire to assert both 'Retired' AND 'low confidence'. All 10 tests pass. get_confidence_from_db helper added.",
+      "passes": true,
       "priority": 25,
       "qualityDimensions": {
         "correctness": [
