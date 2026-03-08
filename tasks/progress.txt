@@ -98,3 +98,11 @@
   anywhere in the crate; format function named `format_text` inside module, re-exported as
   `format_invalidate_learning_text` in mod.rs (matches existing apply_learning pattern).
 ---
+
+## 2026-03-07 - 12656b00-CODE-REVIEW-1
+- Systematic review of all 5 implementation files against 10 acceptance criteria
+- All criteria pass: no unwrap in production, proper error propagation, parameterized SQL, quality dimensions met, edge cases covered, full integration wiring verified, no dead code warnings
+- No CODE-FIX tasks needed
+- **Approach**: Manual checklist review across all criteria, plus cargo fmt/check/clippy/test verification
+- **Learnings:** impl_text_formattable! macro (no trailing \n) is the standard pattern; ApplyLearningResult's custom impl with \n is the exception for backward compat. The 5 pre-existing warnings (claude.rs, watchdog.rs, worktrees.rs, curate/tests.rs) are unrelated to new code.
+---
