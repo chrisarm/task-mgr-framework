@@ -884,6 +884,12 @@ APPEND to `.task-mgr/tasks/progress.txt`:
 - Instead of separate entries for FIX-001, FIX-002, FIX-003
 - Write: "FIX-001 through FIX-003: Fixed X by doing Y"
 
+**Invalidate wrong learnings:**
+
+- If a learning recalled via `task-mgr recall` turns out to be wrong or harmful, run `task-mgr invalidate-learning <id>` to degrade it
+- First call downgrades confidence to Low; second call (when already Low) retires the learning permanently
+- Use the learning `id` shown in the `recall` output
+
 ---
 
 ## Stop and Blocked Conditions

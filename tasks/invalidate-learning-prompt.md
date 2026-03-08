@@ -236,6 +236,16 @@ For each issue: add REFACTOR-N-xxx + add to corresponding MILESTONE dependsOn.
 
 ---
 
+## Learnings Guidelines
+
+**Invalidate wrong learnings:**
+
+- If a learning recalled via `task-mgr recall` turns out to be wrong or harmful, run `task-mgr invalidate-learning <id>` to degrade it
+- First call downgrades confidence to Low; second call (when already Low) retires the learning permanently
+- Use the learning `id` shown in the `recall` output
+
+---
+
 ## Progress Report Format
 
 APPEND to `tasks/progress.txt`:
