@@ -662,25 +662,6 @@ pub struct LoopRunConfig {
     pub external_repo: Option<PathBuf>,
 }
 
-/// Run the full autonomous agent loop.
-///
-/// This is the top-level orchestrator called from `main.rs`:
-/// 1. Load .env and validate git repo
-/// 2. Resolve paths and open DB
-/// 3. Read PRD metadata (branch name, task count)
-/// 4. Begin a run session
-/// 5. Create deadline if hours specified
-/// 6. Install signal handlers
-/// 7. Iterate until done, blocked, max iterations, or signal
-/// 8. End run, cleanup, return exit code
-///
-/// # Exit codes
-/// - 0: success (all tasks complete) or graceful stop
-/// - 1: error, max crashes, max stale, or max iterations reached
-/// - 2: blocked
-/// - 130: SIGINT
-/// - 143: SIGTERM
-
 /// Expected global skills for task-mgr loop workflows.
 ///
 /// These skills (`.md` files in `~/.claude/commands/`) provide slash commands
@@ -747,6 +728,24 @@ fn check_global_skills(source_root: &Path) {
     eprintln!();
 }
 
+/// Run the full autonomous agent loop.
+///
+/// This is the top-level orchestrator called from `main.rs`:
+/// 1. Load .env and validate git repo
+/// 2. Resolve paths and open DB
+/// 3. Read PRD metadata (branch name, task count)
+/// 4. Begin a run session
+/// 5. Create deadline if hours specified
+/// 6. Install signal handlers
+/// 7. Iterate until done, blocked, max iterations, or signal
+/// 8. End run, cleanup, return exit code
+///
+/// # Exit codes
+/// - 0: success (all tasks complete) or graceful stop
+/// - 1: error, max crashes, max stale, or max iterations reached
+/// - 2: blocked
+/// - 130: SIGINT
+/// - 143: SIGTERM
 pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 1: Load environment
     env::load_env();
@@ -1274,7 +1273,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     };
 
     // Step 15: Resolve permission mode (needed for banner hint below)
-    let permission_mode = config::permission_mode_from_env();
+    let permission_mode = config::resolve_permission_mode(&run_config.db_dir);
 
     // Step 15.5: Print session banner
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");

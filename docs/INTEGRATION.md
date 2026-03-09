@@ -289,6 +289,19 @@ The `scripts/claude-loop.sh` script is a complete reference implementation. Key 
 ./scripts/claude-loop.sh -y 10 tasks/my-project.json
 ```
 
+### Project Tool Configuration
+
+Projects can extend the default tool allowlist by creating `.task-mgr/config.json`:
+
+```json
+{
+  "version": 1,
+  "additionalAllowedTools": ["Bash(docker:*)", "Bash(curl:*)"]
+}
+```
+
+Tools listed here are appended to the built-in defaults. The `LOOP_ALLOWED_TOOLS` env var fully overrides (no merge with project config). See the README for the full list of common opt-in tools.
+
 ### Steering Features
 
 The loop supports runtime steering via special files:

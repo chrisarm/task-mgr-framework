@@ -21,6 +21,7 @@ pub mod monitor;
 pub mod oauth;
 pub mod output_parsing;
 pub mod prd_reconcile;
+pub(crate) mod project_config;
 pub mod progress;
 pub mod prompt;
 pub mod prompt_sections;

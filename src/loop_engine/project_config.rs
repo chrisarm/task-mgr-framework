@@ -1,0 +1,114 @@
+use serde::Deserialize;
+use std::path::Path;
+
+/// Per-project loop configuration read from `.task-mgr/config.json`.
+///
+/// Allows projects to extend the default tool allowlist with project-specific
+/// tools (e.g., `docker`, `curl`, `./scripts/*`) without modifying the core
+/// default. Forward-compatible: unknown fields are silently ignored.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectConfig {
+    /// Schema version for forward compatibility.
+    #[serde(default = "default_version")]
+    #[allow(dead_code)]
+    pub version: u32,
+
+    /// Additional tool entries appended to CODING_ALLOWED_TOOLS.
+    /// Example: `["Bash(docker:*)", "Bash(curl:*)"]`
+    #[serde(default)]
+    pub additional_allowed_tools: Vec<String>,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            additional_allowed_tools: Vec::new(),
+        }
+    }
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+/// Read project config from `<db_dir>/config.json`.
+///
+/// Returns default (empty) config if the file doesn't exist.
+/// Warns on invalid JSON but does not fail — returns defaults instead.
+pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
+    let path = db_dir.join("config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
+            eprintln!(
+                "\x1b[33m[warn]\x1b[0m Invalid .task-mgr/config.json: {e}"
+            );
+            ProjectConfig::default()
+        }),
+        Err(_) => ProjectConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_read_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.version, 1);
+        assert!(config.additional_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn test_read_invalid_json_warns_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "not json").unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.version, 1);
+        assert!(config.additional_allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn test_read_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version": 1, "additionalAllowedTools": ["Bash(docker:*)", "Bash(curl:*)"]}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.version, 1);
+        assert_eq!(config.additional_allowed_tools, vec!["Bash(docker:*)", "Bash(curl:*)"]);
+    }
+
+    #[test]
+    fn test_read_config_with_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version": 1, "additionalAllowedTools": ["Bash(docker:*)"], "futureField": true}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.additional_allowed_tools, vec!["Bash(docker:*)"]);
+    }
+
+    #[test]
+    fn test_default_version() {
+        let config = ProjectConfig::default();
+        assert_eq!(config.version, 1);
+    }
+
+    #[test]
+    fn test_empty_json_object_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.version, 1);
+        assert!(config.additional_allowed_tools.is_empty());
+    }
+}

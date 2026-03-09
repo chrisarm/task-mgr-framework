@@ -262,6 +262,35 @@ Worktrees are created at `{repo-parent}/{repo-name}-worktrees/{branch-name}/`. F
 
 Use `--no-worktree` to revert to the old behavior of checking out branches directly (useful for CI/CD or when you prefer the simpler model).
 
+### Project Configuration
+
+Create `.task-mgr/config.json` to add project-specific tool permissions:
+
+```json
+{
+  "version": 1,
+  "additionalAllowedTools": [
+    "Bash(docker:*)",
+    "Bash(docker-compose:*)",
+    "Bash(curl:*)",
+    "Bash(./scripts/*:*)"
+  ]
+}
+```
+
+These tools are appended to the built-in defaults. Common opt-in tools:
+
+| Tool | When to add |
+|------|-------------|
+| `Bash(docker:*)` | Projects with Docker infrastructure |
+| `Bash(docker-compose:*)` | Projects using Docker Compose |
+| `Bash(curl:*)` | Projects that test HTTP APIs |
+| `Bash(wget:*)` | Projects that download resources |
+| `Bash(./scripts/*:*)` | Projects with executable shell scripts |
+| `Bash(source:*)` | Projects that source env files in scripts |
+
+Note: The `LOOP_ALLOWED_TOOLS` env var fully overrides — when set, project config is not merged.
+
 ## Iterative Build Workflow
 
 task-mgr is designed around a 5-phase iterative workflow that takes you from idea to working code:

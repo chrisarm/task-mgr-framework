@@ -156,7 +156,7 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 /// Tools like `Bash(cat:*)` and `Bash(git:*)` permit arbitrary file
 /// reads and remote pushes respectively. For stricter isolation, use a
 /// container or VM.
-pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,NotebookEdit,Agent,LSP,Bash(cargo:*),Bash(git:*),Bash(task-mgr:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(find:*),Bash(rg:*),Bash(sed:*),Bash(cd:*),Bash(ruff:*),Bash(mypy:*),Bash(uv:*),Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(grep:*),Bash(awk:*),Bash(sort:*),Bash(uniq:*),Bash(tr:*),Bash(cut:*),Bash(diff:*),Bash(touch:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(chmod:*),Bash(echo:*),Bash(printf:*),Bash(tee:*),Bash(xargs:*),Bash(jq:*),Bash(yq:*),Bash(curl:*),Bash(wget:*),Bash(docker:*),Bash(docker-compose:*),Bash(tree:*),Bash(which:*),Bash(command:*),Bash(pwd:*),Bash(realpath:*),Bash(dirname:*),Bash(basename:*),Bash(date:*),Bash(stat:*),Bash(env:*),Bash(source:*),Bash(rustup:*),Bash(mix:*),Bash(elixir:*),Bash(iex:*),Bash(hex:*),Bash(rebar3:*),Bash(./scripts/*:*),Glob,Grep";
+pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,NotebookEdit,Agent,LSP,Bash(cargo:*),Bash(git:*),Bash(task-mgr:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(find:*),Bash(rg:*),Bash(sed:*),Bash(cd:*),Bash(ruff:*),Bash(mypy:*),Bash(uv:*),Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(grep:*),Bash(awk:*),Bash(sort:*),Bash(uniq:*),Bash(tr:*),Bash(cut:*),Bash(diff:*),Bash(touch:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(chmod:*),Bash(echo:*),Bash(printf:*),Bash(tee:*),Bash(xargs:*),Bash(jq:*),Bash(yq:*),Bash(tree:*),Bash(which:*),Bash(command:*),Bash(pwd:*),Bash(realpath:*),Bash(dirname:*),Bash(basename:*),Bash(date:*),Bash(stat:*),Bash(env:*),Bash(rustup:*),Bash(mix:*),Bash(elixir:*),Bash(iex:*),Bash(hex:*),Bash(rebar3:*),Bash(shellcheck:*),Bash(shfmt:*),Glob,Grep";
 
 /// Permission mode for Claude subprocess invocation.
 ///
@@ -166,12 +166,12 @@ pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,Noteb
 ///
 /// # Call sites
 ///
-/// | Caller                           | Mode                                      |
-/// |----------------------------------|-------------------------------------------|
-/// | `engine::run_loop`               | `permission_mode_from_env()` (env vars)   |
-/// | `curate::enrich`                 | `text_only()` — no tool access needed     |
-/// | `curate::dedup`                  | `text_only()` — no tool access needed     |
-/// | `learnings::ingestion`           | `text_only()` — no tool access needed     |
+/// | Caller                           | Mode                                           |
+/// |----------------------------------|------------------------------------------------|
+/// | `engine::run_loop`               | `resolve_permission_mode(db_dir)` (env + config)|
+/// | `curate::enrich`                 | `text_only()` — no tool access needed          |
+/// | `curate::dedup`                  | `text_only()` — no tool access needed          |
+/// | `learnings::ingestion`           | `text_only()` — no tool access needed          |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Legacy mode: passes `--dangerously-skip-permissions`.
@@ -196,7 +196,86 @@ impl PermissionMode {
     }
 }
 
-/// Resolve the permission mode from environment variables.
+/// Resolve permission mode, merging project-specific tools if applicable.
+///
+/// Resolution order (highest to lowest priority):
+/// 1. `LOOP_PERMISSION_MODE=dangerous` → `Dangerous` (no tool restrictions)
+/// 2. `LOOP_ENABLE_AUTO_MODE=true` → `Auto`
+/// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped` with those tools (NO project config merge)
+/// 4. Default → `Scoped` with `CODING_ALLOWED_TOOLS` + project config additional tools
+///
+/// This is the primary entry point for the loop engine. Non-loop callers
+/// (curate, learnings) should use `PermissionMode::text_only()` instead.
+pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
+    // 1. Dangerous takes absolute precedence.
+    if let Ok(mode) = std::env::var("LOOP_PERMISSION_MODE") {
+        if mode.to_lowercase() == "dangerous" {
+            return PermissionMode::Dangerous;
+        }
+        eprintln!(
+            "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
+             falling back to scoped mode (safe default). Valid values: 'dangerous'.",
+            mode
+        );
+    }
+
+    // 2. Auto mode — only reached when LOOP_PERMISSION_MODE is not "dangerous".
+    if parse_env_bool("LOOP_ENABLE_AUTO_MODE") == Some(true) {
+        return PermissionMode::Auto;
+    }
+
+    // 3. Custom env var → full override, no project config merge.
+    if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS") {
+        if !tools.is_empty() {
+            return PermissionMode::Scoped {
+                allowed_tools: Some(tools),
+            };
+        }
+    }
+
+    // 4. Default + project config merge.
+    let project_config = super::project_config::read_project_config(db_dir);
+    let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
+
+    if !project_config.additional_allowed_tools.is_empty() {
+        let names: Vec<&str> = project_config
+            .additional_allowed_tools
+            .iter()
+            .filter_map(|t| t.strip_prefix("Bash(").and_then(|s| s.strip_suffix(":*)")))
+            .collect();
+        eprintln!(
+            "\x1b[36m[info]\x1b[0m Project config: +{} tool(s) ({})",
+            project_config.additional_allowed_tools.len(),
+            names.join(", ")
+        );
+    }
+
+    PermissionMode::Scoped {
+        allowed_tools: Some(tools),
+    }
+}
+
+/// Merge CODING_ALLOWED_TOOLS with additional project-specific tools.
+/// Deduplicates entries, preserving insertion order.
+fn merge_allowed_tools(additional: &[String]) -> String {
+    if additional.is_empty() {
+        return CODING_ALLOWED_TOOLS.to_string();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for tool in CODING_ALLOWED_TOOLS
+        .split(',')
+        .chain(additional.iter().map(String::as_str))
+    {
+        let trimmed = tool.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            result.push(trimmed);
+        }
+    }
+    result.join(",")
+}
+
+/// Resolve the permission mode from environment variables only (no project config).
 ///
 /// Resolution order (highest to lowest priority):
 /// 1. `LOOP_PERMISSION_MODE=dangerous` → `Dangerous`
@@ -204,7 +283,8 @@ impl PermissionMode {
 /// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped { allowed_tools: Some(tools) }`
 /// 4. Default → `Scoped { allowed_tools: Some(CODING_ALLOWED_TOOLS) }`
 ///
-/// Unrecognized `LOOP_PERMISSION_MODE` values fall through to the default.
+/// Prefer `resolve_permission_mode(db_dir)` for loop engine use.
+/// This function is kept for non-loop callers and tests.
 pub fn permission_mode_from_env() -> PermissionMode {
     // 1. Dangerous takes absolute precedence.
     if let Ok(mode) = std::env::var("LOOP_PERMISSION_MODE") {
@@ -771,10 +851,6 @@ mod tests {
             "Bash(xargs:*)",
             "Bash(jq:*)",
             "Bash(yq:*)",
-            "Bash(curl:*)",
-            "Bash(wget:*)",
-            "Bash(docker:*)",
-            "Bash(docker-compose:*)",
             "Bash(tree:*)",
             "Bash(which:*)",
             "Bash(command:*)",
@@ -785,20 +861,40 @@ mod tests {
             "Bash(date:*)",
             "Bash(stat:*)",
             "Bash(env:*)",
-            "Bash(source:*)",
             "Bash(rustup:*)",
             "Bash(mix:*)",
             "Bash(elixir:*)",
             "Bash(iex:*)",
             "Bash(hex:*)",
             "Bash(rebar3:*)",
-            "Bash(./scripts/*:*)",
+            "Bash(shellcheck:*)",
+            "Bash(shfmt:*)",
             "Glob",
             "Grep",
         ] {
             assert!(
                 tools.contains(required),
                 "CODING_ALLOWED_TOOLS missing '{required}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_coding_allowed_tools_excludes_per_project_tools() {
+        let tools = CODING_ALLOWED_TOOLS;
+        for excluded in &[
+            "Bash(curl:*)",
+            "Bash(wget:*)",
+            "Bash(docker:*)",
+            "Bash(docker-compose:*)",
+            "Bash(source:*)",
+            "Bash(./scripts/*:*)",
+            "Bash(test:*)",
+            "Bash([:*)",
+        ] {
+            assert!(
+                !tools.contains(excluded),
+                "CODING_ALLOWED_TOOLS should NOT contain '{excluded}' (moved to per-project config)"
             );
         }
     }
@@ -1064,5 +1160,121 @@ mod tests {
                 | IterationOutcome::Empty
                 | IterationOutcome::PromptOverflow
         );
+    }
+
+    // --- merge_allowed_tools ---
+
+    #[test]
+    fn test_merge_allowed_tools_empty_returns_default() {
+        let result = merge_allowed_tools(&[]);
+        assert_eq!(result, CODING_ALLOWED_TOOLS);
+    }
+
+    #[test]
+    fn test_merge_allowed_tools_appends() {
+        let additional = vec!["Bash(docker:*)".to_string(), "Bash(curl:*)".to_string()];
+        let result = merge_allowed_tools(&additional);
+        assert!(result.contains("Bash(docker:*)"));
+        assert!(result.contains("Bash(curl:*)"));
+        // Core tools still present
+        assert!(result.starts_with("Read,"));
+        assert!(result.contains("Bash(cargo:*)"));
+    }
+
+    #[test]
+    fn test_merge_allowed_tools_deduplicates() {
+        // Bash(git:*) is already in CODING_ALLOWED_TOOLS
+        let additional = vec!["Bash(git:*)".to_string(), "Bash(docker:*)".to_string()];
+        let result = merge_allowed_tools(&additional);
+        // Count occurrences of Bash(git:*)
+        let count = result.matches("Bash(git:*)").count();
+        assert_eq!(count, 1, "Bash(git:*) should appear exactly once");
+        // New tool still added
+        assert!(result.contains("Bash(docker:*)"));
+    }
+
+    // --- resolve_permission_mode ---
+
+    #[test]
+    fn test_resolve_permission_mode_default_uses_coding_tools() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        // Use a temp dir with no config.json
+        let dir = tempfile::tempdir().unwrap();
+        let mode = resolve_permission_mode(dir.path());
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_permission_mode_env_override_skips_project_config() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash");
+
+        // Create a dir WITH config.json — it should be ignored
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"additionalAllowedTools": ["Bash(docker:*)"]}"#,
+        )
+        .unwrap();
+
+        let mode = resolve_permission_mode(dir.path());
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        assert_eq!(
+            mode,
+            PermissionMode::Scoped {
+                allowed_tools: Some("Read,Bash".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_permission_mode_dangerous_skips_all() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mode = resolve_permission_mode(dir.path());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        assert_eq!(mode, PermissionMode::Dangerous);
+    }
+
+    #[test]
+    fn test_resolve_permission_mode_merges_project_config() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"additionalAllowedTools": ["Bash(docker:*)", "Bash(curl:*)"]}"#,
+        )
+        .unwrap();
+
+        let mode = resolve_permission_mode(dir.path());
+        if let PermissionMode::Scoped {
+            allowed_tools: Some(tools),
+        } = &mode
+        {
+            assert!(tools.contains("Bash(docker:*)"));
+            assert!(tools.contains("Bash(curl:*)"));
+            assert!(tools.contains("Bash(cargo:*)")); // core still present
+        } else {
+            panic!("Expected Scoped with tools, got {:?}", mode);
+        }
     }
 }
