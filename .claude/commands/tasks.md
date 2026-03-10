@@ -47,7 +47,7 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 | `ANALYSIS-xxx`                                               | opus                       | Deep semantic and consumer analysis              |
 | `CODE-REVIEW-xxx`                                            | opus                       | Nuanced quality/security judgment                |
 | `REFACTOR-REVIEW-xxx`                                        | opus                       | Architectural judgment calls                     |
-| `MILESTONE-xxx`                                              | sonnet                     | Comprehensive verification, runs full test suite |
+| `MILESTONE-xxx`                                              | opus                       | Cross-PRD task review and update based on learnings |
 | `VERIFY-xxx`                                                 | opus                       | Final validation gate, thoroughness required     |
 | `FEAT-xxx`, `FIX-xxx`, `TEST-xxx`, `INT-xxx`, `WIRE-FIX-xxx` | _(omit — use PRD default)_ | Standard implementation work                     |
 
@@ -55,7 +55,7 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 | Task type       | `timeoutSecs` | Rationale                                          |
 | --------------- | ------------- | -------------------------------------------------- |
-| `MILESTONE-xxx` | 1800          | Full `cargo test` + fixture suite can take 20+ min |
+| `MILESTONE-xxx` | 1800          | Deep cross-PRD review + task updates can be extensive |
 | `VERIFY-xxx`    | 1800          | Same — runs complete test suite                    |
 | All others      | _(omit)_      | Uses loop default (12 min)                         |
 
@@ -927,12 +927,29 @@ If blocked (missing dependencies, unclear requirements):
 
 ## Milestones
 
-Milestones (MILESTONE-xxx) are gate tasks:
+Milestones (MILESTONE-xxx) are **review-and-update checkpoints** for upcoming tasks.
+Their purpose is ensuring remaining tasks stay accurate as implementation evolves.
+Verification is handled by VERIFY tasks, not milestones.
+
+### Milestone Protocol
 
 1. Check all `dependsOn` tasks have `passes: true`
-2. Run verification commands in acceptance criteria
-3. Only mark `passes: true` when ALL criteria met
-4. Milestones ensure code review and refactor review happen before proceeding
+2. **Review completed work**: Read `tasks/progress.txt` and recent git log to understand
+   what was actually implemented vs. what the remaining tasks assume
+3. **Identify deviations**: List implementation decisions that diverge from upcoming task
+   expectations (changed APIs, different data structures, new dependencies, abandoned approaches)
+4. **Update THIS PRD's remaining tasks**: For every `passes: false` task in the current JSON:
+   - Update `description`, `acceptanceCriteria`, `touchesFiles`, `notes` to reflect actual implementation
+   - Add/remove `dependsOn` if the dependency graph changed
+   - If a task is now unnecessary, mark `passes: true` with note "Superseded by [TASK-ID]"
+   - If a task needs splitting due to implementation changes, create new tasks and update deps
+5. **Update batch sibling PRDs** (if "Sibling PRD Tasks" section is present):
+   - Review the relevant sibling tasks shown — these touch files changed by this PRD
+   - Read full sibling PRD files if the summaries indicate updates are needed
+   - Update affected task descriptions, acceptance criteria, touchesFiles, or notes
+   - Commit sibling updates separately: `chore: MILESTONE-N update sibling tasks in [file].json`
+6. **Document changes**: Append a summary of task updates to `tasks/progress.txt`
+7. Only mark milestone `passes: true` when all reviews and updates are committed
 
 ---
 
@@ -1033,10 +1050,10 @@ Every task list should include:
    - Mark REFACTOR-REVIEW-1 as `passes: true` once review complete and tasks created
    - Acceptance criteria: "Any issues found have corresponding REFACTOR-1-xxx tasks created"
 
-5. **MILESTONE-1** (priority 20)
+5. **MILESTONE-1** (priority 20) — **Review & Update Checkpoint**
 
    - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
-   - Gate before comprehensive testing phase
+   - Review-and-update checkpoint before comprehensive testing phase
    - Depends on: CODE-REVIEW-1 + REFACTOR-REVIEW-1 + all TEST-INIT-xxx + all FEAT-xxx + all FIX-xxx + all WIRE-FIX-xxx
    - Acceptance criteria must include:
      - "All initial tests (TEST-INIT-xxx) pass"
@@ -1046,8 +1063,10 @@ Every task list should include:
      - **"No unused warnings for new code in `cargo check`/`cargo clippy`"**
      - **"Integration test verifying the feature's observable behavior change exists and passes"**
      - **"The feature's primary user story is exercised end-to-end (not just unit tested)"**
+     - **"Remaining tasks in this PRD reviewed and updated based on implementation learnings"**
+     - **"Sibling PRD tasks reviewed and updated if in batch mode"**
    - If the feature has a critical integration boundary, add `"requiredTests": ["test_filter_name"]` to enforce test-gated completion (see `requiredTests` field docs below)
-   - Notes: "Initial tests pass, implementation reviewed, refactored, and **fully wired in**. If no integration test exists for the core behavior change, create one before marking complete."
+   - Notes: "Review-and-update checkpoint. Read progress.txt and git log, identify deviations from plan, update all remaining tasks (this PRD + siblings) to reflect actual implementation."
 
 6. **Comprehensive Test Tasks** (priority 25-38)
 
@@ -1073,15 +1092,17 @@ Every task list should include:
    - Mark REFACTOR-REVIEW-2 as `passes: true` once review complete and tasks created
    - Acceptance criteria: "Any issues found have corresponding REFACTOR-2-xxx tasks created"
 
-9. **MILESTONE-2** (priority 50)
+9. **MILESTONE-2** (priority 50) — **Review & Update Checkpoint**
 
    - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
-   - Gate before integration/verification
+   - Review-and-update checkpoint before integration/verification
    - Depends on: MILESTONE-1 + REFACTOR-REVIEW-2 + all TEST-xxx + all IMPL-FIX-xxx
    - Acceptance criteria must include:
      - "All comprehensive tests (TEST-xxx) pass"
      - "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)"
-   - Notes: "Full test coverage achieved, test code refactored"
+     - **"Remaining tasks in this PRD reviewed and updated based on test findings and implementation learnings"**
+     - **"Sibling PRD tasks reviewed and updated if in batch mode"**
+   - Notes: "Review-and-update checkpoint. Update remaining tasks to reflect test findings, implementation changes, and API evolution."
 
 10. **Integration/Verification Tasks** (priority 55-65)
 
@@ -1105,14 +1126,18 @@ Every task list should include:
     - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
     - Depends on: INT-xxx + REFACTOR-REVIEW-3
 
-13. **MILESTONE-FINAL** (priority 99)
+13. **MILESTONE-FINAL** (priority 99) — **Final Review & Update Checkpoint**
+
     - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
-    - Gate before merge
+    - Final review-and-update checkpoint before merge
     - Depends on: VERIFY-001 + REFACTOR-REVIEW-3
-    - Acceptance criteria must include: "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)"
-    - All acceptance criteria met
+    - Acceptance criteria must include:
+      - "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)"
+      - "All acceptance criteria met"
+      - **"Sibling PRD tasks reviewed and updated with final implementation state"**
     - Ready for merge
     - If the feature has a critical integration path, add `"requiredTests": ["test_that_verifies_feature_purpose"]` — a test that verifies the feature's _purpose_ (the observable behavior change, not just compilation)
+    - Notes: "Final checkpoint. Ensure sibling PRD tasks accurately reflect what was built. This is the last chance to update before this PRD is complete."
 
 ### Known-Bad Discriminators
 
