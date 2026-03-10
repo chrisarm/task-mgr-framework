@@ -311,6 +311,7 @@ fn test_full_loop_worktree_created_and_cleaned_up() {
         prompt_file: Some(prompt_path),
         external_repo: None,
         config,
+        batch_sibling_prds: vec![],
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

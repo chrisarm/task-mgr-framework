@@ -92,6 +92,8 @@ fn test_e2e_high_difficulty_resolves_to_opus() {
         verbose: false,
         default_model: default_model.as_deref(),
         task_prefix: None,
+        batch_sibling_prds: &[],
+        permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
     };
 
     let result = build_prompt(&params)
@@ -142,6 +144,8 @@ fn test_e2e_explicit_model_overrides_default() {
         verbose: false,
         default_model: default_model.as_deref(),
         task_prefix: None,
+        batch_sibling_prds: &[],
+        permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
     };
 
     let result = build_prompt(&params)
@@ -194,6 +198,8 @@ fn test_e2e_no_model_fields_resolves_to_none() {
         verbose: false,
         default_model: None,
         task_prefix: None,
+        batch_sibling_prds: &[],
+        permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
     };
 
     let result = build_prompt(&params)
@@ -239,6 +245,8 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
         verbose: false,
         default_model: default_model.as_deref(),
         task_prefix: None,
+        batch_sibling_prds: &[],
+        permission_mode: &task_mgr::loop_engine::config::PermissionMode::Dangerous,
     };
 
     let result = build_prompt(&params)

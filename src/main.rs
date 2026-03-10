@@ -642,6 +642,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 prompt_file,
                 config,
                 external_repo,
+                batch_sibling_prds: vec![],
             };
 
             let rt = tokio::runtime::Builder::new_current_thread()

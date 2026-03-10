@@ -135,6 +135,8 @@ pub struct IterationParams<'a> {
     pub default_model: Option<&'a str>,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: &'a PermissionMode,
+    /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
+    pub batch_sibling_prds: &'a [PathBuf],
 }
 
 /// Result of a single iteration.
@@ -320,6 +322,8 @@ pub fn run_iteration(
         verbose: params.verbose,
         default_model: params.default_model,
         task_prefix: params.task_prefix,
+        batch_sibling_prds: params.batch_sibling_prds,
+        permission_mode: params.permission_mode,
     };
 
     let prompt_result = match prompt::build_prompt(&prompt_params) {
@@ -660,6 +664,9 @@ pub struct LoopRunConfig {
     pub config: LoopConfig,
     /// Optional path to external git repo for commit scanning (CLI override)
     pub external_repo: Option<PathBuf>,
+    /// Paths to OTHER PRD JSON files in the batch (empty for single-PRD runs).
+    /// Used to inject sibling PRD context into MILESTONE task prompts.
+    pub batch_sibling_prds: Vec<PathBuf>,
 }
 
 /// Expected global skills for task-mgr loop workflows.
@@ -712,11 +719,7 @@ fn check_global_skills(source_root: &Path) {
         for name in &missing {
             let src = repo_skill_dir.join(format!("{}.md", name));
             if src.exists() {
-                eprintln!(
-                    "    cp {} {}/",
-                    src.display(),
-                    global_dir.display()
-                );
+                eprintln!("    cp {} {}/", src.display(), global_dir.display());
             }
         }
     } else {
@@ -1275,6 +1278,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 15: Resolve permission mode (needed for banner hint below)
     let permission_mode = config::resolve_permission_mode(&run_config.db_dir);
 
+    if run_config.config.verbose {
+        eprintln!("[verbose] Permission mode: {}", permission_mode);
+    }
+
     // Step 15.5: Print session banner
     let branch_display = branch_name.as_deref().unwrap_or("(unknown)");
     let db_path = run_config.db_dir.join("tasks.db");
@@ -1377,6 +1384,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
             permission_mode: &permission_mode,
+            batch_sibling_prds: &run_config.batch_sibling_prds,
         };
 
         let mut result = match run_iteration(&mut ctx, &iteration_params) {

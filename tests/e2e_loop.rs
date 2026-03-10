@@ -891,6 +891,7 @@ fn test_run_loop_with_mock_claude() {
         prompt_file: Some(prompt_path),
         external_repo: None,
         config,
+        batch_sibling_prds: vec![],
     };
 
     // Run the loop

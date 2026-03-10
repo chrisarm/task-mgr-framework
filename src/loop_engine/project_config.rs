@@ -41,9 +41,7 @@ pub fn read_project_config(db_dir: &Path) -> ProjectConfig {
     let path = db_dir.join("config.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!(
-                "\x1b[33m[warn]\x1b[0m Invalid .task-mgr/config.json: {e}"
-            );
+            eprintln!("\x1b[33m[warn]\x1b[0m Invalid .task-mgr/config.json: {e}");
             ProjectConfig::default()
         }),
         Err(_) => ProjectConfig::default(),
@@ -82,7 +80,10 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.version, 1);
-        assert_eq!(config.additional_allowed_tools, vec!["Bash(docker:*)", "Bash(curl:*)"]);
+        assert_eq!(
+            config.additional_allowed_tools,
+            vec!["Bash(docker:*)", "Bash(curl:*)"]
+        );
     }
 
     #[test]

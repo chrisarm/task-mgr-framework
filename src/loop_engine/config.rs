@@ -196,6 +196,24 @@ impl PermissionMode {
     }
 }
 
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dangerous => write!(f, "Dangerous (no tool restrictions)"),
+            Self::Scoped {
+                allowed_tools: None,
+            } => write!(f, "Scoped (text-only, no tools)"),
+            Self::Scoped {
+                allowed_tools: Some(tools),
+            } => {
+                let count = tools.split(',').count();
+                write!(f, "Scoped ({count} tools)")
+            }
+            Self::Auto => write!(f, "Auto"),
+        }
+    }
+}
+
 /// Resolve permission mode, merging project-specific tools if applicable.
 ///
 /// Resolution order (highest to lowest priority):
@@ -791,6 +809,37 @@ mod tests {
             allowed_tools: Some("Read".to_string()),
         };
         assert_eq!(mode.clone(), mode);
+    }
+
+    // --- PermissionMode Display ---
+
+    #[test]
+    fn test_permission_mode_display_dangerous() {
+        assert_eq!(
+            PermissionMode::Dangerous.to_string(),
+            "Dangerous (no tool restrictions)"
+        );
+    }
+
+    #[test]
+    fn test_permission_mode_display_auto() {
+        assert_eq!(PermissionMode::Auto.to_string(), "Auto");
+    }
+
+    #[test]
+    fn test_permission_mode_display_scoped_none() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: None,
+        };
+        assert_eq!(mode.to_string(), "Scoped (text-only, no tools)");
+    }
+
+    #[test]
+    fn test_permission_mode_display_scoped_with_tools() {
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read,Edit,Bash(cargo:*)".to_string()),
+        };
+        assert_eq!(mode.to_string(), "Scoped (3 tools)");
     }
 
     // --- CODING_ALLOWED_TOOLS constant ---

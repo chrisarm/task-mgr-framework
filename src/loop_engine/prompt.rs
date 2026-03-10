@@ -13,7 +13,7 @@
 /// The prompt builder is the integration point between task selection, learning
 /// recall, source scanning, and the Claude subprocess.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -26,6 +26,7 @@ use crate::loop_engine::prompt_sections::escalation::build_escalation_section;
 use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
 };
+use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
 use crate::loop_engine::prompt_sections::synergy::{
     build_synergy_section, resolve_synergy_cluster_model,
 };
@@ -98,6 +99,10 @@ pub struct BuildPromptParams<'a> {
     pub default_model: Option<&'a str>,
     /// Optional PRD task prefix for scoping task selection to a specific PRD.
     pub task_prefix: Option<&'a str>,
+    /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
+    pub batch_sibling_prds: &'a [PathBuf],
+    /// Resolved permission mode (for tool-awareness prompt section).
+    pub permission_mode: &'a super::config::PermissionMode,
 }
 
 /// Build a prompt for the current iteration.
@@ -250,6 +255,19 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
+    let sibling_section = build_sibling_prd_section(
+        params.conn,
+        &task_output.id,
+        params.task_prefix,
+        params.batch_sibling_prds,
+    );
+    let sibling_section = try_fit_section(
+        sibling_section,
+        "Sibling PRD Tasks",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
     let steering_section = params
         .steering_path
         .map(build_steering_section)
@@ -297,18 +315,28 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
+    let tool_awareness_section = build_tool_awareness_section(params.permission_mode);
+    let tool_awareness_section = try_fit_section(
+        tool_awareness_section,
+        "Tool Awareness",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
     // ============================================================
     // Assembly: concatenate in display order
     // ============================================================
-    // Display order: steering → guidance → hint → source → deps → synergy →
+    // Display order: steering → guidance → hint → tools → source → deps → synergy →
     //                task → learnings → completion → escalation → reorder instr → base prompt
     let mut prompt = String::with_capacity(TOTAL_PROMPT_BUDGET);
     prompt.push_str(&steering_section);
     prompt.push_str(&guidance_section);
     prompt.push_str(&hint_section);
+    prompt.push_str(&tool_awareness_section);
     prompt.push_str(&source_section);
     prompt.push_str(&dep_section);
     prompt.push_str(&synergy_section);
+    prompt.push_str(&sibling_section);
     prompt.push_str(&task_section);
     prompt.push_str(&learnings_section);
     prompt.push_str(&completion_section);
@@ -352,6 +380,61 @@ fn try_fit_section(
         );
         dropped.push(name.to_string());
         String::new()
+    }
+}
+
+/// Build a tool-awareness section that tells the agent what tools it has.
+///
+/// Prevents the "I need Bash access" behavioral pattern by explicitly informing
+/// the agent about its available tools based on the resolved permission mode.
+fn build_tool_awareness_section(permission_mode: &super::config::PermissionMode) -> String {
+    use super::config::PermissionMode;
+
+    match permission_mode {
+        PermissionMode::Scoped {
+            allowed_tools: Some(tools),
+        } => {
+            // Extract Bash command prefixes: "Bash(cargo:*)" → "cargo"
+            let bash_prefixes: Vec<&str> = tools
+                .split(',')
+                .filter_map(|t| {
+                    let t = t.trim();
+                    t.strip_prefix("Bash(").and_then(|s| s.strip_suffix(":*)"))
+                })
+                .collect();
+
+            let tool_count = tools.split(',').count();
+            let mut section = format!(
+                "## Available Tools\n\n\
+                 You have {tool_count} pre-approved tools. "
+            );
+
+            if !bash_prefixes.is_empty() {
+                section.push_str(&format!(
+                    "Bash commands are scoped to: `{}`.\n",
+                    bash_prefixes.join("`, `")
+                ));
+            }
+
+            section.push_str(
+                "\nDo NOT say \"I need Bash access\" or ask for permission. \
+                 You already have these permissions — just use the tools.\n\n",
+            );
+
+            section
+        }
+        PermissionMode::Dangerous => "## Available Tools\n\n\
+             You have unrestricted tool access. Just use any tool you need.\n\n"
+            .to_string(),
+        PermissionMode::Auto => "## Available Tools\n\n\
+             You have auto-approved tool access. Just use any tool you need.\n\n"
+            .to_string(),
+        PermissionMode::Scoped {
+            allowed_tools: None,
+        } => {
+            // Text-only mode — no tools section needed
+            String::new()
+        }
     }
 }
 
@@ -519,6 +602,9 @@ mod tests {
         insert_task_full, insert_test_learning, setup_test_db,
     };
 
+    static DEFAULT_PERM: super::super::config::PermissionMode =
+        super::super::config::PermissionMode::Dangerous;
+
     /// Create a base prompt file and return its path.
     fn create_base_prompt(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("prompt.md");
@@ -562,6 +648,8 @@ mod tests {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         }
     }
 
@@ -617,6 +705,54 @@ mod tests {
             prompt.is_empty(),
             "Missing prompt file should be no-op (with warning)"
         );
+    }
+
+    // --- build_tool_awareness_section ---
+
+    #[test]
+    fn test_tool_awareness_scoped_with_bash_prefixes() {
+        use super::super::config::PermissionMode;
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read,Edit,Bash(cargo:*),Bash(git:*),Write".to_string()),
+        };
+        let section = build_tool_awareness_section(&mode);
+        assert!(section.contains("## Available Tools"));
+        assert!(section.contains("5 pre-approved tools"));
+        assert!(section.contains("`cargo`"));
+        assert!(section.contains("`git`"));
+        assert!(section.contains("Do NOT say"));
+    }
+
+    #[test]
+    fn test_tool_awareness_scoped_no_bash() {
+        use super::super::config::PermissionMode;
+        let mode = PermissionMode::Scoped {
+            allowed_tools: Some("Read,Edit,Write".to_string()),
+        };
+        let section = build_tool_awareness_section(&mode);
+        assert!(section.contains("3 pre-approved tools"));
+        assert!(!section.contains("scoped to"));
+    }
+
+    #[test]
+    fn test_tool_awareness_dangerous() {
+        use super::super::config::PermissionMode;
+        let section = build_tool_awareness_section(&PermissionMode::Dangerous);
+        assert!(section.contains("unrestricted tool access"));
+    }
+
+    #[test]
+    fn test_tool_awareness_auto() {
+        use super::super::config::PermissionMode;
+        let section = build_tool_awareness_section(&PermissionMode::Auto);
+        assert!(section.contains("auto-approved tool access"));
+    }
+
+    #[test]
+    fn test_tool_awareness_text_only_empty() {
+        use super::super::config::PermissionMode;
+        let section = build_tool_awareness_section(&PermissionMode::text_only());
+        assert!(section.is_empty());
     }
 
     #[test]
@@ -730,6 +866,8 @@ mod tests {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1097,6 +1235,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1213,6 +1353,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1258,6 +1400,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1886,6 +2030,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1937,6 +2083,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -1980,6 +2128,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         // next::next uses dir for DB access — task should be found
@@ -2828,6 +2978,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -2915,6 +3067,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)
@@ -3015,6 +3169,8 @@ pub enum ApiError {
             verbose: false,
             default_model: None,
             task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
         };
 
         let result = build_prompt(&params)

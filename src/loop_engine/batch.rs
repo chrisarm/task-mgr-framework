@@ -311,6 +311,13 @@ pub async fn run_batch(
             config.max_iterations = max_iter;
         }
 
+        // Sibling PRDs = all other PRD files in the batch (for milestone context)
+        let sibling_prds: Vec<PathBuf> = pairs
+            .iter()
+            .filter(|(p, _)| p != prd_file)
+            .map(|(p, _)| p.clone())
+            .collect();
+
         let run_config = LoopRunConfig {
             db_dir: dir.to_path_buf(),
             source_root: project_root.to_path_buf(),
@@ -319,6 +326,7 @@ pub async fn run_batch(
             prompt_file: Some(prompt_file.clone()),
             config,
             external_repo: None, // Batch mode reads from PRD metadata
+            batch_sibling_prds: sibling_prds,
         };
 
         let should_cleanup_worktree = run_config.config.cleanup_worktree;

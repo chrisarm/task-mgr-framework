@@ -6,7 +6,7 @@ target/
 .task-mgr/*
 !.task-mgr/tasks/
 *.db
-.task-mgr/tasks/progress*.txt
+progress*.txt
 
 # External project symlinks
 linked_projects/
