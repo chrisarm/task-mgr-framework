@@ -112,6 +112,7 @@ fn is_rate_limited(output: &str) -> bool {
         || output_lower.contains("usage")
             && output_lower.contains("limit")
             && output_lower.contains("reached")
+        || output_lower.contains("hit your limit")
 }
 
 // --- Key Decision Extraction ---
@@ -557,6 +558,18 @@ mod tests {
     }
 
     #[test]
+    fn test_hit_your_limit_detected_as_rate_limit() {
+        // Exact message from Claude CLI when session limit is reached
+        let output = "You've hit your limit · resets 4pm (America/Los_Angeles)\nYou've hit your limit · resets 4pm (America/Los_Angeles)\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Session limit message should be detected as RateLimit, not Crash"
+        );
+    }
+
+    #[test]
     fn test_complete_takes_priority_over_rate_limit() {
         let output = "rate_limit_error earlier\nRecovered\n<promise>COMPLETE</promise>\n";
         let result = analyze_output(&output, 0, &test_dir());
@@ -636,6 +649,10 @@ mod tests {
         assert!(is_rate_limited("rate_limit_error"));
         assert!(is_rate_limited("HTTP 429 rate limit"));
         assert!(is_rate_limited("Usage limit reached"));
+        assert!(is_rate_limited(
+            "You've hit your limit · resets 4pm (America/Los_Angeles)"
+        ));
+        assert!(is_rate_limited("You've hit your limit"));
     }
 
     #[test]
