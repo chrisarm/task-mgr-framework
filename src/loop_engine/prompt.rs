@@ -418,7 +418,10 @@ fn build_tool_awareness_section(permission_mode: &super::config::PermissionMode)
 
             section.push_str(
                 "\nDo NOT say \"I need Bash access\" or ask for permission. \
-                 You already have these permissions — just use the tools.\n\n",
+                 You already have these permissions — just use the tools.\n\n\
+                 **Environment variables**: Commands like `VAR=val command` will be denied \
+                 because the shell sees `VAR=val` as the first token, not `command`. \
+                 Use `env VAR=val command` instead — `env` is an allowed prefix.\n\n",
             );
 
             section
@@ -721,6 +724,10 @@ mod tests {
         assert!(section.contains("`cargo`"));
         assert!(section.contains("`git`"));
         assert!(section.contains("Do NOT say"));
+        assert!(
+            section.contains("env VAR=val command"),
+            "Should include env var prefix guidance"
+        );
     }
 
     #[test]
