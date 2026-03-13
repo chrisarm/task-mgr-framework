@@ -856,5 +856,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             }
             Ok(())
         }
+        // Full dispatch wired in FEAT-003
+        Commands::Decisions { .. } => {
+            eprintln!("error: `decisions` subcommand not yet wired (coming in FEAT-003)");
+            std::process::exit(1);
+        }
     }
 }
