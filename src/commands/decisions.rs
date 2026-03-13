@@ -180,49 +180,52 @@ pub fn revert_decision_cmd(conn: &Connection, id: i64) -> TaskMgrResult<Decision
     Ok(DecisionRevertResult { id, title })
 }
 
+/// Map a single ASCII letter ('a'/'A' → 0, 'b'/'B' → 1, …) to the matching option.
+///
+/// Returns `NotFound` with a descriptive message if the letter exceeds the number of options.
+fn letter_to_option(options: &[KeyDecisionOption], ch: char) -> TaskMgrResult<&KeyDecisionOption> {
+    let idx = (ch.to_ascii_lowercase() as u8).wrapping_sub(b'a') as usize;
+    options.get(idx).ok_or_else(|| {
+        let max_letter = (b'A' + options.len().saturating_sub(1) as u8) as char;
+        TaskMgrError::NotFound {
+            resource_type: "Option".to_string(),
+            id: format!(
+                "'{}' — valid options are A–{} (this decision has {} option(s))",
+                ch.to_ascii_uppercase(),
+                max_letter,
+                options.len()
+            ),
+        }
+    })
+}
+
 /// Find an option by single-letter index or label substring.
 ///
 /// Letter matching: 'a'/'A' → index 0, 'b'/'B' → index 1, etc. (case-insensitive).
 /// Returns `NotFound` if the letter is out of range or no label matches the substring.
-fn find_option<'a>(
+pub(crate) fn find_option<'a>(
     options: &'a [KeyDecisionOption],
     option_str: &str,
 ) -> TaskMgrResult<&'a KeyDecisionOption> {
     let trimmed = option_str.trim();
 
-    // Try single letter mapping: a → 0, b → 1, ... (wrapping_sub avoids overflow)
+    // Try single letter mapping: a → 0, b → 1, …
     if trimmed.len() == 1 {
         let ch = trimmed.chars().next().unwrap(); // safe: len == 1
         if ch.is_ascii_alphabetic() {
-            let idx = (ch.to_ascii_lowercase() as u8).wrapping_sub(b'a') as usize;
-            if let Some(opt) = options.get(idx) {
-                return Ok(opt);
-            }
-            let max_letter = (b'A' + options.len().saturating_sub(1) as u8) as char;
-            return Err(TaskMgrError::NotFound {
-                resource_type: "Option".to_string(),
-                id: format!(
-                    "'{}' — valid options are A–{} (this decision has {} option(s))",
-                    trimmed.to_uppercase(),
-                    max_letter,
-                    options.len()
-                ),
-            });
+            return letter_to_option(options, ch);
         }
     }
 
     // Fall back to case-insensitive label substring match
     let lower = trimmed.to_lowercase();
-    for opt in options {
-        if opt.label.to_lowercase().contains(&lower) {
-            return Ok(opt);
-        }
-    }
-
-    Err(TaskMgrError::NotFound {
-        resource_type: "Option".to_string(),
-        id: format!("'{}' did not match any option label", trimmed),
-    })
+    options
+        .iter()
+        .find(|opt| opt.label.to_lowercase().contains(&lower))
+        .ok_or_else(|| TaskMgrError::NotFound {
+            resource_type: "Option".to_string(),
+            id: format!("'{}' did not match any option label", trimmed),
+        })
 }
 
 /// Format list result as human-readable text.
