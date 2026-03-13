@@ -10,6 +10,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use chrono::TimeZone;
+
 use crate::loop_engine::display;
 use crate::loop_engine::oauth;
 use crate::loop_engine::signals;
@@ -19,6 +21,9 @@ const MAX_WAIT_SECS: u64 = 5 * 3600;
 
 /// Interval between .stop signal checks during wait: 10 seconds.
 const WAIT_CHECK_INTERVAL_SECS: u64 = 10;
+
+/// Interval between rate-limit probe checks: 60 seconds.
+const PROBE_INTERVAL_SECS: u64 = 60;
 
 /// Anthropic Usage API endpoint.
 const USAGE_API_URL: &str = "https://api.anthropic.com/v1/organizations/usage";
@@ -113,11 +118,21 @@ pub fn check_usage_api(access_token: &str) -> Option<UsageInfo> {
 /// Wait for usage to reset, displaying a countdown to stderr.
 ///
 /// Checks the `.stop` signal file every `WAIT_CHECK_INTERVAL_SECS` seconds.
-/// Returns `true` if the wait completed, `false` if interrupted by `.stop`.
+/// When `probe_fn` is `Some`, calls it every ~60 seconds to check if the
+/// rate limit has been lifted early. The probe returns `true` if the limit
+/// is lifted (resume immediately).
+///
+/// Returns `true` if the wait completed (or probe succeeded),
+/// `false` if interrupted by `.stop`.
 ///
 /// The `wait_secs` parameter specifies how long to wait. It is capped at
 /// `MAX_WAIT_SECS` (5 hours).
-pub fn wait_for_usage_reset(wait_secs: u64, tasks_dir: &Path, fallback_wait: u64) -> bool {
+pub fn wait_for_usage_reset(
+    wait_secs: u64,
+    tasks_dir: &Path,
+    fallback_wait: u64,
+    probe_fn: Option<&dyn Fn() -> bool>,
+) -> bool {
     let effective_wait = if wait_secs == 0 {
         fallback_wait
     } else {
@@ -125,17 +140,37 @@ pub fn wait_for_usage_reset(wait_secs: u64, tasks_dir: &Path, fallback_wait: u64
     };
 
     eprintln!(
-        "Usage limit reached. Waiting {} for reset...",
-        display::format_duration(effective_wait)
+        "Usage limit reached. Waiting {} for reset{}...",
+        display::format_duration(effective_wait),
+        if probe_fn.is_some() {
+            format!(" (probing every {}s)", PROBE_INTERVAL_SECS)
+        } else {
+            String::new()
+        }
     );
 
     let mut remaining = effective_wait;
+    // Start at the probe interval so the first probe fires immediately
+    let mut since_last_probe: u64 = PROBE_INTERVAL_SECS;
 
     while remaining > 0 {
         // Check for stop signal
         if signals::check_stop_signal(tasks_dir, None) {
             eprintln!("Stop signal detected during usage wait. Exiting wait.");
             return false;
+        }
+
+        // Periodic probe: check if rate limit has been lifted early
+        if let Some(ref probe) = probe_fn {
+            if since_last_probe >= PROBE_INTERVAL_SECS {
+                since_last_probe = 0;
+                eprintln!("  Probing whether rate limit has been lifted...");
+                if probe() {
+                    eprintln!("  Rate limit lifted early! Resuming...");
+                    return true;
+                }
+                eprintln!("  Still rate-limited. Continuing wait...");
+            }
         }
 
         // Display countdown every interval
@@ -149,6 +184,7 @@ pub fn wait_for_usage_reset(wait_secs: u64, tasks_dir: &Path, fallback_wait: u64
 
         thread::sleep(Duration::from_secs(sleep_time));
         remaining = remaining.saturating_sub(sleep_time);
+        since_last_probe += sleep_time;
     }
 
     eprintln!("Usage wait complete. Resuming...");
@@ -236,13 +272,105 @@ pub fn check_and_wait(threshold: u8, tasks_dir: &Path, fallback_wait: u64) -> Us
         .and_then(estimate_reset_seconds)
         .unwrap_or(0);
 
-    let completed = wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait);
+    let completed = wait_for_usage_reset(wait_secs, tasks_dir, fallback_wait, None);
 
     if completed {
         UsageCheckResult::WaitedAndReset
     } else {
         UsageCheckResult::StopSignaled
     }
+}
+
+/// Parse a reset time from Claude CLI output like "resets 4pm (America/Los_Angeles)".
+///
+/// Extracts the time token after "resets " and computes seconds until that local time.
+/// Returns `None` if the pattern is not found, unparseable, or the time has already passed.
+pub fn parse_reset_from_output(output: &str) -> Option<u64> {
+    let lower = output.to_lowercase();
+    let idx = lower.find("resets ")?;
+    let after = &lower[idx + "resets ".len()..];
+
+    // Extract time token: everything up to the next space or '('
+    let end = after
+        .find(|c: char| c == '(' || (c.is_whitespace() && c != ' '))
+        .unwrap_or(after.len());
+    let token_region = after[..end].trim();
+
+    // The token might be like "4pm", "12:30am", "4:00pm", "16:00"
+    // Take the first whitespace-delimited word as the time token
+    let token = token_region
+        .split_whitespace()
+        .next()
+        .unwrap_or(token_region);
+
+    let (hour, minute) = parse_time_token(token)?;
+
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+
+    // Build target datetime in local timezone
+    let target_naive = today.and_hms_opt(hour, minute, 0)?;
+    let target_local = now
+        .timezone()
+        .from_local_datetime(&target_naive)
+        .single()?;
+
+    let diff = target_local.signed_duration_since(now);
+    if diff.num_seconds() <= 0 {
+        return None; // Already past
+    }
+
+    Some(diff.num_seconds() as u64)
+}
+
+/// Parse a time token like "4pm", "12:30am", "4:00pm", "16:00" into (hour, minute).
+fn parse_time_token(token: &str) -> Option<(u32, u32)> {
+    let token = token.trim().trim_end_matches(|c: char| c == ',' || c == '.');
+
+    let (time_part, am_pm) = if token.ends_with("am") {
+        (&token[..token.len() - 2], Some("am"))
+    } else if token.ends_with("pm") {
+        (&token[..token.len() - 2], Some("pm"))
+    } else {
+        (token, None)
+    };
+
+    let (hour, minute) = if let Some(colon_pos) = time_part.find(':') {
+        let h: u32 = time_part[..colon_pos].parse().ok()?;
+        let m: u32 = time_part[colon_pos + 1..].parse().ok()?;
+        (h, m)
+    } else {
+        let h: u32 = time_part.parse().ok()?;
+        (h, 0)
+    };
+
+    let hour = match am_pm {
+        Some("am") => {
+            if hour == 12 {
+                0
+            } else if hour > 12 {
+                return None;
+            } else {
+                hour
+            }
+        }
+        Some("pm") => {
+            if hour == 12 {
+                12
+            } else if hour > 12 {
+                return None;
+            } else {
+                hour + 12
+            }
+        }
+        _ => hour, // 24-hour format
+    };
+
+    if hour >= 24 || minute >= 60 {
+        return None;
+    }
+
+    Some((hour, minute))
 }
 
 /// Sanitize API error messages to prevent token leakage.
@@ -353,7 +481,7 @@ mod tests {
     fn test_wait_for_usage_reset_zero_wait_uses_fallback() {
         let temp_dir = TempDir::new().unwrap();
         // With 0 wait_secs and 1 second fallback, should complete quickly
-        let completed = wait_for_usage_reset(0, temp_dir.path(), 1);
+        let completed = wait_for_usage_reset(0, temp_dir.path(), 1, None);
         assert!(completed, "Should complete with very short fallback");
     }
 
@@ -364,7 +492,7 @@ mod tests {
         std::fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
 
         // Should detect stop and return false immediately (at first check interval)
-        let completed = wait_for_usage_reset(60, temp_dir.path(), 300);
+        let completed = wait_for_usage_reset(60, temp_dir.path(), 300, None);
         assert!(!completed, "Should be interrupted by stop signal");
     }
 
@@ -378,7 +506,7 @@ mod tests {
     fn test_wait_for_usage_reset_short_wait_completes() {
         let temp_dir = TempDir::new().unwrap();
         // Very short wait should complete
-        let completed = wait_for_usage_reset(1, temp_dir.path(), 1);
+        let completed = wait_for_usage_reset(1, temp_dir.path(), 1, None);
         assert!(completed);
     }
 
@@ -616,7 +744,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         // Wait for 0 seconds with 0 fallback — should still complete
         // (effective_wait = fallback_wait = 0, loop body doesn't execute)
-        let completed = wait_for_usage_reset(0, temp_dir.path(), 0);
+        let completed = wait_for_usage_reset(0, temp_dir.path(), 0, None);
         // With effective_wait=0, remaining starts at 0, while loop doesn't execute
         assert!(completed, "Zero effective wait should complete immediately");
     }
@@ -631,7 +759,7 @@ mod tests {
 
         // Pass u64::MAX as wait_secs — should be capped to MAX_WAIT_SECS
         // The .stop file will interrupt it immediately
-        let completed = wait_for_usage_reset(u64::MAX, temp_dir.path(), 300);
+        let completed = wait_for_usage_reset(u64::MAX, temp_dir.path(), 300, None);
         assert!(!completed, "Should be interrupted by stop signal");
     }
 
@@ -639,7 +767,7 @@ mod tests {
     fn test_wait_for_usage_reset_fallback_not_used_when_wait_nonzero() {
         let temp_dir = TempDir::new().unwrap();
         // wait_secs=1, fallback=3600 — should use wait_secs (1), not fallback
-        let completed = wait_for_usage_reset(1, temp_dir.path(), 3600);
+        let completed = wait_for_usage_reset(1, temp_dir.path(), 3600, None);
         assert!(completed, "Should complete quickly with 1 second wait");
     }
 
@@ -651,8 +779,28 @@ mod tests {
         // Pre-create stop file so it's detected at first check
         std::fs::write(temp_dir.path().join(STOP_FILE), "").unwrap();
 
-        let completed = wait_for_usage_reset(100, temp_dir.path(), 300);
+        let completed = wait_for_usage_reset(100, temp_dir.path(), 300, None);
         assert!(!completed, "Stop file should interrupt wait");
+    }
+
+    // --- probe-based early exit ---
+
+    #[test]
+    fn test_wait_for_usage_reset_probe_exits_early() {
+        let temp_dir = TempDir::new().unwrap();
+        // Probe always says "limit lifted" → should exit after first probe check
+        let probe = || true;
+        let completed = wait_for_usage_reset(3600, temp_dir.path(), 300, Some(&probe));
+        assert!(completed, "Probe returning true should exit wait early");
+    }
+
+    #[test]
+    fn test_wait_for_usage_reset_probe_false_continues() {
+        let temp_dir = TempDir::new().unwrap();
+        // Probe always says "still limited" → should complete via timeout
+        let probe = || false;
+        let completed = wait_for_usage_reset(1, temp_dir.path(), 1, Some(&probe));
+        assert!(completed, "Probe returning false should not prevent completion");
     }
 
     // --- sanitize_api_error edge cases ---
@@ -803,5 +951,147 @@ mod tests {
             USAGE_API_URL.contains("anthropic.com"),
             "Usage API URL should point to anthropic.com"
         );
+    }
+
+    // --- parse_reset_from_output tests ---
+
+    #[test]
+    fn test_parse_reset_from_output_4pm() {
+        // Use a time 2 hours from now, formatted as hour-only (e.g. "4pm").
+        // Since the format truncates minutes, the parsed reset time is the
+        // top of that hour — which may be up to 59 minutes less than 2h away.
+        let now = chrono::Local::now();
+        let future = now + chrono::Duration::hours(2);
+        let hour_str = future.format("%-I%P").to_string(); // e.g. "4pm"
+        let output = format!(
+            "You've hit your limit · resets {} (America/Los_Angeles)",
+            hour_str
+        );
+        let result = parse_reset_from_output(&output);
+        assert!(result.is_some(), "Should parse '{}' from output", hour_str);
+        let secs = result.unwrap();
+        // The top-of-hour is 1h01m..2h00m from now (depends on current minute)
+        assert!(secs > 3600, "Expected >3600 but got {}", secs);
+        assert!(secs <= 7200, "Expected <=7200 but got {}", secs);
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_with_minutes() {
+        let now = chrono::Local::now();
+        let future = now + chrono::Duration::hours(1) + chrono::Duration::minutes(30);
+        let time_str = future.format("%-I:%M%P").to_string(); // e.g. "5:30pm"
+        let output = format!("resets {} (America/Los_Angeles)", time_str);
+        let result = parse_reset_from_output(&output);
+        assert!(result.is_some(), "Should parse '{}' from output", time_str);
+        let secs = result.unwrap();
+        assert!(
+            secs > 5340,
+            "Expected >5340 (90 min - tolerance) but got {}",
+            secs
+        );
+        assert!(
+            secs < 5460,
+            "Expected <5460 (90 min + tolerance) but got {}",
+            secs
+        );
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_no_match() {
+        let output = "Some random output without reset info";
+        assert!(parse_reset_from_output(output).is_none());
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_empty() {
+        assert!(parse_reset_from_output("").is_none());
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_past_time() {
+        // Construct a time that's definitely in the past
+        let now = chrono::Local::now();
+        let past = now - chrono::Duration::hours(2);
+        let time_str = past.format("%-I%P").to_string();
+        let output = format!("resets {}", time_str);
+        let result = parse_reset_from_output(&output);
+        assert!(result.is_none(), "Past time should return None");
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_case_insensitive() {
+        let now = chrono::Local::now();
+        let future = now + chrono::Duration::hours(3);
+        let time_str = future.format("%-I%P").to_string().to_uppercase(); // e.g. "7PM"
+        let output = format!("RESETS {} (America/Los_Angeles)", time_str);
+        // The function lowercases internally, so "PM" becomes "pm"
+        let result = parse_reset_from_output(&output);
+        assert!(
+            result.is_some(),
+            "Should handle uppercase 'RESETS {}' ",
+            time_str
+        );
+    }
+
+    #[test]
+    fn test_parse_reset_from_output_24h_format() {
+        let now = chrono::Local::now();
+        let future = now + chrono::Duration::hours(1);
+        let time_str = future.format("%H:%M").to_string(); // e.g. "16:00"
+        let output = format!("resets {}", time_str);
+        let result = parse_reset_from_output(&output);
+        assert!(
+            result.is_some(),
+            "Should parse 24h format '{}' from output",
+            time_str
+        );
+    }
+
+    // --- parse_time_token unit tests ---
+
+    #[test]
+    fn test_parse_time_token_simple_pm() {
+        assert_eq!(parse_time_token("4pm"), Some((16, 0)));
+    }
+
+    #[test]
+    fn test_parse_time_token_simple_am() {
+        assert_eq!(parse_time_token("9am"), Some((9, 0)));
+    }
+
+    #[test]
+    fn test_parse_time_token_12am() {
+        assert_eq!(parse_time_token("12am"), Some((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_time_token_12pm() {
+        assert_eq!(parse_time_token("12pm"), Some((12, 0)));
+    }
+
+    #[test]
+    fn test_parse_time_token_with_minutes() {
+        assert_eq!(parse_time_token("4:30pm"), Some((16, 30)));
+    }
+
+    #[test]
+    fn test_parse_time_token_midnight_minutes() {
+        assert_eq!(parse_time_token("12:15am"), Some((0, 15)));
+    }
+
+    #[test]
+    fn test_parse_time_token_24h() {
+        assert_eq!(parse_time_token("16:00"), Some((16, 0)));
+        assert_eq!(parse_time_token("0:00"), Some((0, 0)));
+        assert_eq!(parse_time_token("23:59"), Some((23, 59)));
+    }
+
+    #[test]
+    fn test_parse_time_token_invalid() {
+        assert_eq!(parse_time_token(""), None);
+        assert_eq!(parse_time_token("abc"), None);
+        assert_eq!(parse_time_token("25:00"), None);
+        assert_eq!(parse_time_token("12:60pm"), None);
+        assert_eq!(parse_time_token("13pm"), None); // 13pm is invalid
     }
 }

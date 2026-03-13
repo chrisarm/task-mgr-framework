@@ -104,7 +104,7 @@ fn extract_reorder_task_id(output: &str) -> Option<String> {
 }
 
 /// Check if output contains rate-limit error patterns.
-fn is_rate_limited(output: &str) -> bool {
+pub(crate) fn is_rate_limited(output: &str) -> bool {
     let output_lower = output.to_lowercase();
     output_lower.contains("rate_limit_error")
         || output_lower.contains("429")

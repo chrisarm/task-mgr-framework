@@ -531,23 +531,66 @@ pub fn run_iteration(
         detection::analyze_output(&claude_output, claude_result.exit_code, params.project_root);
 
     // Step 7.5: On rate-limit detection, trigger usage wait and mark as non-counting
-    if outcome == IterationOutcome::RateLimit && params.usage_params.enabled {
+    if outcome == IterationOutcome::RateLimit {
         eprintln!("Rate limit detected in output, checking usage API...");
-        let check_result = usage::check_and_wait(
-            params.usage_params.threshold,
-            params.tasks_dir,
-            params.usage_params.fallback_wait,
-        );
-        if check_result == UsageCheckResult::StopSignaled {
-            return Ok(IterationResult {
-                outcome: IterationOutcome::RateLimit,
-                task_id: Some(task_id),
-                files_modified: task_files,
-                should_stop: true,
-                output: String::new(),
-                effective_model: None,
-                key_decisions_count: 0,
-            });
+
+        let mut waited = false;
+
+        // Try the usage API first (if enabled)
+        if params.usage_params.enabled {
+            let check_result = usage::check_and_wait(
+                params.usage_params.threshold,
+                params.tasks_dir,
+                params.usage_params.fallback_wait,
+            );
+            match check_result {
+                UsageCheckResult::StopSignaled => {
+                    return Ok(IterationResult {
+                        outcome: IterationOutcome::RateLimit,
+                        task_id: Some(task_id),
+                        files_modified: task_files,
+                        should_stop: true,
+                        output: String::new(),
+                        effective_model: None,
+                        key_decisions_count: 0,
+                    });
+                }
+                UsageCheckResult::WaitedAndReset => {
+                    waited = true;
+                }
+                _ => {} // Skipped, BelowThreshold, ApiError — didn't actually wait
+            }
+        }
+
+        // Fallback: if the usage API didn't wait, parse reset time from output
+        if !waited {
+            let wait_secs = usage::parse_reset_from_output(&claude_output).unwrap_or(0);
+            eprintln!(
+                "Usage API did not wait (CLI session limit). Falling back to output-parsed reset time ({})...",
+                if wait_secs > 0 {
+                    display::format_duration(wait_secs)
+                } else {
+                    format!("fallback {}s", params.usage_params.fallback_wait)
+                }
+            );
+            let probe = || probe_rate_limit_lifted(params.permission_mode);
+            let completed = usage::wait_for_usage_reset(
+                wait_secs,
+                params.tasks_dir,
+                params.usage_params.fallback_wait,
+                Some(&probe),
+            );
+            if !completed {
+                return Ok(IterationResult {
+                    outcome: IterationOutcome::RateLimit,
+                    task_id: Some(task_id),
+                    files_modified: task_files,
+                    should_stop: true,
+                    output: String::new(),
+                    effective_model: None,
+                    key_decisions_count: 0,
+                });
+            }
         }
     }
 
@@ -1330,7 +1373,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Rotate progress file before starting iterations to bound context size
     progress::rotate_progress(&paths.progress_file);
 
-    for iteration in 1..=max_iterations {
+    let mut iteration: u32 = 0;
+    while iteration < max_iterations as u32 {
+        iteration += 1; // 1-based, incremented at top
         // Pre-iteration: refresh OAuth token if usage checking enabled
         if usage_params.enabled {
             oauth::ensure_valid_token();
@@ -1684,6 +1729,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         match result.outcome {
             IterationOutcome::Reorder(_) | IterationOutcome::RateLimit => {
                 // Don't count against iteration budget
+                iteration -= 1;
             }
             IterationOutcome::Completed => {
                 iterations_completed += 1;
@@ -2108,6 +2154,65 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         effective_model: None,
         key_decisions_count: 0,
     }
+}
+
+/// Probe whether the CLI rate limit has been lifted by spawning a minimal Claude call.
+///
+/// Sends `claude -p "." --print --max-turns 1 --no-session-persistence` and checks
+/// whether the output still contains rate-limit patterns. Returns `true` if the
+/// limit appears to be lifted (Claude responds without a rate-limit error).
+fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool {
+    let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
+
+    let mut args = vec![
+        "--print",
+        "--no-session-persistence",
+        "--max-turns",
+        "1",
+    ];
+
+    // Use the same permission mode as the main loop so the probe doesn't hang
+    // on a permission prompt.
+    let allowed_tools_str;
+    match permission_mode {
+        PermissionMode::Dangerous => {
+            args.push("--dangerously-skip-permissions");
+        }
+        PermissionMode::Scoped { allowed_tools } => {
+            args.push("--permission-mode");
+            args.push("dontAsk");
+            if let Some(tools) = allowed_tools {
+                allowed_tools_str = tools.clone();
+                args.push("--allowedTools");
+                args.push(&allowed_tools_str);
+            }
+        }
+        PermissionMode::Auto => {
+            args.push("--enable-auto-mode");
+        }
+    }
+
+    args.push("-p");
+    args.push(".");
+
+    let output = match std::process::Command::new(&binary)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("  Probe failed to spawn: {}", e);
+            return false;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    !detection::is_rate_limited(&combined)
 }
 
 /// Update crash and stale trackers based on iteration outcome.
