@@ -1,0 +1,550 @@
+{
+  "branchName": "feat/invalidate-learning",
+  "description": "Add `task-mgr invalidate-learning <id>` command with two-step degradation: first call downgrades confidence to Low, second call (already Low) sets retired_at to soft-archive the learning.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases. Tests verify boundaries work correctly",
+      "2. FUNCTIONING CODE - Pragmatic, reliable code that works according to the plan",
+      "3. CORRECTNESS - Code compiles, type-checks, passes all tests deterministically",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings",
+      "5. POLISH - Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Ship solid working code first, then use tests to improve it",
+      "Test the boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "12656b00",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Test: high confidence learning -> downgraded to low (action='downgraded')",
+        "Test: medium confidence learning -> downgraded to low (action='downgraded')",
+        "Test: low confidence learning -> retired (action='retired', retired_at set)",
+        "Test: two-step sequence (high -> low -> retired in two calls)",
+        "Test: already-retired learning returns InvalidState error",
+        "Test: non-existent learning ID returns NotFound error",
+        "Test: format_text produces correct output for both downgrade and retire cases",
+        "Known-bad discriminator: test that confidence=Low on first call returns 'downgraded' not 'retired' (rejects naive 'Low always retires' stub)",
+        "Test file compiles (tests may be #[ignore] or expected to fail)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation defining expected behavior for the invalidate-learning two-step degradation. Tests should compile but fail (or be #[ignore]) until implementation exists. Place in src/commands/invalidate_learning.rs #[cfg(test)] mod tests.",
+      "edgeCases": [
+        "Learning already retired: must return InvalidState error, not silently succeed",
+        "Learning not found: must return NotFound error with learning ID",
+        "Confidence already Low on first call: must still return 'downgraded' action (not 'retired'), writes Low via edit_learning idempotently",
+        "Two rapid sequential calls: first sets Low, second retires — correct ordering guaranteed by single-threaded CLI + LockGuard"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Learning ID does not exist in database",
+          "expectedBehavior": "Return TaskMgrError::NotFound with learning_not_found(id)"
+        },
+        {
+          "cause": "Learning is already retired (retired_at IS NOT NULL)",
+          "expectedBehavior": "Return TaskMgrError::InvalidState with descriptive message"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "A single invalidate call never both downgrades AND retires in one operation",
+        "After downgrade, confidence is always Low regardless of starting level",
+        "After retirement, retired_at IS NOT NULL in the database",
+        "format_text output always contains the learning title and ID"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Use setup_db() from crate::learnings::test_helpers and RecordLearningParams from crate::learnings::crud. The Learning struct does NOT have retired_at, so verify retirement via direct SQL: SELECT retired_at FROM learnings WHERE id = ?1. Follow apply_learning.rs test patterns exactly.",
+      "passes": true,
+      "priority": 1,
+      "synergyWith": [
+        "FEAT-001"
+      ],
+      "title": "Initial tests for invalidate_learning command",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "InvalidateLearningResult struct with fields: learning_id (i64), title (String), previous_confidence (String), action (String), new_confidence (Option<String>)",
+        "InvalidateLearningResult derives Debug, Clone, Serialize",
+        "invalidate_learning(conn: &Connection, learning_id: i64) -> TaskMgrResult<InvalidateLearningResult>",
+        "get_learning returns None -> TaskMgrError::learning_not_found(id)",
+        "retired_at IS NOT NULL -> TaskMgrError::InvalidState error",
+        "confidence != Low -> edit_learning with confidence: Some(Confidence::Low), action='downgraded'",
+        "confidence == Low -> UPDATE learnings SET retired_at = datetime('now') WHERE id = ?1, action='retired'",
+        "format_text: downgrade -> 'Invalidated learning #ID: \"Title\" (confidence: prev -> low)'",
+        "format_text: retire -> 'Retired learning #ID: \"Title\" (was already low confidence)'",
+        "All TEST-INIT-001 tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Create src/commands/invalidate_learning.rs with InvalidateLearningResult struct, invalidate_learning() function, and format_text(). Follow apply_learning.rs structural template exactly. Logic: fetch learning via get_learning -> check not already retired via SELECT retired_at -> if confidence != Low: downgrade via edit_learning -> if confidence == Low: retire via UPDATE SET retired_at = datetime('now').",
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Key detail: Learning struct lacks retired_at field, so use direct SQL query SELECT retired_at FROM learnings WHERE id = ?1 to check retirement status. Use crate::learnings::crud::{get_learning, edit_learning, EditLearningParams} and crate::models::Confidence. Match apply_learning.rs structure: result struct at top, main function, format_text, #[cfg(test)] mod tests.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "First invalidation MUST set confidence to Low regardless of current level",
+          "Second invalidation (already Low) MUST set retired_at via SQL",
+          "Already-retired learnings MUST return InvalidState error",
+          "Non-existent IDs MUST return NotFound error via learning_not_found()"
+        ],
+        "performance": [
+          "Best effort — single-row operations on indexed primary key"
+        ],
+        "style": [
+          "Follow apply_learning.rs structural template exactly",
+          "Use edit_learning() for confidence downgrade (no raw SQL for CRUD-covered fields)",
+          "Use raw SQL only for retired_at update (matching curate retire pattern)",
+          "No .unwrap() outside tests"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Implement invalidate_learning core logic and result struct",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/commands/mod.rs: pub mod invalidate_learning; added after import_learnings",
+        "src/commands/mod.rs: re-exports for invalidate_learning, format_invalidate_learning_text, InvalidateLearningResult",
+        "src/cli/commands.rs: InvalidateLearning { learning_id: i64 } variant with #[command(name = \"invalidate-learning\")] and doc comment",
+        "src/main.rs: Commands::InvalidateLearning { learning_id } match arm with LockGuard::acquire, open_connection, invalidate_learning call, output_result",
+        "src/main.rs: import invalidate_learning in the use task_mgr::commands block",
+        "src/handlers.rs: impl_text_formattable!(InvalidateLearningResult, format_invalidate_learning_text) added",
+        "src/handlers.rs: InvalidateLearningResult and format_invalidate_learning_text added to imports from crate::commands",
+        "cargo check passes with no warnings",
+        "task-mgr --help shows invalidate-learning subcommand"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Wire the new invalidate_learning module into the full CLI pipeline: 1) src/commands/mod.rs: add pub mod + re-exports, 2) src/cli/commands.rs: add InvalidateLearning variant, 3) src/main.rs: add dispatch match arm with LockGuard, 4) src/handlers.rs: add impl_text_formattable! macro line.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Follow the exact pattern from ApplyLearning wiring: same LockGuard + open_connection + output_result pattern in main.rs dispatch. The handlers.rs impl_text_formattable! should add a trailing newline like ApplyLearningResult does (custom impl, not macro). Check if the custom impl pattern or macro is more appropriate by examining the ApplyLearningResult handler.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": {
+        "correctness": [
+          "Command name is 'invalidate-learning' (hyphenated) in CLI",
+          "Dispatch acquires LockGuard before database operations",
+          "output_result called with cli.format for both JSON and text support"
+        ],
+        "performance": [
+          "Best effort — wiring only, no performance concerns"
+        ],
+        "style": [
+          "Follow ApplyLearning wiring pattern exactly across all 4 files",
+          "Maintain alphabetical ordering in mod.rs exports where existing code does so",
+          "Module doc comment on invalidate_learning matches style of apply_learning"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-001"
+      ],
+      "title": "Wire up invalidate-learning command (mod.rs, CLI, main.rs, handlers.rs)",
+      "touchesFiles": [
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context",
+        "Security: no injection vulnerabilities (learning_id is i64, no string interpolation in SQL)",
+        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "Edge case coverage: each edgeCases entry from TEST-INIT-001 has a corresponding test",
+        "Integration: invalidate_learning reachable from CLI entry point (main.rs -> dispatch -> function)",
+        "Integration: module exported in mod.rs and re-exports are correct",
+        "Integration: impl_text_formattable! wired in handlers.rs",
+        "Integration: no dead code warnings from cargo check or cargo clippy",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Review all implementation tasks for code quality, error handling, security, and full integration wiring.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. No issues found — all 10 acceptance criteria pass. Zero unwrap in production, all errors propagated with context, parameterized SQL only, quality dimensions satisfied, all edge cases covered, full integration wiring verified, no dead code warnings. No CODE-FIX tasks needed.",
+      "passes": true,
+      "priority": 13,
+      "synergyWith": [],
+      "title": "Review implementation for quality, security, and integration wiring",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "No tight coupling between modules",
+        "Code is easy to change and extend",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. No refactoring needed. DRY: no violations. Complexity: invalidate_learning() is ~45 code lines but well-structured single-purpose if/else — splitting would reduce readability, not improve it. Coupling: minimal, uses existing CRUD layer. Maintainability: follows apply_learning.rs pattern exactly. No REFACTOR-1-xxx tasks needed.",
+      "passes": true,
+      "priority": 17,
+      "synergyWith": [],
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All initial tests (TEST-INIT-001) pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx or WIRE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points (no dead code)",
+        "No unused warnings for new code in `cargo check` / `cargo clippy`",
+        "`cargo test --lib` passes",
+        "`cargo clippy -- -D warnings` clean",
+        "Update follow-on tasks based on implementation decisions and learnings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "FEAT-001",
+        "FEAT-002",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Gate checkpoint: all initial tests pass, implementation reviewed for quality/security, refactored, and fully wired into CLI pipeline.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-1",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Initial tests pass, implementation reviewed, refactored, and fully wired in. Next set of tasks updated.",
+      "passes": true,
+      "priority": 20,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Initial tests pass, implementation reviewed and wired in",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: error message for not-found contains learning ID",
+        "Test: error message for already-retired contains 'retired' or 'already'",
+        "Test: InvalidateLearningResult fields correct for high->low downgrade (previous_confidence='high', action='downgraded', new_confidence=Some('low'))",
+        "Test: InvalidateLearningResult fields correct for medium->low downgrade",
+        "Test: InvalidateLearningResult fields correct for low->retired (action='retired', new_confidence=None)",
+        "Test: format_text downgrade output contains '->' arrow and 'low'",
+        "Test: format_text retire output contains 'Retired' and 'low confidence'",
+        "Test: after downgrade, database confidence column actually reads 'low'",
+        "Test: after retire, database retired_at column is NOT NULL",
+        "80%+ coverage for invalidate_learning module"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage beyond initial tests. Focus on error message content, result struct field values, format_text edge cases, and interaction with edit_learning/retired_at SQL.",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Complete. Added test_db_confidence_reads_low_after_downgrade (queries DB confidence column directly) and strengthened test_format_text_retire to assert both 'Retired' AND 'low confidence'. All 10 tests pass. get_confidence_from_db helper added.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": {
+        "correctness": [
+          "Tests verify actual database state, not just function return values",
+          "Error message assertions use contains() for resilience to message tweaks"
+        ],
+        "performance": [
+          "Best effort — test execution speed not a concern"
+        ],
+        "style": [
+          "Follow existing test patterns in apply_learning.rs tests",
+          "Use setup_db() from crate::learnings::test_helpers"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Comprehensive tests for invalidate_learning",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001"
+      ],
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. No refactoring needed. Setup code uses 3 well-extracted helpers (make_params, get_retired_at, get_confidence_from_db). Remaining 2-line setup varies per test and isn't worth abstracting. All 10 test names are descriptive. known_bad_discriminator overlap with high_confidence_downgraded is intentional (different purpose). No REFACTOR-2-xxx tasks needed.",
+      "passes": true,
+      "priority": 39,
+      "synergyWith": [],
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All comprehensive tests (TEST-001) pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "`cargo test --lib` passes with no failures",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Gate checkpoint: all comprehensive tests pass and test code is refactored.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-sonnet-4-6",
+      "modifiesBehavior": false,
+      "notes": "Full test coverage achieved, test code refactored.",
+      "passes": true,
+      "priority": 50,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Full test coverage achieved",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "CLI integration test: task-mgr invalidate-learning <id> produces correct text output for downgrade",
+        "CLI integration test: second call produces correct text output for retire",
+        "CLI integration test: non-existent ID returns non-zero exit code",
+        "CLI integration test: already-retired ID returns non-zero exit code",
+        "CLI integration test: --format json produces valid JSON with expected fields",
+        "All integration tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Add integration test in tests/cli_tests.rs (or a new test file) that exercises the invalidate-learning command through the actual CLI binary. Verify: downgrade output, retire output, not-found error, already-retired error, JSON output format.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "Check tests/cli_tests.rs for existing CLI test patterns. Use assert_cmd or similar if available, otherwise use std::process::Command to invoke the binary. Create learning via task-mgr learn first, then invalidate it.",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": {
+        "correctness": [
+          "Tests exercise the real CLI binary, not just library functions",
+          "Both text and JSON output formats verified"
+        ],
+        "performance": [
+          "Best effort — integration test speed not a concern"
+        ],
+        "style": [
+          "Follow existing CLI test patterns in tests/cli_tests.rs"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Integration test: invalidate-learning CLI end-to-end",
+      "touchesFiles": [
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "The prompt template in .claude/commands/tasks.md contains guidance about using invalidate-learning",
+        "Guidance explains: when a recalled learning turns out to be wrong, call `task-mgr invalidate-learning <id>`",
+        "Guidance explains the two-step behavior: first call downgrades to low, second call retires",
+        "Guidance is placed near the existing 'Learnings Guidelines' section in the template",
+        "The generated prompt file (tasks/invalidate-learning-prompt.md) is also updated with matching guidance"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Update .claude/commands/tasks.md prompt template so that generated prompt files instruct the loop agent to call `task-mgr invalidate-learning <id>` when it discovers a recalled learning is wrong or harmful. Add guidance in the Learnings Guidelines section and/or a new 'Learning Invalidation' section near the learnings guidelines.",
+      "estimatedEffort": "low",
+      "id": "POLISH-001",
+      "modifiesBehavior": false,
+      "notes": "The /tasks skill prompt template is at .claude/commands/tasks.md. The Learnings Guidelines section starts around line 871. Add a subsection like 'Invalidate wrong learnings' that tells the agent: if you discover a learning from `recall` is wrong, run `task-mgr invalidate-learning <id>` to degrade it. Also update this PRD's own prompt file to include the same guidance.",
+      "passes": true,
+      "priority": 60,
+      "synergyWith": [],
+      "title": "Update /tasks skill prompt template to instruct loop LLM to invalidate learnings",
+      "touchesFiles": [
+        ".claude/commands/tasks.md",
+        "tasks/invalidate-learning-prompt.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows project patterns (see CLAUDE.md)",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "POLISH-001"
+      ],
+      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge. For each issue found: 1) Add a REFACTOR-3-xxx task to JSON (priority 66-80), 2) Add REFACTOR-3-xxx to MILESTONE-FINAL dependsOn array, 3) Commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": true,
+      "priority": 65,
+      "synergyWith": [],
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/commands/invalidate_learning.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs",
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`cargo fmt --check` passes",
+        "`cargo check` passes with no warnings",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes (all unit + integration tests)",
+        "No dead code warnings for invalidate_learning module",
+        "task-mgr --help lists invalidate-learning command"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Run the full verification suite: cargo check, cargo clippy, cargo test, cargo fmt --check. Ensure everything is clean.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge. If any check fails, create fix tasks.",
+      "passes": true,
+      "priority": 90,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Final verification - all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All 7+ unit tests pass",
+        "Integration tests pass",
+        "No clippy warnings",
+        "Command discoverable via task-mgr --help",
+        "docs/INTEGRATION.md updated with invalidate-learning usage examples"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "All acceptance criteria met, all tests pass, all reviews complete. Ready to merge to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Merge gate. All quality checks green.",
+      "passes": true,
+      "priority": 99,
+      "synergyWith": [],
+      "timeoutSecs": 1800,
+      "title": "Ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

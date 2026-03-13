@@ -23,6 +23,12 @@ linked_projects/
 .env.local
 .env.*.local
 
+# Built binary
+task-mgr
+
+# Branch tracking state
+tasks/.last-branch
+
 # Debug/logs
 *.log
 
