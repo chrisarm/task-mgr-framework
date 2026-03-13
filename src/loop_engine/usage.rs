@@ -322,9 +322,7 @@ pub fn parse_reset_from_output(output: &str) -> Option<u64> {
 
 /// Parse a time token like "4pm", "12:30am", "4:00pm", "16:00" into (hour, minute).
 fn parse_time_token(token: &str) -> Option<(u32, u32)> {
-    let token = token
-        .trim()
-        .trim_end_matches([',', '.']);
+    let token = token.trim().trim_end_matches([',', '.']);
 
     let (time_part, am_pm) = if let Some(stripped) = token.strip_suffix("am") {
         (stripped, Some("am"))
