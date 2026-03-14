@@ -14,6 +14,7 @@ use crate::{TaskMgrError, TaskMgrResult};
 pub struct DecisionSummary {
     pub id: i64,
     pub title: String,
+    pub description: String,
     pub status: String,
     pub options: Vec<KeyDecisionOption>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +70,7 @@ pub fn list_decisions(conn: &Connection, all: bool) -> TaskMgrResult<DecisionsLi
         .map(|d| DecisionSummary {
             id: d.id,
             title: d.title,
+            description: d.description,
             status: d.status,
             options: d.options,
             resolution: d.resolution,
@@ -433,6 +435,7 @@ mod tests {
             decisions: vec![DecisionSummary {
                 id: 3,
                 title: "Pick DB".to_string(),
+                description: "Choose a database".to_string(),
                 status: "pending".to_string(),
                 options: vec![
                     KeyDecisionOption {
@@ -459,6 +462,37 @@ mod tests {
         assert!(
             text.contains("2 option(s)"),
             "expected options count in: {text}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_with_label_substring_picks_matching_option() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = key_decisions_db::insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        let result = resolve_decision_cmd(&conn, id, "SQL").unwrap();
+        assert_eq!(result.resolution, "SQLite: Embedded");
+    }
+
+    #[test]
+    fn test_format_list_text_shows_resolution_for_resolved() {
+        let result = DecisionsListResult {
+            decisions: vec![DecisionSummary {
+                id: 5,
+                title: "Pick DB".to_string(),
+                description: "Choose a database".to_string(),
+                status: "resolved".to_string(),
+                options: vec![],
+                resolution: Some("SQLite: Embedded".to_string()),
+                resolved_at: Some("2026-03-13".to_string()),
+            }],
+            showing_all: true,
+        };
+        let text = format_list_text(&result);
+        assert!(
+            text.contains("\u{2192} SQLite: Embedded"),
+            "expected resolution arrow in: {text}"
         );
     }
 }
