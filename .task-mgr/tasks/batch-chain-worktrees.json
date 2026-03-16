@@ -381,7 +381,7 @@
       ],
       "description": "Fix DRY violations in batch.rs:\n\n1. The early-exit `BatchResult { succeeded: 0, failed: 1, skipped: 0, results: vec![] }` is repeated 4 times in run_batch (lines ~283, ~295, ~327, ~340). Extract `fn batch_fail_early() -> BatchResult`.\n\n2. The 'push remaining as skipped' loop appears twice (stop-signal path ~368 and chain-stop-on-failure path ~452). Both iterate over remaining pairs and push PrdRunResult{skipped:true,...}. Extract a helper `fn push_remaining_skipped(results: &mut Vec<PrdRunResult>, pairs: &[(PathBuf, PathBuf)], from: usize, skipped: &mut usize)`.\n\nDO: Pure refactor — no behavior changes, no new logic.\nDO NOT: Change error messages or add new functionality.",
       "id": "REFACTOR-FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 80,
       "title": "Fix DRY violations in batch.rs: early-exit helper and skipped-PRD push",
       "touchesFiles": [
@@ -402,7 +402,7 @@
       ],
       "description": "Break down run_batch (~260 lines) and cleanup_worktree_after_prd (~64 lines, 8 params).\n\nrun_batch responsibilities to extract:\n- Pattern expansion + dedup: `collect_prd_files(patterns)` → `TaskMgrResult<Vec<PathBuf>>`\n- Summary printing: `print_batch_summary(results, total, succeeded, failed, skipped, chain)`\n\nFor cleanup_worktree_after_prd: the #[allow(clippy::too_many_arguments)] suppression is a code smell. Evaluate whether a `WorktreeCleanupContext` struct holding (yes, keep_worktrees, cleanup_worktree, chain) reduces noise at call sites. Only introduce if it genuinely simplifies — avoid over-engineering.\n\nDO: Pure refactor — no behavior changes.\nDO NOT: Add new logic or change existing function signatures beyond the extractions.",
       "id": "REFACTOR-FIX-002",
-      "passes": false,
+      "passes": true,
       "priority": 75,
       "title": "Break run_batch into sub-functions; address cleanup_worktree_after_prd arg count",
       "touchesFiles": [
@@ -436,8 +436,8 @@
       "estimatedEffort": "medium",
       "id": "REVIEW-001",
       "model": "claude-opus-4-6",
-      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'. Critical wiring check: ensure the --chain flag actually results in start_point being passed to git worktree add. Trace the full path.",
-      "passes": false,
+      "notes": "Clean review. Full wiring path verified: CLI --chain → main.rs → run_batch(chain) → LoopRunConfig.chain_base → engine.rs ensure_worktree(chain_base.as_deref()) → worktree.rs git args with -- separator. Reverse flow: LoopResult.branch_name → batch.rs chain_base advancement. All 14 early-return LoopResult sites set branch_name: None. chain=false is a complete no-op. No unwrap() in production paths. No dead code. All 2496 tests pass.",
+      "passes": true,
       "priority": 99,
       "title": "Code review + final verification",
       "touchesFiles": [
