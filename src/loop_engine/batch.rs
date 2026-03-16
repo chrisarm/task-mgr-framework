@@ -202,7 +202,10 @@ pub async fn run_batch(
     project_root: &Path,
     verbose: bool,
     keep_worktrees: bool,
+    chain: bool,
 ) -> BatchResult {
+    // TODO(CHAIN-004): use `chain` to implement sequential chaining of PRD branches
+    let _ = chain;
     // Step 1: Expand all patterns and deduplicate
     let mut prd_files: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::HashSet::new();

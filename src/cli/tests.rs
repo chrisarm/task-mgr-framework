@@ -2537,6 +2537,60 @@ fn test_batch_short_yes_flag() {
     }
 }
 
+#[test]
+fn test_batch_chain_flag_true() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        "tasks/stage-*.json",
+        "--chain",
+        "--yes",
+    ]);
+    match cli.command {
+        Commands::Batch { chain, yes, .. } => {
+            assert!(chain);
+            assert!(yes);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_chain_defaults_false() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/stage-*.json"]);
+    match cli.command {
+        Commands::Batch { chain, .. } => {
+            assert!(!chain);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_chain_with_yes_and_keep_worktrees() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "batch",
+        "tasks/stage-*.json",
+        "--chain",
+        "--yes",
+        "--keep-worktrees",
+    ]);
+    match cli.command {
+        Commands::Batch {
+            chain,
+            yes,
+            keep_worktrees,
+            ..
+        } => {
+            assert!(chain);
+            assert!(yes);
+            assert!(keep_worktrees);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
 // =============================================================================
 // Archive command tests (TEST-INIT-004)
 // =============================================================================

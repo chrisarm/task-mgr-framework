@@ -730,6 +730,9 @@ EXAMPLES:
 
     # Keep worktrees after each PRD (default: auto-remove on success)
     task-mgr batch 'tasks/*.json' --yes --keep-worktrees
+
+    # Chain PRDs so each builds on the previous PRD's branch
+    task-mgr batch 'tasks/stage-*.json' --chain --yes
 ")]
     Batch {
         /// Glob patterns or file paths to match PRD files
@@ -751,6 +754,17 @@ EXAMPLES:
         /// This flag skips cleanup entirely.
         #[arg(long = "keep-worktrees", default_value_t = false)]
         keep_worktrees: bool,
+
+        /// Chain PRDs so each builds on the previous PRD's branch
+        ///
+        /// When enabled, each PRD's worktree branches from the previous PRD's
+        /// branch instead of HEAD. This ensures later phases see earlier phases'
+        /// code changes. Batch stops on the first failure (downstream PRDs
+        /// would be based on incomplete work).
+        ///
+        /// Requires each PRD to have a `branchName` field.
+        #[arg(long, default_value_t = false)]
+        chain: bool,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
