@@ -1090,6 +1090,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 &run_config.source_root,
                 branch,
                 run_config.config.yes_mode,
+                None,
             ) {
                 Ok(wt_path) => {
                     actual_worktree_path = Some(wt_path.clone());
@@ -1376,7 +1377,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let mut iteration: u32 = 0;
     while iteration < max_iterations as u32 {
         iteration += 1; // 1-based, incremented at top
-        // Pre-iteration: refresh OAuth token if usage checking enabled
+                        // Pre-iteration: refresh OAuth token if usage checking enabled
         if usage_params.enabled {
             oauth::ensure_valid_token();
         }
@@ -2164,12 +2165,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
 fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
 
-    let mut args = vec![
-        "--print",
-        "--no-session-persistence",
-        "--max-turns",
-        "1",
-    ];
+    let mut args = vec!["--print", "--no-session-persistence", "--max-turns", "1"];
 
     // Use the same permission mode as the main loop so the probe doesn't hang
     // on a permission prompt.

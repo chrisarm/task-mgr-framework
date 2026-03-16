@@ -208,7 +208,7 @@ fn test_ensure_worktree_creates_directory() {
 
     // ensure_worktree should create the worktree directory
     let wt_path =
-        ensure_worktree(repo.path(), branch, true).expect("ensure_worktree should succeed");
+        ensure_worktree(repo.path(), branch, true, None).expect("ensure_worktree should succeed");
 
     assert!(
         wt_path.exists(),

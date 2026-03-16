@@ -310,10 +310,7 @@ pub fn parse_reset_from_output(output: &str) -> Option<u64> {
 
     // Build target datetime in local timezone
     let target_naive = today.and_hms_opt(hour, minute, 0)?;
-    let target_local = now
-        .timezone()
-        .from_local_datetime(&target_naive)
-        .single()?;
+    let target_local = now.timezone().from_local_datetime(&target_naive).single()?;
 
     let diff = target_local.signed_duration_since(now);
     if diff.num_seconds() <= 0 {
@@ -325,12 +322,12 @@ pub fn parse_reset_from_output(output: &str) -> Option<u64> {
 
 /// Parse a time token like "4pm", "12:30am", "4:00pm", "16:00" into (hour, minute).
 fn parse_time_token(token: &str) -> Option<(u32, u32)> {
-    let token = token.trim().trim_end_matches(|c: char| c == ',' || c == '.');
+    let token = token.trim().trim_end_matches([',', '.']);
 
-    let (time_part, am_pm) = if token.ends_with("am") {
-        (&token[..token.len() - 2], Some("am"))
-    } else if token.ends_with("pm") {
-        (&token[..token.len() - 2], Some("pm"))
+    let (time_part, am_pm) = if let Some(t) = token.strip_suffix("am") {
+        (t, Some("am"))
+    } else if let Some(t) = token.strip_suffix("pm") {
+        (t, Some("pm"))
     } else {
         (token, None)
     };
@@ -800,7 +797,10 @@ mod tests {
         // Probe always says "still limited" → should complete via timeout
         let probe = || false;
         let completed = wait_for_usage_reset(1, temp_dir.path(), 1, Some(&probe));
-        assert!(completed, "Probe returning false should not prevent completion");
+        assert!(
+            completed,
+            "Probe returning false should not prevent completion"
+        );
     }
 
     // --- sanitize_api_error edge cases ---

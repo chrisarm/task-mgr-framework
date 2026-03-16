@@ -102,6 +102,9 @@ pub(crate) fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)
 /// * `project_root` - Path to the main git repository
 /// * `branch_name` - Target branch name
 /// * `yes_mode` - If false, prompts user before creating worktree
+/// * `start_point` - Optional git ref to branch from when creating a NEW branch.
+///   Passed as `-- <start_point>` to prevent flag injection. Ignored if the branch
+///   already exists.
 ///
 /// # Returns
 ///
@@ -117,6 +120,7 @@ pub fn ensure_worktree(
     project_root: &Path,
     branch_name: &str,
     yes_mode: bool,
+    start_point: Option<&str>,
 ) -> TaskMgrResult<PathBuf> {
     // Check if we're already inside a worktree
     if is_inside_worktree(project_root)? {
@@ -278,15 +282,22 @@ pub fn ensure_worktree(
                 )
             })?
     } else {
-        // Branch doesn't exist, create new branch in worktree
+        // Branch doesn't exist, create new branch in worktree.
+        // The `--` separator before start_point prevents flag injection from
+        // malicious ref values (e.g. "--exec=...").
+        let mut args = vec![
+            "worktree",
+            "add",
+            "-b",
+            branch_name,
+            worktree_path.to_str().unwrap_or_default(),
+        ];
+        if let Some(sp) = start_point {
+            args.push("--");
+            args.push(sp);
+        }
         Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                branch_name,
-                worktree_path.to_str().unwrap_or_default(),
-            ])
+            .args(&args)
             .current_dir(project_root)
             .output()
             .map_err(|e| {
@@ -495,7 +506,7 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a new worktree for a new branch
-        let result = ensure_worktree(tmp.path(), "feature/test-wt", true);
+        let result = ensure_worktree(tmp.path(), "feature/test-wt", true, None);
         assert!(
             result.is_ok(),
             "Should create worktree for new branch: {:?}",
@@ -523,12 +534,12 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a worktree
-        let result1 = ensure_worktree(tmp.path(), "feature/reuse-test", true);
+        let result1 = ensure_worktree(tmp.path(), "feature/reuse-test", true, None);
         assert!(result1.is_ok());
         let wt_path1 = result1.unwrap();
 
         // Call again - should reuse the same worktree
-        let result2 = ensure_worktree(tmp.path(), "feature/reuse-test", true);
+        let result2 = ensure_worktree(tmp.path(), "feature/reuse-test", true, None);
         assert!(result2.is_ok());
         let wt_path2 = result2.unwrap();
 
@@ -550,7 +561,7 @@ detached
             .expect("create branch");
 
         // Create worktree for the existing branch
-        let result = ensure_worktree(tmp.path(), "existing-branch", true);
+        let result = ensure_worktree(tmp.path(), "existing-branch", true, None);
         assert!(
             result.is_ok(),
             "Should create worktree for existing branch: {:?}",
@@ -566,7 +577,7 @@ detached
     fn test_ensure_worktree_path_contains_sanitized_branch_name() {
         let tmp = setup_git_repo_with_file();
 
-        let result = ensure_worktree(tmp.path(), "feature/nested/branch", true);
+        let result = ensure_worktree(tmp.path(), "feature/nested/branch", true, None);
         assert!(result.is_ok());
 
         let wt_path = result.unwrap();
@@ -585,12 +596,12 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a worktree
-        let result1 = ensure_worktree(tmp.path(), "feature/inside-test", true);
+        let result1 = ensure_worktree(tmp.path(), "feature/inside-test", true, None);
         assert!(result1.is_ok());
         let wt_path = result1.unwrap();
 
         // Now call ensure_worktree from inside the worktree for the same branch
-        let result2 = ensure_worktree(&wt_path, "feature/inside-test", true);
+        let result2 = ensure_worktree(&wt_path, "feature/inside-test", true, None);
         assert!(
             result2.is_ok(),
             "Should succeed when called from inside correct worktree: {:?}",
@@ -609,12 +620,12 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a worktree
-        let result1 = ensure_worktree(tmp.path(), "feature/wt-one", true);
+        let result1 = ensure_worktree(tmp.path(), "feature/wt-one", true, None);
         assert!(result1.is_ok());
         let wt_path = result1.unwrap();
 
         // Now call ensure_worktree from inside the worktree but for a different branch
-        let result2 = ensure_worktree(&wt_path, "feature/wt-two", true);
+        let result2 = ensure_worktree(&wt_path, "feature/wt-two", true, None);
         assert!(
             result2.is_err(),
             "Should fail when called from inside worktree for wrong branch"
@@ -645,7 +656,7 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a worktree
-        let result1 = ensure_worktree(tmp.path(), "feature/detect-test", true);
+        let result1 = ensure_worktree(tmp.path(), "feature/detect-test", true, None);
         assert!(result1.is_ok());
         let wt_path = result1.unwrap();
 
@@ -662,7 +673,7 @@ detached
 
         // Create a worktree to remove
         let wt_path =
-            ensure_worktree(tmp.path(), "feature/cleanup-me", true).expect("create worktree");
+            ensure_worktree(tmp.path(), "feature/cleanup-me", true, None).expect("create worktree");
         assert!(wt_path.exists(), "Worktree should exist before removal");
 
         let result = remove_worktree(tmp.path(), &wt_path);
@@ -688,7 +699,7 @@ detached
 
         // Create a worktree
         let wt_path =
-            ensure_worktree(tmp.path(), "feature/dirty-wt", true).expect("create worktree");
+            ensure_worktree(tmp.path(), "feature/dirty-wt", true, None).expect("create worktree");
 
         // Dirty the worktree
         fs::write(wt_path.join("dirty.txt"), "uncommitted content").expect("write dirty file");
@@ -716,7 +727,7 @@ detached
 
         // Create a single worktree (will be the only one in the parent dir)
         let wt_path =
-            ensure_worktree(tmp.path(), "feature/last-wt", true).expect("create worktree");
+            ensure_worktree(tmp.path(), "feature/last-wt", true, None).expect("create worktree");
         let parent = wt_path
             .parent()
             .expect("worktree has parent dir")
@@ -739,8 +750,8 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create two worktrees in the same parent dir
-        let wt1 = ensure_worktree(tmp.path(), "feature/wt-alpha", true).expect("create wt1");
-        let wt2 = ensure_worktree(tmp.path(), "feature/wt-beta", true).expect("create wt2");
+        let wt1 = ensure_worktree(tmp.path(), "feature/wt-alpha", true, None).expect("create wt1");
+        let wt2 = ensure_worktree(tmp.path(), "feature/wt-beta", true, None).expect("create wt2");
 
         let parent = wt1.parent().expect("wt1 has parent").to_path_buf();
         assert_eq!(
@@ -798,7 +809,7 @@ detached
             "parent dir should not pre-exist before the test"
         );
 
-        let result = ensure_worktree(tmp.path(), branch, true);
+        let result = ensure_worktree(tmp.path(), branch, true, None);
         assert!(
             result.is_err(),
             "ensure_worktree with invalid git ref name should fail"
@@ -821,8 +832,8 @@ detached
     fn test_remove_worktree_staged_changes_returns_false() {
         let tmp = setup_git_repo_with_file();
 
-        let wt_path =
-            ensure_worktree(tmp.path(), "feature/staged-changes", true).expect("create worktree");
+        let wt_path = ensure_worktree(tmp.path(), "feature/staged-changes", true, None)
+            .expect("create worktree");
 
         // Stage a new file in the worktree without committing
         let new_file = wt_path.join("staged.txt");
@@ -871,8 +882,8 @@ detached
         let tmp = setup_git_repo_with_file();
 
         // Create a real worktree first so git knows about it
-        let wt_path =
-            ensure_worktree(tmp.path(), "feature/out-of-band", true).expect("create worktree");
+        let wt_path = ensure_worktree(tmp.path(), "feature/out-of-band", true, None)
+            .expect("create worktree");
         assert!(wt_path.exists(), "Worktree should exist initially");
 
         // Simulate out-of-band deletion: manually remove the directory without going through git
@@ -897,8 +908,8 @@ detached
     fn test_remove_worktree_parent_with_extra_file_not_removed() {
         let tmp = setup_git_repo_with_file();
 
-        let wt_path =
-            ensure_worktree(tmp.path(), "feature/wt-with-sibling", true).expect("create worktree");
+        let wt_path = ensure_worktree(tmp.path(), "feature/wt-with-sibling", true, None)
+            .expect("create worktree");
         let parent = wt_path.parent().expect("worktree has parent").to_path_buf();
 
         // Place a regular file in the parent dir (simulates user-created content)
@@ -980,7 +991,7 @@ detached
         for case in cases {
             let tmp = setup_git_repo_with_file();
             let branch = format!("feature/state-test-{}", case.name.replace([':', ' '], "-"));
-            let wt_path = ensure_worktree(tmp.path(), &branch, true)
+            let wt_path = ensure_worktree(tmp.path(), &branch, true, None)
                 .unwrap_or_else(|e| panic!("[{}] create worktree: {:?}", case.name, e));
 
             (case.setup)(&wt_path);
@@ -1032,7 +1043,7 @@ detached
         // Put a file inside so git refuses to use this non-empty directory.
         fs::write(wt_path.join("dummy.txt"), "block").expect("write dummy file");
 
-        let result = ensure_worktree(tmp.path(), "feature/prune-test", true);
+        let result = ensure_worktree(tmp.path(), "feature/prune-test", true, None);
         assert!(
             result.is_err(),
             "ensure_worktree should fail when directory already exists"
@@ -1056,5 +1067,113 @@ detached
 
         // Clean up
         let _ = fs::remove_dir_all(parent);
+    }
+
+    // --- CHAIN-001: start_point parameter tests ---
+
+    /// Regression test: start_point=None must produce identical behavior to before the
+    /// parameter was added (new branch from HEAD).
+    #[test]
+    fn test_ensure_worktree_start_point_none_creates_from_head() {
+        let tmp = setup_git_repo_with_file();
+
+        let result = ensure_worktree(tmp.path(), "feat/from-head", true, None);
+        assert!(
+            result.is_ok(),
+            "start_point=None should create worktree from HEAD: {:?}",
+            result.err()
+        );
+
+        let wt_path = result.unwrap();
+        assert!(wt_path.exists(), "Worktree path should exist");
+
+        let current = get_current_branch(&wt_path).expect("get branch");
+        assert_eq!(current, "feat/from-head");
+    }
+
+    /// start_point=Some("branch-a") must create the new branch rooted at branch-a's commits.
+    /// The `--` separator in git args is what enables this (prevents flag injection).
+    #[test]
+    fn test_ensure_worktree_start_point_some_creates_branch_from_ref() {
+        let tmp = setup_git_repo_with_file();
+
+        // Create branch-a and add a distinguishing commit on it.
+        Command::new("git")
+            .args(["checkout", "-b", "branch-a"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("checkout -b branch-a");
+        fs::write(tmp.path().join("branch-a-marker.txt"), "branch-a content")
+            .expect("write marker");
+        Command::new("git")
+            .args(["add", "branch-a-marker.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "branch-a unique commit"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git commit on branch-a");
+
+        // Return to main so we can create the new worktree from the main repo.
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("checkout main");
+
+        // Create branch-b from branch-a via ensure_worktree with start_point.
+        let result = ensure_worktree(tmp.path(), "feat/branch-b", true, Some("branch-a"));
+        assert!(
+            result.is_ok(),
+            "start_point=Some('branch-a') should succeed: {:?}",
+            result.err()
+        );
+
+        let wt_path = result.unwrap();
+        // Verify branch-b worktree contains branch-a's distinguishing file.
+        assert!(
+            wt_path.join("branch-a-marker.txt").exists(),
+            "branch-b should contain branch-a-marker.txt (start_point was branch-a)"
+        );
+        // Verify it is a new branch, not a checkout of branch-a.
+        let current = get_current_branch(&wt_path).expect("get branch");
+        assert_eq!(
+            current, "feat/branch-b",
+            "Worktree should be on branch feat/branch-b, not branch-a"
+        );
+    }
+
+    /// When the branch already exists, start_point must be silently ignored.
+    /// The existing-branch git command path (`git worktree add <path> <branch>`) does
+    /// not receive start_point — this test confirms no error is raised and the result
+    /// is on the existing branch.
+    #[test]
+    fn test_ensure_worktree_start_point_ignored_for_existing_branch() {
+        let tmp = setup_git_repo_with_file();
+
+        // Create branch "preexisting" without a worktree.
+        Command::new("git")
+            .args(["branch", "preexisting"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("create branch");
+
+        // Call with start_point=Some("nonexistent-ref") — if start_point were passed to
+        // the existing-branch path it would cause a git error; succeeding proves it's ignored.
+        let result = ensure_worktree(tmp.path(), "preexisting", true, Some("nonexistent-ref"));
+        assert!(
+            result.is_ok(),
+            "start_point should be ignored when branch already exists: {:?}",
+            result.err()
+        );
+
+        let wt_path = result.unwrap();
+        let current = get_current_branch(&wt_path).expect("get branch");
+        assert_eq!(
+            current, "preexisting",
+            "Worktree should be on the existing branch"
+        );
     }
 }
