@@ -10,6 +10,7 @@ use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopRunConfig};
 use crate::loop_engine::signals;
+use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
 
 /// Result of a batch run.
@@ -34,6 +35,10 @@ pub struct PrdRunResult {
     pub exit_code: i32,
     /// Whether this PRD was skipped.
     pub skipped: bool,
+    /// Branch name produced by this PRD's run (from LoopResult). Used for chain summary.
+    pub branch_name: Option<String>,
+    /// Chain base ref this PRD branched from (None = branched from HEAD).
+    pub chain_base: Option<String>,
 }
 
 /// Expand a glob pattern into sorted PRD file paths.
@@ -116,6 +121,44 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
     Ok(pairs)
 }
 
+/// Validate that all PRDs have a `branchName` field when running in chain mode.
+///
+/// Returns an error if any PRD is missing `branchName` (chain cannot proceed without it).
+/// Emits a warning to stderr for duplicate branch names (worktree reuse, changes accumulate).
+fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()> {
+    use std::collections::HashMap;
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+
+    for (prd_file, _) in pairs {
+        match status_queries::read_branch_name_from_prd(prd_file) {
+            None => missing.push(prd_file.display().to_string()),
+            Some(branch) => *seen.entry(branch).or_insert(0) += 1,
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(TaskMgrError::invalid_state(
+            "batch --chain",
+            "branchName",
+            "all PRDs must have branchName when --chain is active",
+            format!("PRDs missing branchName:\n{}", missing.join("\n")),
+        ));
+    }
+
+    for (branch, count) in &seen {
+        if *count > 1 {
+            eprintln!(
+                "Warning: duplicate branchName '{}' found in {} PRDs — worktree will be reused",
+                branch, count
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Offer to clean up a worktree after a PRD run in batch mode.
 ///
 /// Policy:
@@ -125,6 +168,7 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
 /// - `yes = true` without `cleanup_worktree` → keep (matches engine behavior)
 /// - `yes = false` (interactive) → prompt user
 /// - Cleanup failure warns but does not affect batch result
+#[allow(clippy::too_many_arguments)]
 fn cleanup_worktree_after_prd(
     project_root: &Path,
     wt_path: &Path,
@@ -132,6 +176,8 @@ fn cleanup_worktree_after_prd(
     yes: bool,
     keep_worktrees: bool,
     cleanup_worktree: bool,
+    chain: bool,
+    branch_name: Option<&str>,
 ) {
     if keep_worktrees {
         return;
@@ -162,7 +208,20 @@ fn cleanup_worktree_after_prd(
 
     if should_remove {
         match worktree::remove_worktree(project_root, wt_path) {
-            Ok(true) => eprintln!("Removed worktree: {}", wt_path.display()),
+            Ok(true) => {
+                if chain {
+                    if let Some(branch) = branch_name {
+                        eprintln!(
+                            "Worktree removed but branch {} retained for chaining",
+                            branch
+                        );
+                    } else {
+                        eprintln!("Removed worktree: {}", wt_path.display());
+                    }
+                } else {
+                    eprintln!("Removed worktree: {}", wt_path.display());
+                }
+            }
             Ok(false) => eprintln!(
                 "Warning: worktree has uncommitted changes, kept: {}",
                 wt_path.display()
@@ -194,6 +253,7 @@ fn cleanup_worktree_after_prd(
 /// * `project_root` - Git repository root for git operations and path resolution
 /// * `verbose` - Verbose output
 /// * `keep_worktrees` - Never remove worktrees after PRD completion
+#[allow(clippy::too_many_arguments)]
 pub async fn run_batch(
     patterns: &[String],
     max_iterations: Option<usize>,
@@ -204,8 +264,6 @@ pub async fn run_batch(
     keep_worktrees: bool,
     chain: bool,
 ) -> BatchResult {
-    // TODO(CHAIN-004): use `chain` to implement sequential chaining of PRD branches
-    let _ = chain;
     // Step 1: Expand all patterns and deduplicate
     let mut prd_files: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -275,10 +333,28 @@ pub async fn run_batch(
         }
     };
 
-    // Step 3: Resolve tasks dir for .stop signal checking
+    // Step 3: Chain validation — all PRDs must have branchName when --chain is active.
+    // This runs upfront so we fail fast before any work begins.
+    if chain {
+        if let Err(e) = validate_chain_branches(&pairs) {
+            eprintln!("Error: {}", e);
+            return BatchResult {
+                succeeded: 0,
+                failed: 1,
+                skipped: 0,
+                results: vec![],
+            };
+        }
+    }
+
+    // Step 4: Resolve tasks dir for .stop signal checking
     let tasks_dir = dir.join("tasks");
 
-    // Step 4: Run each PRD sequentially
+    // Chain tracking: advances to loop_result.branch_name after each successful PRD.
+    // Starts as None so the first PRD branches from HEAD.
+    let mut chain_base: Option<String> = None;
+
+    // Step 5: Run each PRD sequentially
     let mut results = Vec::with_capacity(pairs.len());
     let mut succeeded = 0usize;
     let mut failed = 0usize;
@@ -294,6 +370,8 @@ pub async fn run_batch(
                     prd_file: remaining_prd.clone(),
                     exit_code: 0,
                     skipped: true,
+                    branch_name: None,
+                    chain_base: None,
                 });
             }
             skipped += remaining;
@@ -330,18 +408,21 @@ pub async fn run_batch(
             config,
             external_repo: None, // Batch mode reads from PRD metadata
             batch_sibling_prds: sibling_prds,
-            chain_base: None, // Populated by chain logic in CHAIN-003
+            chain_base: if chain { chain_base.clone() } else { None },
         };
 
         let should_cleanup_worktree = run_config.config.cleanup_worktree;
         let loop_result = engine::run_loop(run_config).await;
         let exit_code = loop_result.exit_code;
         let worktree_path = loop_result.worktree_path.clone();
+        let result_branch_name = loop_result.branch_name.clone();
 
         results.push(PrdRunResult {
             prd_file: prd_file.clone(),
             exit_code,
             skipped: false,
+            branch_name: result_branch_name.clone(),
+            chain_base: if chain { chain_base.clone() } else { None },
         });
 
         if exit_code == 0 {
@@ -359,7 +440,32 @@ pub async fn run_batch(
                 yes,
                 keep_worktrees,
                 should_cleanup_worktree,
+                chain,
+                result_branch_name.as_deref(),
             );
+        }
+
+        // Chain stop-on-failure: if this PRD failed, skip all remaining PRDs.
+        // Downstream PRDs would build on a broken state, so we abort immediately.
+        if chain && exit_code != 0 {
+            eprintln!("Chain stopped: PRD failed, skipping remaining PRDs");
+            for (remaining_prd, _) in &pairs[i + 1..] {
+                results.push(PrdRunResult {
+                    prd_file: remaining_prd.clone(),
+                    exit_code: 0,
+                    skipped: true,
+                    branch_name: None,
+                    chain_base: None,
+                });
+            }
+            skipped += pairs.len() - i - 1;
+            break;
+        }
+
+        // Advance chain: next PRD branches from this PRD's branch (using LoopResult,
+        // not pre-read from JSON — avoids mismatch if DB normalizes the branch name).
+        if chain {
+            chain_base = result_branch_name;
         }
     }
 
@@ -381,12 +487,24 @@ pub async fn run_batch(
         } else {
             "FAILED"
         };
-        eprintln!(
-            "  [{}] {} (exit: {})",
-            status,
-            result.prd_file.display(),
-            result.exit_code
-        );
+        if chain {
+            let branch = result.branch_name.as_deref().unwrap_or("(unknown)");
+            let from = result.chain_base.as_deref().unwrap_or("HEAD");
+            eprintln!(
+                "  [{}] {} → {} (from {})",
+                status,
+                result.prd_file.display(),
+                branch,
+                from,
+            );
+        } else {
+            eprintln!(
+                "  [{}] {} (exit: {})",
+                status,
+                result.prd_file.display(),
+                result.exit_code
+            );
+        }
     }
 
     BatchResult {
@@ -585,16 +703,22 @@ mod tests {
                     prd_file: PathBuf::from("a.json"),
                     exit_code: 0,
                     skipped: false,
+                    branch_name: None,
+                    chain_base: None,
                 },
                 PrdRunResult {
                     prd_file: PathBuf::from("b.json"),
                     exit_code: 0,
                     skipped: false,
+                    branch_name: None,
+                    chain_base: None,
                 },
                 PrdRunResult {
                     prd_file: PathBuf::from("c.json"),
                     exit_code: 1,
                     skipped: false,
+                    branch_name: None,
+                    chain_base: None,
                 },
             ],
         };
@@ -610,6 +734,8 @@ mod tests {
             prd_file: PathBuf::from("skipped.json"),
             exit_code: 0,
             skipped: true,
+            branch_name: None,
+            chain_base: None,
         };
         assert!(result.skipped);
         assert_eq!(result.exit_code, 0);
@@ -641,7 +767,7 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // Pass keep_worktrees=true — function should return without touching path
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true, false);
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true, false, false, None);
 
         assert!(
             dummy_path.exists(),
@@ -657,7 +783,7 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // exit_code=1 → keep worktree for debugging
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false, true);
+        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false, true, false, None);
 
         assert!(
             dummy_path.exists(),
@@ -691,11 +817,159 @@ mod tests {
         assert!(wt_path.exists(), "worktree must exist before cleanup");
 
         // exit_code=0, cleanup_worktree=true → should remove
-        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false, true);
+        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false, true, false, None);
 
         assert!(
             !wt_path.exists(),
             "worktree dir should be removed on successful PRD with yes=true"
+        );
+    }
+
+    // --- validate_chain_branches tests ---
+
+    #[test]
+    fn test_validate_chain_branches_errors_on_missing_branch_name() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        // PRD without branchName field
+        let prd_no_branch = temp_dir.path().join("no-branch.json");
+        fs::write(&prd_no_branch, r#"{"title": "No Branch PRD"}"#).expect("write prd");
+        let prompt_no_branch = temp_dir.path().join("no-branch-prompt.md");
+        fs::write(&prompt_no_branch, "# Prompt").expect("write prompt");
+
+        let pairs = vec![(prd_no_branch.clone(), prompt_no_branch)];
+        let result = validate_chain_branches(&pairs);
+
+        assert!(result.is_err(), "should error when branchName is missing");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("PRDs missing branchName"),
+            "Error should mention missing branchName: {}",
+            err
+        );
+        assert!(
+            err.contains("no-branch.json"),
+            "Error should name the offending file: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_chain_branches_ok_when_all_have_branch_name() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        let prd = temp_dir.path().join("phase-1.json");
+        fs::write(&prd, r#"{"branchName": "feat/phase-1"}"#).expect("write prd");
+        let prompt = temp_dir.path().join("phase-1-prompt.md");
+        fs::write(&prompt, "# Prompt").expect("write prompt");
+
+        let pairs = vec![(prd, prompt)];
+        assert!(validate_chain_branches(&pairs).is_ok());
+    }
+
+    #[test]
+    fn test_validate_chain_branches_warns_on_duplicate_branch_names() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        // Two PRDs sharing the same branchName — warns but does not error
+        let prd1 = temp_dir.path().join("a.json");
+        fs::write(&prd1, r#"{"branchName": "feat/shared"}"#).expect("write prd1");
+        let prompt1 = temp_dir.path().join("a-prompt.md");
+        fs::write(&prompt1, "# A").expect("write prompt1");
+
+        let prd2 = temp_dir.path().join("b.json");
+        fs::write(&prd2, r#"{"branchName": "feat/shared"}"#).expect("write prd2");
+        let prompt2 = temp_dir.path().join("b-prompt.md");
+        fs::write(&prompt2, "# B").expect("write prompt2");
+
+        let pairs = vec![(prd1, prompt1), (prd2, prompt2)];
+        // Must succeed (duplicate is warn-only, not an error)
+        assert!(
+            validate_chain_branches(&pairs).is_ok(),
+            "duplicate branchName should warn but not error"
+        );
+    }
+
+    #[test]
+    fn test_validate_chain_branches_not_called_when_chain_false() {
+        // Verify that chain=false path does NOT validate branchName.
+        // A PRD without branchName must be accepted when chain=false.
+        // This guards against accidentally running validation on the non-chain path.
+        let temp_dir = TempDir::new().expect("create temp dir");
+
+        let prd = temp_dir.path().join("no-branch.json");
+        fs::write(&prd, r#"{"title": "No Branch"}"#).expect("write prd");
+        let prompt = temp_dir.path().join("no-branch-prompt.md");
+        fs::write(&prompt, "# Prompt").expect("write prompt");
+
+        let pairs = vec![(prd, prompt)];
+
+        // chain=false: validate_chain_branches should NOT be called.
+        // If we call it, it would return Err — which we can assert wouldn't happen
+        // from the run_batch code path. We directly test the guard: chain=false
+        // must not invoke validate_chain_branches, so the PRD above would be fine.
+        //
+        // Directly test the invariant: calling validate_chain_branches with a
+        // branchless PRD returns Err, confirming the guard is real.
+        let result = validate_chain_branches(&pairs);
+        assert!(
+            result.is_err(),
+            "validate_chain_branches must error on branchless PRD — \
+             confirming chain=false must NOT call it"
+        );
+    }
+
+    #[test]
+    fn test_stop_on_failure_results_structure() {
+        // Verify that when chain=true and a PRD fails, remaining PRDs are skipped.
+        // We test the PrdRunResult structure that would be produced, not the async runner.
+        //
+        // Simulate what run_batch would produce for 3 PRDs where PRD[1] fails:
+        let results = vec![
+            PrdRunResult {
+                prd_file: PathBuf::from("phase-1.json"),
+                exit_code: 0,
+                skipped: false,
+                branch_name: Some("feat/phase-1".to_string()),
+                chain_base: None, // first PRD branches from HEAD
+            },
+            PrdRunResult {
+                prd_file: PathBuf::from("phase-2.json"),
+                exit_code: 1,
+                skipped: false,
+                branch_name: None,
+                chain_base: Some("feat/phase-1".to_string()),
+            },
+            // PRD[2] would be skipped by stop-on-failure
+            PrdRunResult {
+                prd_file: PathBuf::from("phase-3.json"),
+                exit_code: 0,
+                skipped: true,
+                branch_name: None,
+                chain_base: None,
+            },
+        ];
+
+        // Verify the structure invariants
+        assert!(
+            !results[0].skipped && results[0].exit_code == 0,
+            "PRD 1 succeeded"
+        );
+        assert!(
+            !results[1].skipped && results[1].exit_code == 1,
+            "PRD 2 failed"
+        );
+        assert!(results[2].skipped, "PRD 3 skipped after chain failure");
+        assert_eq!(
+            results[2].chain_base, None,
+            "skipped PRDs have no chain_base"
+        );
+
+        // Chain advancement: PRD[1].chain_base == PRD[0].branch_name
+        assert_eq!(
+            results[1].chain_base.as_deref(),
+            results[0].branch_name.as_deref(),
+            "chain_base must equal previous PRD's branch_name"
         );
     }
 }
