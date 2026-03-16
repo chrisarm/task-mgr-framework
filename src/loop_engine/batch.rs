@@ -235,6 +235,35 @@ fn cleanup_worktree_after_prd(
     }
 }
 
+/// Return a `BatchResult` representing a single early-exit failure (validation error, etc.).
+fn batch_fail_early() -> BatchResult {
+    BatchResult {
+        succeeded: 0,
+        failed: 1,
+        skipped: 0,
+        results: vec![],
+    }
+}
+
+/// Push all `pairs[from..]` as skipped `PrdRunResult`s and update the skipped counter.
+fn push_remaining_skipped(
+    results: &mut Vec<PrdRunResult>,
+    pairs: &[(PathBuf, PathBuf)],
+    from: usize,
+    skipped: &mut usize,
+) {
+    for (remaining_prd, _) in &pairs[from..] {
+        results.push(PrdRunResult {
+            prd_file: remaining_prd.clone(),
+            exit_code: 0,
+            skipped: true,
+            branch_name: None,
+            chain_base: None,
+        });
+    }
+    *skipped += pairs.len() - from;
+}
+
 /// Run multiple PRDs in sequence.
 ///
 /// 1. Expand glob patterns with natural sort and deduplication
@@ -280,24 +309,14 @@ pub async fn run_batch(
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
-                return BatchResult {
-                    succeeded: 0,
-                    failed: 1,
-                    skipped: 0,
-                    results: vec![],
-                };
+                return batch_fail_early();
             }
         }
     }
 
     if prd_files.is_empty() {
         eprintln!("Error: no files matched any patterns");
-        return BatchResult {
-            succeeded: 0,
-            failed: 1,
-            skipped: 0,
-            results: vec![],
-        };
+        return batch_fail_early();
     }
 
     // Sort after collecting all files for consistent ordering
@@ -324,12 +343,7 @@ pub async fn run_batch(
         Ok(pairs) => pairs,
         Err(e) => {
             eprintln!("Error: {}", e);
-            return BatchResult {
-                succeeded: 0,
-                failed: 1,
-                skipped: 0,
-                results: vec![],
-            };
+            return batch_fail_early();
         }
     };
 
@@ -338,12 +352,7 @@ pub async fn run_batch(
     if chain {
         if let Err(e) = validate_chain_branches(&pairs) {
             eprintln!("Error: {}", e);
-            return BatchResult {
-                succeeded: 0,
-                failed: 1,
-                skipped: 0,
-                results: vec![],
-            };
+            return batch_fail_early();
         }
     }
 
@@ -364,17 +373,7 @@ pub async fn run_batch(
         // Check .stop signal between PRDs
         if i > 0 && signals::check_stop_signal(&tasks_dir, None) {
             eprintln!("Stop signal detected, skipping remaining PRDs");
-            let remaining = pairs.len() - i;
-            for (remaining_prd, _) in &pairs[i..] {
-                results.push(PrdRunResult {
-                    prd_file: remaining_prd.clone(),
-                    exit_code: 0,
-                    skipped: true,
-                    branch_name: None,
-                    chain_base: None,
-                });
-            }
-            skipped += remaining;
+            push_remaining_skipped(&mut results, &pairs, i, &mut skipped);
             break;
         }
 
@@ -449,16 +448,7 @@ pub async fn run_batch(
         // Downstream PRDs would build on a broken state, so we abort immediately.
         if chain && exit_code != 0 {
             eprintln!("Chain stopped: PRD failed, skipping remaining PRDs");
-            for (remaining_prd, _) in &pairs[i + 1..] {
-                results.push(PrdRunResult {
-                    prd_file: remaining_prd.clone(),
-                    exit_code: 0,
-                    skipped: true,
-                    branch_name: None,
-                    chain_base: None,
-                });
-            }
-            skipped += pairs.len() - i - 1;
+            push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
             break;
         }
 
