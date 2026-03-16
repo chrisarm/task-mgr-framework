@@ -1,0 +1,453 @@
+{
+  "branchName": "feat/batch-chain-worktrees",
+  "description": "Add --chain flag to batch mode that makes sequential PRDs build on each other via chained git worktrees",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing APIs unless required",
+      "Default behavior (without --chain) must be identical to current behavior"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "3. CORRECTNESS — Self-critique after code. Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Each task delivers working code + tests together",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Test boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "CHAIN",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Signature: ensure_worktree(project_root, branch_name, yes_mode, start_point: Option<&str>)",
+        "When start_point is Some and branch is NEW: `git worktree add -b <branch> <path> -- <start_point>` is executed",
+        "When start_point is None and branch is NEW: `git worktree add -b <branch> <path>` (no `--`, no start_point) — identical to current behavior",
+        "When branch already EXISTS: start_point is ignored, existing `git worktree add <path> <branch>` path unchanged",
+        "Security: `--` separator always inserted before start_point to prevent flag injection",
+        "All existing callers updated to pass None — callers: engine.rs line ~1105, all test call sites in worktree.rs",
+        "Unit test: ensure_worktree with start_point=Some('branch-a') creates new branch containing branch-a's commits",
+        "Unit test: ensure_worktree with start_point=None creates new branch from HEAD (regression test)",
+        "Unit test: ensure_worktree with start_point=Some for an EXISTING branch ignores start_point",
+        "Negative: Must NOT change the git command for the existing-branch path (line ~262)",
+        "Known-bad: if `--` separator is omitted, a start_point of '--exec=something' could be interpreted as a git flag — test verifies args structure"
+      ],
+      "dependsOn": [],
+      "description": "Add an optional `start_point: Option<&str>` parameter to `ensure_worktree()` in worktree.rs. When creating a NEW branch (branch doesn't exist), pass the start_point to `git worktree add -b <branch> <path> -- <start_point>`. The `--` separator is critical to prevent flag injection from malicious branch names.\n\nDO: Add the parameter, use `--` separator before start_point in git args, update ALL callers to pass None.\nDO NOT: Change behavior when start_point is None — it must be identical to current behavior. Do NOT touch the existing-branch path (start_point is irrelevant when branch already exists).\n\nEdge cases:\n- start_point=None: branches from HEAD (current behavior, unchanged)\n- start_point=Some(valid_ref): new branch from that ref\n- start_point=Some(invalid_ref): git error propagated cleanly\n- start_point looks like a flag (\"--exec=bad\"): `--` separator prevents injection\n- Branch already exists: start_point ignored entirely\n\nKnown-bad to guard against:\n- Forgetting the `--` separator would allow start_point values starting with `-` to be interpreted as git flags",
+      "edgeCases": [
+        "start_point=None: identical to current behavior (branches from HEAD)",
+        "start_point=Some(valid_branch): new branch created from that ref",
+        "start_point=Some(invalid_ref): git error propagated via TaskMgrError::InvalidState",
+        "start_point=Some('--exec=bad'): -- separator prevents flag injection",
+        "Branch already exists + start_point=Some: start_point silently ignored"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Invalid start_point ref",
+          "expectedBehavior": "Git error propagated as TaskMgrError::InvalidState with stderr message"
+        },
+        {
+          "cause": "start_point looks like a flag",
+          "expectedBehavior": "-- separator ensures it's treated as a ref, not a flag"
+        }
+      ],
+      "id": "CHAIN-001",
+      "modifiesBehavior": false,
+      "notes": "Key function: ensure_worktree() at worktree.rs:116. New-branch creation at line 282. Existing-branch path at line 262. Test helper: setup_git_repo_with_file() in test_utils.rs. Existing test pattern: test_ensure_worktree_creates_new_worktree at line 494. To verify start_point works: create branch-a with a commit, then create branch-b with start_point=branch-a, check git log in branch-b contains branch-a's commit.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "start_point=None must produce EXACTLY the same git command as before (no -- added)",
+          "start_point=Some must include -- separator before the value",
+          "Existing-branch path must be completely untouched"
+        ],
+        "performance": [
+          "No performance considerations — git commands are the bottleneck"
+        ],
+        "style": [
+          "Follow existing pattern of building args vec then calling Command::new('git').args(&args)",
+          "Keep the if/else structure for branch_exists vs !branch_exists"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Add start_point parameter to ensure_worktree",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "LoopRunConfig has `pub chain_base: Option<String>` field with doc comment",
+        "LoopResult has `pub branch_name: Option<String>` field with doc comment",
+        "engine.rs passes run_config.chain_base.as_deref() as the start_point arg to ensure_worktree()",
+        "branch_name is set from prd_metadata.branch_name (around line 1068) on the success path",
+        "All early-return LoopResult constructions set branch_name: None (grep for 'LoopResult {' in engine.rs)",
+        "All LoopRunConfig construction sites updated to include chain_base: None — main.rs Run command (~line 621)",
+        "Negative: engine.rs must NOT contain any chain-specific logic (no if-chain checks) — it's pure plumbing",
+        "Compiles: cargo check passes with all callers updated"
+      ],
+      "dependsOn": [
+        "CHAIN-001"
+      ],
+      "description": "Thread the chain mechanism through the engine layer. Add `chain_base: Option<String>` to LoopRunConfig (the batch runner sets this) and `branch_name: Option<String>` to LoopResult (the batch runner reads this to advance the chain).\n\nDO: Add both fields, pass chain_base.as_deref() to ensure_worktree, set branch_name from prd_metadata.branch_name in ALL LoopResult return paths.\nDO NOT: Add any chain logic to engine.rs — it's just plumbing. The engine doesn't know about chaining.\n\nEdge cases:\n- chain_base=None: ensure_worktree gets None start_point (current behavior)\n- branch_name populated from prd_metadata even when chain is not active (always useful metadata)\n\nKnown-bad to guard against:\n- Forgetting to set branch_name on early-return error paths in run_loop — ALL return paths must set it",
+      "edgeCases": [
+        "chain_base=None: start_point passed as None to ensure_worktree (no behavioral change)",
+        "No branch_name in prd_metadata: branch_name in LoopResult is None",
+        "Early error return: branch_name is None (haven't read metadata yet)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Missing chain_base field on a LoopRunConfig construction site",
+          "expectedBehavior": "Compile error — struct literal missing field"
+        }
+      ],
+      "id": "CHAIN-002",
+      "modifiesBehavior": false,
+      "notes": "LoopRunConfig at engine.rs:701. LoopResult at engine.rs:689. ensure_worktree call at engine.rs:1105. prd_metadata.branch_name read at engine.rs:1068. Grep for 'LoopResult {' to find ALL return sites — there are several early returns. main.rs constructs LoopRunConfig at ~line 621 (Run command) and batch.rs constructs it at ~line 321.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "Every LoopResult return path must set branch_name (None for errors, Some for success)",
+          "chain_base=None must produce identical behavior to pre-change code"
+        ],
+        "performance": [
+          "No performance impact — just threading Option values"
+        ],
+        "style": [
+          "Doc comments on both new fields explaining their purpose and who sets/reads them",
+          "chain_base doc: 'Set by --chain in batch mode. Passed to ensure_worktree as start_point.'",
+          "branch_name doc: 'Branch used by this run. Read by batch --chain to advance the chain.'"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Add chain_base to LoopRunConfig and branch_name to LoopResult",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Batch variant has `chain: bool` field with #[arg(long, default_value_t = false)]",
+        "Doc comment: explains chaining behavior, mentions stop-on-failure, mentions requires worktrees",
+        "after_help updated with example: `task-mgr batch 'tasks/stage-*.json' --chain --yes`",
+        "main.rs Commands::Batch destructure includes `chain`",
+        "main.rs passes `chain` to run_batch() call (run_batch doesn't accept it yet — add a TODO comment or adjust signature)",
+        "CLI test: --chain flag parses as true",
+        "CLI test: --chain defaults to false when omitted",
+        "CLI test: --chain combined with --yes and --keep-worktrees all parse correctly",
+        "Compiles: cargo check passes (may need temporary `let _ = chain;` in main.rs if run_batch signature not yet updated)"
+      ],
+      "dependsOn": [],
+      "description": "Add `--chain` boolean flag to the Batch CLI variant in commands.rs. Thread it through main.rs dispatch to the run_batch call. Add CLI parsing tests.\n\nDO: Add the flag with clear doc comment and help text. Update after_help examples. Add tests for flag parsing.\nDO NOT: Implement any chain logic — this is just the CLI surface. The flag is passed to run_batch which doesn't use it yet (CHAIN-004).\n\nEdge cases:\n- --chain not specified: defaults to false\n- --chain with --keep-worktrees: valid combination, both flags passed through\n\nKnown-bad to guard against:\n- Forgetting to update the Commands::Batch destructure pattern in main.rs — causes compile error (good, but fix it)",
+      "edgeCases": [
+        "--chain omitted: defaults to false",
+        "--chain with all other batch flags: all parse independently"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Forgot to destructure chain in main.rs",
+          "expectedBehavior": "Compile error (exhaustive pattern match)"
+        }
+      ],
+      "id": "CHAIN-003",
+      "modifiesBehavior": false,
+      "notes": "Batch variant at commands.rs:734. Main.rs dispatch at line 676. Existing CLI test pattern at cli/tests.rs:2411 (test_batch_with_pattern_and_yes). Follow the exact same pattern for the --chain tests. The run_batch signature will be updated in CHAIN-004; for now, either update signature proactively or use `let _ = chain;` to suppress unused warning.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "--chain must default to false",
+          "Parsing must not affect other Batch flags"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "Follow exact same pattern as keep_worktrees flag (#[arg(long, default_value_t = false)])",
+          "Tests follow existing test_batch_* pattern in cli/tests.rs"
+        ]
+      },
+      "synergyWith": [
+        "CHAIN-002"
+      ],
+      "title": "Add --chain CLI flag and thread through main.rs",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/cli/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "run_batch signature includes `chain: bool` parameter",
+        "Upfront validation when chain=true: calls read_branch_name_from_prd for each PRD file before the loop starts",
+        "Upfront validation: returns error (BatchResult with failed=1) if any PRD lacks a branchName",
+        "Upfront validation: prints warning to stderr if duplicate branchName values found across PRDs",
+        "Chain tracking: chain_base starts as None, advances to loop_result.branch_name after each PRD",
+        "Chain tracking: LoopRunConfig.chain_base set from chain_base when chain=true, None when chain=false",
+        "Stop-on-failure: when chain=true and exit_code!=0, remaining PRDs are marked skipped and loop breaks",
+        "Stop-on-failure: stderr message 'Chain stopped: PRD failed, skipping remaining PRDs'",
+        "PrdRunResult has branch_name: Option<String> and chain_base: Option<String> fields",
+        "Summary output when chain=true shows chain info: '[OK] phase-1.json → feat/phase-1 (from HEAD)'",
+        "Cleanup diagnostic: when worktree removed mid-chain, prints 'Worktree removed but branch X retained for chaining'",
+        "chain=false: no validation, no tracking, no stop-on-failure — ZERO behavioral change",
+        "Negative: chain advancement must use loop_result.branch_name, NOT read_branch_name_from_prd()",
+        "Known-bad: if chain=false path accidentally runs validation, it would fail on PRDs without branchName — test chain=false with a branchless PRD to verify",
+        "Unit test: validate_chain_branches errors on missing branchName",
+        "Unit test: validate_chain_branches warns on duplicate branchNames",
+        "Unit test: stop-on-failure skips remaining PRDs after a failure"
+      ],
+      "dependsOn": [
+        "CHAIN-002",
+        "CHAIN-003"
+      ],
+      "description": "This is the core orchestration task. Add `chain: bool` parameter to `run_batch()`. When chain=true:\n1. Upfront validation: read all PRD branchNames, error if any missing, warn on duplicates\n2. Chain tracking: use LoopResult.branch_name to advance chain_base after each PRD\n3. Stop-on-failure: if a PRD fails, skip remaining PRDs\n4. Chain-aware summary: show 'from HEAD' / 'from feat/phase-1' in output\n5. Cleanup diagnostic: when worktree cleaned up mid-chain, print 'branch retained for chaining'\n\nDO: Use `status_queries::read_branch_name_from_prd()` for upfront validation. Use `loop_result.branch_name` (not pre-read) for chain advancement. Update PrdRunResult with branch_name and chain_base fields.\nDO NOT: Modify engine.rs or worktree.rs — those are done in CHAIN-001/002.\n\nEdge cases:\n- First PRD: chain_base=None (branches from HEAD)\n- All PRDs same branchName: warn but allow (worktree reused, changes accumulate)\n- PRD failure: remaining PRDs skipped with clear message\n- chain=false: completely unchanged behavior — no validation, no tracking, no stop-on-failure\n\nKnown-bad to guard against:\n- Using pre-read branch name (from read_branch_name_from_prd) for chain advancement instead of LoopResult.branch_name — could mismatch if DB normalizes the name\n- Forgetting to update PrdRunResult construction sites with new fields",
+      "edgeCases": [
+        "First PRD in chain: chain_base=None (branches from HEAD)",
+        "All PRDs same branchName + chain=true: warn, but worktree reuses correctly",
+        "PRD without branchName + chain=true: caught by upfront validation",
+        "PRD failure + chain=true: remaining skipped, chain_base still valid for diagnostics",
+        "chain=false: no validation, no tracking, no stop-on-failure"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "PRD file unreadable during validation",
+          "expectedBehavior": "read_branch_name_from_prd returns None, treated as 'missing branchName' → error"
+        },
+        {
+          "cause": "First PRD fails",
+          "expectedBehavior": "Remaining PRDs skipped, batch summary shows failure + skipped counts"
+        },
+        {
+          "cause": "LoopResult.branch_name is None for a completed PRD",
+          "expectedBehavior": "chain_base stays at previous value (chain from last known branch)"
+        }
+      ],
+      "id": "CHAIN-004",
+      "modifiesBehavior": false,
+      "notes": "run_batch at batch.rs:197. Loop at line 284. LoopRunConfig construction at line 321. PrdRunResult at line 30. read_branch_name_from_prd in status_queries.rs:63. The validation function can be a private fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()>. For unit tests: create temp files with/without branchName JSON and call the validation function directly. The stop-on-failure test can verify the results vec structure without actually calling run_loop.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": {
+        "correctness": [
+          "chain=false must be a complete no-op — zero code paths touched",
+          "Validation runs BEFORE the loop, not inside it",
+          "Chain advancement uses LoopResult.branch_name (authoritative source from engine/DB)"
+        ],
+        "performance": [
+          "Validation reads each PRD file once (small JSON files, negligible)",
+          "No extra overhead when chain=false"
+        ],
+        "style": [
+          "Extract validation into a private function (validate_chain_branches)",
+          "Follow existing eprintln! pattern for diagnostics",
+          "Chain banner printed once at batch start, not per-PRD"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Implement chain logic in batch.rs: validation, tracking, stop-on-failure",
+      "touchesFiles": [
+        "src/loop_engine/batch.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Integration test in worktree.rs tests: test_ensure_worktree_chain_preserves_commits",
+        "Test creates a temp git repo with initial commit on main",
+        "Test creates branch 'feat/phase-1' via ensure_worktree (start_point=None)",
+        "Test makes a unique commit in the phase-1 worktree (e.g., writes 'phase1-marker.txt')",
+        "Test creates branch 'feat/phase-2' via ensure_worktree (start_point=Some('feat/phase-1'))",
+        "Test verifies phase-2 worktree contains 'phase1-marker.txt' (file existence check)",
+        "Test verifies phase-2's git log contains phase-1's commit message",
+        "Known-bad: if start_point is silently ignored, phase-2 would NOT contain phase1-marker.txt — this test catches it",
+        "Negative: phase-2 must NOT be just a detached HEAD or checkout of phase-1 — it must be a NEW branch",
+        "Test verifies `git rev-parse --abbrev-ref HEAD` in phase-2 worktree returns 'feat/phase-2'"
+      ],
+      "dependsOn": [
+        "CHAIN-001"
+      ],
+      "description": "Write an integration test that verifies the core chaining mechanism at the git level: creating a worktree with start_point from another branch, and verifying the resulting branch contains the source branch's commits.\n\nDO: Create temp git repo, make commits on branch-a, create branch-b from branch-a using ensure_worktree(start_point=Some('branch-a')), verify branch-b's git log contains branch-a's unique commit.\nDO NOT: Call run_loop or run_batch — this tests the git mechanism, not the batch orchestration.\n\nEdge cases:\n- Branch-a has multiple commits: branch-b should contain all of them\n- Branch-a diverges from main: branch-b should have branch-a's divergent commits but not need main\n\nKnown-bad to guard against:\n- Testing only that the worktree was created (exists on disk) without verifying the commit history — would pass even if start_point was silently ignored",
+      "edgeCases": [
+        "Phase-1 branch has commits that diverge from main",
+        "Phase-2 must have its own branch name, not be a checkout of phase-1"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "start_point silently ignored by git",
+          "expectedBehavior": "phase1-marker.txt would be missing in phase-2 — test catches this"
+        }
+      ],
+      "id": "CHAIN-005",
+      "modifiesBehavior": false,
+      "notes": "Test helper: setup_git_repo_with_file() in test_utils.rs creates a git repo with initial commit. To make commits in a worktree: use std::process::Command for git add/commit in the worktree path. To check git log: use `git log --oneline` in the worktree and check for commit message substring. Pattern: follow test_ensure_worktree_creates_new_worktree (line 494) for setup structure.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "Must verify COMMIT HISTORY, not just branch creation",
+          "Must verify the branch NAME is correct (not detached HEAD)"
+        ],
+        "performance": [
+          "Test should complete in <2s (git operations on temp dir are fast)"
+        ],
+        "style": [
+          "Follow existing worktree test patterns",
+          "Use descriptive assert messages explaining what went wrong"
+        ]
+      },
+      "synergyWith": [
+        "CHAIN-001"
+      ],
+      "title": "Integration test: verify git-level chaining works end-to-end",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "Clear separation of concerns",
+        "Code follows existing project patterns",
+        "validate_chain_branches is well-factored and testable independently"
+      ],
+      "dependsOn": [
+        "CHAIN-001",
+        "CHAIN-002",
+        "CHAIN-003",
+        "CHAIN-004",
+        "CHAIN-005"
+      ],
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated logic, functions >30 lines, tight coupling between modules.\nDO NOT: Skip — this gate catches issues before the final review.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-001",
+      "notes": "Issues found: (1) 4x repeated BatchResult early-exit struct in run_batch — DRY violation; (2) 2x near-identical 'push remaining as skipped' loops — DRY violation; (3) run_batch is ~260 lines, cleanup_worktree_after_prd is ~64 lines with 8 params. Tasks REFACTOR-FIX-001 and REFACTOR-FIX-002 added to address these. validate_chain_branches (32 lines) is well-factored and testable — no change needed.",
+      "passes": true,
+      "priority": 98,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Extract `fn batch_fail_early() -> BatchResult` helper used in all 4 early-exit sites in run_batch",
+        "Extract a helper to push remaining pairs as skipped PrdRunResults (used in stop-signal and chain-stop-on-failure paths)",
+        "No behavioral changes — same error paths, same exit codes",
+        "All existing tests pass unchanged",
+        "cargo fmt --check, cargo clippy -- -D warnings, cargo test all clean"
+      ],
+      "dependsOn": [
+        "CHAIN-001",
+        "CHAIN-002",
+        "CHAIN-003",
+        "CHAIN-004",
+        "CHAIN-005",
+        "REFACTOR-001"
+      ],
+      "description": "Fix DRY violations in batch.rs:\n\n1. The early-exit `BatchResult { succeeded: 0, failed: 1, skipped: 0, results: vec![] }` is repeated 4 times in run_batch (lines ~283, ~295, ~327, ~340). Extract `fn batch_fail_early() -> BatchResult`.\n\n2. The 'push remaining as skipped' loop appears twice (stop-signal path ~368 and chain-stop-on-failure path ~452). Both iterate over remaining pairs and push PrdRunResult{skipped:true,...}. Extract a helper `fn push_remaining_skipped(results: &mut Vec<PrdRunResult>, pairs: &[(PathBuf, PathBuf)], from: usize, skipped: &mut usize)`.\n\nDO: Pure refactor — no behavior changes, no new logic.\nDO NOT: Change error messages or add new functionality.",
+      "id": "REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 80,
+      "title": "Fix DRY violations in batch.rs: early-exit helper and skipped-PRD push",
+      "touchesFiles": [
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Extract `fn collect_prd_files(patterns: &[String]) -> TaskMgrResult<Vec<PathBuf>>` from run_batch (handles pattern expansion, dedup, sort — currently ~40 lines)",
+        "Extract `fn print_batch_summary(results: &[PrdRunResult], total: usize, succeeded: usize, failed: usize, skipped: usize, chain: bool)` from run_batch (~30 lines)",
+        "run_batch body is reduced to orchestration flow only",
+        "Consider replacing 8-arg cleanup_worktree_after_prd with a CleanupContext struct if it simplifies the call sites",
+        "All existing tests pass unchanged",
+        "cargo fmt --check, cargo clippy -- -D warnings, cargo test all clean"
+      ],
+      "dependsOn": [
+        "REFACTOR-FIX-001"
+      ],
+      "description": "Break down run_batch (~260 lines) and cleanup_worktree_after_prd (~64 lines, 8 params).\n\nrun_batch responsibilities to extract:\n- Pattern expansion + dedup: `collect_prd_files(patterns)` → `TaskMgrResult<Vec<PathBuf>>`\n- Summary printing: `print_batch_summary(results, total, succeeded, failed, skipped, chain)`\n\nFor cleanup_worktree_after_prd: the #[allow(clippy::too_many_arguments)] suppression is a code smell. Evaluate whether a `WorktreeCleanupContext` struct holding (yes, keep_worktrees, cleanup_worktree, chain) reduces noise at call sites. Only introduce if it genuinely simplifies — avoid over-engineering.\n\nDO: Pure refactor — no behavior changes.\nDO NOT: Add new logic or change existing function signatures beyond the extractions.",
+      "id": "REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 75,
+      "title": "Break run_batch into sub-functions; address cleanup_worktree_after_prd arg count",
+      "touchesFiles": [
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: --chain flag flows CLI → main.rs → run_batch → LoopRunConfig.chain_base → ensure_worktree start_point",
+        "Positive: LoopResult.branch_name flows engine.rs → batch.rs chain_base tracking",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Security: -- separator present in git worktree add args before start_point",
+        "Negative: No unwrap() in production code paths",
+        "Negative: chain=false must not touch any validation or tracking code paths",
+        "Negative: No dead code warnings for new code",
+        "Task update: Remaining tasks reviewed and updated based on implementation learnings",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-97"
+      ],
+      "dependsOn": [
+        "CHAIN-001",
+        "CHAIN-002",
+        "CHAIN-003",
+        "CHAIN-004",
+        "CHAIN-005",
+        "REFACTOR-001",
+        "REFACTOR-FIX-001",
+        "REFACTOR-FIX-002"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. Run full test suite.\n\nDO: Check every new function for error handling, check callers still work, verify no dead code, verify the -- separator is present in git args, verify chain=false is truly a no-op.\nDO NOT: Skip the integration wiring check — ensure --chain flag flows from CLI through main.rs through batch.rs through engine.rs to worktree.rs.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'. Critical wiring check: ensure the --chain flag actually results in start_point being passed to git worktree add. Trace the full path.",
+      "passes": false,
+      "priority": 99,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
