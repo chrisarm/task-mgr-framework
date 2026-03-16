@@ -159,7 +159,7 @@ fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()> {
     Ok(())
 }
 
-/// Offer to clean up a worktree after a PRD run in batch mode.
+/// Context for cleaning up worktrees after PRD runs in batch mode.
 ///
 /// Policy:
 /// - `keep_worktrees = true` → never remove
@@ -168,69 +168,69 @@ fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()> {
 /// - `yes = true` without `cleanup_worktree` → keep (matches engine behavior)
 /// - `yes = false` (interactive) → prompt user
 /// - Cleanup failure warns but does not affect batch result
-#[allow(clippy::too_many_arguments)]
-fn cleanup_worktree_after_prd(
-    project_root: &Path,
-    wt_path: &Path,
-    exit_code: i32,
+struct WorktreeCleanupContext<'a> {
+    project_root: &'a Path,
     yes: bool,
     keep_worktrees: bool,
     cleanup_worktree: bool,
     chain: bool,
-    branch_name: Option<&str>,
-) {
-    if keep_worktrees {
-        return;
-    }
+}
 
-    if exit_code != 0 {
-        // Keep worktrees from failed runs for debugging
-        eprintln!("Keeping worktree (PRD failed): {}", wt_path.display());
-        return;
-    }
-
-    let should_remove = if cleanup_worktree {
-        // --cleanup-worktree flag: always attempt removal
-        true
-    } else if yes {
-        // --yes without --cleanup-worktree: keep worktree (matches engine behavior)
-        false
-    } else {
-        // Interactive: prompt user
-        eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-        } else {
-            false
+impl WorktreeCleanupContext<'_> {
+    fn cleanup(&self, wt_path: &Path, exit_code: i32, branch_name: Option<&str>) {
+        if self.keep_worktrees {
+            return;
         }
-    };
 
-    if should_remove {
-        match worktree::remove_worktree(project_root, wt_path) {
-            Ok(true) => {
-                if chain {
-                    if let Some(branch) = branch_name {
-                        eprintln!(
-                            "Worktree removed but branch {} retained for chaining",
-                            branch
-                        );
+        if exit_code != 0 {
+            // Keep worktrees from failed runs for debugging
+            eprintln!("Keeping worktree (PRD failed): {}", wt_path.display());
+            return;
+        }
+
+        let should_remove = if self.cleanup_worktree {
+            // --cleanup-worktree flag: always attempt removal
+            true
+        } else if self.yes {
+            // --yes without --cleanup-worktree: keep worktree (matches engine behavior)
+            false
+        } else {
+            // Interactive: prompt user
+            eprint!("Remove worktree '{}'? [y/N] ", wt_path.display());
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+            } else {
+                false
+            }
+        };
+
+        if should_remove {
+            match worktree::remove_worktree(self.project_root, wt_path) {
+                Ok(true) => {
+                    if self.chain {
+                        if let Some(branch) = branch_name {
+                            eprintln!(
+                                "Worktree removed but branch {} retained for chaining",
+                                branch
+                            );
+                        } else {
+                            eprintln!("Removed worktree: {}", wt_path.display());
+                        }
                     } else {
                         eprintln!("Removed worktree: {}", wt_path.display());
                     }
-                } else {
-                    eprintln!("Removed worktree: {}", wt_path.display());
                 }
+                Ok(false) => eprintln!(
+                    "Warning: worktree has uncommitted changes, kept: {}",
+                    wt_path.display()
+                ),
+                Err(e) => eprintln!(
+                    "Warning: failed to remove worktree '{}': {}",
+                    wt_path.display(),
+                    e
+                ),
             }
-            Ok(false) => eprintln!(
-                "Warning: worktree has uncommitted changes, kept: {}",
-                wt_path.display()
-            ),
-            Err(e) => eprintln!(
-                "Warning: failed to remove worktree '{}': {}",
-                wt_path.display(),
-                e
-            ),
         }
     }
 }
@@ -264,6 +264,83 @@ fn push_remaining_skipped(
     *skipped += pairs.len() - from;
 }
 
+/// Expand glob patterns into sorted, deduplicated PRD file paths.
+///
+/// Processes all patterns in order, canonicalises each path to deduplicate
+/// across overlapping globs, then returns a sorted list.
+fn collect_prd_files(patterns: &[String]) -> TaskMgrResult<Vec<PathBuf>> {
+    let mut prd_files: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for pattern in patterns {
+        let files = expand_glob(pattern)?;
+        for file in files {
+            let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+            if seen.insert(canonical.clone()) {
+                prd_files.push(canonical);
+            }
+        }
+    }
+
+    if prd_files.is_empty() {
+        return Err(TaskMgrError::invalid_state(
+            "batch",
+            "patterns",
+            "at least one matching file",
+            "no files matched any patterns",
+        ));
+    }
+
+    prd_files.sort();
+    prd_files.dedup();
+
+    Ok(prd_files)
+}
+
+/// Print the batch summary to stderr.
+fn print_batch_summary(
+    results: &[PrdRunResult],
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+    skipped: usize,
+    chain: bool,
+) {
+    eprintln!("\n=== Batch Summary ===");
+    eprintln!(
+        "{} succeeded, {} failed, {} skipped (of {} total)",
+        succeeded, failed, skipped, total
+    );
+
+    for result in results {
+        let status = if result.skipped {
+            "SKIPPED"
+        } else if result.exit_code == 0 {
+            "OK"
+        } else {
+            "FAILED"
+        };
+        if chain {
+            let branch = result.branch_name.as_deref().unwrap_or("(unknown)");
+            let from = result.chain_base.as_deref().unwrap_or("HEAD");
+            eprintln!(
+                "  [{}] {} → {} (from {})",
+                status,
+                result.prd_file.display(),
+                branch,
+                from,
+            );
+        } else {
+            eprintln!(
+                "  [{}] {} (exit: {})",
+                status,
+                result.prd_file.display(),
+                result.exit_code
+            );
+        }
+    }
+}
+
 /// Run multiple PRDs in sequence.
 ///
 /// 1. Expand glob patterns with natural sort and deduplication
@@ -293,35 +370,14 @@ pub async fn run_batch(
     keep_worktrees: bool,
     chain: bool,
 ) -> BatchResult {
-    // Step 1: Expand all patterns and deduplicate
-    let mut prd_files: Vec<PathBuf> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for pattern in patterns {
-        match expand_glob(pattern) {
-            Ok(files) => {
-                for file in files {
-                    let canonical = std::fs::canonicalize(&file).unwrap_or(file);
-                    if seen.insert(canonical.clone()) {
-                        prd_files.push(canonical);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                return batch_fail_early();
-            }
+    // Step 1: Expand all patterns, deduplicate, and sort
+    let prd_files = match collect_prd_files(patterns) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return batch_fail_early();
         }
-    }
-
-    if prd_files.is_empty() {
-        eprintln!("Error: no files matched any patterns");
-        return batch_fail_early();
-    }
-
-    // Sort after collecting all files for consistent ordering
-    prd_files.sort();
-    prd_files.dedup();
+    };
 
     let pattern_display = if patterns.len() <= 3 {
         patterns
@@ -432,16 +488,14 @@ pub async fn run_batch(
 
         // Worktree cleanup after each PRD
         if let Some(ref wt_path) = worktree_path {
-            cleanup_worktree_after_prd(
+            WorktreeCleanupContext {
                 project_root,
-                wt_path,
-                exit_code,
                 yes,
                 keep_worktrees,
-                should_cleanup_worktree,
+                cleanup_worktree: should_cleanup_worktree,
                 chain,
-                result_branch_name.as_deref(),
-            );
+            }
+            .cleanup(wt_path, exit_code, result_branch_name.as_deref());
         }
 
         // Chain stop-on-failure: if this PRD failed, skip all remaining PRDs.
@@ -460,42 +514,7 @@ pub async fn run_batch(
     }
 
     // Step 5: Print batch summary
-    eprintln!("\n=== Batch Summary ===");
-    eprintln!(
-        "{} succeeded, {} failed, {} skipped (of {} total)",
-        succeeded,
-        failed,
-        skipped,
-        pairs.len()
-    );
-
-    for result in &results {
-        let status = if result.skipped {
-            "SKIPPED"
-        } else if result.exit_code == 0 {
-            "OK"
-        } else {
-            "FAILED"
-        };
-        if chain {
-            let branch = result.branch_name.as_deref().unwrap_or("(unknown)");
-            let from = result.chain_base.as_deref().unwrap_or("HEAD");
-            eprintln!(
-                "  [{}] {} → {} (from {})",
-                status,
-                result.prd_file.display(),
-                branch,
-                from,
-            );
-        } else {
-            eprintln!(
-                "  [{}] {} (exit: {})",
-                status,
-                result.prd_file.display(),
-                result.exit_code
-            );
-        }
-    }
+    print_batch_summary(&results, pairs.len(), succeeded, failed, skipped, chain);
 
     BatchResult {
         succeeded,
@@ -757,7 +776,14 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // Pass keep_worktrees=true — function should return without touching path
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 0, true, true, false, false, None);
+        WorktreeCleanupContext {
+            project_root: tmp.path(),
+            yes: true,
+            keep_worktrees: true,
+            cleanup_worktree: false,
+            chain: false,
+        }
+        .cleanup(&dummy_path, 0, None);
 
         assert!(
             dummy_path.exists(),
@@ -773,7 +799,14 @@ mod tests {
         fs::create_dir_all(&dummy_path).expect("create dummy dir");
 
         // exit_code=1 → keep worktree for debugging
-        cleanup_worktree_after_prd(tmp.path(), &dummy_path, 1, true, false, true, false, None);
+        WorktreeCleanupContext {
+            project_root: tmp.path(),
+            yes: true,
+            keep_worktrees: false,
+            cleanup_worktree: true,
+            chain: false,
+        }
+        .cleanup(&dummy_path, 1, None);
 
         assert!(
             dummy_path.exists(),
@@ -807,7 +840,14 @@ mod tests {
         assert!(wt_path.exists(), "worktree must exist before cleanup");
 
         // exit_code=0, cleanup_worktree=true → should remove
-        cleanup_worktree_after_prd(&repo, &wt_path, 0, true, false, true, false, None);
+        WorktreeCleanupContext {
+            project_root: &repo,
+            yes: true,
+            keep_worktrees: false,
+            cleanup_worktree: true,
+            chain: false,
+        }
+        .cleanup(&wt_path, 0, None);
 
         assert!(
             !wt_path.exists(),
