@@ -1176,4 +1176,73 @@ detached
             "Worktree should be on the existing branch"
         );
     }
+
+    /// Integration test: creating a worktree with `start_point` from another branch
+    /// must cause the new worktree to contain the source branch's commits.
+    ///
+    /// Known-bad discriminator: if `start_point` is silently ignored, `feat/phase-2`
+    /// would branch from HEAD (main) and would NOT contain `phase1-marker.txt` —
+    /// this test catches that failure.
+    #[test]
+    fn test_ensure_worktree_chain_preserves_commits() {
+        let tmp = setup_git_repo_with_file();
+
+        // Step 1: create feat/phase-1 worktree from HEAD (main)
+        let phase1_path = ensure_worktree(tmp.path(), "feat/phase-1", true, None)
+            .expect("create feat/phase-1 worktree");
+        assert!(phase1_path.exists(), "phase-1 worktree must exist on disk");
+
+        // Step 2: make a unique commit in the phase-1 worktree
+        fs::write(phase1_path.join("phase1-marker.txt"), "phase1 content")
+            .expect("write phase1-marker.txt");
+        Command::new("git")
+            .args(["add", "phase1-marker.txt"])
+            .current_dir(&phase1_path)
+            .output()
+            .expect("git add phase1-marker.txt");
+        Command::new("git")
+            .args(["commit", "-m", "phase-1 unique commit"])
+            .current_dir(&phase1_path)
+            .output()
+            .expect("git commit in phase-1");
+
+        // Step 3: create feat/phase-2 branched from feat/phase-1 via start_point
+        let phase2_path = ensure_worktree(tmp.path(), "feat/phase-2", true, Some("feat/phase-1"))
+            .expect("create feat/phase-2 worktree from feat/phase-1");
+        assert!(phase2_path.exists(), "phase-2 worktree must exist on disk");
+
+        // Acceptance: phase-2 must contain phase-1's marker file
+        assert!(
+            phase2_path.join("phase1-marker.txt").exists(),
+            "phase-2 must contain phase1-marker.txt (inherited via start_point=feat/phase-1)"
+        );
+
+        // Acceptance: phase-2's git log must include phase-1's commit message
+        let log_output = Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&phase2_path)
+            .output()
+            .expect("git log in phase-2");
+        let log_str = String::from_utf8_lossy(&log_output.stdout);
+        assert!(
+            log_str.contains("phase-1 unique commit"),
+            "phase-2 git log must contain phase-1's commit message, got: {}",
+            log_str
+        );
+
+        // Negative: phase-2 must be a NEW branch, not a detached HEAD or checkout of phase-1
+        let branch_output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&phase2_path)
+            .output()
+            .expect("git rev-parse HEAD in phase-2");
+        let branch = String::from_utf8_lossy(&branch_output.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            branch, "feat/phase-2",
+            "phase-2 worktree must be on branch 'feat/phase-2', not '{}'",
+            branch
+        );
+    }
 }
