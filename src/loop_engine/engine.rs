@@ -679,6 +679,11 @@ pub struct LoopResult {
     /// `use_worktrees = true` and a branch was specified). `None` when running
     /// directly in source_root or when no branch was configured.
     pub worktree_path: Option<PathBuf>,
+    /// Branch name used for this run, from PRD metadata.
+    ///
+    /// Read by the batch runner to advance the chain — the next PRD branches from this.
+    /// `None` on early-return error paths or when no branch was configured in the PRD.
+    pub branch_name: Option<String>,
 }
 
 /// Configuration for running the loop, built from CLI args + env.
@@ -710,6 +715,12 @@ pub struct LoopRunConfig {
     /// Paths to OTHER PRD JSON files in the batch (empty for single-PRD runs).
     /// Used to inject sibling PRD context into MILESTONE task prompts.
     pub batch_sibling_prds: Vec<PathBuf>,
+    /// Base git ref for this run's worktree.
+    ///
+    /// When `Some`, passed as `start_point` to `ensure_worktree()` so the branch
+    /// is created from the specified ref instead of HEAD. Set by the batch runner
+    /// when `--chain` is active. `None` for standalone runs and chain=false batch runs.
+    pub chain_base: Option<String>,
 }
 
 /// Expected global skills for task-mgr loop workflows.
@@ -806,6 +817,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: None,
+            branch_name: None,
         };
     }
 
@@ -825,6 +837,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
+                branch_name: None,
             };
         }
     };
@@ -835,6 +848,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: None,
+            branch_name: None,
         };
     }
 
@@ -899,6 +913,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
+                branch_name: None,
             };
         }
     };
@@ -950,6 +965,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: None,
+            branch_name: None,
         };
     }
 
@@ -966,6 +982,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
+                branch_name: None,
             };
         }
     };
@@ -1019,6 +1036,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
+                branch_name: None,
             };
         }
     }
@@ -1046,6 +1064,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: None,
+                branch_name: None,
             };
         }
     };
@@ -1090,7 +1109,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 &run_config.source_root,
                 branch,
                 run_config.config.yes_mode,
-                None,
+                run_config.chain_base.as_deref(),
             ) {
                 Ok(wt_path) => {
                     actual_worktree_path = Some(wt_path.clone());
@@ -1101,6 +1120,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     return LoopResult {
                         exit_code: 1,
                         worktree_path: None,
+                        branch_name: None,
                     };
                 }
             }
@@ -1113,6 +1133,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 return LoopResult {
                     exit_code: 1,
                     worktree_path: None,
+                    branch_name: None,
                 };
             }
             run_config.source_root.clone()
@@ -1221,6 +1242,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
+            branch_name: None,
         };
     }
 
@@ -1245,6 +1267,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
+                branch_name: None,
             };
         }
     }
@@ -1258,6 +1281,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
+                branch_name: None,
             };
         }
     };
@@ -1882,6 +1906,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     LoopResult {
         exit_code,
         worktree_path: actual_worktree_path,
+        branch_name: branch_name.clone(),
     }
 }
 

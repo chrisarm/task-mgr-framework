@@ -327,6 +327,7 @@ pub async fn run_batch(
             config,
             external_repo: None, // Batch mode reads from PRD metadata
             batch_sibling_prds: sibling_prds,
+            chain_base: None, // Populated by chain logic in CHAIN-003
         };
 
         let should_cleanup_worktree = run_config.config.cleanup_worktree;

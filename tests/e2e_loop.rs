@@ -892,6 +892,7 @@ fn test_run_loop_with_mock_claude() {
         external_repo: None,
         config,
         batch_sibling_prds: vec![],
+        chain_base: None,
     };
 
     // Run the loop

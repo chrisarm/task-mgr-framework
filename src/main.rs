@@ -643,6 +643,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 config,
                 external_repo,
                 batch_sibling_prds: vec![],
+                chain_base: None,
             };
 
             let rt = tokio::runtime::Builder::new_current_thread()
