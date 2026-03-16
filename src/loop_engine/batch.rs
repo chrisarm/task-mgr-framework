@@ -126,10 +126,10 @@ fn validate_prompt_files(prd_files: &[PathBuf]) -> TaskMgrResult<Vec<(PathBuf, P
 /// Returns an error if any PRD is missing `branchName` (chain cannot proceed without it).
 /// Emits a warning to stderr for duplicate branch names (worktree reuse, changes accumulate).
 fn validate_chain_branches(pairs: &[(PathBuf, PathBuf)]) -> TaskMgrResult<()> {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     let mut missing: Vec<String> = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
 
     for (prd_file, _) in pairs {
         match status_queries::read_branch_name_from_prd(prd_file) {
@@ -292,7 +292,6 @@ fn collect_prd_files(patterns: &[String]) -> TaskMgrResult<Vec<PathBuf>> {
     }
 
     prd_files.sort();
-    prd_files.dedup();
 
     Ok(prd_files)
 }
