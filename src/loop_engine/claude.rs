@@ -40,6 +40,9 @@ pub struct ClaudeResult {
     pub conversation: Option<String>,
     /// Whether the process was killed due to iteration timeout.
     pub timed_out: bool,
+    /// Tool calls denied by the permission system during this invocation.
+    /// Each entry is a raw JSON value from the stream-json `permission_denials` array.
+    pub permission_denials: Vec<serde_json::Value>,
 }
 
 /// Spawn Claude with the given prompt and collect its output.
@@ -214,7 +217,7 @@ pub(crate) fn spawn_claude(
 
     let reader = BufReader::new(stdout);
 
-    let (output, conversation) = if stream_json {
+    let (output, conversation, permission_denials) = if stream_json {
         tee_stream_json(reader)
     } else {
         let mut buf = String::new();
@@ -232,7 +235,7 @@ pub(crate) fn spawn_claude(
                 }
             }
         }
-        (buf, None)
+        (buf, None, Vec::new())
     };
 
     let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
@@ -255,6 +258,7 @@ pub(crate) fn spawn_claude(
         output,
         conversation,
         timed_out,
+        permission_denials,
     })
 }
 
@@ -268,7 +272,9 @@ pub(crate) fn spawn_claude(
 /// Each JSON line is parsed exactly once; the parsed `Value` is passed to both
 /// `tee_assistant_text` (for live display) and `process_stream_json_values` (for
 /// conversation building).
-fn tee_stream_json(reader: BufReader<impl std::io::Read>) -> (String, Option<String>) {
+fn tee_stream_json(
+    reader: BufReader<impl std::io::Read>,
+) -> (String, Option<String>, Vec<serde_json::Value>) {
     let mut parsed: Vec<serde_json::Value> = Vec::new();
 
     for line_result in reader.lines() {
@@ -341,10 +347,22 @@ fn tee_assistant_text(val: &serde_json::Value) {
 ///   user messages (tool_result), capped at `MAX_CONVERSATION_BYTES`.
 ///
 /// Malformed JSON lines and unknown message types are silently skipped with a warning.
+///
+/// Note: permission_denials are discarded here to keep existing test call sites unchanged.
+/// Use `parse_stream_json_lines_full` to get the full 3-tuple including denials.
 #[cfg(test)]
 pub(crate) fn parse_stream_json_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (String, Option<String>) {
+    let (output, conversation, _denials) = parse_stream_json_lines_full(lines);
+    (output, conversation)
+}
+
+/// Like `parse_stream_json_lines` but also returns permission_denials.
+#[cfg(test)]
+pub(crate) fn parse_stream_json_lines_full<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> (String, Option<String>, Vec<serde_json::Value>) {
     let values = lines.filter_map(
         |line| match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => Some(v),
@@ -357,15 +375,17 @@ pub(crate) fn parse_stream_json_lines<'a>(
     process_stream_json_values(values)
 }
 
-/// Process an iterator of already-parsed stream-json `Value`s into (output_text, conversation).
+/// Process an iterator of already-parsed stream-json `Value`s into
+/// (output_text, conversation, permission_denials).
 ///
 /// This is the shared core used by both `parse_stream_json_lines` (which parses strings first)
 /// and `tee_stream_json` (which passes pre-parsed values to avoid double-parsing).
 fn process_stream_json_values(
     values: impl Iterator<Item = serde_json::Value>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Vec<serde_json::Value>) {
     let mut output_text = String::new();
     let mut conversation = String::new();
+    let mut permission_denials: Vec<serde_json::Value> = Vec::new();
 
     for val in values {
         match val.get("type").and_then(|t| t.as_str()) {
@@ -389,13 +409,18 @@ fn process_stream_json_values(
                         })
                     })
                     .unwrap_or_default();
+
+                // Extract permission denials from the result line
+                if let Some(denials) = val.get("permission_denials").and_then(|d| d.as_array()) {
+                    permission_denials.extend(denials.iter().cloned());
+                }
             }
             // Skip system/init and unknown types
             _ => {}
         }
     }
 
-    (output_text, Some(conversation))
+    (output_text, Some(conversation), permission_denials)
 }
 
 /// Append formatted assistant message content to the conversation buffer.
@@ -490,6 +515,86 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Maximum number of denied-command hints to emit per iteration.
+const MAX_DENIAL_HINTS: usize = 20;
+
+/// Extract actionable denied Bash commands from permission_denials.
+///
+/// Returns deduplicated binary/script names suitable for hint output.
+/// Only Bash tool denials produce entries; other tools are silently skipped.
+pub(crate) fn extract_denied_commands(denials: &[serde_json::Value]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+
+    for denial in denials {
+        // Filter to Bash tool denials only
+        let tool_name = denial
+            .get("tool_name")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if tool_name != "Bash" {
+            continue;
+        }
+
+        // Extract the command string from tool_input.command
+        let command = match denial
+            .get("tool_input")
+            .and_then(|i| i.get("command"))
+            .and_then(|c| c.as_str())
+        {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let binary = extract_binary(command);
+        if binary.is_empty() {
+            continue;
+        }
+
+        if seen.insert(binary.clone()) {
+            result.push(binary);
+            if result.len() >= MAX_DENIAL_HINTS {
+                break;
+            }
+        }
+    }
+
+    result
+}
+
+/// Extract the binary/script name from a shell command string.
+///
+/// Takes the first whitespace-delimited token, strips leading `(` or `{` chars
+/// (subshell/brace-group prefixes), and filters out control characters.
+/// Returns empty string for empty/unparseable input.
+fn extract_binary(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Handle `env` prefix: `env VAR=val cmd ...` → extract `cmd`
+    let effective = if trimmed.starts_with("env ") {
+        // Skip "env" and any VAR=val tokens
+        trimmed
+            .split_whitespace()
+            .skip(1) // skip "env"
+            .find(|tok| !tok.contains('='))
+            .unwrap_or("")
+    } else {
+        // First whitespace-delimited token
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+
+    // Strip leading ( or { (subshell/brace-group)
+    let cleaned = effective.trim_start_matches(['(', '{']);
+
+    // Filter out control characters
+    let sanitized: String = cleaned.chars().filter(|c| !c.is_control()).collect();
+
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,11 +669,13 @@ mod tests {
             output: "Hello world\n".to_string(),
             conversation: None,
             timed_out: false,
+            permission_denials: vec![],
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
         assert!(result.conversation.is_none());
         assert!(!result.timed_out);
+        assert!(result.permission_denials.is_empty());
     }
 
     #[test]
@@ -578,6 +685,7 @@ mod tests {
             output: String::new(),
             conversation: None,
             timed_out: false,
+            permission_denials: vec![],
         };
         assert_eq!(result.exit_code, 137);
         assert!(result.output.is_empty());
@@ -624,6 +732,7 @@ mod tests {
             output: String::new(),
             conversation: None,
             timed_out: false,
+            permission_denials: vec![],
         })
     }
 
@@ -762,6 +871,7 @@ mod tests {
             output,
             conversation: None,
             timed_out: false,
+            permission_denials: vec![],
         })
     }
 
@@ -2309,6 +2419,142 @@ mod tests {
             !output.contains("--allowedTools"),
             "Scoped {{ allowed_tools: None }} must NOT emit --allowedTools at all, got: '{}'",
             output.trim()
+        );
+    }
+
+    // --- permission_denials extraction tests ---
+
+    #[test]
+    fn test_permission_denials_extracted_from_result_line() {
+        let lines = [
+            r#"{"type":"result","result":"done","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"touch /tmp/foo","description":"Create file"}}]}"#,
+        ];
+        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0]["tool_name"], "Bash");
+        assert_eq!(denials[0]["tool_input"]["command"], "touch /tmp/foo");
+    }
+
+    #[test]
+    fn test_permission_denials_empty_array() {
+        let lines =
+            [r#"{"type":"result","result":"done","permission_denials":[]}"#];
+        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        assert!(denials.is_empty());
+    }
+
+    #[test]
+    fn test_permission_denials_missing_field() {
+        let lines = [r#"{"type":"result","result":"done"}"#];
+        let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
+        assert!(denials.is_empty());
+    }
+
+    #[test]
+    fn test_extract_denied_commands_bash_denial() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Bash",
+            "tool_use_id": "t1",
+            "tool_input": {"command": "docker build .", "description": "Build image"}
+        })];
+        let cmds = extract_denied_commands(&denials);
+        assert_eq!(cmds, vec!["docker"]);
+    }
+
+    #[test]
+    fn test_extract_denied_commands_non_bash_skipped() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Write",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": "/tmp/foo", "content": "bar"}
+        })];
+        let cmds = extract_denied_commands(&denials);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_extract_denied_commands_deduplication() {
+        let denials = vec![
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_use_id": "t1",
+                "tool_input": {"command": "npm install"}
+            }),
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_use_id": "t2",
+                "tool_input": {"command": "npm test"}
+            }),
+        ];
+        let cmds = extract_denied_commands(&denials);
+        assert_eq!(cmds, vec!["npm"]);
+    }
+
+    #[test]
+    fn test_extract_denied_commands_multiple_distinct() {
+        let denials = vec![
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_use_id": "t1",
+                "tool_input": {"command": "npm install"}
+            }),
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_use_id": "t2",
+                "tool_input": {"command": "docker build ."}
+            }),
+        ];
+        let cmds = extract_denied_commands(&denials);
+        assert_eq!(cmds, vec!["npm", "docker"]);
+    }
+
+    #[test]
+    fn test_extract_denied_commands_missing_command_field() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Bash",
+            "tool_use_id": "t1",
+            "tool_input": {}
+        })];
+        let cmds = extract_denied_commands(&denials);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_extract_binary_simple() {
+        assert_eq!(extract_binary("docker build ."), "docker");
+    }
+
+    #[test]
+    fn test_extract_binary_with_path() {
+        assert_eq!(extract_binary("/usr/bin/docker build ."), "/usr/bin/docker");
+    }
+
+    #[test]
+    fn test_extract_binary_subshell_prefix() {
+        assert_eq!(extract_binary("(cd /tmp && ls)"), "cd");
+    }
+
+    #[test]
+    fn test_extract_binary_brace_group() {
+        assert_eq!(extract_binary("{echo hello}"), "echo");
+    }
+
+    #[test]
+    fn test_extract_binary_empty() {
+        assert_eq!(extract_binary(""), "");
+        assert_eq!(extract_binary("  "), "");
+    }
+
+    #[test]
+    fn test_extract_binary_env_prefix() {
+        assert_eq!(extract_binary("env FOO=bar docker build ."), "docker");
+    }
+
+    #[test]
+    fn test_extract_binary_env_multiple_vars() {
+        assert_eq!(
+            extract_binary("env FOO=bar BAZ=qux npm install"),
+            "npm"
         );
     }
 }
