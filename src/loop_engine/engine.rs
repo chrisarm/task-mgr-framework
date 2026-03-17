@@ -485,6 +485,22 @@ pub fn run_iteration(
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
 
+    // Step 6.1: Print hints for denied tools
+    let denied_cmds = claude::extract_denied_commands(&claude_result.permission_denials);
+    if !denied_cmds.is_empty() {
+        let config_path = params.db_dir.join("config.json");
+        for cmd in &denied_cmds {
+            eprintln!(
+                "\x1b[33m[hint]\x1b[0m Tool denied: {} \u{2014} to allow in future loops, add to {}:",
+                cmd,
+                config_path.display(),
+            );
+            eprintln!(
+                "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}", cmd,
+            );
+        }
+    }
+
     // Step 6.5a: If iteration timed out, log and treat as a crash-like outcome
     if claude_result.timed_out {
         eprintln!(
