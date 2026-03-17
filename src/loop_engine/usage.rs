@@ -308,16 +308,25 @@ pub fn parse_reset_from_output(output: &str) -> Option<u64> {
     let now = chrono::Local::now();
     let today = now.date_naive();
 
-    // Build target datetime in local timezone
+    // Build target datetime in local timezone — try today first, then tomorrow
     let target_naive = today.and_hms_opt(hour, minute, 0)?;
     let target_local = now.timezone().from_local_datetime(&target_naive).single()?;
 
     let diff = target_local.signed_duration_since(now);
-    if diff.num_seconds() <= 0 {
-        return None; // Already past
+    if diff.num_seconds() > 0 {
+        return Some(diff.num_seconds() as u64);
     }
 
-    Some(diff.num_seconds() as u64)
+    // Time already passed today — assume it means tomorrow
+    let tomorrow = today.succ_opt()?;
+    let target_naive = tomorrow.and_hms_opt(hour, minute, 0)?;
+    let target_local = now.timezone().from_local_datetime(&target_naive).single()?;
+    let diff = target_local.signed_duration_since(now);
+    if diff.num_seconds() > 0 {
+        return Some(diff.num_seconds() as u64);
+    }
+
+    None
 }
 
 /// Parse a time token like "4pm", "12:30am", "4:00pm", "16:00" into (hour, minute).
@@ -1008,14 +1017,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reset_from_output_past_time() {
-        // Construct a time that's definitely in the past
+    fn test_parse_reset_from_output_past_time_wraps_to_tomorrow() {
+        // A time 2 hours ago today should wrap to ~22 hours from now (tomorrow)
         let now = chrono::Local::now();
         let past = now - chrono::Duration::hours(2);
         let time_str = past.format("%-I%P").to_string();
         let output = format!("resets {}", time_str);
         let result = parse_reset_from_output(&output);
-        assert!(result.is_none(), "Past time should return None");
+        assert!(
+            result.is_some(),
+            "Past time '{}' should wrap to tomorrow",
+            time_str
+        );
+        let secs = result.unwrap();
+        // Should be roughly 22 hours (±1h for rounding to top-of-hour)
+        assert!(secs > 75000, "Expected >75000 (~21h) but got {}", secs);
+        assert!(secs < 86400, "Expected <86400 (24h) but got {}", secs);
     }
 
     #[test]
