@@ -489,15 +489,32 @@ pub fn run_iteration(
     let denied_cmds = claude::extract_denied_commands(&claude_result.permission_denials);
     if !denied_cmds.is_empty() {
         let config_path = params.db_dir.join("config.json");
+        let allowed_str = match params.permission_mode {
+            PermissionMode::Scoped {
+                allowed_tools: Some(ref t),
+            } => t.as_str(),
+            _ => "",
+        };
         for cmd in &denied_cmds {
-            eprintln!(
-                "\x1b[33m[hint]\x1b[0m Tool denied: {} \u{2014} to allow in future loops, add to {}:",
-                cmd,
-                config_path.display(),
-            );
-            eprintln!(
-                "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}", cmd,
-            );
+            let pattern = format!("Bash({}:*)", cmd);
+            if allowed_str.contains(&pattern) {
+                // Tool is in the allowlist but Claude CLI still denied it —
+                // likely user-level deny rules in ~/.claude/settings.json
+                eprintln!(
+                    "\x1b[33m[hint]\x1b[0m Tool denied: {} (already in --allowedTools \u{2014} \
+                     check ~/.claude/settings.json or project .claude/settings.json for deny rules)",
+                    cmd,
+                );
+            } else {
+                eprintln!(
+                    "\x1b[33m[hint]\x1b[0m Tool denied: {} \u{2014} to allow in future loops, add to {}:",
+                    cmd,
+                    config_path.display(),
+                );
+                eprintln!(
+                    "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}", cmd,
+                );
+            }
         }
     }
 
