@@ -3,7 +3,7 @@
 //! Provides insert, query, and update functions for the `key_decisions` table.
 //! The table is created via migration v12 — no DDL here.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json;
 
 use crate::loop_engine::config::{KeyDecision, KeyDecisionOption};
@@ -21,6 +21,8 @@ pub struct StoredKeyDecision {
     pub options: Vec<KeyDecisionOption>,
     pub status: String,
     pub created_at: String,
+    pub resolution: Option<String>,
+    pub resolved_at: Option<String>,
 }
 
 /// Insert a key decision into the database.
@@ -63,7 +65,7 @@ pub fn get_pending_decisions(
 ) -> TaskMgrResult<Vec<StoredKeyDecision>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at
+            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE run_id = ?1 AND status IN ('pending', 'deferred')
              ORDER BY created_at ASC",
@@ -81,7 +83,7 @@ pub fn get_pending_decisions(
 pub fn get_all_pending_decisions(conn: &Connection) -> TaskMgrResult<Vec<StoredKeyDecision>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at
+            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE status IN ('pending', 'deferred')
              ORDER BY created_at ASC",
@@ -121,6 +123,74 @@ pub fn defer_decision(conn: &Connection, id: i64) -> TaskMgrResult<()> {
     Ok(())
 }
 
+/// Get a single decision by its ID. Returns `Ok(None)` if not found.
+pub fn get_decision_by_id(conn: &Connection, id: i64) -> TaskMgrResult<Option<StoredKeyDecision>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
+             FROM key_decisions
+             WHERE id = ?1",
+        )
+        .map_err(TaskMgrError::DatabaseError)?;
+
+    stmt.query_row(rusqlite::params![id], map_row)
+        .optional()
+        .map_err(TaskMgrError::DatabaseError)
+}
+
+/// Get all decisions, optionally filtered by status.
+///
+/// If `status_filter` is `None`, returns all decisions regardless of status.
+/// If `status_filter` is `Some(s)`, returns only decisions with that status.
+pub fn get_all_decisions(
+    conn: &Connection,
+    status_filter: Option<&str>,
+) -> TaskMgrResult<Vec<StoredKeyDecision>> {
+    // Use a single parameterized query: when status_filter is None the WHERE clause
+    // is always true (no filtering), when Some the status must match.
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
+             FROM key_decisions
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at ASC",
+        )
+        .map_err(TaskMgrError::DatabaseError)?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![status_filter], map_row)
+        .map_err(TaskMgrError::DatabaseError)?;
+
+    collect_rows(rows)
+}
+
+/// Revert a resolved or deferred decision back to pending.
+///
+/// Returns `InvalidState` if the decision is already pending.
+pub fn revert_decision(conn: &Connection, id: i64) -> TaskMgrResult<()> {
+    let decision = get_decision_by_id(conn, id)?
+        .ok_or_else(|| TaskMgrError::decision_not_found(id.to_string()))?;
+
+    if decision.status == "pending" {
+        return Err(TaskMgrError::invalid_state(
+            "Key Decision",
+            id.to_string(),
+            "resolved or deferred",
+            "pending",
+        ));
+    }
+
+    conn.execute(
+        "UPDATE key_decisions
+         SET status = 'pending', resolution = NULL, resolved_at = NULL
+         WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .map_err(TaskMgrError::DatabaseError)?;
+
+    Ok(())
+}
+
 /// Map a rusqlite row to a `StoredKeyDecision`.
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredKeyDecision> {
     let options_json: String = row.get(6)?;
@@ -145,6 +215,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredKeyDecision> {
         options,
         status: row.get(7)?,
         created_at: row.get(8)?,
+        resolution: row.get(9)?,
+        resolved_at: row.get(10)?,
     })
 }
 
@@ -281,6 +353,83 @@ mod tests {
 
         let all = get_all_pending_decisions(&conn).unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_get_decision_by_id_existing() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        resolve_decision(&conn, id, "Go with SQLite").unwrap();
+
+        let decision = get_decision_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(decision.id, id);
+        assert_eq!(decision.status, "resolved");
+        assert_eq!(decision.resolution.as_deref(), Some("Go with SQLite"));
+        assert!(decision.resolved_at.is_some());
+    }
+
+    #[test]
+    fn test_get_decision_by_id_missing() {
+        let (_dir, conn) = setup_db();
+        let result = get_decision_by_id(&conn, 9999).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_revert_already_pending_returns_invalid_state() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        let err = revert_decision(&conn, id).unwrap_err();
+        assert!(
+            matches!(err, TaskMgrError::InvalidState { .. }),
+            "expected InvalidState, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_revert_resolved_decision_succeeds() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        resolve_decision(&conn, id, "Go with SQLite").unwrap();
+        revert_decision(&conn, id).unwrap();
+
+        let decision = get_decision_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(decision.status, "pending");
+        assert!(decision.resolution.is_none());
+        assert!(decision.resolved_at.is_none());
+    }
+
+    #[test]
+    fn test_get_all_decisions_no_filter() {
+        let (_dir, conn) = setup_db();
+        conn.execute("INSERT INTO runs (run_id) VALUES ('run-002')", [])
+            .unwrap();
+        let d = make_decision();
+        let id1 = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+        insert_key_decision(&conn, "run-002", None, 2, &d).unwrap();
+        resolve_decision(&conn, id1, "Resolved").unwrap();
+
+        let all = get_all_decisions(&conn, None).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_decisions_with_pending_filter() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id1 = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+        insert_key_decision(&conn, "run-001", None, 2, &d).unwrap();
+        resolve_decision(&conn, id1, "Resolved").unwrap();
+
+        let pending = get_all_decisions(&conn, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, "pending");
     }
 
     #[test]

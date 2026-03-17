@@ -237,6 +237,15 @@ impl TaskMgrError {
         }
     }
 
+    /// Creates a NotFound error for a key decision.
+    #[must_use]
+    pub fn decision_not_found(id: impl Into<String>) -> Self {
+        TaskMgrError::NotFound {
+            resource_type: "Key Decision".to_string(),
+            id: id.into(),
+        }
+    }
+
     /// Creates an InvalidState error.
     #[must_use]
     pub fn invalid_state(

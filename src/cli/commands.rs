@@ -899,6 +899,48 @@ GENERATED MAN PAGES:
         #[command(subcommand)]
         action: CurateAction,
     },
+
+    /// Manage key architectural decisions
+    Decisions {
+        #[command(subcommand)]
+        action: DecisionAction,
+    },
+}
+
+/// Decisions subcommand actions
+#[derive(Subcommand, Debug)]
+pub enum DecisionAction {
+    /// List key decisions (pending and deferred by default)
+    List {
+        /// Show all decisions including resolved
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+
+    /// Resolve a key decision by selecting an option
+    Resolve {
+        /// Decision ID
+        decision_id: i64,
+
+        /// Option to select: letter (A/B/...) or option label substring
+        option: String,
+    },
+
+    /// Decline a key decision (mark as not needed)
+    Decline {
+        /// Decision ID
+        decision_id: i64,
+
+        /// Reason for declining (defaults to "Not needed")
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Revert a resolved or deferred decision back to pending
+    Revert {
+        /// Decision ID
+        decision_id: i64,
+    },
 }
 
 /// Curate subcommand actions

@@ -25,6 +25,7 @@
 pub mod apply_learning;
 pub mod complete;
 pub mod curate;
+pub mod decisions;
 pub mod dependency_checker;
 pub mod doctor;
 pub mod export;
@@ -54,6 +55,12 @@ pub use apply_learning::{
 };
 pub use complete::{
     complete, format_text as format_complete_text, CompleteResult, TaskCompletionResult,
+};
+pub use decisions::{
+    decline_decision_cmd, format_decline_text, format_list_text as format_decisions_list_text,
+    format_resolve_text, format_revert_text, list_decisions, resolve_decision_cmd,
+    revert_decision_cmd, DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult,
+    DecisionSummary, DecisionsListResult,
 };
 pub use doctor::{
     doctor, format_doctor_verbose, format_text as format_doctor_text, DoctorResult, DoctorSummary,

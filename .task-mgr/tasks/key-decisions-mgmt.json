@@ -1,0 +1,208 @@
+{
+  "branchName": "feat/key-decisions-mgmt",
+  "description": "Add task-mgr decisions subcommand for managing key decisions (list, resolve, decline, revert) and a /tm-decisions skill",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing DB functions — extend, don't modify signatures",
+      "JSON output (--format json) works correctly for all new commands"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Bottom-up: DB layer → CLI definition → command logic → wiring → skill",
+    "hierarchy": [
+      "1. PLAN - Read all files before modifying; understand existing patterns",
+      "2. FUNCTIONING CODE - Working end-to-end flow matters more than polish",
+      "3. CORRECTNESS - Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY - Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Follow existing patterns exactly (review.rs, unblock.rs are the closest analogues)",
+      "Each task delivers working code + tests together",
+      "No schema migration — reuse existing resolve_decision/defer_decision DB functions where possible",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "project": "task-mgr",
+  "taskPrefix": "KDM",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: StoredKeyDecision has resolution: Option<String> and resolved_at: Option<String> fields",
+        "Positive: map_row reads resolution (index 9) and resolved_at (index 10) from query results",
+        "Positive: get_pending_decisions and get_all_pending_decisions SELECT clauses include resolution, resolved_at",
+        "Positive: get_decision_by_id returns Ok(Some(decision)) for existing ID, Ok(None) for missing",
+        "Positive: get_all_decisions(conn, None) returns all decisions regardless of status",
+        "Positive: get_all_decisions(conn, Some('pending')) returns only pending decisions",
+        "Positive: revert_decision sets status='pending', resolution=NULL, resolved_at=NULL",
+        "Negative: revert_decision on already-pending decision returns InvalidState error",
+        "Negative: No changes to existing function signatures — engine.rs callers must compile without changes",
+        "Unit test: insert decision, resolve it, get_decision_by_id returns status='resolved' with resolution text",
+        "Unit test: insert decision, revert fails with InvalidState (already pending)",
+        "Unit test: insert + resolve + revert succeeds, status back to 'pending', resolution is None",
+        "Unit test: get_all_decisions returns resolved AND pending decisions",
+        "Known-bad: updating map_row without updating SELECT queries causes runtime panic — test all existing query functions still work after the change",
+        "Positive: error.rs has decision_not_found constructor following task_not_found pattern"
+      ],
+      "dependsOn": [],
+      "description": "Extend the StoredKeyDecision struct with resolution/resolved_at fields, update all queries, and add new DB functions for the decisions management commands.\n\nDO:\n- Add `resolution: Option<String>` and `resolved_at: Option<String>` to StoredKeyDecision\n- Update map_row to read 11 columns (currently reads 9, skipping resolution and resolved_at)\n- Update ALL SELECT queries in this file to include `resolution, resolved_at` columns\n- Add get_decision_by_id(conn, id) -> Result<Option<StoredKeyDecision>>\n- Add get_all_decisions(conn, status_filter: Option<&str>) -> Result<Vec<StoredKeyDecision>>\n- Add revert_decision(conn, id) that SETs status='pending', resolution=NULL, resolved_at=NULL\n- Add a decision_not_found convenience constructor to error.rs (follow task_not_found pattern at line 215)\n\nDO NOT:\n- Change the signature of existing functions (resolve_decision, defer_decision, etc.) — callers in engine.rs depend on them\n- Add a schema migration — the columns already exist in the DB, we're just reading them now\n- Add 'approved' or 'declined' to any CHECK constraint\n\nEdge cases:\n- get_decision_by_id with non-existent ID returns Ok(None), not Err\n- get_all_decisions with status_filter=None returns ALL decisions (pending, resolved, deferred)\n- revert_decision on an already-pending decision should be an error (InvalidState)\n- Existing tests must still pass after map_row changes (they don't assert on resolution/resolved_at columns, but the column indices shift)\n\nKnown-bad to guard against:\n- If you update map_row to read 11 columns but forget to update the SELECT in get_pending_decisions or get_all_pending_decisions, you'll get runtime column-index-out-of-bounds errors. ALL SELECTs must be updated atomically.",
+      "id": "FEAT-001",
+      "notes": "Key files:\n- src/db/schema/key_decisions.rs (main changes)\n- src/error.rs (add decision_not_found at ~line 221)\n\nExisting patterns to follow:\n- task_not_found at error.rs:215 for the NotFound constructor\n- The existing map_row function at key_decisions.rs:125 — extend it\n- setup_db() test helper at key_decisions.rs:166 — reuse for new tests\n- make_decision() test helper at key_decisions.rs:177 — reuse for new tests\n\nThe SELECT column order MUST be: id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at",
+      "passes": true,
+      "priority": 1,
+      "title": "Extend StoredKeyDecision and add DB functions",
+      "touchesFiles": [
+        "src/db/schema/key_decisions.rs",
+        "src/error.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr decisions list` parses correctly via clap (cargo build succeeds)",
+        "Positive: `task-mgr decisions resolve 3 A` parses decision_id=3, option='A' as positional args",
+        "Positive: `task-mgr decisions decline 5 --reason 'Not MVP'` parses correctly",
+        "Positive: `task-mgr decisions revert 3` parses correctly",
+        "Positive: list_decisions returns pending/deferred by default, all with --all flag",
+        "Positive: resolve_decision_cmd with letter 'a' selects first option (case-insensitive)",
+        "Positive: resolve_decision_cmd with letter 'B' selects second option",
+        "Positive: decline_decision_cmd with no reason defaults to 'DECLINED: Not needed'",
+        "Positive: decline_decision_cmd with reason produces 'DECLINED: {reason}' resolution",
+        "Negative: resolve_decision_cmd on resolved decision returns InvalidState error",
+        "Negative: resolve_decision_cmd with invalid letter (e.g., 'Z' for 2-option decision) returns clear error",
+        "Negative: revert_decision_cmd on pending decision returns InvalidState error",
+        "Unit test: resolve with 'a' on 2-option decision picks first option",
+        "Unit test: resolve on resolved decision returns error",
+        "Unit test: decline defaults to 'DECLINED: Not needed'",
+        "Unit test: revert on resolved decision succeeds, on pending fails",
+        "Unit test: format_list_text with 0 decisions shows 'No pending key decisions'",
+        "Unit test: format_list_text with decisions shows ID, status, title, options count",
+        "Known-bad: if option parsing uses (ch as u8 - b'a') without bounds check, passing 'Z' causes out-of-bounds panic instead of error"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add the Decisions variant to the Commands enum, the DecisionAction subcommand enum, and implement the full command module with result structs, logic functions, and format functions.\n\nDO:\n- Add Decisions { action: DecisionAction } variant to Commands enum in src/cli/commands.rs\n- Add DecisionAction enum with List, Resolve, Decline, Revert subcommands (see plan for exact definitions)\n- Add DecisionAction to re-exports in src/cli/mod.rs\n- Create src/commands/decisions.rs with result structs, logic functions, format functions\n- Add pub mod decisions + re-exports to src/commands/mod.rs\n- Resolve uses positional args: decision_id and option (no --option flag)\n- Decline uses positional decision_id + optional --reason flag\n\nDO NOT:\n- Create a separate enums entry for DecisionStatusFilter — use a simple --all bool flag instead\n- Add the main.rs dispatch or handlers.rs registration (that's FEAT-003)\n- Use unwrap() — map errors via TaskMgrError\n\nEdge cases:\n- resolve_decision_cmd: option_str 'a' and 'A' both map to first option (case-insensitive)\n- resolve_decision_cmd: option_str 'Z' with only 2 options → clear error message\n- resolve_decision_cmd: option_str that matches an option label (substring) also works\n- decline_decision_cmd: no reason provided → default 'Not needed'\n- revert_decision_cmd: decision already pending → InvalidState error\n- list_decisions with --all=false (default) shows only pending/deferred\n\nKnown-bad to guard against:\n- If option letter parsing uses 0-based without wrapping_sub(b'a'), index calculation is wrong\n- If decline calls defer_decision instead of resolve_decision, status becomes 'deferred' not 'resolved' and the decision keeps appearing in pending lists",
+      "id": "FEAT-002",
+      "notes": "Key files:\n- src/cli/commands.rs — add Decisions variant near line 888 (after Curate), add DecisionAction enum\n- src/cli/mod.rs — add DecisionAction to the re-export line 23\n- src/commands/decisions.rs — NEW FILE, follow review.rs pattern exactly\n- src/commands/mod.rs — add pub mod decisions + re-exports\n\nPatterns to follow:\n- review.rs for result struct shape, format_text pattern, and test helpers\n- RunAction/WorktreesAction in commands.rs for the subcommand enum pattern\n- The option parsing should follow the session-end prompt pattern in engine.rs:1970-1987\n\nResult structs must derive Serialize for JSON output. Use #[serde(skip_serializing_if = \"Option::is_none\")] on optional fields.",
+      "passes": true,
+      "priority": 2,
+      "title": "CLI subcommand definition + command implementation",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/cli/mod.rs",
+        "src/commands/decisions.rs",
+        "src/commands/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: cargo build succeeds with all wiring in place",
+        "Positive: task-mgr decisions list produces text output",
+        "Positive: task-mgr --format json decisions list produces JSON output",
+        "Positive: task-mgr decisions resolve/decline/revert acquire LockGuard before DB access",
+        "Positive: task-mgr decisions list does NOT acquire LockGuard",
+        "Negative: No unwrap() in the dispatch code — all errors propagated via ?",
+        "Known-bad: forgetting impl_text_formattable! causes runtime panic on text output — verify text output works for all 4 result types"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Connect the decisions command module to the CLI entry point and output system.\n\nDO:\n- Add Commands::Decisions { action } match arm to run() in main.rs\n- Dispatch List → list_decisions (read-only, no LockGuard)\n- Dispatch Resolve → resolve_decision_cmd (LockGuard + open_connection)\n- Dispatch Decline → decline_decision_cmd (LockGuard + open_connection)\n- Dispatch Revert → revert_decision_cmd (LockGuard + open_connection)\n- Import DecisionAction from cli module\n- Import decision functions from commands module\n- Add impl_text_formattable! for DecisionsListResult, DecisionResolveResult, DecisionDeclineResult, DecisionRevertResult in handlers.rs\n- Import decision format functions and result types in handlers.rs\n\nDO NOT:\n- Add verbose output — keep it simple for v1\n- Add format_json override — the generic output_result handles JSON via Serialize\n\nEdge cases:\n- List is read-only (no lock needed)\n- Resolve/Decline/Revert mutate the DB (need LockGuard)\n\nKnown-bad to guard against:\n- If you forget to register impl_text_formattable!, text output will compile but panic at runtime\n- If you import from wrong module path (e.g., commands::decisions vs db::schema::key_decisions), you'll get type mismatches",
+      "id": "FEAT-003",
+      "notes": "Key files:\n- src/main.rs — add dispatch arm (follow the Review pattern at ~line 542)\n- src/handlers.rs — add imports and impl_text_formattable! calls (follow review pattern at ~line 96-97)\n\nPatterns to follow:\n- The Review dispatch at main.rs:542-563 is the closest analogue — it has both read-only and write paths\n- handlers.rs macro usage at line 96: impl_text_formattable!(ReviewResult, format_review_text)\n\nThe main.rs dispatch for List should be:\n  let conn = open_connection(&cli.dir)?;\n  let result = list_decisions(&conn, all)?;\n  output_result(&result, cli.format);\n\nThe dispatch for Resolve/Decline/Revert should be:\n  let _lock = LockGuard::acquire(&cli.dir)?;\n  let conn = open_connection(&cli.dir)?;\n  let result = resolve_decision_cmd(&conn, decision_id, &option)?;\n  output_result(&result, cli.format);",
+      "passes": true,
+      "priority": 3,
+      "title": "Wire dispatch in main.rs and register TextFormattable in handlers.rs",
+      "touchesFiles": [
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: .claude/commands/tm-decisions.md exists and is valid markdown",
+        "Positive: skill includes step-by-step instructions for Claude",
+        "Positive: skill handles the 'no pending decisions' case",
+        "Positive: skill shows option labels and descriptions before asking user to choose",
+        "Positive: skill includes usage examples at the top",
+        "Negative: skill does NOT directly query the database — uses task-mgr CLI only"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Create the Claude Code skill command that provides an interactive interface for managing key decisions.\n\nDO:\n- Create .claude/commands/tm-decisions.md\n- Step 1: Run task-mgr --format json decisions list to get pending decisions\n- Step 2: Present each decision with full detail (title, description, all options with labels)\n- Step 3: For each decision, ask the user what they want to do (resolve/decline/skip)\n- Step 4: Run the appropriate CLI command\n- Include usage examples at the top\n- Handle the case where no decisions are pending\n\nDO NOT:\n- Make the skill overly complex — keep it as instructions for Claude, not a script\n- Duplicate the CLI help text — focus on the interactive flow\n- Include implementation details about the DB — the skill operates through the CLI",
+      "id": "FEAT-004",
+      "notes": "Follow the pattern of existing skills like tm-status.md and tm-apply.md.\n\nThe skill should use --format json to get structured data, then present it in a readable format.\n\nKey commands the skill will run:\n- task-mgr --format json decisions list\n- task-mgr decisions resolve <id> <option>\n- task-mgr decisions decline <id> --reason '<reason>'\n- task-mgr decisions revert <id>",
+      "passes": true,
+      "priority": 4,
+      "title": "Add /tm-decisions skill command",
+      "touchesFiles": [
+        ".claude/commands/tm-decisions.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: No function longer than 30 lines in new code",
+        "Positive: All public functions have doc comments",
+        "Positive: Option parsing logic is not duplicated between decisions.rs and engine.rs",
+        "Positive: cargo clippy -- -D warnings passes",
+        "Positive: cargo fmt --check passes"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Review all new code for opportunities to improve.\n\nDO:\n- Check for duplicated logic between decisions.rs and the session-end prompt code in engine.rs (option parsing, display formatting)\n- Check function lengths — anything over 30 lines should be broken up\n- Check that all public functions have doc comments\n- Verify separation of concerns (DB layer vs command layer vs format layer)\n- Look for opportunities to extract shared helpers\n\nDO NOT:\n- Refactor existing code outside the scope of this feature\n- Add unnecessary abstractions for one-time operations",
+      "id": "REFACTOR-001",
+      "passes": true,
+      "priority": 5,
+      "title": "Review for DRY, testability, and code quality",
+      "touchesFiles": [
+        "src/commands/decisions.rs",
+        "src/db/schema/key_decisions.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (main.rs dispatch → commands → DB)",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: JSON output works for all 4 subcommands (list, resolve, decline, revert)",
+        "Positive: Existing key_decisions tests still pass (map_row changes didn't break them)",
+        "Positive: Session-end interactive prompt still works (engine.rs callers unchanged)",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings for new code",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-98"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring. Run full test suite.\n\nDO: Check every new function for error handling, check callers still work, verify no dead code.\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode.",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically. If no issues: mark passes:true with note 'Clean review'.",
+      "passes": true,
+      "priority": 99,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/db/schema/key_decisions.rs",
+        "src/error.rs",
+        "src/cli/commands.rs",
+        "src/cli/mod.rs",
+        "src/commands/decisions.rs",
+        "src/commands/mod.rs",
+        "src/handlers.rs",
+        "src/main.rs",
+        ".claude/commands/tm-decisions.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

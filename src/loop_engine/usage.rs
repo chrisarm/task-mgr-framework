@@ -324,10 +324,10 @@ pub fn parse_reset_from_output(output: &str) -> Option<u64> {
 fn parse_time_token(token: &str) -> Option<(u32, u32)> {
     let token = token.trim().trim_end_matches([',', '.']);
 
-    let (time_part, am_pm) = if let Some(t) = token.strip_suffix("am") {
-        (t, Some("am"))
-    } else if let Some(t) = token.strip_suffix("pm") {
-        (t, Some("pm"))
+    let (time_part, am_pm) = if let Some(stripped) = token.strip_suffix("am") {
+        (stripped, Some("am"))
+    } else if let Some(stripped) = token.strip_suffix("pm") {
+        (stripped, Some("pm"))
     } else {
         (token, None)
     };

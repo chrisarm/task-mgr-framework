@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
+use crate::commands::decisions::find_option;
 use crate::commands::init::generate_prefix;
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
@@ -1977,29 +1978,26 @@ fn prompt_pending_key_decisions(conn: &Connection, run_id: &str, yes_mode: bool)
                 break;
             }
 
-            // Try to map single letter to option index
-            if trimmed.len() == 1 {
-                let ch = trimmed.chars().next().unwrap();
-                if ch.is_ascii_alphabetic() {
-                    let idx = (ch.to_ascii_lowercase() as u8).wrapping_sub(b'a') as usize;
-                    if let Some(opt) = decision.options.get(idx) {
-                        let resolution = format!("{}: {}", opt.label, opt.description);
-                        if let Err(e) =
-                            key_decisions_db::resolve_decision(conn, decision.id, &resolution)
-                        {
-                            eprintln!("Warning: failed to resolve decision: {}", e);
-                        } else {
-                            eprintln!("Decision resolved: {}", resolution);
-                        }
-                        break;
+            // Match letter or label substring to an option
+            match find_option(&decision.options, &trimmed) {
+                Ok(opt) => {
+                    let resolution = format!("{}: {}", opt.label, opt.description);
+                    if let Err(e) =
+                        key_decisions_db::resolve_decision(conn, decision.id, &resolution)
+                    {
+                        eprintln!("Warning: failed to resolve decision: {}", e);
+                    } else {
+                        eprintln!("Decision resolved: {}", resolution);
                     }
+                    break;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Invalid choice — enter a letter (A–{}) or S to skip.",
+                        (b'A' + decision.options.len() as u8 - 1) as char
+                    );
                 }
             }
-
-            eprintln!(
-                "Invalid choice — enter a letter (A–{}) or S to skip.",
-                (b'A' + decision.options.len() as u8 - 1) as char
-            );
         }
     }
 }
