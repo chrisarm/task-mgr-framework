@@ -1860,12 +1860,6 @@ fn get_learning_col_str(conn: &Connection, id: i64, col: &str) -> Option<String>
         .expect("get_learning_col_str: learning must exist")
 }
 
-fn get_learning_col_i64(conn: &Connection, id: i64, col: &str) -> i64 {
-    let sql = format!("SELECT {col} FROM learnings WHERE id = ?1");
-    conn.query_row(&sql, [id], |row| row.get::<_, i64>(0))
-        .expect("get_learning_col_i64: learning must exist")
-}
-
 fn get_learning_col_i32(conn: &Connection, id: i64, col: &str) -> i32 {
     let sql = format!("SELECT {col} FROM learnings WHERE id = ?1");
     conn.query_row(&sql, [id], |row| row.get::<_, i32>(0))

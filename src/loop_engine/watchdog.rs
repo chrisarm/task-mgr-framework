@@ -332,7 +332,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_timeout_extends_on_activity() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::Mutex;
         use std::time::{SystemTime, UNIX_EPOCH};
         static ENV_MUTEX: Mutex<()> = Mutex::new(());

@@ -603,7 +603,7 @@ mod tests {
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // Serialize tests that mutate CLAUDE_BINARY to avoid race conditions
     // when cargo test runs threads in parallel.

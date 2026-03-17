@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_list_shows_correct_branch_path_lock_status() {
-        let (tmp, repo, db_dir) = setup_worktree_test_env();
+        let (_tmp, repo, db_dir) = setup_worktree_test_env();
 
         let result = list(&db_dir, &repo).expect("list should succeed");
         assert!(
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_list_shows_locked_when_lock_file_present() {
-        let (tmp, repo, db_dir) = setup_worktree_test_env();
+        let (_tmp, repo, db_dir) = setup_worktree_test_env();
 
         // Write a lock file claiming the repo path is active, with an actual flock
         let repo_str = repo.to_string_lossy().to_string();
