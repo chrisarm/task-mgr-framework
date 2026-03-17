@@ -683,6 +683,14 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         } => {
             let project_root = get_project_root()?;
 
+            // Anchor db_dir to source_root so worktrees don't create a separate DB.
+            // Same resolution as the `loop` command.
+            let db_dir = if cli.dir.is_relative() {
+                project_root.join(&cli.dir)
+            } else {
+                cli.dir.clone()
+            };
+
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -695,7 +703,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     &patterns,
                     max_iterations,
                     yes,
-                    &cli.dir,
+                    &db_dir,
                     &project_root,
                     cli.verbose,
                     keep_worktrees,
