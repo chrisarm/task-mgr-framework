@@ -1679,6 +1679,24 @@ fn test_generate_prefix_known_values() {
 }
 
 #[test]
+fn test_prefix_id_adds_prefix() {
+    assert_eq!(super::prefix_id("P1", "FEAT-001"), "P1-FEAT-001");
+}
+
+#[test]
+fn test_prefix_id_idempotent_when_already_prefixed() {
+    // If the ID already starts with the prefix, don't double it
+    assert_eq!(super::prefix_id("KBTEST", "KBTEST-FEAT-001"), "KBTEST-FEAT-001");
+    assert_eq!(super::prefix_id("P1", "P1-US-003"), "P1-US-003");
+}
+
+#[test]
+fn test_prefix_id_does_not_match_partial_prefix() {
+    // "P1-" must not match "P10-FEAT-001" — the dash separator prevents it
+    assert_eq!(super::prefix_id("P1", "P10-FEAT-001"), "P1-P10-FEAT-001");
+}
+
+#[test]
 fn test_init_auto_prefix_dry_run_deterministic() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
