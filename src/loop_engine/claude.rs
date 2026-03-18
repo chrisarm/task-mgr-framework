@@ -54,7 +54,7 @@ pub struct ClaudeResult {
 /// - `Dangerous` → `--dangerously-skip-permissions`
 /// - `Scoped { allowed_tools: Some(t) }` → `--permission-mode dontAsk --allowedTools <t>`
 /// - `Scoped { allowed_tools: None }` → `--permission-mode dontAsk`
-/// - `Auto` → `--enable-auto-mode`
+/// - `Auto` → `--permission-mode auto`
 ///
 /// When `model` is `Some(m)` and non-empty, `--model m` is inserted before `-p`.
 /// The binary defaults to `claude` but can be overridden via the `CLAUDE_BINARY`
@@ -112,7 +112,8 @@ pub(crate) fn spawn_claude(
             }
         }
         PermissionMode::Auto => {
-            args.push("--enable-auto-mode".to_string());
+            args.push("--permission-mode".to_string());
+            args.push("auto".to_string());
         }
     }
     if let Some(m) = model {
@@ -2255,7 +2256,7 @@ mod tests {
     // --- PERM-FEAT-002: Permission mode arg construction tests ---
 
     /// AC: Dangerous mode includes --dangerously-skip-permissions in args.
-    /// Negative: must NOT include --permission-mode or --enable-auto-mode.
+    /// Negative: must NOT include --permission-mode.
     #[test]
     fn test_spawn_dangerous_mode_emits_skip_permissions_flag() {
         let mode = PermissionMode::Dangerous;
@@ -2270,10 +2271,6 @@ mod tests {
         assert!(
             !output.contains("--permission-mode"),
             "Dangerous mode must NOT include --permission-mode, got: '{output}'"
-        );
-        assert!(
-            !output.contains("--enable-auto-mode"),
-            "Dangerous mode must NOT include --enable-auto-mode, got: '{output}'"
         );
     }
 
@@ -2350,26 +2347,22 @@ mod tests {
         );
     }
 
-    /// AC: Auto mode includes --enable-auto-mode.
+    /// AC: Auto mode includes --permission-mode auto.
     /// Negative: must NOT include --dangerously-skip-permissions.
     #[test]
-    fn test_spawn_auto_mode_emits_enable_auto_mode_flag() {
+    fn test_spawn_auto_mode_emits_permission_mode_auto() {
         let mode = PermissionMode::Auto;
         let result = spawn_claude_echo("prompt", None, None, false, &mode);
         let output = result.expect("echo should succeed").output;
         let output = output.trim();
 
         assert!(
-            output.contains("--enable-auto-mode"),
-            "Auto mode must include --enable-auto-mode, got: '{output}'"
+            output.contains("--permission-mode") && output.contains("auto"),
+            "Auto mode must include --permission-mode auto, got: '{output}'"
         );
         assert!(
             !output.contains("--dangerously-skip-permissions"),
             "Auto mode must NOT include --dangerously-skip-permissions, got: '{output}'"
-        );
-        assert!(
-            !output.contains("--permission-mode"),
-            "Auto mode must NOT include --permission-mode, got: '{output}'"
         );
     }
 

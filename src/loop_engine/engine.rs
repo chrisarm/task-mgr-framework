@@ -2240,7 +2240,8 @@ fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool {
             }
         }
         PermissionMode::Auto => {
-            args.push("--enable-auto-mode");
+            args.push("--permission-mode");
+            args.push("auto");
         }
     }
 
