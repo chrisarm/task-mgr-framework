@@ -429,7 +429,7 @@ fn build_tool_awareness_section(permission_mode: &super::config::PermissionMode)
         PermissionMode::Dangerous => "## Available Tools\n\n\
              You have unrestricted tool access. Just use any tool you need.\n\n"
             .to_string(),
-        PermissionMode::Auto => "## Available Tools\n\n\
+        PermissionMode::Auto { .. } => "## Available Tools\n\n\
              You have auto-approved tool access. Just use any tool you need.\n\n"
             .to_string(),
         PermissionMode::Scoped {
@@ -751,7 +751,9 @@ mod tests {
     #[test]
     fn test_tool_awareness_auto() {
         use super::super::config::PermissionMode;
-        let section = build_tool_awareness_section(&PermissionMode::Auto);
+        let section = build_tool_awareness_section(&PermissionMode::Auto {
+            allowed_tools: None,
+        });
         assert!(section.contains("auto-approved tool access"));
     }
 

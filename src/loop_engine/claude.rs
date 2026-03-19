@@ -111,9 +111,13 @@ pub(crate) fn spawn_claude(
                 args.push(tools.clone());
             }
         }
-        PermissionMode::Auto => {
+        PermissionMode::Auto { allowed_tools } => {
             args.push("--permission-mode".to_string());
             args.push("auto".to_string());
+            if let Some(tools) = allowed_tools {
+                args.push("--allowedTools".to_string());
+                args.push(tools.clone());
+            }
         }
     }
     if let Some(m) = model {
@@ -2347,11 +2351,13 @@ mod tests {
         );
     }
 
-    /// AC: Auto mode includes --permission-mode auto.
+    /// AC: Auto mode includes --permission-mode auto and --allowedTools when tools provided.
     /// Negative: must NOT include --dangerously-skip-permissions.
     #[test]
-    fn test_spawn_auto_mode_emits_permission_mode_auto() {
-        let mode = PermissionMode::Auto;
+    fn test_spawn_auto_mode_emits_permission_mode_auto_with_tools() {
+        let mode = PermissionMode::Auto {
+            allowed_tools: Some("Read,Edit,Bash(cargo:*)".to_string()),
+        };
         let result = spawn_claude_echo("prompt", None, None, false, &mode);
         let output = result.expect("echo should succeed").output;
         let output = output.trim();
@@ -2361,8 +2367,32 @@ mod tests {
             "Auto mode must include --permission-mode auto, got: '{output}'"
         );
         assert!(
+            output.contains("--allowedTools"),
+            "Auto mode with tools must include --allowedTools, got: '{output}'"
+        );
+        assert!(
             !output.contains("--dangerously-skip-permissions"),
             "Auto mode must NOT include --dangerously-skip-permissions, got: '{output}'"
+        );
+    }
+
+    /// AC: Auto mode without tools includes --permission-mode auto but no --allowedTools.
+    #[test]
+    fn test_spawn_auto_mode_no_tools_omits_allowed_tools() {
+        let mode = PermissionMode::Auto {
+            allowed_tools: None,
+        };
+        let result = spawn_claude_echo("prompt", None, None, false, &mode);
+        let output = result.expect("echo should succeed").output;
+        let output = output.trim();
+
+        assert!(
+            output.contains("--permission-mode") && output.contains("auto"),
+            "Auto mode must include --permission-mode auto, got: '{output}'"
+        );
+        assert!(
+            !output.contains("--allowedTools"),
+            "Auto mode without tools must NOT include --allowedTools, got: '{output}'"
         );
     }
 

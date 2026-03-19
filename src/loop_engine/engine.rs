@@ -492,6 +492,9 @@ pub fn run_iteration(
         let allowed_str = match params.permission_mode {
             PermissionMode::Scoped {
                 allowed_tools: Some(ref t),
+            }
+            | PermissionMode::Auto {
+                allowed_tools: Some(ref t),
             } => t.as_str(),
             _ => "",
         };
@@ -1405,7 +1408,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Informs the user that the current permission model will be deprecated.
     if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
         if config::parse_bool_value(&val) == Some(true)
-            && permission_mode != config::PermissionMode::Auto
+            && !matches!(permission_mode, config::PermissionMode::Auto { .. })
         {
             eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
         }
@@ -2239,9 +2242,14 @@ fn probe_rate_limit_lifted(permission_mode: &PermissionMode) -> bool {
                 args.push(&allowed_tools_str);
             }
         }
-        PermissionMode::Auto => {
+        PermissionMode::Auto { allowed_tools } => {
             args.push("--permission-mode");
             args.push("auto");
+            if let Some(tools) = allowed_tools {
+                allowed_tools_str = tools.clone();
+                args.push("--allowedTools");
+                args.push(&allowed_tools_str);
+            }
         }
     }
 
@@ -3203,7 +3211,7 @@ mod tests {
     /// Mirrors the inline hint condition in run_loop() so the logic can be unit-tested.
     fn hint_should_fire(mode: &config::PermissionMode) -> bool {
         if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
-            config::parse_bool_value(&val) == Some(true) && *mode != config::PermissionMode::Auto
+            config::parse_bool_value(&val) == Some(true) && !matches!(mode, config::PermissionMode::Auto { .. })
         } else {
             false
         }
@@ -3262,7 +3270,9 @@ mod tests {
     fn test_hint_does_not_fire_when_mode_is_auto() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
-        let mode = config::PermissionMode::Auto;
+        let mode = config::PermissionMode::Auto {
+            allowed_tools: None,
+        };
         let fires = hint_should_fire(&mode);
         std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
         assert!(!fires, "Hint must not fire when mode is already Auto");
