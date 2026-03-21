@@ -417,7 +417,7 @@ pub enum CrashType {
 /// Outcome of a single loop iteration, determined by analyzing Claude's output.
 ///
 /// Priority order (highest to lowest):
-/// Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
+/// Completed > Blocked > Reorder > RateLimit > Crash > NoEligibleTasks > Empty
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IterationOutcome {
     /// All tasks completed successfully
@@ -430,8 +430,8 @@ pub enum IterationOutcome {
     RateLimit,
     /// Claude subprocess crashed
     Crash(CrashType),
-    /// No progress detected (same DB state before and after)
-    Stale,
+    /// No eligible tasks to work on (queue empty or all blocked/done)
+    NoEligibleTasks,
     /// Claude produced no output (empty response with exit 0)
     Empty,
     /// Prompt critical sections exceed the total character budget
@@ -647,9 +647,22 @@ mod tests {
     }
 
     #[test]
-    fn test_iteration_outcome_stale_variant() {
-        let outcome = IterationOutcome::Stale;
-        assert_eq!(outcome, IterationOutcome::Stale);
+    fn test_iteration_outcome_no_eligible_tasks_variant() {
+        let outcome = IterationOutcome::NoEligibleTasks;
+        assert_eq!(outcome, IterationOutcome::NoEligibleTasks);
+    }
+
+    #[test]
+    fn test_no_eligible_tasks_ne_completed() {
+        assert_ne!(
+            IterationOutcome::NoEligibleTasks,
+            IterationOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn test_no_eligible_tasks_ne_empty() {
+        assert_ne!(IterationOutcome::NoEligibleTasks, IterationOutcome::Empty);
     }
 
     #[test]
@@ -698,8 +711,11 @@ mod tests {
     fn test_iteration_outcome_variants_are_distinct() {
         assert_ne!(IterationOutcome::Completed, IterationOutcome::Blocked);
         assert_ne!(IterationOutcome::Blocked, IterationOutcome::RateLimit);
-        assert_ne!(IterationOutcome::RateLimit, IterationOutcome::Stale);
-        assert_ne!(IterationOutcome::Stale, IterationOutcome::Empty);
+        assert_ne!(
+            IterationOutcome::RateLimit,
+            IterationOutcome::NoEligibleTasks
+        );
+        assert_ne!(IterationOutcome::NoEligibleTasks, IterationOutcome::Empty);
     }
 
     #[test]
@@ -1332,7 +1348,7 @@ mod tests {
                 | IterationOutcome::Reorder(_)
                 | IterationOutcome::RateLimit
                 | IterationOutcome::Crash(_)
-                | IterationOutcome::Stale
+                | IterationOutcome::NoEligibleTasks
                 | IterationOutcome::Empty
                 | IterationOutcome::PromptOverflow
         );

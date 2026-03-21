@@ -2375,6 +2375,100 @@ mod tests {
         );
     }
 
+    /// progress-CHAIN.txt must never be moved during archive.
+    /// Uses realistic prefix "CHAIN" as used in chained PRD workflows.
+    #[test]
+    fn test_archive_skips_chain_prefixed_progress_file() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-chain", "feat/chain", Some("CHAIN"));
+        insert_task(&conn, "CHAIN-001", "Chain Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-chain.json", "task_list");
+        insert_prd_file(&conn, 1, "progress-CHAIN.txt", "prd");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-chain.json"), "{}").unwrap();
+        fs::write(
+            tasks_dir.join("progress-CHAIN.txt"),
+            "## CHAIN-001\n- Done.\n---\n",
+        )
+        .unwrap();
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert!(
+            !result.archived.is_empty(),
+            "Archive should produce results"
+        );
+
+        assert!(
+            tasks_dir.join("progress-CHAIN.txt").exists(),
+            "progress-CHAIN.txt must never be moved to the archive"
+        );
+
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources
+                .iter()
+                .any(|s| s.contains("progress-CHAIN.txt")),
+            "progress-CHAIN.txt must not appear in archived items"
+        );
+    }
+
+    /// progress-99ae54f7.txt must never be moved during archive.
+    /// Uses realistic hex-style prefix as used in this very PRD.
+    #[test]
+    fn test_archive_skips_hex_prefixed_progress_file() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(
+            &conn,
+            1,
+            "loop-reliability",
+            "feat/loop-reliability",
+            Some("99ae54f7"),
+        );
+        insert_task(&conn, "99ae54f7-FEAT-001", "Hex Task", 1, "done");
+        insert_prd_file(&conn, 1, "loop-reliability.json", "task_list");
+        insert_prd_file(&conn, 1, "progress-99ae54f7.txt", "prd");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("loop-reliability.json"), "{}").unwrap();
+        fs::write(
+            tasks_dir.join("progress-99ae54f7.txt"),
+            "## 99ae54f7-FEAT-001\n- Done.\n---\n",
+        )
+        .unwrap();
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert!(
+            !result.archived.is_empty(),
+            "Archive should produce results"
+        );
+
+        assert!(
+            tasks_dir.join("progress-99ae54f7.txt").exists(),
+            "progress-99ae54f7.txt must never be moved to the archive"
+        );
+
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources
+                .iter()
+                .any(|s| s.contains("progress-99ae54f7.txt")),
+            "progress-99ae54f7.txt must not appear in archived items"
+        );
+    }
+
     /// With branch_filter=None, all completed PRDs are archived (backward compat).
     #[test]
     fn test_branch_filter_none_archives_all() {

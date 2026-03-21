@@ -79,7 +79,7 @@ pub fn format_outcome(outcome: &IterationOutcome) -> String {
         IterationOutcome::Crash(crash_type) => format!("Crash ({:?})", crash_type),
         IterationOutcome::RateLimit => "RateLimit".to_string(),
         IterationOutcome::Reorder(task_id) => format!("Reorder ({})", task_id),
-        IterationOutcome::Stale => "Stale".to_string(),
+        IterationOutcome::NoEligibleTasks => "NoEligibleTasks".to_string(),
         IterationOutcome::Empty => "Empty".to_string(),
         IterationOutcome::PromptOverflow => "PromptOverflow".to_string(),
     }
@@ -326,8 +326,11 @@ mod tests {
     }
 
     #[test]
-    fn test_format_outcome_stale() {
-        assert_eq!(format_outcome(&IterationOutcome::Stale), "Stale");
+    fn test_format_outcome_no_eligible_tasks() {
+        assert_eq!(
+            format_outcome(&IterationOutcome::NoEligibleTasks),
+            "NoEligibleTasks"
+        );
     }
 
     #[test]

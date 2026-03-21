@@ -392,7 +392,7 @@ pub fn run_iteration(
                             remaining
                         );
                         return Ok(IterationResult {
-                            outcome: IterationOutcome::Stale,
+                            outcome: IterationOutcome::NoEligibleTasks,
                             task_id: None,
                             files_modified: vec![],
                             should_stop: false,
@@ -416,7 +416,7 @@ pub fn run_iteration(
                     remaining
                 );
                 return Ok(IterationResult {
-                    outcome: IterationOutcome::Stale,
+                    outcome: IterationOutcome::NoEligibleTasks,
                     task_id: None,
                     files_modified: vec![],
                     should_stop: false,
@@ -1843,7 +1843,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
 
         // Track consecutive stale iterations and abort if stuck
-        if matches!(result.outcome, IterationOutcome::Stale) {
+        if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
             ctx.stale_tracker.check("stale", "stale"); // same hash → increment
             if ctx.stale_tracker.should_abort() {
                 eprintln!(
@@ -2491,7 +2491,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
             // Reorder — skip, not a real iteration result
             false
         }
-        IterationOutcome::Stale => {
+        IterationOutcome::NoEligibleTasks => {
             // Stale detection handled by the outer loop via stale_tracker.check()
             false
         }

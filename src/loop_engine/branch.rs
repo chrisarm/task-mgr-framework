@@ -416,6 +416,111 @@ mod tests {
         );
     }
 
+    // --- progress_file_name: additional prefix variants ---
+
+    #[test]
+    fn test_progress_file_name_chain_prefix() {
+        assert_eq!(progress_file_name(Some("CHAIN")), "progress-CHAIN.txt");
+    }
+
+    #[test]
+    fn test_progress_file_name_hex_prefix() {
+        assert_eq!(
+            progress_file_name(Some("99ae54f7")),
+            "progress-99ae54f7.txt"
+        );
+    }
+
+    #[test]
+    fn test_progress_file_name_dots_and_hyphens() {
+        assert_eq!(
+            progress_file_name(Some("P1.alpha-2")),
+            "progress-P1.alpha-2.txt"
+        );
+    }
+
+    #[test]
+    fn test_progress_file_name_long_prefix() {
+        let long_prefix = "a".repeat(100);
+        let expected = format!("progress-{}.txt", long_prefix);
+        assert_eq!(progress_file_name(Some(&long_prefix)), expected);
+    }
+
+    // --- detect_branch_change with realistic prefixes ---
+
+    #[test]
+    fn test_detect_branch_change_resets_chain_progress_file() {
+        let tmp = setup_git_repo("new-feature");
+        let tasks_dir = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+
+        fs::write(
+            tasks_dir.join("progress-CHAIN.txt"),
+            "# Old Progress\nSome chain content\n",
+        )
+        .expect("write progress-CHAIN.txt");
+
+        fs::write(tasks_dir.join(LAST_BRANCH_FILE), "old-branch\n").expect("write .last-branch");
+
+        detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true, Some("CHAIN"))
+            .expect("detect");
+
+        let content =
+            fs::read_to_string(tasks_dir.join("progress-CHAIN.txt")).expect("read progress");
+        assert!(
+            content.contains("# Claude Code Progress Log"),
+            "Should contain new header, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("Some chain content"),
+            "Old content should be gone"
+        );
+        assert!(
+            !tasks_dir.join("progress.txt").exists(),
+            "progress.txt should not be created when prefix is CHAIN"
+        );
+    }
+
+    #[test]
+    fn test_detect_branch_change_resets_hex_prefix_progress_file() {
+        let tmp = setup_git_repo("feat/loop-reliability");
+        let tasks_dir = tmp.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+
+        fs::write(
+            tasks_dir.join("progress-99ae54f7.txt"),
+            "# Old Progress\nSome hex content\n",
+        )
+        .expect("write progress-99ae54f7.txt");
+
+        fs::write(tasks_dir.join(LAST_BRANCH_FILE), "main\n").expect("write .last-branch");
+
+        detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true, Some("99ae54f7"))
+            .expect("detect");
+
+        let content = fs::read_to_string(tasks_dir.join("progress-99ae54f7.txt"))
+            .expect("read progress-99ae54f7.txt");
+        assert!(
+            content.contains("# Claude Code Progress Log"),
+            "Should contain new header, got: {}",
+            content
+        );
+        assert!(
+            content.contains("Branch changed from 'main' to 'feat/loop-reliability'"),
+            "Should contain branch change note, got: {}",
+            content
+        );
+        assert!(
+            !content.contains("Some hex content"),
+            "Old content should be gone"
+        );
+        assert!(
+            !tasks_dir.join("progress.txt").exists(),
+            "progress.txt should not be created when prefix is 99ae54f7"
+        );
+    }
+
     #[test]
     fn test_detect_branch_change_fails_outside_git_repo() {
         let tmp = tempfile::tempdir().expect("create temp dir");

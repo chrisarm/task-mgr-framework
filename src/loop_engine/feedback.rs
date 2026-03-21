@@ -153,17 +153,17 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_outcome_does_not_record_applied() {
+    fn test_no_eligible_tasks_outcome_does_not_record_applied() {
         let (_temp_dir, conn) = setup_test_db();
         let id = insert_learning_with_shown(&conn, "Learning 1");
 
         let shown_ids = vec![id];
-        record_iteration_feedback(&conn, &shown_ids, &IterationOutcome::Stale).unwrap();
+        record_iteration_feedback(&conn, &shown_ids, &IterationOutcome::NoEligibleTasks).unwrap();
 
         let stats = get_window_stats(&conn, id).unwrap();
         assert_eq!(
             stats.window_applied, 0,
-            "Stale outcome should not record applied"
+            "NoEligibleTasks outcome should not record applied"
         );
     }
 
@@ -360,7 +360,7 @@ mod tests {
 
         // 5 failures
         for _ in 0..5 {
-            record_iteration_feedback(&conn, &[id], &IterationOutcome::Stale).unwrap();
+            record_iteration_feedback(&conn, &[id], &IterationOutcome::NoEligibleTasks).unwrap();
         }
         assert_eq!(get_window_stats(&conn, id).unwrap().window_applied, 0);
 
@@ -401,7 +401,7 @@ mod tests {
             IterationOutcome::Crash(crate::loop_engine::config::CrashType::OomOrKilled),
             IterationOutcome::Crash(crate::loop_engine::config::CrashType::Segfault),
             IterationOutcome::Crash(crate::loop_engine::config::CrashType::RateLimit),
-            IterationOutcome::Stale,
+            IterationOutcome::NoEligibleTasks,
             IterationOutcome::Empty,
         ];
 

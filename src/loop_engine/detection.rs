@@ -5,7 +5,7 @@
 //! reorder requests, rate-limit errors, crashes, and empty output.
 //!
 //! Priority order (highest to lowest):
-//! Completed > Blocked > Reorder > RateLimit > Crash > Stale > Empty
+//! Completed > Blocked > Reorder > RateLimit > Crash > NoEligibleTasks > Empty
 use std::path::Path;
 
 use crate::loop_engine::config::{CrashType, IterationOutcome, KeyDecision, KeyDecisionOption};
@@ -78,8 +78,8 @@ pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOut
         return IterationOutcome::Empty;
     }
 
-    // Default: no signal detected, treat as stale (no progress)
-    IterationOutcome::Stale
+    // Default: no signal detected, treat as no-eligible-tasks (no progress)
+    IterationOutcome::NoEligibleTasks
 }
 
 /// Extract task ID from `<reorder>TASK-ID</reorder>` tag in output.
@@ -506,13 +506,13 @@ mod tests {
     }
 
     #[test]
-    fn test_nonempty_output_with_exit_0_returns_stale() {
+    fn test_nonempty_output_with_exit_0_returns_no_eligible_tasks() {
         let output = "Did some work but no completion signal\n";
         let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
-            IterationOutcome::Stale,
-            "Non-empty output with exit 0 and no signal should return Stale"
+            IterationOutcome::NoEligibleTasks,
+            "Non-empty output with exit 0 and no signal should return NoEligibleTasks"
         );
     }
 
@@ -694,7 +694,7 @@ mod tests {
         let output = lines.join("\n");
         assert_eq!(
             analyze_output(&output, 0, &test_dir()),
-            IterationOutcome::Stale,
+            IterationOutcome::NoEligibleTasks,
             "COMPLETE on line 21 from end should NOT be detected"
         );
     }
@@ -852,7 +852,7 @@ mod tests {
 
         assert_eq!(
             analyze_output(&output, 0, &test_dir()),
-            IterationOutcome::Stale,
+            IterationOutcome::NoEligibleTasks,
             "COMPLETE far from end of large output should not be detected"
         );
     }
@@ -866,8 +866,8 @@ mod tests {
 
         assert_eq!(
             analyze_output(&output, 0, &test_dir()),
-            IterationOutcome::Stale,
-            "Large output with no signals should be Stale"
+            IterationOutcome::NoEligibleTasks,
+            "Large output with no signals should be NoEligibleTasks"
         );
     }
 
@@ -929,7 +929,7 @@ mod tests {
         let output = "日本語のテスト 🎉";
         assert_eq!(
             analyze_output(output, 0, &test_dir()),
-            IterationOutcome::Stale,
+            IterationOutcome::NoEligibleTasks,
         );
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
             "Did some work, compiled things, ran tests.\nAll green.\nNo completion signal.";
         assert_eq!(
             analyze_output(output, 0, &test_dir()),
-            IterationOutcome::Stale,
+            IterationOutcome::NoEligibleTasks,
         );
     }
 
@@ -1256,6 +1256,6 @@ mod tests {
         // A key-decision tag in output should NOT change IterationOutcome
         let output = make_kd("DB Choice", "Which DB?", &[("A: SQLite", "easy")]);
         let result = analyze_output(&output, 0, &test_dir());
-        assert_eq!(result, IterationOutcome::Stale);
+        assert_eq!(result, IterationOutcome::NoEligibleTasks);
     }
 }
