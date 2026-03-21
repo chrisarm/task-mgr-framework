@@ -682,7 +682,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Run full cargo test suite. If any CODE-FIX-xxx or REFACTOR-1-xxx tasks were spawned by reviews, they must also be complete before this milestone passes.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": {
         "correctness": [
@@ -732,7 +732,7 @@
       "id": "99ae54f7-TEST-001",
       "modifiesBehavior": false,
       "notes": "Build on TEST-INIT-003 tests. Add parameterized tests using different max_retries values. Test the integration of escalation + auto-block.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": {
         "correctness": [
@@ -784,7 +784,7 @@
       "id": "99ae54f7-TEST-004",
       "modifiesBehavior": false,
       "notes": "Build on TEST-INIT-005 tests. Test with realistic prefixes used in the project.",
-      "passes": false,
+      "passes": true,
       "priority": 33,
       "qualityDimensions": {
         "correctness": [
@@ -856,6 +856,33 @@
     },
     {
       "acceptanceCriteria": [
+        "All 10 per-test `use crate::loop_engine::test_utils::setup_test_db;` imports in engine.rs are replaced by a single module-level import",
+        "No test semantics are changed (all tests still pass with same assertions)",
+        "cargo fmt, cargo clippy, cargo test all pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-REFACTOR-REVIEW-2"
+      ],
+      "description": "Hoist the repeated per-test `use crate::loop_engine::test_utils::setup_test_db;` import to the module level in engine.rs test module. Currently imported inside 10 individual test function bodies.\n\nDO: Move import to top of mod tests block.\nDO NOT: Change test semantics or assertions.",
+      "estimatedEffort": "low",
+      "id": "99ae54f7-REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "Trivial DRY cleanup. The import is repeated inside test_consecutive_failures_increments_in_db, test_consecutive_failures_resets_to_zero_in_db, test_auto_block_sets_last_error_with_descriptive_message, test_task_succeeds_on_third_attempt_counter_resets, test_rapid_alternating_success_failure_tracks_correctly, test_reset_scoped_to_task_not_cross_task, test_consecutive_failures_never_goes_negative, test_model_escalation_sonnet_to_opus_at_two_failures, test_model_escalation_opus_stays_at_ceiling, test_model_escalation_none_model_to_opus, test_model_escalation_not_triggered_at_one_failure.",
+      "passes": false,
+      "priority": 44,
+      "rootCause": "Per-test import pattern left over from TDD stub phase where tests were written incrementally",
+      "exactFix": "Move `use crate::loop_engine::test_utils::setup_test_db;` to top of `mod tests` block in engine.rs, remove all per-test imports",
+      "synergyWith": [],
+      "taskType": "refactor",
+      "title": "Hoist repeated setup_test_db import to module level in engine.rs tests",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
         "All comprehensive tests (TEST-001 through TEST-004) pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
         "cargo test passes with zero failures",
@@ -867,7 +894,8 @@
         "99ae54f7-MILESTONE-1",
         "99ae54f7-REFACTOR-REVIEW-2",
         "99ae54f7-TEST-001",
-        "99ae54f7-TEST-004"
+        "99ae54f7-TEST-004",
+        "99ae54f7-REFACTOR-2-001"
       ],
       "description": "Gate before integration testing. Verify all comprehensive tests pass and test code has been reviewed for quality.",
       "estimatedEffort": "medium",

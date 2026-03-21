@@ -1,0 +1,211 @@
+# Progress Log - Loop Reliability PRD (99ae54f7)
+
+## 2026-03-21 - 99ae54f7-TEST-004
+- Renamed `IterationOutcome::Stale` → `NoEligibleTasks` across config, detection, progress, engine, feedback
+- Added branch.rs tests: CHAIN, 99ae54f7, dots-and-hyphens, long prefix variants for `progress_file_name`
+- Added branch.rs tests: `detect_branch_change` resets correct prefixed file for CHAIN and 99ae54f7
+- Added archive.rs tests: `test_archive_skips_chain_prefixed_progress_file`, `test_archive_skips_hex_prefixed_progress_file`
+- Added config.rs tests: `NoEligibleTasks` variant equality/inequality
+- Updated progress.rs: `format_outcome` returns `"NoEligibleTasks"` for renamed variant
+- **Learning**: `Stale` rename was not in any specific FEAT task; TEST-004 appropriately included it since the tests required the variant to exist
+---
+
+## 2026-03-21 - 99ae54f7-TEST-INIT-001
+
+**Task**: Initial tests for migration v13 and new Task fields
+
+**Approach chosen**: Stub migration + compile-time struct stubs following learning #243 pattern.
+- Created `v13.rs` stub migration: registers schema version 13, defers ALTER TABLE to FEAT-001
+- Added `max_retries: i32` and `consecutive_failures: i32` to Task struct (minimum stubs for TDD)
+- TryFrom<Row> graceful fallback: `row.get("max_retries").unwrap_or(3)` — works before AND after migration
+- DB-level tests are `#[ignore]` (compile but skip until FEAT-001 adds columns)
+- Struct-level tests are active and pass immediately
+
+**Files changed**:
+- `src/db/migrations/v13.rs` — NEW: stub migration + 12 tests (10 `#[ignore]`, 2 active)
+- `src/db/migrations/mod.rs` — mod v13, MIGRATIONS slice, CURRENT_SCHEMA_VERSION=13
+- `src/models/task.rs` — max_retries/consecutive_failures fields, new() defaults, TryFrom<Row>, 6 new tests
+- `src/commands/list.rs` — added new fields to Task struct literal in test
+
+**Test results**: 2515 passed, 0 failed, 20 ignored
+
+**Learnings**:
+- Stub migration pattern: empty SQL (just version bump) lets schema version check pass immediately
+- Adding struct fields (even as stubs) is necessary for Rust TDD — #[ignore] tests still compile
+- `row.get::<_, i32>("col").unwrap_or(default)` is the correct graceful fallback pattern for columns that don't exist in DB yet
+- Task struct literals in tests need to be updated when new fields are added (found in list.rs)
+
+---
+
+## 2026-03-21 - 99ae54f7-TEST-INIT-003
+
+**Task**: Initial tests for retry tracking and auto-block
+
+**Approach chosen**: TDD stub pattern (learning #342 + #351):
+- Added 5 `pub` stub functions to `engine.rs`: `should_auto_block` (returns false), `should_escalate_for_consecutive_failures` (returns false), `increment_consecutive_failures` (todo!()), `reset_consecutive_failures` (todo!()), `auto_block_task` (todo!())
+- Pure functions (`should_auto_block`, `should_escalate_for_consecutive_failures`) use `_`-prefixed parameters to suppress unused-variable warnings; return `false` as stubs
+- DB functions use `todo!()` since they can't safely return a meaningful value
+- **Active tests** (6): verify "should NOT block/escalate" cases — all pass against stub since stub returns false
+- **Ignored tests** (13 in engine.rs + 2 in complete.rs): define behavior contract for FEAT-003/FEAT-004
+
+**Criteria coverage**:
+1. consecutive_failures increments → `test_consecutive_failures_increments_in_db` (ignored)
+2. reset to 0 after Completed → `test_consecutive_failures_resets_to_zero_in_db` (ignored) + `test_complete_resets_consecutive_failures_to_zero` (ignored in complete.rs)
+3. auto-block triggers at threshold → `test_auto_block_triggers_at_max_retries_threshold` (ignored)
+4. NO auto-block on first attempt → `test_auto_block_not_triggered_on_first_attempt` (ACTIVE)
+5. max_retries=0 disables auto-block → `test_auto_block_disabled_when_max_retries_zero` (ACTIVE)
+6. auto-block sets last_error → `test_auto_block_sets_last_error_with_descriptive_message` (ignored)
+7. task succeeds on attempt 3 → `test_task_succeeds_on_third_attempt_counter_resets` (ignored)
+8. rapid alternating success/failure → `test_rapid_alternating_success_failure_tracks_correctly` (ignored)
+9. consecutive_failures >= 2 → model escalation → `test_failure_escalation_fires_at_consecutive_failures_two` (ignored)
+10. edge case: never negative → `test_auto_block_negative_failures_safe` (ACTIVE) + `test_consecutive_failures_never_goes_negative` (ignored)
+
+**Key design decision**: complete.rs ignored tests use `crate::loop_engine::test_utils::setup_test_db` (runs migrations) instead of the local `setup_test_db` (no migrations) — necessary because `consecutive_failures` column is added by migration v13 only. FEAT-004 implementer does not need to change this.
+
+**Files changed**:
+- `src/loop_engine/engine.rs` — 5 new pub stub functions + 19 tests (6 active, 13 ignored)
+- `src/commands/complete.rs` — 2 new ignored tests for reset-on-complete
+
+---
+
+## 2026-03-21 - 99ae54f7-TEST-INIT-005
+
+**Task**: Initial tests for progress file naming fix
+
+**Approach chosen**: Added pure helper `progress_file_name` to branch.rs (3-line function, FEAT-011 will wire it in), then wrote tests targeting both new helper and the archive skip logic.
+
+**Files changed**:
+- `src/loop_engine/branch.rs` — added `progress_file_name(prefix: Option<&str>)` helper + 2 passing tests
+- `src/loop_engine/archive.rs` — added `test_archive_skips_exact_progress_via_prd_files` (passes) and `test_archive_skips_prefixed_progress_file` (#[ignore])
+
+**Test results**: 2553 passed, 0 failed, 10 ignored
+
+**Learnings**:
+- `prd_files` CHECK constraint: `file_type IN ('prd', 'task_list', 'prompt')` — tests inserting progress files must use one of these valid types (used 'prd' as workaround)
+- `#[ignore]` test for prefixed progress files will fail until FEAT-012 updates `archive_single_prd` skip condition to `file_name == "progress.txt" || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))`
+- Pure helper approach: adding `progress_file_name` now (with `#[allow(dead_code)]`) lets TDD tests compile and pass while deferring the wiring to FEAT-011
+
+---
+
+## 2026-03-21 - 99ae54f7-CODE-REVIEW-1
+
+**Task**: Code review of all FEAT tasks for quality, security, and wiring
+
+**Approach**: Systematic review of all 10 acceptance criteria across all files touched by FEAT-001/002/003/004/011. Reviewed each file's production code for unwrap(), error propagation, security, and integration wiring. Ran full quality check suite.
+
+**Files reviewed**:
+- `src/db/migrations/v13.rs` — Migration correct: ALTER TABLE ADD COLUMN with defaults, reversible
+- `src/models/task.rs` — Task struct: max_retries/consecutive_failures fields correct, TryFrom<Row> graceful fallback
+- `src/commands/init/import.rs` — Import: max_retries precedence chain correct (per-task > PRD > 3)
+- `src/commands/init/parse.rs` — Parse: serde fields with correct defaults
+- `src/loop_engine/engine.rs` — Retry tracking: atomic transaction, correct exclusion of non-failure outcomes
+- `src/loop_engine/model.rs` — Model resolution: pure functions, correct precedence, escalation chain
+- `src/loop_engine/branch.rs` — Progress file naming: progress_file_name() helper + wired into detect_branch_change
+- `src/loop_engine/archive.rs` — Skip pattern covers both "progress.txt" and "progress-*.txt"
+- `src/loop_engine/config.rs` — IterationOutcome::Stale still present (rename to NoEligibleTasks not in FEAT scope)
+- `src/loop_engine/progress.rs` — Progress logging correct, format_outcome handles all variants
+- `src/commands/complete.rs` — consecutive_failures reset via `let _` (defensive pre-v13 compat)
+
+**Wiring verified**:
+1. `detect_branch_change` call site (engine.rs:984) passes `pre_lock_prefix.as_deref()` ✓
+2. `resolve_task_model` call sites (synergy.rs:84, 121) use correct 3-param signature ✓
+3. `increment_consecutive_failures` → `escalate_task_model_if_needed` → `should_auto_block` → `auto_block_task` chain in engine.rs:1840-1872 ✓
+4. `reset_consecutive_failures` via `let _` in complete.rs:253 ✓
+5. Archive skip pattern covers prefixed progress files ✓
+
+**Issues found and fixed**:
+- 2 `#[ignore]` tests in engine.rs referencing "FEAT-003" were un-ignored (FEAT-003 is complete). Both pass.
+- `cargo fmt` fixes in batch.rs, claude.rs, config.rs (whitespace only)
+
+**No CODE-FIX tasks needed** — all issues were trivial and fixed in-place.
+
+**Quality check results**: cargo fmt ✓, cargo check ✓, cargo clippy ✓, 2561 tests pass (0 failures, 7 ignored)
+
+---
+
+## 2026-03-21 - 99ae54f7-REFACTOR-REVIEW-1
+
+**Task**: Review implementation for refactoring opportunities
+
+**Approach**: Systematic 4-axis review (DRY, complexity, coupling, maintainability) across all 8 files listed in task. Used parallel sub-agents for engine.rs (large file) and the remaining 7 files.
+
+**Files reviewed**:
+- `src/loop_engine/engine.rs` — New helper functions (should_auto_block, should_escalate_for_consecutive_failures, escalate_task_model_if_needed, increment/reset_consecutive_failures, auto_block_task) are all clean: <30 lines, single-responsibility, well-documented. **Issue found**: 65-line inline retry tracking block in run_loop (lines 1829-1893) with 5-level nesting.
+- `src/loop_engine/model.rs` — Clean. Pure functions, zero coupling, excellent testability.
+- `src/loop_engine/branch.rs` — Clean. `progress_file_name` is a 3-line pure helper. Pre-existing `detect_branch_change` (98 lines) is out of scope.
+- `src/loop_engine/config.rs` — No new code from this PRD. Pre-existing duplication out of scope.
+- `src/loop_engine/progress.rs` — Clean. No new issues.
+- `src/commands/init/parse.rs` — Clean. New serde fields correctly use `#[serde(default)]`.
+- `src/commands/init/import.rs` — New max_retries resolution adds ~3 lines to insert_task/update_task. Minimal duplication, acceptable per learning #76.
+- `src/commands/complete.rs` — Clean. Only added 1 line for reset_consecutive_failures.
+
+**Spawned tasks**:
+- REFACTOR-1-001 (priority 18): Extract retry tracking block from run_loop into `handle_task_failure()`. Added to MILESTONE-1 dependsOn.
+
+**Learnings**:
+- Two escalation paths (crash escalation in run_iteration vs retry escalation in run_loop) are intentionally separate: crash escalation is transient (per-iteration model override), retry escalation is persistent (DB update). They use the same `model::escalate_model()` under the hood — good DRY.
+- Pre-existing issues (run_loop 1190 lines, config.rs duplication, complete_single_task 128 lines) exist but were not introduced or worsened by this PRD. Out of scope for this review.
+
+---
+
+## 2026-03-21 - 99ae54f7-MILESTONE-1
+
+**Task**: Milestone 1: Implementation complete, reviewed, and refactored
+
+**Verification results**:
+- All prerequisite tasks (TEST-INIT-001/003/005, FEAT-001/002/003/004/011, CODE-REVIEW-1, REFACTOR-REVIEW-1, REFACTOR-1-001) confirmed `passes: true`
+- `cargo fmt --check`: clean
+- `cargo check`: clean
+- `cargo clippy -- -D warnings`: zero warnings
+- `cargo test`: 2739 passed, 0 failed, 9 ignored
+
+**Learnings**:
+- All quality gates pass on first attempt — implementation was clean throughout the feature branch
+
+---
+
+## [2026-03-21] - 99ae54f7-TEST-001
+
+**Task**: Comprehensive tests for retry tracking + auto-block
+
+- Created tests/retry_tracking.rs: 12 integration tests covering all acceptance criteria
+- Updated auto_block_task to include task_id in last_error message (was failure count only)
+- Parameterized should_auto_block for max_retries ∈ {0,1,2,3,5,10} with boundary checks
+- handle_task_failure pipeline: escalation at count=2, block at count=3
+- Haiku→sonnet escalation test via handle_task_failure (was untested)
+- Rapid 10-step complete/fail sequence counter accuracy test
+- max_retries=0/1/2 blocking boundary integration tests
+- All 2573 tests pass, 0 failed
+
+**Learnings**:
+- Integration tests can't use pub(crate) test_utils — replicate setup_db locally
+- auto_block_task needed task_id in message to satisfy "message contains task ID" criterion
+- read_task_state helper reduces query boilerplate across multiple assertions
+
+---
+
+## [2026-03-21] - 99ae54f7-REFACTOR-REVIEW-2
+
+**Task**: Review test code for refactoring opportunities
+
+**Approach**: 4-axis review (DRY, complexity, naming, brittleness) across all test files modified in this feature: tests/retry_tracking.rs, engine.rs inline tests (22 new), branch.rs (progress_file_name + detect_branch_change), archive.rs (skip patterns), config.rs (NoEligibleTasks), v13.rs (migration), task.rs (struct fields), complete.rs (reset).
+
+**Files reviewed**:
+- `tests/retry_tracking.rs` — Clean: good helpers (setup_db, insert_retry_task, read_task_state), parameterized boundary tests, clear names
+- `src/loop_engine/engine.rs` tests — **Issue found**: `use crate::loop_engine::test_utils::setup_test_db;` imported 10x inside individual test fns instead of once at module level
+- `src/loop_engine/branch.rs` tests — Clean: setup_git_repo helper, 3 similar progress reset tests (marginal parameterization opportunity, not worth a task)
+- `src/loop_engine/archive.rs` tests — Clean: good coverage of archive skip patterns
+- `src/loop_engine/config.rs` tests — Clean: NoEligibleTasks variant tests added
+- `src/db/migrations/v13.rs` tests — Clean: setup_migrated_db helper, comprehensive column/default/reversibility tests
+- `src/models/task.rs` tests — Clean: pre-existing tests updated for new fields
+- `src/commands/complete.rs` tests — Clean: own setup_test_db (no migrations, by design)
+
+**Spawned tasks**:
+- REFACTOR-2-001 (priority 44): Hoist repeated setup_test_db import to module level in engine.rs tests. Added to MILESTONE-2 dependsOn.
+
+**Areas that passed cleanly**:
+- Test names: all descriptive, consistent pattern
+- No brittle tests: all test behavior via public APIs, loose content assertions
+- No overlapping integration/unit tests: retry_tracking.rs tests handle_task_failure pipeline, engine.rs tests individual functions — complementary
+
+---
