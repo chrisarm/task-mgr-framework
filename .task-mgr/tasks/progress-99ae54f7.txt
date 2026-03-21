@@ -309,3 +309,23 @@
 **Resolution needed**: User must either (a) add `.claude/commands/` write permission to their settings, or (b) manually apply the planned changes above.
 
 ---
+
+## 2026-03-21 - 99ae54f7-FEAT-014 (BLOCKED - attempt 4)
+
+**Completed**: criteria 5 & 6 (escalation-policy.md) satisfied in commit 49a1296
+
+**Blocker**: Edit tool denied for `.claude/commands/prd.md` and `~/.claude/agents/md-to-json-prd-reviewer.md` in don't-ask mode.
+
+**Changes needed for `.claude/commands/prd.md`**:
+1. Step 2: Add Research/Spike type after "Refactor" with requiresHuman=true/model=opus/taskType=spike guidance
+2. User story template: Add optional `verify_command` field after acceptanceCriteria
+3. New execution parameters section: document defaultMaxRetries, maxRetries, environment_checks
+
+**Changes needed for `~/.claude/agents/md-to-json-prd-reviewer.md`** (optional fields ~line 339):
+1. Add `verify_command: string`
+2. Add `environment_checks: array of strings`
+3. Update taskType valid values: add `spike`
+4. Add max_retries lint rule: warn if outside 1-10 range
+5. Add spike validation: taskType="spike" requires requiresHuman=true, model=opus
+
+---
