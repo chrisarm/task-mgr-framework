@@ -1107,6 +1107,7 @@
       "id": "99ae54f7-FEAT-014",
       "modifiesBehavior": false,
       "notes": "IMPORTANT: ~/.claude/agents/md-to-json-prd-reviewer.md is a GLOBAL file outside the project repo. Changes to it affect all projects. Be conservative with lint rules — warn, don't error. scripts/escalation-policy.md is in-repo.",
+      "escalationNote": "BLOCKED (permission): Write access to .claude/commands/ and ~/.claude/agents/ is denied in don't-ask mode. Third attempt (FEAT-013 had identical block). scripts/escalation-policy.md was updated successfully. Remaining work: (1) prd.md Step 2: add Research/Spike type with taskType/requiresHuman/model guidance; (2) prd.md user story template: add optional verify_command field; (3) prd.md: add execution parameters section (defaultMaxRetries, maxRetries, environment_checks); (4) md-to-json-prd-reviewer.md: add verify_command, max_retries (1-10 lint rule), environment_checks to optional fields; update taskType to include 'spike'; add Research/Spike lint rules. User must grant write access to these paths or apply changes manually.",
       "passes": false,
       "priority": 62,
       "qualityDimensions": {
