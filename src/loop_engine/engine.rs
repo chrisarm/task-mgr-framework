@@ -1828,7 +1828,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
-        // Increment and auto-block check happen atomically in a single transaction.
         if let Some(ref task_id) = result.task_id {
             if !matches!(
                 result.outcome,
@@ -1837,58 +1836,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
             ) {
-                match conn.transaction() {
-                    Ok(tx) => {
-                        let increment_result = increment_consecutive_failures(&tx, task_id);
-                        match increment_result {
-                            Ok(new_count) => {
-                                // Model escalation: escalate before auto-block check.
-                                if let Err(e) =
-                                    escalate_task_model_if_needed(&tx, task_id, new_count)
-                                {
-                                    eprintln!(
-                                        "Warning: failed to escalate model for {}: {}",
-                                        task_id, e
-                                    );
-                                }
-                                let max_retries: i32 = tx
-                                    .query_row(
-                                        "SELECT max_retries FROM tasks WHERE id = ?",
-                                        [task_id.as_str()],
-                                        |r| r.get(0),
-                                    )
-                                    .unwrap_or(3);
-                                if should_auto_block(new_count, max_retries) {
-                                    if let Err(e) = auto_block_task(&tx, task_id, new_count) {
-                                        eprintln!(
-                                            "Warning: failed to auto-block task {}: {}",
-                                            task_id, e
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "Auto-blocked task {} after {} consecutive failures",
-                                            task_id, new_count
-                                        );
-                                    }
-                                }
-                                if let Err(e) = tx.commit() {
-                                    eprintln!(
-                                        "Warning: failed to commit retry tracking for {}: {}",
-                                        task_id, e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to increment consecutive_failures for {}: {}",
-                                    task_id, e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: failed to start retry tracking transaction: {}", e);
-                    }
+                if let Err(e) = handle_task_failure(&mut conn, task_id) {
+                    eprintln!("Warning: failed to start retry tracking transaction: {}", e);
                 }
             }
         }
@@ -2388,6 +2337,52 @@ pub fn auto_block_task(
         "UPDATE tasks SET status = 'blocked', last_error = ?, updated_at = datetime('now') WHERE id = ?",
         rusqlite::params![msg, task_id],
     )?;
+    Ok(())
+}
+
+/// Increment consecutive failure count, escalate model tier if needed, and auto-block if the
+/// task has exhausted its retry budget. All DB writes are wrapped in a single transaction.
+pub fn handle_task_failure(conn: &mut Connection, task_id: &str) -> TaskMgrResult<()> {
+    let tx = conn.transaction()?;
+
+    let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
+        eprintln!(
+            "Warning: failed to increment consecutive_failures for {}: {}",
+            task_id, e
+        );
+        e
+    })?;
+
+    if let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
+        eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+    }
+
+    let max_retries: i32 = tx
+        .query_row(
+            "SELECT max_retries FROM tasks WHERE id = ?",
+            [task_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(3);
+
+    if should_auto_block(new_count, max_retries) {
+        if let Err(e) = auto_block_task(&tx, task_id, new_count) {
+            eprintln!("Warning: failed to auto-block task {}: {}", task_id, e);
+        } else {
+            eprintln!(
+                "Auto-blocked task {} after {} consecutive failures",
+                task_id, new_count
+            );
+        }
+    }
+
+    if let Err(e) = tx.commit() {
+        eprintln!(
+            "Warning: failed to commit retry tracking for {}: {}",
+            task_id, e
+        );
+    }
+
     Ok(())
 }
 
