@@ -14,24 +14,24 @@
 use super::Migration;
 
 /// Migration 13: Add per-task retry tracking columns.
-///
-/// NOTE: This is a stub migration that only bumps the schema version.
-/// The actual ALTER TABLE statements are deferred to FEAT-001.
 pub static MIGRATION: Migration = Migration {
     version: 13,
     description: "Add max_retries and consecutive_failures for per-task retry limits",
-    // TODO(FEAT-001): Replace with actual ALTER TABLE statements:
-    //   ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3;
-    //   ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
-    //   ALTER TABLE prd_metadata ADD COLUMN default_max_retries INTEGER;
     up_sql: r#"
-        -- Placeholder: schema changes deferred to FEAT-001
+        ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 3;
+        ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE prd_metadata ADD COLUMN default_max_retries INTEGER;
+
+        -- Update schema version
         UPDATE global_state SET schema_version = 13 WHERE id = 1;
     "#,
-    // TODO(FEAT-001): SQLite pre-3.35 doesn't support DROP COLUMN directly.
-    // The down migration will need to recreate tasks and prd_metadata without the new columns.
+    // DROP COLUMN requires SQLite >= 3.35.0. rusqlite 0.31 bundles SQLite 3.45+.
     down_sql: r#"
-        -- Placeholder: column removal deferred to FEAT-001
+        ALTER TABLE tasks DROP COLUMN max_retries;
+        ALTER TABLE tasks DROP COLUMN consecutive_failures;
+        ALTER TABLE prd_metadata DROP COLUMN default_max_retries;
+
+        -- Update schema version back to 12
         UPDATE global_state SET schema_version = 12 WHERE id = 1;
     "#,
 };
@@ -75,7 +75,6 @@ mod tests {
 
     /// After v13 up, `tasks.max_retries` column must exist.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_tasks_max_retries_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -94,7 +93,6 @@ mod tests {
 
     /// After v13 up, `tasks.consecutive_failures` column must exist.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_tasks_consecutive_failures_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -113,7 +111,6 @@ mod tests {
 
     /// After v13 up, `prd_metadata.default_max_retries` column must exist.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_prd_metadata_default_max_retries_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -132,7 +129,6 @@ mod tests {
 
     /// New tasks inserted after v13 must default to max_retries=3.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_tasks_max_retries_default_is_3() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -154,7 +150,6 @@ mod tests {
 
     /// New tasks inserted after v13 must default to consecutive_failures=0.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_tasks_consecutive_failures_default_is_0() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -179,7 +174,6 @@ mod tests {
 
     /// Pre-existing tasks (inserted before v13) must have max_retries=3 after migration.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_existing_tasks_get_default_max_retries() {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
@@ -215,7 +209,6 @@ mod tests {
 
     /// max_retries=0 is valid and means auto-blocking is disabled.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_max_retries_zero_is_valid() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -241,7 +234,6 @@ mod tests {
 
     /// consecutive_failures can be written and read back.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_consecutive_failures_writable() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -263,7 +255,6 @@ mod tests {
 
     /// Per-task max_retries is independent of any other task's consecutive_failures.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_consecutive_failures_is_per_task() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -294,7 +285,6 @@ mod tests {
 
     /// prd_metadata.default_max_retries accepts NULL (no override).
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_prd_metadata_default_max_retries_nullable() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -321,7 +311,6 @@ mod tests {
 
     /// prd_metadata.default_max_retries can be set to override the system default.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_prd_metadata_default_max_retries_writable() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -348,7 +337,6 @@ mod tests {
 
     /// v13 down migration must revert schema to version 12.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_migration_down_reverts_to_v12() {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
@@ -368,7 +356,6 @@ mod tests {
 
     /// v13 down migration must remove max_retries from tasks.
     #[test]
-    #[ignore = "FEAT-001: stub migration doesn't add DB columns yet"]
     fn test_v13_migration_down_removes_tasks_columns() {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
