@@ -235,6 +235,18 @@ pub struct Task {
     /// Cargo test filter strings that must pass before task can be completed
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_tests: Vec<String>,
+
+    /// Maximum consecutive failures before auto-blocking this task (0 = disabled)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: i32,
+
+    /// Number of consecutive failed iterations for this task (resets on success)
+    #[serde(default)]
+    pub consecutive_failures: i32,
+}
+
+fn default_max_retries() -> i32 {
+    3
 }
 
 impl Task {
@@ -265,6 +277,8 @@ impl Task {
             difficulty: None,
             escalation_note: None,
             required_tests: Vec::new(),
+            max_retries: 3,
+            consecutive_failures: 0,
         }
     }
 
@@ -343,6 +357,9 @@ impl TryFrom<&Row<'_>> for Task {
                     _ => Vec::new(),
                 }
             },
+            // Graceful fallback: column doesn't exist until v13 migration runs (FEAT-001)
+            max_retries: row.get::<_, i32>("max_retries").unwrap_or(3),
+            consecutive_failures: row.get::<_, i32>("consecutive_failures").unwrap_or(0),
         })
     }
 }
@@ -553,6 +570,89 @@ mod tests {
         assert!(task.description.is_none());
         assert!(task.acceptance_criteria.is_empty());
         assert_eq!(task.error_count, 0);
+    }
+
+    #[test]
+    fn test_task_new_max_retries_default() {
+        let task = Task::new("US-001", "Test Task");
+        assert_eq!(
+            task.max_retries, 3,
+            "Task::new() must default max_retries to 3"
+        );
+    }
+
+    #[test]
+    fn test_task_new_consecutive_failures_default() {
+        let task = Task::new("US-001", "Test Task");
+        assert_eq!(
+            task.consecutive_failures, 0,
+            "Task::new() must default consecutive_failures to 0"
+        );
+    }
+
+    #[test]
+    fn test_task_max_retries_zero_is_valid() {
+        let mut task = Task::new("US-001", "Test Task");
+        task.max_retries = 0;
+        // max_retries=0 means auto-block is disabled — just verify it's storable
+        assert_eq!(task.max_retries, 0);
+    }
+
+    #[test]
+    fn test_task_retry_fields_serialize() {
+        let task = Task::new("US-001", "Test Task");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            json.contains("\"max_retries\":3"),
+            "max_retries must serialize to 3"
+        );
+        assert!(
+            json.contains("\"consecutive_failures\":0"),
+            "consecutive_failures must serialize to 0"
+        );
+    }
+
+    #[test]
+    fn test_task_retry_fields_deserialize_with_defaults() {
+        // JSON without retry fields must deserialize using serde defaults
+        let json = r#"{
+            "id": "US-001",
+            "title": "Test Task",
+            "priority": 10,
+            "status": "done",
+            "created_at": "2026-01-18T12:00:00Z",
+            "updated_at": "2026-01-18T12:00:00Z",
+            "error_count": 0
+        }"#;
+
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            task.max_retries, 3,
+            "missing max_retries must deserialize to 3"
+        );
+        assert_eq!(
+            task.consecutive_failures, 0,
+            "missing consecutive_failures must deserialize to 0"
+        );
+    }
+
+    #[test]
+    fn test_task_retry_fields_deserialize_explicit() {
+        let json = r#"{
+            "id": "US-001",
+            "title": "Test Task",
+            "priority": 10,
+            "status": "todo",
+            "created_at": "2026-01-18T12:00:00Z",
+            "updated_at": "2026-01-18T12:00:00Z",
+            "error_count": 0,
+            "max_retries": 5,
+            "consecutive_failures": 2
+        }"#;
+
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(task.max_retries, 5);
+        assert_eq!(task.consecutive_failures, 2);
     }
 
     #[test]
