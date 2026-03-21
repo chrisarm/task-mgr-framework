@@ -2460,8 +2460,7 @@ mod tests {
 
     #[test]
     fn test_permission_denials_empty_array() {
-        let lines =
-            [r#"{"type":"result","result":"done","permission_denials":[]}"#];
+        let lines = [r#"{"type":"result","result":"done","permission_denials":[]}"#];
         let (_output, _conv, denials) = parse_stream_json_lines_full(lines.iter().copied());
         assert!(denials.is_empty());
     }
@@ -2575,9 +2574,6 @@ mod tests {
 
     #[test]
     fn test_extract_binary_env_multiple_vars() {
-        assert_eq!(
-            extract_binary("env FOO=bar BAZ=qux npm install"),
-            "npm"
-        );
+        assert_eq!(extract_binary("env FOO=bar BAZ=qux npm install"), "npm");
     }
 }

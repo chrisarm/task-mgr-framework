@@ -3792,9 +3792,8 @@ mod tests {
         );
     }
 
-    /// Ignored: resetting one task's failures does not affect a different task's counter.
+    /// Resetting one task's failures does not affect a different task's counter.
     #[test]
-    #[ignore = "FEAT-003: Implement reset_consecutive_failures"]
     fn test_reset_scoped_to_task_not_cross_task() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
@@ -3820,9 +3819,8 @@ mod tests {
         );
     }
 
-    /// Ignored: increment always produces a non-negative result (invariant).
+    /// Increment always produces a non-negative result (invariant).
     #[test]
-    #[ignore = "FEAT-003: Implement increment_consecutive_failures"]
     fn test_consecutive_failures_never_goes_negative() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();

@@ -1058,7 +1058,12 @@ mod tests {
 
         let mode = permission_mode_from_env();
         assert!(
-            matches!(mode, PermissionMode::Scoped { allowed_tools: Some(_) }),
+            matches!(
+                mode,
+                PermissionMode::Scoped {
+                    allowed_tools: Some(_)
+                }
+            ),
             "Default should be Scoped with tools, got {:?}",
             mode
         );
@@ -1086,7 +1091,12 @@ mod tests {
         let mode = permission_mode_from_env();
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
         assert!(
-            matches!(mode, PermissionMode::Auto { allowed_tools: Some(_) }),
+            matches!(
+                mode,
+                PermissionMode::Auto {
+                    allowed_tools: Some(_)
+                }
+            ),
             "Legacy auto should be Auto with tools, got {:?}",
             mode
         );
@@ -1150,7 +1160,12 @@ mod tests {
         let mode = permission_mode_from_env();
         std::env::remove_var("LOOP_ALLOWED_TOOLS");
         assert!(
-            matches!(mode, PermissionMode::Scoped { allowed_tools: Some(_) }),
+            matches!(
+                mode,
+                PermissionMode::Scoped {
+                    allowed_tools: Some(_)
+                }
+            ),
             "Empty LOOP_ALLOWED_TOOLS should fall back to Scoped with tools, got {:?}",
             mode
         );

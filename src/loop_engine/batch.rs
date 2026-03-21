@@ -243,8 +243,7 @@ impl WorktreeCleanupContext<'_> {
 ///
 /// Format: `{taskPrefix}.{md5(canonical_path)[:8]}` (or just the hash if no taskPrefix).
 fn generate_batch_prefix(prd_file: &Path) -> PrefixMode {
-    let canonical = std::fs::canonicalize(prd_file)
-        .unwrap_or_else(|_| prd_file.to_path_buf());
+    let canonical = std::fs::canonicalize(prd_file).unwrap_or_else(|_| prd_file.to_path_buf());
     let path_str = canonical.to_string_lossy();
     let digest = md5::compute(path_str.as_bytes());
     let path_hash = &format!("{:x}", digest)[..8];
