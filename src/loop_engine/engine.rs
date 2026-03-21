@@ -2510,6 +2510,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::test_utils::setup_test_db;
 
     // --- pre_lock_prefix fallback tests ---
 
@@ -2680,8 +2681,6 @@ mod tests {
 
     #[test]
     fn test_on_run_completed_no_panic_on_empty_db() {
-        use crate::loop_engine::test_utils::setup_test_db;
-
         let (_temp_dir, conn) = setup_test_db();
 
         // Should not panic even with no data
@@ -2927,7 +2926,6 @@ mod tests {
     #[test]
     fn test_stale_recovery_resets_in_progress_tasks() {
         // Verifies the SQL recovery logic: in_progress tasks get reset to todo.
-        use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
 
@@ -3229,7 +3227,6 @@ mod tests {
     #[test]
     fn test_initial_recovery_resets_only_p1_in_progress() {
         use crate::db::prefix::prefix_and;
-        use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
@@ -3274,7 +3271,6 @@ mod tests {
     #[test]
     fn test_initial_recovery_none_prefix_resets_all_in_progress() {
         use crate::db::prefix::prefix_and;
-        use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
@@ -3301,7 +3297,6 @@ mod tests {
     #[test]
     fn test_remaining_count_scoped_to_p1() {
         use crate::db::prefix::prefix_and;
-        use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
@@ -3326,7 +3321,6 @@ mod tests {
     #[test]
     fn test_remaining_count_none_prefix_counts_all() {
         use crate::db::prefix::prefix_and;
-        use crate::loop_engine::test_utils::setup_test_db;
 
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
@@ -3617,7 +3611,6 @@ mod tests {
     /// consecutive_failures increments by 1 in the DB after a non-Completed outcome.
     #[test]
     fn test_consecutive_failures_increments_in_db() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
@@ -3641,7 +3634,6 @@ mod tests {
     /// consecutive_failures resets to 0 in the DB after a Completed outcome.
     #[test]
     fn test_consecutive_failures_resets_to_zero_in_db() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 3)",
@@ -3667,7 +3659,6 @@ mod tests {
     /// Auto-block sets last_error with a descriptive message.
     #[test]
     fn test_auto_block_sets_last_error_with_descriptive_message() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries) VALUES ('T-001', 'Test', 'in_progress', 3, 3)",
@@ -3703,7 +3694,6 @@ mod tests {
     /// Task succeeds on 3rd attempt → counter resets to 0, auto-block NOT triggered.
     #[test]
     fn test_task_succeeds_on_third_attempt_counter_resets() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries) VALUES ('T-001', 'Test', 'in_progress', 0, 3)",
@@ -3745,7 +3735,6 @@ mod tests {
     /// Rapid alternating success/failure on same task → counter tracks correctly.
     #[test]
     fn test_rapid_alternating_success_failure_tracks_correctly() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
@@ -3790,7 +3779,6 @@ mod tests {
     /// Resetting one task's failures does not affect a different task's counter.
     #[test]
     fn test_reset_scoped_to_task_not_cross_task() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute_batch(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES
@@ -3817,7 +3805,6 @@ mod tests {
     /// Increment always produces a non-negative result (invariant).
     #[test]
     fn test_consecutive_failures_never_goes_negative() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
@@ -3852,7 +3839,6 @@ mod tests {
     /// Sonnet task at 2 consecutive failures → model escalated to opus in DB.
     #[test]
     fn test_model_escalation_sonnet_to_opus_at_two_failures() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
@@ -3881,7 +3867,6 @@ mod tests {
     /// Opus task at 2 consecutive failures → model stays at opus (ceiling, no-op).
     #[test]
     fn test_model_escalation_opus_stays_at_ceiling() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-opus-4-6', 0)",
@@ -3910,7 +3895,6 @@ mod tests {
     /// Task with None model at 2 consecutive failures → model set to opus (sonnet baseline).
     #[test]
     fn test_model_escalation_none_model_to_opus() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
@@ -3939,7 +3923,6 @@ mod tests {
     /// Escalation not triggered at 1 consecutive failure (threshold is 2).
     #[test]
     fn test_model_escalation_not_triggered_at_one_failure() {
-        use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
         conn.execute(
             "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
