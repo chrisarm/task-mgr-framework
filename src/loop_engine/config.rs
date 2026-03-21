@@ -180,11 +180,11 @@ pub enum PermissionMode {
     /// Enabled by `LOOP_PERMISSION_MODE=dangerous`.
     Dangerous,
     /// Scoped mode: passes `--permission-mode dontAsk [--allowedTools <tools>]`.
-    /// Default when no env vars are set.
+    /// Default when no env vars are set. Denies any tool not explicitly listed.
     /// `allowed_tools`: when `Some`, passed as `--allowedTools`; when `None`, omitted.
     Scoped { allowed_tools: Option<String> },
     /// Auto mode: passes `--permission-mode auto [--allowedTools <tools>]`.
-    /// Default mode. Also enabled by `LOOP_ENABLE_AUTO_MODE=true` (legacy).
+    /// Enabled by `LOOP_PERMISSION_MODE=auto` or `LOOP_ENABLE_AUTO_MODE=true` (legacy).
     /// The `allowed_tools` list ensures common coding tools are pre-approved
     /// even in non-interactive (`--print`) mode where auto-mode cannot prompt.
     Auto { allowed_tools: Option<String> },
@@ -231,10 +231,12 @@ impl std::fmt::Display for PermissionMode {
 /// Resolution order (highest to lowest priority):
 /// 1. `LOOP_PERMISSION_MODE=dangerous` → `Dangerous` (no tool restrictions)
 /// 2. `LOOP_PERMISSION_MODE=scoped` → `Scoped` with `CODING_ALLOWED_TOOLS` + project config
-/// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped` with those tools (NO project config merge)
-/// 4. Default → `Auto` with `CODING_ALLOWED_TOOLS` + project config
+/// 3. `LOOP_PERMISSION_MODE=auto` → `Auto` with `CODING_ALLOWED_TOOLS` + project config
+/// 4. `LOOP_ENABLE_AUTO_MODE=true` → `Auto` (legacy env var)
+/// 5. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped` with those tools (NO project config merge)
+/// 6. Default → `Scoped` with `CODING_ALLOWED_TOOLS` + project config
 ///
-/// Both `scoped` and `auto` (default) modes merge `CODING_ALLOWED_TOOLS` with
+/// Both `scoped` (default) and `auto` modes merge `CODING_ALLOWED_TOOLS` with
 /// project-specific tools from `.task-mgr/config.json`. The difference is the
 /// Claude CLI flag: `auto` passes `--permission-mode auto` (auto-approves
 /// unlisted tools interactively), while `scoped` passes `--permission-mode
@@ -270,7 +272,7 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
             _ => {
                 eprintln!(
                     "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
-                     falling back to auto mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
                     mode
                 );
             }
@@ -296,11 +298,11 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
         }
     }
 
-    // 4. Default → Auto mode with full coding allowlist + project config.
+    // 4. Default → Scoped mode with full coding allowlist + project config.
     let project_config = super::project_config::read_project_config(db_dir);
     let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
     log_project_config_additions(&project_config.additional_allowed_tools);
-    PermissionMode::Auto {
+    PermissionMode::Scoped {
         allowed_tools: Some(tools),
     }
 }
@@ -346,7 +348,7 @@ fn merge_allowed_tools(additional: &[String]) -> String {
 /// 1. `LOOP_PERMISSION_MODE=dangerous|scoped|auto` → corresponding variant
 /// 2. `LOOP_ENABLE_AUTO_MODE=true` → `Auto` (legacy)
 /// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped { allowed_tools: Some(tools) }`
-/// 4. Default → `Auto` with `CODING_ALLOWED_TOOLS`
+/// 4. Default → `Scoped` with `CODING_ALLOWED_TOOLS`
 ///
 /// Prefer `resolve_permission_mode(db_dir)` for loop engine use.
 /// This function is kept for non-loop callers and tests.
@@ -370,7 +372,7 @@ pub fn permission_mode_from_env() -> PermissionMode {
             _ => {
                 eprintln!(
                     "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
-                     falling back to auto mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
                     mode
                 );
             }
@@ -393,8 +395,8 @@ pub fn permission_mode_from_env() -> PermissionMode {
         }
     }
 
-    // 4. Default → Auto with coding allowlist.
-    PermissionMode::Auto {
+    // 4. Default → Scoped with coding allowlist.
+    PermissionMode::Scoped {
         allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string()),
     }
 }
@@ -1048,7 +1050,7 @@ mod tests {
     static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_permission_mode_from_env_default_is_auto() {
+    fn test_permission_mode_from_env_default_is_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LOOP_PERMISSION_MODE");
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
@@ -1056,8 +1058,8 @@ mod tests {
 
         let mode = permission_mode_from_env();
         assert!(
-            matches!(mode, PermissionMode::Auto { allowed_tools: Some(_) }),
-            "Default should be Auto with tools, got {:?}",
+            matches!(mode, PermissionMode::Scoped { allowed_tools: Some(_) }),
+            "Default should be Scoped with tools, got {:?}",
             mode
         );
     }
@@ -1123,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_mode_from_env_unknown_mode_falls_through_to_auto() {
+    fn test_permission_mode_from_env_unknown_mode_falls_through_to_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("LOOP_PERMISSION_MODE", "unknown");
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
@@ -1132,14 +1134,14 @@ mod tests {
         let mode = permission_mode_from_env();
         std::env::remove_var("LOOP_PERMISSION_MODE");
         assert!(
-            matches!(mode, PermissionMode::Auto { .. }),
-            "Unknown mode should fall back to Auto, got {:?}",
+            matches!(mode, PermissionMode::Scoped { .. }),
+            "Unknown mode should fall back to Scoped, got {:?}",
             mode
         );
     }
 
     #[test]
-    fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_auto() {
+    fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LOOP_PERMISSION_MODE");
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
@@ -1148,8 +1150,8 @@ mod tests {
         let mode = permission_mode_from_env();
         std::env::remove_var("LOOP_ALLOWED_TOOLS");
         assert!(
-            matches!(mode, PermissionMode::Auto { allowed_tools: Some(_) }),
-            "Empty LOOP_ALLOWED_TOOLS should fall back to Auto with tools, got {:?}",
+            matches!(mode, PermissionMode::Scoped { allowed_tools: Some(_) }),
+            "Empty LOOP_ALLOWED_TOOLS should fall back to Scoped with tools, got {:?}",
             mode
         );
     }
@@ -1355,7 +1357,7 @@ mod tests {
     // --- resolve_permission_mode ---
 
     #[test]
-    fn test_resolve_permission_mode_default_is_auto_with_tools() {
+    fn test_resolve_permission_mode_default_is_scoped_with_tools() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LOOP_PERMISSION_MODE");
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
@@ -1364,14 +1366,14 @@ mod tests {
         // Use a temp dir with no config.json
         let dir = tempfile::tempdir().unwrap();
         let mode = resolve_permission_mode(dir.path());
-        if let PermissionMode::Auto {
+        if let PermissionMode::Scoped {
             allowed_tools: Some(tools),
         } = &mode
         {
             assert!(tools.contains("Bash(cargo:*)"), "Should include cargo");
             assert!(tools.contains("Bash(git:*)"), "Should include git");
         } else {
-            panic!("Expected Auto with tools, got {:?}", mode);
+            panic!("Expected Scoped with tools, got {:?}", mode);
         }
     }
 
@@ -1442,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_permission_mode_auto_merges_project_config() {
+    fn test_resolve_permission_mode_default_merges_project_config() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LOOP_PERMISSION_MODE");
         std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
@@ -1456,21 +1458,21 @@ mod tests {
         .unwrap();
 
         let mode = resolve_permission_mode(dir.path());
-        // Auto mode now merges project config just like scoped mode
-        if let PermissionMode::Auto {
+        // Default (Scoped) mode merges project config
+        if let PermissionMode::Scoped {
             allowed_tools: Some(tools),
         } = &mode
         {
             assert!(
                 tools.contains("Bash(docker:*)"),
-                "Auto should merge project config tools"
+                "Default should merge project config tools"
             );
             assert!(
                 tools.contains("Bash(cargo:*)"),
                 "Core tools should still be present"
             );
         } else {
-            panic!("Expected Auto with tools, got {:?}", mode);
+            panic!("Expected Scoped with tools, got {:?}", mode);
         }
     }
 }

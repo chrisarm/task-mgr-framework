@@ -23,7 +23,7 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::commands::decisions::find_option;
-use crate::commands::init::generate_prefix;
+use crate::commands::init::{generate_prefix, PrefixMode};
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::schema::key_decisions as key_decisions_db;
@@ -758,6 +758,12 @@ pub struct LoopRunConfig {
     /// is created from the specified ref instead of HEAD. Set by the batch runner
     /// when `--chain` is active. `None` for standalone runs and chain=false batch runs.
     pub chain_base: Option<String>,
+    /// Prefix mode for task ID namespacing during `init()`.
+    ///
+    /// `Auto` (default for single runs): reads `taskPrefix` from JSON or auto-generates.
+    /// `Explicit(prefix)`: used by batch mode to inject a unique combined prefix per PRD.
+    /// `Disabled`: no prefix (CLI `--no-prefix` flag).
+    pub prefix_mode: PrefixMode,
 }
 
 /// Expected global skills for task-mgr loop workflows.
@@ -900,27 +906,34 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Read both hints in a single file parse.
     let prd_hints = read_prd_hints(&run_config.prd_file);
     let pre_lock_branch = prd_hints.branch_name;
-    let pre_lock_prefix: Option<String> = prd_hints
-        .task_prefix
-        .or_else(|| {
-            // taskPrefix absent: derive deterministic prefix from branchName + filename,
-            // using the same formula as PrefixMode::Auto in init so lock files match
-            // across restarts.
-            let filename = run_config
-                .prd_file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            Some(generate_prefix(pre_lock_branch.as_deref(), filename))
-        })
-        .and_then(|p| {
-            // Only use prefix if it is safe for filenames
-            if validate_prefix(&p).is_ok() {
-                Some(p)
-            } else {
-                None
-            }
-        });
+    let pre_lock_prefix: Option<String> = match &run_config.prefix_mode {
+        // Explicit prefix (batch mode): use it directly, skip PRD hints.
+        PrefixMode::Explicit(p) => Some(p.clone()),
+        // Disabled: no prefix at all.
+        PrefixMode::Disabled => None,
+        // Auto: use PRD hints or auto-generate.
+        PrefixMode::Auto => prd_hints
+            .task_prefix
+            .or_else(|| {
+                // taskPrefix absent: derive deterministic prefix from branchName + filename,
+                // using the same formula as PrefixMode::Auto in init so lock files match
+                // across restarts.
+                let filename = run_config
+                    .prd_file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                Some(generate_prefix(pre_lock_branch.as_deref(), filename))
+            }),
+    }
+    .and_then(|p| {
+        // Only use prefix if it is safe for filenames
+        if validate_prefix(&p).is_ok() {
+            Some(p)
+        } else {
+            None
+        }
+    });
     let lock_name = match &pre_lock_prefix {
         Some(p) => format!("loop-{p}.lock"),
         None => "loop.lock".to_string(),
@@ -988,7 +1001,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     }
 
     // Step 5: Initialize PRD (creates schema + imports tasks, idempotent)
-    // Uses Auto prefix mode: reads taskPrefix from JSON, or auto-generates one
+    // Uses run_config.prefix_mode: Auto for single runs, Explicit for batch mode.
     if let Err(e) = crate::commands::init(
         &run_config.db_dir,
         &[&run_config.prd_file],
@@ -996,7 +1009,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         true,  // append
         true,  // update_existing
         false, // dry_run
-        crate::commands::init::PrefixMode::Auto,
+        run_config.prefix_mode.clone(),
     ) {
         eprintln!("Error initializing PRD: {}", e);
         return LoopResult {
@@ -1263,7 +1276,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             true,  // append
             true,  // update_existing
             false, // dry_run
-            crate::commands::init::PrefixMode::Auto,
+            run_config.prefix_mode.clone(),
         ) {
             eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
         }
@@ -1380,8 +1393,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         None
     };
 
-    // Step 15: Resolve permission mode (needed for banner hint below)
-    let permission_mode = config::resolve_permission_mode(&run_config.db_dir);
+    // Step 15: Resolve permission mode (needed for banner hint below).
+    // Resolved once at startup; re-checked each iteration for hot-reload.
+    let mut permission_mode = config::resolve_permission_mode(&run_config.db_dir);
 
     if run_config.config.verbose {
         eprintln!("[verbose] Permission mode: {}", permission_mode);
@@ -1451,6 +1465,17 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             break;
         }
 
+        // Hot-reload permission mode: re-resolve each iteration so config.json
+        // edits mid-loop take effect without restarting.
+        let iter_permission_mode = config::resolve_permission_mode(&run_config.db_dir);
+        if iter_permission_mode != permission_mode {
+            eprintln!(
+                "\x1b[36m[info]\x1b[0m Permission mode changed: {} → {}",
+                permission_mode, iter_permission_mode
+            );
+            permission_mode = iter_permission_mode;
+        }
+
         // Re-import PRD if Claude modified it during the previous iteration.
         // Use live_prd_file (worktree copy) since Claude edits in the worktree.
         let current_hash = hash_file(&live_prd_file);
@@ -1463,7 +1488,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 true,  // append
                 true,  // update_existing
                 false, // dry_run
-                crate::commands::init::PrefixMode::Auto,
+                run_config.prefix_mode.clone(),
             ) {
                 eprintln!("Warning: PRD re-import failed: {} (continuing)", e);
             }

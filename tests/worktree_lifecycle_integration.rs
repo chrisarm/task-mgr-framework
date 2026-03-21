@@ -313,6 +313,7 @@ fn test_full_loop_worktree_created_and_cleaned_up() {
         config,
         batch_sibling_prds: vec![],
         chain_base: None,
+        prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

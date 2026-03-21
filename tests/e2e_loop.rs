@@ -893,6 +893,7 @@ fn test_run_loop_with_mock_claude() {
         config,
         batch_sibling_prds: vec![],
         chain_base: None,
+        prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
     };
 
     // Run the loop

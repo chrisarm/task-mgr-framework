@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::commands::init::PrefixMode;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::LoopConfig;
 use crate::loop_engine::engine::{self, LoopRunConfig};
@@ -235,6 +236,30 @@ impl WorktreeCleanupContext<'_> {
     }
 }
 
+/// Generate a unique batch prefix for a PRD file.
+///
+/// Reads the PRD's `taskPrefix` (if any) and combines it with an MD5 hash of the
+/// canonical path to guarantee uniqueness across PRDs in a batch run.
+///
+/// Format: `{taskPrefix}.{md5(canonical_path)[:8]}` (or just the hash if no taskPrefix).
+fn generate_batch_prefix(prd_file: &Path) -> PrefixMode {
+    let canonical = std::fs::canonicalize(prd_file)
+        .unwrap_or_else(|_| prd_file.to_path_buf());
+    let path_str = canonical.to_string_lossy();
+    let digest = md5::compute(path_str.as_bytes());
+    let path_hash = &format!("{:x}", digest)[..8];
+
+    // Read existing taskPrefix from the PRD JSON
+    let task_prefix = status_queries::read_prd_hints(prd_file).task_prefix;
+
+    let combined = match task_prefix {
+        Some(ref pfx) if !pfx.is_empty() => format!("{}.{}", pfx, path_hash),
+        _ => path_hash.to_string(),
+    };
+
+    PrefixMode::Explicit(combined)
+}
+
 /// Return a `BatchResult` representing a single early-exit failure (validation error, etc.).
 fn batch_fail_early() -> BatchResult {
     BatchResult {
@@ -453,6 +478,10 @@ pub async fn run_batch(
             .map(|(p, _)| p.clone())
             .collect();
 
+        // Generate a unique prefix for this PRD to avoid task ID collisions
+        // across PRDs sharing the same database.
+        let prefix_mode = generate_batch_prefix(prd_file);
+
         let run_config = LoopRunConfig {
             db_dir: dir.to_path_buf(),
             source_root: project_root.to_path_buf(),
@@ -463,6 +492,7 @@ pub async fn run_batch(
             external_repo: None, // Batch mode reads from PRD metadata
             batch_sibling_prds: sibling_prds,
             chain_base: if chain { chain_base.clone() } else { None },
+            prefix_mode,
         };
 
         let should_cleanup_worktree = run_config.config.cleanup_worktree;
