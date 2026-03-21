@@ -1841,6 +1841,15 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         let increment_result = increment_consecutive_failures(&tx, task_id);
                         match increment_result {
                             Ok(new_count) => {
+                                // Model escalation: escalate before auto-block check.
+                                if let Err(e) =
+                                    escalate_task_model_if_needed(&tx, task_id, new_count)
+                                {
+                                    eprintln!(
+                                        "Warning: failed to escalate model for {}: {}",
+                                        task_id, e
+                                    );
+                                }
                                 let max_retries: i32 = tx
                                     .query_row(
                                         "SELECT max_retries FROM tasks WHERE id = ?",
@@ -2294,6 +2303,45 @@ pub fn should_auto_block(consecutive_failures: i32, max_retries: i32) -> bool {
 /// Gives the task one more attempt at a higher-tier model before blocking.
 pub fn should_escalate_for_consecutive_failures(consecutive_failures: i32) -> bool {
     consecutive_failures >= 2
+}
+
+/// Escalate the model for a task in the DB when consecutive failures reach the threshold.
+///
+/// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
+/// - `None` or empty model assumes sonnet baseline → escalates to opus.
+/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
+///
+/// Returns `Some(new_model)` if escalation fired, `None` if below threshold or
+/// the model tier is unknown. The DB is updated in-place when `Some` is returned.
+pub fn escalate_task_model_if_needed(
+    conn: &Connection,
+    task_id: &str,
+    new_count: i32,
+) -> TaskMgrResult<Option<String>> {
+    if !should_escalate_for_consecutive_failures(new_count) {
+        return Ok(None);
+    }
+    let current_model: Option<String> = conn
+        .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .unwrap_or(None);
+    // None/empty model: assume sonnet baseline → escalate to opus (matches check_crash_escalation).
+    let escalated = match current_model.as_deref().filter(|s| !s.is_empty()) {
+        None => Some(model::OPUS_MODEL.to_string()),
+        Some(m) => model::escalate_model(Some(m)),
+    };
+    if let Some(ref new_model) = escalated {
+        conn.execute(
+            "UPDATE tasks SET model = ? WHERE id = ?",
+            rusqlite::params![new_model, task_id],
+        )?;
+        eprintln!(
+            "Escalated task {} to model {} after {} consecutive failures",
+            task_id, new_model, new_count
+        );
+    }
+    Ok(escalated)
 }
 
 /// Increment `consecutive_failures` for a task in the DB.
@@ -3802,6 +3850,120 @@ mod tests {
             after_reset >= 0,
             "consecutive_failures must never be negative after reset, got {}",
             after_reset
+        );
+    }
+
+    // --- escalate_task_model_if_needed tests (FEAT-004) ---
+
+    /// Sonnet task at 2 consecutive failures → model escalated to opus in DB.
+    #[test]
+    fn test_model_escalation_sonnet_to_opus_at_two_failures() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
+            [],
+        )
+        .unwrap();
+
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "sonnet at 2 failures must escalate to opus"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(OPUS_MODEL.to_string()),
+            "model column in DB must be updated to opus"
+        );
+    }
+
+    /// Opus task at 2 consecutive failures → model stays at opus (ceiling, no-op).
+    #[test]
+    fn test_model_escalation_opus_stays_at_ceiling() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-opus-4-6', 0)",
+            [],
+        )
+        .unwrap();
+
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "opus at ceiling must return opus (no-op value)"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(OPUS_MODEL.to_string()),
+            "opus model in DB must remain opus"
+        );
+    }
+
+    /// Task with None model at 2 consecutive failures → model set to opus (sonnet baseline).
+    #[test]
+    fn test_model_escalation_none_model_to_opus() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "None model assumes sonnet baseline and must escalate to opus"
+        );
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(OPUS_MODEL.to_string()),
+            "model in DB must be set to opus when previously unset"
+        );
+    }
+
+    /// Escalation not triggered at 1 consecutive failure (threshold is 2).
+    #[test]
+    fn test_model_escalation_not_triggered_at_one_failure() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
+            [],
+        )
+        .unwrap();
+
+        let result = escalate_task_model_if_needed(&conn, "T-001", 1).unwrap();
+        assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            model,
+            Some(SONNET_MODEL.to_string()),
+            "model in DB must be unchanged at 1 failure"
         );
     }
 }
