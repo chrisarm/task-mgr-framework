@@ -1,0 +1,1241 @@
+{
+  "branchName": "feat/loop-reliability",
+  "description": "Loop reliability improvements: per-task retry tracking with auto-block, model escalation on consecutive failures, environment checks pre-loop, verify command post-iteration, taskType-driven model/timeout selection, progress file naming fix, IterationOutcome::Stale → NoEligibleTasks rename, and skill/prompt updates.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing APIs unless explicitly required",
+      "Migration v13 must be backward-compatible: existing databases upgrade cleanly"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "3. CORRECTNESS — Self-critique after code. Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Each task delivers working code + tests together",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Test boundaries and exceptions — edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    ".unwrap() in production code paths — use ? with TaskMgrResult"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "99ae54f7",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "v13 migration adds max_retries and consecutive_failures columns to tasks table",
+        "v13 migration adds default_max_retries column to prd_metadata table",
+        "Migration up/down are reversible",
+        "Tasks table: max_retries defaults to 3, consecutive_failures defaults to 0",
+        "Task struct has max_retries (i32) and consecutive_failures (i32)",
+        "TryFrom<Row> correctly maps new columns",
+        "Task::new() sets correct defaults",
+        "Schema version bumped to 13"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write unit tests for migration v13, new Task struct fields, and TryFrom<Row> BEFORE implementation. Tests must cover column existence, defaults, and edge cases around retry tracking semantics.\n\nDO: Write tests for migration up/down, verify columns exist with correct defaults, test Task struct construction.\nDO NOT: Implement the migration or struct changes — this is test-first.\n\nEdge cases:\n- Migration on already-migrated DB must be idempotent\n- max_retries=0 means auto-block is disabled\n- consecutive_failures tracks per-task, not globally\n- Per-task max_retries overrides PRD-level defaultMaxRetries",
+      "edgeCases": [
+        "max_retries=0: special value meaning auto-block disabled",
+        "consecutive_failures wraps around correctly after reset",
+        "Migration on already-migrated DB: idempotent",
+        "Default max_retries=3 when no value in JSON"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Migration run on already-migrated DB",
+          "expectedBehavior": "Idempotent, no error"
+        },
+        {
+          "cause": "Task imported without max_retries in JSON",
+          "expectedBehavior": "Defaults to PRD default or 3"
+        }
+      ],
+      "id": "99ae54f7-TEST-INIT-001",
+      "invariants": [
+        "max_retries defaults to 3 for all existing tasks",
+        "consecutive_failures defaults to 0",
+        "Migration v13 is idempotent"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write tests first. Follow existing migration test patterns in src/db/migrations/tests.rs. Tests will initially fail until FEAT-001 implements the migration and struct changes.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Migration must be backward-compatible: existing databases upgrade cleanly",
+          "Defaults must be correct: max_retries=3, consecutive_failures=0, task_type=None, verify_command=None"
+        ],
+        "performance": [
+          "Best effort — migration tests are one-shot operations"
+        ],
+        "style": [
+          "Follow existing migration test patterns (v12.rs → v13.rs)",
+          "Use assert_eq! for exact comparisons of column defaults"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Initial tests for migration v13 and new Task fields",
+      "touchesFiles": [
+        "src/db/migrations/v13.rs",
+        "src/models/task.rs",
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test consecutive_failures increments by 1 after non-Completed outcome",
+        "Test consecutive_failures resets to 0 after Completed outcome",
+        "Test auto-block triggers when consecutive_failures >= max_retries and max_retries > 0",
+        "Test auto-block does NOT trigger on first attempt (consecutive_failures=0, max_retries=3)",
+        "Test max_retries=0 disables auto-block entirely (never fires regardless of failures)",
+        "Test auto-block sets last_error with descriptive message",
+        "Test task succeeds on attempt 3 (counter=2, then success) → counter resets to 0, NOT auto-block",
+        "Test rapid alternating success/failure on same task → counter tracks correctly",
+        "Test consecutive_failures >= 2 → model escalation fires before auto-block at 3",
+        "Edge case: consecutive_failures never goes negative"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write unit tests for retry tracking logic in engine.rs and reset-on-completion in complete.rs BEFORE implementation.\n\nDO: Test increment, reset, auto-block threshold, max_retries=0 disabling, and model escalation trigger.\nDO NOT: Implement the engine changes — this is test-first.\n\nEdge cases:\n- Task succeeds on 3rd attempt (counter=2, then success) → reset to 0\n- Different task succeeding does not reset another task's counter\n- max_retries=0 → never auto-block\n- consecutive_failures >= 2 → model escalation before auto-block at 3",
+      "edgeCases": [
+        "Task succeeds on 3rd attempt (counter=2 then success): reset to 0",
+        "Task fails, different task succeeds, original fails again: per-task tracking",
+        "max_retries=0 disables auto-block entirely",
+        "consecutive_failures >= 2 triggers model escalation before auto-block at 3",
+        "Completed outcome resets counter for completed task only, not all tasks"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Rapid alternating success/failure on same task",
+          "expectedBehavior": "Counter tracks correctly per task"
+        },
+        {
+          "cause": "Auto-block fires mid-iteration",
+          "expectedBehavior": "Task transitions to blocked cleanly"
+        }
+      ],
+      "id": "99ae54f7-TEST-INIT-003",
+      "invariants": [
+        "consecutive_failures is never negative",
+        "Auto-block only fires when max_retries > 0 AND consecutive_failures >= max_retries",
+        "Counter resets to 0 on Completed outcome"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write tests in engine.rs and/or complete.rs test modules. Tests will fail until FEAT-003 and FEAT-004 implement the logic.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "Auto-block must not fire on first attempt — only after max_retries consecutive failures",
+          "consecutive_failures counter must reset to 0 on successful completion"
+        ],
+        "performance": [
+          "No additional DB queries per iteration for retry tracking"
+        ],
+        "style": [
+          "Follow existing engine.rs test patterns",
+          "Use descriptive assert messages explaining what went wrong"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Initial tests for retry tracking and auto-block",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/commands/complete.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "branch.rs: progress file with prefix P1 is progress-P1.txt",
+        "branch.rs: progress file without prefix is progress.txt",
+        "archive.rs: skips progress-*.txt files, not just exact progress.txt",
+        "Tests compile (may be #[ignore] or expected to fail before FEAT-011)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for prefix-aware progress file naming in branch.rs and archive.rs.",
+      "edgeCases": [
+        "Progress file with prefix P1: progress-P1.txt",
+        "No prefix: fallback to progress.txt",
+        "branch.rs resets correct prefixed file, not progress.txt",
+        "archive.rs skips progress-*.txt files"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Prefix contains special characters",
+          "expectedBehavior": "Used as-is in filename"
+        }
+      ],
+      "id": "99ae54f7-TEST-INIT-005",
+      "invariants": [
+        "With prefix, progress file is progress-{prefix}.txt",
+        "Without prefix, progress file is progress.txt"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write tests in branch.rs, archive.rs, progress.rs, and config.rs test modules. Tests will fail until FEAT-011 and FEAT-012 implement the changes.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "Progress filename must incorporate prefix when present",
+          "NoEligibleTasks must replace Stale everywhere"
+        ],
+        "performance": [
+          "Best effort — simple string operations"
+        ],
+        "style": [
+          "Follow existing test patterns in branch.rs and config.rs",
+          "Use assert_eq! for exact string comparisons"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Initial tests for progress file naming fix",
+      "touchesFiles": [
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "v13 migration file created at src/db/migrations/v13.rs following v12 pattern",
+        "Migration adds max_retries (INT DEFAULT 3) and consecutive_failures (INT DEFAULT 0) to tasks table",
+        "Migration adds default_max_retries (INT DEFAULT 3) to prd_metadata table",
+        "Migration registered in mod.rs, CURRENT_SCHEMA_VERSION bumped to 13",
+        "CREATE TABLE in tasks.rs and metadata.rs include new columns for fresh installs",
+        "Task struct has max_retries (i32) and consecutive_failures (i32) fields",
+        "Task::new() defaults: max_retries=3, consecutive_failures=0",
+        "TryFrom<Row> maps new columns correctly",
+        "Existing databases migrate cleanly (ALTER TABLE ADD COLUMN)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-TEST-INIT-001"
+      ],
+      "description": "Create migration v13 adding retry tracking and taskType columns to tasks and prd_metadata tables. Update schema files, Task struct, and Task::new() defaults.\n\nDO: Follow existing migration pattern (v12.rs). Use ALTER TABLE ADD COLUMN (SQLite supports this). Update all schema definitions and the Task model.\nDO NOT: Change existing column definitions. Do not modify any query logic — that's in later tasks.\n\nEdge cases:\n- Existing databases with data must upgrade cleanly (ALTER TABLE is non-destructive)\n- Down migration must cleanly remove columns",
+      "edgeCases": [
+        "Existing databases with data must upgrade cleanly",
+        "Down migration must cleanly remove the added columns"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Migration run on already-migrated DB",
+          "expectedBehavior": "Idempotent, no error — ALTER TABLE ADD COLUMN IF NOT EXISTS or guarded"
+        },
+        {
+          "cause": "Existing DB has rows in tasks table",
+          "expectedBehavior": "ALTER TABLE ADD COLUMN with DEFAULT fills existing rows correctly"
+        }
+      ],
+      "id": "99ae54f7-FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Follow v12.rs pattern exactly. The MIGRATION struct should have up_sql and down_sql. For down migration, SQLite does not support DROP COLUMN before 3.35.0 — use the table-recreation pattern if needed. Check which SQLite version the project targets.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "Migration must be backward-compatible: existing databases upgrade cleanly",
+          "Defaults must match: max_retries=3, consecutive_failures=0, task_type=NULL, verify_command=NULL"
+        ],
+        "performance": [
+          "Migration runs once — no performance concerns"
+        ],
+        "style": [
+          "Follow existing migration pattern (v12.rs → v13.rs): static MIGRATION struct",
+          "No .unwrap() in production code — use ? with TaskMgrResult"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Migration v13 + schema/struct additions",
+      "touchesFiles": [
+        "src/db/migrations/v13.rs",
+        "src/db/migrations/mod.rs",
+        "src/db/schema/tasks.rs",
+        "src/db/schema/metadata.rs",
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "PrdUserStory has max_retries: Option<i32> (JSON: maxRetries, serde default None)",
+        "PrdFile has default_max_retries: Option<i32> (JSON: defaultMaxRetries, serde default None)",
+        "insert_task resolves: per-task maxRetries > PRD defaultMaxRetries > hardcoded 3",
+        "insert_prd_metadata stores default_max_retries in prd_metadata table",
+        "Round-trip: import JSON with maxRetries → export → values preserved"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-FEAT-001"
+      ],
+      "description": "Update parse.rs and import.rs to handle new PRD JSON fields: max_retries, task_type, verify_command on user stories, and default_max_retries, environment_checks on the PRD file.\n\nDO: Add serde fields, update INSERT statements, implement max_retries precedence logic.\nDO NOT: Change query/selection logic — only import path.\n\nEdge cases:\n- Old JSON without new fields: all default to None\n- Per-task max_retries overrides PRD-level default_max_retries\n- environment_checks is a JSON array stored as TEXT",
+      "edgeCases": [
+        "Old JSON without new fields: all fields default to None via serde(default)",
+        "Per-task max_retries present: overrides PRD default_max_retries",
+        "environment_checks with empty array: stored as '[]' in DB"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Old PRD JSON without new fields",
+          "expectedBehavior": "All new fields default to None, no deserialization error"
+        },
+        {
+          "cause": "environment_checks serialization failure",
+          "expectedBehavior": "serde_json::to_string on Vec<String> never fails, but propagate error if it does"
+        }
+      ],
+      "id": "99ae54f7-FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "FEAT-005 and FEAT-008 can batch with this task since they touch the same files. If batching, implement all three together. The max_retries precedence: story.max_retries.unwrap_or_else(|| prd.default_max_retries.unwrap_or(3)).",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": {
+        "correctness": [
+          "Max_retries precedence: per-task > PRD default > 3",
+          "Old JSON without new fields must not cause deserialization errors"
+        ],
+        "performance": [
+          "No performance concerns — import is a one-shot operation"
+        ],
+        "style": [
+          "Follow existing parse.rs/import.rs patterns for serde and SQL",
+          "No .unwrap() in production code — use ? with TaskMgrResult"
+        ]
+      },
+      "synergyWith": [
+        "99ae54f7-FEAT-001"
+      ],
+      "taskType": "implementation",
+      "title": "Import logic for new fields",
+      "touchesFiles": [
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After non-Completed iteration outcome: UPDATE tasks SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+        "After Completed outcome (in complete.rs): UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
+        "When consecutive_failures >= max_retries AND max_retries > 0: auto-block task with descriptive last_error",
+        "Auto-block sets task status to 'blocked' and last_error to 'Auto-blocked after N consecutive failures'",
+        "Auto-block does NOT fire when max_retries = 0 (disabled)",
+        "Auto-block does NOT fire on first attempt (consecutive_failures must exceed threshold)",
+        "The increment and auto-block check happen in a single DB transaction",
+        "All TEST-INIT-003 tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-FEAT-001",
+        "99ae54f7-TEST-INIT-003"
+      ],
+      "description": "Implement retry tracking in engine.rs (increment on failure) and complete.rs (reset on success). Add auto-block logic when threshold exceeded.\n\nDO: Increment consecutive_failures after non-Completed outcomes. Reset to 0 in complete.rs. Auto-block when >= max_retries and max_retries > 0.\nDO NOT: Implement model escalation — that's FEAT-004. Keep the DB update minimal.\n\nEdge cases:\n- max_retries=0 disables auto-block entirely\n- Auto-block only after threshold crossed, not on first failure\n- Reset only on THAT specific task's completion",
+      "edgeCases": [
+        "max_retries=0 → auto-block disabled",
+        "First failure with max_retries=1 → auto-block immediately (threshold is 1)",
+        "Complete resets counter for that task only, not others"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "DB update and auto-block check not atomic",
+          "expectedBehavior": "Use transaction to ensure consistency"
+        },
+        {
+          "cause": "Reset happens on any completion, not just the failing task",
+          "expectedBehavior": "Reset is per-task: WHERE id = ? with the specific task_id"
+        }
+      ],
+      "id": "99ae54f7-FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "In engine.rs, after processing an iteration outcome, check if it was non-Completed. If so, increment consecutive_failures. Then check if consecutive_failures >= max_retries && max_retries > 0. In complete.rs, after marking a task done, reset consecutive_failures = 0.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": {
+        "correctness": [
+          "Auto-block must not fire on first attempt — only after max_retries consecutive failures",
+          "consecutive_failures counter must reset to 0 on successful completion"
+        ],
+        "performance": [
+          "No additional DB queries per iteration for retry tracking — piggyback on existing update"
+        ],
+        "style": [
+          "Follow existing engine.rs pattern for DB updates",
+          "No .unwrap() in production code — use ? with TaskMgrResult"
+        ]
+      },
+      "synergyWith": [
+        "99ae54f7-FEAT-004"
+      ],
+      "taskType": "implementation",
+      "title": "Engine retry tracking + auto-block",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/commands/complete.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "After 2 consecutive failures (consecutive_failures >= 2): auto-escalate model via escalate_model()",
+        "Escalation integrates with existing check_crash_escalation() function",
+        "Escalation from sonnet → opus (not opus → something higher)",
+        "If already at opus, escalation is a no-op",
+        "Escalation happens BEFORE auto-block check (at 3 failures, escalation at 2 gives one more chance)"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-FEAT-003"
+      ],
+      "description": "Add model escalation on consecutive failures. After 2 consecutive failures, escalate the model (sonnet → opus) to give the task a better chance before auto-block at 3.\n\nDO: Check consecutive_failures >= 2 and call escalate_model(). Integrate with existing crash escalation pattern.\nDO NOT: Create a new escalation mechanism — reuse the existing escalate_model() infrastructure.\n\nEdge cases:\n- Already at opus model → escalation is a no-op\n- Escalation at 2, auto-block at 3 → gives opus one attempt before blocking",
+      "edgeCases": [
+        "Already at opus model → escalation is no-op",
+        "Escalation at 2 failures, auto-block at 3 → one opus attempt before block"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Escalation fires after auto-block already set",
+          "expectedBehavior": "Escalation must run BEFORE auto-block check in the failure handling path"
+        }
+      ],
+      "id": "99ae54f7-FEAT-004",
+      "modifiesBehavior": true,
+      "notes": "The existing check_crash_escalation() pattern in engine.rs is the model to follow. Escalation should be additive — integrate into the same flow, don't create a parallel mechanism.",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": {
+        "correctness": [
+          "Escalation at 2 failures, auto-block at 3 — order matters",
+          "Already at opus → no-op, no error"
+        ],
+        "performance": [
+          "No additional DB queries — escalation is an in-memory model string swap"
+        ],
+        "style": [
+          "Integrate with existing check_crash_escalation() pattern",
+          "No .unwrap() in production code — use ? with TaskMgrResult"
+        ]
+      },
+      "synergyWith": [
+        "99ae54f7-FEAT-003"
+      ],
+      "taskType": "implementation",
+      "title": "Model escalation on consecutive failures",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "branch.rs: function accepts task_prefix: Option<&str> parameter",
+        "With prefix 'P1': progress file is named 'progress-P1.txt'",
+        "With prefix None: progress file is named 'progress.txt' (unchanged)",
+        "archive.rs: skip pattern matches 'progress*.txt' (glob) to handle all prefix variants",
+        "Caller in engine.rs updated to pass task_prefix to branch.rs function",
+        "All TEST-INIT-005 progress naming tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-TEST-INIT-005"
+      ],
+      "description": "Fix progress file naming to incorporate task_prefix. Update branch.rs to accept prefix, construct prefix-aware filename. Update archive.rs skip pattern.\n\nDO: Add task_prefix parameter to progress file naming. Update archive pattern to skip all progress*.txt files.\nDO NOT: Change the progress file content format — only the filename.\n\nEdge cases:\n- Prefix with special characters → used as-is (validated elsewhere)\n- No prefix → progress.txt (backwards compatible)",
+      "edgeCases": [
+        "Prefix with special characters → used as-is (validated elsewhere)",
+        "No taskPrefix → fall back to progress.txt"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Archive pattern too broad (matches non-progress files)",
+          "expectedBehavior": "Pattern is 'progress*.txt' — only matches progress files"
+        }
+      ],
+      "id": "99ae54f7-FEAT-011",
+      "modifiesBehavior": true,
+      "notes": "branch.rs is the source of truth for progress filename construction. archive.rs has the skip pattern. engine.rs is the caller that passes the prefix.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": {
+        "correctness": [
+          "Progress filename must incorporate prefix when present",
+          "Without prefix, filename is progress.txt (backwards compatible)"
+        ],
+        "performance": [
+          "Simple string formatting — no performance concerns"
+        ],
+        "style": [
+          "Use format! for filename construction",
+          "Follow existing parameter patterns in branch.rs"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Fix progress file naming",
+      "touchesFiles": [
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context via TaskMgrResult",
+        "Security: no command injection in env checks / verify command execution",
+        "All new code is exported and importable",
+        "All new Task struct fields wired through import → DB → model",
+        "resolve_task_model call sites updated with new task_type parameter",
+        "detect_branch_change call sites pass task_prefix",
+        "No dead code warnings (cargo check / cargo clippy)",
+        "Quality dimensions met for each FEAT task",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-FEAT-001",
+        "99ae54f7-FEAT-002",
+        "99ae54f7-FEAT-003",
+        "99ae54f7-FEAT-004",
+        "99ae54f7-FEAT-011"
+      ],
+      "description": "Review all implementation tasks for code quality, error handling, security, and integration wiring. Run full test suite. Verify every new feature is correctly wired and functional.\n\nDO: Check every new function for error handling, verify callers, run cargo test/clippy/fmt.\nDO NOT: Skip any FEAT task — review all 12.",
+      "estimatedEffort": "high",
+      "id": "99ae54f7-CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "This is the most critical review gate. Focus on: (1) retry tracking atomicity, (2) verify command timeout enforcement, (3) model escalation ordering, (4) migration backward compatibility. For each issue found: add a CODE-FIX-xxx task (priority 14-16), commit JSON changes.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": {
+        "correctness": [
+          "Auto-block must not fire on first attempt — only after max_retries consecutive failures",
+          "Verify command failures must NOT mark the task as done",
+          "Migration must be backward-compatible: existing databases upgrade cleanly"
+        ],
+        "performance": [
+          "Environment checks run sequentially; total overhead <5 seconds",
+          "Verify command timeout after 60 seconds"
+        ],
+        "style": [
+          "Follow existing migration pattern (v12.rs → v13.rs): static MIGRATION struct",
+          "Follow existing model resolution pattern: pure functions in model.rs, no I/O",
+          "No .unwrap() in production code — use ? with TaskMgrResult"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Code review: all FEAT tasks for quality, security, and wiring",
+      "touchesFiles": [
+        "src/db/migrations/v13.rs",
+        "src/models/task.rs",
+        "src/commands/init/",
+        "src/commands/complete.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/progress.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "Clear separation of concerns between modules",
+        "Code follows existing project patterns",
+        "No tight coupling introduced between unrelated features",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON with priority 18-19"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues. Focus on: duplicated retry/escalation patterns, functions over 30 lines, coupling between retry tracking and model escalation.\n\nDO: Check for duplicated logic, oversized functions, tight coupling.\nDO NOT: Skip — this gate catches structural issues before comprehensive testing.",
+      "estimatedEffort": "medium",
+      "id": "99ae54f7-REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review complete. 1 refactoring task spawned: REFACTOR-1-001 (extract retry tracking block from run_loop). All new helper functions are clean (<30 lines, single-responsibility). Pre-existing issues (run_loop 1190 lines, config.rs permission mode duplication) are out of scope.",
+      "passes": true,
+      "priority": 17,
+      "qualityDimensions": {
+        "correctness": [
+          "No duplicated retry/escalation logic across modules"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Functions under 30 lines, DRY principle, clear separation of concerns"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/progress.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/init/import.rs",
+        "src/commands/complete.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Retry tracking block (lines 1829-1893) extracted into a dedicated function",
+        "Function signature: handle_task_failure(conn, task_id, outcome) -> TaskMgrResult<()>",
+        "Function encapsulates: outcome filtering, transaction, increment, escalate, auto-block",
+        "All existing tests still pass",
+        "No behavior change — pure refactoring",
+        "Nesting depth reduced from 5 levels to 2-3"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-REFACTOR-REVIEW-1"
+      ],
+      "description": "Extract the 65-line retry tracking block from run_loop (lines 1829-1893) into a dedicated handle_task_failure() function. The block chains increment_consecutive_failures → escalate_task_model_if_needed → should_auto_block → auto_block_task with 5 levels of nesting. Extracting it reduces run_loop complexity and improves testability.\n\nDO: Extract into a function with clear signature, preserve transaction atomicity, preserve all warning eprintln! messages.\nDO NOT: Change behavior, add new features, or refactor other parts of run_loop.",
+      "estimatedEffort": "low",
+      "id": "99ae54f7-REFACTOR-1-001",
+      "modifiesBehavior": false,
+      "notes": "Pure refactoring. The new function should take conn (not tx) and manage its own transaction internally. Outcome filtering (the matches! guard) can stay in run_loop or move into the function.",
+      "passes": false,
+      "priority": 18,
+      "rootCause": "Retry tracking logic (increment → escalate → auto-block) was added inline in run_loop during FEAT-003/004 implementation, creating a 65-line nested block",
+      "exactFix": "Extract lines 1829-1893 into pub fn handle_task_failure(conn: &Connection, task_id: &str, outcome: &IterationOutcome) -> TaskMgrResult<()>",
+      "synergyWith": [],
+      "taskType": "refactor",
+      "title": "Extract retry tracking block from run_loop into handle_task_failure()",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All initial tests (TEST-INIT-001 through TEST-INIT-005) pass",
+        "All implementation tasks (FEAT-001 through FEAT-012) pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points (no dead code)",
+        "No unused warnings for new code in cargo check / cargo clippy",
+        "cargo test passes with zero failures",
+        "cargo fmt --check passes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-FEAT-001",
+        "99ae54f7-FEAT-002",
+        "99ae54f7-FEAT-003",
+        "99ae54f7-FEAT-004",
+        "99ae54f7-FEAT-011",
+        "99ae54f7-TEST-INIT-001",
+        "99ae54f7-TEST-INIT-003",
+        "99ae54f7-TEST-INIT-005",
+        "99ae54f7-CODE-REVIEW-1",
+        "99ae54f7-REFACTOR-REVIEW-1",
+        "99ae54f7-REFACTOR-1-001"
+      ],
+      "description": "Gate before comprehensive testing. Verify all initial tests pass, all implementation tasks complete, code review and refactor review done. Run full cargo test suite.",
+      "estimatedEffort": "medium",
+      "id": "99ae54f7-MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Run full cargo test suite. If any CODE-FIX-xxx or REFACTOR-1-xxx tasks were spawned by reviews, they must also be complete before this milestone passes.",
+      "passes": false,
+      "priority": 20,
+      "qualityDimensions": {
+        "correctness": [
+          "All tests pass, all reviews complete"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Clean cargo clippy, clean cargo fmt"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone 1: Implementation complete, reviewed, and refactored",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Parameterized tests for max_retries values: 0, 1, 2, 3, 5, 10",
+        "Test rapid complete/fail sequences verify counter accuracy",
+        "Test auto-block message contains failure count and task ID",
+        "Test auto-block sets status to 'blocked' and populates last_error",
+        "Test model escalation at threshold 2 before auto-block at threshold 3",
+        "Test escalation is no-op when already at opus",
+        "80%+ coverage for retry tracking code paths"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-1"
+      ],
+      "description": "Write comprehensive tests for retry tracking and auto-block logic. Include parameterized tests for various max_retries values and race conditions.\n\nDO: Test boundary values, rapid sequences, model escalation integration.\nDO NOT: Duplicate TEST-INIT-003 tests — build on them.",
+      "edgeCases": [
+        "max_retries=1 → auto-block after first failure",
+        "max_retries=10 → long sequence needed",
+        "Rapid success/fail/success/fail → counter accuracy"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Parameterized test with max_retries=0",
+          "expectedBehavior": "Auto-block never fires regardless of failure count"
+        }
+      ],
+      "id": "99ae54f7-TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Build on TEST-INIT-003 tests. Add parameterized tests using different max_retries values. Test the integration of escalation + auto-block.",
+      "passes": false,
+      "priority": 25,
+      "qualityDimensions": {
+        "correctness": [
+          "Auto-block must not fire on first attempt — only after max_retries consecutive failures",
+          "consecutive_failures counter must reset to 0 on successful completion"
+        ],
+        "performance": [
+          "No additional DB queries per iteration for retry tracking"
+        ],
+        "style": [
+          "Use parameterized tests (test table pattern) for max_retries values",
+          "Descriptive assert messages"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Comprehensive tests for retry tracking + auto-block",
+      "touchesFiles": [
+        "tests/",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test progress filename with various prefixes: P1, CHAIN, 99ae54f7",
+        "Test archive skip pattern with prefixed progress files",
+        "Test branch change with prefix preserves correct progress file",
+        "Test NoEligibleTasks variant in all code paths",
+        "Test format_outcome for NoEligibleTasks returns correct string",
+        "80%+ coverage for progress naming and outcome formatting"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-1"
+      ],
+      "description": "Thorough tests for branch change with prefix, archive with prefixed progress files.",
+      "edgeCases": [
+        "Prefix with dots and hyphens (e.g., 'P1.alpha-2')",
+        "Very long prefix (100+ chars)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Archive pattern too narrow (misses prefixed files)",
+          "expectedBehavior": "progress*.txt pattern matches all variants"
+        }
+      ],
+      "id": "99ae54f7-TEST-004",
+      "modifiesBehavior": false,
+      "notes": "Build on TEST-INIT-005 tests. Test with realistic prefixes used in the project.",
+      "passes": false,
+      "priority": 33,
+      "qualityDimensions": {
+        "correctness": [
+          "Progress filename must incorporate prefix when present",
+          "Archive pattern must match all prefixed progress files"
+        ],
+        "performance": [
+          "Simple string operations — fast"
+        ],
+        "style": [
+          "Use assert_eq! for exact string comparisons",
+          "Test with realistic prefix values"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Comprehensive tests for progress file naming",
+      "touchesFiles": [
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code (extract helpers for common patterns)",
+        "Helper functions extracted for common test fixtures",
+        "Test names clearly describe what is tested",
+        "No brittle tests that depend on implementation details",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-TEST-001",
+        "99ae54f7-TEST-004"
+      ],
+      "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements across all test files modified in this feature.\n\nDO: Check for duplicated setup, missing helpers, unclear test names.\nDO NOT: Change test semantics — only improve structure.",
+      "estimatedEffort": "medium",
+      "id": "99ae54f7-REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue found: add a REFACTOR-2-xxx task, commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
+      "passes": false,
+      "priority": 43,
+      "qualityDimensions": {
+        "correctness": [
+          "Test helpers must not change test semantics"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "DRY test setup, clear naming, descriptive assertions"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/config.rs",
+        "src/commands/complete.rs",
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All comprehensive tests (TEST-001 through TEST-004) pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "cargo test passes with zero failures",
+        "cargo clippy passes with zero warnings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-1",
+        "99ae54f7-REFACTOR-REVIEW-2",
+        "99ae54f7-TEST-001",
+        "99ae54f7-TEST-004"
+      ],
+      "description": "Gate before integration testing. Verify all comprehensive tests pass and test code has been reviewed for quality.",
+      "estimatedEffort": "medium",
+      "id": "99ae54f7-MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Run full cargo test suite. All comprehensive tests and refactor reviews must be complete.",
+      "passes": false,
+      "priority": 50,
+      "qualityDimensions": {
+        "correctness": [
+          "All tests pass, all reviews complete"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Clean cargo clippy, clean cargo fmt"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone 2: Full test coverage achieved, test code refactored",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "End-to-end test: task fails 3 times consecutively with max_retries=3",
+        "After 2nd failure: model escalation to opus is triggered",
+        "After 3rd failure: task is auto-blocked with descriptive last_error",
+        "After auto-block: next eligible task is selected by the loop",
+        "Test verifies DB state at each step (consecutive_failures, status, model)",
+        "Test uses mock Claude or test harness to simulate loop iterations",
+        "Test covers the full lifecycle: import PRD → run loop → verify auto-block → next task"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-2"
+      ],
+      "description": "End-to-end integration test using mock Claude: task fails 3 times → auto-blocked → next task selected. Verifies the full retry tracking lifecycle.\n\nDO: Test the complete flow from import through loop execution to auto-block.\nDO NOT: Test individual components — those are covered by unit tests.",
+      "edgeCases": [
+        "Only one task in PRD → after auto-block, loop has NoEligibleTasks",
+        "Multiple tasks → after auto-block of task A, task B is selected"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Mock Claude doesn't trigger the right code paths",
+          "expectedBehavior": "Use the test harness to simulate specific iteration outcomes"
+        }
+      ],
+      "id": "99ae54f7-INT-001",
+      "modifiesBehavior": false,
+      "notes": "Follow existing e2e test patterns. The mock Claude should return non-completed outcomes to trigger retry tracking.",
+      "passes": false,
+      "priority": 55,
+      "qualityDimensions": {
+        "correctness": [
+          "Full lifecycle must work: import → loop → fail → escalate → fail → auto-block → next task",
+          "DB state must be correct at each step"
+        ],
+        "performance": [
+          "Integration test should complete in <30 seconds"
+        ],
+        "style": [
+          "Clear step-by-step test structure with comments explaining each phase",
+          "Descriptive assert messages at each verification point"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Integration test: full loop with retry tracking",
+      "touchesFiles": [
+        "tests/e2e_loop.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Create JSON with all new fields: max_retries, task_type, verify_command, default_max_retries, environment_checks",
+        "Import the JSON into the database",
+        "Read back all tasks and verify new fields are preserved",
+        "Export/query and verify field values match input",
+        "Test with old-format JSON (missing new fields): import succeeds with defaults",
+        "Test round-trip: insert → read → verify for each new field"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-2"
+      ],
+      "description": "Round-trip test: create JSON with maxRetries and defaultMaxRetries → import → export → verify fields preserved and resolved correctly.",
+      "edgeCases": [
+        "JSON with all new fields present",
+        "JSON with no new fields (old format)",
+        "JSON with partial new fields (some present, some missing)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "New field not included in export query",
+          "expectedBehavior": "Round-trip test catches missing field"
+        }
+      ],
+      "id": "99ae54f7-INT-002",
+      "modifiesBehavior": false,
+      "notes": "Create minimal PRD JSON fixtures with and without new fields. Verify both forward and backward compatibility.",
+      "passes": false,
+      "priority": 58,
+      "qualityDimensions": {
+        "correctness": [
+          "All new fields must survive the import → read round-trip",
+          "Old JSON format must import without errors"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Use descriptive test fixtures with clear field values",
+          "Assert exact values, not just non-null"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Integration test: PRD import with maxRetries fields",
+      "touchesFiles": [
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "tasks.md: JSON schema section updated with max_retries, task_type, verify_command, timeoutSecs fields",
+        "tasks.md: model selection table updated with taskType-driven model rules",
+        "tasks.md: Step 4 (task ID generation) documents prefix behavior",
+        "tasks.md: Step 8 (validation) updated with new field validation rules",
+        "tasks.md: CODE-FIX template updated to reference retry tracking and auto-block",
+        "tasks.md: qualityDimensions section includes correctness, performance, style examples for new features",
+        "All schema examples in tasks.md are syntactically valid JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-2"
+      ],
+      "description": "Update the /tasks skill (tasks.md) with new schema fields, model selection rules, prefix behavior, and validation rules.\n\nDO: Update schema, model table, prefix docs, validation rules, CODE-FIX template.\nDO NOT: Change the overall structure of tasks.md — only update content for new features.",
+      "edgeCases": [
+        "Old JSON without new fields: skill should document backward compatibility"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Schema example has invalid JSON",
+          "expectedBehavior": "All examples must be syntactically valid"
+        }
+      ],
+      "id": "99ae54f7-FEAT-013",
+      "modifiesBehavior": false,
+      "notes": "This is a documentation task — updating the Claude skill that generates task JSON files. All schema examples must be valid JSON.",
+      "passes": false,
+      "priority": 60,
+      "qualityDimensions": {
+        "correctness": [
+          "Schema documentation matches actual implementation",
+          "All JSON examples are syntactically valid"
+        ],
+        "performance": [
+          "N/A — documentation task"
+        ],
+        "style": [
+          "Follow existing tasks.md documentation patterns",
+          "Clear, concise descriptions of new fields and rules"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "/tasks skill schema + validation updates",
+      "touchesFiles": [
+        ".claude/commands/tasks.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "prd.md: Research/Spike task type documented with description and model implications",
+        "prd.md: environment_checks and default_max_retries fields documented in PRD schema",
+        "prd.md: verify_command field documented for user stories",
+        "md-to-json-prd-reviewer.md: lint rules updated for new fields (max_retries range, valid taskType values)",
+        "escalation-policy.md: stuck loop guidance includes retry tracking and auto-block behavior",
+        "escalation-policy.md: model escalation policy documented"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-MILESTONE-2"
+      ],
+      "description": "Update /prd skill, PRD reviewer agent, and escalation policy document with new features.\n\nDO: Document Research/Spike type in prd.md, update lint rules in reviewer, add stuck loop guidance.\nDO NOT: Change existing PRD schema structure — only add new fields.\n\nNOTE: ~/.claude/agents/md-to-json-prd-reviewer.md is a global file outside the project — document this in notes.",
+      "edgeCases": [
+        "PRD without environment_checks: should work (optional field)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Reviewer lint rule too strict (rejects valid PRDs)",
+          "expectedBehavior": "All new fields are optional — lint should warn, not error"
+        }
+      ],
+      "id": "99ae54f7-FEAT-014",
+      "modifiesBehavior": false,
+      "notes": "IMPORTANT: ~/.claude/agents/md-to-json-prd-reviewer.md is a GLOBAL file outside the project repo. Changes to it affect all projects. Be conservative with lint rules — warn, don't error. scripts/escalation-policy.md is in-repo.",
+      "passes": false,
+      "priority": 62,
+      "qualityDimensions": {
+        "correctness": [
+          "Documentation matches actual implementation",
+          "Reviewer lint rules are correct and not too strict"
+        ],
+        "performance": [
+          "N/A — documentation task"
+        ],
+        "style": [
+          "Follow existing prd.md documentation patterns",
+          "Clear, concise descriptions"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "/prd skill + reviewer agent + escalation policy",
+      "touchesFiles": [
+        ".claude/commands/prd.md",
+        "scripts/escalation-policy.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows existing project patterns",
+        "Integration tests are well-structured and maintainable",
+        "Skill/prompt updates are consistent with implementation",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-INT-001",
+        "99ae54f7-INT-002",
+        "99ae54f7-FEAT-013",
+        "99ae54f7-FEAT-014"
+      ],
+      "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity. Final opportunity to improve before verification.\n\nDO: Review all implementation, test, and documentation code.\nDO NOT: Skip — this is the final structural quality gate.",
+      "estimatedEffort": "medium",
+      "id": "99ae54f7-REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final refactoring review. For each issue found: add a REFACTOR-3-xxx task (priority 71-89), add it to MILESTONE-FINAL dependsOn, commit JSON changes.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": {
+        "correctness": [
+          "No duplicated logic across modules"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Functions under 30 lines, DRY, clear separation of concerns"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/db/migrations/v13.rs",
+        "src/models/task.rs",
+        "src/commands/init/",
+        "src/commands/complete.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/branch.rs",
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/config.rs",
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check produces zero warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes with zero failures",
+        "No dead code warnings for new code",
+        "All task stories have passes: true",
+        "Integration tests pass end-to-end",
+        "Migration v13 applies cleanly to a fresh database and an existing database"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-INT-001",
+        "99ae54f7-INT-002",
+        "99ae54f7-REFACTOR-REVIEW-3"
+      ],
+      "description": "Run full verification: cargo fmt --check, cargo check, cargo clippy, cargo test. Verify no warnings, no failures, no dead code. Test migration on both fresh and existing databases.\n\nDO: Run all quality checks and verify everything passes.\nDO NOT: Skip any check — this is the final verification gate.",
+      "estimatedEffort": "low",
+      "id": "99ae54f7-VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate before merge. Run all quality checks and verify everything passes. Include migration compatibility testing.",
+      "passes": false,
+      "priority": 90,
+      "qualityDimensions": {
+        "correctness": [
+          "All checks pass with zero warnings and zero failures"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Clean output from all quality tools"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "All user stories have acceptance criteria met",
+        "cargo test passes with zero failures",
+        "No dead code, no warnings, clean cargo clippy output",
+        "Branch is mergeable to main"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "99ae54f7-VERIFY-001",
+        "99ae54f7-REFACTOR-REVIEW-3"
+      ],
+      "description": "Final gate — all tests pass, all reviews complete, code is clean and ready for merge to main.",
+      "estimatedEffort": "low",
+      "id": "99ae54f7-MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final milestone. All acceptance criteria from all user stories must be met. Branch should be mergeable to main.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": {
+        "correctness": [
+          "All tests pass, all reviews complete, all criteria met"
+        ],
+        "performance": [
+          "Best effort"
+        ],
+        "style": [
+          "Clean output from all quality tools"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Milestone Final: Ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
