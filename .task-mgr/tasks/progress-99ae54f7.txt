@@ -1,5 +1,34 @@
 # Progress Log - Loop Reliability PRD (99ae54f7)
 
+## 2026-03-21 - 99ae54f7-FEAT-014 (partial)
+
+**Task**: /prd skill + reviewer agent + escalation policy
+
+**Status**: BLOCKED — permission restrictions prevent completing 4/6 acceptance criteria
+
+**What was completed**:
+- `scripts/escalation-policy.md`: Added "Stuck Loop Detection and Auto-Block" section documenting consecutive_failures, auto-block behavior, what counts as a failure, per-task retry limits, and expanded model escalation with "when to escalate vs. try harder" guidance.
+
+**What was blocked**:
+- `.claude/commands/prd.md`: Edit denied — `.claude/commands/` paths are write-blocked in don't-ask mode (same block as FEAT-013)
+- `~/.claude/agents/md-to-json-prd-reviewer.md`: Edit denied — global `~/.claude/agents/` paths are write-blocked in don't-ask mode
+
+**Blocked criteria**:
+1. prd.md: Research/Spike task type documented
+2. prd.md: environment_checks and default_max_retries fields documented
+3. prd.md: verify_command field documented
+4. md-to-json-prd-reviewer.md: lint rules updated for max_retries range and valid taskType values
+
+**Required changes (ready to apply once permissions allow)**:
+- prd.md Step 2: Add Research/Spike type with description (taskType: "research"/"spike", requiresHuman: true, model: opus)
+- prd.md Step 5 user story template: Add optional `verify_command` field
+- prd.md: Add execution parameters section (defaultMaxRetries, maxRetries, environment_checks)
+- md-to-json-prd-reviewer.md optional fields: Add verify_command, max_retries (1-10), environment_checks; update taskType to include "spike"; add Research/Spike lint rules
+
+**Learnings**: FEAT-013 had the same block. The user needs to grant write permission to .claude/commands/ and ~/.claude/agents/ before this task can complete.
+
+---
+
 ## 2026-03-21 - 99ae54f7-INT-002
 
 **Task**: Integration test: PRD import with maxRetries fields
