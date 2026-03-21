@@ -15,6 +15,8 @@ use task_mgr::commands::{
     begin, complete, doctor, end, export, fail, init, learn, next, LearnParams,
 };
 use task_mgr::db::open_connection;
+use task_mgr::loop_engine::engine::handle_task_failure;
+use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 use task_mgr::models::RunStatus;
 
 /// Get the path to the sample PRD fixture file.
@@ -938,6 +940,226 @@ fn test_run_loop_with_mock_claude() {
         )
         .unwrap();
     assert_eq!(todo_count, 0, "All tasks should be done");
+}
+
+// ============================================================================
+// Test: Full loop retry lifecycle (INT-001)
+//
+// Exercises the complete retry tracking lifecycle using library functions
+// to simulate what the loop engine does across iterations:
+//
+//   import PRD → simulate 3 failures → verify auto-block → next task selected
+//
+// Verifies all acceptance criteria without a real Claude subprocess:
+//   1. Task fails 3 times with max_retries=3
+//   2. After failure 2: model escalates sonnet → opus
+//   3. After failure 3: task is auto-blocked with descriptive last_error
+//   4. After auto-block: next::next selects the next eligible task
+//   5. DB state verified at each step (consecutive_failures, model, status)
+// ============================================================================
+
+#[test]
+fn test_full_loop_retry_lifecycle() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a PRD with two independent tasks:
+    //   RETRY-001: sonnet model, max_retries=3 — will be failed 3 times
+    //   RETRY-002: no model override, no deps — eligible after RETRY-001 is blocked
+    let prd_json = serde_json::json!({
+        "project": "retry-lifecycle-test",
+        "branchName": "test/retry-lifecycle",
+        "description": "PRD for INT-001 retry lifecycle integration test.",
+        "priorityPhilosophy": {"description": "Priority", "hierarchy": []},
+        "globalAcceptanceCriteria": {"description": "All pass", "criteria": []},
+        "reviewGuidelines": {"priorityGuidelines": {"critical": "1-10"}},
+        "userStories": [
+            {
+                "id": "RETRY-001",
+                "title": "Task that will fail three times",
+                "description": "Intentionally failed to test retry tracking.",
+                "acceptanceCriteria": ["Should be auto-blocked after 3 failures"],
+                "priority": 1,
+                "passes": false,
+                "model": "claude-sonnet-4-6",
+                "maxRetries": 3,
+                "dependsOn": [],
+                "synergyWith": [],
+                "batchWith": [],
+                "conflictsWith": [],
+                "touchesFiles": ["src/retry_test.rs"]
+            },
+            {
+                "id": "RETRY-002",
+                "title": "Second task eligible after first is blocked",
+                "description": "Should be selected after RETRY-001 is auto-blocked.",
+                "acceptanceCriteria": ["Selected after RETRY-001 blocked"],
+                "priority": 2,
+                "passes": false,
+                "dependsOn": [],
+                "synergyWith": [],
+                "batchWith": [],
+                "conflictsWith": [],
+                "touchesFiles": ["src/retry_test_2.rs"]
+            }
+        ]
+    });
+
+    let prd_path = temp_dir.path().join("retry-lifecycle-prd.json");
+    fs::write(&prd_path, prd_json.to_string()).unwrap();
+
+    // Step 1: Import PRD — applies migrations creating max_retries/consecutive_failures columns
+    let init_result = init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
+    assert_eq!(
+        init_result.tasks_imported, 2,
+        "Should import exactly 2 tasks"
+    );
+
+    // Step 2: Verify RETRY-001 initial DB state
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+
+    let (init_failures, init_model, init_status): (i32, Option<String>, String) = conn
+        .query_row(
+            "SELECT consecutive_failures, model, status FROM tasks WHERE id = 'RETRY-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        init_failures, 0,
+        "RETRY-001 initial consecutive_failures should be 0"
+    );
+    assert_eq!(
+        init_model.as_deref(),
+        Some(SONNET_MODEL),
+        "RETRY-001 initial model should be sonnet"
+    );
+    assert_eq!(
+        init_status, "todo",
+        "RETRY-001 initial status should be todo"
+    );
+
+    // Simulate claiming RETRY-001 (loop normally does this via next --claim)
+    conn.execute(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = 'RETRY-001'",
+        [],
+    )
+    .unwrap();
+
+    // ── Failure 1 ──────────────────────────────────────────────────────────────
+    // No escalation (threshold=2 not reached), no auto-block (count=1 < max_retries=3)
+    handle_task_failure(&mut conn, "RETRY-001").unwrap();
+
+    let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
+        .query_row(
+            "SELECT consecutive_failures, model, status, last_error \
+             FROM tasks WHERE id = 'RETRY-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "Failure 1: consecutive_failures should be 1");
+    assert_eq!(
+        model.as_deref(),
+        Some(SONNET_MODEL),
+        "Failure 1: model should remain sonnet (escalation threshold not yet reached)"
+    );
+    assert_eq!(
+        status, "in_progress",
+        "Failure 1: task should not be blocked"
+    );
+    assert!(
+        last_error.is_none(),
+        "Failure 1: last_error should not be set"
+    );
+
+    // ── Failure 2 ──────────────────────────────────────────────────────────────
+    // Model escalation fires (consecutive_failures=2 >= escalation threshold=2)
+    // Task not yet blocked (count=2 < max_retries=3)
+    handle_task_failure(&mut conn, "RETRY-001").unwrap();
+
+    let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
+        .query_row(
+            "SELECT consecutive_failures, model, status, last_error \
+             FROM tasks WHERE id = 'RETRY-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 2, "Failure 2: consecutive_failures should be 2");
+    assert_eq!(
+        model.as_deref(),
+        Some(OPUS_MODEL),
+        "Failure 2: model should be escalated from sonnet to opus"
+    );
+    assert_eq!(
+        status, "in_progress",
+        "Failure 2: task should not yet be blocked (count < max_retries=3)"
+    );
+    assert!(
+        last_error.is_none(),
+        "Failure 2: last_error should not be set"
+    );
+
+    // ── Failure 3 ──────────────────────────────────────────────────────────────
+    // Auto-block fires (consecutive_failures=3 >= max_retries=3)
+    handle_task_failure(&mut conn, "RETRY-001").unwrap();
+
+    let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
+        .query_row(
+            "SELECT consecutive_failures, model, status, last_error \
+             FROM tasks WHERE id = 'RETRY-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 3, "Failure 3: consecutive_failures should be 3");
+    assert_eq!(
+        model.as_deref(),
+        Some(OPUS_MODEL),
+        "Failure 3: model should remain opus (already at ceiling)"
+    );
+    assert_eq!(
+        status, "blocked",
+        "Failure 3: task should be auto-blocked after reaching max_retries=3"
+    );
+
+    let err = last_error.expect("Failure 3: last_error must be populated by auto_block_task");
+    assert!(
+        err.contains("RETRY-001"),
+        "last_error must contain the task ID, got: '{}'",
+        err
+    );
+
+    // ── Next task selection after auto-block ────────────────────────────────────
+    // The loop selects the next eligible task after detecting auto-block.
+    // RETRY-001 is blocked → only RETRY-002 (todo, no unmet deps) is eligible.
+    drop(conn);
+    let next_result = next::next(
+        temp_dir.path(),
+        &[],   // no after_files
+        false, // don't claim
+        None,  // no run_id
+        false, // not verbose
+        None,  // no task_prefix
+    )
+    .unwrap();
+
+    let selected = next_result
+        .task
+        .expect("Should have an eligible task after RETRY-001 is auto-blocked");
+    assert_eq!(
+        selected.id, "RETRY-002",
+        "After auto-block, next() should select RETRY-002 (only remaining eligible task)"
+    );
 }
 
 /// Get the path to the test loop PRD fixture.
