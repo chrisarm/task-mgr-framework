@@ -3401,8 +3401,14 @@ mod tests {
     /// Active: max_retries=0 disables auto-block entirely (never fires regardless of failures).
     #[test]
     fn test_auto_block_disabled_when_max_retries_zero() {
-        assert!(!should_auto_block(0, 0), "max_retries=0 must disable auto-block at 0 failures");
-        assert!(!should_auto_block(5, 0), "max_retries=0 must disable auto-block at 5 failures");
+        assert!(
+            !should_auto_block(0, 0),
+            "max_retries=0 must disable auto-block at 0 failures"
+        );
+        assert!(
+            !should_auto_block(5, 0),
+            "max_retries=0 must disable auto-block at 5 failures"
+        );
         assert!(
             !should_auto_block(100, 0),
             "max_retries=0 must disable auto-block regardless of failure count"
@@ -3508,10 +3514,16 @@ mod tests {
         .unwrap();
 
         let new_count = increment_consecutive_failures(&conn, "T-001").unwrap();
-        assert_eq!(new_count, 1, "consecutive_failures must increment from 0 to 1");
+        assert_eq!(
+            new_count, 1,
+            "consecutive_failures must increment from 0 to 1"
+        );
 
         let new_count2 = increment_consecutive_failures(&conn, "T-001").unwrap();
-        assert_eq!(new_count2, 2, "consecutive_failures must increment from 1 to 2");
+        assert_eq!(
+            new_count2, 2,
+            "consecutive_failures must increment from 1 to 2"
+        );
     }
 
     /// Ignored: consecutive_failures resets to 0 in the DB after a Completed outcome.
@@ -3535,7 +3547,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0, "consecutive_failures must reset to 0 after success");
+        assert_eq!(
+            count, 0,
+            "consecutive_failures must reset to 0 after success"
+        );
     }
 
     /// Ignored: auto-block sets last_error with a descriptive message.
@@ -3559,7 +3574,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status, "blocked", "auto-blocked task must have status='blocked'");
+        assert_eq!(
+            status, "blocked",
+            "auto-blocked task must have status='blocked'"
+        );
         assert!(last_error.is_some(), "auto-block must set last_error");
         let err = last_error.unwrap();
         // Message must reference failures — exact wording up to implementer
@@ -3591,7 +3609,10 @@ mod tests {
 
         let c2 = increment_consecutive_failures(&conn, "T-001").unwrap();
         assert_eq!(c2, 2);
-        assert!(!should_auto_block(c2, 3), "no auto-block at count=2 (below max_retries=3)");
+        assert!(
+            !should_auto_block(c2, 3),
+            "no auto-block at count=2 (below max_retries=3)"
+        );
 
         // Success on 3rd attempt → counter resets to 0
         reset_consecutive_failures(&conn, "T-001").unwrap();
@@ -3602,8 +3623,14 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(final_count, 0, "counter must reset to 0 after success on attempt 3");
-        assert!(!should_auto_block(final_count, 3), "reset counter must not trigger auto-block");
+        assert_eq!(
+            final_count, 0,
+            "counter must reset to 0 after success on attempt 3"
+        );
+        assert!(
+            !should_auto_block(final_count, 3),
+            "reset counter must not trigger auto-block"
+        );
     }
 
     /// Ignored: rapid alternating success/failure on same task → counter tracks correctly.
@@ -3632,7 +3659,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0, "reset must zero counter regardless of prior alternation pattern");
+        assert_eq!(
+            count, 0,
+            "reset must zero counter regardless of prior alternation pattern"
+        );
 
         // Verify next failure increments from 0
         increment_consecutive_failures(&conn, "T-001").unwrap();
@@ -3643,7 +3673,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count2, 1, "failure after reset must start from 0, not carry over prior streak");
+        assert_eq!(
+            count2, 1,
+            "failure after reset must start from 0, not carry over prior streak"
+        );
     }
 
     /// Ignored: resetting one task's failures does not affect a different task's counter.
@@ -3687,7 +3720,11 @@ mod tests {
         .unwrap();
 
         let count = increment_consecutive_failures(&conn, "T-001").unwrap();
-        assert!(count >= 0, "consecutive_failures must never be negative, got {}", count);
+        assert!(
+            count >= 0,
+            "consecutive_failures must never be negative, got {}",
+            count
+        );
 
         reset_consecutive_failures(&conn, "T-001").unwrap();
         let after_reset: i32 = conn
