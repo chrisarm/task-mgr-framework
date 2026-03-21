@@ -1,0 +1,187 @@
+# Progress Log — 99ae54f7 (loop-reliability)
+
+## 2026-03-21 — 99ae54f7-FEAT-014 (Attempt 6)
+
+- **Status**: BLOCKED — permission denied for .claude/commands/ and ~/.claude/agents/ in don't-ask mode
+- **Completed**: criteria 5+6 (escalation-policy.md) — already done by previous iteration
+- **Blocked**: criteria 1-4 require editing .claude/commands/prd.md and ~/.claude/agents/md-to-json-prd-reviewer.md
+- **Action taken**: Set requiresHuman: true on FEAT-014 to prevent further autonomous retries
+- **User action needed**:
+  1. Grant write permission to `.claude/commands/*.md` in settings, OR apply changes manually per escalationNote
+  2. After applying, set `requiresHuman: false` and `passes: true` on 99ae54f7-FEAT-014
+- **Learnings**: .task-mgr/tasks/*.json IS writable; .claude/commands/ and ~/.claude/agents/ are NOT writable in don't-ask mode
+
+---
+
+## 2026-03-21 — 99ae54f7-FEAT-013 (Attempt 7 — BLOCKED, requiresHuman already set)
+
+- **Status**: BLOCKED — same permission restriction applies
+- **Note**: `requiresHuman: true` was already set on this task in the PRD JSON, yet the loop ran this task again. The loop engine may not be checking `requiresHuman` for in_progress tasks.
+- **All planned changes documented below** — human must apply to `.claude/commands/tasks.md`
+
+### Change 1: Step 1.5 — Add taskType-driven model selection table
+
+After the existing model assignment table (after the row with `FEAT-xxx`, `FIX-xxx`...), **add** this new subsection:
+
+```markdown
+**`taskType`-driven model selection** — set `taskType` on every task to enable automatic model/timeout assignment by the loop engine:
+
+| `taskType`         | Assign `model` | `timeoutSecs` | Rationale                                      |
+| ------------------ | -------------- | ------------- | ---------------------------------------------- |
+| `"review"`         | opus           | _(omit)_      | Nuanced quality/security/architectural judgment |
+| `"milestone"`      | opus           | 1800          | Cross-PRD review + remaining task updates      |
+| `"test"`           | _(omit)_       | _(omit)_      | Standard test work — use PRD default (sonnet)  |
+| `"implementation"` | _(omit)_       | _(omit)_      | Standard feature work — use PRD default        |
+| `"refactor"`       | _(omit)_       | _(omit)_      | Standard refactor work — use PRD default       |
+
+When both the explicit `model` field and `taskType` are set, `model` takes precedence. For review and milestone tasks, the task-type prefix (e.g., `CODE-REVIEW-xxx`, `MILESTONE-xxx`) is the primary signal — set `taskType: "review"` or `taskType: "milestone"` accordingly.
+```
+
+### Change 2: Step 4 — Document prefix behavior
+
+After the list of prefixes (after `POLISH-xxx` line), **add**:
+
+```markdown
+#### Task ID Prefix Behavior
+
+When `task-mgr init` imports a JSON file, task IDs are prefixed with an 8-char hex string
+derived from `md5(branchName + ":" + filename)[..8]`, e.g. `99ae54f7-FEAT-001`.
+
+The prefix is resolved in this order:
+1. `taskPrefix` field in the PRD JSON (if present — pinned, stable across re-imports)
+2. Auto-generated: `md5(branchName + ":" + filename)[..8]` (written back to JSON on first import)
+
+Include `"taskPrefix"` in your PRD JSON to pin the prefix; omit it to auto-generate:
+```json
+{
+  "version": "1.0",
+  "taskPrefix": "99ae54f7",
+  "branchName": "feat/my-feature",
+  ...
+}
+```
+
+The auto-generated prefix is written back to the JSON file after the first import, ensuring
+stable IDs across re-imports. Use the prefix as a namespace when running multiple PRDs in the
+same database (e.g., batch mode).
+```
+
+### Change 3: Step 5 JSON Schema — Add new PRD-level fields
+
+In the PRD-level schema block (after `"mergeStrategy"` line), **add**:
+
+```json
+  "taskPrefix": "auto-generated 8-char hex on first import, or specify to pin",
+  "defaultMaxRetries": 3,
+```
+
+In the per-task schema block (after `"conflictsWith": []` line), **add**:
+
+```json
+      "maxRetries": 3,
+      "taskType": "implementation|test|review|refactor|milestone",
+      "verifyCommand": "cargo test --test integration",
+```
+
+Full schema note: `maxRetries` overrides `defaultMaxRetries` for this task. `taskType` drives
+automatic model/timeout selection (see Step 1.5). `verifyCommand` runs after each iteration to
+verify task-specific conditions.
+
+### Change 4: CODE-FIX template — Add rootCause and exactFix
+
+Replace the CODE-FIX template task structure:
+
+**Before:**
+```json
+{
+  "id": "CODE-FIX-001",
+  "title": "Fix: [specific issue]",
+  "description": "Address finding from CODE-REVIEW-1: [details]",
+  "acceptanceCriteria": ["Issue resolved", "No new warnings"],
+  "priority": 14,
+  "passes": false,
+  "dependsOn": [],
+  "touchesFiles": ["affected/file.rs"]
+}
+```
+
+**After:**
+```json
+{
+  "id": "CODE-FIX-001",
+  "title": "Fix: [specific issue]",
+  "description": "Address finding from CODE-REVIEW-1: [details]",
+  "rootCause": "[Underlying cause — helps agent understand what went wrong, not just what to change]",
+  "exactFix": "[Precise change needed — specific function, line range, or pattern to apply]",
+  "acceptanceCriteria": ["Issue resolved", "No new warnings"],
+  "priority": 14,
+  "passes": false,
+  "taskType": "implementation",
+  "maxRetries": 2,
+  "dependsOn": [],
+  "touchesFiles": ["affected/file.rs"]
+}
+```
+
+Note: `maxRetries: 2` on CODE-FIX tasks enables auto-block if the fix repeatedly fails — prevents
+the loop from wasting iterations on an unfixable issue.
+
+### Change 5: Step 8 Validation — Add new field checks
+
+After the existing `- [ ] **Behavior modification validation**:` block, **add**:
+
+```markdown
+- [ ] **New field validation**:
+  - `taskType` values are one of: `test`, `implementation`, `review`, `refactor`, `milestone`
+  - `maxRetries` is a non-negative integer if present (0 = auto-block disabled)
+  - `verifyCommand` is a non-empty string if present
+  - `defaultMaxRetries` at PRD level is a positive integer (default: 3) if present
+  - `taskPrefix` at PRD level is an 8-char hex string or omitted (auto-generated)
+  - CODE-FIX tasks include `rootCause` and `exactFix` for loop reliability
+```
+
+### Change 6: qualityDimensions example — Add new feature examples
+
+In the schema `qualityDimensions` block (inside the per-task template), **update** with examples:
+
+**Before:**
+```json
+"qualityDimensions": {
+  "correctness": ["What must not go wrong — from PRD section 2.5"],
+  "performance": [
+    "Efficiency requirements — exit early, avoid redundant work"
+  ],
+  "style": ["Idiomatic patterns required, anti-patterns to avoid"]
+},
+```
+
+**After:**
+```json
+"qualityDimensions": {
+  "correctness": [
+    "What must not go wrong — from PRD section 2.5",
+    "Example: maxRetries=0 must disable auto-block entirely, never fire regardless of failures",
+    "Example: consecutive_failures resets to 0 on task success, not just on block"
+  ],
+  "performance": [
+    "Efficiency requirements — exit early, avoid redundant work",
+    "Example: verifyCommand runs once per iteration end, not per retry attempt"
+  ],
+  "style": [
+    "Idiomatic patterns required, anti-patterns to avoid",
+    "Example: use taskType enum field instead of inferring type from task ID prefix",
+    "Example: maxRetries absent means inherit defaultMaxRetries, not 0"
+  ]
+},
+```
+
+---
+
+## User Actions Required for FEAT-013
+
+1. Apply the 6 changes above to `.claude/commands/tasks.md`
+2. Verify all JSON examples are syntactically valid
+3. Set `requiresHuman: false` (or remove the field) and `passes: true` on `99ae54f7-FEAT-013` in `.task-mgr/tasks/loop-reliability.json`
+4. Commit: `feat: 99ae54f7-FEAT-013-completed - /tasks skill schema + validation updates`
+
+---
