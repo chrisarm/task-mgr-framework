@@ -248,6 +248,12 @@ fn complete_single_task(
             "UPDATE tasks SET status = 'done', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
             [task_id],
         )?;
+        // Reset consecutive_failures on success (column added by migration v13;
+        // silently ignored on pre-v13 schemas that lack the column).
+        let _ = conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
+            [task_id],
+        );
     }
 
     // If run_id provided, update run_tasks entry
@@ -839,12 +845,11 @@ mod tests {
 
     // --- retry tracking reset tests (TDD for FEAT-004) ---
 
-    /// Ignored: complete() must reset consecutive_failures to 0 for the completed task.
+    /// complete() must reset consecutive_failures to 0 for the completed task.
     ///
     /// Uses `test_utils::setup_test_db` (runs migrations) to ensure the
     /// `consecutive_failures` column added by migration v13 is present.
     #[test]
-    #[ignore = "FEAT-004: Implement consecutive_failures reset in complete_single_task"]
     fn test_complete_resets_consecutive_failures_to_zero() {
         use crate::loop_engine::test_utils::setup_test_db as setup_migrated_db;
         let (_dir, mut conn) = setup_migrated_db();
@@ -868,12 +873,11 @@ mod tests {
         assert_eq!(count, 0, "complete() must reset consecutive_failures to 0");
     }
 
-    /// Ignored: completing one task must not reset a different task's consecutive_failures.
+    /// Completing one task must not reset a different task's consecutive_failures.
     ///
     /// Uses `test_utils::setup_test_db` (runs migrations) to ensure the
     /// `consecutive_failures` column added by migration v13 is present.
     #[test]
-    #[ignore = "FEAT-004: Reset must be scoped to the completed task only"]
     fn test_complete_does_not_reset_other_tasks_consecutive_failures() {
         use crate::loop_engine::test_utils::setup_test_db as setup_migrated_db;
         let (_dir, mut conn) = setup_migrated_db();

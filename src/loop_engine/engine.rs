@@ -1825,6 +1825,64 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             }
         }
 
+        // Retry tracking: increment consecutive_failures for non-Completed task failures.
+        // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
+        // Increment and auto-block check happen atomically in a single transaction.
+        if let Some(ref task_id) = result.task_id {
+            if !matches!(
+                result.outcome,
+                IterationOutcome::Completed
+                    | IterationOutcome::Empty
+                    | IterationOutcome::Reorder(_)
+                    | IterationOutcome::RateLimit
+            ) {
+                match conn.transaction() {
+                    Ok(tx) => {
+                        let increment_result = increment_consecutive_failures(&tx, task_id);
+                        match increment_result {
+                            Ok(new_count) => {
+                                let max_retries: i32 = tx
+                                    .query_row(
+                                        "SELECT max_retries FROM tasks WHERE id = ?",
+                                        [task_id.as_str()],
+                                        |r| r.get(0),
+                                    )
+                                    .unwrap_or(3);
+                                if should_auto_block(new_count, max_retries) {
+                                    if let Err(e) = auto_block_task(&tx, task_id, new_count) {
+                                        eprintln!(
+                                            "Warning: failed to auto-block task {}: {}",
+                                            task_id, e
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "Auto-blocked task {} after {} consecutive failures",
+                                            task_id, new_count
+                                        );
+                                    }
+                                }
+                                if let Err(e) = tx.commit() {
+                                    eprintln!(
+                                        "Warning: failed to commit retry tracking for {}: {}",
+                                        task_id, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: failed to increment consecutive_failures for {}: {}",
+                                    task_id, e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to start retry tracking transaction: {}", e);
+                    }
+                }
+            }
+        }
+
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::Stale) {
             ctx.stale_tracker.check("stale", "stale"); // same hash → increment
@@ -2226,46 +2284,62 @@ pub fn check_crash_escalation(
 ///
 /// Auto-block fires when `consecutive_failures >= max_retries` AND `max_retries > 0`.
 /// `max_retries=0` disables auto-blocking entirely (task retries indefinitely).
-// TODO(FEAT-003): Implement auto-block logic
-pub fn should_auto_block(_consecutive_failures: i32, _max_retries: i32) -> bool {
-    false
+pub fn should_auto_block(consecutive_failures: i32, max_retries: i32) -> bool {
+    max_retries > 0 && consecutive_failures >= max_retries
 }
 
 /// Returns true if the model should be escalated due to consecutive failures.
 ///
 /// Fires at `consecutive_failures >= 2`, before the auto-block threshold.
 /// Gives the task one more attempt at a higher-tier model before blocking.
-// TODO(FEAT-003): Implement failure-based model escalation
-pub fn should_escalate_for_consecutive_failures(_consecutive_failures: i32) -> bool {
-    false
+pub fn should_escalate_for_consecutive_failures(consecutive_failures: i32) -> bool {
+    consecutive_failures >= 2
 }
 
 /// Increment `consecutive_failures` for a task in the DB.
 ///
 /// Returns the new `consecutive_failures` count after incrementing.
-// TODO(FEAT-003): Implement
-pub fn increment_consecutive_failures(_conn: &Connection, _task_id: &str) -> TaskMgrResult<i32> {
-    todo!("FEAT-003: Implement increment_consecutive_failures")
+pub fn increment_consecutive_failures(conn: &Connection, task_id: &str) -> TaskMgrResult<i32> {
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = consecutive_failures + 1 WHERE id = ?",
+        [task_id],
+    )?;
+    let count: i32 = conn.query_row(
+        "SELECT consecutive_failures FROM tasks WHERE id = ?",
+        [task_id],
+        |r| r.get(0),
+    )?;
+    Ok(count)
 }
 
 /// Reset `consecutive_failures` for a task in the DB to 0.
 ///
 /// Called after a Completed outcome to clear the failure streak.
-// TODO(FEAT-003): Implement
-pub fn reset_consecutive_failures(_conn: &Connection, _task_id: &str) -> TaskMgrResult<()> {
-    todo!("FEAT-003: Implement reset_consecutive_failures")
+pub fn reset_consecutive_failures(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
+        [task_id],
+    )?;
+    Ok(())
 }
 
 /// Auto-block a task by setting status to 'blocked' and recording a descriptive last_error.
 ///
 /// Called when `should_auto_block()` returns true after an iteration.
-// TODO(FEAT-003): Implement
 pub fn auto_block_task(
-    _conn: &Connection,
-    _task_id: &str,
-    _consecutive_failures: i32,
+    conn: &Connection,
+    task_id: &str,
+    consecutive_failures: i32,
 ) -> TaskMgrResult<()> {
-    todo!("FEAT-003: Implement auto_block_task")
+    let msg = format!(
+        "Auto-blocked after {} consecutive failures",
+        consecutive_failures
+    );
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', last_error = ?, updated_at = datetime('now') WHERE id = ?",
+        rusqlite::params![msg, task_id],
+    )?;
+    Ok(())
 }
 
 /// Build an `IterationResult` for a prompt overflow, logging the error to stderr.
@@ -3451,9 +3525,8 @@ mod tests {
         );
     }
 
-    /// Ignored: auto-block triggers at exactly the max_retries threshold.
+    /// Auto-block triggers at exactly the max_retries threshold.
     #[test]
-    #[ignore = "FEAT-003: Implement should_auto_block"]
     fn test_auto_block_triggers_at_max_retries_threshold() {
         assert!(
             should_auto_block(3, 3),
@@ -3461,9 +3534,8 @@ mod tests {
         );
     }
 
-    /// Ignored: auto-block triggers above the threshold.
+    /// Auto-block triggers above the threshold.
     #[test]
-    #[ignore = "FEAT-003: Implement should_auto_block"]
     fn test_auto_block_triggers_above_threshold() {
         assert!(
             should_auto_block(4, 3),
@@ -3471,9 +3543,8 @@ mod tests {
         );
     }
 
-    /// Ignored: auto-block triggers with max_retries=1 after one failure.
+    /// Auto-block triggers with max_retries=1 after one failure.
     #[test]
-    #[ignore = "FEAT-003: Implement should_auto_block"]
     fn test_auto_block_triggers_with_max_retries_one() {
         assert!(
             should_auto_block(1, 1),
@@ -3481,9 +3552,8 @@ mod tests {
         );
     }
 
-    /// Ignored: model escalation fires at consecutive_failures >= 2 (before auto-block at 3).
+    /// Model escalation fires at consecutive_failures >= 2 (before auto-block at 3).
     #[test]
-    #[ignore = "FEAT-003: Implement should_escalate_for_consecutive_failures"]
     fn test_failure_escalation_fires_at_consecutive_failures_two() {
         assert!(
             should_escalate_for_consecutive_failures(2),
@@ -3491,9 +3561,8 @@ mod tests {
         );
     }
 
-    /// Ignored: model escalation also fires at consecutive_failures=3.
+    /// Model escalation also fires at consecutive_failures=3.
     #[test]
-    #[ignore = "FEAT-003: Implement should_escalate_for_consecutive_failures"]
     fn test_failure_escalation_fires_at_three() {
         assert!(
             should_escalate_for_consecutive_failures(3),
@@ -3501,9 +3570,8 @@ mod tests {
         );
     }
 
-    /// Ignored: consecutive_failures increments by 1 in the DB after a non-Completed outcome.
+    /// consecutive_failures increments by 1 in the DB after a non-Completed outcome.
     #[test]
-    #[ignore = "FEAT-003: Implement increment_consecutive_failures"]
     fn test_consecutive_failures_increments_in_db() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
@@ -3526,9 +3594,8 @@ mod tests {
         );
     }
 
-    /// Ignored: consecutive_failures resets to 0 in the DB after a Completed outcome.
+    /// consecutive_failures resets to 0 in the DB after a Completed outcome.
     #[test]
-    #[ignore = "FEAT-003: Implement reset_consecutive_failures"]
     fn test_consecutive_failures_resets_to_zero_in_db() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
@@ -3553,9 +3620,8 @@ mod tests {
         );
     }
 
-    /// Ignored: auto-block sets last_error with a descriptive message.
+    /// Auto-block sets last_error with a descriptive message.
     #[test]
-    #[ignore = "FEAT-003: Implement auto_block_task"]
     fn test_auto_block_sets_last_error_with_descriptive_message() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
@@ -3590,9 +3656,8 @@ mod tests {
         );
     }
 
-    /// Ignored: task succeeds on 3rd attempt → counter resets to 0, auto-block NOT triggered.
+    /// Task succeeds on 3rd attempt → counter resets to 0, auto-block NOT triggered.
     #[test]
-    #[ignore = "FEAT-003: Implement increment/reset consecutive_failures"]
     fn test_task_succeeds_on_third_attempt_counter_resets() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
@@ -3633,9 +3698,8 @@ mod tests {
         );
     }
 
-    /// Ignored: rapid alternating success/failure on same task → counter tracks correctly.
+    /// Rapid alternating success/failure on same task → counter tracks correctly.
     #[test]
-    #[ignore = "FEAT-003: Implement increment/reset consecutive_failures"]
     fn test_rapid_alternating_success_failure_tracks_correctly() {
         use crate::loop_engine::test_utils::setup_test_db;
         let (_dir, conn) = setup_test_db();
