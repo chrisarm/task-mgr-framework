@@ -515,7 +515,8 @@ pub fn run_iteration(
                     config_path.display(),
                 );
                 eprintln!(
-                    "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}", cmd,
+                    "       {{\"additionalAllowedTools\": [\"Bash({}:*)\"]}}",
+                    cmd,
                 );
             }
         }
@@ -912,19 +913,17 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         // Disabled: no prefix at all.
         PrefixMode::Disabled => None,
         // Auto: use PRD hints or auto-generate.
-        PrefixMode::Auto => prd_hints
-            .task_prefix
-            .or_else(|| {
-                // taskPrefix absent: derive deterministic prefix from branchName + filename,
-                // using the same formula as PrefixMode::Auto in init so lock files match
-                // across restarts.
-                let filename = run_config
-                    .prd_file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                Some(generate_prefix(pre_lock_branch.as_deref(), filename))
-            }),
+        PrefixMode::Auto => prd_hints.task_prefix.or_else(|| {
+            // taskPrefix absent: derive deterministic prefix from branchName + filename,
+            // using the same formula as PrefixMode::Auto in init so lock files match
+            // across restarts.
+            let filename = run_config
+                .prd_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            Some(generate_prefix(pre_lock_branch.as_deref(), filename))
+        }),
     }
     .and_then(|p| {
         // Only use prefix if it is safe for filenames
@@ -2223,6 +2222,52 @@ pub fn check_crash_escalation(
     }
 }
 
+/// Returns true if a task should be auto-blocked due to consecutive failures.
+///
+/// Auto-block fires when `consecutive_failures >= max_retries` AND `max_retries > 0`.
+/// `max_retries=0` disables auto-blocking entirely (task retries indefinitely).
+// TODO(FEAT-003): Implement auto-block logic
+pub fn should_auto_block(_consecutive_failures: i32, _max_retries: i32) -> bool {
+    false
+}
+
+/// Returns true if the model should be escalated due to consecutive failures.
+///
+/// Fires at `consecutive_failures >= 2`, before the auto-block threshold.
+/// Gives the task one more attempt at a higher-tier model before blocking.
+// TODO(FEAT-003): Implement failure-based model escalation
+pub fn should_escalate_for_consecutive_failures(_consecutive_failures: i32) -> bool {
+    false
+}
+
+/// Increment `consecutive_failures` for a task in the DB.
+///
+/// Returns the new `consecutive_failures` count after incrementing.
+// TODO(FEAT-003): Implement
+pub fn increment_consecutive_failures(_conn: &Connection, _task_id: &str) -> TaskMgrResult<i32> {
+    todo!("FEAT-003: Implement increment_consecutive_failures")
+}
+
+/// Reset `consecutive_failures` for a task in the DB to 0.
+///
+/// Called after a Completed outcome to clear the failure streak.
+// TODO(FEAT-003): Implement
+pub fn reset_consecutive_failures(_conn: &Connection, _task_id: &str) -> TaskMgrResult<()> {
+    todo!("FEAT-003: Implement reset_consecutive_failures")
+}
+
+/// Auto-block a task by setting status to 'blocked' and recording a descriptive last_error.
+///
+/// Called when `should_auto_block()` returns true after an iteration.
+// TODO(FEAT-003): Implement
+pub fn auto_block_task(
+    _conn: &Connection,
+    _task_id: &str,
+    _consecutive_failures: i32,
+) -> TaskMgrResult<()> {
+    todo!("FEAT-003: Implement auto_block_task")
+}
+
 /// Build an `IterationResult` for a prompt overflow, logging the error to stderr.
 fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) -> IterationResult {
     eprintln!(
@@ -3236,7 +3281,8 @@ mod tests {
     /// Mirrors the inline hint condition in run_loop() so the logic can be unit-tested.
     fn hint_should_fire(mode: &config::PermissionMode) -> bool {
         if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
-            config::parse_bool_value(&val) == Some(true) && !matches!(mode, config::PermissionMode::Auto { .. })
+            config::parse_bool_value(&val) == Some(true)
+                && !matches!(mode, config::PermissionMode::Auto { .. })
         } else {
             false
         }
@@ -3334,6 +3380,327 @@ mod tests {
         assert!(
             HINT_MSG.contains("current settings continue"),
             "Hint must reassure users that their current settings continue to work"
+        );
+    }
+
+    // --- retry tracking and auto-block tests ---
+    //
+    // Active tests verify the "should NOT block/escalate" cases — these pass
+    // against the current stub (returns false).
+    // Ignored tests define the expected behavior contract for FEAT-003/FEAT-004.
+
+    /// Active: auto-block must NOT trigger on first attempt (consecutive_failures=0).
+    #[test]
+    fn test_auto_block_not_triggered_on_first_attempt() {
+        assert!(
+            !should_auto_block(0, 3),
+            "auto-block must not fire on first attempt (consecutive_failures=0, max_retries=3)"
+        );
+    }
+
+    /// Active: max_retries=0 disables auto-block entirely (never fires regardless of failures).
+    #[test]
+    fn test_auto_block_disabled_when_max_retries_zero() {
+        assert!(!should_auto_block(0, 0), "max_retries=0 must disable auto-block at 0 failures");
+        assert!(!should_auto_block(5, 0), "max_retries=0 must disable auto-block at 5 failures");
+        assert!(
+            !should_auto_block(100, 0),
+            "max_retries=0 must disable auto-block regardless of failure count"
+        );
+    }
+
+    /// Active: auto-block does NOT fire one below the threshold (2 < 3).
+    #[test]
+    fn test_auto_block_not_triggered_below_threshold() {
+        assert!(
+            !should_auto_block(2, 3),
+            "auto-block must not fire at consecutive_failures=2, max_retries=3 (threshold not reached)"
+        );
+    }
+
+    /// Active: negative consecutive_failures never triggers auto-block (safety invariant).
+    #[test]
+    fn test_auto_block_negative_failures_safe() {
+        assert!(
+            !should_auto_block(-1, 3),
+            "negative consecutive_failures must never trigger auto-block"
+        );
+    }
+
+    /// Active: model escalation NOT triggered at zero failures.
+    #[test]
+    fn test_failure_escalation_not_triggered_on_zero_failures() {
+        assert!(
+            !should_escalate_for_consecutive_failures(0),
+            "model escalation must not fire at consecutive_failures=0"
+        );
+    }
+
+    /// Active: model escalation NOT triggered at consecutive_failures=1.
+    #[test]
+    fn test_failure_escalation_not_triggered_on_single_failure() {
+        assert!(
+            !should_escalate_for_consecutive_failures(1),
+            "model escalation must not fire at consecutive_failures=1"
+        );
+    }
+
+    /// Ignored: auto-block triggers at exactly the max_retries threshold.
+    #[test]
+    #[ignore = "FEAT-003: Implement should_auto_block"]
+    fn test_auto_block_triggers_at_max_retries_threshold() {
+        assert!(
+            should_auto_block(3, 3),
+            "auto-block must fire when consecutive_failures == max_retries (3 >= 3)"
+        );
+    }
+
+    /// Ignored: auto-block triggers above the threshold.
+    #[test]
+    #[ignore = "FEAT-003: Implement should_auto_block"]
+    fn test_auto_block_triggers_above_threshold() {
+        assert!(
+            should_auto_block(4, 3),
+            "auto-block must fire when consecutive_failures > max_retries (4 >= 3)"
+        );
+    }
+
+    /// Ignored: auto-block triggers with max_retries=1 after one failure.
+    #[test]
+    #[ignore = "FEAT-003: Implement should_auto_block"]
+    fn test_auto_block_triggers_with_max_retries_one() {
+        assert!(
+            should_auto_block(1, 1),
+            "auto-block must fire when consecutive_failures=1 and max_retries=1"
+        );
+    }
+
+    /// Ignored: model escalation fires at consecutive_failures >= 2 (before auto-block at 3).
+    #[test]
+    #[ignore = "FEAT-003: Implement should_escalate_for_consecutive_failures"]
+    fn test_failure_escalation_fires_at_consecutive_failures_two() {
+        assert!(
+            should_escalate_for_consecutive_failures(2),
+            "model escalation must fire at consecutive_failures=2 (before auto-block threshold of 3)"
+        );
+    }
+
+    /// Ignored: model escalation also fires at consecutive_failures=3.
+    #[test]
+    #[ignore = "FEAT-003: Implement should_escalate_for_consecutive_failures"]
+    fn test_failure_escalation_fires_at_three() {
+        assert!(
+            should_escalate_for_consecutive_failures(3),
+            "model escalation must fire at consecutive_failures=3"
+        );
+    }
+
+    /// Ignored: consecutive_failures increments by 1 in the DB after a non-Completed outcome.
+    #[test]
+    #[ignore = "FEAT-003: Implement increment_consecutive_failures"]
+    fn test_consecutive_failures_increments_in_db() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let new_count = increment_consecutive_failures(&conn, "T-001").unwrap();
+        assert_eq!(new_count, 1, "consecutive_failures must increment from 0 to 1");
+
+        let new_count2 = increment_consecutive_failures(&conn, "T-001").unwrap();
+        assert_eq!(new_count2, 2, "consecutive_failures must increment from 1 to 2");
+    }
+
+    /// Ignored: consecutive_failures resets to 0 in the DB after a Completed outcome.
+    #[test]
+    #[ignore = "FEAT-003: Implement reset_consecutive_failures"]
+    fn test_consecutive_failures_resets_to_zero_in_db() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 3)",
+            [],
+        )
+        .unwrap();
+
+        reset_consecutive_failures(&conn, "T-001").unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "consecutive_failures must reset to 0 after success");
+    }
+
+    /// Ignored: auto-block sets last_error with a descriptive message.
+    #[test]
+    #[ignore = "FEAT-003: Implement auto_block_task"]
+    fn test_auto_block_sets_last_error_with_descriptive_message() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries) VALUES ('T-001', 'Test', 'in_progress', 3, 3)",
+            [],
+        )
+        .unwrap();
+
+        auto_block_task(&conn, "T-001", 3).unwrap();
+
+        let (status, last_error): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, last_error FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "blocked", "auto-blocked task must have status='blocked'");
+        assert!(last_error.is_some(), "auto-block must set last_error");
+        let err = last_error.unwrap();
+        // Message must reference failures — exact wording up to implementer
+        assert!(
+            err.contains('3')
+                || err.to_lowercase().contains("consecutive")
+                || err.to_lowercase().contains("fail"),
+            "last_error must describe the failure count, got: '{}'",
+            err
+        );
+    }
+
+    /// Ignored: task succeeds on 3rd attempt → counter resets to 0, auto-block NOT triggered.
+    #[test]
+    #[ignore = "FEAT-003: Implement increment/reset consecutive_failures"]
+    fn test_task_succeeds_on_third_attempt_counter_resets() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures, max_retries) VALUES ('T-001', 'Test', 'in_progress', 0, 3)",
+            [],
+        )
+        .unwrap();
+
+        // Two failures (counter: 0 → 2, below max_retries=3 → no auto-block)
+        let c1 = increment_consecutive_failures(&conn, "T-001").unwrap();
+        assert_eq!(c1, 1);
+        assert!(!should_auto_block(c1, 3), "no auto-block at count=1");
+
+        let c2 = increment_consecutive_failures(&conn, "T-001").unwrap();
+        assert_eq!(c2, 2);
+        assert!(!should_auto_block(c2, 3), "no auto-block at count=2 (below max_retries=3)");
+
+        // Success on 3rd attempt → counter resets to 0
+        reset_consecutive_failures(&conn, "T-001").unwrap();
+        let final_count: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_count, 0, "counter must reset to 0 after success on attempt 3");
+        assert!(!should_auto_block(final_count, 3), "reset counter must not trigger auto-block");
+    }
+
+    /// Ignored: rapid alternating success/failure on same task → counter tracks correctly.
+    #[test]
+    #[ignore = "FEAT-003: Implement increment/reset consecutive_failures"]
+    fn test_rapid_alternating_success_failure_tracks_correctly() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        // Pattern: fail → reset → fail → fail → reset
+        increment_consecutive_failures(&conn, "T-001").unwrap(); // 1
+        reset_consecutive_failures(&conn, "T-001").unwrap(); // 0
+        increment_consecutive_failures(&conn, "T-001").unwrap(); // 1
+        increment_consecutive_failures(&conn, "T-001").unwrap(); // 2
+        reset_consecutive_failures(&conn, "T-001").unwrap(); // 0
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "reset must zero counter regardless of prior alternation pattern");
+
+        // Verify next failure increments from 0
+        increment_consecutive_failures(&conn, "T-001").unwrap();
+        let count2: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count2, 1, "failure after reset must start from 0, not carry over prior streak");
+    }
+
+    /// Ignored: resetting one task's failures does not affect a different task's counter.
+    #[test]
+    #[ignore = "FEAT-003: Implement reset_consecutive_failures"]
+    fn test_reset_scoped_to_task_not_cross_task() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES
+             ('T-001', 'Task A', 'in_progress', 2),
+             ('T-002', 'Task B', 'in_progress', 0);",
+        )
+        .unwrap();
+
+        // Succeeding T-002 must NOT reset T-001's counter
+        reset_consecutive_failures(&conn, "T-002").unwrap();
+        let count_a: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_a, 2,
+            "resetting T-002 must not affect T-001's consecutive_failures"
+        );
+    }
+
+    /// Ignored: increment always produces a non-negative result (invariant).
+    #[test]
+    #[ignore = "FEAT-003: Implement increment_consecutive_failures"]
+    fn test_consecutive_failures_never_goes_negative() {
+        use crate::loop_engine::test_utils::setup_test_db;
+        let (_dir, conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 0)",
+            [],
+        )
+        .unwrap();
+
+        let count = increment_consecutive_failures(&conn, "T-001").unwrap();
+        assert!(count >= 0, "consecutive_failures must never be negative, got {}", count);
+
+        reset_consecutive_failures(&conn, "T-001").unwrap();
+        let after_reset: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            after_reset >= 0,
+            "consecutive_failures must never be negative after reset, got {}",
+            after_reset
         );
     }
 }

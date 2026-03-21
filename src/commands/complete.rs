@@ -836,4 +836,73 @@ mod tests {
         let result_b = complete(&mut conn, &["B".to_string()], None, None, true);
         assert!(result_b.is_ok());
     }
+
+    // --- retry tracking reset tests (TDD for FEAT-004) ---
+
+    /// Ignored: complete() must reset consecutive_failures to 0 for the completed task.
+    ///
+    /// Uses `test_utils::setup_test_db` (runs migrations) to ensure the
+    /// `consecutive_failures` column added by migration v13 is present.
+    #[test]
+    #[ignore = "FEAT-004: Implement consecutive_failures reset in complete_single_task"]
+    fn test_complete_resets_consecutive_failures_to_zero() {
+        use crate::loop_engine::test_utils::setup_test_db as setup_migrated_db;
+        let (_dir, mut conn) = setup_migrated_db();
+        // Insert task with consecutive_failures=3 (has been failing repeatedly)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, consecutive_failures) \
+             VALUES ('T-001', 'Test', 'in_progress', 10, 3)",
+            [],
+        )
+        .unwrap();
+
+        complete(&mut conn, &["T-001".to_string()], None, None, false).unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "complete() must reset consecutive_failures to 0");
+    }
+
+    /// Ignored: completing one task must not reset a different task's consecutive_failures.
+    ///
+    /// Uses `test_utils::setup_test_db` (runs migrations) to ensure the
+    /// `consecutive_failures` column added by migration v13 is present.
+    #[test]
+    #[ignore = "FEAT-004: Reset must be scoped to the completed task only"]
+    fn test_complete_does_not_reset_other_tasks_consecutive_failures() {
+        use crate::loop_engine::test_utils::setup_test_db as setup_migrated_db;
+        let (_dir, mut conn) = setup_migrated_db();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, consecutive_failures) \
+             VALUES ('T-001', 'Task A', 'in_progress', 10, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, consecutive_failures) \
+             VALUES ('T-002', 'Task B', 'in_progress', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Completing T-002 must NOT touch T-001's counter
+        complete(&mut conn, &["T-002".to_string()], None, None, false).unwrap();
+
+        let count_a: i32 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM tasks WHERE id = 'T-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_a, 2,
+            "completing T-002 must not reset T-001's consecutive_failures"
+        );
+    }
 }
