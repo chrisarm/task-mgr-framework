@@ -49,6 +49,42 @@
 - task_type, verifyCommand, environmentChecks in JSON are silently ignored by serde (not yet in parse.rs)
 ---
 
+## 2026-03-21 - 99ae54f7-FEAT-013 (attempt 9)
+- BLOCKED (same as attempts 1-8): Edit tool denied for .claude/commands/tasks.md
+- global settings.json shows `Write` and `Edit` in allow list, but still denied in don't-ask mode
+- `requiresHuman: true` is set on task but loop engine doesn't filter it yet (new feature in this PRD)
+- Full change spec documented in escalationNote. User must: add .claude/commands/ to allowed write paths
+  OR manually apply changes below.
+
+**EXACT CHANGES NEEDED** (copy-paste ready):
+
+1. JSON schema (Step 5, after "timeoutSecs": 1800 line):
+   Add: `"task_type": "feat|fix|research|spike|review|milestone",`
+   Add: `"max_retries": 3,`
+   Add: `"verify_command": "cargo test -- test_name",`
+
+2. Model selection table (Step 1.5, after last table row before closing):
+   Add row: `| \`task_type: "research"\` or \`task_type: "spike"\` | opus | Research/exploratory tasks requiring thorough analysis |`
+
+3. Step 4 (after prefix list, before "### Step 4.5"):
+   Add paragraph: `**Task ID Prefix Convention**: When a PRD has a UUID prefix (short 8-char string like \`99ae54f7\`), task IDs include that prefix: \`99ae54f7-FEAT-001\`. The loop engine uses this prefix to name the progress file \`progress-{prefix}.txt\`, ensuring PRDs have isolated progress logs.`
+
+4. Step 8 validation (add to checklist after existing items):
+   `- [ ] \`max_retries\` is an integer in range 1-10 (omit for default 3)`
+   `- [ ] \`task_type\` is one of: feat, fix, research, spike, review, milestone, test, int, analysis, verify, refactor`
+   `- [ ] \`verify_command\` is a valid shell command string (omit if no custom verification needed)`
+
+5. CODE-FIX template (add after "touchesFiles" line in template):
+   `"rootCause": "Underlying condition causing this issue",`
+   `"exactFix": "Precise code change needed to address root cause",`
+   `"max_retries": 2,`
+
+6. qualityDimensions examples (update in user story schema template):
+   correctness: "Schema documentation matches actual implementation (no phantom fields, no missing required fields)"
+   performance: "N/A for documentation tasks; for implementation: use early exit on auto-blocked tasks"
+   style: "Follow existing tasks.md table/JSON formatting patterns; JSON examples must be syntactically valid"
+---
+
 ## 2026-03-21 - 99ae54f7-MILESTONE-2
 - Quality gate verification: all checks pass
 - cargo fmt --check: clean
