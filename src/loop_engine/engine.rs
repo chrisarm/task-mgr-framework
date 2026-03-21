@@ -2330,8 +2330,8 @@ pub fn auto_block_task(
     consecutive_failures: i32,
 ) -> TaskMgrResult<()> {
     let msg = format!(
-        "Auto-blocked after {} consecutive failures",
-        consecutive_failures
+        "Auto-blocked after {} consecutive failures (task: {})",
+        consecutive_failures, task_id
     );
     conn.execute(
         "UPDATE tasks SET status = 'blocked', last_error = ?, updated_at = datetime('now') WHERE id = ?",
