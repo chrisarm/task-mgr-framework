@@ -19,6 +19,11 @@ pub(crate) type RelationshipMaps = (
     HashMap<String, Vec<String>>, // conflicts_with
 );
 
+/// Default value for max_retries deserialization (used when field absent in old JSON).
+fn default_max_retries_value() -> i32 {
+    3
+}
+
 /// JSON structure for a user story in the exported PRD.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +60,10 @@ pub struct ExportedUserStory {
     pub difficulty: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_note: Option<String>,
+    /// Per-task retry limit. Always exported so the value survives round-trips.
+    /// Defaults to 3 on deserialization (handles old exported JSONs that lack this field).
+    #[serde(default = "default_max_retries_value")]
+    pub max_retries: i32,
 }
 
 /// JSON structure for the exported PRD file.
@@ -74,6 +83,9 @@ pub struct ExportedPrd {
     pub review_guidelines: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// PRD-level default retry limit. Absent from JSON when NULL (backward compat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_retries: Option<i32>,
     pub user_stories: Vec<ExportedUserStory>,
 }
 
@@ -86,6 +98,7 @@ pub(crate) struct PrdMetadata {
     pub global_acceptance_criteria: Option<Value>,
     pub review_guidelines: Option<Value>,
     pub default_model: Option<String>,
+    pub default_max_retries: Option<i32>,
 }
 
 /// Load PRD metadata from the database.
@@ -103,13 +116,14 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
             global_acceptance_criteria: None,
             review_guidelines: None,
             default_model: None,
+            default_max_retries: None,
         });
     }
 
     conn.query_row(
         r#"SELECT project, branch_name, description,
            priority_philosophy, global_acceptance_criteria, review_guidelines,
-           default_model
+           default_model, default_max_retries
            FROM prd_metadata ORDER BY id ASC LIMIT 1"#,
         [],
         |row| {
@@ -120,6 +134,7 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
             let global_str: Option<String> = row.get("global_acceptance_criteria")?;
             let review_str: Option<String> = row.get("review_guidelines")?;
             let default_model: Option<String> = row.get("default_model")?;
+            let default_max_retries: Option<i32> = row.get("default_max_retries")?;
 
             // Parse JSON strings back to Values
             let priority_philosophy = priority_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -134,6 +149,7 @@ pub(crate) fn load_prd_metadata(conn: &Connection) -> TaskMgrResult<PrdMetadata>
                 global_acceptance_criteria,
                 review_guidelines,
                 default_model,
+                default_max_retries,
             })
         },
     )
@@ -146,7 +162,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
     let mut stmt = conn.prepare(
         r#"SELECT id, title, description, priority, status, notes,
            acceptance_criteria, review_scope, severity, source_review,
-           model, difficulty, escalation_note
+           model, difficulty, escalation_note, max_retries
            FROM tasks ORDER BY id"#,
     )?;
 
@@ -164,6 +180,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         let model: Option<String> = row.get("model")?;
         let difficulty: Option<String> = row.get("difficulty")?;
         let escalation_note: Option<String> = row.get("escalation_note")?;
+        // Graceful fallback: column may not exist on pre-migration DBs
+        let max_retries: i32 = row.get::<_, i32>("max_retries").unwrap_or(3);
 
         Ok((
             id,
@@ -179,6 +197,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             model,
             difficulty,
             escalation_note,
+            max_retries,
         ))
     })?;
 
@@ -205,6 +224,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             model,
             difficulty,
             escalation_note,
+            max_retries,
         ) = row?;
 
         // Map status to passes boolean
@@ -255,6 +275,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             model,
             difficulty,
             escalation_note,
+            max_retries,
         });
     }
 

@@ -93,6 +93,7 @@ pub fn export(
         global_acceptance_criteria: metadata.global_acceptance_criteria,
         review_guidelines: metadata.review_guidelines,
         model: metadata.default_model,
+        default_max_retries: metadata.default_max_retries,
         user_stories: tasks,
     };
 

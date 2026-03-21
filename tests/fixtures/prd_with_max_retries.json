@@ -1,0 +1,36 @@
+{
+  "project": "max-retries-test",
+  "branchName": "test/max-retries",
+  "description": "PRD with maxRetries and defaultMaxRetries fields for round-trip testing.",
+  "defaultMaxRetries": 5,
+  "userStories": [
+    {
+      "id": "MR-001",
+      "title": "Task with explicit maxRetries overriding PRD default",
+      "description": "Explicit maxRetries: 7 overrides the PRD defaultMaxRetries: 5.",
+      "priority": 1,
+      "passes": false,
+      "maxRetries": 7,
+      "taskType": "implementation",
+      "verifyCommand": "cargo test --test retry",
+      "touchesFiles": ["src/retry.rs"]
+    },
+    {
+      "id": "MR-002",
+      "title": "Task inheriting PRD default maxRetries",
+      "description": "No explicit maxRetries — resolved value should equal defaultMaxRetries: 5.",
+      "priority": 2,
+      "passes": false,
+      "touchesFiles": ["src/default.rs"]
+    },
+    {
+      "id": "MR-003",
+      "title": "Task with explicit maxRetries lower than PRD default",
+      "description": "Explicit maxRetries: 2 overrides the PRD defaultMaxRetries: 5.",
+      "priority": 3,
+      "passes": false,
+      "maxRetries": 2,
+      "touchesFiles": ["src/lower.rs"]
+    }
+  ]
+}
