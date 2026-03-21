@@ -986,6 +986,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         &run_config.db_dir,
         &paths.tasks_dir,
         run_config.config.yes_mode,
+        pre_lock_prefix.as_deref(),
     ) {
         Ok(true) => {
             eprintln!("Branch change handled, continuing with new branch setup");

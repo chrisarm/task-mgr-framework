@@ -126,7 +126,9 @@ fn archive_single_prd(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if file_name == "progress.txt" {
+        if file_name == "progress.txt"
+            || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))
+        {
             continue;
         }
         items.push(ArchivedItem {
@@ -2328,7 +2330,6 @@ mod tests {
     /// FAILS until FEAT-012 updates `archive_single_prd` to use the pattern:
     /// `file_name == "progress.txt" || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))`
     #[test]
-    #[ignore = "Fails until FEAT-012 updates skip condition to cover progress-*.txt"]
     fn test_archive_skips_prefixed_progress_file() {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
