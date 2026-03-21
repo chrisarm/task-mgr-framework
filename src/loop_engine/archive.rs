@@ -2278,6 +2278,102 @@ mod tests {
         );
     }
 
+    // --- progress file skip: exact and prefix-scoped ---
+
+    /// progress.txt registered in prd_files must never be moved during archive.
+    /// Tests the existing exact-match skip (`file_name == "progress.txt"`).
+    #[test]
+    fn test_archive_skips_exact_progress_via_prd_files() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        // Use "prd" as file_type — schema CHECK only allows prd/task_list/prompt;
+        // the type is irrelevant to the skip logic being tested.
+        insert_prd_file(&conn, 1, "progress.txt", "prd");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join("progress.txt"), "## PA-001\n- Done.\n---\n").unwrap();
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert!(
+            !result.archived.is_empty(),
+            "Archive should produce results"
+        );
+
+        // progress.txt must remain in tasks/
+        assert!(
+            tasks_dir.join("progress.txt").exists(),
+            "progress.txt must never be moved to the archive"
+        );
+
+        // progress.txt must NOT appear in archived list
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources.iter().any(|s| s.contains("progress.txt")),
+            "progress.txt must not appear in archived items"
+        );
+    }
+
+    /// progress-PA.txt (prefix-scoped progress file) must never be moved during archive.
+    /// Verifies the skip pattern covers both "progress.txt" and "progress-*.txt".
+    ///
+    /// FAILS until FEAT-012 updates `archive_single_prd` to use the pattern:
+    /// `file_name == "progress.txt" || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))`
+    #[test]
+    #[ignore = "Fails until FEAT-012 updates skip condition to cover progress-*.txt"]
+    fn test_archive_skips_prefixed_progress_file() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
+        insert_task(&conn, "PA-001", "PA Task", 1, "done");
+        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        // Use "prd" as file_type — schema CHECK only allows prd/task_list/prompt;
+        // the type is irrelevant to the skip logic being tested.
+        insert_prd_file(&conn, 1, "progress-PA.txt", "prd");
+        drop(conn);
+
+        let tasks_dir = dir.path().join("tasks");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(
+            tasks_dir.join("progress-PA.txt"),
+            "## PA-001\n- Done.\n---\n",
+        )
+        .unwrap();
+
+        let result = run_archive(dir.path(), false, None).unwrap();
+
+        assert!(
+            !result.archived.is_empty(),
+            "Archive should produce results"
+        );
+
+        // progress-PA.txt must remain in tasks/
+        assert!(
+            tasks_dir.join("progress-PA.txt").exists(),
+            "progress-PA.txt must never be moved to the archive"
+        );
+
+        // progress-PA.txt must NOT appear in archived list
+        let archived_sources: Vec<&str> =
+            result.archived.iter().map(|a| a.source.as_str()).collect();
+        assert!(
+            !archived_sources
+                .iter()
+                .any(|s| s.contains("progress-PA.txt")),
+            "progress-PA.txt must not appear in archived items"
+        );
+    }
+
     /// With branch_filter=None, all completed PRDs are archived (backward compat).
     #[test]
     fn test_branch_filter_none_archives_all() {

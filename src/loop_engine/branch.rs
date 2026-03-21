@@ -131,6 +131,23 @@ pub fn detect_branch_change(
     Ok(true)
 }
 
+/// Returns the progress file name for the given task prefix.
+///
+/// With `prefix = Some("P1")` → `"progress-P1.txt"`.
+/// With `prefix = None`       → `"progress.txt"`.
+///
+/// Mirrors the naming used in `env::resolve_paths` so all parts of the loop
+/// engine agree on which progress file to read/write.
+///
+/// Not yet called from production code — wired in by FEAT-011.
+#[allow(dead_code)]
+pub(crate) fn progress_file_name(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(p) => format!("progress-{}.txt", p),
+        None => "progress.txt".to_string(),
+    }
+}
+
 /// Write the current branch name to .last-branch file.
 fn write_last_branch(path: &Path, branch: &str) -> TaskMgrResult<()> {
     std::fs::write(path, format!("{}\n", branch))
@@ -342,6 +359,20 @@ mod tests {
         let result =
             detect_branch_change(tmp.path(), tmp.path(), &tasks_dir, true).expect("detect");
         assert!(!result, "Should trim whitespace and detect same branch");
+    }
+
+    // --- progress_file_name ---
+
+    #[test]
+    fn test_progress_file_name_with_prefix() {
+        // branch.rs: progress file with prefix P1 is progress-P1.txt
+        assert_eq!(progress_file_name(Some("P1")), "progress-P1.txt");
+    }
+
+    #[test]
+    fn test_progress_file_name_without_prefix() {
+        // branch.rs: progress file without prefix is progress.txt
+        assert_eq!(progress_file_name(None), "progress.txt");
     }
 
     #[test]
