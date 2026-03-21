@@ -1836,7 +1836,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
             ) {
-                if let Err(e) = handle_task_failure(&mut conn, task_id) {
+                if let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64) {
                     eprintln!("Warning: failed to start retry tracking transaction: {}", e);
                 }
             }
@@ -2274,8 +2274,7 @@ pub fn escalate_task_model_if_needed(
     let current_model: Option<String> = conn
         .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
-        })
-        .unwrap_or(None);
+        })?;
     // None/empty model: assume sonnet baseline → escalate to opus (matches check_crash_escalation).
     let escalated = match current_model.as_deref().filter(|s| !s.is_empty()) {
         None => Some(model::OPUS_MODEL.to_string()),
@@ -2324,25 +2323,35 @@ pub fn reset_consecutive_failures(conn: &Connection, task_id: &str) -> TaskMgrRe
 /// Auto-block a task by setting status to 'blocked' and recording a descriptive last_error.
 ///
 /// Called when `should_auto_block()` returns true after an iteration.
+/// Sets `blocked_at_iteration` for decay tracking (consistent with `fail/transition.rs`).
 pub fn auto_block_task(
     conn: &Connection,
     task_id: &str,
     consecutive_failures: i32,
+    current_iteration: i64,
 ) -> TaskMgrResult<()> {
     let msg = format!(
         "Auto-blocked after {} consecutive failures (task: {})",
         consecutive_failures, task_id
     );
     conn.execute(
-        "UPDATE tasks SET status = 'blocked', last_error = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![msg, task_id],
+        "UPDATE tasks SET status = 'blocked', last_error = ?, blocked_at_iteration = ?, updated_at = datetime('now') WHERE id = ?",
+        rusqlite::params![msg, current_iteration, task_id],
     )?;
     Ok(())
 }
 
 /// Increment consecutive failure count, escalate model tier if needed, and auto-block if the
 /// task has exhausted its retry budget. All DB writes are wrapped in a single transaction.
-pub fn handle_task_failure(conn: &mut Connection, task_id: &str) -> TaskMgrResult<()> {
+///
+/// `current_iteration` is used to set `blocked_at_iteration` on auto-blocked tasks for
+/// decay tracking. Escalation is skipped when auto-block fires on the same iteration
+/// (the escalated model would never be used).
+pub fn handle_task_failure(
+    conn: &mut Connection,
+    task_id: &str,
+    current_iteration: i64,
+) -> TaskMgrResult<()> {
     let tx = conn.transaction()?;
 
     let new_count = increment_consecutive_failures(&tx, task_id).map_err(|e| {
@@ -2353,10 +2362,6 @@ pub fn handle_task_failure(conn: &mut Connection, task_id: &str) -> TaskMgrResul
         e
     })?;
 
-    if let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
-        eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
-    }
-
     let max_retries: i32 = tx
         .query_row(
             "SELECT max_retries FROM tasks WHERE id = ?",
@@ -2365,8 +2370,15 @@ pub fn handle_task_failure(conn: &mut Connection, task_id: &str) -> TaskMgrResul
         )
         .unwrap_or(3);
 
+    // Only escalate if auto-block won't immediately follow (escalated model would never be used)
+    if !should_auto_block(new_count, max_retries) {
+        if let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
+            eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+        }
+    }
+
     if should_auto_block(new_count, max_retries) {
-        if let Err(e) = auto_block_task(&tx, task_id, new_count) {
+        if let Err(e) = auto_block_task(&tx, task_id, new_count, current_iteration) {
             eprintln!("Warning: failed to auto-block task {}: {}", task_id, e);
         } else {
             eprintln!(
@@ -2376,12 +2388,7 @@ pub fn handle_task_failure(conn: &mut Connection, task_id: &str) -> TaskMgrResul
         }
     }
 
-    if let Err(e) = tx.commit() {
-        eprintln!(
-            "Warning: failed to commit retry tracking for {}: {}",
-            task_id, e
-        );
-    }
+    tx.commit()?;
 
     Ok(())
 }
@@ -3666,7 +3673,7 @@ mod tests {
         )
         .unwrap();
 
-        auto_block_task(&conn, "T-001", 3).unwrap();
+        auto_block_task(&conn, "T-001", 3, 1).unwrap();
 
         let (status, last_error): (String, Option<String>) = conn
             .query_row(

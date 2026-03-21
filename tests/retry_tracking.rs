@@ -144,7 +144,7 @@ fn test_auto_block_message_contains_task_id_and_failure_count() {
     let (_dir, conn) = setup_db();
     insert_retry_task(&conn, "FAIL-007", Some(SONNET_MODEL), 3, 3);
 
-    auto_block_task(&conn, "FAIL-007", 3).unwrap();
+    auto_block_task(&conn, "FAIL-007", 3, 1).unwrap();
 
     let (_, _, status, last_error) = read_task_state(&conn, "FAIL-007");
     assert_eq!(
@@ -163,6 +163,20 @@ fn test_auto_block_message_contains_task_id_and_failure_count() {
         "last_error must reference the failure count, got: '{}'",
         err
     );
+
+    // blocked_at_iteration must be set for decay tracking
+    let blocked_iter: Option<i64> = conn
+        .query_row(
+            "SELECT blocked_at_iteration FROM tasks WHERE id = 'FAIL-007'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_iter,
+        Some(1),
+        "auto_block_task must set blocked_at_iteration"
+    );
 }
 
 /// auto_block_task works correctly with a different task ID — verifies message
@@ -172,7 +186,7 @@ fn test_auto_block_message_task_id_interpolation() {
     let (_dir, conn) = setup_db();
     insert_retry_task(&conn, "XYZ-999", Some(SONNET_MODEL), 5, 5);
 
-    auto_block_task(&conn, "XYZ-999", 5).unwrap();
+    auto_block_task(&conn, "XYZ-999", 5, 1).unwrap();
 
     let (_, _, _, last_error) = read_task_state(&conn, "XYZ-999");
     let err = last_error.expect("auto_block_task must populate last_error");
@@ -254,7 +268,7 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
     insert_retry_task(&conn, "TASK-A", Some(SONNET_MODEL), 3, 0);
 
     // Failure 1
-    handle_task_failure(&mut conn, "TASK-A").unwrap();
+    handle_task_failure(&mut conn, "TASK-A", 1).unwrap();
     let (count, model, status, _) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 1, "failure 1: count must be 1");
     assert_eq!(
@@ -265,7 +279,7 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
     assert_eq!(status, "in_progress", "failure 1: task must not be blocked");
 
     // Failure 2: escalation fires (count=2 >= threshold=2)
-    handle_task_failure(&mut conn, "TASK-A").unwrap();
+    handle_task_failure(&mut conn, "TASK-A", 2).unwrap();
     let (count, model, status, _) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 2, "failure 2: count must be 2");
     assert_eq!(
@@ -278,8 +292,8 @@ fn test_handle_task_failure_escalation_at_two_then_block_at_three() {
         "failure 2: task must not yet be blocked"
     );
 
-    // Failure 3: auto-block fires (count=3 >= max_retries=3)
-    handle_task_failure(&mut conn, "TASK-A").unwrap();
+    // Failure 3: auto-block fires (count=3 >= max_retries=3), escalation skipped (would be wasted)
+    handle_task_failure(&mut conn, "TASK-A", 3).unwrap();
     let (count, model, status, last_error) = read_task_state(&conn, "TASK-A");
     assert_eq!(count, 3, "failure 3: count must be 3");
     assert_eq!(
@@ -299,8 +313,8 @@ fn test_handle_task_failure_max_retries_zero_never_blocks() {
     let (_dir, mut conn) = setup_db();
     insert_retry_task(&conn, "NEVER-BLOCK", Some(SONNET_MODEL), 0, 0);
 
-    for _ in 0..5 {
-        handle_task_failure(&mut conn, "NEVER-BLOCK").unwrap();
+    for i in 0..5 {
+        handle_task_failure(&mut conn, "NEVER-BLOCK", i + 1).unwrap();
     }
 
     let (count, _, status, _) = read_task_state(&conn, "NEVER-BLOCK");
@@ -320,7 +334,7 @@ fn test_handle_task_failure_max_retries_one_blocks_immediately() {
     let (_dir, mut conn) = setup_db();
     insert_retry_task(&conn, "BLOCK-FAST", Some(SONNET_MODEL), 1, 0);
 
-    handle_task_failure(&mut conn, "BLOCK-FAST").unwrap();
+    handle_task_failure(&mut conn, "BLOCK-FAST", 1).unwrap();
 
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-FAST");
     assert_eq!(
@@ -340,7 +354,7 @@ fn test_handle_task_failure_max_retries_two_blocks_on_second() {
     insert_retry_task(&conn, "BLOCK-TWO", Some(SONNET_MODEL), 2, 0);
 
     // Failure 1: no block yet
-    handle_task_failure(&mut conn, "BLOCK-TWO").unwrap();
+    handle_task_failure(&mut conn, "BLOCK-TWO", 1).unwrap();
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-TWO");
     assert_eq!(count, 1, "failure 1: count must be 1");
     assert_eq!(
@@ -348,8 +362,8 @@ fn test_handle_task_failure_max_retries_two_blocks_on_second() {
         "failure 1: must not block at count=1, max_retries=2"
     );
 
-    // Failure 2: blocks
-    handle_task_failure(&mut conn, "BLOCK-TWO").unwrap();
+    // Failure 2: blocks (escalation skipped — would be wasted since auto-block fires too)
+    handle_task_failure(&mut conn, "BLOCK-TWO", 2).unwrap();
     let (count, _, status, _) = read_task_state(&conn, "BLOCK-TWO");
     assert_eq!(count, 2, "failure 2: count must be 2");
     assert_eq!(
@@ -394,7 +408,7 @@ fn test_handle_task_failure_haiku_escalates_to_sonnet_at_two() {
     insert_retry_task(&conn, "HAIKU-PIPE", Some(HAIKU_MODEL), 5, 0);
 
     // Failure 1: no escalation
-    handle_task_failure(&mut conn, "HAIKU-PIPE").unwrap();
+    handle_task_failure(&mut conn, "HAIKU-PIPE", 1).unwrap();
     let (_, model, _, _) = read_task_state(&conn, "HAIKU-PIPE");
     assert_eq!(
         model.as_deref(),
@@ -403,7 +417,7 @@ fn test_handle_task_failure_haiku_escalates_to_sonnet_at_two() {
     );
 
     // Failure 2: escalates haiku → sonnet
-    handle_task_failure(&mut conn, "HAIKU-PIPE").unwrap();
+    handle_task_failure(&mut conn, "HAIKU-PIPE", 2).unwrap();
     let (_, model, status, _) = read_task_state(&conn, "HAIKU-PIPE");
     assert_eq!(
         model.as_deref(),

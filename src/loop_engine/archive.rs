@@ -2326,9 +2326,6 @@ mod tests {
 
     /// progress-PA.txt (prefix-scoped progress file) must never be moved during archive.
     /// Verifies the skip pattern covers both "progress.txt" and "progress-*.txt".
-    ///
-    /// FAILS until FEAT-012 updates `archive_single_prd` to use the pattern:
-    /// `file_name == "progress.txt" || (file_name.starts_with("progress-") && file_name.ends_with(".txt"))`
     #[test]
     fn test_archive_skips_prefixed_progress_file() {
         let dir = TempDir::new().unwrap();

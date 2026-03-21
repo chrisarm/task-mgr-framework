@@ -249,11 +249,16 @@ fn complete_single_task(
             [task_id],
         )?;
         // Reset consecutive_failures on success (column added by migration v13;
-        // silently ignored on pre-v13 schemas that lack the column).
-        let _ = conn.execute(
+        // tolerated on pre-v13 schemas that lack the column).
+        if let Err(e) = conn.execute(
             "UPDATE tasks SET consecutive_failures = 0 WHERE id = ?",
             [task_id],
-        );
+        ) {
+            eprintln!(
+                "Warning: failed to reset consecutive_failures for {}: {}",
+                task_id, e
+            );
+        }
     }
 
     // If run_id provided, update run_tasks entry

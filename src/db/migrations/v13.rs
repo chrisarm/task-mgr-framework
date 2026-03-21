@@ -55,7 +55,6 @@ mod tests {
     }
 
     /// Schema version must be 13 after full migration run.
-    /// This is the ONE active test — all others are #[ignore] pending FEAT-001.
     #[test]
     fn test_v13_current_schema_version_is_13() {
         let (_temp_dir, conn) = setup_migrated_db();
@@ -66,12 +65,6 @@ mod tests {
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(version, 13, "DB schema_version must be 13 after migration");
     }
-
-    // =========================================================================
-    // Tests below verify what FEAT-001 must implement.
-    // They are #[ignore] because the stub migration doesn't add DB columns yet.
-    // Remove #[ignore] once FEAT-001 implements the full ALTER TABLE statements.
-    // =========================================================================
 
     /// After v13 up, `tasks.max_retries` column must exist.
     #[test]
