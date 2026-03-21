@@ -42,6 +42,8 @@ pub struct PrdUserStory {
     pub escalation_note: Option<String>,
     #[serde(default)]
     pub required_tests: Vec<String>,
+    #[serde(default)]
+    pub max_retries: Option<i32>,
 }
 
 /// JSON structure for the PRD file.
@@ -75,4 +77,8 @@ pub struct PrdFile {
     /// in the database after import.
     #[serde(default)]
     pub model: Option<String>,
+    /// Default max retries for all tasks in this PRD. Per-task maxRetries overrides this.
+    /// Maps to `prd_metadata.default_max_retries` in the database after import.
+    #[serde(default)]
+    pub default_max_retries: Option<i32>,
 }

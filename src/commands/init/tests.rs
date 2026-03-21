@@ -1628,6 +1628,178 @@ fn test_insert_prd_metadata_without_default_model() {
     assert_eq!(default_model, None);
 }
 
+// --- max_retries import tests ---
+
+/// No maxRetries in JSON → task gets default of 3.
+#[test]
+fn test_insert_task_max_retries_defaults_to_3() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let max_retries: i64 = conn
+        .query_row(
+            "SELECT max_retries FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(max_retries, 3, "tasks without maxRetries must default to 3");
+}
+
+/// Per-task maxRetries overrides PRD defaultMaxRetries.
+#[test]
+fn test_insert_task_per_task_max_retries_overrides_prd_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "defaultMaxRetries": 5,
+        "userStories": [
+            {"id": "US-001", "title": "Override", "priority": 1, "passes": false, "maxRetries": 2},
+            {"id": "US-002", "title": "Default", "priority": 2, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let mr1: i64 = conn
+        .query_row(
+            "SELECT max_retries FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mr2: i64 = conn
+        .query_row(
+            "SELECT max_retries FROM tasks WHERE id = 'US-002'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(mr1, 2, "per-task maxRetries=2 must override PRD default=5");
+    assert_eq!(mr2, 5, "task without maxRetries must use PRD default=5");
+}
+
+/// PRD defaultMaxRetries stored in prd_metadata.
+#[test]
+fn test_insert_prd_metadata_stores_default_max_retries() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "test",
+        "defaultMaxRetries": 7,
+        "userStories": [
+            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let default_max_retries: Option<i64> = conn
+        .query_row(
+            "SELECT default_max_retries FROM prd_metadata WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        default_max_retries,
+        Some(7),
+        "prd_metadata.default_max_retries must store PRD defaultMaxRetries"
+    );
+}
+
+/// Old JSON without maxRetries/defaultMaxRetries: all tasks default to 3, prd_metadata is NULL.
+#[test]
+fn test_insert_task_old_json_no_max_retries_fields() {
+    let temp_dir = TempDir::new().unwrap();
+    let json = r#"{
+        "project": "legacy",
+        "userStories": [
+            {"id": "US-001", "title": "Old task", "priority": 1, "passes": false}
+        ]
+    }"#;
+    let path = temp_dir.path().join("prd.json");
+    fs::write(&path, json).unwrap();
+
+    init(
+        temp_dir.path(),
+        &[&path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let task_mr: i64 = conn
+        .query_row(
+            "SELECT max_retries FROM tasks WHERE id = 'US-001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let prd_mr: Option<i64> = conn
+        .query_row(
+            "SELECT default_max_retries FROM prd_metadata WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(task_mr, 3, "legacy task must default to max_retries=3");
+    assert_eq!(
+        prd_mr, None,
+        "legacy PRD must have NULL default_max_retries"
+    );
+}
+
 // --- Deterministic prefix generation tests ---
 
 #[test]
@@ -1686,7 +1858,10 @@ fn test_prefix_id_adds_prefix() {
 #[test]
 fn test_prefix_id_idempotent_when_already_prefixed() {
     // If the ID already starts with the prefix, don't double it
-    assert_eq!(super::prefix_id("KBTEST", "KBTEST-FEAT-001"), "KBTEST-FEAT-001");
+    assert_eq!(
+        super::prefix_id("KBTEST", "KBTEST-FEAT-001"),
+        "KBTEST-FEAT-001"
+    );
     assert_eq!(super::prefix_id("P1", "P1-US-003"), "P1-US-003");
 }
 
@@ -1779,6 +1954,7 @@ mod scoped_import_tests {
             task_prefix: task_prefix.map(|s| s.to_string()),
             prd_file: None,
             model: None,
+            default_max_retries: None,
         }
     }
 

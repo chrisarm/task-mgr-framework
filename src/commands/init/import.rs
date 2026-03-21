@@ -173,8 +173,8 @@ pub fn insert_prd_metadata(
         r#"INSERT INTO prd_metadata
            (project, branch_name, description, priority_philosophy,
             global_acceptance_criteria, review_guidelines, raw_json,
-            external_git_repo, task_prefix, default_model, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            external_git_repo, task_prefix, default_model, default_max_retries, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
            ON CONFLICT(task_prefix) DO UPDATE SET
                project = excluded.project,
                branch_name = excluded.branch_name,
@@ -185,6 +185,7 @@ pub fn insert_prd_metadata(
                raw_json = excluded.raw_json,
                external_git_repo = excluded.external_git_repo,
                default_model = excluded.default_model,
+               default_max_retries = excluded.default_max_retries,
                updated_at = excluded.updated_at"#,
         rusqlite::params![
             prd.project,
@@ -197,6 +198,7 @@ pub fn insert_prd_metadata(
             prd.external_git_repo,
             prd.task_prefix,
             prd.model,
+            prd.default_max_retries,
         ],
     )?;
 
@@ -218,7 +220,14 @@ pub fn insert_prd_metadata(
 }
 
 /// Insert a task into the database.
-pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()> {
+///
+/// `prd_default_max_retries` is the PRD-level default used to resolve the per-task
+/// `max_retries`. Precedence: story.max_retries > prd_default_max_retries > 3.
+pub fn insert_task(
+    conn: &Connection,
+    story: &PrdUserStory,
+    prd_default_max_retries: Option<i32>,
+) -> TaskMgrResult<()> {
     // Map passes boolean to TaskStatus
     let status = if story.passes {
         TaskStatus::Done
@@ -243,12 +252,17 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
         Some(serde_json::to_string(&story.required_tests)?)
     };
 
+    // Resolve max_retries: per-task > PRD default > hardcoded 3
+    let max_retries = story
+        .max_retries
+        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+
     conn.execute(
         r#"INSERT INTO tasks
            (id, title, description, priority, status, notes, acceptance_criteria,
             review_scope, severity, source_review, model, difficulty, escalation_note,
-            required_tests)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            required_tests, max_retries)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             story.id,
             story.title,
@@ -264,6 +278,7 @@ pub fn insert_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             story.difficulty,
             story.escalation_note,
             required_tests,
+            max_retries,
         ],
     )?;
 
@@ -316,7 +331,14 @@ pub fn insert_task_relationships(conn: &Connection, story: &PrdUserStory) -> Tas
 }
 
 /// Update an existing task in the database.
-pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()> {
+///
+/// `prd_default_max_retries` is the PRD-level default used to resolve the per-task
+/// `max_retries`. Precedence: story.max_retries > prd_default_max_retries > 3.
+pub fn update_task(
+    conn: &Connection,
+    story: &PrdUserStory,
+    prd_default_max_retries: Option<i32>,
+) -> TaskMgrResult<()> {
     // Serialize acceptance criteria as JSON array
     let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
 
@@ -334,6 +356,11 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
         Some(serde_json::to_string(&story.required_tests)?)
     };
 
+    // Resolve max_retries: per-task > PRD default > hardcoded 3
+    let max_retries = story
+        .max_retries
+        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+
     // Note: We don't update status from passes here - the task may have been
     // completed in the DB since the JSON was written. We only update metadata.
     conn.execute(
@@ -341,7 +368,7 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
            title = ?, description = ?, priority = ?, notes = ?,
            acceptance_criteria = ?, review_scope = ?, severity = ?,
            source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
-           required_tests = ?,
+           required_tests = ?, max_retries = ?,
            updated_at = datetime('now')
            WHERE id = ?"#,
         rusqlite::params![
@@ -357,6 +384,7 @@ pub fn update_task(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<()>
             story.difficulty,
             story.escalation_note,
             required_tests,
+            max_retries,
             story.id,
         ],
     )?;

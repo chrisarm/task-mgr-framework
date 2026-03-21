@@ -340,6 +340,7 @@ pub fn init(
                 task_prefix: resolved_prefix.clone().or(prd.task_prefix.clone()),
                 prd_file: prd.prd_file.clone(),
                 model: prd.model.clone(),
+                default_max_retries: prd.default_max_retries,
             });
         }
 
@@ -358,6 +359,7 @@ pub fn init(
                 task_prefix: None,
                 prd_file: prd.prd_file.clone(),
                 model: None,
+                default_max_retries: None,
             },
         ));
 
@@ -445,6 +447,9 @@ pub fn init(
     // Wrap all data imports in a transaction for atomicity
     let tx = conn.transaction()?;
 
+    // Extract PRD-level default before prd_metadata is moved into the if-let
+    let prd_default_max_retries = prd_metadata.as_ref().and_then(|m| m.default_max_retries);
+
     // Insert PRD metadata and get the upserted row id for prd_files linking
     let prd_id = if let Some(metadata) = prd_metadata {
         insert_prd_metadata(&tx, &metadata, raw_json.as_deref())?
@@ -460,7 +465,7 @@ pub fn init(
 
     // Import new tasks
     for story in &all_stories {
-        insert_task(&tx, story)?;
+        insert_task(&tx, story, prd_default_max_retries)?;
 
         for file_path in &story.touches_files {
             insert_task_file(&tx, &story.id, file_path)?;
@@ -471,7 +476,7 @@ pub fn init(
 
     // Update existing tasks if --update-existing
     for story in &stories_to_update {
-        update_task(&tx, story)?;
+        update_task(&tx, story, prd_default_max_retries)?;
 
         if story.passes {
             let current_status: String = tx
