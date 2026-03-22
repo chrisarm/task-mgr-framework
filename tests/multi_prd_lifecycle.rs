@@ -38,7 +38,7 @@ fn setup_dual_prd_db() -> (TempDir, rusqlite::Connection) {
         false, // append
         false, // update_existing
         false, // dry_run
-        PrefixMode::Auto,
+        PrefixMode::Explicit("P1".to_string()),
     )
     .unwrap();
 
@@ -50,7 +50,7 @@ fn setup_dual_prd_db() -> (TempDir, rusqlite::Connection) {
         true,  // append
         false, // update_existing
         false, // dry_run
-        PrefixMode::Auto,
+        PrefixMode::Explicit("P2".to_string()),
     )
     .unwrap();
 
@@ -171,7 +171,7 @@ fn test_force_reinit_p1_preserves_p2_and_learnings() {
     let learning_id: i64 = conn.last_insert_rowid();
     drop(conn);
 
-    // Force-reinit only P1 (PrefixMode::Auto reads taskPrefix from the JSON)
+    // Force-reinit only P1 with explicit prefix
     init::init(
         temp_dir.path(),
         &[&fixture("prd_p1_alpha.json")],
@@ -179,7 +179,7 @@ fn test_force_reinit_p1_preserves_p2_and_learnings() {
         false, // append
         false,
         false,
-        PrefixMode::Auto,
+        PrefixMode::Explicit("P1".to_string()),
     )
     .unwrap();
 

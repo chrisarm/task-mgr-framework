@@ -912,18 +912,16 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         PrefixMode::Explicit(p) => Some(p.clone()),
         // Disabled: no prefix at all.
         PrefixMode::Disabled => None,
-        // Auto: use PRD hints or auto-generate.
-        PrefixMode::Auto => prd_hints.task_prefix.or_else(|| {
-            // taskPrefix absent: derive deterministic prefix from branchName + filename,
-            // using the same formula as PrefixMode::Auto in init so lock files match
-            // across restarts.
+        // Auto: always generate deterministically from branchName + filename.
+        // The JSON's taskPrefix field is ignored to prevent mismatch bugs.
+        PrefixMode::Auto => {
             let filename = run_config
                 .prd_file
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             Some(generate_prefix(pre_lock_branch.as_deref(), filename))
-        }),
+        },
     }
     .and_then(|p| {
         // Only use prefix if it is safe for filenames

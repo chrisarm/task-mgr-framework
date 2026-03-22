@@ -1154,10 +1154,11 @@ fn test_init_explicit_prefix_applied_to_relationships() {
 }
 
 #[test]
-fn test_init_auto_prefix_from_json_field() {
+fn test_init_auto_prefix_ignores_json_field() {
     let temp_dir = TempDir::new().unwrap();
     let json = r#"{
         "project": "test",
+        "branchName": "feat/test",
         "taskPrefix": "P5",
         "userStories": [
             {"id": "US-001", "title": "Task 1", "priority": 1, "passes": false}
@@ -1165,6 +1166,9 @@ fn test_init_auto_prefix_from_json_field() {
     }"#;
     let path = temp_dir.path().join("prd.json");
     fs::write(&path, json).unwrap();
+
+    // Auto mode always generates from branchName + filename, ignoring JSON taskPrefix
+    let expected_prefix = generate_prefix(Some("feat/test"), "prd.json");
 
     let result = init(
         temp_dir.path(),
@@ -1177,13 +1181,13 @@ fn test_init_auto_prefix_from_json_field() {
     )
     .unwrap();
 
-    assert_eq!(result.prefix_applied, Some("P5".to_string()));
+    assert_eq!(result.prefix_applied, Some(expected_prefix.clone()));
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let id: String = conn
         .query_row("SELECT id FROM tasks", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(id, "P5-US-001");
+    assert_eq!(id, format!("{}-US-001", expected_prefix));
 }
 
 #[test]
@@ -2235,7 +2239,7 @@ mod multi_prd_import_tests {
             false,
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P1".to_string()),
         )
         .unwrap();
 
@@ -2246,7 +2250,7 @@ mod multi_prd_import_tests {
             true, // append
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P2".to_string()),
         )
         .unwrap();
 
@@ -2293,7 +2297,7 @@ mod multi_prd_import_tests {
             false,
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P1".to_string()),
         )
         .unwrap();
         init(
@@ -2303,7 +2307,7 @@ mod multi_prd_import_tests {
             true,
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P2".to_string()),
         )
         .unwrap();
 
@@ -2457,7 +2461,7 @@ mod multi_prd_import_tests {
             false,
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P1".to_string()),
         )
         .unwrap();
         init(
@@ -2467,7 +2471,7 @@ mod multi_prd_import_tests {
             true, // append
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P2".to_string()),
         )
         .unwrap();
 
@@ -2479,7 +2483,7 @@ mod multi_prd_import_tests {
             false,
             false,
             false,
-            PrefixMode::Auto,
+            PrefixMode::Explicit("P1".to_string()),
         )
         .unwrap();
 

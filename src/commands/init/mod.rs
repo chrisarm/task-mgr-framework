@@ -260,30 +260,33 @@ pub fn init(
 
         let prd: PrdFile = serde_json::from_str(&content)?;
 
-        // Resolve prefix from first PRD file (CLI override > JSON field > auto-generate)
+        // Resolve prefix from first PRD file (CLI override > auto-generate).
+        // In Auto mode, always generate deterministically from branchName + filename.
+        // The JSON's taskPrefix field is ignored — it was previously used as a cache
+        // but caused mismatch bugs when agents or worktree copies modified it.
         if file_idx == 0 {
             resolved_prefix = match &prefix_mode {
                 PrefixMode::Disabled => None,
                 PrefixMode::Explicit(p) => Some(p.clone()),
                 PrefixMode::Auto => {
-                    if let Some(ref p) = prd.task_prefix {
-                        Some(p.clone())
-                    } else {
-                        let filename = json_path
-                            .file_name()
-                            .and_then(|f| f.to_str())
-                            .unwrap_or("unknown.json");
-                        let generated = generate_prefix(prd.branch_name.as_deref(), filename);
-                        if !dry_run {
-                            write_prefix_to_json(json_path, &generated)?;
+                    let filename = json_path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("unknown.json");
+                    let generated = generate_prefix(prd.branch_name.as_deref(), filename);
+                    if prd.task_prefix.as_deref() != Some(&generated) {
+                        if prd.task_prefix.is_some() {
+                            eprintln!(
+                                "Note: ignoring JSON taskPrefix '{}', using deterministic prefix '{}'",
+                                prd.task_prefix.as_deref().unwrap_or(""),
+                                generated,
+                            );
                         }
-                        warnings.push(format!(
-                            "Auto-generated taskPrefix '{}' (written to {})",
-                            generated,
-                            json_path.display()
-                        ));
-                        Some(generated)
+                        if !dry_run {
+                            let _ = write_prefix_to_json(json_path, &generated);
+                        }
                     }
+                    Some(generated)
                 }
             };
         }
