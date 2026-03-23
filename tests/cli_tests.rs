@@ -1738,6 +1738,600 @@ fn test_invalidate_learning_already_retired_returns_error() {
         );
 }
 
+// ============================================================================
+// Integration tests: --include-archived flag for list and history
+// ============================================================================
+
+/// Setup a temp dir with one active task and one archived task.
+/// Returns (TempDir, dir_str).
+fn setup_list_with_archived() -> (TempDir, String) {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_string();
+    let prd_path = sample_prd_path();
+
+    // Init with sample PRD (7 tasks)
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Soft-archive one task directly in DB
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Archive the first task found
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = (SELECT id FROM tasks LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    (temp_dir, dir)
+}
+
+/// Setup a temp dir with one active run and one archived run.
+/// Returns (TempDir, dir_str).
+fn setup_history_with_archived() -> (TempDir, String) {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_string();
+    let prd_path = sample_prd_path();
+
+    // Init with sample PRD so the DB and schema are created
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO runs (run_id, status, started_at, iteration_count) VALUES ('run-active', 'completed', '2024-01-01T10:00:00', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (run_id, status, started_at, iteration_count, archived_at) VALUES ('run-archived', 'completed', '2024-01-02T10:00:00', 2, datetime('now'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    (temp_dir, dir)
+}
+
+#[test]
+fn test_list_without_flag_excludes_archived() {
+    // AC: list without --include-archived returns only active tasks
+    let (temp_dir, dir) = setup_list_with_archived();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir, "--format", "json"])
+        .args(["list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    let json: Value = serde_json::from_str(&text).expect("list must produce valid JSON");
+
+    // With 7 tasks total and 1 archived, we should see 6 active tasks
+    let tasks = json["tasks"]
+        .as_array()
+        .expect("JSON must have 'tasks' array");
+    assert_eq!(
+        tasks.len(),
+        6,
+        "list without flag must return 6 active tasks (7 total - 1 archived): {text}"
+    );
+
+    // None of the returned tasks should have archived = true
+    for task in tasks {
+        assert_eq!(
+            task["archived"].as_bool().unwrap_or(false),
+            false,
+            "list without flag must not return archived tasks: {task}"
+        );
+    }
+
+    // Keep temp_dir alive
+    drop(temp_dir);
+}
+
+#[test]
+fn test_list_include_archived_returns_all_with_markers() {
+    // AC: list --include-archived returns active + archived with [archived] markers in text
+    let (temp_dir, dir) = setup_list_with_archived();
+
+    // Text format should show [archived] marker
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["list", "--include-archived"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("[archived]"),
+        "list --include-archived must show [archived] marker: {text}"
+    );
+
+    // JSON format should include archived tasks with archived=true
+    let output_json = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir, "--format", "json"])
+        .args(["list", "--include-archived"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value =
+        serde_json::from_str(&String::from_utf8(output_json).unwrap()).expect("valid JSON");
+    let tasks = json["tasks"].as_array().expect("tasks array");
+    assert_eq!(
+        tasks.len(),
+        7,
+        "all 7 tasks (6 active + 1 archived) must appear"
+    );
+    let archived_count = tasks
+        .iter()
+        .filter(|t| t["archived"].as_bool().unwrap_or(false))
+        .count();
+    assert_eq!(archived_count, 1, "exactly 1 archived task must be marked");
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_list_include_archived_with_limit_caps_archived() {
+    // AC: list --include-archived=N caps the number of archived records returned
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_string();
+    let prd_path = sample_prd_path();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Archive 3 tasks
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id IN (SELECT id FROM tasks LIMIT 3)",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Request only 1 archived task
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir, "--format", "json"])
+        .args(["list", "--include-archived", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    let tasks = json["tasks"].as_array().expect("tasks array");
+    let archived_count = tasks
+        .iter()
+        .filter(|t| t["archived"].as_bool().unwrap_or(false))
+        .count();
+    assert_eq!(
+        archived_count, 1,
+        "limit=1 must cap archived tasks at 1 (got {})",
+        archived_count
+    );
+    // Active tasks should still all appear (4 of 7 remain active)
+    let active_count = tasks
+        .iter()
+        .filter(|t| !t["archived"].as_bool().unwrap_or(false))
+        .count();
+    assert_eq!(active_count, 4, "all 4 active tasks must appear");
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_history_without_flag_excludes_archived_runs() {
+    // AC: history without --include-archived returns only active runs
+    let (temp_dir, dir) = setup_history_with_archived();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir, "--format", "json"])
+        .args(["history"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    let runs = json["runs"].as_array().expect("runs array");
+    assert_eq!(
+        runs.len(),
+        1,
+        "history without flag must return only 1 active run"
+    );
+    assert_eq!(
+        runs[0]["run_id"].as_str().unwrap(),
+        "run-active",
+        "the active run must be returned"
+    );
+    // archived field is omitted from JSON when false (skip_serializing_if)
+    assert_eq!(
+        runs[0]["archived"].as_bool().unwrap_or(false),
+        false,
+        "active run must not be archived"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_history_include_archived_returns_all_with_markers() {
+    // AC: history --include-archived returns active + archived with [archived] markers
+    let (temp_dir, dir) = setup_history_with_archived();
+
+    // Text format: should contain [archived] marker
+    let text_output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args(["history", "--include-archived"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(text_output).unwrap();
+    assert!(
+        text.contains("[archived]"),
+        "history --include-archived text must show [archived] marker: {text}"
+    );
+
+    // JSON format: both runs present, archived run flagged
+    let json_output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir, "--format", "json"])
+        .args(["history", "--include-archived"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value =
+        serde_json::from_str(&String::from_utf8(json_output).unwrap()).expect("valid JSON");
+    let runs = json["runs"].as_array().expect("runs array");
+    assert_eq!(
+        runs.len(),
+        2,
+        "both runs must appear with --include-archived"
+    );
+
+    let archived_run = runs
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some("run-archived"))
+        .expect("run-archived must be in results");
+    assert!(
+        archived_run["archived"].as_bool().unwrap_or(false),
+        "run-archived must have archived=true"
+    );
+
+    let active_run = runs
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some("run-active"))
+        .expect("run-active must be in results");
+    // archived field is omitted from JSON when false (skip_serializing_if)
+    assert_eq!(
+        active_run["archived"].as_bool().unwrap_or(false),
+        false,
+        "run-active must not be archived"
+    );
+
+    drop(temp_dir);
+}
+
+// ============================================================================
+// Integration tests: init --force archive-before-reimport flow
+// ============================================================================
+
+/// Setup a temp dir with P1 initialized and one completed run with key decisions.
+/// Returns (TempDir, dir_str).
+fn setup_init_force_dir() -> (TempDir, String) {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_str().unwrap().to_string();
+
+    let tasks_dir = temp_dir.path().join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let p1_src = manifest_dir.join("tests/fixtures/prd_p1_alpha.json");
+    let p1_dest = tasks_dir.join("prd_p1_alpha.json");
+    fs::copy(&p1_src, &p1_dest).unwrap();
+
+    // Init P1
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--from-json",
+            p1_dest.to_str().unwrap(),
+            "--prefix",
+            "P1",
+        ])
+        .assert()
+        .success();
+
+    let db_path = temp_dir.path().join("tasks.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // Insert a run associated with P1
+        conn.execute(
+            "INSERT INTO runs (run_id, status, started_at, ended_at, iteration_count) VALUES ('run-p1-001', 'completed', '2024-01-01T10:00:00', '2024-01-01T11:00:00', 3)",
+            [],
+        )
+        .unwrap();
+        // Insert a run_task for this run
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, iteration, status) VALUES ('run-p1-001', 'P1-TASK-001', 1, 'completed')",
+            [],
+        )
+        .unwrap();
+        // Insert a key decision for this run
+        conn.execute(
+            "INSERT INTO key_decisions (run_id, task_id, iteration, title, description, options) VALUES ('run-p1-001', 'P1-TASK-001', 1, 'Test Decision', 'Some important decision', '[]')",
+            [],
+        )
+        .unwrap();
+    }
+
+    (temp_dir, dir)
+}
+
+#[test]
+fn test_init_force_archives_runs_and_key_decisions_hard_deletes_tasks() {
+    // AC: init --force archives runs/key_decisions, hard-deletes tasks, reimports clean
+    let (temp_dir, dir) = setup_init_force_dir();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    // Verify baseline: run and key decision exist as active
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE run_id = 'run-p1-001' AND archived_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1, "run must exist as active before force");
+        let kd_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM key_decisions WHERE run_id = 'run-p1-001' AND archived_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kd_count, 1,
+            "key_decision must exist as active before force"
+        );
+    }
+
+    let tasks_dir = temp_dir.path().join("tasks");
+    let p1_dest = tasks_dir.join("prd_p1_alpha.json");
+
+    // Run init --force for P1
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--force",
+            "--from-json",
+            p1_dest.to_str().unwrap(),
+            "--prefix",
+            "P1",
+        ])
+        .assert()
+        .success();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Runs must be soft-archived (not deleted)
+    let run_archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE run_id = 'run-p1-001' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_archived, 1,
+        "init --force must soft-archive runs, not hard-delete them"
+    );
+
+    // Key decisions must be soft-archived
+    let kd_archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_decisions WHERE run_id = 'run-p1-001' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kd_archived, 1,
+        "init --force must soft-archive key_decisions"
+    );
+
+    // P1 tasks must be freshly re-imported (hard-deleted and reimported)
+    let p1_active: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%' AND archived_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        p1_active > 0,
+        "init --force must reimport P1 tasks as active"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_init_force_preserves_previously_archived_data() {
+    // AC: init --force preserves previously-archived runs/key_decisions
+    let (temp_dir, dir) = setup_init_force_dir();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    // Pre-archive the run manually (simulating a previous archive cycle)
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE runs SET archived_at = datetime('now') WHERE run_id = 'run-p1-001'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE key_decisions SET archived_at = datetime('now') WHERE run_id = 'run-p1-001'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let tasks_dir = temp_dir.path().join("tasks");
+    let p1_dest = tasks_dir.join("prd_p1_alpha.json");
+
+    // Run init --force — must not touch the already-archived run
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--force",
+            "--from-json",
+            p1_dest.to_str().unwrap(),
+            "--prefix",
+            "P1",
+        ])
+        .assert()
+        .success();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Previously-archived run must still exist
+    let run_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE run_id = 'run-p1-001' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_count, 1,
+        "init --force must preserve previously-archived runs"
+    );
+
+    // Previously-archived key_decision must still exist
+    let kd_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_decisions WHERE run_id = 'run-p1-001' AND archived_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kd_count, 1,
+        "init --force must preserve previously-archived key_decisions"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_init_force_global_wipe_hard_deletes_everything() {
+    // AC: init --force without a prefix (global wipe) hard-deletes all data
+    // This tests the None-prefix path in drop_existing_data.
+    let (temp_dir, dir) = setup_init_force_dir();
+    let db_path = temp_dir.path().join("tasks.db");
+
+    let prd_path = sample_prd_path();
+
+    // Run init --force without --prefix (no-prefix = global wipe)
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", &dir])
+        .args([
+            "init",
+            "--force",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Global wipe: the P1 run must be hard-deleted (no row at all)
+    let run_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE run_id = 'run-p1-001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_count, 0,
+        "global --force wipe must hard-delete all runs (including P1 run)"
+    );
+
+    // Key decisions for that run must also be gone
+    let kd_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_decisions WHERE run_id = 'run-p1-001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kd_count, 0,
+        "global --force wipe must hard-delete all key_decisions"
+    );
+
+    drop(temp_dir);
+}
+
 #[test]
 fn test_invalidate_learning_json_format() {
     // AC5: --format json produces valid JSON with expected fields

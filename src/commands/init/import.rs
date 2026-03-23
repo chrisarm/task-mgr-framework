@@ -63,6 +63,7 @@ pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskM
             // Drop in correct order due to foreign keys.
             conn.execute("DELETE FROM learning_tags", [])?;
             conn.execute("DELETE FROM learnings", [])?;
+            conn.execute("DELETE FROM key_decisions", [])?;
             conn.execute("DELETE FROM run_tasks", [])?;
             conn.execute("DELETE FROM runs", [])?;
             conn.execute("DELETE FROM task_relationships", [])?;
