@@ -28,35 +28,8 @@ pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskM
         Some(prefix) => {
             let pattern = make_like_pattern(prefix);
 
-            // Archive run_tasks linked to prefix tasks (preserve history).
-            // AND archived_at IS NULL ensures previously archived rows keep their original timestamp.
-            conn.execute(
-                "UPDATE run_tasks SET archived_at = datetime('now') \
-                 WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-                [&pattern],
-            )?;
-
-            // Archive key_decisions linked to prefix tasks or to runs that processed them.
-            conn.execute(
-                "UPDATE key_decisions SET archived_at = datetime('now') \
-                 WHERE archived_at IS NULL AND (\
-                     task_id LIKE ? ESCAPE '\\' \
-                     OR run_id IN (\
-                         SELECT DISTINCT run_id FROM run_tasks \
-                         WHERE task_id LIKE ? ESCAPE '\\'\
-                     )\
-                 )",
-                rusqlite::params![&pattern, &pattern],
-            )?;
-
-            // Archive runs that had tasks from this prefix.
-            conn.execute(
-                "UPDATE runs SET archived_at = datetime('now') \
-                 WHERE run_id IN (\
-                     SELECT DISTINCT run_id FROM run_tasks WHERE task_id LIKE ? ESCAPE '\\'\
-                 ) AND archived_at IS NULL",
-                [&pattern],
-            )?;
+            // Archive run_tasks, key_decisions, and runs for this prefix (preserve history).
+            crate::db::soft_archive::soft_archive_by_prefix(conn, prefix)?;
 
             // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
             // (run_tasks.task_id has ON DELETE CASCADE, which would wipe archived rows if FK is on.)

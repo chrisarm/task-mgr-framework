@@ -458,51 +458,8 @@ fn archive_prd_data(
         .transaction()
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 1. Soft-archive run_tasks for this prefix
-    tx.execute(
-        "UPDATE run_tasks SET archived_at = datetime('now') \
-         WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-        rusqlite::params![pattern],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    // 2a. Soft-archive key_decisions by task prefix
-    tx.execute(
-        "UPDATE key_decisions SET archived_at = datetime('now') \
-         WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-        rusqlite::params![pattern],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    // 2b. Soft-archive key_decisions for runs that are now fully archived
-    //     (covers NULL task_id key_decisions that reference the run)
-    tx.execute(
-        "UPDATE key_decisions SET archived_at = datetime('now') \
-         WHERE archived_at IS NULL \
-         AND run_id IN ( \
-             SELECT run_id FROM runs \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM run_tasks \
-                 WHERE run_tasks.run_id = runs.run_id \
-                 AND run_tasks.archived_at IS NULL \
-             ) \
-         )",
-        [],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
-
-    // 3. Soft-archive runs where ALL run_tasks are now archived
-    tx.execute(
-        "UPDATE runs SET archived_at = datetime('now') \
-         WHERE archived_at IS NULL \
-         AND NOT EXISTS ( \
-             SELECT 1 FROM run_tasks \
-             WHERE run_tasks.run_id = runs.run_id \
-             AND run_tasks.archived_at IS NULL \
-         )",
-        [],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    // 1-3. Soft-archive run_tasks, key_decisions, and runs for this prefix
+    crate::db::soft_archive::soft_archive_by_prefix(&tx, prefix)?;
 
     // 4. Hard-delete task_relationships touching this prefix (no historical value)
     tx.execute(

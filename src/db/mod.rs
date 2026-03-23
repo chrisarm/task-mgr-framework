@@ -10,6 +10,7 @@ pub mod lock;
 pub mod migrations;
 pub mod prefix;
 pub mod schema;
+pub mod soft_archive;
 
 pub use connection::open_connection;
 pub use lock::LockGuard;
