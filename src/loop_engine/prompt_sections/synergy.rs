@@ -52,6 +52,7 @@ fn get_synergy_tasks_in_run(
          WHERE tr.task_id = ?1
            AND tr.rel_type = 'synergyWith'
            AND t.status = 'done'
+           AND t.archived_at IS NULL
          ORDER BY t.id",
     )?;
 

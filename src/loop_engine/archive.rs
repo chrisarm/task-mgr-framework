@@ -339,7 +339,7 @@ fn is_prd_completed_by_prefix(conn: &rusqlite::Connection, prefix: &str) -> Task
 
     let total: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
             rusqlite::params![pattern],
             |row| row.get(0),
         )
@@ -351,7 +351,7 @@ fn is_prd_completed_by_prefix(conn: &rusqlite::Connection, prefix: &str) -> Task
 
     let non_terminal: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND status IN ('todo', 'in_progress', 'blocked')",
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL AND status IN ('todo', 'in_progress', 'blocked')",
             rusqlite::params![pattern],
             |row| row.get(0),
         )
