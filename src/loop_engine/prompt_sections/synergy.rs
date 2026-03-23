@@ -110,7 +110,8 @@ fn get_synergy_partner_models(
          INNER JOIN task_relationships tr ON tr.related_id = t.id
          WHERE tr.task_id = ?1
            AND tr.rel_type = 'synergyWith'
-           AND t.status IN ('todo', 'in_progress')",
+           AND t.status IN ('todo', 'in_progress')
+           AND t.archived_at IS NULL",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
