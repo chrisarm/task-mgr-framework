@@ -58,6 +58,7 @@ pub fn find_active_runs_without_end(conn: &Connection) -> TaskMgrResult<Vec<(Str
         FROM runs
         WHERE status = 'active'
         AND ended_at IS NULL
+        AND archived_at IS NULL
         ORDER BY started_at
         "#,
     )?;
