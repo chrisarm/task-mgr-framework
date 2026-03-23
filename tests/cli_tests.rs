@@ -1429,14 +1429,27 @@ fn setup_archive_test_dir() -> (TempDir, String) {
     // Init P1 (alpha-project) from the local copy with explicit prefix
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", &dir])
-        .args(["init", "--from-json", p1_dest.to_str().unwrap(), "--prefix", "P1"])
+        .args([
+            "init",
+            "--from-json",
+            p1_dest.to_str().unwrap(),
+            "--prefix",
+            "P1",
+        ])
         .assert()
         .success();
 
     // Init P2 (beta-project) with --append from the local copy with explicit prefix
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", &dir])
-        .args(["init", "--append", "--from-json", p2_dest.to_str().unwrap(), "--prefix", "P2"])
+        .args([
+            "init",
+            "--append",
+            "--from-json",
+            p2_dest.to_str().unwrap(),
+            "--prefix",
+            "P2",
+        ])
         .assert()
         .success();
 
