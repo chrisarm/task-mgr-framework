@@ -34,25 +34,30 @@ pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskM
             // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
             // (run_tasks.task_id has ON DELETE CASCADE, which would wipe archived rows if FK is on.)
             // FK is always re-enabled after deletes, even on error.
+            // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
+            // PRAGMA foreign_keys cannot be changed inside a transaction (SQLite constraint),
+            // so it must be set before/after the transaction.
             conn.pragma_update(None, "foreign_keys", "OFF")?;
             let delete_result = (|| -> TaskMgrResult<()> {
+                let tx = conn.unchecked_transaction()?;
                 // Delete child tables before parent (FK ordering)
-                conn.execute(
+                tx.execute(
                     "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
                     [&pattern],
                 )?;
-                conn.execute(
+                tx.execute(
                     "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
                     [&pattern],
                 )?;
-                conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
+                tx.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
                 // prd_files must be removed before prd_metadata (FK ordering)
-                conn.execute(
+                tx.execute(
                     "DELETE FROM prd_files WHERE prd_id = \
                      (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
                     [prefix],
                 )?;
-                conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+                tx.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+                tx.commit()?;
                 Ok(())
             })();
             conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -131,6 +136,9 @@ pub fn get_delete_preview(
                 })?;
             let learnings: usize =
                 conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+            // Count ALL runs (including archived) since the global wipe DELETE FROM runs
+            // removes everything. Tasks are filtered by archived_at IS NULL because
+            // archived tasks are invisible to users and the count reflects "active" state.
             let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
             Ok(DryRunDeletePreview {
                 tasks,

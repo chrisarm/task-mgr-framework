@@ -72,10 +72,15 @@ pub fn find_active_runs_without_end(conn: &Connection) -> TaskMgrResult<Vec<(Str
     Ok(results)
 }
 
-/// Find relationships where related_id references a non-existent task.
+/// Find relationships where related_id references a non-existent or archived task.
 ///
 /// Note: We intentionally don't have a foreign key on related_id to allow
 /// importing tasks with forward references, so we check this manually.
+///
+/// Relationships pointing to soft-archived tasks are also reported since
+/// the archive command hard-deletes task_relationships for the archived
+/// prefix. Cross-prefix relationships (e.g., PA-001 depends on PB-001
+/// where PB is archived) will surface here as expected.
 pub fn find_orphaned_relationships(
     conn: &Connection,
 ) -> TaskMgrResult<Vec<(String, String, String)>> {

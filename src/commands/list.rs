@@ -168,8 +168,7 @@ fn query_tasks(
                 archived: archived_at.is_some(),
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Apply optional limit to archived records
     if let Some(Some(limit)) = include_archived {

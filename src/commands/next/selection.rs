@@ -398,7 +398,7 @@ fn get_eligible_batch_tasks(
         .collect::<Vec<_>>()
         .join(",");
     let query = format!(
-        "SELECT id, status FROM tasks WHERE id IN ({})",
+        "SELECT id, status FROM tasks WHERE id IN ({}) AND archived_at IS NULL",
         placeholders
     );
 

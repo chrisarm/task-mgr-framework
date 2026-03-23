@@ -1599,6 +1599,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_global_state_last_run_id_nulled_when_run_archived() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Create a run with a run_task for PA-001 only
+        conn.execute(
+            "INSERT INTO runs (run_id, started_at, status, iteration_count) \
+             VALUES ('r-pa', datetime('now'), 'completed', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, iteration, status) \
+             VALUES ('r-pa', 'PA-001', 1, 'completed')",
+            [],
+        )
+        .unwrap();
+
+        // Point last_run_id at the run that will be archived
+        conn.execute(
+            "UPDATE global_state SET last_run_id = 'r-pa' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
+
+        let last_run: Option<String> = conn
+            .query_row(
+                "SELECT last_run_id FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            last_run.is_none(),
+            "last_run_id must be NULL after the referenced run is archived"
+        );
+    }
+
+    #[test]
+    fn test_global_state_last_run_id_preserved_if_from_other_prd() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Create a run tied to PB (not PA)
+        conn.execute(
+            "INSERT INTO runs (run_id, started_at, status, iteration_count) \
+             VALUES ('r-pb', datetime('now'), 'active', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, iteration, status) \
+             VALUES ('r-pb', 'PB-001', 1, 'started')",
+            [],
+        )
+        .unwrap();
+
+        // Point last_run_id at the PB run
+        conn.execute(
+            "UPDATE global_state SET last_run_id = 'r-pb' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Archive PA only — PB run should survive
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
+
+        let last_run: Option<String> = conn
+            .query_row(
+                "SELECT last_run_id FROM global_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_run.as_deref(),
+            Some("r-pb"),
+            "last_run_id referencing another PRD's run must be preserved"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Tests for multi-PRD run_archive() top-level flow
     // -----------------------------------------------------------------------
