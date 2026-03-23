@@ -38,6 +38,9 @@ pub struct TaskSummary {
     pub status: String,
     /// Priority (lower = higher priority)
     pub priority: i32,
+    /// Whether this task has been soft-archived
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl From<&Task> for TaskSummary {
@@ -47,6 +50,7 @@ impl From<&Task> for TaskSummary {
             title: task.title.clone(),
             status: task.status.to_string(),
             priority: task.priority,
+            archived: false,
         }
     }
 }
@@ -72,12 +76,12 @@ pub fn list(
     status: Option<TaskStatusFilter>,
     file: Option<&str>,
     task_type: Option<&str>,
+    include_archived: Option<Option<usize>>,
 ) -> TaskMgrResult<ListResult> {
     let conn = open_connection(dir)?;
 
-    let tasks = query_tasks(&conn, status, file, task_type)?;
-    let count = tasks.len();
-    let summaries: Vec<TaskSummary> = tasks.iter().map(TaskSummary::from).collect();
+    let summaries = query_tasks(&conn, status, file, task_type, include_archived)?;
+    let count = summaries.len();
 
     Ok(ListResult {
         tasks: summaries,
@@ -89,15 +93,26 @@ pub fn list(
 }
 
 /// Query tasks from database with optional filtering.
+///
+/// Returns `TaskSummary` records directly, including the `archived` flag.
+/// When `include_archived` is `None`, only active (non-archived) tasks are returned.
+/// When `Some(None)` or `Some(Some(0))`, all archived tasks are included.
+/// When `Some(Some(n))` with n > 0, up to n archived tasks are included.
 fn query_tasks(
     conn: &Connection,
     status: Option<TaskStatusFilter>,
     file: Option<&str>,
     task_type: Option<&str>,
-) -> TaskMgrResult<Vec<Task>> {
+    include_archived: Option<Option<usize>>,
+) -> TaskMgrResult<Vec<TaskSummary>> {
     // Build the query based on filters
     let mut conditions = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    // Filter out archived tasks unless --include-archived is set
+    if include_archived.is_none() {
+        conditions.push("t.archived_at IS NULL");
+    }
 
     if let Some(status_filter) = status {
         conditions.push("t.status = ?");
@@ -109,31 +124,24 @@ fn query_tasks(
         params.push(Box::new(format!("{}%", task_type_filter)));
     }
 
-    // Build the base query
+    // Build the base query — select only columns needed for TaskSummary plus archived_at
     let base_query = if file.is_some() {
         // Join with task_files for file pattern matching
-        "SELECT DISTINCT t.id, t.title, t.description, t.priority, t.status, t.notes, \
-         t.acceptance_criteria, t.review_scope, t.severity, t.source_review, \
-         t.created_at, t.updated_at, t.started_at, t.completed_at, \
-         t.last_error, t.error_count \
+        "SELECT DISTINCT t.id, t.title, t.priority, t.status, t.archived_at \
          FROM tasks t \
          INNER JOIN task_files tf ON t.id = tf.task_id"
     } else {
-        "SELECT t.id, t.title, t.description, t.priority, t.status, t.notes, \
-         t.acceptance_criteria, t.review_scope, t.severity, t.source_review, \
-         t.created_at, t.updated_at, t.started_at, t.completed_at, \
-         t.last_error, t.error_count \
+        "SELECT t.id, t.title, t.priority, t.status, t.archived_at \
          FROM tasks t"
     };
 
     // Add file pattern filter if specified
     if let Some(file_pattern) = file {
-        // Convert glob pattern to SQLite GLOB pattern
         conditions.push("tf.file_path GLOB ?");
         params.push(Box::new(file_pattern.to_string()));
     }
 
-    // Construct full query
+    // Construct full query — active tasks first (archived_at IS NULL = 0 < 1), then by priority
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
@@ -141,30 +149,41 @@ fn query_tasks(
     };
 
     let query = format!(
-        "{}{} ORDER BY t.priority ASC, t.id ASC",
+        "{}{} ORDER BY (t.archived_at IS NOT NULL) ASC, t.priority ASC, t.id ASC",
         base_query, where_clause
     );
 
     // Execute query
     let mut stmt = conn.prepare(&query)?;
-
-    // Create parameter references for rusqlite
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-    let tasks: Vec<Task> = stmt
+    let mut summaries: Vec<TaskSummary> = stmt
         .query_map(param_refs.as_slice(), |row| {
-            Task::try_from(row).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
+            let archived_at: Option<String> = row.get(4)?;
+            Ok(TaskSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                priority: row.get(2)?,
+                status: row.get(3)?,
+                archived: archived_at.is_some(),
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    Ok(tasks)
+    // Apply optional limit to archived records
+    if let Some(Some(limit)) = include_archived {
+        if limit > 0 {
+            let active_count = summaries.iter().filter(|t| !t.archived).count();
+            let archived_count = summaries.len() - active_count;
+            if archived_count > limit {
+                // Active tasks come first in the result; truncate excess archived tasks
+                summaries.truncate(active_count + limit);
+            }
+        }
+    }
+
+    Ok(summaries)
 }
 
 /// Extract the task ID prefix (first segment before `-`).
@@ -195,10 +214,11 @@ pub fn format_text(result: &ListResult) -> String {
     let mut output = String::new();
 
     let render_task_row = |task: &TaskSummary, out: &mut String| {
+        let archived_tag = if task.archived { " [archived]" } else { "" };
         let title_display = super::truncate_str(&task.title, 37);
         out.push_str(&format!(
-            "{:<12} {:<12} {:>5}  {}\n",
-            task.id, task.status, task.priority, title_display
+            "{:<12} {:<12} {:>5}  {}{}\n",
+            task.id, task.status, task.priority, title_display, archived_tag
         ));
     };
 
@@ -245,8 +265,9 @@ mod tests {
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
@@ -274,7 +295,7 @@ mod tests {
         insert_test_task(&conn, "FIX-001", "Fix 1", "in_progress", 5);
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, None).unwrap();
+        let result = list(temp_dir.path(), None, None, None, None).unwrap();
         assert_eq!(result.count, 3);
         // Should be ordered by priority
         assert_eq!(result.tasks[0].id, "FIX-001");
@@ -287,7 +308,7 @@ mod tests {
         let (temp_dir, conn) = setup_test_db();
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, None).unwrap();
+        let result = list(temp_dir.path(), None, None, None, None).unwrap();
         assert_eq!(result.count, 0);
         assert!(result.tasks.is_empty());
     }
@@ -300,7 +321,14 @@ mod tests {
         insert_test_task(&conn, "US-003", "Task 3", "todo", 30);
         drop(conn);
 
-        let result = list(temp_dir.path(), Some(TaskStatusFilter::Todo), None, None).unwrap();
+        let result = list(
+            temp_dir.path(),
+            Some(TaskStatusFilter::Todo),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().all(|t| t.status == "todo"));
     }
@@ -317,6 +345,7 @@ mod tests {
             Some(TaskStatusFilter::InProgress),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.count, 1);
@@ -331,7 +360,14 @@ mod tests {
         insert_test_task(&conn, "US-003", "Task 3", "todo", 30);
         drop(conn);
 
-        let result = list(temp_dir.path(), Some(TaskStatusFilter::Done), None, None).unwrap();
+        let result = list(
+            temp_dir.path(),
+            Some(TaskStatusFilter::Done),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().all(|t| t.status == "done"));
     }
@@ -345,7 +381,7 @@ mod tests {
         insert_test_task(&conn, "TECH-001", "Tech Debt 1", "todo", 15);
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, Some("US-")).unwrap();
+        let result = list(temp_dir.path(), None, None, Some("US-"), None).unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().all(|t| t.id.starts_with("US-")));
     }
@@ -363,7 +399,7 @@ mod tests {
         drop(conn);
 
         // Match all .rs files in src/commands/
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None).unwrap();
+        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None).unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().any(|t| t.id == "US-001"));
         assert!(result.tasks.iter().any(|t| t.id == "US-002"));
@@ -376,7 +412,7 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/main.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("nonexistent/*.rs"), None).unwrap();
+        let result = list(temp_dir.path(), None, Some("nonexistent/*.rs"), None, None).unwrap();
         assert_eq!(result.count, 0);
     }
 
@@ -397,6 +433,7 @@ mod tests {
             Some(TaskStatusFilter::Todo),
             Some("src/commands/*"),
             Some("US-"),
+            None,
         )
         .unwrap();
         assert_eq!(result.count, 1);
@@ -414,6 +451,7 @@ mod tests {
             Some(TaskStatusFilter::Todo),
             Some("*.rs"),
             Some("US-"),
+            None,
         )
         .unwrap();
 
@@ -432,7 +470,7 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/commands/show.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None).unwrap();
+        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None).unwrap();
         // Should only return the task once, not three times
         assert_eq!(result.count, 1);
         assert_eq!(result.tasks[0].id, "US-001");
@@ -447,12 +485,14 @@ mod tests {
                     title: "Implement feature".to_string(),
                     status: "todo".to_string(),
                     priority: 10,
+                    archived: false,
                 },
                 TaskSummary {
                     id: "FIX-001".to_string(),
                     title: "Fix bug".to_string(),
                     status: "done".to_string(),
                     priority: 5,
+                    archived: false,
                 },
             ],
             count: 2,
@@ -492,6 +532,7 @@ mod tests {
                     .to_string(),
                 status: "todo".to_string(),
                 priority: 10,
+                archived: false,
             }],
             count: 1,
             filter_status: None,
@@ -514,12 +555,14 @@ mod tests {
                     title: "Feature 1".to_string(),
                     status: "todo".to_string(),
                     priority: 10,
+                    archived: false,
                 },
                 TaskSummary {
                     id: "abc123-FEAT-002".to_string(),
                     title: "Feature 2".to_string(),
                     status: "done".to_string(),
                     priority: 20,
+                    archived: false,
                 },
             ],
             count: 2,
@@ -545,12 +588,14 @@ mod tests {
                     title: "Feature 1".to_string(),
                     status: "todo".to_string(),
                     priority: 10,
+                    archived: false,
                 },
                 TaskSummary {
                     id: "def456-FEAT-001".to_string(),
                     title: "Other Feature".to_string(),
                     status: "done".to_string(),
                     priority: 10,
+                    archived: false,
                 },
             ],
             count: 2,
@@ -604,5 +649,110 @@ mod tests {
         assert_eq!(summary.title, "Test Task");
         assert_eq!(summary.status, "in_progress");
         assert_eq!(summary.priority, 15);
+        assert!(!summary.archived);
+    }
+
+    #[test]
+    fn test_list_excludes_archived_by_default() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Active Task", "todo", 10);
+        insert_test_task(&conn, "US-002", "Archived Task", "done", 20);
+        // Soft-archive US-002
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'US-002'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Default (no include_archived) should exclude archived
+        let result = list(temp_dir.path(), None, None, None, None).unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.tasks[0].id, "US-001");
+        assert!(!result.tasks[0].archived);
+    }
+
+    #[test]
+    fn test_list_include_archived_shows_all() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Active Task", "todo", 10);
+        insert_test_task(&conn, "US-002", "Archived Task", "done", 20);
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'US-002'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // include_archived = Some(None) → show all (no limit)
+        let result = list(temp_dir.path(), None, None, None, Some(None)).unwrap();
+        assert_eq!(result.count, 2);
+
+        // Active task comes first
+        assert_eq!(result.tasks[0].id, "US-001");
+        assert!(!result.tasks[0].archived);
+
+        // Archived task second with archived = true
+        assert_eq!(result.tasks[1].id, "US-002");
+        assert!(result.tasks[1].archived);
+    }
+
+    #[test]
+    fn test_list_include_archived_with_limit() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Active Task", "todo", 5);
+        insert_test_task(&conn, "US-002", "Archived A", "done", 10);
+        insert_test_task(&conn, "US-003", "Archived B", "done", 20);
+        insert_test_task(&conn, "US-004", "Archived C", "done", 30);
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id IN ('US-002', 'US-003', 'US-004')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // include_archived = Some(Some(2)) → show active + max 2 archived
+        let result = list(temp_dir.path(), None, None, None, Some(Some(2))).unwrap();
+        let active: Vec<_> = result.tasks.iter().filter(|t| !t.archived).collect();
+        let archived: Vec<_> = result.tasks.iter().filter(|t| t.archived).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(archived.len(), 2);
+    }
+
+    #[test]
+    fn test_format_text_shows_archived_marker() {
+        let result = ListResult {
+            tasks: vec![
+                TaskSummary {
+                    id: "US-001".to_string(),
+                    title: "Active Task".to_string(),
+                    status: "todo".to_string(),
+                    priority: 10,
+                    archived: false,
+                },
+                TaskSummary {
+                    id: "US-002".to_string(),
+                    title: "Archived Task".to_string(),
+                    status: "done".to_string(),
+                    priority: 20,
+                    archived: true,
+                },
+            ],
+            count: 2,
+            filter_status: None,
+            filter_file: None,
+            filter_task_type: None,
+        };
+
+        let text = format_text(&result);
+        assert!(text.contains("[archived]"));
+        // Active task should not have [archived] marker
+        assert!(text.contains("Active Task"));
+        // Verify archived appears on the archived task line
+        let archived_line = text
+            .lines()
+            .find(|l| l.contains("US-002"))
+            .expect("US-002 line not found");
+        assert!(archived_line.contains("[archived]"));
     }
 }
