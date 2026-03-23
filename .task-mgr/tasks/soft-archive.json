@@ -617,9 +617,13 @@
         "get_synergy_partner_models query at ~line 113 has AND t.archived_at IS NULL",
         "cargo test passes with no new warnings"
       ],
-      "batchWith": ["CODE-FIX-002"],
+      "batchWith": [
+        "CODE-FIX-002"
+      ],
       "conflictsWith": [],
-      "dependsOn": ["CODE-REVIEW-1"],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
       "description": "The get_synergy_partner_models function in synergy.rs queries tasks t via JOIN but is missing AND t.archived_at IS NULL. Archived tasks with todo/in_progress status could leak into synergy model resolution, affecting model selection for loop iterations.",
       "estimatedEffort": "low",
       "id": "CODE-FIX-001",
@@ -627,19 +631,27 @@
       "notes": "One-line fix: add AND t.archived_at IS NULL after the existing AND t.status IN ('todo', 'in_progress') clause at ~line 113.",
       "passes": false,
       "priority": 14,
-      "synergyWith": ["CODE-FIX-002"],
+      "synergyWith": [
+        "CODE-FIX-002"
+      ],
       "taskType": "implementation",
       "title": "Add missing archived_at filter to get_synergy_partner_models",
-      "touchesFiles": ["src/loop_engine/prompt_sections/synergy.rs"]
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/synergy.rs"
+      ]
     },
     {
       "acceptanceCriteria": [
         "find_active_runs_without_end query at ~line 59 has AND archived_at IS NULL",
         "cargo test passes with no new warnings"
       ],
-      "batchWith": ["CODE-FIX-001"],
+      "batchWith": [
+        "CODE-FIX-001"
+      ],
       "conflictsWith": [],
-      "dependsOn": ["CODE-REVIEW-1"],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
       "description": "The find_active_runs_without_end function in doctor/checks.rs queries runs with status='active' AND ended_at IS NULL but does not filter archived_at IS NULL. Archived runs that were abandoned before archiving would cause false positive doctor warnings.",
       "estimatedEffort": "low",
       "id": "CODE-FIX-002",
@@ -647,10 +659,14 @@
       "notes": "One-line fix: add AND archived_at IS NULL to the WHERE clause at ~line 59.",
       "passes": false,
       "priority": 14,
-      "synergyWith": ["CODE-FIX-001"],
+      "synergyWith": [
+        "CODE-FIX-001"
+      ],
       "taskType": "implementation",
       "title": "Add missing archived_at filter to find_active_runs_without_end",
-      "touchesFiles": ["src/commands/doctor/checks.rs"]
+      "touchesFiles": [
+        "src/commands/doctor/checks.rs"
+      ]
     },
     {
       "acceptanceCriteria": [
@@ -684,6 +700,93 @@
     },
     {
       "acceptanceCriteria": [
+        "Shared helper exists (e.g. soft_archive_by_prefix) that both archive_prd_data and drop_existing_data call",
+        "No duplicate SQL for soft-archiving run_tasks, key_decisions, or runs",
+        "All existing archive and init --force tests pass unchanged",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "batchWith": [
+        "REFACTOR-1-002"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "archive_prd_data (archive.rs:450-593) and drop_existing_data (import.rs:26-86) both soft-archive run_tasks, key_decisions, and runs with nearly identical SQL (~30 duplicated lines). Extract a shared soft_archive_by_prefix(conn, prefix) helper that both callers invoke. This also reduces archive_prd_data from 143 lines by extracting the archive steps.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-1-001",
+      "modifiesBehavior": false,
+      "notes": "The shared helper should live in a common module (e.g. src/db/archive.rs or src/loop_engine/archive_helpers.rs). archive_prd_data steps 1-3 and drop_existing_data lines 33-58 are the duplicated code. Keep the transaction boundary in archive_prd_data; the helper should accept a connection/transaction ref.",
+      "passes": false,
+      "priority": 18,
+      "synergyWith": [
+        "REFACTOR-1-002"
+      ],
+      "taskType": "implementation",
+      "title": "Extract shared soft-archive-by-prefix helper",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs",
+        "src/commands/init/import.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No .map_err(crate::TaskMgrError::DatabaseError) calls remain in archive.rs",
+        "All occurrences replaced with plain ? operator",
+        "cargo check and cargo test pass",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "batchWith": [
+        "REFACTOR-1-001"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "archive.rs has ~17 instances of .map_err(crate::TaskMgrError::DatabaseError)? that are unnecessary because TaskMgrError has #[from] rusqlite::Error (error.rs:24). Replace all with plain ? operator. Affects archive_prd_data (~14), query_all_prds (~3), and is_prd_completed_by_prefix (~2).",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-002",
+      "modifiesBehavior": false,
+      "notes": "Pure mechanical cleanup. Search for .map_err(crate::TaskMgrError::DatabaseError) in archive.rs and remove each one. Verify with cargo check that the From impl handles the conversion.",
+      "passes": false,
+      "priority": 19,
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
+      "taskType": "implementation",
+      "title": "Remove redundant .map_err(DatabaseError) boilerplate in archive.rs",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Shared helper function for acceptance_criteria/review_scope/required_tests/max_retries serialization",
+        "Both insert_task and update_task call the shared helper",
+        "No duplicate serialization code between insert_task and update_task",
+        "All existing init tests pass unchanged"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "insert_task (import.rs:287-306) and update_task (import.rs:391-410) share ~20 lines of identical serialization logic for acceptance_criteria, review_scope, required_tests, and max_retries resolution. Extract a prepare_task_fields(story, prd_default_max_retries) helper that returns the serialized values.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-003",
+      "modifiesBehavior": false,
+      "notes": "The helper should return a struct with the serialized fields (acceptance_criteria: String, review_scope: Option<String>, required_tests: Option<String>, max_retries: i32). Both insert_task and update_task destructure the result.",
+      "passes": false,
+      "priority": 19,
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Extract task field serialization helper in import.rs",
+      "touchesFiles": [
+        "src/commands/init/import.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
         "All TEST-INIT tests pass",
         "All FEAT tasks pass",
         "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
@@ -707,7 +810,10 @@
         "CODE-REVIEW-1",
         "CODE-FIX-001",
         "CODE-FIX-002",
-        "REFACTOR-REVIEW-1"
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002",
+        "REFACTOR-1-003"
       ],
       "description": "Review-and-update checkpoint. All core implementation is done: migration, archive function, query filters, CLI flags, init --force change. Verify everything works together and update remaining tasks.",
       "estimatedEffort": "medium",
