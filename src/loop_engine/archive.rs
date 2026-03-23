@@ -464,7 +464,26 @@ fn clear_prd_data(
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 2. Delete orphaned runs (no remaining run_tasks reference them)
+    // 2a. Delete key_decisions for this prefix (FK→runs, FK→tasks, both RESTRICT)
+    tx.execute(
+        "DELETE FROM key_decisions WHERE task_id LIKE ? ESCAPE '\\'",
+        rusqlite::params![pattern],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
+    // 2b. Delete orphaned runs (no remaining run_tasks reference them).
+    //     key_decisions referencing these runs were removed in 2a.
+    //     Also clear any key_decisions whose run is about to be deleted
+    //     (the run has no remaining run_tasks but key_decisions may reference
+    //     it with a NULL task_id).
+    tx.execute(
+        "DELETE FROM key_decisions WHERE run_id IN \
+         (SELECT run_id FROM runs WHERE NOT EXISTS \
+          (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id))",
+        [],
+    )
+    .map_err(crate::TaskMgrError::DatabaseError)?;
+
     tx.execute(
         "DELETE FROM runs WHERE NOT EXISTS \
          (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id)",
@@ -1551,6 +1570,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rt_pa, 0, "PA run_task entry should be removed");
+    }
+
+    #[test]
+    fn test_clear_prd_with_key_decisions_does_not_fk_violate() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+        setup_two_prds(&conn);
+
+        // Create a run for PA
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-pa', 'completed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
+             VALUES ('run-pa', 'PA-001', 'completed', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Insert key_decisions referencing both run and task
+        conn.execute(
+            "INSERT INTO key_decisions (run_id, task_id, iteration, title, description, options) \
+             VALUES ('run-pa', 'PA-001', 1, 'Test Decision', 'desc', '[]')",
+            [],
+        )
+        .unwrap();
+        // Also one with NULL task_id (just references the run)
+        conn.execute(
+            "INSERT INTO key_decisions (run_id, task_id, iteration, title, description, options) \
+             VALUES ('run-pa', NULL, 1, 'Another Decision', 'desc', '[]')",
+            [],
+        )
+        .unwrap();
+
+        // This must not fail with FK constraint violation
+        let deleted = clear_prd_data(&mut conn, 1, "PA").unwrap();
+        assert!(deleted > 0, "Should have deleted PA tasks");
+
+        // key_decisions must be gone
+        let kd_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM key_decisions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kd_count, 0, "key_decisions must be cleaned up");
+
+        // PB data should be intact
+        let pb_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'PB-%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(pb_count > 0, "PB tasks must be preserved");
     }
 
     #[test]
