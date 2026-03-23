@@ -68,6 +68,7 @@ pub fn get_pending_decisions(
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE run_id = ?1 AND status IN ('pending', 'deferred')
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;
@@ -86,6 +87,7 @@ pub fn get_all_pending_decisions(conn: &Connection) -> TaskMgrResult<Vec<StoredK
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE status IN ('pending', 'deferred')
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;
@@ -153,6 +155,7 @@ pub fn get_all_decisions(
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE (?1 IS NULL OR status = ?1)
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;

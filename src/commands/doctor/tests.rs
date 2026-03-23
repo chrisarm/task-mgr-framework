@@ -1,13 +1,15 @@
 //! Tests for the doctor command.
 
 use super::*;
+use crate::db::migrations::run_migrations;
 use crate::db::{create_schema, open_connection};
 use tempfile::TempDir;
 
 fn setup_test_db() -> (TempDir, rusqlite::Connection) {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 

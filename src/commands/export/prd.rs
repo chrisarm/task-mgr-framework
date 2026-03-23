@@ -163,7 +163,7 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         r#"SELECT id, title, description, priority, status, notes,
            acceptance_criteria, review_scope, severity, source_review,
            model, difficulty, escalation_note, max_retries
-           FROM tasks ORDER BY id"#,
+           FROM tasks WHERE archived_at IS NULL ORDER BY id"#,
     )?;
 
     let task_rows = stmt.query_map([], |row| {
