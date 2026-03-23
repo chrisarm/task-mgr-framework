@@ -124,6 +124,7 @@ fn query_task_counts(conn: &Connection) -> TaskMgrResult<TaskCounts> {
             COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) as skipped,
             COALESCE(SUM(CASE WHEN status = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant
         FROM tasks
+        WHERE archived_at IS NULL
         "#,
     )?;
 
@@ -177,6 +178,7 @@ fn query_active_run(conn: &Connection) -> TaskMgrResult<Option<ActiveRunInfo>> {
         SELECT run_id, started_at, iteration_count
         FROM runs
         WHERE status = 'active'
+        AND archived_at IS NULL
         ORDER BY started_at DESC
         LIMIT 1
         "#,

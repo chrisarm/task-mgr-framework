@@ -112,7 +112,7 @@ pub fn get_reviewable_tasks(
     let query = format!(
         "SELECT id, title, description, status, last_error, notes, priority \
          FROM tasks \
-         WHERE {} \
+         WHERE {} AND archived_at IS NULL \
          ORDER BY priority ASC, id ASC",
         status_filter
     );
@@ -381,13 +381,14 @@ pub fn format_text(result: &ReviewResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
+    use crate::db::{create_schema, migrations::run_migrations, open_connection};
     use tempfile::TempDir;
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 

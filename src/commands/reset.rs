@@ -133,8 +133,9 @@ pub fn reset_tasks(conn: &Connection, task_ids: &[String]) -> TaskMgrResult<Rese
 /// * `Ok(ResetResult)` - Summary of reset operations
 pub fn reset_all_tasks(conn: &Connection) -> TaskMgrResult<ResetResult> {
     // Find all non-todo tasks
-    let mut stmt =
-        conn.prepare("SELECT id FROM tasks WHERE status != 'todo' ORDER BY priority ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tasks WHERE status != 'todo' AND archived_at IS NULL ORDER BY priority ASC",
+    )?;
 
     let task_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
@@ -170,7 +171,7 @@ pub fn reset_all_tasks(conn: &Connection) -> TaskMgrResult<ResetResult> {
 /// * `Ok(usize)` - Number of non-todo tasks
 pub fn count_resettable_tasks(conn: &Connection) -> TaskMgrResult<usize> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tasks WHERE status != 'todo'",
+        "SELECT COUNT(*) FROM tasks WHERE status != 'todo' AND archived_at IS NULL",
         [],
         |row| row.get(0),
     )?;
@@ -215,13 +216,14 @@ pub fn format_text(result: &ResetResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
+    use crate::db::{create_schema, migrations::run_migrations, open_connection};
     use tempfile::TempDir;
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
