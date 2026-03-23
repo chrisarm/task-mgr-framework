@@ -259,7 +259,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "The temporary hard-delete fix for key_decisions (commit a80bb46) should be replaced by the soft-archive approach. The existing test test_clear_prd_with_key_decisions_does_not_fk_violate should be updated to verify soft-archive behavior instead.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [

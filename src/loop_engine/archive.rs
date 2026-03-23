@@ -144,7 +144,7 @@ fn archive_single_prd(
     let task_count = if dry_run {
         let like_pattern = make_like_pattern(prefix);
         conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
             rusqlite::params![like_pattern],
             |row| row.get::<_, usize>(0),
         )
@@ -170,7 +170,7 @@ fn archive_single_prd(
                 })?;
             }
         }
-        clear_prd_data(conn, prd.id, prefix)?
+        archive_prd_data(conn, prd.id, prefix)?
     };
 
     Ok(PrdArchiveOutcome::Archived {
@@ -437,16 +437,17 @@ fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> TaskMgrResult<Ve
     Ok(paths)
 }
 
-/// Clear task data scoped to a single PRD.
+/// Soft-archive task data scoped to a single PRD.
 ///
-/// Wraps all deletions in a single transaction. Deletes tasks matching
-/// `{prefix}-%` and all dependent data (run_tasks, orphaned runs,
-/// task_relationships, task_files). Also removes prd_files and prd_metadata
-/// for the given `prd_id`. NULLs out dangling `global_state` references, and
-/// resets `iteration_counter` only when no tasks remain across all PRDs.
+/// Sets `archived_at = datetime('now')` on tasks, run_tasks, key_decisions,
+/// and fully-archived runs matching `{prefix}-%`. A run is soft-archived only
+/// when ALL its run_tasks have `archived_at IS NOT NULL`. Hard-deletes
+/// task_relationships and task_files (no historical value). Also hard-deletes
+/// prd_files and prd_metadata. Resets `iteration_counter` only when no active
+/// (archived_at IS NULL) tasks remain across all PRDs.
 ///
-/// Returns the number of tasks deleted.
-fn clear_prd_data(
+/// Returns the number of tasks soft-archived.
+fn archive_prd_data(
     conn: &mut rusqlite::Connection,
     prd_id: i64,
     prefix: &str,
@@ -457,41 +458,53 @@ fn clear_prd_data(
         .transaction()
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 1. Delete run_tasks for this prefix
+    // 1. Soft-archive run_tasks for this prefix
     tx.execute(
-        "DELETE FROM run_tasks WHERE task_id LIKE ? ESCAPE '\\'",
+        "UPDATE run_tasks SET archived_at = datetime('now') \
+         WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
         rusqlite::params![pattern],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 2a. Delete key_decisions for this prefix (FK→runs, FK→tasks, both RESTRICT)
+    // 2a. Soft-archive key_decisions by task prefix
     tx.execute(
-        "DELETE FROM key_decisions WHERE task_id LIKE ? ESCAPE '\\'",
+        "UPDATE key_decisions SET archived_at = datetime('now') \
+         WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
         rusqlite::params![pattern],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 2b. Delete orphaned runs (no remaining run_tasks reference them).
-    //     key_decisions referencing these runs were removed in 2a.
-    //     Also clear any key_decisions whose run is about to be deleted
-    //     (the run has no remaining run_tasks but key_decisions may reference
-    //     it with a NULL task_id).
+    // 2b. Soft-archive key_decisions for runs that are now fully archived
+    //     (covers NULL task_id key_decisions that reference the run)
     tx.execute(
-        "DELETE FROM key_decisions WHERE run_id IN \
-         (SELECT run_id FROM runs WHERE NOT EXISTS \
-          (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id))",
+        "UPDATE key_decisions SET archived_at = datetime('now') \
+         WHERE archived_at IS NULL \
+         AND run_id IN ( \
+             SELECT run_id FROM runs \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM run_tasks \
+                 WHERE run_tasks.run_id = runs.run_id \
+                 AND run_tasks.archived_at IS NULL \
+             ) \
+         )",
         [],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
+    // 3. Soft-archive runs where ALL run_tasks are now archived
     tx.execute(
-        "DELETE FROM runs WHERE NOT EXISTS \
-         (SELECT 1 FROM run_tasks WHERE run_tasks.run_id = runs.run_id)",
+        "UPDATE runs SET archived_at = datetime('now') \
+         WHERE archived_at IS NULL \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM run_tasks \
+             WHERE run_tasks.run_id = runs.run_id \
+             AND run_tasks.archived_at IS NULL \
+         )",
         [],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 3. Delete task_relationships touching this prefix
+    // 4. Hard-delete task_relationships touching this prefix (no historical value)
     tx.execute(
         "DELETE FROM task_relationships \
          WHERE task_id LIKE ? ESCAPE '\\' OR related_id LIKE ? ESCAPE '\\'",
@@ -499,55 +512,68 @@ fn clear_prd_data(
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 4. Delete task_files for this prefix
+    // 5. Hard-delete task_files for this prefix (no historical value)
     tx.execute(
         "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
         rusqlite::params![pattern],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 5. Delete tasks and capture the count for reporting
-    let deleted = tx
+    // 6. Soft-archive tasks and capture the count for reporting
+    let archived = tx
         .execute(
-            "DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+            "UPDATE tasks SET archived_at = datetime('now') \
+             WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
             rusqlite::params![pattern],
         )
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 6. Delete prd_files for this PRD (may not exist in pre-v6 databases)
+    // 7. Hard-delete prd_files for this PRD (may not exist in pre-v6 databases)
     let _ = tx.execute(
         "DELETE FROM prd_files WHERE prd_id = ?",
         rusqlite::params![prd_id],
     );
 
-    // 7. Delete prd_metadata row
+    // 8. Hard-delete prd_metadata row
     tx.execute(
         "DELETE FROM prd_metadata WHERE id = ?",
         rusqlite::params![prd_id],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 8. NULL out last_task_id if the referenced task no longer exists
+    // 9. NULL out last_task_id if the referenced task is now archived
     tx.execute(
         "UPDATE global_state SET last_task_id = NULL \
          WHERE id = 1 AND last_task_id IS NOT NULL \
-         AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id = global_state.last_task_id)",
+         AND NOT EXISTS ( \
+             SELECT 1 FROM tasks \
+             WHERE tasks.id = global_state.last_task_id \
+             AND tasks.archived_at IS NULL \
+         )",
         [],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 9. NULL out last_run_id if the referenced run no longer exists
+    // 10. NULL out last_run_id if the referenced run is now archived
     tx.execute(
         "UPDATE global_state SET last_run_id = NULL \
          WHERE id = 1 AND last_run_id IS NOT NULL \
-         AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.run_id = global_state.last_run_id)",
+         AND NOT EXISTS ( \
+             SELECT 1 FROM runs \
+             WHERE runs.run_id = global_state.last_run_id \
+             AND runs.archived_at IS NULL \
+         )",
         [],
     )
     .map_err(crate::TaskMgrError::DatabaseError)?;
 
-    // 10. Reset counters only when no tasks remain across all PRDs
+    // 11. Reset counters only when no active (non-archived) tasks remain
     let remaining: i64 = tx
-        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .map_err(crate::TaskMgrError::DatabaseError)?;
 
     if remaining == 0 {
@@ -563,29 +589,7 @@ fn clear_prd_data(
 
     tx.commit().map_err(crate::TaskMgrError::DatabaseError)?;
 
-    Ok(deleted)
-}
-
-/// Soft-archive task data scoped to a single PRD.
-///
-/// Sets `archived_at = datetime('now')` on tasks, run_tasks, and key_decisions
-/// matching `{prefix}-%`. Runs whose ALL remaining run_tasks belong to this
-/// prefix get soft-archived too. Hard-deletes task_relationships and task_files
-/// (no historical value). Resets `iteration_counter` only when no active
-/// (archived_at IS NULL) tasks remain across all PRDs.
-///
-/// Returns the number of tasks soft-archived.
-///
-/// # Stub
-/// Not yet implemented — exists to allow test compilation before the
-/// implementation lands in the corresponding FEAT task.
-#[allow(dead_code)]
-fn archive_prd_data(
-    _conn: &mut rusqlite::Connection,
-    _prd_id: i64,
-    _prefix: &str,
-) -> TaskMgrResult<usize> {
-    unimplemented!("archive_prd_data: soft-archive implementation pending FEAT task")
+    Ok(archived)
 }
 
 /// Extract learnings from progress.txt.
@@ -1005,13 +1009,17 @@ mod tests {
         assert!(folder_name.contains("test-branch"));
         assert!(!folder_name.contains("ralph/"));
 
-        // Verify DB was cleared
+        // Verify DB was soft-archived (tasks still exist but have archived_at set)
         assert_eq!(result.tasks_cleared, 1);
         let conn = crate::db::open_connection(dir.path()).unwrap();
-        let task_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        let active_task_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(task_count, 0);
+        assert_eq!(active_task_count, 0);
         let metadata_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM prd_metadata", [], |row| row.get(0))
             .unwrap();
@@ -1437,7 +1445,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests for clear_prd_data
+    // Tests for archive_prd_data
     // -----------------------------------------------------------------------
 
     /// Insert two PRDs' worth of tasks: PA-001/PA-002 (done) and PB-001/PB-002
@@ -1457,14 +1465,17 @@ mod tests {
         let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
-        let pa_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%'", [], |r| {
-                r.get(0)
-            })
+        // PA tasks should be soft-archived (still exist but have archived_at set)
+        let pa_archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%' AND archived_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(pa_count, 0, "PRD A tasks should be deleted");
+        assert_eq!(pa_archived, 2, "PRD A tasks should be soft-archived");
 
         let pb_in_progress: i64 = conn
             .query_row(
@@ -1510,12 +1521,12 @@ mod tests {
         };
         record_learning(&conn, params).unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1, "Learnings must survive PRD clear");
+        assert_eq!(count, 1, "Learnings must survive PRD archive");
     }
 
     #[test]
@@ -1524,7 +1535,7 @@ mod tests {
         let mut conn = setup_db(dir.path());
         setup_two_prds(&conn);
 
-        // Run that only references PA tasks — will be orphaned after clear
+        // Run that only references PA tasks — will be fully archived after soft-archive
         conn.execute(
             "INSERT INTO runs (run_id, status) VALUES ('run-a-only', 'completed')",
             [],
@@ -1536,16 +1547,19 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
-        let run_count: i64 = conn
+        let run_archived: Option<String> = conn
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE run_id = 'run-a-only'",
+                "SELECT archived_at FROM runs WHERE run_id = 'run-a-only'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(run_count, 0, "Orphaned run should be deleted");
+        assert!(
+            run_archived.is_some(),
+            "Orphaned run should be soft-archived"
+        );
     }
 
     #[test]
@@ -1571,27 +1585,31 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
-        // Run must survive because PB-001 still references it
-        let run_count: i64 = conn
+        // Shared run must remain active because PB-001 run_task is not yet archived
+        let run_archived: Option<String> = conn
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE run_id = 'run-shared'",
+                "SELECT archived_at FROM runs WHERE run_id = 'run-shared'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(run_count, 1, "Shared run must be preserved");
+        assert!(run_archived.is_none(), "Shared run must remain active");
 
-        // The PA run_task entry should be gone
-        let rt_pa: i64 = conn
+        // The PA run_task entry should be soft-archived
+        let rt_pa_archived: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM run_tasks WHERE run_id = 'run-shared' AND task_id = 'PA-001'",
+                "SELECT COUNT(*) FROM run_tasks \
+                 WHERE run_id = 'run-shared' AND task_id = 'PA-001' AND archived_at IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rt_pa, 0, "PA run_task entry should be removed");
+        assert_eq!(
+            rt_pa_archived, 1,
+            "PA run_task entry should be soft-archived"
+        );
     }
 
     #[test]
@@ -1629,14 +1647,26 @@ mod tests {
         .unwrap();
 
         // This must not fail with FK constraint violation
-        let deleted = clear_prd_data(&mut conn, 1, "PA").unwrap();
-        assert!(deleted > 0, "Should have deleted PA tasks");
+        let archived = archive_prd_data(&mut conn, 1, "PA").unwrap();
+        assert!(archived > 0, "Should have soft-archived PA tasks");
 
-        // key_decisions must be gone
-        let kd_count: i64 = conn
+        // key_decisions must be soft-archived (not deleted — history preserved)
+        let kd_archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM key_decisions WHERE archived_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kd_archived, 2, "Both key_decisions must be soft-archived");
+
+        let kd_total: i64 = conn
             .query_row("SELECT COUNT(*) FROM key_decisions", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(kd_count, 0, "key_decisions must be cleaned up");
+        assert_eq!(
+            kd_total, 2,
+            "key_decisions must survive (soft-archive preserves history)"
+        );
 
         // PB data should be intact
         let pb_count: i64 = conn
@@ -1659,8 +1689,8 @@ mod tests {
         )
         .unwrap();
 
-        // Clear PA only — PB still has tasks, so counters must NOT reset
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        // Archive PA only — PB still has active tasks, so counters must NOT reset
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
         let counter: i64 = conn
             .query_row(
@@ -1687,8 +1717,8 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
-        clear_prd_data(&mut conn, 2, "PB").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 2, "PB").unwrap();
 
         let counter: i64 = conn
             .query_row(
@@ -1699,7 +1729,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             counter, 0,
-            "Counter must reset when the last PRD is cleared"
+            "Counter must reset when the last PRD is archived"
         );
     }
 
@@ -1715,7 +1745,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
         let last_task: Option<String> = conn
             .query_row(
@@ -1726,7 +1756,7 @@ mod tests {
             .unwrap();
         assert!(
             last_task.is_none(),
-            "last_task_id must be NULL after the referenced task is deleted"
+            "last_task_id must be NULL after the referenced task is archived"
         );
     }
 
@@ -1742,7 +1772,7 @@ mod tests {
         )
         .unwrap();
 
-        clear_prd_data(&mut conn, 1, "PA").unwrap();
+        archive_prd_data(&mut conn, 1, "PA").unwrap();
 
         let last_task: Option<String> = conn
             .query_row(
@@ -2272,18 +2302,18 @@ mod tests {
         assert_eq!(result.prds_archived[0].tasks_cleared, 1);
         assert_eq!(result.tasks_cleared, 1);
 
-        // DB data must be cleared even though no files were moved
+        // DB data must be soft-archived even though no files were moved
         let conn = crate::db::open_connection(dir.path()).unwrap();
-        let task_count: i64 = conn
+        let active_task_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'GP-%'",
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'GP-%' AND archived_at IS NULL",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            task_count, 0,
-            "DB tasks should be cleared for completed PRD with no files"
+            active_task_count, 0,
+            "DB tasks should be soft-archived for completed PRD with no files"
         );
 
         let meta_count: i64 = conn
@@ -2590,14 +2620,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Tests for archive_prd_data (soft-archive — TEST-INIT-002)
-    //
-    // archive_prd_data is not yet implemented; tests that call it are marked
-    // #[ignore] so the suite stays green while the implementation lands.
     // -----------------------------------------------------------------------
 
     /// Archiving PA sets archived_at on PA tasks; PB tasks are untouched.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_a_sets_archived_at_on_tasks() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2634,7 +2660,6 @@ mod tests {
 
     /// Archiving PA sets archived_at on PA run_tasks; PB run_tasks are untouched.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_a_run_tasks_archived_pb_untouched() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2688,7 +2713,6 @@ mod tests {
 
     /// Shared run (PA + PB run_tasks) must NOT be archived when only PA is archived.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_a_shared_run_stays_active() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2729,7 +2753,6 @@ mod tests {
 
     /// Orphaned run (only PA run_tasks) must be soft-archived when PA is archived.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_a_orphaned_run_gets_archived() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2764,7 +2787,6 @@ mod tests {
 
     /// key_decisions for PA must have archived_at set after soft-archive.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_a_archives_key_decisions() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2812,7 +2834,6 @@ mod tests {
 
     /// task_relationships and task_files must be hard-deleted (not soft-archived).
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_prd_hard_deletes_relationships_and_files() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());
@@ -2993,7 +3014,6 @@ mod tests {
 
     /// Counter must not reset while active tasks remain; must reset when all tasks archived.
     #[test]
-    #[ignore = "archive_prd_data not yet implemented"]
     fn test_soft_archive_counter_reset_when_no_active_tasks_remain() {
         let dir = TempDir::new().unwrap();
         let mut conn = setup_db(dir.path());

@@ -1542,15 +1542,17 @@ fn test_archive_actual_archives_p1_leaves_p2() {
     let db_path = temp_dir.path().join("tasks.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
 
-    // P1 tasks must be cleared from the DB after archiving
-    let p1_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%'", [], |r| {
-            r.get(0)
-        })
+    // P1 tasks must be soft-archived (archived_at set) after archiving
+    let p1_active_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P1-%' AND archived_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(
-        p1_count, 0,
-        "P1 tasks must be cleared from DB after archive"
+        p1_active_count, 0,
+        "P1 tasks must be soft-archived (no active tasks remaining)"
     );
 
     // P2 tasks must remain intact
