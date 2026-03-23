@@ -1117,7 +1117,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate before merge. Verify everything works together.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "taskType": "verification",
