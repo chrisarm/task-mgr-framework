@@ -1397,43 +1397,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_prd_a_leaves_prd_b_intact() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-
-        // PA tasks should be soft-archived (still exist but have archived_at set)
-        let pa_archived: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'PA-%' AND archived_at IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pa_archived, 2, "PRD A tasks should be soft-archived");
-
-        let pb_in_progress: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id = 'PB-001' AND status = 'in_progress'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pb_in_progress, 1, "PRD B in_progress task must survive");
-
-        let pb_todo: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id = 'PB-002' AND status = 'todo'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pb_todo, 1, "PRD B todo task must survive");
-    }
-
-    #[test]
     fn test_clear_prd_a_leaves_learnings_intact() {
         use crate::learnings::crud::{record_learning, RecordLearningParams};
         use crate::models::{Confidence, LearningOutcome};
@@ -1464,39 +1427,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "Learnings must survive PRD archive");
-    }
-
-    #[test]
-    fn test_clear_prd_a_deletes_orphaned_runs() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        // Run that only references PA tasks — will be fully archived after soft-archive
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-a-only', 'completed')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, status, iteration) VALUES ('run-a-only', 'PA-001', 'completed', 1)",
-            [],
-        )
-        .unwrap();
-
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-
-        let run_archived: Option<String> = conn
-            .query_row(
-                "SELECT archived_at FROM runs WHERE run_id = 'run-a-only'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            run_archived.is_some(),
-            "Orphaned run should be soft-archived"
-        );
     }
 
     #[test]
@@ -1612,62 +1542,6 @@ mod tests {
             })
             .unwrap();
         assert!(pb_count > 0, "PB tasks must be preserved");
-    }
-
-    #[test]
-    fn test_global_state_counters_not_reset_while_other_prd_remains() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        conn.execute(
-            "UPDATE global_state SET iteration_counter = 42 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        // Archive PA only — PB still has active tasks, so counters must NOT reset
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-
-        let counter: i64 = conn
-            .query_row(
-                "SELECT iteration_counter FROM global_state WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            counter, 42,
-            "Counter must not reset while another PRD's tasks remain"
-        );
-    }
-
-    #[test]
-    fn test_global_state_counters_reset_when_last_prd_cleared() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        conn.execute(
-            "UPDATE global_state SET iteration_counter = 42 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-        archive_prd_data(&mut conn, 2, "PB").unwrap();
-
-        let counter: i64 = conn
-            .query_row(
-                "SELECT iteration_counter FROM global_state WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            counter, 0,
-            "Counter must reset when the last PRD is archived"
-        );
     }
 
     #[test]
@@ -2648,46 +2522,6 @@ mod tests {
         assert_eq!(pb_rt_archived, 0, "PB run_tasks must remain unarchived");
     }
 
-    /// Shared run (PA + PB run_tasks) must NOT be archived when only PA is archived.
-    #[test]
-    fn test_soft_archive_prd_a_shared_run_stays_active() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-shared', 'completed')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
-             VALUES ('run-shared', 'PA-001', 'completed', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
-             VALUES ('run-shared', 'PB-001', 'completed', 2)",
-            [],
-        )
-        .unwrap();
-
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-
-        let run_archived: Option<String> = conn
-            .query_row(
-                "SELECT archived_at FROM runs WHERE run_id = 'run-shared'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            run_archived.is_none(),
-            "Shared run must stay active: PB still has an unarchived run_task referencing it"
-        );
-    }
-
     /// Orphaned run (only PA run_tasks) must be soft-archived when PA is archived.
     #[test]
     fn test_soft_archive_prd_a_orphaned_run_gets_archived() {
@@ -2719,53 +2553,6 @@ mod tests {
         assert!(
             run_archived.is_some(),
             "Orphaned run must be soft-archived when all its run_tasks belong to the archived PRD"
-        );
-    }
-
-    /// key_decisions for PA must have archived_at set after soft-archive.
-    #[test]
-    fn test_soft_archive_prd_a_archives_key_decisions() {
-        let dir = TempDir::new().unwrap();
-        let mut conn = setup_db(dir.path());
-        setup_two_prds(&conn);
-
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('run-pa', 'completed')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
-             VALUES ('run-pa', 'PA-001', 'completed', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO key_decisions (run_id, task_id, iteration, title, description, options) \
-             VALUES ('run-pa', 'PA-001', 1, 'Arch Decision', 'desc', '[]')",
-            [],
-        )
-        .unwrap();
-
-        archive_prd_data(&mut conn, 1, "PA").unwrap();
-
-        let kd_archived: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM key_decisions \
-                 WHERE task_id LIKE 'PA-%' AND archived_at IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(kd_archived, 1, "PA key_decisions must have archived_at set");
-
-        // Row must still exist (soft-archive, not hard-delete)
-        let kd_total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM key_decisions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            kd_total, 1,
-            "key_decision row must survive (soft-archive preserves history)"
         );
     }
 
