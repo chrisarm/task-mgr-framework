@@ -629,7 +629,7 @@
       "id": "CODE-FIX-001",
       "modifiesBehavior": false,
       "notes": "One-line fix: add AND t.archived_at IS NULL after the existing AND t.status IN ('todo', 'in_progress') clause at ~line 113.",
-      "passes": false,
+      "passes": true,
       "priority": 14,
       "synergyWith": [
         "CODE-FIX-002"
@@ -657,7 +657,7 @@
       "id": "CODE-FIX-002",
       "modifiesBehavior": false,
       "notes": "One-line fix: add AND archived_at IS NULL to the WHERE clause at ~line 59.",
-      "passes": false,
+      "passes": true,
       "priority": 14,
       "synergyWith": [
         "CODE-FIX-001"
@@ -686,7 +686,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": false,
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "taskType": "review",
@@ -717,7 +717,7 @@
       "id": "REFACTOR-1-001",
       "modifiesBehavior": false,
       "notes": "The shared helper should live in a common module (e.g. src/db/archive.rs or src/loop_engine/archive_helpers.rs). archive_prd_data steps 1-3 and drop_existing_data lines 33-58 are the duplicated code. Keep the transaction boundary in archive_prd_data; the helper should accept a connection/transaction ref.",
-      "passes": false,
+      "passes": true,
       "priority": 18,
       "synergyWith": [
         "REFACTOR-1-002"
@@ -748,7 +748,7 @@
       "id": "REFACTOR-1-002",
       "modifiesBehavior": false,
       "notes": "Pure mechanical cleanup. Search for .map_err(crate::TaskMgrError::DatabaseError) in archive.rs and remove each one. Verify with cargo check that the From impl handles the conversion.",
-      "passes": false,
+      "passes": true,
       "priority": 19,
       "synergyWith": [
         "REFACTOR-1-001"
@@ -776,7 +776,7 @@
       "id": "REFACTOR-1-003",
       "modifiesBehavior": false,
       "notes": "The helper should return a struct with the serialized fields (acceptance_criteria: String, review_scope: Option<String>, required_tests: Option<String>, max_retries: i32). Both insert_task and update_task destructure the result.",
-      "passes": false,
+      "passes": true,
       "priority": 19,
       "synergyWith": [],
       "taskType": "implementation",
@@ -821,7 +821,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Review-and-update checkpoint. Read the progress file and git log, identify deviations from plan, update all remaining tasks to reflect actual implementation.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "taskType": "milestone",
@@ -851,7 +851,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Focus on scenarios not covered by TEST-INIT-002. Test real query functions (status_queries, next/selection) to verify end-to-end filter behavior.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": {
         "correctness": [
@@ -895,7 +895,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "For CLI tests, check tests/cli_tests.rs for the pattern. For init --force, may need a helper to set up a pre-archived state.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "qualityDimensions": {
         "correctness": [
@@ -951,6 +951,64 @@
     },
     {
       "acceptanceCriteria": [
+        "Duplicate test pairs identified in review are consolidated (keep the more thorough version)",
+        "No two tests verify the exact same behavior with different names",
+        "All remaining tests still pass after dedup",
+        "Net reduction of at least 150 lines of test code"
+      ],
+      "batchWith": [
+        "REFACTOR-2-002"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Deduplicate archive_prd_data tests in archive.rs. The original test set (lines ~1399-1700) and the TEST-001 set (lines ~2563-3180) contain 6 duplicate pairs testing identical soft-archive behavior. For each pair, keep the more thorough version and remove the other. Pairs: (1) test_clear_prd_a_leaves_prd_b_intact vs test_soft_archive_prd_a_sets_archived_at_on_tasks, (2) test_clear_prd_a_deletes_orphaned_runs vs test_soft_archive_prd_a_orphaned_run_gets_archived, (3) test_clear_prd_a_preserves_shared_runs vs test_soft_archive_prd_a_shared_run_stays_active, (4) test_clear_prd_with_key_decisions_does_not_fk_violate vs test_soft_archive_prd_a_archives_key_decisions, (5) test_global_state_counters_not_reset_while_other_prd_remains vs first half of test_soft_archive_counter_reset_when_no_active_tasks_remain, (6) test_global_state_counters_reset_when_last_prd_cleared vs test_soft_archive_counter_reset_when_no_active_tasks_remain.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 44,
+      "synergyWith": [
+        "REFACTOR-2-002"
+      ],
+      "taskType": "refactor",
+      "title": "Deduplicate archive_prd_data test pairs in archive.rs",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "3 near-identical progress file skip tests replaced with a single parameterized test or loop",
+        "All prefix variants (PA, CHAIN, hex) still covered",
+        "Tests still pass after refactor",
+        "Net reduction of at least 60 lines"
+      ],
+      "batchWith": [
+        "REFACTOR-2-001"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Parameterize the 3 near-identical progress file skip tests in archive.rs (test_archive_skips_prefixed_progress_file, test_archive_skips_chain_prefixed_progress_file, test_archive_skips_hex_prefixed_progress_file). These tests differ only in the prefix name/project name but each is ~40 lines. Extract a helper fn like assert_progress_file_skipped(prefix, project, task_id) and call it 3 times in a single test, or use a loop over test cases.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "passes": false,
+      "priority": 46,
+      "synergyWith": [
+        "REFACTOR-2-001"
+      ],
+      "taskType": "refactor",
+      "title": "Parameterize progress file skip tests in archive.rs",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
         "All TEST-xxx tests pass",
         "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
         "Remaining tasks reviewed and updated based on test findings"
@@ -961,7 +1019,9 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002"
       ],
       "description": "Review-and-update checkpoint after comprehensive testing phase. Verify all tests pass, update remaining tasks.",
       "estimatedEffort": "medium",
