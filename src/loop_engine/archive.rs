@@ -2949,6 +2949,192 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Acceptance-criteria tests for TEST-001
+    // -----------------------------------------------------------------------
+
+    /// archive_prd_data with a prefix that has no matching tasks returns 0 (no-op).
+    #[test]
+    fn test_archive_prd_data_no_tasks_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "empty-project", "main", Some("EMPTY"));
+        // No tasks inserted for prefix EMPTY
+
+        let count = archive_prd_data(&mut conn, 1, "EMPTY").unwrap();
+        assert_eq!(count, 0, "archive with no matching tasks must return 0");
+    }
+
+    /// Archiving the same tasks a second time is idempotent: count is 0 and
+    /// the original archived_at timestamp is unchanged.
+    #[test]
+    fn test_archive_prd_data_idempotent_on_second_call() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+        insert_prd(&conn, 1, "project-a", "main", Some("PA"));
+        insert_task(&conn, "PA-001", "Task", 1, "done");
+
+        // First archive
+        let count1 = archive_prd_data(&mut conn, 1, "PA").unwrap();
+        assert_eq!(count1, 1, "First call must archive 1 task");
+
+        let ts1: Option<String> = conn
+            .query_row(
+                "SELECT archived_at FROM tasks WHERE id = 'PA-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ts1.is_some(), "Task must be archived after first call");
+
+        // Re-insert prd_metadata (deleted by first call) so second call is valid
+        insert_prd(&conn, 2, "project-a", "main", Some("PA"));
+
+        // Second archive: must not change archived_at
+        let count2 = archive_prd_data(&mut conn, 2, "PA").unwrap();
+        assert_eq!(count2, 0, "Second archive must return 0 (already archived)");
+
+        let ts2: Option<String> = conn
+            .query_row(
+                "SELECT archived_at FROM tasks WHERE id = 'PA-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ts1, ts2,
+            "archived_at must not change on second archive call"
+        );
+    }
+
+    /// Three-PRD scenario: archive P1 via archive_prd_data, verify P2 and P3
+    /// tasks remain active (archived_at IS NULL).
+    #[test]
+    fn test_archive_prd_data_three_prds_p2_p3_untouched() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "p1", "main", Some("P1"));
+        insert_prd(&conn, 2, "p2", "main", Some("P2"));
+        insert_prd(&conn, 3, "p3", "main", Some("P3"));
+        insert_task(&conn, "P1-001", "P1 task", 1, "done");
+        insert_task(&conn, "P2-001", "P2 task", 1, "todo");
+        insert_task(&conn, "P2-002", "P2 task 2", 2, "in_progress");
+        insert_task(&conn, "P3-001", "P3 task", 1, "done");
+        insert_task(&conn, "P3-002", "P3 task 2", 2, "todo");
+
+        let count = archive_prd_data(&mut conn, 1, "P1").unwrap();
+        assert_eq!(count, 1, "Only P1 tasks should be archived");
+
+        // P2 tasks must be untouched
+        let p2_archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P2-%' AND archived_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_archived, 0,
+            "P2 tasks must remain active after archiving P1"
+        );
+
+        // P3 tasks must be untouched
+        let p3_archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE 'P3-%' AND archived_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p3_archived, 0,
+            "P3 tasks must remain active after archiving P1"
+        );
+    }
+
+    /// A run with run_tasks spanning 3 PRDs is only soft-archived when all 3 PRDs
+    /// have been archived. Archiving P1 and P2 alone must leave the run active.
+    #[test]
+    fn test_shared_run_archived_only_when_all_three_prds_archived() {
+        let dir = TempDir::new().unwrap();
+        let mut conn = setup_db(dir.path());
+
+        insert_prd(&conn, 1, "p1", "main", Some("P1"));
+        insert_prd(&conn, 2, "p2", "main", Some("P2"));
+        insert_prd(&conn, 3, "p3", "main", Some("P3"));
+        insert_task(&conn, "P1-001", "P1 task", 1, "done");
+        insert_task(&conn, "P2-001", "P2 task", 1, "done");
+        insert_task(&conn, "P3-001", "P3 task", 1, "done");
+
+        // One run spanning all three PRDs
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('r-shared', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
+             VALUES ('r-shared', 'P1-001', 'completed', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
+             VALUES ('r-shared', 'P2-001', 'completed', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_tasks (run_id, task_id, status, iteration) \
+             VALUES ('r-shared', 'P3-001', 'completed', 3)",
+            [],
+        )
+        .unwrap();
+
+        // Archive P1: run still active (P2 and P3 run_tasks not yet archived)
+        archive_prd_data(&mut conn, 1, "P1").unwrap();
+        let run_archived: Option<String> = conn
+            .query_row(
+                "SELECT archived_at FROM runs WHERE run_id = 'r-shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            run_archived.is_none(),
+            "Run must stay active after P1-only archive"
+        );
+
+        // Archive P2: run still active (P3 run_task not yet archived)
+        archive_prd_data(&mut conn, 2, "P2").unwrap();
+        let run_archived: Option<String> = conn
+            .query_row(
+                "SELECT archived_at FROM runs WHERE run_id = 'r-shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            run_archived.is_none(),
+            "Run must stay active after P1+P2 archive, P3 still pending"
+        );
+
+        // Archive P3: all run_tasks archived, run must now be soft-archived
+        archive_prd_data(&mut conn, 3, "P3").unwrap();
+        let run_archived: Option<String> = conn
+            .query_row(
+                "SELECT archived_at FROM runs WHERE run_id = 'r-shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            run_archived.is_some(),
+            "Run must be soft-archived after all 3 PRDs are archived"
+        );
+    }
+
     /// Counter must not reset while active tasks remain; must reset when all tasks archived.
     #[test]
     fn test_soft_archive_counter_reset_when_no_active_tasks_remain() {

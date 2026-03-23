@@ -435,6 +435,27 @@ mod tests {
         assert_eq!(pending[0].status, "pending");
     }
 
+    /// get_pending_decisions must not return decisions whose archived_at IS NOT NULL.
+    #[test]
+    fn test_get_pending_decisions_excludes_archived() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        // Soft-archive the decision directly
+        conn.execute(
+            "UPDATE key_decisions SET archived_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+
+        let pending = get_pending_decisions(&conn, "run-001").unwrap();
+        assert!(
+            pending.is_empty(),
+            "Archived decisions must not appear in get_pending_decisions"
+        );
+    }
+
     #[test]
     fn test_options_serialized_as_json() {
         let (_dir, conn) = setup_db();

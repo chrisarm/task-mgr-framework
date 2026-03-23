@@ -661,4 +661,55 @@ mod tests {
         assert_eq!(prefixes.len(), 1, "should deduplicate: {:?}", prefixes);
         assert_eq!(prefixes[0], "abc123");
     }
+
+    // -----------------------------------------------------------------------
+    // Acceptance-criteria tests: archived tasks excluded from queries
+    // -----------------------------------------------------------------------
+
+    /// query_dashboard_task_counts returns 0 for a prefix after all its tasks
+    /// are soft-archived.
+    #[test]
+    fn test_query_task_counts_returns_zero_for_archived_prefix() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_task(&conn, "PA-001", "Task 1", "done", 10);
+        insert_task(&conn, "PA-002", "Task 2", "todo", 20);
+
+        // Soft-archive all PA tasks
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id LIKE 'PA-%'",
+            [],
+        )
+        .unwrap();
+
+        let counts = query_dashboard_task_counts(&conn, Some("PA")).unwrap();
+        assert_eq!(
+            counts.total, 0,
+            "Archived tasks must not appear in total count"
+        );
+        assert_eq!(counts.done, 0, "Archived done tasks must not appear");
+        assert_eq!(counts.todo, 0, "Archived todo tasks must not appear");
+    }
+
+    /// query_pending_tasks must not return tasks whose archived_at IS NOT NULL.
+    #[test]
+    fn test_query_pending_tasks_skips_archived_tasks() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_task(&conn, "PA-001", "Active todo", "todo", 10);
+        insert_task(&conn, "PA-002", "Archived todo", "todo", 20);
+
+        // Soft-archive PA-002
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'PA-002'",
+            [],
+        )
+        .unwrap();
+
+        let pending = query_pending_tasks(&conn, None).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "Only non-archived pending tasks must be returned"
+        );
+        assert_eq!(pending[0].id, "PA-001");
+    }
 }
