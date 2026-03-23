@@ -101,8 +101,15 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             status,
             file,
             task_type,
+            include_archived,
         } => {
-            let result = list(&cli.dir, status, file.as_deref(), task_type.as_deref())?;
+            let result = list(
+                &cli.dir,
+                status,
+                file.as_deref(),
+                task_type.as_deref(),
+                include_archived,
+            )?;
             output_result(&result, cli.format);
             Ok(())
         }
@@ -459,12 +466,16 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
-        Commands::History { limit, run_id } => {
+        Commands::History {
+            limit,
+            run_id,
+            include_archived,
+        } => {
             if let Some(rid) = run_id {
                 let result = history_detail(&cli.dir, &rid)?;
                 output_result(&result, cli.format);
             } else {
-                let result = history(&cli.dir, limit)?;
+                let result = history(&cli.dir, limit, include_archived)?;
                 output_result(&result, cli.format);
             }
             Ok(())

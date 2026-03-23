@@ -68,6 +68,7 @@ pub fn get_pending_decisions(
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE run_id = ?1 AND status IN ('pending', 'deferred')
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;
@@ -86,6 +87,7 @@ pub fn get_all_pending_decisions(conn: &Connection) -> TaskMgrResult<Vec<StoredK
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE status IN ('pending', 'deferred')
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;
@@ -153,6 +155,7 @@ pub fn get_all_decisions(
             "SELECT id, run_id, task_id, iteration, title, description, options, status, created_at, resolution, resolved_at
              FROM key_decisions
              WHERE (?1 IS NULL OR status = ?1)
+             AND archived_at IS NULL
              ORDER BY created_at ASC",
         )
         .map_err(TaskMgrError::DatabaseError)?;
@@ -430,6 +433,27 @@ mod tests {
         let pending = get_all_decisions(&conn, Some("pending")).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].status, "pending");
+    }
+
+    /// get_pending_decisions must not return decisions whose archived_at IS NOT NULL.
+    #[test]
+    fn test_get_pending_decisions_excludes_archived() {
+        let (_dir, conn) = setup_db();
+        let d = make_decision();
+        let id = insert_key_decision(&conn, "run-001", None, 1, &d).unwrap();
+
+        // Soft-archive the decision directly
+        conn.execute(
+            "UPDATE key_decisions SET archived_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+
+        let pending = get_pending_decisions(&conn, "run-001").unwrap();
+        assert!(
+            pending.is_empty(),
+            "Archived decisions must not appear in get_pending_decisions"
+        );
     }
 
     #[test]

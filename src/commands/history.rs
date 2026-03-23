@@ -38,6 +38,9 @@ pub struct RunSummary {
     pub tasks_failed: i64,
     /// Number of tasks skipped in this run
     pub tasks_skipped: i64,
+    /// Whether this run has been soft-archived
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// Result of the history command when showing a single run detail.
@@ -87,11 +90,15 @@ pub struct TaskAttempt {
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queried.
-pub fn history(dir: &std::path::Path, limit: usize) -> TaskMgrResult<HistoryResult> {
+pub fn history(
+    dir: &std::path::Path,
+    limit: usize,
+    include_archived: Option<Option<usize>>,
+) -> TaskMgrResult<HistoryResult> {
     let conn = open_connection(dir)?;
 
-    let total_runs = query_total_runs(&conn)?;
-    let runs = query_runs(&conn, limit)?;
+    let total_runs = query_total_runs(&conn, include_archived)?;
+    let runs = query_runs(&conn, limit, include_archived)?;
 
     Ok(HistoryResult { runs, total_runs })
 }
@@ -119,41 +126,69 @@ pub fn history_detail(dir: &std::path::Path, run_id: &str) -> TaskMgrResult<RunD
     Ok(RunDetailResult { run, tasks })
 }
 
-/// Query total number of runs.
-fn query_total_runs(conn: &Connection) -> TaskMgrResult<i64> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+/// Query total number of runs (active only, or all when include_archived is set).
+fn query_total_runs(
+    conn: &Connection,
+    include_archived: Option<Option<usize>>,
+) -> TaskMgrResult<i64> {
+    let sql = if include_archived.is_some() {
+        "SELECT COUNT(*) FROM runs"
+    } else {
+        "SELECT COUNT(*) FROM runs WHERE archived_at IS NULL"
+    };
+    let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
     Ok(count)
 }
 
 /// Query runs with task stats, ordered by started_at DESC.
-fn query_runs(conn: &Connection, limit: usize) -> TaskMgrResult<Vec<RunSummary>> {
-    let mut stmt = conn.prepare(
+///
+/// When `include_archived` is `None`, only active (non-archived) runs are returned.
+/// When `Some(None)` or `Some(Some(0))`, all archived runs are included.
+/// When `Some(Some(n))` with n > 0, up to n archived runs are included.
+fn query_runs(
+    conn: &Connection,
+    limit: usize,
+    include_archived: Option<Option<usize>>,
+) -> TaskMgrResult<Vec<RunSummary>> {
+    let archived_filter = if include_archived.is_none() {
+        "WHERE r.archived_at IS NULL"
+    } else {
+        ""
+    };
+
+    let sql = format!(
         r#"
         SELECT
             r.run_id,
             r.started_at,
             r.ended_at,
             r.status,
-            r.iteration_count
+            r.iteration_count,
+            r.archived_at
         FROM runs r
-        ORDER BY r.started_at DESC
+        {archived_filter}
+        ORDER BY (r.archived_at IS NOT NULL) ASC, r.started_at DESC
         LIMIT ?
-        "#,
-    )?;
+        "#
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map([limit as i64], |row| {
+        let archived_at: Option<String> = row.get(5)?;
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
+            archived_at.is_some(),
         ))
     })?;
 
     let mut runs = Vec::new();
     for row_result in rows {
-        let (run_id, started_at, ended_at, status, iteration_count) = row_result?;
+        let (run_id, started_at, ended_at, status, iteration_count, archived) = row_result?;
 
         // Get task stats for this run
         let (tasks_completed, tasks_failed, tasks_skipped) = query_run_task_stats(conn, &run_id)?;
@@ -167,24 +202,49 @@ fn query_runs(conn: &Connection, limit: usize) -> TaskMgrResult<Vec<RunSummary>>
             tasks_completed,
             tasks_failed,
             tasks_skipped,
+            archived,
         });
+    }
+
+    // Apply optional limit to archived runs
+    if let Some(Some(arch_limit)) = include_archived {
+        if arch_limit > 0 {
+            let active_count = runs.iter().filter(|r| !r.archived).count();
+            let archived_count = runs.len() - active_count;
+            if archived_count > arch_limit {
+                runs.truncate(active_count + arch_limit);
+            }
+        }
     }
 
     Ok(runs)
 }
 
-/// Query a single run by ID.
+/// Query a single run by ID (direct lookup, no archived filter — supports viewing archived runs).
 fn query_run_by_id(conn: &Connection, run_id: &str) -> TaskMgrResult<RunSummary> {
-    let (started_at, ended_at, status, iteration_count): (String, Option<String>, String, i64) =
-        conn.query_row(
-            r#"
-            SELECT started_at, ended_at, status, iteration_count
-            FROM runs
-            WHERE run_id = ?
-            "#,
-            [run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+    let (started_at, ended_at, status, iteration_count, archived_at): (
+        String,
+        Option<String>,
+        String,
+        i64,
+        Option<String>,
+    ) = conn.query_row(
+        r#"
+        SELECT started_at, ended_at, status, iteration_count, archived_at
+        FROM runs
+        WHERE run_id = ?
+        "#,
+        [run_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
 
     let (tasks_completed, tasks_failed, tasks_skipped) = query_run_task_stats(conn, run_id)?;
 
@@ -197,6 +257,7 @@ fn query_run_by_id(conn: &Connection, run_id: &str) -> TaskMgrResult<RunSummary>
         tasks_completed,
         tasks_failed,
         tasks_skipped,
+        archived: archived_at.is_some(),
     })
 }
 
@@ -291,15 +352,17 @@ pub fn format_text(result: &HistoryResult) -> String {
             &run.started_at
         };
 
+        let archived_tag = if run.archived { " [archived]" } else { "" };
         output.push_str(&format!(
-            "{:<36}  {:<19}  {:<9}  {:>4}  {:>4}  {:>4}  {:>4}\n",
+            "{:<36}  {:<19}  {:<9}  {:>4}  {:>4}  {:>4}  {:>4}{}\n",
             run.run_id,
             started,
             run.status,
             run.iteration_count,
             run.tasks_completed,
             run.tasks_failed,
-            run.tasks_skipped
+            run.tasks_skipped,
+            archived_tag
         ));
     }
 
@@ -361,8 +424,9 @@ mod tests {
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        crate::db::migrations::run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 
@@ -415,7 +479,7 @@ mod tests {
         let (temp_dir, conn) = setup_test_db();
         drop(conn);
 
-        let result = history(temp_dir.path(), 10).unwrap();
+        let result = history(temp_dir.path(), 10, None).unwrap();
         assert!(result.runs.is_empty());
         assert_eq!(result.total_runs, 0);
     }
@@ -431,7 +495,7 @@ mod tests {
 
         drop(conn);
 
-        let result = history(temp_dir.path(), 10).unwrap();
+        let result = history(temp_dir.path(), 10, None).unwrap();
         assert_eq!(result.runs.len(), 3);
         assert_eq!(result.total_runs, 3);
 
@@ -452,7 +516,7 @@ mod tests {
 
         drop(conn);
 
-        let result = history(temp_dir.path(), 5).unwrap();
+        let result = history(temp_dir.path(), 5, None).unwrap();
         assert_eq!(result.runs.len(), 5);
         assert_eq!(result.total_runs, 15);
     }
@@ -474,7 +538,7 @@ mod tests {
 
         drop(conn);
 
-        let result = history(temp_dir.path(), 10).unwrap();
+        let result = history(temp_dir.path(), 10, None).unwrap();
         assert_eq!(result.runs.len(), 1);
         assert_eq!(result.runs[0].tasks_completed, 2);
         assert_eq!(result.runs[0].tasks_failed, 1);
@@ -563,6 +627,7 @@ mod tests {
                     tasks_completed: 3,
                     tasks_failed: 1,
                     tasks_skipped: 0,
+                    archived: false,
                 },
                 RunSummary {
                     run_id: "run-002".to_string(),
@@ -573,6 +638,7 @@ mod tests {
                     tasks_completed: 1,
                     tasks_failed: 0,
                     tasks_skipped: 1,
+                    archived: false,
                 },
             ],
             total_runs: 2,
@@ -598,6 +664,7 @@ mod tests {
                 tasks_completed: 2,
                 tasks_failed: 1,
                 tasks_skipped: 0,
+                archived: false,
             },
             tasks: vec![
                 TaskAttempt {
@@ -631,5 +698,94 @@ mod tests {
         assert!(text.contains("US-002"));
         assert!(text.contains("First task"));
         assert!(text.contains("failed"));
+    }
+
+    #[test]
+    fn test_history_excludes_archived_by_default() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_run_with_time(&conn, "run-active", "completed", "2024-01-01T10:00:00", 3);
+        insert_test_run_with_time(&conn, "run-archived", "completed", "2024-01-02T10:00:00", 2);
+        conn.execute(
+            "UPDATE runs SET archived_at = datetime('now') WHERE run_id = 'run-archived'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Default (no include_archived) should exclude archived runs
+        let result = history(temp_dir.path(), 10, None).unwrap();
+        assert_eq!(result.runs.len(), 1);
+        assert_eq!(result.runs[0].run_id, "run-active");
+        assert!(!result.runs[0].archived);
+        assert_eq!(result.total_runs, 1);
+    }
+
+    #[test]
+    fn test_history_include_archived_shows_all() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_run_with_time(&conn, "run-active", "completed", "2024-01-01T10:00:00", 3);
+        insert_test_run_with_time(&conn, "run-archived", "completed", "2024-01-02T10:00:00", 2);
+        conn.execute(
+            "UPDATE runs SET archived_at = datetime('now') WHERE run_id = 'run-archived'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // include_archived = Some(None) → show all
+        let result = history(temp_dir.path(), 10, Some(None)).unwrap();
+        assert_eq!(result.runs.len(), 2);
+        assert_eq!(result.total_runs, 2);
+
+        // Active run should be first (not archived)
+        assert!(!result.runs[0].archived);
+        // Archived run second
+        let archived_run = result.runs.iter().find(|r| r.run_id == "run-archived");
+        assert!(archived_run.is_some());
+        assert!(archived_run.unwrap().archived);
+    }
+
+    #[test]
+    fn test_format_text_shows_archived_marker() {
+        let result = HistoryResult {
+            runs: vec![
+                RunSummary {
+                    run_id: "run-active".to_string(),
+                    started_at: "2024-01-01T10:00:00".to_string(),
+                    ended_at: None,
+                    status: "completed".to_string(),
+                    iteration_count: 1,
+                    tasks_completed: 1,
+                    tasks_failed: 0,
+                    tasks_skipped: 0,
+                    archived: false,
+                },
+                RunSummary {
+                    run_id: "run-archived".to_string(),
+                    started_at: "2024-01-02T10:00:00".to_string(),
+                    ended_at: None,
+                    status: "completed".to_string(),
+                    iteration_count: 2,
+                    tasks_completed: 2,
+                    tasks_failed: 0,
+                    tasks_skipped: 0,
+                    archived: true,
+                },
+            ],
+            total_runs: 2,
+        };
+
+        let text = format_text(&result);
+        assert!(text.contains("[archived]"));
+        let archived_line = text
+            .lines()
+            .find(|l| l.contains("run-archived"))
+            .expect("run-archived line not found");
+        assert!(archived_line.contains("[archived]"));
+        let active_line = text
+            .lines()
+            .find(|l| l.contains("run-active"))
+            .expect("run-active line not found");
+        assert!(!active_line.contains("[archived]"));
     }
 }

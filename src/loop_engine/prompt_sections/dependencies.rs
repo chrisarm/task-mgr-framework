@@ -33,6 +33,7 @@ fn get_completed_dependencies(
          WHERE tr.task_id = ?1
            AND tr.rel_type = 'dependsOn'
            AND t.status = 'done'
+           AND t.archived_at IS NULL
          ORDER BY t.id",
     )?;
 

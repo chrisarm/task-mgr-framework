@@ -283,6 +283,35 @@ mod selection_tests {
     }
 
     #[test]
+    fn test_batch_tasks_excludes_archived() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Main Task", "todo", 10);
+        insert_test_task(&conn, "FIX-001", "Archived Batch Task", "todo", 50);
+        insert_test_task(&conn, "FIX-002", "Active Batch Task", "todo", 50);
+        insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
+        insert_test_relationship(&conn, "US-001", "FIX-002", "batchWith");
+
+        // Soft-archive FIX-001
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'FIX-001'",
+            [],
+        )
+        .unwrap();
+
+        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        assert!(result.task.is_some());
+        // FIX-001 is archived and must be excluded; FIX-002 is active and must be included
+        assert!(
+            !result.batch_tasks.contains(&"FIX-001".to_string()),
+            "Archived tasks must not appear in batch_tasks"
+        );
+        assert!(
+            result.batch_tasks.contains(&"FIX-002".to_string()),
+            "Active batch tasks must still be included"
+        );
+    }
+
+    #[test]
     fn test_combined_scoring() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Completed Prereq", "done", 1);

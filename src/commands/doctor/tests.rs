@@ -1,13 +1,15 @@
 //! Tests for the doctor command.
 
 use super::*;
+use crate::db::migrations::run_migrations;
 use crate::db::{create_schema, open_connection};
 use tempfile::TempDir;
 
 fn setup_test_db() -> (TempDir, rusqlite::Connection) {
     let temp_dir = TempDir::new().unwrap();
-    let conn = open_connection(temp_dir.path()).unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
     create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
     (temp_dir, conn)
 }
 
@@ -1037,4 +1039,34 @@ fn test_git_reconciliation_serialization() {
     assert!(json.contains("git_reconciliation"));
     assert!(json.contains("\"reconciled\":1"));
     assert!(json.contains("FEAT-001"));
+}
+
+// ============ soft-archive exclusion tests ============
+
+/// Archived runs (archived_at IS NOT NULL) must not appear in
+/// find_active_runs_without_end results (verified through doctor()).
+#[test]
+fn test_archived_run_excluded_from_active_runs_without_end() {
+    let (tmp_dir, conn) = setup_test_db();
+
+    conn.execute(
+        "INSERT INTO runs (run_id, status, started_at) VALUES ('r-archived', 'active', datetime('now'))",
+        [],
+    )
+    .unwrap();
+
+    // Soft-archive the run
+    conn.execute(
+        "UPDATE runs SET archived_at = datetime('now') WHERE run_id = 'r-archived'",
+        [],
+    )
+    .unwrap();
+
+    // doctor() internally calls find_active_runs_without_end; archived runs must
+    // not be reported as abandoned active runs.
+    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    assert_eq!(
+        result.summary.active_runs, 0,
+        "Archived runs must not be counted as active runs without end"
+    );
 }

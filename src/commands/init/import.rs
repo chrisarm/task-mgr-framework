@@ -17,38 +17,58 @@ use super::parse::{PrdFile, PrdUserStory};
 
 /// Drop existing data from the database.
 ///
-/// When `task_prefix` is `Some(prefix)`, only data belonging to that PRD prefix
-/// is deleted (tasks, relationships, files, and the matching prd_metadata row).
-/// Learnings, runs, and other PRDs are preserved.
+/// When `task_prefix` is `Some(prefix)`, run_tasks, key_decisions, and runs are
+/// soft-archived (UPDATE SET archived_at) to preserve history. Tasks and their
+/// metadata are hard-deleted so their IDs are clean for reimport.
+/// Learnings and other PRDs are untouched.
 ///
 /// When `task_prefix` is `None`, all data is wiped (legacy global-force behavior).
 pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<()> {
     match task_prefix {
         Some(prefix) => {
             let pattern = make_like_pattern(prefix);
-            // Delete child tables before parent (FK ordering)
-            conn.execute(
-                "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
-                [&pattern],
-            )?;
-            conn.execute(
-                "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
-                [&pattern],
-            )?;
-            conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
-            // prd_files must be removed before prd_metadata (FK ordering)
-            conn.execute(
-                "DELETE FROM prd_files WHERE prd_id = \
-                 (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
-                [prefix],
-            )?;
-            conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+
+            // Archive run_tasks, key_decisions, and runs for this prefix (preserve history).
+            crate::db::soft_archive::soft_archive_by_prefix(conn, prefix)?;
+
+            // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
+            // (run_tasks.task_id has ON DELETE CASCADE, which would wipe archived rows if FK is on.)
+            // FK is always re-enabled after deletes, even on error.
+            // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
+            // PRAGMA foreign_keys cannot be changed inside a transaction (SQLite constraint),
+            // so it must be set before/after the transaction.
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let delete_result = (|| -> TaskMgrResult<()> {
+                let tx = conn.unchecked_transaction()?;
+                // Delete child tables before parent (FK ordering)
+                tx.execute(
+                    "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                    [&pattern],
+                )?;
+                tx.execute(
+                    "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                    [&pattern],
+                )?;
+                tx.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
+                // prd_files must be removed before prd_metadata (FK ordering)
+                tx.execute(
+                    "DELETE FROM prd_files WHERE prd_id = \
+                     (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
+                    [prefix],
+                )?;
+                tx.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+                tx.commit()?;
+                Ok(())
+            })();
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            delete_result?;
         }
         None => {
             // Global wipe — preserve nothing (legacy behavior).
             // Drop in correct order due to foreign keys.
             conn.execute("DELETE FROM learning_tags", [])?;
             conn.execute("DELETE FROM learnings", [])?;
+            conn.execute("DELETE FROM key_decisions", [])?;
             conn.execute("DELETE FROM run_tasks", [])?;
             conn.execute("DELETE FROM runs", [])?;
             conn.execute("DELETE FROM task_relationships", [])?;
@@ -80,7 +100,7 @@ pub fn get_delete_preview(
         Some(prefix) => {
             let pattern = make_like_pattern(prefix);
             let tasks: usize = conn.query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
                 [&pattern],
                 |row| row.get(0),
             )?;
@@ -103,8 +123,11 @@ pub fn get_delete_preview(
             })
         }
         None => {
-            let tasks: usize =
-                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+            let tasks: usize = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
             let files: usize =
                 conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
             let relationships: usize =
@@ -113,6 +136,9 @@ pub fn get_delete_preview(
                 })?;
             let learnings: usize =
                 conn.query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))?;
+            // Count ALL runs (including archived) since the global wipe DELETE FROM runs
+            // removes everything. Tasks are filtered by archived_at IS NULL because
+            // archived tasks are invisible to users and the count reflects "active" state.
             let runs: usize = conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
             Ok(DryRunDeletePreview {
                 tasks,
@@ -125,15 +151,19 @@ pub fn get_delete_preview(
     }
 }
 
-/// Check if the database is fresh (no tasks).
+/// Check if the database is fresh (no active tasks).
 pub fn is_fresh_database(conn: &Connection) -> TaskMgrResult<bool> {
-    let count: i32 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+    let count: i32 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(count == 0)
 }
 
-/// Get existing task IDs from the database.
+/// Get existing active (non-archived) task IDs from the database.
 pub fn get_existing_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM tasks")?;
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE archived_at IS NULL")?;
     let ids = stmt.query_map([], |row| row.get(0))?;
     let mut result = HashSet::new();
     for id in ids {
@@ -219,6 +249,47 @@ pub fn insert_prd_metadata(
     Ok(prd_id)
 }
 
+/// Serialized fields shared between insert_task and update_task.
+struct TaskSerializedFields {
+    acceptance_criteria: String,
+    review_scope: Option<String>,
+    required_tests: Option<String>,
+    max_retries: i32,
+}
+
+/// Serialize and resolve the fields that insert_task and update_task both need.
+///
+/// Precedence for max_retries: story.max_retries > prd_default_max_retries > 3.
+fn prepare_task_fields(
+    story: &PrdUserStory,
+    prd_default_max_retries: Option<i32>,
+) -> TaskMgrResult<TaskSerializedFields> {
+    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
+
+    let review_scope = story
+        .review_scope
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    let required_tests = if story.required_tests.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&story.required_tests)?)
+    };
+
+    let max_retries = story
+        .max_retries
+        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+
+    Ok(TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    })
+}
+
 /// Insert a task into the database.
 ///
 /// `prd_default_max_retries` is the PRD-level default used to resolve the per-task
@@ -235,27 +306,12 @@ pub fn insert_task(
         TaskStatus::Todo
     };
 
-    // Serialize acceptance criteria as JSON array
-    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
-
-    // Serialize review_scope if present
-    let review_scope = story
-        .review_scope
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-
-    // Serialize required_tests as JSON array (NULL if empty)
-    let required_tests = if story.required_tests.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&story.required_tests)?)
-    };
-
-    // Resolve max_retries: per-task > PRD default > hardcoded 3
-    let max_retries = story
-        .max_retries
-        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+    let TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    } = prepare_task_fields(story, prd_default_max_retries)?;
 
     conn.execute(
         r#"INSERT INTO tasks
@@ -339,27 +395,12 @@ pub fn update_task(
     story: &PrdUserStory,
     prd_default_max_retries: Option<i32>,
 ) -> TaskMgrResult<()> {
-    // Serialize acceptance criteria as JSON array
-    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
-
-    // Serialize review_scope if present
-    let review_scope = story
-        .review_scope
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-
-    // Serialize required_tests as JSON array (NULL if empty)
-    let required_tests = if story.required_tests.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&story.required_tests)?)
-    };
-
-    // Resolve max_retries: per-task > PRD default > hardcoded 3
-    let max_retries = story
-        .max_retries
-        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+    let TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    } = prepare_task_fields(story, prd_default_max_retries)?;
 
     // Note: We don't update status from passes here - the task may have been
     // completed in the DB since the JSON was written. We only update metadata.

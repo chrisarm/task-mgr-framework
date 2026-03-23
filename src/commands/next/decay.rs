@@ -76,6 +76,7 @@ pub fn apply_decay(
             (status = 'skipped' AND skipped_at_iteration IS NOT NULL
              AND (?1 - skipped_at_iteration) >= ?2)
         )
+        AND archived_at IS NULL
         {prefix_clause}
         ORDER BY id
         "#
@@ -188,6 +189,7 @@ pub fn find_decay_warnings(
              AND (?1 - skipped_at_iteration) >= (?2 - ?3)
              AND (?1 - skipped_at_iteration) < ?2)
         )
+        AND archived_at IS NULL
         {prefix_clause}
         ORDER BY id
         "#

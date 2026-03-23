@@ -280,8 +280,9 @@ fn get_completed_task_ids(
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<HashSet<String>> {
     let (prefix_clause, prefix_param) = prefix_and(task_prefix);
-    let sql =
-        format!("SELECT id FROM tasks WHERE status IN ('done', 'irrelevant') {prefix_clause}");
+    let sql = format!(
+        "SELECT id FROM tasks WHERE status IN ('done', 'irrelevant') AND archived_at IS NULL {prefix_clause}"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let ids: Result<HashSet<String>, rusqlite::Error> = if let Some(pattern) = prefix_param {
         stmt.query_map([pattern], |row| row.get(0))?.collect()
@@ -301,7 +302,7 @@ fn get_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult
          last_error, error_count, \
          blocked_at_iteration, skipped_at_iteration, \
          model, difficulty, escalation_note \
-         FROM tasks WHERE status = 'todo' {prefix_clause} ORDER BY priority ASC"
+         FROM tasks WHERE status = 'todo' AND archived_at IS NULL {prefix_clause} ORDER BY priority ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
 
@@ -397,7 +398,7 @@ fn get_eligible_batch_tasks(
         .collect::<Vec<_>>()
         .join(",");
     let query = format!(
-        "SELECT id, status FROM tasks WHERE id IN ({})",
+        "SELECT id, status FROM tasks WHERE id IN ({}) AND archived_at IS NULL",
         placeholders
     );
 

@@ -76,7 +76,7 @@ pub(crate) fn reconcile_external_git_completions(
     // Query all incomplete task IDs, scoped to this PRD's prefix.
     let (regc_pfx_clause, regc_pfx_param) = prefix_and(task_prefix);
     let regc_sql = format!(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {regc_pfx_clause}"
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {regc_pfx_clause}"
     );
     let mut stmt = match conn.prepare(&regc_sql) {
         Ok(s) => s,

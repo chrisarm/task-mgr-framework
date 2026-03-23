@@ -76,7 +76,7 @@ fn get_completed_task_files(conn: &Connection, task_prefix: Option<&str>) -> Has
     let sql = format!(
         "SELECT DISTINCT tf.file_path FROM task_files tf \
          INNER JOIN tasks t ON tf.task_id = t.id \
-         WHERE t.status = 'done' {prefix_clause}"
+         WHERE t.status = 'done' AND t.archived_at IS NULL {prefix_clause}"
     );
 
     let result: Result<Vec<String>, rusqlite::Error> = (|| {
@@ -243,14 +243,16 @@ fn format_sibling_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::migrations::run_migrations;
     use crate::db::schema;
     use rusqlite::Connection;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
     fn setup_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         schema::create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         conn
     }
 

@@ -25,9 +25,11 @@ pub fn get_unsatisfied_deps(conn: &Connection, task_id: &str) -> TaskMgrResult<V
     let mut unsatisfied = Vec::new();
     for dep_id in &dep_ids {
         let status: Option<String> = conn
-            .query_row("SELECT status FROM tasks WHERE id = ?", [dep_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ? AND archived_at IS NULL",
+                [dep_id],
+                |row| row.get(0),
+            )
             .ok();
         match status.as_deref() {
             Some("done") | Some("irrelevant") => {} // satisfied
@@ -71,13 +73,14 @@ pub fn check_dependencies_satisfied(conn: &Connection, task_id: &str) -> TaskMgr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection};
+    use crate::db::{create_schema, migrations::run_migrations, open_connection};
     use tempfile::TempDir;
 
     fn setup_test_db() -> (TempDir, Connection) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(temp_dir.path()).unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
         (temp_dir, conn)
     }
 

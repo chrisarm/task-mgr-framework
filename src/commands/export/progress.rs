@@ -132,7 +132,7 @@ fn load_all_run_tasks(conn: &Connection) -> TaskMgrResult<HashMap<String, Vec<Ru
     let mut stmt = conn.prepare(
         r#"SELECT run_id, task_id, status, iteration, started_at, ended_at,
            duration_seconds, notes
-           FROM run_tasks ORDER BY run_id, iteration, started_at"#,
+           FROM run_tasks WHERE archived_at IS NULL ORDER BY run_id, iteration, started_at"#,
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -330,7 +330,8 @@ pub(crate) fn calculate_statistics(conn: &Connection) -> TaskMgrResult<ProgressS
     let mut stats = ProgressStatistics::new();
 
     // Count tasks by status
-    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")?;
+    let mut stmt = conn
+        .prepare("SELECT status, COUNT(*) FROM tasks WHERE archived_at IS NULL GROUP BY status")?;
     let rows = stmt.query_map([], |row| {
         let status: String = row.get(0)?;
         let count: i32 = row.get(1)?;
@@ -347,7 +348,8 @@ pub(crate) fn calculate_statistics(conn: &Connection) -> TaskMgrResult<ProgressS
     }
 
     // Count runs by status
-    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM runs GROUP BY status")?;
+    let mut stmt = conn
+        .prepare("SELECT status, COUNT(*) FROM runs WHERE archived_at IS NULL GROUP BY status")?;
     let rows = stmt.query_map([], |row| {
         let status: String = row.get(0)?;
         let count: i32 = row.get(1)?;

@@ -26,6 +26,7 @@ pub fn find_stale_in_progress_tasks(conn: &Connection) -> TaskMgrResult<Vec<(Str
         SELECT t.id, t.title
         FROM tasks t
         WHERE t.status = 'in_progress'
+        AND t.archived_at IS NULL
         AND NOT EXISTS (
             SELECT 1 FROM run_tasks rt
             JOIN runs r ON rt.run_id = r.run_id
@@ -58,6 +59,7 @@ pub fn find_active_runs_without_end(conn: &Connection) -> TaskMgrResult<Vec<(Str
         FROM runs
         WHERE status = 'active'
         AND ended_at IS NULL
+        AND archived_at IS NULL
         ORDER BY started_at
         "#,
     )?;
@@ -107,10 +109,15 @@ fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-/// Find relationships where related_id references a non-existent task.
+/// Find relationships where related_id references a non-existent or archived task.
 ///
 /// Note: We intentionally don't have a foreign key on related_id to allow
 /// importing tasks with forward references, so we check this manually.
+///
+/// Relationships pointing to soft-archived tasks are also reported since
+/// the archive command hard-deletes task_relationships for the archived
+/// prefix. Cross-prefix relationships (e.g., PA-001 depends on PB-001
+/// where PB is archived) will surface here as expected.
 pub fn find_orphaned_relationships(
     conn: &Connection,
 ) -> TaskMgrResult<Vec<(String, String, String)>> {
@@ -119,7 +126,7 @@ pub fn find_orphaned_relationships(
         SELECT tr.task_id, tr.related_id, tr.rel_type
         FROM task_relationships tr
         WHERE NOT EXISTS (
-            SELECT 1 FROM tasks t WHERE t.id = tr.related_id
+            SELECT 1 FROM tasks t WHERE t.id = tr.related_id AND t.archived_at IS NULL
         )
         ORDER BY tr.task_id, tr.related_id
         "#,
@@ -229,7 +236,7 @@ pub fn find_git_reconciliation_tasks(
     for task_id in &git_task_ids {
         let row: Option<(String, String)> = conn
             .query_row(
-                "SELECT id, title FROM tasks WHERE id = ? AND status != 'done'",
+                "SELECT id, title FROM tasks WHERE id = ? AND status != 'done' AND archived_at IS NULL",
                 [task_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

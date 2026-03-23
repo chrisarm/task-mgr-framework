@@ -209,6 +209,7 @@ fn test_list_no_filters() {
             status,
             file,
             task_type,
+            ..
         } => {
             assert!(status.is_none());
             assert!(file.is_none());
@@ -1444,7 +1445,7 @@ fn test_stats_with_json_format() {
 fn test_history_default() {
     let cli = Cli::parse_from(["task-mgr", "history"]);
     match cli.command {
-        Commands::History { limit, run_id } => {
+        Commands::History { limit, run_id, .. } => {
             assert_eq!(limit, 10);
             assert!(run_id.is_none());
         }
@@ -1456,7 +1457,7 @@ fn test_history_default() {
 fn test_history_with_limit() {
     let cli = Cli::parse_from(["task-mgr", "history", "--limit", "25"]);
     match cli.command {
-        Commands::History { limit, run_id } => {
+        Commands::History { limit, run_id, .. } => {
             assert_eq!(limit, 25);
             assert!(run_id.is_none());
         }
@@ -1468,7 +1469,7 @@ fn test_history_with_limit() {
 fn test_history_with_run_id() {
     let cli = Cli::parse_from(["task-mgr", "history", "--run-id", "run-abc123"]);
     match cli.command {
-        Commands::History { limit, run_id } => {
+        Commands::History { limit, run_id, .. } => {
             assert_eq!(limit, 10); // default
             assert_eq!(run_id, Some("run-abc123".to_string()));
         }
@@ -1480,7 +1481,7 @@ fn test_history_with_run_id() {
 fn test_history_with_json_format() {
     let cli = Cli::parse_from(["task-mgr", "--format", "json", "history"]);
     match cli.command {
-        Commands::History { limit, run_id } => {
+        Commands::History { limit, run_id, .. } => {
             assert_eq!(limit, 10);
             assert!(run_id.is_none());
         }

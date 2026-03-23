@@ -75,7 +75,7 @@ pub(crate) fn scan_output_for_completed_tasks(
     // Query all non-done task IDs, scoped to this PRD's prefix.
     let (soct_pfx_clause, soct_pfx_param) = prefix_and(task_prefix);
     let soct_sql = format!(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') {soct_pfx_clause}"
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {soct_pfx_clause}"
     );
     let mut stmt = match conn.prepare(&soct_sql) {
         Ok(s) => s,

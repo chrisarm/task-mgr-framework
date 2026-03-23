@@ -95,6 +95,10 @@ TASK ID PREFIXING:
         /// Filter by task type prefix (e.g., US-, SEC-, FIX-)
         #[arg(long = "task-type")]
         task_type: Option<String>,
+
+        /// Include archived tasks; optionally limit number of archived records returned
+        #[arg(long = "include-archived", num_args = 0..=1)]
+        include_archived: Option<Option<usize>>,
     },
 
     /// Show detailed information about a single task
@@ -509,6 +513,10 @@ MATCHING BEHAVIOR:
         /// Show detailed information for a specific run
         #[arg(long = "run-id")]
         run_id: Option<String>,
+
+        /// Include archived runs; optionally limit number of archived records returned
+        #[arg(long = "include-archived", num_args = 0..=1)]
+        include_archived: Option<Option<usize>>,
     },
 
     /// Delete a learning from the database

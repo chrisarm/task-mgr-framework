@@ -333,7 +333,7 @@ pub fn run_iteration(
             // No eligible task found — check if truly all done or just temporarily unavailable
             let (rem_pfx_clause, rem_pfx_param) = prefix_and(params.task_prefix);
             let rem_sql = format!(
-                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {rem_pfx_clause}"
+                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {rem_pfx_clause}"
             );
             let rem_params: Vec<&dyn rusqlite::types::ToSql> = match &rem_pfx_param {
                 Some(p) => vec![p],
@@ -921,7 +921,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             Some(generate_prefix(pre_lock_branch.as_deref(), filename))
-        },
+        }
     }
     .and_then(|p| {
         // Only use prefix if it is safe for filenames
@@ -2269,8 +2269,8 @@ pub fn escalate_task_model_if_needed(
     if !should_escalate_for_consecutive_failures(new_count) {
         return Ok(None);
     }
-    let current_model: Option<String> = conn
-        .query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
+    let current_model: Option<String> =
+        conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
     // None/empty model: assume sonnet baseline → escalate to opus (matches check_crash_escalation).
@@ -3309,7 +3309,7 @@ mod tests {
         // Count remaining (not done/irrelevant) for P1 only
         let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
         let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
             Some(p) => vec![p],
@@ -3332,7 +3332,7 @@ mod tests {
 
         let (pfx_clause, pfx_param) = prefix_and(None);
         let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
             Some(p) => vec![p],
