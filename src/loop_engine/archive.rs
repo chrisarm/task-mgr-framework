@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::db::prefix::make_like_pattern;
 use crate::TaskMgrResult;
 

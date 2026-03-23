@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use chrono::{DateTime, Utc};
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::learnings::{record_learning, RecordLearningParams};
 use crate::models::{LearningExport, ProgressExport};
 use crate::{TaskMgrError, TaskMgrResult};

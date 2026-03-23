@@ -46,8 +46,22 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use super::migrations::run_migrations;
 use super::schema::create_schema;
 use crate::TaskMgrResult;
+
+/// Opens a SQLite connection and runs any pending migrations.
+///
+/// Convenience wrapper around [`open_connection`] + [`run_migrations`] for
+/// production CLI commands. Tests that need to control migration state should
+/// call `open_connection` directly instead.
+pub fn open_and_migrate(db_dir: &Path) -> TaskMgrResult<Connection> {
+    let mut conn = open_connection(db_dir)?;
+    if let Err(e) = run_migrations(&mut conn) {
+        eprintln!("Warning: failed to run migrations: {} (continuing)", e);
+    }
+    Ok(conn)
+}
 
 /// Opens a SQLite connection with appropriate pragmas set for reliability and performance.
 ///

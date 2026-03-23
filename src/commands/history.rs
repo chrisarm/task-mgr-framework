@@ -6,7 +6,7 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::TaskMgrResult;
 
 /// Result of the history command when listing runs.

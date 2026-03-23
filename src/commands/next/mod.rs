@@ -97,7 +97,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::learnings::recall::{recall_learnings, RecallParams};
 use crate::TaskMgrError;
 use crate::TaskMgrResult;

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::TaskMgrResult;
 
 use super::status_queries::{

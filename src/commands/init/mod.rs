@@ -41,7 +41,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::error::validate_safe_path;
 use crate::TaskMgrError;
 use crate::TaskMgrResult;

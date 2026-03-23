@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::cli::TaskStatusFilter;
-use crate::db::open_connection;
+use crate::db::open_and_migrate as open_connection;
 use crate::models::Task;
 use crate::TaskMgrResult;
 
