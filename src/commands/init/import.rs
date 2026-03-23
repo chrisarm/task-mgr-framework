@@ -17,32 +17,73 @@ use super::parse::{PrdFile, PrdUserStory};
 
 /// Drop existing data from the database.
 ///
-/// When `task_prefix` is `Some(prefix)`, only data belonging to that PRD prefix
-/// is deleted (tasks, relationships, files, and the matching prd_metadata row).
-/// Learnings, runs, and other PRDs are preserved.
+/// When `task_prefix` is `Some(prefix)`, run_tasks, key_decisions, and runs are
+/// soft-archived (UPDATE SET archived_at) to preserve history. Tasks and their
+/// metadata are hard-deleted so their IDs are clean for reimport.
+/// Learnings and other PRDs are untouched.
 ///
 /// When `task_prefix` is `None`, all data is wiped (legacy global-force behavior).
 pub fn drop_existing_data(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<()> {
     match task_prefix {
         Some(prefix) => {
             let pattern = make_like_pattern(prefix);
-            // Delete child tables before parent (FK ordering)
+
+            // Archive run_tasks linked to prefix tasks (preserve history).
+            // AND archived_at IS NULL ensures previously archived rows keep their original timestamp.
             conn.execute(
-                "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                "UPDATE run_tasks SET archived_at = datetime('now') \
+                 WHERE task_id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
                 [&pattern],
             )?;
+
+            // Archive key_decisions linked to prefix tasks or to runs that processed them.
             conn.execute(
-                "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                "UPDATE key_decisions SET archived_at = datetime('now') \
+                 WHERE archived_at IS NULL AND (\
+                     task_id LIKE ? ESCAPE '\\' \
+                     OR run_id IN (\
+                         SELECT DISTINCT run_id FROM run_tasks \
+                         WHERE task_id LIKE ? ESCAPE '\\'\
+                     )\
+                 )",
+                rusqlite::params![&pattern, &pattern],
+            )?;
+
+            // Archive runs that had tasks from this prefix.
+            conn.execute(
+                "UPDATE runs SET archived_at = datetime('now') \
+                 WHERE run_id IN (\
+                     SELECT DISTINCT run_id FROM run_tasks WHERE task_id LIKE ? ESCAPE '\\'\
+                 ) AND archived_at IS NULL",
                 [&pattern],
             )?;
-            conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
-            // prd_files must be removed before prd_metadata (FK ordering)
-            conn.execute(
-                "DELETE FROM prd_files WHERE prd_id = \
-                 (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
-                [prefix],
-            )?;
-            conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+
+            // Disable FK enforcement so archived run_tasks survive the tasks hard-delete.
+            // (run_tasks.task_id has ON DELETE CASCADE, which would wipe archived rows if FK is on.)
+            // FK is always re-enabled after deletes, even on error.
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let delete_result = (|| -> TaskMgrResult<()> {
+                // Delete child tables before parent (FK ordering)
+                conn.execute(
+                    "DELETE FROM task_relationships WHERE task_id LIKE ? ESCAPE '\\'",
+                    [&pattern],
+                )?;
+                conn.execute(
+                    "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
+                    [&pattern],
+                )?;
+                conn.execute("DELETE FROM tasks WHERE id LIKE ? ESCAPE '\\'", [&pattern])?;
+                // prd_files must be removed before prd_metadata (FK ordering)
+                conn.execute(
+                    "DELETE FROM prd_files WHERE prd_id = \
+                     (SELECT id FROM prd_metadata WHERE task_prefix = ?)",
+                    [prefix],
+                )?;
+                conn.execute("DELETE FROM prd_metadata WHERE task_prefix = ?", [prefix])?;
+                Ok(())
+            })();
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            delete_result?;
         }
         None => {
             // Global wipe — preserve nothing (legacy behavior).
@@ -80,7 +121,7 @@ pub fn get_delete_preview(
         Some(prefix) => {
             let pattern = make_like_pattern(prefix);
             let tasks: usize = conn.query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\'",
+                "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
                 [&pattern],
                 |row| row.get(0),
             )?;
@@ -103,8 +144,11 @@ pub fn get_delete_preview(
             })
         }
         None => {
-            let tasks: usize =
-                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+            let tasks: usize = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
             let files: usize =
                 conn.query_row("SELECT COUNT(*) FROM task_files", [], |row| row.get(0))?;
             let relationships: usize =
@@ -125,15 +169,19 @@ pub fn get_delete_preview(
     }
 }
 
-/// Check if the database is fresh (no tasks).
+/// Check if the database is fresh (no active tasks).
 pub fn is_fresh_database(conn: &Connection) -> TaskMgrResult<bool> {
-    let count: i32 = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))?;
+    let count: i32 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(count == 0)
 }
 
-/// Get existing task IDs from the database.
+/// Get existing active (non-archived) task IDs from the database.
 pub fn get_existing_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM tasks")?;
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE archived_at IS NULL")?;
     let ids = stmt.query_map([], |row| row.get(0))?;
     let mut result = HashSet::new();
     for id in ids {
