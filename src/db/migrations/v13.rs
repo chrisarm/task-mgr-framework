@@ -54,16 +54,19 @@ mod tests {
         (temp_dir, conn)
     }
 
-    /// Schema version must be 13 after full migration run.
+    /// v13 migration must have been applied (schema_version >= 13 after full migration run).
     #[test]
     fn test_v13_current_schema_version_is_13() {
         let (_temp_dir, conn) = setup_migrated_db();
-        assert_eq!(
-            CURRENT_SCHEMA_VERSION, 13,
-            "CURRENT_SCHEMA_VERSION constant must be 13"
+        assert!(
+            CURRENT_SCHEMA_VERSION >= 13,
+            "CURRENT_SCHEMA_VERSION must be at least 13"
         );
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 13, "DB schema_version must be 13 after migration");
+        assert!(
+            version >= 13,
+            "DB schema_version must be at least 13 after migration"
+        );
     }
 
     /// After v13 up, `tasks.max_retries` column must exist.
@@ -334,7 +337,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
         create_schema(&conn).unwrap();
-        run_migrations(&mut conn).unwrap();
+
+        // Migrate exactly to v13 so migrate_down targets v13 → v12, not a later version
+        for _ in 0..13 {
+            migrate_up(&mut conn).unwrap();
+        }
         assert_eq!(get_schema_version(&conn).unwrap(), 13);
 
         // Run v13 down migration
@@ -390,6 +397,6 @@ mod tests {
             result.applied.is_empty(),
             "Second migration run must be a no-op"
         );
-        assert_eq!(get_schema_version(&conn).unwrap(), 13);
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
     }
 }
