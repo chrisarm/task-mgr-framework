@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::Connection;
 
 use crate::db::lock::LockGuard;
-use crate::db::prefix::{prefix_and, prefix_where};
+use crate::db::prefix::prefix_and;
 use crate::TaskMgrResult;
 
 use super::status::{DashboardTaskCounts, DeadlineInfo, PendingTask, ProjectInfo};
@@ -112,7 +112,7 @@ pub(crate) fn query_dashboard_task_counts(
     conn: &Connection,
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<DashboardTaskCounts> {
-    let (where_clause, like_pattern) = prefix_where(task_prefix);
+    let (and_clause, like_pattern) = prefix_and(task_prefix);
 
     let sql = format!(
         r#"
@@ -125,7 +125,8 @@ pub(crate) fn query_dashboard_task_counts(
             COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) as skipped,
             COALESCE(SUM(CASE WHEN status = 'irrelevant' THEN 1 ELSE 0 END), 0) as irrelevant
         FROM tasks
-        {where_clause}
+        WHERE archived_at IS NULL
+        {and_clause}
         "#,
     );
 
@@ -172,7 +173,7 @@ pub(crate) fn query_pending_tasks(
         r#"
         SELECT id, title, priority, status
         FROM tasks
-        WHERE status IN ('todo', 'in_progress', 'blocked')
+        WHERE status IN ('todo', 'in_progress', 'blocked') AND archived_at IS NULL
         {and_clause}
         ORDER BY priority ASC, id ASC
         "#,
@@ -210,7 +211,7 @@ pub(crate) fn query_pending_tasks(
 /// Returns prefixes in sorted order.
 pub(crate) fn query_distinct_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT SUBSTR(id, 1, INSTR(id, '-') - 1) FROM tasks WHERE INSTR(id, '-') > 0 ORDER BY 1",
+        "SELECT DISTINCT SUBSTR(id, 1, INSTR(id, '-') - 1) FROM tasks WHERE INSTR(id, '-') > 0 AND archived_at IS NULL ORDER BY 1",
     )?;
     let prefixes = stmt
         .query_map([], |row| row.get(0))?

@@ -333,7 +333,7 @@ pub fn run_iteration(
             // No eligible task found — check if truly all done or just temporarily unavailable
             let (rem_pfx_clause, rem_pfx_param) = prefix_and(params.task_prefix);
             let rem_sql = format!(
-                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {rem_pfx_clause}"
+                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {rem_pfx_clause}"
             );
             let rem_params: Vec<&dyn rusqlite::types::ToSql> = match &rem_pfx_param {
                 Some(p) => vec![p],
@@ -3309,7 +3309,7 @@ mod tests {
         // Count remaining (not done/irrelevant) for P1 only
         let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
         let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
             Some(p) => vec![p],
@@ -3332,7 +3332,7 @@ mod tests {
 
         let (pfx_clause, pfx_param) = prefix_and(None);
         let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {pfx_clause}"
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
             Some(p) => vec![p],

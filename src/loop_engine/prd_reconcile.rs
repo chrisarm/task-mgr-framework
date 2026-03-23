@@ -67,7 +67,7 @@ pub(crate) fn read_prd_metadata(
 
     let (tc_pfx_clause, tc_pfx_param) = prefix_and(task_prefix.as_deref());
     let tc_sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') {tc_pfx_clause}"
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {tc_pfx_clause}"
     );
     let tc_params: Vec<&dyn rusqlite::types::ToSql> = match &tc_pfx_param {
         Some(p) => vec![p],
@@ -189,7 +189,7 @@ pub(crate) fn reconcile_passes_with_db(
     // Get all todo/in_progress task IDs from the DB, scoped to this PRD's prefix.
     let (rpdb_pfx_clause, rpdb_pfx_param) = prefix_and(task_prefix);
     let rpdb_sql =
-        format!("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') {rpdb_pfx_clause}");
+        format!("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND archived_at IS NULL {rpdb_pfx_clause}");
     let mut stmt = match conn.prepare(&rpdb_sql) {
         Ok(s) => s,
         Err(_) => return,
@@ -248,7 +248,7 @@ pub(crate) fn reconcile_passes_with_db(
             // Re-check status — may have been marked done in a previous pass
             let still_open: bool = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM tasks WHERE id = ? AND status IN ('todo', 'in_progress')",
+                    "SELECT COUNT(*) FROM tasks WHERE id = ? AND status IN ('todo', 'in_progress') AND archived_at IS NULL",
                     [task_id.as_str()],
                     |row| row.get::<_, i64>(0),
                 )

@@ -134,7 +134,9 @@ pub fn recalibrate_weights(
 /// Count completed tasks that have score breakdown data.
 fn count_completed_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<usize> {
     let (prefix_clause, prefix_param) = prefix_and(task_prefix);
-    let sql = format!("SELECT COUNT(*) FROM tasks WHERE status = 'done' {prefix_clause}");
+    let sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND archived_at IS NULL {prefix_clause}"
+    );
     let count: i64 = match prefix_param {
         Some(ref p) => conn.query_row(&sql, rusqlite::params![p], |row| row.get(0))?,
         None => conn.query_row(&sql, [], |row| row.get(0))?,
@@ -206,16 +208,16 @@ fn load_task_outcomes(
         Some(p) => {
             let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
             (
-                "WHERE task_id LIKE ? ESCAPE '\\'".to_string(),
+                "WHERE archived_at IS NULL AND task_id LIKE ? ESCAPE '\\'".to_string(),
                 Some(pattern),
             )
         }
-        None => (String::new(), None),
+        None => ("WHERE archived_at IS NULL".to_string(), None),
     };
     let sql = format!(
         "SELECT task_id, status, iteration \
          FROM run_tasks \
-         {prefix_clause}\
+         {prefix_clause} \
          ORDER BY task_id, iteration ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
