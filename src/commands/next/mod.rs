@@ -218,7 +218,10 @@ fn claim_task(
     task_id: &str,
     run_id: Option<&str>,
 ) -> TaskMgrResult<ClaimMetadata> {
-    // If run_id provided, verify run exists and is active
+    // If run_id provided, verify run exists and is active.
+    // If the run was externally aborted (e.g., by `doctor --auto-fix`), proceed
+    // without run linkage rather than crashing the loop.
+    let mut effective_run_id = run_id;
     if let Some(rid) = run_id {
         let run_status: Result<String, _> =
             conn.query_row("SELECT status FROM runs WHERE run_id = ?1", [rid], |row| {
@@ -227,7 +230,11 @@ fn claim_task(
 
         match run_status {
             Ok(status) if status != "active" => {
-                return Err(TaskMgrError::invalid_state("run", rid, "active", &status));
+                eprintln!(
+                    "Warning: run '{}' was externally changed to '{}'; continuing without run linkage",
+                    rid, status
+                );
+                effective_run_id = None;
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(TaskMgrError::run_not_found(rid));
@@ -261,8 +268,9 @@ fn claim_task(
         };
     }
 
-    // Link to run if run_id provided
-    if let Some(rid) = run_id {
+    // Link to run if run_id provided (uses effective_run_id which may be None
+    // if the run was externally aborted)
+    if let Some(rid) = effective_run_id {
         // Get current iteration for this run
         let current_iteration: i64 = conn
             .query_row(

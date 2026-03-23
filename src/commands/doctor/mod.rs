@@ -26,8 +26,8 @@ use crate::models::RunStatus;
 use crate::TaskMgrResult;
 
 use checks::{
-    find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
-    find_stale_in_progress_tasks,
+    find_active_runs_without_end, find_git_reconciliation_tasks, has_active_loop_lock,
+    find_orphaned_relationships, find_stale_in_progress_tasks,
 };
 use fixes::{fix_active_run, fix_git_reconciliation, fix_orphaned_relationship, fix_stale_task};
 
@@ -72,8 +72,16 @@ pub fn doctor(
         });
     }
 
-    // Check for active runs without end
-    let active_runs = find_active_runs_without_end(conn)?;
+    // Check for active runs without end.
+    // Skip this category entirely if a loop lock is held — those runs belong
+    // to a live loop and aborting them would crash the running session.
+    let loop_is_running = has_active_loop_lock(dir);
+    let active_runs = if loop_is_running {
+        eprintln!("Note: skipping active-run checks — a loop is currently running");
+        Vec::new()
+    } else {
+        find_active_runs_without_end(conn)?
+    };
     for (run_id, started_at) in &active_runs {
         issues.push(Issue {
             issue_type: IssueType::ActiveRunWithoutEnd,

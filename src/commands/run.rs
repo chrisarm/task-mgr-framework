@@ -171,16 +171,29 @@ pub fn end(conn: &Connection, run_id: &str, status: RunStatus) -> TaskMgrResult<
         ));
     }
 
-    // Verify run exists and is active
+    // Verify run exists and check current state
     let run = query_run(conn, run_id)?;
 
     if !run.status.is_active() {
-        return Err(TaskMgrError::invalid_state(
-            "Run",
-            run_id,
-            "active",
-            run.status.to_string(),
-        ));
+        // If the run was already externally terminated (e.g., by `doctor --auto-fix`),
+        // return success with the existing state rather than erroring.
+        // This makes end() idempotent and prevents cascading errors when an external
+        // process aborts a run that a loop is still trying to finalize.
+        let duration_seconds = conn
+            .query_row(
+                "SELECT CAST((julianday(ended_at) - julianday(started_at)) * 86400 AS INTEGER) FROM runs WHERE run_id = ?",
+                [run_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+
+        return Ok(EndResult {
+            run_id: run_id.to_string(),
+            previous_status: run.status.clone(),
+            new_status: run.status,
+            duration_seconds,
+        });
     }
 
     // Update run status and ended_at
@@ -529,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_already_ended_run_fails() {
+    fn test_end_already_ended_run_is_idempotent() {
         let (_dir, conn) = setup_test_db();
 
         conn.execute(
@@ -538,13 +551,14 @@ mod tests {
         )
         .unwrap();
 
+        // Calling end() on an already-ended run should succeed idempotently,
+        // returning the existing terminal status rather than erroring.
         let result = end(&conn, "run-done", RunStatus::Aborted);
+        assert!(result.is_ok(), "end() should be idempotent for terminal runs");
 
-        assert!(result.is_err());
-        match result {
-            Err(TaskMgrError::InvalidState { .. }) => {}
-            _ => panic!("Expected InvalidState error"),
-        }
+        let end_result = result.unwrap();
+        assert_eq!(end_result.previous_status, RunStatus::Completed);
+        assert_eq!(end_result.new_status, RunStatus::Completed); // keeps existing status
     }
 
     #[test]

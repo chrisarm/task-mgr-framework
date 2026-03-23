@@ -742,7 +742,8 @@ mod next_command_tests {
         .unwrap();
         drop(conn);
 
-        // Attempt to claim with inactive run
+        // Claiming with an inactive run should succeed (graceful degradation)
+        // but without run linkage — the task gets claimed without a run_tasks entry.
         let result = next(
             temp_dir.path(),
             &[],
@@ -751,8 +752,23 @@ mod next_command_tests {
             false,
             None,
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected active"));
+        assert!(result.is_ok(), "should succeed with warning, not error");
+
+        // Verify task was claimed but no run_tasks entry was created
+        let conn = crate::db::open_connection(temp_dir.path()).unwrap();
+        let task_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'US-001'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task_status, "in_progress");
+
+        let run_task_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_tasks WHERE run_id = 'completed-run'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_task_count, 0, "no run_tasks entry for inactive run");
     }
 
     #[test]

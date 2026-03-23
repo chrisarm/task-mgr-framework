@@ -12,6 +12,7 @@ use std::process::Command;
 
 use rusqlite::Connection;
 
+use crate::db::LockGuard;
 use crate::TaskMgrResult;
 
 /// Find tasks that are in_progress but have no active run tracking them.
@@ -68,6 +69,42 @@ pub fn find_active_runs_without_end(conn: &Connection) -> TaskMgrResult<Vec<(Str
         results.push(row?);
     }
     Ok(results)
+}
+
+/// Check whether any loop lock file in the DB directory is actively held.
+///
+/// Scans for `loop*.lock` files and attempts a non-blocking exclusive lock
+/// on each. If any lock cannot be acquired, a loop is actively running and
+/// its runs should NOT be auto-fixed by doctor.
+///
+/// Returns `true` if at least one loop lock is held by a live process.
+pub fn has_active_loop_lock(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("loop") && name_str.ends_with(".lock") {
+            let path = entry.path();
+            // If we can read a holder PID and it's still alive, the lock is active
+            if let Some(info) = LockGuard::read_holder_info(&path) {
+                if is_pid_alive(info.pid) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a process with the given PID is still alive.
+fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) checks for process existence without sending a signal
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// Find relationships where related_id references a non-existent task.
