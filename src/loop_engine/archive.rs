@@ -147,8 +147,7 @@ fn archive_single_prd(
             "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
             rusqlite::params![like_pattern],
             |row| row.get::<_, usize>(0),
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?
+        )?
     } else {
         if !items.is_empty() {
             fs::create_dir_all(&archive_dir).map_err(|e| {
@@ -308,9 +307,8 @@ pub struct PrdRecord {
 
 /// Return all rows from prd_metadata ordered by id.
 pub fn query_all_prds(conn: &rusqlite::Connection) -> TaskMgrResult<Vec<PrdRecord>> {
-    let mut stmt = conn
-        .prepare("SELECT id, project, branch_name, task_prefix FROM prd_metadata ORDER BY id")
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+    let mut stmt =
+        conn.prepare("SELECT id, project, branch_name, task_prefix FROM prd_metadata ORDER BY id")?;
 
     let records = stmt
         .query_map([], |row| {
@@ -320,10 +318,8 @@ pub fn query_all_prds(conn: &rusqlite::Connection) -> TaskMgrResult<Vec<PrdRecor
                 branch: row.get(2)?,
                 task_prefix: row.get(3)?,
             })
-        })
-        .map_err(crate::TaskMgrError::DatabaseError)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(records)
 }
@@ -337,13 +333,11 @@ pub fn query_all_prds(conn: &rusqlite::Connection) -> TaskMgrResult<Vec<PrdRecor
 fn is_prd_completed_by_prefix(conn: &rusqlite::Connection, prefix: &str) -> TaskMgrResult<bool> {
     let pattern = make_like_pattern(prefix);
 
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-            rusqlite::params![pattern],
-            |row| row.get(0),
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
+        rusqlite::params![pattern],
+        |row| row.get(0),
+    )?;
 
     if total == 0 {
         return Ok(false);
@@ -355,7 +349,7 @@ fn is_prd_completed_by_prefix(conn: &rusqlite::Connection, prefix: &str) -> Task
             rusqlite::params![pattern],
             |row| row.get(0),
         )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+        ?;
 
     Ok(non_terminal == 0)
 }
@@ -429,10 +423,8 @@ fn query_prd_files(conn: &rusqlite::Connection, prd_id: i64) -> TaskMgrResult<Ve
     };
 
     let paths = stmt
-        .query_map(rusqlite::params![prd_id], |row| row.get(0))
-        .map_err(crate::TaskMgrError::DatabaseError)?
-        .collect::<Result<Vec<String>, _>>()
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+        .query_map(rusqlite::params![prd_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
 
     Ok(paths)
 }
@@ -454,9 +446,7 @@ fn archive_prd_data(
 ) -> TaskMgrResult<usize> {
     let pattern = make_like_pattern(prefix);
 
-    let tx = conn
-        .transaction()
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+    let tx = conn.transaction()?;
 
     // 1-3. Soft-archive run_tasks, key_decisions, and runs for this prefix
     crate::db::soft_archive::soft_archive_by_prefix(&tx, prefix)?;
@@ -466,24 +456,20 @@ fn archive_prd_data(
         "DELETE FROM task_relationships \
          WHERE task_id LIKE ? ESCAPE '\\' OR related_id LIKE ? ESCAPE '\\'",
         rusqlite::params![pattern, pattern],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    )?;
 
     // 5. Hard-delete task_files for this prefix (no historical value)
     tx.execute(
         "DELETE FROM task_files WHERE task_id LIKE ? ESCAPE '\\'",
         rusqlite::params![pattern],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    )?;
 
     // 6. Soft-archive tasks and capture the count for reporting
-    let archived = tx
-        .execute(
-            "UPDATE tasks SET archived_at = datetime('now') \
+    let archived = tx.execute(
+        "UPDATE tasks SET archived_at = datetime('now') \
              WHERE id LIKE ? ESCAPE '\\' AND archived_at IS NULL",
-            rusqlite::params![pattern],
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+        rusqlite::params![pattern],
+    )?;
 
     // 7. Hard-delete prd_files for this PRD (may not exist in pre-v6 databases)
     let _ = tx.execute(
@@ -495,8 +481,7 @@ fn archive_prd_data(
     tx.execute(
         "DELETE FROM prd_metadata WHERE id = ?",
         rusqlite::params![prd_id],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    )?;
 
     // 9. NULL out last_task_id if the referenced task is now archived
     tx.execute(
@@ -508,8 +493,7 @@ fn archive_prd_data(
              AND tasks.archived_at IS NULL \
          )",
         [],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    )?;
 
     // 10. NULL out last_run_id if the referenced run is now archived
     tx.execute(
@@ -521,17 +505,14 @@ fn archive_prd_data(
              AND runs.archived_at IS NULL \
          )",
         [],
-    )
-    .map_err(crate::TaskMgrError::DatabaseError)?;
+    )?;
 
     // 11. Reset counters only when no active (non-archived) tasks remain
-    let remaining: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+    let remaining: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE archived_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
 
     if remaining == 0 {
         tx.execute(
@@ -540,11 +521,10 @@ fn archive_prd_data(
                  updated_at = datetime('now') \
              WHERE id = 1",
             [],
-        )
-        .map_err(crate::TaskMgrError::DatabaseError)?;
+        )?;
     }
 
-    tx.commit().map_err(crate::TaskMgrError::DatabaseError)?;
+    tx.commit()?;
 
     Ok(archived)
 }
