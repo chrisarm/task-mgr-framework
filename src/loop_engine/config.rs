@@ -234,7 +234,8 @@ impl std::fmt::Display for PermissionMode {
 /// 3. `LOOP_PERMISSION_MODE=auto` → `Auto` with `CODING_ALLOWED_TOOLS` + project config
 /// 4. `LOOP_ENABLE_AUTO_MODE=true` → `Auto` (legacy env var)
 /// 5. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped` with those tools (NO project config merge)
-/// 6. Default → `Scoped` with `CODING_ALLOWED_TOOLS` + project config
+/// 6. `.task-mgr/config.json` `permissionMode` field → corresponding variant
+/// 7. Default → `Scoped` with `CODING_ALLOWED_TOOLS` + project config
 ///
 /// Both `scoped` (default) and `auto` modes merge `CODING_ALLOWED_TOOLS` with
 /// project-specific tools from `.task-mgr/config.json`. The difference is the
@@ -298,8 +299,36 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
         }
     }
 
-    // 4. Default → Scoped mode with full coding allowlist + project config.
+    // 4. Project config permissionMode (from .task-mgr/config.json).
     let project_config = super::project_config::read_project_config(db_dir);
+    if let Some(ref mode) = project_config.permission_mode {
+        match mode.to_lowercase().as_str() {
+            "dangerous" => return PermissionMode::Dangerous,
+            "scoped" => {
+                let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
+                log_project_config_additions(&project_config.additional_allowed_tools);
+                return PermissionMode::Scoped {
+                    allowed_tools: Some(tools),
+                };
+            }
+            "auto" => {
+                let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
+                log_project_config_additions(&project_config.additional_allowed_tools);
+                return PermissionMode::Auto {
+                    allowed_tools: Some(tools),
+                };
+            }
+            _ => {
+                eprintln!(
+                    "\x1b[33m[warn]\x1b[0m Unrecognized permissionMode='{}' in config.json, \
+                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                    mode
+                );
+            }
+        }
+    }
+
+    // 5. Default → Scoped mode with full coding allowlist + project config.
     let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
     log_project_config_additions(&project_config.additional_allowed_tools);
     PermissionMode::Scoped {
@@ -1505,5 +1534,47 @@ mod tests {
         } else {
             panic!("Expected Scoped with tools, got {:?}", mode);
         }
+    }
+
+    #[test]
+    fn test_resolve_permission_mode_project_config_dangerous() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"permissionMode": "dangerous"}"#,
+        )
+        .unwrap();
+
+        let mode = resolve_permission_mode(dir.path());
+        assert_eq!(mode, PermissionMode::Dangerous);
+    }
+
+    #[test]
+    fn test_resolve_permission_mode_env_overrides_project_config() {
+        let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LOOP_PERMISSION_MODE", "scoped");
+        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+
+        let dir = tempfile::tempdir().unwrap();
+        // Project config says dangerous, but env says scoped — env wins
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"permissionMode": "dangerous"}"#,
+        )
+        .unwrap();
+
+        let mode = resolve_permission_mode(dir.path());
+        std::env::remove_var("LOOP_PERMISSION_MODE");
+        assert!(
+            matches!(mode, PermissionMode::Scoped { .. }),
+            "Env var should override project config, got {:?}",
+            mode
+        );
     }
 }

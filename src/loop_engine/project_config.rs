@@ -18,6 +18,12 @@ pub struct ProjectConfig {
     /// Example: `["Bash(docker:*)", "Bash(curl:*)"]`
     #[serde(default)]
     pub additional_allowed_tools: Vec<String>,
+
+    /// Permission mode override for this project.
+    /// Values: `"dangerous"`, `"scoped"`, `"auto"`.
+    /// When set, overrides the default scoped mode (but env vars still win).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 impl Default for ProjectConfig {
@@ -25,6 +31,7 @@ impl Default for ProjectConfig {
         Self {
             version: 1,
             additional_allowed_tools: Vec::new(),
+            permission_mode: None,
         }
     }
 }
@@ -111,5 +118,30 @@ mod tests {
         let config = read_project_config(dir.path());
         assert_eq!(config.version, 1);
         assert!(config.additional_allowed_tools.is_empty());
+        assert!(config.permission_mode.is_none());
+    }
+
+    #[test]
+    fn test_permission_mode_dangerous() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"permissionMode": "dangerous"}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.permission_mode.as_deref(), Some("dangerous"));
+    }
+
+    #[test]
+    fn test_permission_mode_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"additionalAllowedTools": []}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.permission_mode.is_none());
     }
 }
