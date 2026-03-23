@@ -2259,27 +2259,30 @@ mod tests {
         );
     }
 
-    /// progress-PA.txt (prefix-scoped progress file) must never be moved during archive.
-    /// Verifies the skip pattern covers both "progress.txt" and "progress-*.txt".
-    #[test]
-    fn test_archive_skips_prefixed_progress_file() {
+    /// Asserts that a progress-{prefix}.txt file is never moved during archive.
+    /// Sets up a single PRD with one done task, runs archive, and verifies the
+    /// progress file remains in tasks/ and does not appear in the archived list.
+    fn assert_progress_file_skipped(prefix: &str, project: &str, branch: &str, task_id: &str) {
         let dir = TempDir::new().unwrap();
         let conn = setup_db(dir.path());
 
-        insert_prd(&conn, 1, "project-a", "feat/branch-a", Some("PA"));
-        insert_task(&conn, "PA-001", "PA Task", 1, "done");
-        insert_prd_file(&conn, 1, "project-a.json", "task_list");
+        let json_file = format!("{project}.json");
+        let progress_file = format!("progress-{prefix}.txt");
+
+        insert_prd(&conn, 1, project, branch, Some(prefix));
+        insert_task(&conn, task_id, "Task", 1, "done");
+        insert_prd_file(&conn, 1, &json_file, "task_list");
         // Use "prd" as file_type — schema CHECK only allows prd/task_list/prompt;
         // the type is irrelevant to the skip logic being tested.
-        insert_prd_file(&conn, 1, "progress-PA.txt", "prd");
+        insert_prd_file(&conn, 1, &progress_file, "prd");
         drop(conn);
 
         let tasks_dir = dir.path().join("tasks");
         fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(tasks_dir.join("project-a.json"), "{}").unwrap();
+        fs::write(tasks_dir.join(&json_file), "{}").unwrap();
         fs::write(
-            tasks_dir.join("progress-PA.txt"),
-            "## PA-001\n- Done.\n---\n",
+            tasks_dir.join(&progress_file),
+            format!("## {task_id}\n- Done.\n---\n"),
         )
         .unwrap();
 
@@ -2289,115 +2292,30 @@ mod tests {
             !result.archived.is_empty(),
             "Archive should produce results"
         );
-
-        // progress-PA.txt must remain in tasks/
         assert!(
-            tasks_dir.join("progress-PA.txt").exists(),
-            "progress-PA.txt must never be moved to the archive"
-        );
-
-        // progress-PA.txt must NOT appear in archived list
-        let archived_sources: Vec<&str> =
-            result.archived.iter().map(|a| a.source.as_str()).collect();
-        assert!(
-            !archived_sources
-                .iter()
-                .any(|s| s.contains("progress-PA.txt")),
-            "progress-PA.txt must not appear in archived items"
-        );
-    }
-
-    /// progress-CHAIN.txt must never be moved during archive.
-    /// Uses realistic prefix "CHAIN" as used in chained PRD workflows.
-    #[test]
-    fn test_archive_skips_chain_prefixed_progress_file() {
-        let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
-
-        insert_prd(&conn, 1, "project-chain", "feat/chain", Some("CHAIN"));
-        insert_task(&conn, "CHAIN-001", "Chain Task", 1, "done");
-        insert_prd_file(&conn, 1, "project-chain.json", "task_list");
-        insert_prd_file(&conn, 1, "progress-CHAIN.txt", "prd");
-        drop(conn);
-
-        let tasks_dir = dir.path().join("tasks");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(tasks_dir.join("project-chain.json"), "{}").unwrap();
-        fs::write(
-            tasks_dir.join("progress-CHAIN.txt"),
-            "## CHAIN-001\n- Done.\n---\n",
-        )
-        .unwrap();
-
-        let result = run_archive(dir.path(), false, None).unwrap();
-
-        assert!(
-            !result.archived.is_empty(),
-            "Archive should produce results"
-        );
-
-        assert!(
-            tasks_dir.join("progress-CHAIN.txt").exists(),
-            "progress-CHAIN.txt must never be moved to the archive"
+            tasks_dir.join(&progress_file).exists(),
+            "{progress_file} must never be moved to the archive"
         );
 
         let archived_sources: Vec<&str> =
             result.archived.iter().map(|a| a.source.as_str()).collect();
         assert!(
-            !archived_sources
-                .iter()
-                .any(|s| s.contains("progress-CHAIN.txt")),
-            "progress-CHAIN.txt must not appear in archived items"
+            !archived_sources.iter().any(|s| s.contains(&*progress_file)),
+            "{progress_file} must not appear in archived items"
         );
     }
 
-    /// progress-99ae54f7.txt must never be moved during archive.
-    /// Uses realistic hex-style prefix as used in this very PRD.
+    /// progress-{prefix}.txt must never be moved during archive.
+    /// Covers PA (short alpha), CHAIN (chained PRD workflow), and 99ae54f7 (hex-style prefix).
     #[test]
-    fn test_archive_skips_hex_prefixed_progress_file() {
-        let dir = TempDir::new().unwrap();
-        let conn = setup_db(dir.path());
-
-        insert_prd(
-            &conn,
-            1,
+    fn test_archive_skips_prefixed_progress_file() {
+        assert_progress_file_skipped("PA", "project-a", "feat/branch-a", "PA-001");
+        assert_progress_file_skipped("CHAIN", "project-chain", "feat/chain", "CHAIN-001");
+        assert_progress_file_skipped(
+            "99ae54f7",
             "loop-reliability",
             "feat/loop-reliability",
-            Some("99ae54f7"),
-        );
-        insert_task(&conn, "99ae54f7-FEAT-001", "Hex Task", 1, "done");
-        insert_prd_file(&conn, 1, "loop-reliability.json", "task_list");
-        insert_prd_file(&conn, 1, "progress-99ae54f7.txt", "prd");
-        drop(conn);
-
-        let tasks_dir = dir.path().join("tasks");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(tasks_dir.join("loop-reliability.json"), "{}").unwrap();
-        fs::write(
-            tasks_dir.join("progress-99ae54f7.txt"),
-            "## 99ae54f7-FEAT-001\n- Done.\n---\n",
-        )
-        .unwrap();
-
-        let result = run_archive(dir.path(), false, None).unwrap();
-
-        assert!(
-            !result.archived.is_empty(),
-            "Archive should produce results"
-        );
-
-        assert!(
-            tasks_dir.join("progress-99ae54f7.txt").exists(),
-            "progress-99ae54f7.txt must never be moved to the archive"
-        );
-
-        let archived_sources: Vec<&str> =
-            result.archived.iter().map(|a| a.source.as_str()).collect();
-        assert!(
-            !archived_sources
-                .iter()
-                .any(|s| s.contains("progress-99ae54f7.txt")),
-            "progress-99ae54f7.txt must not appear in archived items"
+            "99ae54f7-FEAT-001",
         );
     }
 
