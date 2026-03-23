@@ -1,6 +1,6 @@
 //! Migration 14: Add archived_at columns and indexes for soft-archive support.
 //!
-//! ## Changes (implemented by FEAT task)
+//! ## Changes
 //! - `tasks`: ADD COLUMN `archived_at TEXT DEFAULT NULL`
 //! - `runs`: ADD COLUMN `archived_at TEXT DEFAULT NULL`
 //! - `run_tasks`: ADD COLUMN `archived_at TEXT DEFAULT NULL`
@@ -19,29 +19,27 @@ use super::Migration;
 pub static MIGRATION: Migration = Migration {
     version: 14,
     description: "Add archived_at columns and indexes for soft-archive support",
-    // Stub: FEAT task will replace TODO comments with real ALTER TABLE statements.
     up_sql: r#"
-        -- TODO: Implemented by FEAT task (4ba90f98-FEAT-001 or similar)
-        -- ALTER TABLE tasks ADD COLUMN archived_at TEXT DEFAULT NULL;
-        -- ALTER TABLE runs ADD COLUMN archived_at TEXT DEFAULT NULL;
-        -- ALTER TABLE run_tasks ADD COLUMN archived_at TEXT DEFAULT NULL;
-        -- ALTER TABLE key_decisions ADD COLUMN archived_at TEXT DEFAULT NULL;
-        -- CREATE INDEX idx_tasks_archived_at ON tasks(archived_at);
-        -- CREATE INDEX idx_runs_archived_at ON runs(archived_at);
-        -- CREATE INDEX idx_run_tasks_archived_at ON run_tasks(archived_at);
-        -- CREATE INDEX idx_key_decisions_archived_at ON key_decisions(archived_at);
+        ALTER TABLE tasks ADD COLUMN archived_at TEXT DEFAULT NULL;
+        ALTER TABLE runs ADD COLUMN archived_at TEXT DEFAULT NULL;
+        ALTER TABLE run_tasks ADD COLUMN archived_at TEXT DEFAULT NULL;
+        ALTER TABLE key_decisions ADD COLUMN archived_at TEXT DEFAULT NULL;
+        CREATE INDEX idx_tasks_archived_at ON tasks(archived_at);
+        CREATE INDEX idx_runs_archived_at ON runs(archived_at);
+        CREATE INDEX idx_run_tasks_archived_at ON run_tasks(archived_at);
+        CREATE INDEX idx_key_decisions_archived_at ON key_decisions(archived_at);
         UPDATE global_state SET schema_version = 14 WHERE id = 1;
     "#,
+    // DROP COLUMN requires SQLite >= 3.35.0. rusqlite 0.31 bundles SQLite 3.45+.
     down_sql: r#"
-        -- TODO: Implemented by FEAT task
-        -- DROP INDEX IF EXISTS idx_tasks_archived_at;
-        -- DROP INDEX IF EXISTS idx_runs_archived_at;
-        -- DROP INDEX IF EXISTS idx_run_tasks_archived_at;
-        -- DROP INDEX IF EXISTS idx_key_decisions_archived_at;
-        -- ALTER TABLE tasks DROP COLUMN archived_at;
-        -- ALTER TABLE runs DROP COLUMN archived_at;
-        -- ALTER TABLE run_tasks DROP COLUMN archived_at;
-        -- ALTER TABLE key_decisions DROP COLUMN archived_at;
+        DROP INDEX IF EXISTS idx_tasks_archived_at;
+        DROP INDEX IF EXISTS idx_runs_archived_at;
+        DROP INDEX IF EXISTS idx_run_tasks_archived_at;
+        DROP INDEX IF EXISTS idx_key_decisions_archived_at;
+        ALTER TABLE tasks DROP COLUMN archived_at;
+        ALTER TABLE runs DROP COLUMN archived_at;
+        ALTER TABLE run_tasks DROP COLUMN archived_at;
+        ALTER TABLE key_decisions DROP COLUMN archived_at;
         UPDATE global_state SET schema_version = 13 WHERE id = 1;
     "#,
 };
@@ -77,7 +75,6 @@ mod tests {
 
     /// After v14 up, tasks.archived_at column must exist.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add ALTER TABLE SQL before this passes"]
     fn test_v14_tasks_archived_at_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
         let exists: bool = conn
@@ -95,7 +92,6 @@ mod tests {
 
     /// After v14 up, runs.archived_at column must exist.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add ALTER TABLE SQL before this passes"]
     fn test_v14_runs_archived_at_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
         let exists: bool = conn
@@ -113,7 +109,6 @@ mod tests {
 
     /// After v14 up, run_tasks.archived_at column must exist.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add ALTER TABLE SQL before this passes"]
     fn test_v14_run_tasks_archived_at_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
         let exists: bool = conn
@@ -131,7 +126,6 @@ mod tests {
 
     /// After v14 up, key_decisions.archived_at column must exist.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add ALTER TABLE SQL before this passes"]
     fn test_v14_key_decisions_archived_at_column_exists() {
         let (_temp_dir, conn) = setup_migrated_db();
         let exists: bool = conn
@@ -149,7 +143,6 @@ mod tests {
 
     /// New tasks inserted after v14 must have archived_at = NULL by default.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add ALTER TABLE SQL before this passes"]
     fn test_v14_archived_at_defaults_to_null_on_tasks() {
         let (_temp_dir, conn) = setup_migrated_db();
         conn.execute(
@@ -169,7 +162,6 @@ mod tests {
 
     /// All 4 archived_at indexes must exist in sqlite_master after v14 migration.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add CREATE INDEX SQL before this passes"]
     fn test_v14_all_archived_at_indexes_exist() {
         let (_temp_dir, conn) = setup_migrated_db();
 
@@ -194,7 +186,6 @@ mod tests {
 
     /// v14 down migration must revert schema to version 13 and remove archived_at columns.
     #[test]
-    #[ignore = "Stub migration: FEAT task must add DROP COLUMN SQL before this passes"]
     fn test_v14_migration_down_removes_columns_and_reverts_to_v13() {
         let temp_dir = TempDir::new().unwrap();
         let mut conn = open_connection(temp_dir.path()).unwrap();
