@@ -240,6 +240,47 @@ pub fn insert_prd_metadata(
     Ok(prd_id)
 }
 
+/// Serialized fields shared between insert_task and update_task.
+struct TaskSerializedFields {
+    acceptance_criteria: String,
+    review_scope: Option<String>,
+    required_tests: Option<String>,
+    max_retries: i32,
+}
+
+/// Serialize and resolve the fields that insert_task and update_task both need.
+///
+/// Precedence for max_retries: story.max_retries > prd_default_max_retries > 3.
+fn prepare_task_fields(
+    story: &PrdUserStory,
+    prd_default_max_retries: Option<i32>,
+) -> TaskMgrResult<TaskSerializedFields> {
+    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
+
+    let review_scope = story
+        .review_scope
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    let required_tests = if story.required_tests.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&story.required_tests)?)
+    };
+
+    let max_retries = story
+        .max_retries
+        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+
+    Ok(TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    })
+}
+
 /// Insert a task into the database.
 ///
 /// `prd_default_max_retries` is the PRD-level default used to resolve the per-task
@@ -256,27 +297,12 @@ pub fn insert_task(
         TaskStatus::Todo
     };
 
-    // Serialize acceptance criteria as JSON array
-    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
-
-    // Serialize review_scope if present
-    let review_scope = story
-        .review_scope
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-
-    // Serialize required_tests as JSON array (NULL if empty)
-    let required_tests = if story.required_tests.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&story.required_tests)?)
-    };
-
-    // Resolve max_retries: per-task > PRD default > hardcoded 3
-    let max_retries = story
-        .max_retries
-        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+    let TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    } = prepare_task_fields(story, prd_default_max_retries)?;
 
     conn.execute(
         r#"INSERT INTO tasks
@@ -360,27 +386,12 @@ pub fn update_task(
     story: &PrdUserStory,
     prd_default_max_retries: Option<i32>,
 ) -> TaskMgrResult<()> {
-    // Serialize acceptance criteria as JSON array
-    let acceptance_criteria = serde_json::to_string(&story.acceptance_criteria)?;
-
-    // Serialize review_scope if present
-    let review_scope = story
-        .review_scope
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-
-    // Serialize required_tests as JSON array (NULL if empty)
-    let required_tests = if story.required_tests.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&story.required_tests)?)
-    };
-
-    // Resolve max_retries: per-task > PRD default > hardcoded 3
-    let max_retries = story
-        .max_retries
-        .unwrap_or_else(|| prd_default_max_retries.unwrap_or(3));
+    let TaskSerializedFields {
+        acceptance_criteria,
+        review_scope,
+        required_tests,
+        max_retries,
+    } = prepare_task_fields(story, prd_default_max_retries)?;
 
     // Note: We don't update status from passes here - the task may have been
     // completed in the DB since the JSON was written. We only update metadata.
