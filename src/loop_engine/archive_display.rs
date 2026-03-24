@@ -1,7 +1,7 @@
 //! Display formatting for archive command results.
 //!
 //! Separated from `archive.rs` to keep the core archive pipeline (run_archive,
-//! learning extraction, discovery/clearing) cohesive while isolating
+//! learning extraction, discovery/archiving) cohesive while isolating
 //! human-readable formatting.
 
 use super::archive::{ArchiveResult, PrdArchiveSummary, PrdSkipReason};
@@ -89,15 +89,15 @@ fn format_archived_prd(
         ));
     }
 
-    let clear_verb = if result.dry_run {
-        "Would clear"
+    let archive_verb = if result.dry_run {
+        "Would archive"
     } else {
-        "Cleared"
+        "Archived"
     };
-    if summary.tasks_cleared > 0 {
+    if summary.tasks_archived > 0 {
         out.push_str(&format!(
-            "  {} {} task(s) from database\n",
-            clear_verb, summary.tasks_cleared
+            "  {} {} task(s) in database\n",
+            archive_verb, summary.tasks_archived
         ));
     }
 
@@ -123,7 +123,7 @@ mod tests {
         learnings: usize,
     ) -> ArchiveResult {
         ArchiveResult {
-            tasks_cleared: prds_archived.iter().map(|p| p.tasks_cleared).sum(),
+            tasks_archived: prds_archived.iter().map(|p| p.tasks_archived).sum(),
             archived,
             learnings_extracted: learnings,
             dry_run,
@@ -154,7 +154,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-02-05-my-project".to_string(),
                 files_archived: 1,
-                tasks_cleared: 0,
+                tasks_archived: 0,
             }],
             vec![],
             true,
@@ -180,7 +180,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-02-05-my-project".to_string(),
                 files_archived: 1,
-                tasks_cleared: 3,
+                tasks_archived: 3,
             }],
             vec![],
             false,
@@ -191,7 +191,7 @@ mod tests {
         assert!(text.contains("PRD: my-project (prefix: PA)"));
         assert!(text.contains("2026-02-05-my-project"));
         assert!(text.contains("Moved my-project.json"));
-        assert!(text.contains("Cleared 3 task(s)"));
+        assert!(text.contains("Archived 3 task(s)"));
     }
 
     #[test]
@@ -226,7 +226,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-02-05-p".to_string(),
                 files_archived: 1,
-                tasks_cleared: 0,
+                tasks_archived: 0,
             }],
             vec![PrdSkipReason {
                 prd_id: 2,
@@ -254,7 +254,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-02-05-p".to_string(),
                 files_archived: 1,
-                tasks_cleared: 0,
+                tasks_archived: 0,
             }],
             vec![],
             false,
@@ -278,7 +278,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-02-05-p".to_string(),
                 files_archived: 1,
-                tasks_cleared: 0,
+                tasks_archived: 0,
             }],
             vec![],
             true,
@@ -342,7 +342,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-03-04-branch-a".to_string(),
                 files_archived: 1,
-                tasks_cleared: 3,
+                tasks_archived: 3,
             }],
             vec![PrdSkipReason {
                 prd_id: 2,
@@ -365,7 +365,7 @@ mod tests {
             "moved file line missing"
         );
         assert!(
-            text.contains("Cleared 3 task(s)"),
+            text.contains("Archived 3 task(s)"),
             "task clear count missing"
         );
 
@@ -402,7 +402,7 @@ mod tests {
                 destination: "archive/2026-02-05-feature/my-project.json".to_string(),
             }],
             learnings_extracted: 2,
-            tasks_cleared: 3,
+            tasks_archived: 3,
             dry_run: true,
             message: "legacy message".to_string(),
             prds_archived: Vec::new(),

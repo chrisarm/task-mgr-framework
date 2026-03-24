@@ -23,8 +23,8 @@ pub struct ArchiveResult {
     pub archived: Vec<ArchivedItem>,
     /// Learnings extracted from progress.txt
     pub learnings_extracted: usize,
-    /// Number of tasks cleared from the database
-    pub tasks_cleared: usize,
+    /// Number of tasks soft-archived in the database
+    pub tasks_archived: usize,
     /// Whether this was a dry run
     pub dry_run: bool,
     /// Human-readable message
@@ -48,8 +48,8 @@ pub struct PrdArchiveSummary {
     pub archive_folder: String,
     /// Number of files moved to the archive folder
     pub files_archived: usize,
-    /// Number of tasks cleared from the database
-    pub tasks_cleared: usize,
+    /// Number of tasks soft-archived in the database
+    pub tasks_archived: usize,
 }
 
 /// Reason a PRD was skipped during archiving.
@@ -179,7 +179,7 @@ fn archive_single_prd(
             task_prefix: prefix.to_string(),
             archive_folder: archive_folder_name,
             files_archived: items.len(),
-            tasks_cleared: task_count,
+            tasks_archived: task_count,
         },
         items,
     })
@@ -222,7 +222,7 @@ pub fn run_archive(
         return Ok(ArchiveResult {
             archived: Vec::new(),
             learnings_extracted: 0,
-            tasks_cleared: 0,
+            tasks_archived: 0,
             dry_run,
             message,
             prds_archived: Vec::new(),
@@ -236,12 +236,12 @@ pub fn run_archive(
     let mut archived_items: Vec<ArchivedItem> = Vec::new();
     let mut prds_archived: Vec<PrdArchiveSummary> = Vec::new();
     let mut prds_skipped: Vec<PrdSkipReason> = Vec::new();
-    let mut total_tasks_cleared: usize = 0;
+    let mut total_tasks_archived: usize = 0;
 
     for prd in &all_prds {
         match archive_single_prd(&mut conn, prd, &tasks_dir, &date_str, dry_run)? {
             PrdArchiveOutcome::Archived { summary, items } => {
-                total_tasks_cleared += summary.tasks_cleared;
+                total_tasks_archived += summary.tasks_archived;
                 prds_archived.push(summary);
                 archived_items.extend(items);
             }
@@ -276,19 +276,19 @@ pub fn run_archive(
     } else {
         let action = if dry_run { "Would archive" } else { "Archived" };
         format!(
-            "{} {} PRD(s), {} file(s). {} learning(s) extracted. Cleared {} task(s) from database.",
+            "{} {} PRD(s), {} file(s). {} learning(s) extracted. Archived {} task(s) in database.",
             action,
             prds_archived.len(),
             archived_items.len(),
             learnings_count,
-            total_tasks_cleared,
+            total_tasks_archived,
         )
     };
 
     Ok(ArchiveResult {
         archived: archived_items,
         learnings_extracted: learnings_count,
-        tasks_cleared: total_tasks_cleared,
+        tasks_archived: total_tasks_archived,
         dry_run,
         message,
         prds_archived,
@@ -809,7 +809,7 @@ mod tests {
                 destination: "archive/dir/a.json".to_string(),
             }],
             learnings_extracted: 5,
-            tasks_cleared: 0,
+            tasks_archived: 0,
             dry_run: true,
             message: "test".to_string(),
             prds_archived: Vec::new(),
@@ -833,14 +833,14 @@ mod tests {
             task_prefix: "MP".to_string(),
             archive_folder: "2026-03-03-my-branch".to_string(),
             files_archived: 3,
-            tasks_cleared: 10,
+            tasks_archived: 10,
         };
         assert_eq!(summary.prd_id, 42);
         assert_eq!(summary.project, "my-project");
         assert_eq!(summary.task_prefix, "MP");
         assert_eq!(summary.archive_folder, "2026-03-03-my-branch");
         assert_eq!(summary.files_archived, 3);
-        assert_eq!(summary.tasks_cleared, 10);
+        assert_eq!(summary.tasks_archived, 10);
     }
 
     #[test]
@@ -947,7 +947,7 @@ mod tests {
         assert!(!folder_name.contains("ralph/"));
 
         // Verify DB was soft-archived (tasks still exist but have archived_at set)
-        assert_eq!(result.tasks_cleared, 1);
+        assert_eq!(result.tasks_archived, 1);
         let conn = crate::db::open_connection(dir.path()).unwrap();
         let active_task_count: i64 = conn
             .query_row(
@@ -1042,7 +1042,7 @@ mod tests {
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
 
         let result = run_archive(dir.path(), false, None).unwrap();
-        assert_eq!(result.tasks_cleared, 1);
+        assert_eq!(result.tasks_archived, 1);
 
         // Verify learnings survived
         let conn = crate::db::open_connection(dir.path()).unwrap();
@@ -1124,7 +1124,7 @@ mod tests {
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
 
         let result = run_archive(dir.path(), false, None).unwrap();
-        assert_eq!(result.tasks_cleared, 3);
+        assert_eq!(result.tasks_archived, 3);
         assert!(!result.archived.is_empty());
     }
 
@@ -1832,7 +1832,7 @@ mod tests {
         let result = run_archive(dir.path(), false, None).unwrap();
 
         assert!(result.archived.is_empty());
-        assert_eq!(result.tasks_cleared, 0);
+        assert_eq!(result.tasks_archived, 0);
         assert!(
             result.message.contains("No PRD metadata") || result.message.contains("no PRD"),
             "Message should indicate no PRD metadata found, got: {}",
@@ -2062,7 +2062,7 @@ mod tests {
                 destination: "archive/2026-03-04-branch-a/project-a.json".to_string(),
             }],
             learnings_extracted: 2,
-            tasks_cleared: 5,
+            tasks_archived: 5,
             dry_run: false,
             message: "Archived 1 PRD(s), 1 file(s).".to_string(),
             prds_archived: vec![PrdArchiveSummary {
@@ -2071,7 +2071,7 @@ mod tests {
                 task_prefix: "PA".to_string(),
                 archive_folder: "2026-03-04-branch-a".to_string(),
                 files_archived: 1,
-                tasks_cleared: 5,
+                tasks_archived: 5,
             }],
             prds_skipped: vec![PrdSkipReason {
                 prd_id: 2,
@@ -2085,7 +2085,7 @@ mod tests {
         // Key fields present in JSON
         assert!(json.contains("\"archived\""));
         assert!(json.contains("\"learnings_extracted\":2"));
-        assert!(json.contains("\"tasks_cleared\":5"));
+        assert!(json.contains("\"tasks_archived\":5"));
         assert!(json.contains("\"dry_run\":false"));
         assert!(json.contains("\"prds_archived\""));
         assert!(json.contains("\"prds_skipped\""));
@@ -2177,7 +2177,7 @@ mod tests {
     }
 
     /// A completed PRD with no discoverable files on disk should still have its
-    /// DB data cleared (tasks + prd_metadata row deleted).
+    /// DB data archived (tasks soft-archived + prd_metadata row deleted).
     #[test]
     fn test_run_archive_completed_prd_no_files_clears_db() {
         let dir = TempDir::new().unwrap();
@@ -2196,8 +2196,8 @@ mod tests {
         // PRD should still be reported as archived (zero files is fine)
         assert_eq!(result.prds_archived.len(), 1);
         assert_eq!(result.prds_archived[0].files_archived, 0);
-        assert_eq!(result.prds_archived[0].tasks_cleared, 1);
-        assert_eq!(result.tasks_cleared, 1);
+        assert_eq!(result.prds_archived[0].tasks_archived, 1);
+        assert_eq!(result.tasks_archived, 1);
 
         // DB data must be soft-archived even though no files were moved
         let conn = crate::db::open_connection(dir.path()).unwrap();
