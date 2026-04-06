@@ -44,12 +44,13 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 | Task type                                                    | Assign `model`             | Rationale                                           |
 | ------------------------------------------------------------ | -------------------------- | --------------------------------------------------- |
+| First `FEAT-xxx` task (lowest priority number)               | opus                       | Foundation task — sets patterns all later tasks follow |
 | `ANALYSIS-xxx`                                               | opus                       | Deep semantic and consumer analysis                 |
 | `CODE-REVIEW-xxx`                                            | opus                       | Nuanced quality/security judgment                   |
 | `REFACTOR-REVIEW-xxx`                                        | opus                       | Architectural judgment calls                        |
 | `MILESTONE-xxx`                                              | opus                       | Cross-PRD task review and update based on learnings |
 | `VERIFY-xxx`                                                 | opus                       | Final validation gate, thoroughness required        |
-| `FEAT-xxx`, `FIX-xxx`, `TEST-xxx`, `INT-xxx`, `WIRE-FIX-xxx` | _(omit — use PRD default)_ | Standard implementation work                        |
+| Remaining `FEAT-xxx`, `FIX-xxx`, `TEST-xxx`, `INT-xxx`, `WIRE-FIX-xxx` | _(omit — use PRD default)_ | Standard implementation work                        |
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -83,6 +84,18 @@ From the PRD's **Section 2.5 (Quality Dimensions)**, extract:
 - **Known edge cases** → become `edgeCases` entries on TEST-INIT tasks
 
 Every edge case in the PRD table MUST appear as an `edgeCases` entry on at least one TEST-INIT task. This ensures the implementing agent is forced to handle it rather than hoping to discover it independently.
+
+#### Data Flow Contracts
+
+From the PRD's **Section 6 (Data Flow Contracts)**, extract the concrete access patterns and embed them in:
+
+1. **The prompt file** — as a "Data Flow Contracts" section with copy-pasteable code showing correct key paths (see prompt template below)
+2. **Implementation task `notes`** — remind the agent which key types to use at each level
+3. **TEST-INIT task `notes`** — require tests to use production-shaped data structures (real structs/schemas), not hand-built maps that might accidentally match the wrong key format
+
+> **Why this is critical**: The #1 source of silent bugs in multi-layer systems is data access path errors — using atom keys on string-keyed maps or vice versa. Tests that construct synthetic data matching the wrong key format pass even though the code is wrong. The PRD's Data Flow Contracts section provides verified access patterns; this step ensures those patterns reach the implementing agent.
+
+If the PRD lacks a Data Flow Contracts section but the feature accesses data across module boundaries, **generate one now** by reading existing code to verify the actual key types at each level.
 
 ---
 
@@ -125,31 +138,53 @@ For each user story, check complexity indicators:
 - Description exceeds 150 words
 - Spans multiple architectural layers
 
-**Ideal story characteristics:**
+**Flag for review (recommended split):**
 
-- 1-3 acceptance criteria
-- 1-2 files modified
-- Can be completed in one iteration
-- Clear "done" state
+- More than 7 acceptance criteria — agents start losing coherence at this size. Split unless there's a strong reason (e.g., atomic migration). If the `md-to-json-prd-reviewer` flags it, split unless you can justify keeping together.
+- Touches more than 7 files — high blast radius for one iteration. Flag for reviewer decision.
+
+**MUST split if (hard rule for automation reliability):**
+
+- More than 12 acceptance criteria — autonomous agents lose coherence across this many requirements
+- Touches more than 10 files — too many files for a single iteration to handle reliably
+- Split into subtasks (e.g., FEAT-001a, FEAT-001b) with clear boundaries between them
+
+**Effort sizing** (set `estimatedEffort` on each task):
+
+| Effort | Indicators |
+|---|---|
+| `low` | 1 file, 1-3 acceptance criteria, single function/field |
+| `medium` | 2-3 files, new function with tests, integration with existing system |
+| `high` | 3+ files, new module/component, cross-cutting — consider splitting |
 
 ### Step 4: Generate Story IDs
 
-Use context-appropriate prefixes:
+Use context-appropriate prefixes. Set the `taskType` field on each task to let the agent apply different strategies per type:
 
-- `ANALYSIS-xxx` - Consumer and semantic analysis (priority 0, blocks implementation)
-- `FEAT-xxx` - New features
-- `FIX-xxx` - Bug fixes
-- `ENV-xxx` - Environment/configuration
-- `PB-xxx` - PromptBuilder (domain-specific)
-- `TEST-xxx` - Test implementation
-- `INT-xxx` - Integration verification
-- `WIRE-xxx` - Integration wiring tasks (spawned by CODE-REVIEW when code not fully integrated)
-- `WIRE-FIX-xxx` - Fix wiring issues (exports, registration, call sites)
-- `VERIFY-xxx` - Validation tasks
-- `MILESTONE-xxx` - Gate checkpoints
-- `CODE-REVIEW-xxx` - Code review tasks
-- `REFACTOR-xxx` - Refactoring tasks
-- `POLISH-xxx` - Documentation/cleanup
+| Prefix | `taskType` | Notes |
+|--------|------------|-------|
+| `ANALYSIS-xxx` | `"analysis"` | Consumer and semantic analysis (priority 0, blocks implementation) |
+| `FEAT-xxx` | `"implementation"` | New features |
+| `FIX-xxx` | `"implementation"` | Bug fixes |
+| `ENV-xxx` | `"implementation"` | Environment/configuration |
+| `TEST-INIT-xxx` | `"test"` | Initial TDD tests (before implementation) |
+| `TEST-xxx` | `"test"` | Comprehensive test implementation |
+| `INT-xxx` | `"verification"` | Integration verification |
+| `WIRE-xxx` | `"implementation"` | Integration wiring (spawned by CODE-REVIEW) |
+| `WIRE-FIX-xxx` | `"implementation"` | Fix wiring issues (exports, registration, call sites) |
+| `CODE-REVIEW-xxx` | `"review"` | Code review tasks |
+| `REFACTOR-xxx` | `"implementation"` | Refactoring tasks |
+| `REFACTOR-REVIEW-xxx` | `"review"` | Refactoring review tasks |
+| `VERIFY-xxx` | `"verification"` | Final validation + documentation |
+| `MILESTONE-xxx` | `"milestone"` | Gate checkpoints |
+| `POLISH-xxx` | `"implementation"` | Formatting/cleanup |
+
+**Special `taskType` values:**
+
+- `"research"` — For spike/evaluation tasks (e.g., "evaluate 3 libraries, write ADR"). Set `requiresHuman: true` so the loop agent skips it and flags it for human attention. Set `difficulty: "high"` so the loop controller selects a larger model if it does attempt the task.
+- `"milestone"` — Agent behavior: review completed work, update remaining tasks, check sibling PRDs.
+- `"review"` — Agent behavior: read and analyze code, spawn fix tasks, don't implement.
+- `"verification"` — Agent behavior: run full test suite, verify integration, update docs.
 
 ### Step 4.5: Identify Behavior-Modifying Tasks
 
@@ -191,7 +226,23 @@ For Bug Fixes, Enhancements, and Refactors, check if any task modifies existing 
 
 ### Step 5: Create JSON Task File
 
-Generate `tasks/{feature}.json` following this schema:
+Generate `tasks/{feature}.json` following this schema.
+
+**Required: `taskPrefix`** — **Do NOT generate this yourself.** Leave `taskPrefix` absent from the JSON. The `task-mgr init` command will auto-generate a deterministic prefix from `md5(branchName + ":" + filename)[..8]` and write it back to the JSON file. This ensures the prefix is stable across re-imports and matches what the loop engine uses. If you set a `taskPrefix` manually, it may conflict with the auto-generated one, causing tasks to be imported under the wrong namespace and breaking dependency tracking.
+
+**Cross-PRD dependencies: `requires`** — If this PRD depends on another PRD being completed first (e.g., proto changes must land before Home can use them), add a top-level `requires` array:
+
+```json
+"requires": [
+  {
+    "prd": "01-proto-redesign.json",
+    "task": "MILESTONE-FINAL",
+    "reason": "SigningKey message must exist in enrollment.proto"
+  }
+]
+```
+
+The agent checks these before starting any task. If the required task in the other PRD hasn't passed, the agent outputs `<promise>BLOCKED</promise>` with the reason.
 
 ```json
 {
@@ -202,18 +253,21 @@ Generate `tasks/{feature}.json` following this schema:
   "externalGitRepo": "{{EXTERNAL_GIT_REPO_OR_OMIT}}",
   "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
   "description": "{Feature description from PRD}",
+  "requires": [],
   "priorityPhilosophy": {
     "description": "The hierarchy of what matters most when implementing tasks",
     "hierarchy": [
       "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
-      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
-      "3. CORRECTNESS — Self-critique after code. Code compiles, type-checks, passes all tests deterministically",
-      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings",
-      "5. POLISH — Documentation, formatting, minor improvements"
+      "2. PHASE 2 FOUNDATION — If a more sophisticated solution costs ~1 day now but saves ~2+ weeks post-launch, take that trade-off (1:10 ratio or better). We are pre-launch; foundations compound enormously",
+      "3. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "4. CORRECTNESS — Self-critique after code. Code compiles, type-checks, passes all tests deterministically",
+      "5. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings",
+      "6. POLISH — Documentation, formatting, minor improvements"
     ],
     "principles": [
       "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
       "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations; if ~1 day now saves ~2+ weeks later (1:10+ ratio), take the sophisticated path",
       "Edge cases = test cases — every known edge case must have a corresponding test; boundaries are where bugs hide",
       "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
       "Ship solid working code with tests to prove it",
@@ -251,6 +305,7 @@ Generate `tasks/{feature}.json` following this schema:
     {
       "id": "FEAT-001",
       "title": "Story title from PRD",
+      "taskType": "implementation",
       "description": "What this story accomplishes",
       "acceptanceCriteria": [
         "Specific, testable criterion 1",
@@ -259,6 +314,10 @@ Generate `tasks/{feature}.json` following this schema:
       "priority": 1,
       "estimatedEffort": "low|medium|high",
       "passes": false,
+      "requiresHuman": false,
+      "environmentRequirements": ["docker", "protoc", "uv"],
+      "preflightChecks": ["docker --version", "protoc --version"],
+      "completionCheck": "cargo test -p example-proto",
       "notes": "Implementation hints, gotchas",
       "model": "<opus-id-if-review/milestone, omit otherwise>",
       "timeoutSecs": 1800,
@@ -320,6 +379,7 @@ Create `tasks/{feature}-prompt.md` using the template below, replacing placehold
 - `{{FEATURE_NAME}}` - Kebab-case filename (e.g., `date-context`)
 - `{{PROBLEM_STATEMENT}}` - Problem description from PRD
 - `{{REFERENCE_CODE}}` - Optional: code patterns identified during exploration
+- `{{DATA_FLOW_CONTRACTS}}` - Optional but **strongly recommended**: Copy-pasteable access patterns from PRD Section 6 "Data Flow Contracts". If the feature accesses data across module boundaries, this section prevents the #1 class of silent bugs (wrong key types). Read actual code to verify key types at each level — never guess from variable names.
 - `{{FEATURE_SPECIFIC_CHECKS}}` - Optional: additional quality checks
 
 <details>
@@ -342,7 +402,7 @@ Before writing ANY code for a task:
 
 1. **Internalize quality targets** — Read `qualityDimensions` and define what "done well" looks like for THIS task
 2. **Map edge cases to implementation plan** — Read `edgeCases`/`invariants`/`failureModes`; for each, decide HOW it will be handled before coding
-3. **Choose your approach** — State assumptions, consider 2-3 approaches with tradeoffs, pick the best, document in progress.txt
+3. **Choose your approach** — State assumptions, consider 2-3 approaches with tradeoffs, pick the best, document in progress file
 4. **After coding, self-critique** — "Does this satisfy every qualityDimensions constraint? Every edge case? Is it idiomatic and efficient?" — revise before moving on
 
 ---
@@ -352,14 +412,16 @@ Before writing ANY code for a task:
 What matters most, in order:
 
 1. **PLAN** - Anticipate edge cases. Tests verify boundaries work correctly
-2. **FUNCTIONING CODE** - Pragmatic, reliable code that works according to plan
-3. **CORRECTNESS** - Code compiles, type-checks, all tests pass deterministically
-4. **CODE QUALITY** - Clean code, good patterns, no warnings
-5. **POLISH** - Documentation, formatting, minor improvements
+2. **PHASE 2 FOUNDATION** - If a more sophisticated solution costs ~1 day now but saves ~2+ weeks post-launch, take that trade-off (1:10 ratio or better). We are pre-launch; foundations compound enormously
+3. **FUNCTIONING CODE** - Pragmatic, reliable code that works according to plan
+4. **CORRECTNESS** - Code compiles, type-checks, all tests pass deterministically
+5. **CODE QUALITY** - Clean code, good patterns, no warnings
+6. **POLISH** - Documentation, formatting, minor improvements
 
 **Key Principles:**
 
 - **Approach from all sides**: Consider 2-3 approaches with tradeoffs, pick the best, then implement
+- **Phase 2 foundation**: Prefer solutions that lay strong post-launch foundations. If ~1 day of effort now saves ~2+ weeks of rework later (1:10+ ratio), take the sophisticated path
 - **Tests Drive Development**: Write initial tests before implementation to define expected behavior
 - **Self-critique after code**: Review your own implementation for correctness, style, and performance before moving on
 - **Quality dimensions explicit**: Read `qualityDimensions` on the task — these define what "good" looks like
@@ -381,33 +443,35 @@ What matters most, in order:
 
 These are the files you will read and modify during the loop:
 
-| File                               | Purpose                                                          |
-| ---------------------------------- | ---------------------------------------------------------------- |
-| `tasks/{{FEATURE_NAME}}.json`      | **Task list (PRD)** - Read tasks, mark complete, add new tasks   |
-| `tasks/{{FEATURE_NAME}}-prompt.md` | This prompt file (read-only)                                     |
-| `tasks/progress.txt`               | Progress log - append findings and learnings                     |
-| `tasks/long-term-learnings.md`     | Curated learnings by category (read first)                       |
-| `tasks/learnings.md`               | Raw iteration learnings (auto-appended, needs periodic curation) |
+| File                                        | Purpose                                                          |
+| ------------------------------------------- | ---------------------------------------------------------------- |
+| `tasks/{{FEATURE_NAME}}.json`               | **Task list (PRD)** - Read tasks, mark complete, add new tasks   |
+| `tasks/{{FEATURE_NAME}}-prompt.md`          | This prompt file (read-only)                                     |
+| `tasks/progress-{{TASK_PREFIX}}.txt`        | Progress log - append findings and learnings (create if missing) |
+| `tasks/long-term-learnings.md`              | Curated learnings by category (create if missing with `# Long-Term Learnings` header) |
+| `tasks/learnings.md`                        | Raw iteration learnings (create if missing with `# Learnings` header) |
 
-When review tasks add new tasks, they modify `tasks/{{FEATURE_NAME}}.json` directly. The loop re-reads this file each iteration.
+**File handling**: If `progress-{{TASK_PREFIX}}.txt`, `long-term-learnings.md`, or `learnings.md` don't exist, create them with a minimal header before appending. Never crash on missing files.
 
 ---
 
 ## Your Task
 
 1. Read the PRD at `tasks/{{FEATURE_NAME}}.json`
-2. Read the progress log at `tasks/progress.txt` (if exists)
-3. Read `tasks/long-term-learnings.md` for curated project patterns (persists across branches)
+2. Read the progress log at `tasks/progress-{{TASK_PREFIX}}.txt` (create if missing)
+3. Read `tasks/long-term-learnings.md` for curated project patterns (create if missing)
 4. Read `CLAUDE.md` for project patterns
 5. Verify you're on the correct branch from PRD `branchName` (and in the correct repo if `externalGitRepo` is set)
-6. **Select the best task** using Smart Task Selection below
+6. **Check cross-PRD dependencies**: If the PRD has a `requires` array, verify each required task in the referenced PRD file has `passes: true`. If not, output `<promise>BLOCKED</promise>` with the reason.
+7. **Select the best task** using Smart Task Selection below
 7. **Pre-implementation review** (before writing code):
    a. Read the task's `qualityDimensions` if present — these define what "good" looks like
    b. Read `edgeCases`, `invariants`, and `failureModes` on TEST-INIT tasks
    c. State your assumptions explicitly — hidden assumptions create bugs
-   d. Consider 2-3 implementation approaches with tradeoffs (even briefly), pick the best
-   e. For each known edge case, plan how it will be handled BEFORE coding
-   f. Document your chosen approach in a brief comment in `progress.txt`
+   d. **Verify data access patterns**: If the task accesses data across module boundaries, read 3+ existing call sites that access the same data structure to verify the correct key path. Check the "Data Flow Contracts" section below for verified patterns. Do NOT guess key types from variable names or comments.
+   e. Consider 2-3 implementation approaches with tradeoffs (even briefly), pick the best
+   f. For each known edge case, plan how it will be handled BEFORE coding
+   g. Document your chosen approach in a brief comment in the progress file
 8. **Implement** that single user story, following your chosen approach
 9. **Self-critique** (after implementation, before quality checks):
    - Review for correctness, idiomatic style, and performance. Revise if improvements exist
@@ -417,7 +481,7 @@ When review tasks add new tasks, they modify `tasks/{{FEATURE_NAME}}.json` direc
 11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
     For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
 12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
-13. Append progress to `tasks/progress.txt` (include approach chosen and any edge cases discovered)
+13. Append progress to `tasks/progress-{{TASK_PREFIX}}.txt` (include approach chosen and any edge cases discovered)
 14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 
 ---
@@ -438,12 +502,27 @@ Tasks have relationship fields:
 
 ### Selection Algorithm
 
-1. **Filter eligible**: `passes: false` AND all `dependsOn` complete
-2. **Check synergy**: Prefer tasks where `synergyWith` contains the previous task's ID
-3. **Check file overlap**: Prefer tasks with `touchesFiles` matching previous iteration's files
-4. **Avoid conflicts**: Skip tasks in `conflictsWith` of recently completed tasks
-5. **Tie-breaker**: If priorities tie, choose the one with most file overlap
-6. **Fall back**: Pick highest priority (lowest number)
+1. **Filter eligible**: `passes: false` AND all `dependsOn` complete AND `requiresHuman` is not `true`
+2. **Check cross-PRD requires**: If the top-level `requires` array has entries, verify each referenced task in the referenced PRD file has `passes: true`. If not, output `<promise>BLOCKED</promise>` with the reason.
+3. **Check preflightChecks**: If the candidate task has `preflightChecks`, run each command. If any fails, skip the task and log the failure in progress file.
+4. **Check synergy**: Prefer tasks where `synergyWith` contains the previous task's ID
+5. **Check file overlap**: Prefer tasks with `touchesFiles` matching previous iteration's files
+6. **Avoid conflicts**: Skip tasks in `conflictsWith` of recently completed tasks
+7. **Tie-breaker**: If priorities tie, use most file overlap; if still tied, sort by task ID alphabetically (deterministic)
+8. **Fall back**: Pick highest priority (lowest number)
+
+### Fast-Path for Simple Tasks
+
+For tasks with `estimatedEffort: "low"` AND fewer than 5 acceptance criteria:
+- Skip the "consider 2-3 approaches" step — implement directly
+- Skip detailed progress file documentation — one-line summary is sufficient
+- Still run quality checks and self-critique
+
+### Verify Previous Task
+
+Before selecting the next task, if the previously completed task had a `completionCheck` command:
+- Run the `completionCheck` command
+- If it fails, reopen the previous task (set `passes: false`) and fix it before moving on
 
 ---
 
@@ -461,7 +540,7 @@ Check if an `ANALYSIS-xxx` task exists for this change:
 
 ### 2. Check Consumer Impact Table
 
-Read `tasks/progress.txt` and find the Consumer Impact Table from the ANALYSIS task:
+Read the progress file and find the Consumer Impact Table from the ANALYSIS task:
 
 - If any consumer has `Impact: BREAKS` → the task must be SPLIT
 - If any consumer has `Impact: NEEDS_REVIEW` → verify before implementing
@@ -482,45 +561,6 @@ If the ANALYSIS identified multiple semantic contexts (same code, different purp
 3. Update dependencies so original task is replaced by split tasks
 4. Commit the JSON changes: `chore: Split [Task ID] for semantic contexts`
 5. Mark original task with `passes: true` and note "Split into [new IDs]"
-
----
-
-## Consumer Analysis Protocol
-
-Before modifying shared code (called from multiple places):
-
-### 1. Identify All Callers
-
-```bash
-# Search for direct callers
-Grep: function_name
-# Search for indirect references (configs, YAML routing)
-Grep: "function_name\\|related_config_key"
-# Search for tests asserting behavior
-Grep: "test.*function_name\\|assert.*expected_value"
-```
-
-### 2. Create Consumer Impact Table
-
-Document in progress.txt:
-
-```markdown
-## Consumer Impact Table for [Task ID]
-
-| File:Line                | Usage                             | Current Behavior        | Impact | Mitigation                        |
-| ------------------------ | --------------------------------- | ----------------------- | ------ | --------------------------------- |
-| workflow/executor.rs:456 | Calls function for auto-invoke    | Caches all results      | OK     | No change needed                  |
-| chat/handler.rs:123      | Calls function for user retry     | Skips caching failures  | OK     | No change needed                  |
-| pto_cancel.yml:246       | Routes on result.success == false | Expects cached failures | BREAKS | Must keep caching for auto-invoke |
-```
-
-### 3. Decision Matrix
-
-Based on Consumer Impact Table:
-
-- **All OK**: Proceed with single implementation
-- **Any BREAKS**: Split task by context, implement each separately
-- **NEEDS_REVIEW**: Verify with tests before/after, document assumptions
 
 ---
 
@@ -574,90 +614,9 @@ Adapt quality checks to match project tooling (check CLAUDE.md or README for pro
 
 ---
 
-## Error Handling Guidelines
+## Common Wiring Failures
 
-- Never use `unwrap()` in production code
-- Use `expect("descriptive message")` for programmer errors
-- Use `?` operator with proper `Result` propagation
-- Handle `Option::None` explicitly with meaningful defaults or errors
-
----
-
-## Integration Verification Protocol (CRITICAL)
-
-**New code must be fully wired in.** A common failure mode is code that compiles and passes unit tests but is never called in production because it's not properly integrated.
-
-### After Implementing New Code, Verify:
-
-#### 1. Export Chain Complete
-
-```bash
-# Verify module is exported from parent
-Grep: "pub mod {new_module}" or "pub use {new_module}"
-# Trace up to crate root - every level must re-export
-```
-
-#### 2. Registration/Wiring Points
-
-Check that new code is registered where required:
-
-- **Routes/Handlers**: Added to router/dispatcher?
-- **Tools**: Registered in tool registry?
-- **Config fields**: Read and passed through?
-- **DI/Services**: Registered in service container?
-- **Feature flags**: Enabled for the appropriate environments?
-
-#### 3. Call Site Verification
-
-```bash
-# Find ALL places that SHOULD call the new code
-Grep: "{old_function_name}" # If replacing
-Grep: "{related_pattern}"   # If adding to existing flow
-
-# Verify new code IS called from those places
-Grep: "{new_function_name}"
-```
-
-#### 4. Dead Code Detection
-
-```bash
-# Check for unused imports/functions
-cargo check 2>&1 | grep -i "unused"
-cargo clippy 2>&1 | grep -i "never used"
-```
-
-#### 5. Trace Entry Point to New Code
-
-**For each production entry point**, trace whether new code is reachable:
-
-```
-Entry Point (API/CLI/Event)
-    ↓
-Router/Dispatcher
-    ↓
-Handler/Controller
-    ↓
-Service Layer
-    ↓
->>> NEW CODE <<<  ← Is this reachable?
-```
-
-If you cannot trace a path from entry point to new code, the code is **not wired in**.
-
-### Integration Verification Checklist
-
-Before marking any implementation task complete:
-
-- [ ] **Exports**: New module/function exported from parent mod.rs?
-- [ ] **Imports**: Consuming modules import the new code?
-- [ ] **Registration**: New handler/tool/route registered?
-- [ ] **Config**: New config fields wired through from config source to usage?
-- [ ] **Call sites**: All places that should use new code actually call it?
-- [ ] **Old code removed**: If replacing, old implementation removed/deprecated?
-- [ ] **No dead code warnings**: `cargo check` shows no unused warnings for new code?
-- [ ] **Traceable path**: Can trace from entry point to new code?
-
-### Common Wiring Failures
+New code must be fully wired in — CODE-REVIEW-1 verifies this. Reference table for diagnosis:
 
 | Symptom                                        | Cause                                   | Fix                    |
 | ---------------------------------------------- | --------------------------------------- | ---------------------- |
@@ -666,6 +625,9 @@ Before marking any implementation task complete:
 | New config field has no effect                 | Config read but not passed to component | Wire config through    |
 | Old behavior persists                          | Conditional still routes to old code    | Update routing logic   |
 | "unused import" warning                        | Imported but never called               | Wire call sites        |
+| Function always returns nil/default            | Wrong key type (atom vs string) on map  | Verify key types match data source (struct=atom, JSONB=string) |
+| Tests pass but runtime returns wrong data      | Test uses hand-built map matching wrong key format | Use production-shaped data (real structs/schemas) in tests |
+| Config field accessible in some modules, not others | Mixed atom/string keys across layers | Trace key type at each hop, document in Data Flow Contracts |
 
 ---
 
@@ -692,7 +654,7 @@ Review tasks are special: they **CAN AND SHOULD add new tasks directly to the JS
    - [ ] No dead code warnings (`cargo check` / `cargo clippy`)
    - [ ] Can trace path from entry point to new code
 5. Use the **rust-code-reviewer** agent when available
-6. Document findings in `progress.txt`
+6. Document findings in the progress file
 
 **Wiring Issues Create WIRE-FIX Tasks**:
 If new code is not properly integrated, create `WIRE-FIX-xxx` tasks:
@@ -717,12 +679,15 @@ If new code is not properly integrated, create `WIRE-FIX-xxx` tasks:
 **Adding Tasks**:
 
 - For EACH issue found, add a `CODE-FIX-xxx` or `WIRE-FIX-xxx` task to the JSON (priority 14-16)
-- Task structure:
+- Task structure (note `rootCause`, `exactFix`, `verifyCommand` — these help the implementing agent fix correctly on the first try):
   ```json
   {
     "id": "CODE-FIX-001",
     "title": "Fix: [specific issue]",
     "description": "Address finding from CODE-REVIEW-1: [details]",
+    "rootCause": "What the review found — specific file:line and the issue (e.g., 'polling.rs:627 uses signing_public_key instead of trusted_keys')",
+    "exactFix": "What lines/functions need changing and how (e.g., 'Replace single-key lookup with key-set iteration per FR-008 pattern')",
+    "verifyCommand": "Shell command to confirm the fix works (e.g., 'cargo test -p example-agent -- command_verify')",
     "acceptanceCriteria": ["Issue resolved", "No new warnings"],
     "priority": 14,
     "passes": false,
@@ -769,57 +734,16 @@ If new code is not properly integrated, create `WIRE-FIX-xxx` tasks:
 
 **If no issues found**: Output `<completed>REFACTOR-REVIEW-1</completed>` with note "No refactoring needed"
 
-### REFACTOR-REVIEW-2 (Priority 43, adds tasks at 44-48) - Before MILESTONE-2
+### REFACTOR-REVIEW-2 and REFACTOR-REVIEW-3
 
-**Purpose**: Ensure test code is maintainable before integration testing.
+Same pattern as REFACTOR-REVIEW-1. Differences:
 
-**Look for**:
+| Review | Priority | Spawns at | Before | Focus |
+|---|---|---|---|---|
+| REFACTOR-REVIEW-2 | 43 | 44-48 | MILESTONE-2 | Test code: duplication, missing helpers, unclear names, brittle tests |
+| REFACTOR-REVIEW-3 | 70 | 71-85 | MILESTONE-FINAL | All code: DRY, complexity, coupling, clarity, pattern adherence |
 
-- **Test duplication**: Same setup code repeated
-- **Missing helpers**: Common patterns that should be extracted
-- **Unclear tests**: Test names/structure that don't clearly describe what's tested
-- **Brittle tests**: Tests that depend on implementation details
-
-**Adding Tasks**:
-
-- For EACH issue found, add a `REFACTOR-2-xxx` task to the JSON (priority 44-48)
-- **CRITICAL**: Add each REFACTOR-2-xxx to MILESTONE-2's `dependsOn` array
-- Commit JSON changes: `chore: REFACTOR-REVIEW-2 - Add refactor tasks`
-- Commit and output `<completed>REFACTOR-REVIEW-2</completed>` once review complete AND all tasks added
-
-**If no issues found**: Output `<completed>REFACTOR-REVIEW-2</completed>` with note "No refactoring needed"
-
-### REFACTOR-REVIEW-3 (Priority 70, adds tasks at 71-85) - Before MILESTONE-FINAL
-
-**Purpose**: Final opportunity to improve code before merge.
-
-**Look for** (comprehensive review):
-
-- **All DRY violations** across implementation and tests
-- **Complexity hotspots** that should be simplified
-- **Coupling issues** between modules
-- **Code clarity** - anything hard to understand
-- **Pattern adherence** - see CLAUDE.md section 8
-
-**Adding Tasks**:
-
-- For EACH issue found, add a `REFACTOR-3-xxx` task to the JSON (priority 71-85)
-- **CRITICAL**: Add each REFACTOR-3-xxx to MILESTONE-FINAL's `dependsOn` array
-- Commit JSON changes: `chore: REFACTOR-REVIEW-3 - Add refactor tasks`
-- Commit and output `<completed>REFACTOR-REVIEW-3</completed>` once review complete AND all tasks added
-
-**If no issues found**: Output `<completed>REFACTOR-REVIEW-3</completed>` with note "No refactoring needed"
-
-### TDD Test Strategy
-
-| Phase                     | Task Type     | Focus                                              | Examples                                                                                                    |
-| ------------------------- | ------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **Initial** (1-5)         | TEST-INIT-xxx | Happy path + edge cases + known-bad discriminators | Happy path, boundary values, empty/null, invalid input, invariant checks, one test that rejects naive stubs |
-| **Comprehensive** (25-38) | TEST-xxx      | Exceptions, errors, parameterized, boundaries      | Error handling, invalid inputs, parameterized, race conditions                                              |
-
-**TEST-INIT-xxx**: Write BEFORE implementation. Must include `edgeCases`, `invariants`, and `failureModes` fields. At least one test must discriminate correct from plausible-but-wrong implementations.
-
-**TEST-xxx**: Write AFTER MILESTONE-1. May spawn IMPL-FIX-xxx tasks if implementation gaps are found.
+Add spawned tasks to the corresponding milestone's `dependsOn` array.
 
 ### Task Flow Diagram (TDD)
 
@@ -842,29 +766,11 @@ Integration (55-65) ──► REFACTOR-REVIEW-3 (70) ──► VERIFY (90) ─�
                               └─ REFACTOR-3-xxx (71-85) ─┘
 ```
 
-### Review Task Commits
-
-When a review adds new tasks to `tasks/{{FEATURE_NAME}}.json`:
-
-```bash
-# 1. Edit the JSON file to add new tasks and update milestone dependsOn
-# 2. Commit the JSON changes
-git add tasks/{{FEATURE_NAME}}.json
-git commit -m "chore: [Review ID] - Add refactor tasks"
-
-# 3. Mark review as passes: true in the same JSON file
-# 4. Commit the completion
-git add tasks/{{FEATURE_NAME}}.json
-git commit -m "feat: [Review ID] - Review complete"
-```
-
-The loop will automatically pick up the new tasks on the next iteration since it re-reads `tasks/{{FEATURE_NAME}}.json` at the start of each iteration.
-
 ---
 
 ## Progress Report Format
 
-APPEND to `tasks/progress.txt`:
+APPEND to `tasks/progress-{{TASK_PREFIX}}.txt` (create if missing):
 
 ```
 ## [Date/Time] - [Story ID]
@@ -916,7 +822,7 @@ If verified:
 
 If blocked (missing dependencies, unclear requirements):
 
-1. Document blocker in `progress.txt`
+1. Document blocker in the progress file
 2. Create clarification task (e.g., `CLARIFY-001` with priority 0)
 3. Add to JSON and commit: `chore: Add blocker task CLARIFY-001`
 4. Output:
@@ -936,7 +842,7 @@ Verification is handled by VERIFY tasks, not milestones.
 ### Milestone Protocol
 
 1. Check all `dependsOn` tasks have `passes: true`
-2. **Review completed work**: Read `tasks/progress.txt` and recent git log to understand
+2. **Review completed work**: Read `tasks/progress-{{TASK_PREFIX}}.txt` and recent git log to understand
    what was actually implemented vs. what the remaining tasks assume
 3. **Identify deviations**: List implementation decisions that diverge from upcoming task
    expectations (changed APIs, different data structures, new dependencies, abandoned approaches)
@@ -950,7 +856,7 @@ Verification is handled by VERIFY tasks, not milestones.
    - Read full sibling PRD files if the summaries indicate updates are needed
    - Update affected task descriptions, acceptance criteria, touchesFiles, or notes
    - Commit sibling updates separately: `chore: MILESTONE-N update sibling tasks in [file].json`
-6. **Document changes**: Append a summary of task updates to `tasks/progress.txt`
+6. **Document changes**: Append a summary of task updates to the progress file
 7. Only mark milestone `passes: true` when all reviews and updates are committed
 
 ---
@@ -960,6 +866,18 @@ Verification is handled by VERIFY tasks, not milestones.
 ## Reference Code
 
 {{REFERENCE_CODE}}
+
+---
+
+{{/if}}
+
+{{#if DATA_FLOW_CONTRACTS}}
+
+## Data Flow Contracts
+
+These are **verified access patterns** for cross-module data structures. Use these exactly — do NOT guess key types from variable names or comments.
+
+{{DATA_FLOW_CONTRACTS}}
 
 ---
 
@@ -999,7 +917,7 @@ Every task list should include:
    - Identifies all consumers of changed behavior
    - Documents semantic distinctions (same code, different contexts)
    - Blocks implementation tasks until analysis passes
-   - Outputs Consumer Impact Table in progress.txt
+   - Outputs Consumer Impact Table in the progress file
 
 1. **Initial Test Tasks** (priority 1-5) - **TESTS FIRST (TDD)**
 
@@ -1015,6 +933,8 @@ Every task list should include:
      - `failureModes`: 1+ failure scenarios with expected behavior
    - **Known-bad requirement**: At least one test must distinguish correct behavior from a plausible-but-wrong implementation
    - Example: "Test that empty query returns [] not nil", "Test that expired specials are excluded not just filtered client-side"
+   - **Production-shaped data requirement**: Tests that access cross-module data structures MUST use production-shaped data (real structs/schemas loaded via the same code path production uses), NOT hand-built maps. Hand-built maps can accidentally match the wrong key format, causing tests and implementation to agree on the wrong contract.
+   - Example: "Test get_escalation_phone/1 with a real RestaurantSettings struct loaded via load_restaurant_settings — not a hand-built map"
 
 2. **Implementation Tasks** (priority 6-12)
 
@@ -1022,6 +942,7 @@ Every task list should include:
    - Ordered by dependency
    - Goal: Make the initial tests pass
    - Acceptance criteria: "All TEST-INIT-xxx tests pass"
+   - **First FEAT task uses Opus**: The first implementation task (lowest priority number) sets `"model": "<opus-id>"`. This foundation task establishes patterns, data models, and architectural decisions that all subsequent tasks build on. Getting the foundation right with a stronger model prevents cascading rework.
 
 3. **Code Review Task** (priority 13) - **CAN SPAWN TASKS**
 
@@ -1062,7 +983,7 @@ Every task list should include:
      - **"No unused warnings for new code in `cargo check`/`cargo clippy`"**
      - **"Remaining tasks in this PRD reviewed and updated based on implementation learnings"**
      - **"Sibling PRD tasks reviewed and updated if in batch mode"**
-   - Notes: "Review-and-update checkpoint. Read progress.txt and git log, identify deviations from plan, update all remaining tasks (this PRD + siblings) to reflect actual implementation."
+   - Notes: "Review-and-update checkpoint. Read the progress file and git log, identify deviations from plan, update all remaining tasks (this PRD + siblings) to reflect actual implementation."
 
 6. **Comprehensive Test Tasks** (priority 25-38)
 
@@ -1121,6 +1042,11 @@ Every task list should include:
     - `VERIFY-001: Final verification - all checks pass`
     - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
     - Depends on: INT-xxx + REFACTOR-REVIEW-3
+    - Acceptance criteria must include documentation updates:
+      - "Architecture docs updated if new modules/subsystems were added (`docs/` directory)"
+      - "CLAUDE.md updated with quick-reference for new tooling/workflows"
+      - "Dev guide created in `docs/` if feature introduces new developer-facing tooling"
+    - **Documentation scope**: The VERIFY task has a complete view of the implementation. It should create/update docs that help future Claude sessions understand the system without reading all the code. Check the PRD's Documentation section for what was identified during planning.
 
 13. **MILESTONE-FINAL** (priority 99) — **Final Review & Update Checkpoint**
 
@@ -1131,6 +1057,7 @@ Every task list should include:
       - "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)"
       - "All acceptance criteria met"
       - **"Sibling PRD tasks reviewed and updated with final implementation state"**
+      - **"Documentation created/updated per PRD Documentation section"**
     - Ready for merge
     - Notes: "Final checkpoint. Ensure sibling PRD tasks accurately reflect what was built. This is the last chance to update before this PRD is complete."
 
@@ -1138,7 +1065,7 @@ Every task list should include:
 
 When creating tasks, use these structures.
 
-**IMPORTANT**: When a review task identifies issues, it must **add new tasks directly to the JSON file** so the task-mgr loop picks them up in subsequent iterations. The loop reads the JSON at each iteration start, so newly added tasks will be selected automatically.
+**IMPORTANT**: Review tasks add new tasks directly to the JSON file (the loop re-reads it each iteration).
 
 #### TEST-INIT-xxx Template (priority 1-5) - **TESTS FIRST**
 
@@ -1146,6 +1073,7 @@ When creating tasks, use these structures.
 {
   "id": "TEST-INIT-001",
   "title": "Initial tests for [feature/component]",
+  "taskType": "test",
   "description": "Write tests BEFORE implementation. Must cover happy path, edge cases, and include at least one known-bad discriminator test.",
   "acceptanceCriteria": [
     "Happy path test defined: [specific scenario]",
@@ -1157,7 +1085,7 @@ When creating tasks, use these structures.
   "priority": 1,
   "estimatedEffort": "low",
   "passes": false,
-  "notes": "TDD: Write these tests first. Tests must be specific enough to reject wrong implementations, not just verify no crash. Implementation tasks depend on these.",
+  "notes": "TDD: Write these tests first. Tests must be specific enough to reject wrong implementations, not just verify no crash. Implementation tasks depend on these. IMPORTANT: If this test accesses cross-module data structures, use production-shaped data (real structs/schemas from actual code paths), NOT hand-built maps — hand-built maps can accidentally match the wrong key format, causing test and implementation to agree on the wrong contract.",
   "qualityDimensions": {
     "correctness": ["[From PRD section 2.5]"],
     "performance": ["[From PRD section 2.5]"],
@@ -1193,6 +1121,7 @@ When creating tasks, use these structures.
 {
   "id": "IMPL-FIX-001",
   "title": "Fix: [issue revealed by test]",
+  "taskType": "implementation",
   "description": "Address implementation gap revealed by TEST-xxx: [specific failing test]",
   "acceptanceCriteria": [
     "Failing test [test_name] now passes",
@@ -1222,6 +1151,7 @@ When creating tasks, use these structures.
 {
   "id": "CODE-REVIEW-1",
   "title": "Review implementation for quality and security",
+  "taskType": "review",
   "description": "Review all implementation tasks for code quality, error handling, and security",
   "acceptanceCriteria": [
     "No unwrap() in production code paths",
@@ -1251,6 +1181,7 @@ When creating tasks, use these structures.
 {
   "id": "REFACTOR-REVIEW-1",
   "title": "Review implementation for refactoring opportunities",
+  "taskType": "review",
   "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability issues",
   "acceptanceCriteria": [
     "No code duplication (DRY principle)",
@@ -1279,6 +1210,7 @@ When creating tasks, use these structures.
 {
   "id": "REFACTOR-REVIEW-2",
   "title": "Review test code for refactoring opportunities",
+  "taskType": "review",
   "description": "Analyze test code for duplication, helper extraction opportunities, and clarity improvements",
   "acceptanceCriteria": [
     "No duplicated test setup code",
@@ -1306,6 +1238,7 @@ When creating tasks, use these structures.
 {
   "id": "REFACTOR-REVIEW-3",
   "title": "Final refactoring review for maintainability",
+  "taskType": "review",
   "description": "Comprehensive review of all code for DRY violations, complexity hotspots, coupling issues, and code clarity",
   "acceptanceCriteria": [
     "No code duplication across entire implementation",
@@ -1332,14 +1265,22 @@ When creating tasks, use these structures.
 
 After generation, verify:
 
+- [ ] `taskPrefix` is NOT set (let `task-mgr init` auto-generate it)
+- [ ] All tasks have `taskType` set
+- [ ] Research/spike tasks have `requiresHuman: true`
+- [ ] Cross-PRD dependencies documented in `requires` array (if applicable)
+- [ ] No task has >12 acceptance criteria (must split if so)
+- [ ] No task touches >10 files (must split if so)
 - [ ] All PRD user stories are represented
 - [ ] Dependencies form a valid DAG (no cycles)
+- [ ] No priority collisions between tasks with different dependency chains (add secondary sort)
 - [ ] touchesFiles paths exist or are clearly new files
 - [ ] Milestones have correct dependencies
 - [ ] No orphan tasks (unreachable via dependencies)
 - [ ] **Quality dimensions carried through**: Every implementation task has `qualityDimensions` populated from PRD section 2.5
 - [ ] **Edge case coverage**: Every PRD Known Edge Case appears as an `edgeCases` entry on at least one TEST-INIT task
 - [ ] **Prompt includes pre-implementation review and self-critique steps**
+- [ ] **Data flow contracts**: If the feature accesses data across module boundaries, the prompt's `{{DATA_FLOW_CONTRACTS}}` section is populated with verified, copy-pasteable access patterns showing key types at each level. If not applicable, section is omitted.
 - [ ] **Behavior modification validation**:
   - Tasks with `modifiesBehavior: true` have a corresponding `ANALYSIS-xxx` dependency
   - Tasks modifying shared code have `consumerAnalysis` populated (or ANALYSIS task creates it)
@@ -1350,6 +1291,7 @@ After generation, verify:
 - A task touches caching, routing, or result handling but `modifiesBehavior` is false
 - A Bug Fix task lacks the Semantic Distinctions section from PRD
 - An implementation task depends on ANALYSIS but ANALYSIS has no acceptance criteria
+- The feature accesses nested data structures across module boundaries but no Data Flow Contracts section exists in the prompt — this is the #1 source of silent bugs in multi-layer systems
 
 Report to user:
 
@@ -1368,130 +1310,5 @@ Dependency graph validated: OK
 To run: task-mgr loop -y tasks/{feature}.json
 ```
 
-## Story Sizing Guidelines
 
-### Low Effort
 
-- Single file modification
-- Adding a field/method
-- Simple configuration change
-- ~30 minutes of work
-
-### Medium Effort
-
-- 2-3 files modified
-- New function with tests
-- Integration with existing system
-- ~1-2 hours of work
-
-### High Effort
-
-- 3+ files modified
-- New module/component
-- Cross-cutting concerns
-- Consider splitting into multiple stories
-- Consider using `/ralph-loop` for iterative refinement (see below)
-
-## Ralph Loop Integration
-
-For `estimatedEffort: "high"` tasks — especially those involving TDD cycles, complex integrations, or iterative refinement — the agent prompt should suggest using `/ralph-loop` as an inner loop within a single task iteration.
-
-**When to suggest ralph-loop in generated prompts:**
-
-- TEST-INIT tasks with 10+ acceptance criteria (lots of edge cases to iterate on)
-- FEAT tasks with `estimatedEffort: "high"` that touch 3+ files
-- Integration tasks (INT-xxx) that require end-to-end iteration
-
-**How it works with task-mgr:** The outer task-mgr loop selects tasks and tracks progress. For a hard task, the agent can use `/ralph-loop` to iterate within that single task until all acceptance criteria pass, then exit the ralph loop and let the outer task-mgr loop continue to the next task.
-
-**Example prompt addition for high-effort tasks:**
-
-```
-For high-effort tasks, consider using `/ralph-loop` to iterate:
-  /ralph-loop "Implement [TASK-ID]: [title]. Acceptance criteria: [list]. Output <promise>DONE</promise> when all criteria pass." --max-iterations 10
-```
-
-## Example Output
-
-For a PRD about adding date context to prompts:
-
-```
-tasks/date-context.json:
-  Initial Tests - TDD (priority 1-5):
-  - TEST-INIT-001: Initial tests for EnvironmentContext (priority 1)
-    └── Likely scenarios: new() populates time fields, format methods return expected strings
-    └── Likely edge cases: timezone at boundary, end of month
-  - TEST-INIT-002: Initial tests for PromptBuilder integration (priority 3)
-    └── Likely scenarios: environment_context accessible, auto-populated on new()
-    └── Likely edge case: context already set before new()
-
-  Implementation (priority 6-12):
-  - ENV-001: Add time fields to EnvironmentContext (priority 6, dependsOn: TEST-INIT-001)
-  - ENV-002: Add formatting methods (priority 7, dependsOn: ENV-001)
-  - PB-001: Add environment_context field (priority 9, dependsOn: TEST-INIT-002)
-  - PB-002: Auto-populate in new() (priority 10, dependsOn: PB-001, ENV-002)
-
-  Code Review (priority 13, adds tasks at 14-16):
-  - CODE-REVIEW-1: Review implementation (priority 13, dependsOn: all FEAT-xxx)
-    └── May add: CODE-FIX-001, CODE-FIX-002, etc. to JSON
-
-  Refactor Review 1 (priority 17, adds tasks at 18-19):
-  - REFACTOR-REVIEW-1: Review for refactoring (priority 17, dependsOn: CODE-REVIEW-1)
-    └── May add: REFACTOR-1-001, REFACTOR-1-002, etc. to JSON
-
-  Milestone 1 (priority 20):
-  - MILESTONE-1: Initial tests pass, implementation reviewed (priority 20)
-    └── dependsOn: TEST-INIT-xxx + FEAT-xxx + CODE-REVIEW-1 + REFACTOR-REVIEW-1
-
-  Comprehensive Testing (priority 25-38):
-  - TEST-001: Comprehensive tests for EnvironmentContext (priority 25)
-    └── Exceptions: invalid timezone string, nil time source
-    └── Parameterized: #[rstest] for multiple timezone/format combinations
-    └── Boundaries: DST transitions, leap years, year rollover
-  - TEST-002: Comprehensive tests for PromptBuilder (priority 30)
-    └── Error handling: nil context, malformed input
-    └── Parameterized: #[rstest] for multiple builder configurations
-    └── Concurrency: race conditions in context access
-
-  Test-Driven Fixes (priority 39-42, spawned by TEST-xxx if needed):
-  - IMPL-FIX-xxx: Fix issues revealed by comprehensive tests
-    └── Created dynamically when tests reveal implementation gaps
-
-  Refactor Review 2 (priority 43, adds tasks at 44-48):
-  - REFACTOR-REVIEW-2: Review test code for refactoring opportunities (priority 43, dependsOn: TEST-xxx)
-    └── May add: REFACTOR-2-001, REFACTOR-2-002, etc. to JSON
-
-  Milestone 2 (priority 50):
-  - MILESTONE-2: Full test coverage achieved (priority 50)
-    └── dependsOn: MILESTONE-1 + TEST-xxx + IMPL-FIX-xxx + REFACTOR-REVIEW-2
-
-  Integration (priority 55-65):
-  - INT-001: Integration tests (priority 55)
-
-  Refactor Review 3 (priority 70, adds tasks at 71-85):
-  - REFACTOR-REVIEW-3: Final refactoring review (priority 70, dependsOn: INT-001)
-    └── May add: REFACTOR-3-001, REFACTOR-3-002, etc. to JSON
-
-  Final Verification (priority 90-95):
-  - VERIFY-001: Full test suite (priority 90, dependsOn: INT-001, REFACTOR-REVIEW-3)
-
-  Milestone Final (priority 99):
-  - MILESTONE-FINAL: Ready for merge (priority 99, dependsOn: VERIFY-001, REFACTOR-REVIEW-3 + added tasks)
-```
-
-## Notes
-
-- Preserve PRD intent - don't over-engineer the task breakdown
-- Keep stories atomic - one clear deliverable per story
-- Front-load risky/uncertain work - fail fast
-- Include code review gates before major milestones
-- Test tasks should reference specific coverage targets
-- Use the project-config.json for consistent defaults if available
-
-> **Final validation — the generated tasks and prompt MUST include:**
->
-> - Every PRD edge case appears as an `edgeCases` entry on at least one TEST-INIT task
-> - Every implementation task has `qualityDimensions` populated from PRD section 2.5
-> - The prompt template contains the "Non-Negotiable Process" section (approach before code, self-critique after code)
-> - TEST-INIT tasks require known-bad discriminator tests
-> - CODE-REVIEW-1 checks that quality dimensions and edge cases were actually addressed

@@ -1,0 +1,369 @@
+{
+  "branchName": "feat/embedding-dedup",
+  "description": "Speed up curate dedup: embedding pre-filter via local Ollama+Jina, parallel LLM batch processing, larger default batch sizes.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code that works",
+      "3. CORRECTNESS — Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "No unnecessary abstractions — concrete structs over traits with one impl",
+      "Handle Option/Result explicitly; avoid unwrap() in production code",
+      "Graceful degradation when Ollama is unavailable"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "a728b804",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Migration v15 creates learning_embeddings table (learning_id PK, model, dimensions, embedding BLOB, created_at)",
+        "CURRENT_SCHEMA_VERSION bumped to 15",
+        "OllamaEmbedder struct: embed(), embed_batch(), is_available() using ureq",
+        "is_available() calls GET /api/tags with 3s timeout, checks model in list",
+        "store_embedding, load_embedding, load_all_active_embeddings, count_embedded functions",
+        "cosine_similarity: handles zero vectors (returns 0.0), identical (1.0), opposite (-1.0)",
+        "ProjectConfig extended with ollamaUrl and embeddingModel (#[serde(default)])",
+        "Unit tests: cosine_similarity edge cases, BLOB round-trip, store/load round-trip, load_all excludes retired learnings, load_all filters by current model"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Foundation: learning_embeddings table, concrete OllamaEmbedder struct (no trait), embedding storage/load functions, cosine_similarity, ProjectConfig extension. Include unit tests for cosine_similarity math and BLOB round-trip.",
+      "estimatedEffort": "high",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Foundation task. No trait — concrete OllamaEmbedder struct. Reference: $HOME/projects/external-ref/service/src/agent/kb/embedder.rs:82-145. Ollama API: POST /api/embed {\"model\": \"...\", \"input\": \"text\" | [\"t1\",\"t2\"]}. Response: {\"embeddings\": [[...f32...]]}. Tags: GET /api/tags -> {\"models\": [{\"name\": \"...\"}]}. Default model: hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0. BLOB: little-endian f32.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "f32 BLOB round-trip must be exact",
+          "cosine_similarity zero vector -> 0.0 not NaN"
+        ],
+        "performance": [
+          "Health check 3s timeout, embed 30s timeout"
+        ],
+        "style": [
+          "ureq not reqwest. TaskMgrResult<T>. #[serde(default)] on config fields."
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "taskType": "implementation",
+      "title": "Migration v15 + OllamaEmbedder + storage + cosine similarity + config",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/db/migrations/mod.rs",
+        "src/learnings/embeddings/mod.rs",
+        "src/learnings/mod.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "CurateAction::Embed variant with --force and --status flags",
+        "Handler in main.rs dispatches to embed logic",
+        "--status: prints embedded/total counts and model name",
+        "Default: checks Ollama, loads unembedded learnings, batch-embeds, stores",
+        "--force: re-embeds ALL active learnings",
+        "Model not found: error with 'Run: ollama pull <model>'",
+        "Zero-length content learnings skipped with warning",
+        "Progress and summary output"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add curate embed subcommand. Default: embed unembedded active learnings. --force: re-embed all. --status: show counts. Checks Ollama availability, errors with helpful message if unavailable or model not pulled.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Embedding text: \"{title}\\n\\n{content}\". Title-only learnings embed title alone. Follow existing CurateAction pattern.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "Check Ollama availability before starting, not after partial work"
+        ],
+        "performance": [
+          "Use batch embedding (array input) to minimize HTTP round-trips"
+        ],
+        "style": [
+          "Follow existing CurateAction pattern (Retire, Unretire, Dedup, Enrich)"
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [
+        "FEAT-001"
+      ],
+      "taskType": "implementation",
+      "title": "CLI: curate embed command",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cluster_by_embedding_similarity: loads embeddings, pairwise cosine, union-find, returns Vec<Vec<i64>>",
+        "When any embeddings exist, curate_dedup uses pre-filter path",
+        "Clustered learnings sent to LLM; singletons skipped",
+        "Learnings without embeddings collected into fallback batch(es) for LLM",
+        "Falls back entirely to current behavior when zero embeddings exist",
+        "Tests: 3 similar + 2 dissimilar = 1 cluster of 3; threshold boundary; transitive A~B B~C; empty input"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Union-find clustering on cosine similarity. Integrate into curate_dedup: when embeddings exist, cluster candidates first, send only clusters to LLM. Learnings without embeddings go to a fallback batch. Include tests for clustering logic.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Union-find: simple inline struct, path compression + union-by-rank, private helper. No arbitrary coverage threshold — use whatever embeddings exist. Similarity threshold slightly below LLM threshold to avoid false negatives.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "Pre-filter must not false-negative — threshold below LLM threshold",
+          "Union-find transitive: A~B, B~C -> {A,B,C}"
+        ],
+        "performance": [
+          "Pairwise 1200 learnings < 1 second"
+        ],
+        "style": [
+          "Union-find as private helper, not public abstraction"
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "taskType": "implementation",
+      "title": "Embedding pre-filter for curate dedup",
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "process_batches_parallel: dispatches to worker threads, collects via mpsc",
+        "Workers only call spawn_claude — no DB access",
+        "Main thread processes merges in original order",
+        "--concurrency flag added (default: 2)",
+        "DedupParams gains concurrency: usize",
+        "Fallback batch size: (200_000 / avg_chars).clamp(20, 100)",
+        "Error in one batch does not block others",
+        "Tests: concurrency=1 same as sequential; error isolation; result ordering"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Replace sequential batch loop with parallel dispatch using std::thread + mpsc. Add --concurrency flag (default 2). Increase fallback batch size to ~200K chars/batch clamped 20-100. Include tests with mock Claude binary.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Pattern: Arc<Mutex<VecDeque>> work queue, mpsc::Sender for results. Spawn min(concurrency, batch_count) threads. Use CLAUDE_BINARY env for mock in tests. Existing sequential loop at curate/mod.rs:595-731.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": {
+        "correctness": [
+          "Results identical regardless of concurrency",
+          "Errors isolated per-batch"
+        ],
+        "performance": [
+          "Spawn only min(concurrency, batch_count) threads"
+        ],
+        "style": [
+          "std::thread + mpsc consistent with existing watchdog/monitor patterns"
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "taskType": "implementation",
+      "title": "Parallel LLM batch processing + larger batch sizes",
+      "touchesFiles": [
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "VectorBackend struct implements RetrievalBackend trait (retrieve, index no-op, remove)",
+        "retrieve: embeds query text, loads all embeddings, cosine similarity, returns top-N sorted",
+        "Score normalization: similarity * 15.0 for parity with FTS5/patterns",
+        "remove: deletes from learning_embeddings table",
+        "Added to CompositeBackend::default_backends()",
+        "Returns empty results when Ollama unavailable or no embeddings exist",
+        "Tests: retrieve sorted by similarity, empty embeddings returns empty, remove works, composite integration"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Implement RetrievalBackend for vector similarity recall. Embeds query text via OllamaEmbedder, computes cosine similarity against stored embeddings, returns top-N. Add to CompositeBackend. Graceful degradation when Ollama unavailable. Include tests.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "No auto-embed via index() — keep it as a no-op. Users run `curate embed` explicitly. CompositeBackend already deduplicates by learning ID and keeps highest score, so vector results merge naturally.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "VectorBackend must never cause errors — return empty on any failure",
+          "Results sorted by relevance_score descending"
+        ],
+        "performance": [
+          "Don't call Ollama if no query text provided. Health check 2-3s timeout."
+        ],
+        "style": [
+          "Follow existing RetrievalBackend patterns in fts5.rs and patterns.rs"
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "taskType": "implementation",
+      "title": "VectorBackend for learnings recall",
+      "touchesFiles": [
+        "src/learnings/retrieval/vector.rs",
+        "src/learnings/retrieval/mod.rs",
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code",
+        "All errors propagated with context",
+        "New modules exported and reachable from CLI entry points",
+        "No dead code warnings",
+        "Any issues found have CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Review all implementation for quality, error handling, security. Verify wiring: new modules exported, CLI subcommand registered, no dead code. Spawn CODE-FIX tasks for issues.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue: add CODE-FIX-xxx task (priority 11-14), add to VERIFY-001 dependsOn. Commit JSON.",
+      "passes": false,
+      "priority": 10,
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review implementation for quality, security, and wiring",
+      "touchesFiles": [
+        "src/learnings/embeddings/mod.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/dedup.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test: all pass",
+        "cargo clippy -- -D warnings: clean",
+        "cargo fmt --check: clean",
+        "CLAUDE.md updated with Ollama/embedding config notes",
+        "Graceful degradation verified: all commands work with Ollama unavailable"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full test suite, clippy, fmt. Update CLAUDE.md with embedding config notes. Verify graceful degradation without Ollama.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate. Run full suite, update docs.",
+      "passes": false,
+      "priority": 90,
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": [
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "All acceptance criteria met",
+        "Branch clean and ready for merge"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "All work complete, tests pass, docs updated, ready for merge.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final checkpoint.",
+      "passes": false,
+      "priority": 99,
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final checkpoint — ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

@@ -86,7 +86,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Follow the v12/v13 test patterns in src/db/migrations/v12.rs and v13.rs. Use setup_migrated_db() helper.",
-      "passes": true,
+      "passes": false,
       "priority": 1,
       "qualityDimensions": {
         "correctness": [
@@ -151,7 +151,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "Use the existing setup_two_prds() helper in archive.rs tests. Existing tests like test_clear_prd_a_leaves_prd_b_intact show the pattern. These tests will initially fail since archive_prd_data doesn't exist yet.",
-      "passes": true,
+      "passes": false,
       "priority": 2,
       "qualityDimensions": {
         "correctness": [
@@ -192,7 +192,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Follow v13.rs as template. Index naming: idx_tasks_archived_at, idx_runs_archived_at, etc. SQLite DROP COLUMN requires >= 3.35.0; rusqlite 0.31 bundles 3.45+.",
-      "passes": true,
+      "passes": false,
       "priority": 6,
       "qualityDimensions": {
         "correctness": [
@@ -259,7 +259,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "The temporary hard-delete fix for key_decisions (commit a80bb46) should be replaced by the soft-archive approach. The existing test test_clear_prd_with_key_decisions_does_not_fk_violate should be updated to verify soft-archive behavior instead.",
-      "passes": true,
+      "passes": false,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -302,7 +302,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Read each file first to find the exact query locations. The line numbers from the PRD are approximate — verify against current code. Pattern: add AND archived_at IS NULL for direct table queries, or AND t.archived_at IS NULL for aliased JOINs. For run_tasks queries in calibrate.rs, filter on run_tasks.archived_at IS NULL.",
-      "passes": true,
+      "passes": false,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -347,7 +347,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "The prompt_sections queries use table aliases (t for tasks). Use AND t.archived_at IS NULL in those JOINs. The archive.rs completeness checks are critical — without the filter, archived tasks would count toward PRD completion and prevent re-archiving.",
-      "passes": true,
+      "passes": false,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -392,7 +392,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": false,
       "notes": "These commands always filter out archived records — they don't get --include-archived flags (that's only for list and history). Read each file to verify exact query locations before editing.",
-      "passes": true,
+      "passes": false,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -437,7 +437,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "key_decisions.rs read functions are in src/db/schema/key_decisions.rs. The get_decision_by_id function does NOT need filtering (single-ID lookup by user choice).",
-      "passes": true,
+      "passes": false,
       "priority": 10,
       "qualityDimensions": {
         "correctness": [
@@ -485,7 +485,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": false,
       "notes": "For clap, use #[arg(long = \"include-archived\", num_args = 0..=1, default_missing_value = \"0\")] to make the limit optional. Value 0 or None means no limit. The [archived] marker should appear in the task/run title or status display. The run_tasks and key_decisions queries within history detail view should also respect the flag.",
-      "passes": true,
+      "passes": false,
       "priority": 11,
       "qualityDimensions": {
         "correctness": [
@@ -545,7 +545,7 @@
       "id": "FEAT-008",
       "modifiesBehavior": true,
       "notes": "The PK conflict is handled by keeping hard-delete for tasks (they need clean IDs for reimport) while soft-archiving runs/key_decisions (which don't have PK conflicts with reimported data). The drop_existing_data function's prefix branch should archive first, then delete tasks.",
-      "passes": true,
+      "passes": false,
       "priority": 12,
       "qualityDimensions": {
         "correctness": [
@@ -595,7 +595,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Critical check: grep the entire src/ for SELECT queries on the 4 tables and verify each has an archived_at IS NULL filter (or is a justified single-ID lookup). For each issue found: 1) Add CODE-FIX-xxx task (priority 14-16), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes.",
-      "passes": true,
+      "passes": false,
       "priority": 13,
       "synergyWith": [],
       "taskType": "review",
@@ -610,62 +610,6 @@
         "src/commands/history.rs",
         "src/commands/init/import.rs",
         "src/db/schema/key_decisions.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "get_synergy_partner_models query at ~line 113 has AND t.archived_at IS NULL",
-        "cargo test passes with no new warnings"
-      ],
-      "batchWith": [
-        "CODE-FIX-002"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "CODE-REVIEW-1"
-      ],
-      "description": "The get_synergy_partner_models function in synergy.rs queries tasks t via JOIN but is missing AND t.archived_at IS NULL. Archived tasks with todo/in_progress status could leak into synergy model resolution, affecting model selection for loop iterations.",
-      "estimatedEffort": "low",
-      "id": "CODE-FIX-001",
-      "modifiesBehavior": false,
-      "notes": "One-line fix: add AND t.archived_at IS NULL after the existing AND t.status IN ('todo', 'in_progress') clause at ~line 113.",
-      "passes": true,
-      "priority": 14,
-      "synergyWith": [
-        "CODE-FIX-002"
-      ],
-      "taskType": "implementation",
-      "title": "Add missing archived_at filter to get_synergy_partner_models",
-      "touchesFiles": [
-        "src/loop_engine/prompt_sections/synergy.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "find_active_runs_without_end query at ~line 59 has AND archived_at IS NULL",
-        "cargo test passes with no new warnings"
-      ],
-      "batchWith": [
-        "CODE-FIX-001"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "CODE-REVIEW-1"
-      ],
-      "description": "The find_active_runs_without_end function in doctor/checks.rs queries runs with status='active' AND ended_at IS NULL but does not filter archived_at IS NULL. Archived runs that were abandoned before archiving would cause false positive doctor warnings.",
-      "estimatedEffort": "low",
-      "id": "CODE-FIX-002",
-      "modifiesBehavior": false,
-      "notes": "One-line fix: add AND archived_at IS NULL to the WHERE clause at ~line 59.",
-      "passes": true,
-      "priority": 14,
-      "synergyWith": [
-        "CODE-FIX-001"
-      ],
-      "taskType": "implementation",
-      "title": "Add missing archived_at filter to find_active_runs_without_end",
-      "touchesFiles": [
-        "src/commands/doctor/checks.rs"
       ]
     },
     {
@@ -686,7 +630,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add REFACTOR-1-xxx task (priority 18-19), 2) Add to MILESTONE-1 dependsOn, 3) Commit JSON changes. If no issues found, mark passes:true with note 'No refactoring needed'.",
-      "passes": true,
+      "passes": false,
       "priority": 17,
       "synergyWith": [],
       "taskType": "review",
@@ -695,93 +639,6 @@
         "src/loop_engine/archive.rs",
         "src/commands/list.rs",
         "src/commands/history.rs",
-        "src/commands/init/import.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "Shared helper exists (e.g. soft_archive_by_prefix) that both archive_prd_data and drop_existing_data call",
-        "No duplicate SQL for soft-archiving run_tasks, key_decisions, or runs",
-        "All existing archive and init --force tests pass unchanged",
-        "cargo clippy -- -D warnings passes"
-      ],
-      "batchWith": [
-        "REFACTOR-1-002"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "REFACTOR-REVIEW-1"
-      ],
-      "description": "archive_prd_data (archive.rs:450-593) and drop_existing_data (import.rs:26-86) both soft-archive run_tasks, key_decisions, and runs with nearly identical SQL (~30 duplicated lines). Extract a shared soft_archive_by_prefix(conn, prefix) helper that both callers invoke. This also reduces archive_prd_data from 143 lines by extracting the archive steps.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-1-001",
-      "modifiesBehavior": false,
-      "notes": "The shared helper should live in a common module (e.g. src/db/archive.rs or src/loop_engine/archive_helpers.rs). archive_prd_data steps 1-3 and drop_existing_data lines 33-58 are the duplicated code. Keep the transaction boundary in archive_prd_data; the helper should accept a connection/transaction ref.",
-      "passes": true,
-      "priority": 18,
-      "synergyWith": [
-        "REFACTOR-1-002"
-      ],
-      "taskType": "implementation",
-      "title": "Extract shared soft-archive-by-prefix helper",
-      "touchesFiles": [
-        "src/loop_engine/archive.rs",
-        "src/commands/init/import.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "No .map_err(crate::TaskMgrError::DatabaseError) calls remain in archive.rs",
-        "All occurrences replaced with plain ? operator",
-        "cargo check and cargo test pass",
-        "cargo clippy -- -D warnings passes"
-      ],
-      "batchWith": [
-        "REFACTOR-1-001"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "REFACTOR-REVIEW-1"
-      ],
-      "description": "archive.rs has ~17 instances of .map_err(crate::TaskMgrError::DatabaseError)? that are unnecessary because TaskMgrError has #[from] rusqlite::Error (error.rs:24). Replace all with plain ? operator. Affects archive_prd_data (~14), query_all_prds (~3), and is_prd_completed_by_prefix (~2).",
-      "estimatedEffort": "low",
-      "id": "REFACTOR-1-002",
-      "modifiesBehavior": false,
-      "notes": "Pure mechanical cleanup. Search for .map_err(crate::TaskMgrError::DatabaseError) in archive.rs and remove each one. Verify with cargo check that the From impl handles the conversion.",
-      "passes": true,
-      "priority": 19,
-      "synergyWith": [
-        "REFACTOR-1-001"
-      ],
-      "taskType": "implementation",
-      "title": "Remove redundant .map_err(DatabaseError) boilerplate in archive.rs",
-      "touchesFiles": [
-        "src/loop_engine/archive.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "Shared helper function for acceptance_criteria/review_scope/required_tests/max_retries serialization",
-        "Both insert_task and update_task call the shared helper",
-        "No duplicate serialization code between insert_task and update_task",
-        "All existing init tests pass unchanged"
-      ],
-      "batchWith": [],
-      "conflictsWith": [],
-      "dependsOn": [
-        "REFACTOR-REVIEW-1"
-      ],
-      "description": "insert_task (import.rs:287-306) and update_task (import.rs:391-410) share ~20 lines of identical serialization logic for acceptance_criteria, review_scope, required_tests, and max_retries resolution. Extract a prepare_task_fields(story, prd_default_max_retries) helper that returns the serialized values.",
-      "estimatedEffort": "low",
-      "id": "REFACTOR-1-003",
-      "modifiesBehavior": false,
-      "notes": "The helper should return a struct with the serialized fields (acceptance_criteria: String, review_scope: Option<String>, required_tests: Option<String>, max_retries: i32). Both insert_task and update_task destructure the result.",
-      "passes": true,
-      "priority": 19,
-      "synergyWith": [],
-      "taskType": "implementation",
-      "title": "Extract task field serialization helper in import.rs",
-      "touchesFiles": [
         "src/commands/init/import.rs"
       ]
     },
@@ -808,12 +665,7 @@
         "FEAT-007",
         "FEAT-008",
         "CODE-REVIEW-1",
-        "CODE-FIX-001",
-        "CODE-FIX-002",
-        "REFACTOR-REVIEW-1",
-        "REFACTOR-1-001",
-        "REFACTOR-1-002",
-        "REFACTOR-1-003"
+        "REFACTOR-REVIEW-1"
       ],
       "description": "Review-and-update checkpoint. All core implementation is done: migration, archive function, query filters, CLI flags, init --force change. Verify everything works together and update remaining tasks.",
       "estimatedEffort": "medium",
@@ -821,7 +673,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Review-and-update checkpoint. Read the progress file and git log, identify deviations from plan, update all remaining tasks to reflect actual implementation.",
-      "passes": true,
+      "passes": false,
       "priority": 20,
       "synergyWith": [],
       "taskType": "milestone",
@@ -851,7 +703,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Focus on scenarios not covered by TEST-INIT-002. Test real query functions (status_queries, next/selection) to verify end-to-end filter behavior.",
-      "passes": true,
+      "passes": false,
       "priority": 25,
       "qualityDimensions": {
         "correctness": [
@@ -895,7 +747,7 @@
       "id": "TEST-002",
       "modifiesBehavior": false,
       "notes": "For CLI tests, check tests/cli_tests.rs for the pattern. For init --force, may need a helper to set up a pre-archived state.",
-      "passes": true,
+      "passes": false,
       "priority": 28,
       "qualityDimensions": {
         "correctness": [
@@ -939,7 +791,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue found: 1) Add REFACTOR-2-xxx task (priority 44-48), 2) Add to MILESTONE-2 dependsOn, 3) Commit JSON changes. If no issues found, mark passes:true.",
-      "passes": true,
+      "passes": false,
       "priority": 43,
       "synergyWith": [],
       "taskType": "review",
@@ -947,64 +799,6 @@
       "touchesFiles": [
         "src/loop_engine/archive.rs",
         "tests/cli_tests.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "Duplicate test pairs identified in review are consolidated (keep the more thorough version)",
-        "No two tests verify the exact same behavior with different names",
-        "All remaining tests still pass after dedup",
-        "Net reduction of at least 150 lines of test code"
-      ],
-      "batchWith": [
-        "REFACTOR-2-002"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "REFACTOR-REVIEW-2"
-      ],
-      "description": "Deduplicate archive_prd_data tests in archive.rs. The original test set (lines ~1399-1700) and the TEST-001 set (lines ~2563-3180) contain 6 duplicate pairs testing identical soft-archive behavior. For each pair, keep the more thorough version and remove the other. Pairs: (1) test_clear_prd_a_leaves_prd_b_intact vs test_soft_archive_prd_a_sets_archived_at_on_tasks, (2) test_clear_prd_a_deletes_orphaned_runs vs test_soft_archive_prd_a_orphaned_run_gets_archived, (3) test_clear_prd_a_preserves_shared_runs vs test_soft_archive_prd_a_shared_run_stays_active, (4) test_clear_prd_with_key_decisions_does_not_fk_violate vs test_soft_archive_prd_a_archives_key_decisions, (5) test_global_state_counters_not_reset_while_other_prd_remains vs first half of test_soft_archive_counter_reset_when_no_active_tasks_remain, (6) test_global_state_counters_reset_when_last_prd_cleared vs test_soft_archive_counter_reset_when_no_active_tasks_remain.",
-      "estimatedEffort": "medium",
-      "id": "REFACTOR-2-001",
-      "modifiesBehavior": false,
-      "passes": true,
-      "priority": 44,
-      "synergyWith": [
-        "REFACTOR-2-002"
-      ],
-      "taskType": "refactor",
-      "title": "Deduplicate archive_prd_data test pairs in archive.rs",
-      "touchesFiles": [
-        "src/loop_engine/archive.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "3 near-identical progress file skip tests replaced with a single parameterized test or loop",
-        "All prefix variants (PA, CHAIN, hex) still covered",
-        "Tests still pass after refactor",
-        "Net reduction of at least 60 lines"
-      ],
-      "batchWith": [
-        "REFACTOR-2-001"
-      ],
-      "conflictsWith": [],
-      "dependsOn": [
-        "REFACTOR-REVIEW-2"
-      ],
-      "description": "Parameterize the 3 near-identical progress file skip tests in archive.rs (test_archive_skips_prefixed_progress_file, test_archive_skips_chain_prefixed_progress_file, test_archive_skips_hex_prefixed_progress_file). These tests differ only in the prefix name/project name but each is ~40 lines. Extract a helper fn like assert_progress_file_skipped(prefix, project, task_id) and call it 3 times in a single test, or use a loop over test cases.",
-      "estimatedEffort": "low",
-      "id": "REFACTOR-2-002",
-      "modifiesBehavior": false,
-      "passes": true,
-      "priority": 46,
-      "synergyWith": [
-        "REFACTOR-2-001"
-      ],
-      "taskType": "refactor",
-      "title": "Parameterize progress file skip tests in archive.rs",
-      "touchesFiles": [
-        "src/loop_engine/archive.rs"
       ]
     },
     {
@@ -1019,9 +813,7 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2",
-        "REFACTOR-2-001",
-        "REFACTOR-2-002"
+        "REFACTOR-REVIEW-2"
       ],
       "description": "Review-and-update checkpoint after comprehensive testing phase. Verify all tests pass, update remaining tasks.",
       "estimatedEffort": "medium",
@@ -1029,7 +821,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Review-and-update checkpoint. Update remaining tasks to reflect test findings and implementation changes.",
-      "passes": true,
+      "passes": false,
       "priority": 50,
       "synergyWith": [],
       "taskType": "milestone",
@@ -1057,7 +849,7 @@
       "id": "INT-001",
       "modifiesBehavior": false,
       "notes": "This is the integration gate. Run the full test suite and verify the complete workflow.",
-      "passes": true,
+      "passes": false,
       "priority": 55,
       "synergyWith": [],
       "taskType": "verification",
@@ -1083,7 +875,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final opportunity to improve code before merge. For each issue found: 1) Add REFACTOR-3-xxx task (priority 71-85), 2) Add to MILESTONE-FINAL dependsOn, 3) Commit JSON changes.",
-      "passes": true,
+      "passes": false,
       "priority": 70,
       "synergyWith": [],
       "taskType": "review",
@@ -1117,7 +909,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate before merge. Verify everything works together.",
-      "passes": true,
+      "passes": false,
       "priority": 90,
       "synergyWith": [],
       "taskType": "verification",

@@ -1,0 +1,858 @@
+{
+  "branchName": "feat/human-review-checkpoint",
+  "description": "Add requiresHuman field to PRD tasks. When a requiresHuman task completes, the loop auto-pauses for interactive human input, injects feedback as session guidance, and runs a Claude call to mutate downstream tasks based on the feedback. Works in both single-loop and batch mode (overrides yes_mode). Optional per-task timeout for auto-continue.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. PHASE 2 FOUNDATION — If a more sophisticated solution costs ~1 day now but saves ~2+ weeks post-launch, take that trade-off (1:10 ratio or better). We are pre-launch; foundations compound enormously",
+      "3. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "4. CORRECTNESS — Self-critique after code. Code compiles, type-checks, passes all tests deterministically",
+      "5. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings",
+      "6. POLISH — Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations; if ~1 day now saves ~2+ weeks later (1:10+ ratio), take the sophisticated path",
+      "Edge cases = test cases — every known edge case must have a corresponding test; boundaries are where bugs hide",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Ship solid working code with tests to prove it",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context"
+  ],
+  "project": "task-mgr",
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "f53bb247",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Test v15 migration adds requires_human and human_review_timeout columns",
+        "Test v15 migration defaults: requires_human=0, human_review_timeout=NULL",
+        "Test v15 down migration removes both columns and reverts to v14",
+        "Test PrdUserStory deserializes requiresHuman: true/false/absent correctly",
+        "Test PrdUserStory deserializes humanReviewTimeout: 60/null/absent correctly",
+        "Test Task::try_from(Row) reads requires_human and human_review_timeout with graceful fallback",
+        "Test insert_task stores requires_human=1 when story has requiresHuman=true",
+        "Test update_task preserves requires_human field on update",
+        "Test show output displays 'Requires Human Review: Yes' when set",
+        "Test export round-trips requiresHuman and humanReviewTimeout fields"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests BEFORE implementation for the requiresHuman/humanReviewTimeout fields: DB migration, PRD parsing, task model, import, show output, export round-trip.",
+      "edgeCases": [
+        "requiresHuman absent from JSON (should default to false/None)",
+        "humanReviewTimeout: 0 (should be treated as no timeout, not instant timeout)",
+        "Pre-v15 database without the columns (graceful fallback in Task::try_from)",
+        "requiresHuman: true with passes: true (pre-completed task, review skipped)",
+        "Export round-trip: requiresHuman false should not appear in output (skip_serializing_if)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Migration SQL syntax error",
+          "expectedBehavior": "Migration fails atomically, DB stays at v14"
+        },
+        {
+          "cause": "Task::try_from on pre-v15 DB (column doesn't exist)",
+          "expectedBehavior": "Graceful fallback: requires_human=false, timeout=None"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "requires_human defaults to 0 (false) in DB for all existing tasks",
+        "human_review_timeout defaults to NULL for all existing tasks",
+        "Absent requiresHuman in JSON is equivalent to requiresHuman: false"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: Write these tests first. Use the v14 migration tests as a template for v15 tests. For Task::try_from tests, use the existing test helpers that create in-memory SQLite DBs.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Migration tests must verify column existence AND default values",
+          "Parsing tests must cover all 3 states: true, false, absent"
+        ],
+        "performance": [
+          "Tests should use in-memory SQLite, not disk"
+        ],
+        "style": [
+          "Follow existing migration test patterns from v14.rs"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Initial tests for requiresHuman data model and parsing",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/db/migrations/mod.rs",
+        "src/commands/init/parse.rs",
+        "src/models/task.rs",
+        "src/commands/init/import.rs",
+        "src/commands/show.rs",
+        "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test handle_human_review with mock stdin input returns true and records guidance",
+        "Test handle_human_review with empty input (just Enter) returns false, no guidance recorded",
+        "Test guidance is tagged as '[Human Review for TASK-ID] input text'",
+        "Test stdin EOF (piped/headless) returns false with no panic",
+        "Test timeout=0 or None means blocking read (no timeout)",
+        "Test banner output includes task ID, title, and notes"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Write tests for the interactive human review handler function: stdin reading, guidance tagging, timeout behavior, EOF handling.",
+      "edgeCases": [
+        "stdin EOF (piped/headless environment)",
+        "Timeout fires mid-typing — partial input collected",
+        "Multi-line input with blank lines in the middle (only final empty line terminates)",
+        "Very long input (>10KB) — should work without truncation"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "stdin is closed/EOF before any input",
+          "expectedBehavior": "Return false, log warning, no guidance recorded"
+        },
+        {
+          "cause": "Thread spawn fails for timeout",
+          "expectedBehavior": "Fall back to blocking read (no timeout)"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Function never panics regardless of stdin state",
+        "SessionGuidance is only mutated when non-empty input is provided"
+      ],
+      "modifiesBehavior": false,
+      "notes": "TDD: The handle_human_review function will reuse handle_pause patterns. For stdin mocking, consider extracting stdin reading into a trait or accepting a BufRead parameter instead of hardcoding io::stdin(). This makes testing possible without actually blocking on stdin.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "Guidance tag format must be exactly '[Human Review for {task_id}] {input}'",
+          "Empty input (whitespace only) must not record guidance"
+        ],
+        "performance": [
+          "Timeout must not busy-wait"
+        ],
+        "style": [
+          "Reuse SessionGuidance infrastructure, don't create parallel system"
+        ]
+      },
+      "synergyWith": [
+        "TEST-INIT-001"
+      ],
+      "taskType": "test",
+      "title": "Initial tests for handle_human_review and timeout",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/guidance.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "v15.rs created following v14 pattern exactly",
+        "Up SQL: ALTER TABLE tasks ADD COLUMN requires_human INTEGER DEFAULT 0",
+        "Up SQL: ALTER TABLE tasks ADD COLUMN human_review_timeout INTEGER DEFAULT NULL",
+        "Down SQL: DROP both columns, revert to v14",
+        "mod.rs: mod v15 added, &v15::MIGRATION in MIGRATIONS array",
+        "mod.rs: CURRENT_SCHEMA_VERSION bumped from 14 to 15",
+        "All TEST-INIT-001 migration tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Create migration v15 adding requires_human INTEGER DEFAULT 0 and human_review_timeout INTEGER DEFAULT NULL to the tasks table. Register in mod.rs and bump CURRENT_SCHEMA_VERSION to 15.",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Use v14.rs as the exact template. INTEGER for boolean (SQLite convention, 0=false 1=true). The update statement should set schema_version=15 in up and =14 in down.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "Migration must be idempotent within its transaction"
+        ],
+        "performance": [
+          "N/A — one-time schema change"
+        ],
+        "style": [
+          "Follow v14 migration pattern exactly"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "taskType": "implementation",
+      "title": "DB migration v15: requires_human and human_review_timeout columns",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/db/migrations/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "PrdUserStory: requires_human: Option<bool> with #[serde(default)]",
+        "PrdUserStory: human_review_timeout: Option<u32> with #[serde(default)]",
+        "Task: requires_human: bool field added (default false)",
+        "Task: human_review_timeout: Option<u32> field added (default None)",
+        "Task::new() initializes both to defaults (false, None)",
+        "Task::try_from(Row) reads both columns with unwrap_or fallback",
+        "All TEST-INIT-001 parsing and model tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add requiresHuman (Option<bool>) and humanReviewTimeout (Option<u32>) to PrdUserStory. Add requires_human (bool) and human_review_timeout (Option<u32>) to Task model with TryFrom<Row> support and graceful fallback for pre-v15 DBs.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "PrdUserStory uses camelCase via #[serde(rename_all = \"camelCase\")] so field names `requires_human` and `human_review_timeout` will map to JSON `requiresHuman` and `humanReviewTimeout` automatically. For Task::try_from, use the same unwrap_or pattern as max_retries for graceful fallback on pre-v15 DBs.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": {
+        "correctness": [
+          "Task::try_from must not panic on pre-v15 databases",
+          "Option<bool> for PRD (absent = None = false), bool for Task (always resolved)"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "Follow existing field patterns in PrdUserStory and Task",
+          "Use #[serde(skip_serializing_if)] on Task fields"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "taskType": "implementation",
+      "title": "PRD parsing and task model: requiresHuman and humanReviewTimeout fields",
+      "touchesFiles": [
+        "src/commands/init/parse.rs",
+        "src/models/task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "insert_task: requires_human and human_review_timeout added to INSERT SQL and params",
+        "update_task: requires_human and human_review_timeout added to UPDATE SQL and params",
+        "show: format_text displays 'Requires Human Review: Yes' when requires_human=true",
+        "show: format_text displays 'Review Timeout: 60s' when human_review_timeout is set",
+        "show: query_task SELECT includes requires_human and human_review_timeout",
+        "next: NextTaskOutput includes requires_human field",
+        "export: ExportedUserStory includes requires_human and human_review_timeout",
+        "export: query populates both fields from DB",
+        "All TEST-INIT-001 import/show/export tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Bind requires_human and human_review_timeout in insert_task() and update_task() SQL. Display in show command output. Include in next command output. Export for round-tripping.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "For import: story.requires_human.unwrap_or(false) as i32 for the DB bind. For show: only display human review lines when requires_human=true. For next: add to NextTaskOutput struct. For export: add to ExportedUserStory and the DB query in export/prd.rs. Selection query in selection.rs also needs the columns added to its SELECT.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "Import must convert Option<bool> to INTEGER (0/1) correctly",
+          "Show must not display review lines when requires_human=false"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "Follow existing patterns for each file"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Import, show, next, and export: wire requiresHuman fields through",
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/show.rs",
+        "src/commands/next/output.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Function signature: (task_id, task_title, task_notes, iteration, session_guidance, timeout_secs) -> bool",
+        "Banner displays task ID, title, and notes in a Unicode box",
+        "Multi-line stdin reading identical to handle_pause (empty line to continue)",
+        "Guidance tagged as '[Human Review for {task_id}] {input}' in SessionGuidance",
+        "Empty input returns false without recording guidance",
+        "stdin EOF returns false with eprintln warning",
+        "Optional timeout via std::thread + channel (no busy-wait)",
+        "timeout=None means blocking read (current pause behavior)",
+        "Partial input before timeout is used as feedback",
+        "All TEST-INIT-002 tests pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Create handle_human_review() function that displays a context-rich banner (task ID, title, notes), reads multi-line stdin input (reusing handle_pause pattern), supports optional timeout, and records input as tagged session guidance.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "For timeout: spawn a reader thread that sends lines over mpsc::channel. Main thread uses recv_timeout. If timeout fires, collect whatever lines arrived. For testability, consider accepting a generic BufRead instead of hardcoding stdin — but this changes the signature from handle_pause. Pragmatic approach: keep stdin hardcoded for now (matching handle_pause), test banner output via captured stderr.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": {
+        "correctness": [
+          "Must never panic on stdin EOF or thread spawn failure",
+          "Timeout must collect partial input, not discard it",
+          "requiresHuman override of yes_mode happens at the CALLER (engine.rs), not in this function"
+        ],
+        "performance": [
+          "Timeout must not busy-wait — use channel recv_timeout",
+          "Thread spawn failure must gracefully fall back to blocking read"
+        ],
+        "style": [
+          "Reuse handle_pause stdin reading pattern",
+          "Banner style should match existing pause banner aesthetics"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-005"
+      ],
+      "taskType": "implementation",
+      "title": "handle_human_review function in signals.rs",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Completed task IDs collected from all detection paths (completed_tags, git, output scan, external reconciliation)",
+        "For each completed task with requires_human=true, query task title and notes from DB",
+        "Call handle_human_review() with task context, regardless of yes_mode",
+        "Skip review for tasks that had passes=true at import time (pre-completed)",
+        "Log at loop start: 'N tasks require human review' if any requiresHuman tasks exist",
+        "Human review guidance flows into subsequent prompts via existing SessionGuidance",
+        "Works in both single-loop and batch mode"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-004",
+        "FEAT-003"
+      ],
+      "description": "In engine.rs, after all completion detection paths converge (~line 1811) and before iteration counter tracking (~line 1813), check each completed task for requires_human=true and call handle_human_review(). Override yes_mode for requiresHuman tasks. Skip review for pre-completed tasks.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-005",
+      "modifiesBehavior": false,
+      "notes": "The key insight: requiresHuman overrides yes_mode at the ENGINE level (the caller), not inside handle_human_review. The function itself doesn't know about yes_mode. Engine code: `if task.requires_human { handle_human_review(...) }` — no yes_mode check wrapping it. For collecting completed task IDs: look at completed_tags Vec, the git detection branch, scan_output_for_completed_tasks return, and external reconciliation count. A practical approach: maintain a Vec<String> of completed_this_iteration IDs and append to it in each detection path.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": {
+        "correctness": [
+          "Must fire after ALL completion paths (not just <completed> tags)",
+          "Must not fire for pre-completed tasks (passes: true at import)",
+          "requiresHuman must override yes_mode — this is the batch mode fix"
+        ],
+        "performance": [
+          "DB query for requires_human is a primary key lookup — negligible cost",
+          "Only query when a task actually completes (not every iteration)"
+        ],
+        "style": [
+          "Insert review check cleanly between existing completion and tracking blocks",
+          "Minimize diff size in the already-large engine.rs"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-006"
+      ],
+      "taskType": "implementation",
+      "title": "Engine integration: trigger human review after task completion",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Build mutation prompt: human feedback + remaining todo tasks from PRD JSON + instruction to update",
+        "Spawn Claude subprocess using existing run_claude pattern (sonnet model default)",
+        "Parse Claude output for updated PRD JSON (or individual task mutations)",
+        "Apply modifications atomically to PRD JSON (temp file + rename, following update_prd_task_passes pattern)",
+        "Re-sync DB by re-importing modified tasks (use existing init/import flow)",
+        "Keep backup of pre-mutation PRD JSON (.json.bak)",
+        "On any failure (spawn, parse, write): log error, continue with session guidance only",
+        "Log summary: 'Task mutation: N tasks modified, M added, K marked irrelevant'"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "After collecting human input for a review checkpoint, spawn a Claude call to process the feedback against remaining todo tasks. Claude modifies task descriptions, notes, acceptance criteria, priorities, or marks tasks irrelevant. Apply changes atomically to PRD JSON and re-sync DB. Graceful degradation to session-guidance-only on failure.",
+      "estimatedEffort": "high",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "This is the most complex task. The mutation prompt should be focused: only include todo tasks (not done/blocked), include the human's feedback, and instruct Claude to output a JSON array of task modifications. Format: [{\"id\": \"FEAT-005\", \"action\": \"modify\", \"fields\": {\"notes\": \"updated notes\", \"acceptanceCriteria\": [...]}}]. For new tasks, action=\"add\" with full task object. For removal, action=\"irrelevant\". Re-sync: read modified PRD JSON, call update_task for each changed task. The backup (.json.bak) is critical — if mutation corrupts the JSON, the user can recover.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": {
+        "correctness": [
+          "Atomic write: temp file + rename, never partial writes",
+          "Backup before mutation: .json.bak preserves pre-mutation state",
+          "Re-sync must only update changed tasks, not re-import everything",
+          "Failure must not corrupt PRD JSON or DB state"
+        ],
+        "performance": [
+          "Use sonnet model (budget-conscious) for mutation calls",
+          "Only include todo tasks in mutation prompt (not done/blocked)"
+        ],
+        "style": [
+          "Follow update_prd_task_passes pattern for atomic JSON writes",
+          "Follow run_claude pattern for subprocess spawning",
+          "Mutation function belongs in prd_reconcile.rs alongside existing reconciliation code"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Task mutation via Claude call after human review",
+      "touchesFiles": [
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context",
+        "Security: mutation prompt doesn't allow arbitrary code execution",
+        "Quality dimensions met: each task's qualityDimensions constraints satisfied",
+        "All new code is reachable from production entry points",
+        "No unused warnings for new code",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all implementation code for: error handling (no unwrap in production paths), security (no injection in mutation prompt), integration wiring (all new code reachable from production entry points), and correctness (all quality dimensions met).",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Key areas to review: (1) handle_human_review timeout implementation for thread safety, (2) mutation prompt injection safety, (3) atomic JSON write correctness, (4) yes_mode override scoping. For each issue: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn.",
+      "passes": false,
+      "priority": 13,
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review implementation for quality, security, and integration wiring",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/commands/init/parse.rs",
+        "src/models/task.rs",
+        "src/commands/init/import.rs",
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/show.rs",
+        "src/commands/next/output.rs",
+        "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication between handle_pause and handle_human_review (extract shared stdin reader if duplicated)",
+        "Engine.rs completion tracking not overly complex (completed_this_iteration Vec is clean)",
+        "Mutation logic properly separated from engine loop",
+        "Functions under 30 lines or justified",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Analyze implementation code for DRY violations (especially between handle_pause and handle_human_review), complexity in engine.rs completion tracking, coupling between mutation and import systems, and maintainability.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Key concern: handle_pause and handle_human_review may share 80%+ of their stdin-reading logic. If so, extract a shared helper (e.g., read_multiline_stdin) and have both functions call it. For each issue: add REFACTOR-1-xxx task (priority 18-19), add to MILESTONE-1 dependsOn.",
+      "passes": false,
+      "priority": 17,
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review implementation for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-INIT-xxx tests pass",
+        "All FEAT-xxx tasks pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points",
+        "No unused warnings in cargo check/clippy",
+        "Remaining tasks in this PRD reviewed and updated based on implementation learnings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "TEST-INIT-002",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Review-and-update checkpoint. All implementation tasks complete, code review done, refactoring done. Review remaining tasks and update based on implementation learnings. Verify: requiresHuman field round-trips through PRD JSON -> DB -> show/next/export, handle_human_review pauses correctly, engine triggers review after completion.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review-and-update checkpoint. Read the progress file and git log, identify deviations from plan, update all remaining tasks to reflect actual implementation.",
+      "passes": false,
+      "priority": 20,
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Review and update checkpoint — data model + interactive handler + engine integration",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Test engine triggers review after <completed> tag detection",
+        "Test engine triggers review after git commit detection",
+        "Test engine triggers review after output scan detection",
+        "Test engine triggers review after external repo reconciliation",
+        "Test yes_mode is overridden for requiresHuman tasks",
+        "Test pre-completed tasks (passes: true at import) skip review",
+        "Test multiple tasks completed in one iteration: each requiresHuman task gets reviewed",
+        "Test task without requiresHuman does NOT trigger review"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Expand test coverage: engine triggers review after each completion path, yes_mode override works, batch mode pauses, multiple completions in one iteration each get reviewed, pre-completed tasks skip review.",
+      "estimatedEffort": "high",
+      "id": "TEST-001",
+      "modifiesBehavior": false,
+      "notes": "Engine integration tests are challenging because run_iteration is complex. Consider testing the requiresHuman check logic in isolation (extract a helper function) and testing it with mock DB state, rather than trying to run full iterations.",
+      "passes": false,
+      "priority": 25,
+      "qualityDimensions": {
+        "correctness": [
+          "Must cover all 4 completion detection paths"
+        ],
+        "performance": [
+          "Tests should be fast — use in-memory DB"
+        ],
+        "style": [
+          "Extract testable helper functions from engine.rs if needed"
+        ]
+      },
+      "synergyWith": [
+        "TEST-002"
+      ],
+      "taskType": "test",
+      "title": "Comprehensive tests for engine integration and batch mode",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test mutation prompt includes human feedback and remaining todo tasks",
+        "Test mutation prompt excludes done/blocked tasks",
+        "Test atomic JSON write: verify temp file + rename pattern",
+        "Test backup file (.json.bak) is created before mutation",
+        "Test DB re-sync: modified tasks reflected in DB after mutation",
+        "Test graceful degradation: when Claude returns invalid JSON, error is logged and loop continues",
+        "Test graceful degradation: when Claude subprocess fails, error is logged and loop continues",
+        "Test mutation summary log message format"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Test the Claude mutation call: prompt construction, JSON parsing, atomic write, DB re-sync, backup creation, and graceful degradation on failure.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "modifiesBehavior": false,
+      "notes": "For testing Claude subprocess calls, mock the subprocess or test the prompt construction and output parsing in isolation. The atomic write and backup logic can be tested with real filesystem operations in a temp directory.",
+      "passes": false,
+      "priority": 26,
+      "qualityDimensions": {
+        "correctness": [
+          "Graceful degradation must be tested — mutation failure must never crash the loop",
+          "Backup must exist BEFORE mutation write, not after"
+        ],
+        "performance": [
+          "Use temp directories for filesystem tests"
+        ],
+        "style": [
+          "Test mutation logic in isolation from engine loop"
+        ]
+      },
+      "synergyWith": [
+        "TEST-001"
+      ],
+      "taskType": "test",
+      "title": "Comprehensive tests for task mutation and graceful degradation",
+      "touchesFiles": [
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns",
+        "Test names clearly describe what is tested",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "TEST-001",
+        "TEST-002"
+      ],
+      "description": "Review test code for duplication, helper extraction, and clarity. Look for duplicated DB setup across migration tests, duplicated task creation helpers, and unclear test names.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "For each issue: add REFACTOR-2-xxx task (priority 44-48), add to MILESTONE-2 dependsOn.",
+      "passes": false,
+      "priority": 43,
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Review test code for refactoring opportunities",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-xxx tasks pass",
+        "REFACTOR-REVIEW-2 passes (and any spawned REFACTOR-2-xxx tasks)",
+        "Remaining tasks in this PRD reviewed and updated based on test findings"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Review-and-update checkpoint after comprehensive testing. All tests pass, coverage adequate. Update remaining tasks based on test findings.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Review-and-update checkpoint. Update remaining tasks to reflect test findings, implementation changes, and API evolution.",
+      "passes": false,
+      "priority": 50,
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Review and update checkpoint — comprehensive testing complete",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test passes (all existing + new tests)",
+        "cargo clippy -- -D warnings passes",
+        "cargo fmt --check passes",
+        "task-mgr init with a test PRD containing requiresHuman: true succeeds",
+        "task-mgr show displays 'Requires Human Review: Yes' for the task",
+        "task-mgr next includes requires_human in JSON output",
+        "task-mgr export round-trips requiresHuman and humanReviewTimeout"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Verify end-to-end flow: init a PRD with requiresHuman task, run loop (or simulate), verify pause triggers, verify guidance injected, verify mutation applied. Also verify cargo test + cargo clippy + cargo fmt --check all pass.",
+      "estimatedEffort": "medium",
+      "id": "INT-001",
+      "modifiesBehavior": false,
+      "notes": "For the loop simulation: create a minimal test PRD JSON with 2 tasks (one requiresHuman: true, one normal). Verify the init/show/next/export commands handle the field correctly. The actual loop pause behavior requires manual testing.",
+      "passes": false,
+      "priority": 55,
+      "qualityDimensions": {
+        "correctness": [
+          "All existing tests must still pass — no regressions"
+        ],
+        "performance": [
+          "N/A"
+        ],
+        "style": [
+          "N/A"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "verification",
+      "title": "Integration verification: end-to-end human review loop",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across entire implementation",
+        "All functions under 30 lines or documented exceptions",
+        "Clear separation of concerns between modules",
+        "Code follows project patterns (see CLAUDE.md)",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Comprehensive review of all code: DRY across implementation, complexity hotspots, coupling, and code clarity. Last chance to improve before merge.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-3",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final opportunity to improve code before merge. For each issue: add REFACTOR-3-xxx task (priority 71-85), add to MILESTONE-FINAL dependsOn.",
+      "passes": false,
+      "priority": 70,
+      "synergyWith": [],
+      "taskType": "review",
+      "title": "Final refactoring review for maintainability",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/commands/init/parse.rs",
+        "src/models/task.rs",
+        "src/commands/init/import.rs",
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/commands/show.rs",
+        "src/commands/next/output.rs",
+        "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test passes",
+        "cargo clippy -- -D warnings passes",
+        "cargo fmt --check passes",
+        "docs/ARCHITECTURE.md updated with Human Review Checkpoint in Task State Machine and Loop Iteration Flow",
+        "CLAUDE.md updated with requiresHuman field reference for PRD authors"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "INT-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Final validation gate. All tests pass, builds succeed, documentation updated. ARCHITECTURE.md has Human Review Checkpoint section. CLAUDE.md updated with requiresHuman field reference.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Documentation scope: ARCHITECTURE.md needs a section on human review checkpoints in the loop flow. CLAUDE.md needs a note about the requiresHuman and humanReviewTimeout fields.",
+      "passes": false,
+      "priority": 90,
+      "synergyWith": [],
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": [
+        "docs/ARCHITECTURE.md",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All tasks pass",
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes (and any spawned REFACTOR-3-xxx tasks)",
+        "Documentation created/updated per PRD Documentation section",
+        "Ready for merge to main"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001",
+        "REFACTOR-REVIEW-3"
+      ],
+      "description": "Final review-and-update checkpoint. All tests pass, documentation complete, code reviewed. Ready for merge.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final checkpoint. Ensure all acceptance criteria are met and code is ready for merge.",
+      "passes": false,
+      "priority": 99,
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final review checkpoint — ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
