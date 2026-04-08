@@ -42,15 +42,15 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 **Model assignment rubric** (set `model` field on tasks that need a specific tier; omit for tasks that should use the PRD-level default):
 
-| Task type                                                    | Assign `model`             | Rationale                                           |
-| ------------------------------------------------------------ | -------------------------- | --------------------------------------------------- |
-| First `FEAT-xxx` task (lowest priority number)               | opus                       | Foundation task — sets patterns all later tasks follow |
-| `ANALYSIS-xxx`                                               | opus                       | Deep semantic and consumer analysis                 |
-| `CODE-REVIEW-xxx`                                            | opus                       | Nuanced quality/security judgment                   |
-| `REFACTOR-REVIEW-xxx`                                        | opus                       | Architectural judgment calls                        |
-| `MILESTONE-xxx`                                              | opus                       | Cross-PRD task review and update based on learnings |
-| `VERIFY-xxx`                                                 | opus                       | Final validation gate, thoroughness required        |
-| Remaining `FEAT-xxx`, `FIX-xxx`, `TEST-xxx`, `INT-xxx`, `WIRE-FIX-xxx` | _(omit — use PRD default)_ | Standard implementation work                        |
+| Task type                                                              | Assign `model`             | Rationale                                              |
+| ---------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------ |
+| First `FEAT-xxx` task (lowest priority number)                         | opus                       | Foundation task — sets patterns all later tasks follow |
+| `ANALYSIS-xxx`                                                         | opus                       | Deep semantic and consumer analysis                    |
+| `CODE-REVIEW-xxx`                                                      | opus                       | Nuanced quality/security judgment                      |
+| `REFACTOR-REVIEW-xxx`                                                  | opus                       | Architectural judgment calls                           |
+| `MILESTONE-xxx`                                                        | opus                       | Cross-PRD task review and update based on learnings    |
+| `VERIFY-xxx`                                                           | opus                       | Final validation gate, thoroughness required           |
+| Remaining `FEAT-xxx`, `FIX-xxx`, `TEST-xxx`, `INT-xxx`, `WIRE-FIX-xxx` | _(omit — use PRD default)_ | Standard implementation work                           |
 
 **`timeoutSecs` assignment** (set on tasks that run the full test suite):
 
@@ -151,33 +151,33 @@ For each user story, check complexity indicators:
 
 **Effort sizing** (set `estimatedEffort` on each task):
 
-| Effort | Indicators |
-|---|---|
-| `low` | 1 file, 1-3 acceptance criteria, single function/field |
+| Effort   | Indicators                                                           |
+| -------- | -------------------------------------------------------------------- |
+| `low`    | 1 file, 1-3 acceptance criteria, single function/field               |
 | `medium` | 2-3 files, new function with tests, integration with existing system |
-| `high` | 3+ files, new module/component, cross-cutting — consider splitting |
+| `high`   | 3+ files, new module/component, cross-cutting — consider splitting   |
 
 ### Step 4: Generate Story IDs
 
 Use context-appropriate prefixes. Set the `taskType` field on each task to let the agent apply different strategies per type:
 
-| Prefix | `taskType` | Notes |
-|--------|------------|-------|
-| `ANALYSIS-xxx` | `"analysis"` | Consumer and semantic analysis (priority 0, blocks implementation) |
-| `FEAT-xxx` | `"implementation"` | New features |
-| `FIX-xxx` | `"implementation"` | Bug fixes |
-| `ENV-xxx` | `"implementation"` | Environment/configuration |
-| `TEST-INIT-xxx` | `"test"` | Initial TDD tests (before implementation) |
-| `TEST-xxx` | `"test"` | Comprehensive test implementation |
-| `INT-xxx` | `"verification"` | Integration verification |
-| `WIRE-xxx` | `"implementation"` | Integration wiring (spawned by CODE-REVIEW) |
-| `WIRE-FIX-xxx` | `"implementation"` | Fix wiring issues (exports, registration, call sites) |
-| `CODE-REVIEW-xxx` | `"review"` | Code review tasks |
-| `REFACTOR-xxx` | `"implementation"` | Refactoring tasks |
-| `REFACTOR-REVIEW-xxx` | `"review"` | Refactoring review tasks |
-| `VERIFY-xxx` | `"verification"` | Final validation + documentation |
-| `MILESTONE-xxx` | `"milestone"` | Gate checkpoints |
-| `POLISH-xxx` | `"implementation"` | Formatting/cleanup |
+| Prefix                | `taskType`         | Notes                                                              |
+| --------------------- | ------------------ | ------------------------------------------------------------------ |
+| `ANALYSIS-xxx`        | `"analysis"`       | Consumer and semantic analysis (priority 0, blocks implementation) |
+| `FEAT-xxx`            | `"implementation"` | New features                                                       |
+| `FIX-xxx`             | `"implementation"` | Bug fixes                                                          |
+| `ENV-xxx`             | `"implementation"` | Environment/configuration                                          |
+| `TEST-INIT-xxx`       | `"test"`           | Initial TDD tests (before implementation)                          |
+| `TEST-xxx`            | `"test"`           | Comprehensive test implementation                                  |
+| `INT-xxx`             | `"verification"`   | Integration verification                                           |
+| `WIRE-xxx`            | `"implementation"` | Integration wiring (spawned by CODE-REVIEW)                        |
+| `WIRE-FIX-xxx`        | `"implementation"` | Fix wiring issues (exports, registration, call sites)              |
+| `CODE-REVIEW-xxx`     | `"review"`         | Code review tasks                                                  |
+| `REFACTOR-xxx`        | `"implementation"` | Refactoring tasks                                                  |
+| `REFACTOR-REVIEW-xxx` | `"review"`         | Refactoring review tasks                                           |
+| `VERIFY-xxx`          | `"verification"`   | Final validation + documentation                                   |
+| `MILESTONE-xxx`       | `"milestone"`      | Gate checkpoints                                                   |
+| `POLISH-xxx`          | `"implementation"` | Formatting/cleanup                                                 |
 
 **Special `taskType` values:**
 
@@ -223,6 +223,40 @@ For Bug Fixes, Enhancements, and Refactors, check if any task modifies existing 
 - Do NOT create the original task
 - Create separate tasks for each semantic context (e.g., FIX-001a, FIX-001b)
 - Each split task should have its own `consumerAnalysis` scoped to its context
+
+### Step 4.7: Enrich Cross-Boundary Tasks with Data Contract Snippets
+
+For tasks where `touchesFiles` (including dependencies' `touchesFiles`) spans different top-level directories (e.g., `src/commands/` and `src/loop_engine/`, or `src/db/` and `src/models/`):
+
+1. **Identify the boundary**: Which module produces data and which consumes it?
+2. **Read the actual struct definitions** at the boundary (use Grep/Read — never guess from variable names)
+3. **Embed a concrete data shape example** in the task's `notes` field showing:
+   - The source struct/type (with relevant fields)
+   - The target struct/type (with relevant fields)
+   - A copy-pasteable example of the correct access pattern
+4. **Source from the codebase** — the example must come from reading real struct definitions, not invented
+
+Example `notes` enrichment:
+```
+Data contract: PrdUserStory (src/commands/init/parse.rs) → Task (src/models/task.rs)
+Source fields: id, title, description, priority, passes, acceptance_criteria
+Access: task.acceptance_criteria = serde_json::to_string(&story.acceptanceCriteria)?
+```
+
+**When to skip**: If all `touchesFiles` are in the same directory, or the task only adds new code with no cross-module dependencies.
+
+### Step 4.8: Auto-Detect Cross-Boundary Integration Gaps
+
+After building the dependency graph (Step 4) and enriching cross-boundary tasks (Step 4.7), scan for integration paths that need INT-xxx coverage:
+
+1. **For each dependency edge** (`dependsOn` relationship), check if the two tasks' `touchesFiles` are in different top-level directories (e.g., `src/commands/` vs `src/loop_engine/`, or `src/db/` vs `src/models/`)
+2. **If cross-boundary paths exist** and no INT-xxx task already traces that specific path, generate one:
+   - Name the specific data/control path being traced
+   - List the handoff points at each module boundary
+   - Set `taskType: "verification"` and priority 55-65
+3. **Cap**: 1 INT-xxx per distinct cross-boundary data/control path, not per task pair. Multiple tasks touching the same cross-boundary path share a single INT-xxx.
+
+**When to skip**: If all tasks touch files in the same top-level directory, or the PRD is small enough (2-4 tasks) that CODE-REVIEW-1 will catch any wiring issues.
 
 ### Step 5: Create JSON Task File
 
@@ -309,7 +343,9 @@ The agent checks these before starting any task. If the required task in the oth
       "description": "What this story accomplishes",
       "acceptanceCriteria": [
         "Specific, testable criterion 1",
-        "Specific, testable criterion 2"
+        "Specific, testable criterion 2",
+        "CONTRACT: field names match EXACTLY the struct fields in {source module} (grep to verify)",
+        "CONTRACT: serde_json::from_value::<TargetStruct>(output) succeeds with production data"
       ],
       "priority": 1,
       "estimatedEffort": "low|medium|high",
@@ -443,13 +479,13 @@ What matters most, in order:
 
 These are the files you will read and modify during the loop:
 
-| File                                        | Purpose                                                          |
-| ------------------------------------------- | ---------------------------------------------------------------- |
-| `tasks/{{FEATURE_NAME}}.json`               | **Task list (PRD)** - Read tasks, mark complete, add new tasks   |
-| `tasks/{{FEATURE_NAME}}-prompt.md`          | This prompt file (read-only)                                     |
-| `tasks/progress-{{TASK_PREFIX}}.txt`        | Progress log - append findings and learnings (create if missing) |
-| `tasks/long-term-learnings.md`              | Curated learnings by category (create if missing with `# Long-Term Learnings` header) |
-| `tasks/learnings.md`                        | Raw iteration learnings (create if missing with `# Learnings` header) |
+| File                                 | Purpose                                                                               |
+| ------------------------------------ | ------------------------------------------------------------------------------------- |
+| `tasks/{{FEATURE_NAME}}.json`        | **Task list (PRD)** - Read tasks, mark complete, add new tasks                        |
+| `tasks/{{FEATURE_NAME}}-prompt.md`   | This prompt file (read-only)                                                          |
+| `tasks/progress-{{TASK_PREFIX}}.txt` | Progress log - append findings and learnings (create if missing)                      |
+| `tasks/long-term-learnings.md`       | Curated learnings by category (create if missing with `# Long-Term Learnings` header) |
+| `tasks/learnings.md`                 | Raw iteration learnings (create if missing with `# Learnings` header)                 |
 
 **File handling**: If `progress-{{TASK_PREFIX}}.txt`, `long-term-learnings.md`, or `learnings.md` don't exist, create them with a minimal header before appending. Never crash on missing files.
 
@@ -464,7 +500,7 @@ These are the files you will read and modify during the loop:
 5. Verify you're on the correct branch from PRD `branchName` (and in the correct repo if `externalGitRepo` is set)
 6. **Check cross-PRD dependencies**: If the PRD has a `requires` array, verify each required task in the referenced PRD file has `passes: true`. If not, output `<promise>BLOCKED</promise>` with the reason.
 7. **Select the best task** using Smart Task Selection below
-7. **Pre-implementation review** (before writing code):
+8. **Pre-implementation review** (before writing code):
    a. Read the task's `qualityDimensions` if present — these define what "good" looks like
    b. Read `edgeCases`, `invariants`, and `failureModes` on TEST-INIT tasks
    c. State your assumptions explicitly — hidden assumptions create bugs
@@ -472,17 +508,17 @@ These are the files you will read and modify during the loop:
    e. Consider 2-3 implementation approaches with tradeoffs (even briefly), pick the best
    f. For each known edge case, plan how it will be handled BEFORE coding
    g. Document your chosen approach in a brief comment in the progress file
-8. **Implement** that single user story, following your chosen approach
-9. **Self-critique** (after implementation, before quality checks):
-   - Review for correctness, idiomatic style, and performance. Revise if improvements exist
-   - Check each `qualityDimensions` constraint: does the code satisfy it?
-   - If the implementation can exit early, avoid redundant work, or be simplified — revise now
-10. Run quality checks (see below)
-11. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
+9. **Implement** that single user story, following your chosen approach
+10. **Self-critique** (after implementation, before quality checks):
+    - Review for correctness, idiomatic style, and performance. Revise if improvements exist
+    - Check each `qualityDimensions` constraint: does the code satisfy it?
+    - If the implementation can exit early, avoid redundant work, or be simplified — revise now
+11. Run quality checks (see below)
+12. If checks pass, commit with message: `feat: FULL-STORY-ID-completed - [Story Title]`
     For multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
-12. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
-13. Append progress to `tasks/progress-{{TASK_PREFIX}}.txt` (include approach chosen and any edge cases discovered)
-14. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
+13. Output `<completed>FULL-STORY-ID</completed>` — the loop will mark the task done and update the PRD automatically
+14. Append progress to `tasks/progress-{{TASK_PREFIX}}.txt` (include approach chosen and any edge cases discovered)
+15. For TEST-xxx tasks: ensure 80%+ coverage for new methods; use `assert_eq!` for string outputs
 
 ---
 
@@ -514,6 +550,7 @@ Tasks have relationship fields:
 ### Fast-Path for Simple Tasks
 
 For tasks with `estimatedEffort: "low"` AND fewer than 5 acceptance criteria:
+
 - Skip the "consider 2-3 approaches" step — implement directly
 - Skip detailed progress file documentation — one-line summary is sufficient
 - Still run quality checks and self-critique
@@ -521,6 +558,7 @@ For tasks with `estimatedEffort: "low"` AND fewer than 5 acceptance criteria:
 ### Verify Previous Task
 
 Before selecting the next task, if the previously completed task had a `completionCheck` command:
+
 - Run the `completionCheck` command
 - If it fails, reopen the previous task (set `passes: false`) and fix it before moving on
 
@@ -618,16 +656,21 @@ Adapt quality checks to match project tooling (check CLAUDE.md or README for pro
 
 New code must be fully wired in — CODE-REVIEW-1 verifies this. Reference table for diagnosis:
 
-| Symptom                                        | Cause                                   | Fix                    |
-| ---------------------------------------------- | --------------------------------------- | ---------------------- |
-| Code compiles but feature doesn't work         | Not registered in dispatcher/router     | Add to registration    |
-| Tests pass but production doesn't use new code | Test mocks bypass real wiring           | Verify production path |
-| New config field has no effect                 | Config read but not passed to component | Wire config through    |
-| Old behavior persists                          | Conditional still routes to old code    | Update routing logic   |
-| "unused import" warning                        | Imported but never called               | Wire call sites        |
-| Function always returns nil/default            | Wrong key type (atom vs string) on map  | Verify key types match data source (struct=atom, JSONB=string) |
-| Tests pass but runtime returns wrong data      | Test uses hand-built map matching wrong key format | Use production-shaped data (real structs/schemas) in tests |
-| Config field accessible in some modules, not others | Mixed atom/string keys across layers | Trace key type at each hop, document in Data Flow Contracts |
+| Symptom                                             | Cause                                              | Fix                                                            |
+| --------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
+| Code compiles but feature doesn't work              | Not registered in dispatcher/router                | Add to registration                                            |
+| Tests pass but production doesn't use new code      | Test mocks bypass real wiring                      | Verify production path                                         |
+| New config field has no effect                      | Config read but not passed to component            | Wire config through                                            |
+| Old behavior persists                               | Conditional still routes to old code               | Update routing logic                                           |
+| "unused import" warning                             | Imported but never called                          | Wire call sites                                                |
+| Function always returns nil/default                 | Wrong key type (atom vs string) on map             | Verify key types match data source (struct=atom, JSONB=string) |
+| Tests pass but runtime returns wrong data           | Test uses hand-built map matching wrong key format | Use production-shaped data (real structs/schemas) in tests     |
+| Config field accessible in some modules, not others | Mixed atom/string keys across layers               | Trace key type at each hop, document in Data Flow Contracts    |
+| New CLI subcommand compiles but isn't reachable     | Not registered in `commands.rs` match arm           | Add match arm to command dispatch                              |
+| New DB column has no effect                         | Column in migration but not read in `TryFrom<Row>`  | Add column to row-to-struct conversion                         |
+| New JSON field parsed but never stored              | Field in `PrdUserStory` but not mapped to `Task`    | Wire field from parse struct into task model                   |
+| New prompt section never appears                    | Section created but not in priority list             | Add to trimmable sections list in `prompt.rs`                  |
+| New learning field silently dropped                 | Field in struct but not in INSERT/SELECT SQL         | Add to all SQL queries that touch the learnings table          |
 
 ---
 
@@ -732,16 +775,18 @@ If new code is not properly integrated, create `WIRE-FIX-xxx` tasks:
 - Commit JSON changes: `chore: REFACTOR-REVIEW-1 - Add refactor tasks`
 - Commit and output `<completed>REFACTOR-REVIEW-1</completed>` once review complete AND all tasks added
 
-**If no issues found**: Output `<completed>REFACTOR-REVIEW-1</completed>` with note "No refactoring needed"
+**If no issues found**: Run the code simplification plugin to simplify the code.
+
+**When finished**: Output `<completed>REFACTOR-REVIEW-1</completed>` with note "No refactoring needed"
 
 ### REFACTOR-REVIEW-2 and REFACTOR-REVIEW-3
 
 Same pattern as REFACTOR-REVIEW-1. Differences:
 
-| Review | Priority | Spawns at | Before | Focus |
-|---|---|---|---|---|
-| REFACTOR-REVIEW-2 | 43 | 44-48 | MILESTONE-2 | Test code: duplication, missing helpers, unclear names, brittle tests |
-| REFACTOR-REVIEW-3 | 70 | 71-85 | MILESTONE-FINAL | All code: DRY, complexity, coupling, clarity, pattern adherence |
+| Review            | Priority | Spawns at | Before          | Focus                                                                 |
+| ----------------- | -------- | --------- | --------------- | --------------------------------------------------------------------- |
+| REFACTOR-REVIEW-2 | 43       | 44-48     | MILESTONE-2     | Test code: duplication, missing helpers, unclear names, brittle tests |
+| REFACTOR-REVIEW-3 | 70       | 71-85     | MILESTONE-FINAL | All code: DRY, complexity, coupling, clarity, pattern adherence       |
 
 Add spawned tasks to the corresponding milestone's `dependsOn` array.
 
@@ -1023,9 +1068,15 @@ Every task list should include:
 
 10. **Integration/Verification Tasks** (priority 55-65)
 
-    - Full test suite
-    - E2E tests
-    - Build verification
+    - `INT-xxx: Verify [data/control path] end-to-end`
+    - Each INT-xxx task MUST name a specific data/control path being traced (e.g., "CLI arg → parse → DB insert → query → display")
+    - List specific handoff points to verify at each module boundary
+    - This task should NOT write new code unless wiring is missing — it verifies existing wiring
+    - Acceptance criteria must include:
+      - "Trace [named path] from entry point to final output — all handoff points connected"
+      - "CONTRACT: data shape at each boundary matches the receiving module's struct definition"
+      - "No dead code along the traced path"
+    - Cap: 1 INT-xxx per distinct cross-boundary data/control path, not per task pair
 
 11. **Refactor Review Task** (priority 70) - **CAN SPAWN TASKS** - _Before MILESTONE-FINAL_
 
@@ -1042,10 +1093,14 @@ Every task list should include:
     - `VERIFY-001: Final verification - all checks pass`
     - Set `"model": "<opus-id>"` and `"timeoutSecs": 1800`
     - Depends on: INT-xxx + REFACTOR-REVIEW-3
-    - Acceptance criteria must include documentation updates:
+    - Acceptance criteria must include documentation updates and cross-module contract checks:
       - "Architecture docs updated if new modules/subsystems were added (`docs/` directory)"
       - "CLAUDE.md updated with quick-reference for new tooling/workflows"
       - "Dev guide created in `docs/` if feature introduces new developer-facing tooling"
+      - "CONTRACT: All new public functions reachable from at least one entry point (grep for callers)"
+      - "CONTRACT: All new CLI commands/subcommands registered and have help text"
+      - "CONTRACT: All test fixtures use field names from actual struct definitions (no invented field names)"
+      - "No `.unwrap()` in production code paths (only in tests)"
     - **Documentation scope**: The VERIFY task has a complete view of the implementation. It should create/update docs that help future Claude sessions understand the system without reading all the code. Check the PRD's Documentation section for what was identified during planning.
 
 13. **MILESTONE-FINAL** (priority 99) — **Final Review & Update Checkpoint**
@@ -1080,12 +1135,15 @@ When creating tasks, use these structures.
     "Edge case tests cover: [from edgeCases field]",
     "Known-bad discriminator: at least one test that would PASS with a naive stub but FAIL with correct implementation",
     "Invariant assertions: [from invariants field]",
-    "Test file compiles (tests may be #[ignore] or expected to fail)"
+    "Test file compiles (tests may be #[ignore] or expected to fail)",
+    "Structural assertion: at least one test asserts serde_json::from_value::<TargetStruct>(fixture).is_ok() (Rust) or Model.model_validate(fixture) (Python) — proves fixture matches actual struct definition",
+    "Test fixtures MUST derive field names from actual struct definitions — do NOT invent field names"
   ],
   "priority": 1,
   "estimatedEffort": "low",
+  "model": "<opus-id>",
   "passes": false,
-  "notes": "TDD: Write these tests first. Tests must be specific enough to reject wrong implementations, not just verify no crash. Implementation tasks depend on these. IMPORTANT: If this test accesses cross-module data structures, use production-shaped data (real structs/schemas from actual code paths), NOT hand-built maps — hand-built maps can accidentally match the wrong key format, causing test and implementation to agree on the wrong contract.",
+  "notes": "TDD: Write these tests first. Tests must be specific enough to reject wrong implementations, not just verify no crash. Implementation tasks depend on these. IMPORTANT: If this test accesses cross-module data structures, ask for or work through custom one-off scripts to get real data examples, to create test structs/schemas from actual code paths). DO NOT use hand-built maps — hand-built maps can accidentally match the wrong key format, causing test and implementation to agree on the wrong contract.",
   "qualityDimensions": {
     "correctness": ["[From PRD section 2.5]"],
     "performance": ["[From PRD section 2.5]"],
@@ -1309,6 +1367,3 @@ Dependency graph validated: OK
 
 To run: task-mgr loop -y tasks/{feature}.json
 ```
-
-
-
