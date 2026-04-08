@@ -17,12 +17,14 @@ use crate::loop_engine::worktree;
 /// Result of a batch run.
 #[derive(Debug)]
 pub struct BatchResult {
-    /// Number of PRDs that completed successfully (exit code 0).
+    /// Number of PRDs that completed successfully (exit code 0, not stopped).
     pub succeeded: usize,
     /// Number of PRDs that failed (exit code != 0).
     pub failed: usize,
-    /// Number of PRDs skipped (due to .stop signal).
+    /// Number of PRDs skipped (due to .stop signal between PRDs).
     pub skipped: usize,
+    /// Number of PRDs stopped mid-run by a .stop file.
+    pub stopped: usize,
     /// Per-PRD results in execution order.
     pub results: Vec<PrdRunResult>,
 }
@@ -34,8 +36,10 @@ pub struct PrdRunResult {
     pub prd_file: PathBuf,
     /// Exit code from run_loop (0 = success).
     pub exit_code: i32,
-    /// Whether this PRD was skipped.
+    /// Whether this PRD was skipped before it started (stop signal between PRDs).
     pub skipped: bool,
+    /// Whether this PRD was halted mid-run by a .stop file.
+    pub stopped: bool,
     /// Branch name produced by this PRD's run (from LoopResult). Used for chain summary.
     pub branch_name: Option<String>,
     /// Chain base ref this PRD branched from (None = branched from HEAD).
@@ -265,6 +269,7 @@ fn batch_fail_early() -> BatchResult {
         succeeded: 0,
         failed: 1,
         skipped: 0,
+        stopped: 0,
         results: vec![],
     }
 }
@@ -281,6 +286,7 @@ fn push_remaining_skipped(
             prd_file: remaining_prd.clone(),
             exit_code: 0,
             skipped: true,
+            stopped: false,
             branch_name: None,
             chain_base: None,
         });
@@ -327,17 +333,20 @@ fn print_batch_summary(
     succeeded: usize,
     failed: usize,
     skipped: usize,
+    stopped: usize,
     chain: bool,
 ) {
     eprintln!("\n=== Batch Summary ===");
     eprintln!(
-        "{} succeeded, {} failed, {} skipped (of {} total)",
-        succeeded, failed, skipped, total
+        "{} succeeded, {} failed, {} stopped, {} skipped (of {} total)",
+        succeeded, failed, stopped, skipped, total
     );
 
     for result in results {
         let status = if result.skipped {
             "SKIPPED"
+        } else if result.stopped {
+            "STOPPED"
         } else if result.exit_code == 0 {
             "OK"
         } else {
@@ -447,10 +456,12 @@ pub async fn run_batch(
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let mut stopped = 0usize;
 
     for (i, (prd_file, prompt_file)) in pairs.iter().enumerate() {
-        // Check .stop signal between PRDs
-        if i > 0 && signals::check_stop_signal(&tasks_dir, None) {
+        // Check .stop signal before each PRD (covers files placed between runs,
+        // or before the batch even starts its first PRD).
+        if signals::check_stop_signal(&tasks_dir, None) {
             eprintln!("Stop signal detected, skipping remaining PRDs");
             push_remaining_skipped(&mut results, &pairs, i, &mut skipped);
             break;
@@ -499,11 +510,44 @@ pub async fn run_batch(
         let exit_code = loop_result.exit_code;
         let worktree_path = loop_result.worktree_path.clone();
         let result_branch_name = loop_result.branch_name.clone();
+        let was_stopped = loop_result.was_stopped;
+
+        // Stop signal: if the engine was halted by a .stop file mid-run, record the
+        // PRD as stopped (not succeeded) and abort the batch. The engine consumes the
+        // signal file before returning, so we rely on the was_stopped flag.
+        if was_stopped {
+            results.push(PrdRunResult {
+                prd_file: prd_file.clone(),
+                exit_code,
+                skipped: false,
+                stopped: true,
+                branch_name: result_branch_name.clone(),
+                chain_base: if chain { chain_base.clone() } else { None },
+            });
+            stopped += 1;
+
+            // Worktree cleanup for the stopped PRD
+            if let Some(ref wt_path) = worktree_path {
+                WorktreeCleanupContext {
+                    project_root,
+                    yes,
+                    keep_worktrees,
+                    cleanup_worktree: should_cleanup_worktree,
+                    chain,
+                }
+                .cleanup(wt_path, exit_code, result_branch_name.as_deref());
+            }
+
+            eprintln!("Stop signal detected during PRD, skipping remaining PRDs");
+            push_remaining_skipped(&mut results, &pairs, i + 1, &mut skipped);
+            break;
+        }
 
         results.push(PrdRunResult {
             prd_file: prd_file.clone(),
             exit_code,
             skipped: false,
+            stopped: false,
             branch_name: result_branch_name.clone(),
             chain_base: if chain { chain_base.clone() } else { None },
         });
@@ -542,12 +586,13 @@ pub async fn run_batch(
     }
 
     // Step 5: Print batch summary
-    print_batch_summary(&results, pairs.len(), succeeded, failed, skipped, chain);
+    print_batch_summary(&results, pairs.len(), succeeded, failed, skipped, stopped, chain);
 
     BatchResult {
         succeeded,
         failed,
         skipped,
+        stopped,
         results,
     }
 }
@@ -735,11 +780,13 @@ mod tests {
             succeeded: 2,
             failed: 1,
             skipped: 0,
+            stopped: 0,
             results: vec![
                 PrdRunResult {
                     prd_file: PathBuf::from("a.json"),
                     exit_code: 0,
                     skipped: false,
+                    stopped: false,
                     branch_name: None,
                     chain_base: None,
                 },
@@ -747,6 +794,7 @@ mod tests {
                     prd_file: PathBuf::from("b.json"),
                     exit_code: 0,
                     skipped: false,
+                    stopped: false,
                     branch_name: None,
                     chain_base: None,
                 },
@@ -754,6 +802,7 @@ mod tests {
                     prd_file: PathBuf::from("c.json"),
                     exit_code: 1,
                     skipped: false,
+                    stopped: false,
                     branch_name: None,
                     chain_base: None,
                 },
@@ -762,6 +811,7 @@ mod tests {
         assert_eq!(result.succeeded, 2);
         assert_eq!(result.failed, 1);
         assert_eq!(result.skipped, 0);
+        assert_eq!(result.stopped, 0);
         assert_eq!(result.results.len(), 3);
     }
 
@@ -771,10 +821,12 @@ mod tests {
             prd_file: PathBuf::from("skipped.json"),
             exit_code: 0,
             skipped: true,
+            stopped: false,
             branch_name: None,
             chain_base: None,
         };
         assert!(result.skipped);
+        assert!(!result.stopped);
         assert_eq!(result.exit_code, 0);
     }
 
@@ -988,6 +1040,7 @@ mod tests {
                 prd_file: PathBuf::from("phase-1.json"),
                 exit_code: 0,
                 skipped: false,
+                stopped: false,
                 branch_name: Some("feat/phase-1".to_string()),
                 chain_base: None, // first PRD branches from HEAD
             },
@@ -995,6 +1048,7 @@ mod tests {
                 prd_file: PathBuf::from("phase-2.json"),
                 exit_code: 1,
                 skipped: false,
+                stopped: false,
                 branch_name: None,
                 chain_base: Some("feat/phase-1".to_string()),
             },
@@ -1003,6 +1057,7 @@ mod tests {
                 prd_file: PathBuf::from("phase-3.json"),
                 exit_code: 0,
                 skipped: true,
+                stopped: false,
                 branch_name: None,
                 chain_base: None,
             },

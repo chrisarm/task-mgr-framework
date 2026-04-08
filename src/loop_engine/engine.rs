@@ -722,6 +722,12 @@ pub struct LoopResult {
     /// Read by the batch runner to advance the chain — the next PRD branches from this.
     /// `None` on early-return error paths or when no branch was configured in the PRD.
     pub branch_name: Option<String>,
+    /// True when the loop exited because a `.stop` file was detected.
+    ///
+    /// The engine consumes the signal file before returning, so callers that need
+    /// to react to a mid-run stop (e.g. `run_batch`) must use this flag instead of
+    /// re-checking the file system.
+    pub was_stopped: bool,
 }
 
 /// Configuration for running the loop, built from CLI args + env.
@@ -862,6 +868,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
+        was_stopped: false,
         };
     }
 
@@ -882,6 +889,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     };
@@ -893,6 +901,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
+        was_stopped: false,
         };
     }
 
@@ -961,6 +970,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     };
@@ -1014,6 +1024,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
+        was_stopped: false,
         };
     }
 
@@ -1031,6 +1042,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     };
@@ -1085,6 +1097,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     }
@@ -1113,6 +1126,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     };
@@ -1169,6 +1183,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         exit_code: 1,
                         worktree_path: None,
                         branch_name: None,
+                    was_stopped: false,
                     };
                 }
             }
@@ -1182,6 +1197,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     exit_code: 1,
                     worktree_path: None,
                     branch_name: None,
+                was_stopped: false,
                 };
             }
             run_config.source_root.clone()
@@ -1291,6 +1307,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
             branch_name: None,
+        was_stopped: false,
         };
     }
 
@@ -1316,6 +1333,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     }
@@ -1330,6 +1348,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
                 branch_name: None,
+            was_stopped: false,
             };
         }
     };
@@ -1443,6 +1462,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let mut exit_code: i32 = 0;
     let mut exit_reason = String::from("max iterations reached");
     let mut final_run_status = RunStatus::Aborted;
+    let mut was_stopped = false; // set true only when a .stop file halted the loop
 
     // Rotate progress file before starting iterations to bound context size
     progress::rotate_progress(&paths.progress_file);
@@ -1885,6 +1905,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     // Stop signal file or other empty exit
                     exit_code = 0;
                     exit_reason = "stop signal".to_string();
+                    was_stopped = true;
                 }
                 IterationOutcome::PromptOverflow => {
                     exit_code = 3;
@@ -1983,6 +2004,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         exit_code,
         worktree_path: actual_worktree_path,
         branch_name: branch_name.clone(),
+        was_stopped,
     }
 }
 
