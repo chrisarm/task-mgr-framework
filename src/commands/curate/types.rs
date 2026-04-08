@@ -221,14 +221,21 @@ pub struct DedupParams {
     pub threshold: f64,
     /// Override automatic batch size calculation. None = auto.
     pub batch_size: Option<usize>,
+    /// Number of LLM batches to process in parallel (default: 2).
+    pub concurrency: usize,
+    /// Embedding model name to use for pre-filtering. Empty string disables pre-filter.
+    pub embed_model: String,
 }
 
 impl Default for DedupParams {
     fn default() -> Self {
+        use crate::learnings::embeddings::DEFAULT_EMBEDDING_MODEL;
         Self {
             dry_run: false,
             threshold: 0.7,
             batch_size: None,
+            concurrency: 2,
+            embed_model: DEFAULT_EMBEDDING_MODEL.to_string(),
         }
     }
 }
@@ -252,6 +259,50 @@ pub struct DedupCluster {
     pub reason: String,
     /// DB ID of the newly-created merged learning. None in dry-run mode.
     pub merged_learning_id: Option<i64>,
+}
+
+/// Parameters for the `curate embed` command.
+#[derive(Debug, Clone)]
+pub struct EmbedParams {
+    /// If true, re-embed ALL active learnings (not just unembedded ones).
+    pub force: bool,
+    /// If true, only print status counts and model name; skip embedding.
+    pub status: bool,
+    /// Ollama server base URL (e.g. `http://localhost:11434`).
+    pub ollama_url: String,
+    /// Embedding model name as known to Ollama.
+    pub model: String,
+}
+
+impl Default for EmbedParams {
+    fn default() -> Self {
+        use crate::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
+        Self {
+            force: false,
+            status: false,
+            ollama_url: DEFAULT_OLLAMA_URL.to_string(),
+            model: DEFAULT_EMBEDDING_MODEL.to_string(),
+        }
+    }
+}
+
+/// Result of the `curate embed` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedResult {
+    /// Whether this was a `--status` call (no embedding was performed).
+    pub status_only: bool,
+    /// Total number of active (non-retired) learnings in the database.
+    pub total_active: i64,
+    /// Number of active learnings already embedded for this model.
+    pub already_embedded: i64,
+    /// Number of learnings newly embedded in this run.
+    pub embedded_this_run: usize,
+    /// Number of learnings skipped because their embedding text was empty.
+    pub skipped_empty: usize,
+    /// Number of embedding or storage errors encountered.
+    pub errors: usize,
+    /// Embedding model used.
+    pub model: String,
 }
 
 /// Result of the `curate dedup` command.

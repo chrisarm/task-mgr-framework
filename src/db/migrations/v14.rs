@@ -61,16 +61,19 @@ mod tests {
         (temp_dir, conn)
     }
 
-    /// Schema version must be 14 after full migration run.
+    /// Schema version must be at least 14 after full migration run.
     #[test]
-    fn test_v14_schema_version_is_14() {
+    fn test_v14_schema_version_at_least_14() {
         let (_temp_dir, conn) = setup_migrated_db();
-        assert_eq!(
-            CURRENT_SCHEMA_VERSION, 14,
-            "CURRENT_SCHEMA_VERSION constant must be 14"
+        assert!(
+            CURRENT_SCHEMA_VERSION >= 14,
+            "CURRENT_SCHEMA_VERSION must be at least 14"
         );
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 14, "DB schema_version must be 14 after migration");
+        assert!(
+            version >= 14,
+            "DB schema_version must be at least 14 after migration"
+        );
     }
 
     /// After v14 up, tasks.archived_at column must exist.

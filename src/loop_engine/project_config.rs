@@ -24,6 +24,16 @@ pub struct ProjectConfig {
     /// When set, overrides the default scoped mode (but env vars still win).
     #[serde(default)]
     pub permission_mode: Option<String>,
+
+    /// Ollama server URL for embedding generation.
+    /// Defaults to `http://localhost:11434`.
+    #[serde(default)]
+    pub ollama_url: Option<String>,
+
+    /// Embedding model name for Ollama.
+    /// Defaults to `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
 }
 
 impl Default for ProjectConfig {
@@ -32,6 +42,8 @@ impl Default for ProjectConfig {
             version: 1,
             additional_allowed_tools: Vec::new(),
             permission_mode: None,
+            ollama_url: None,
+            embedding_model: None,
         }
     }
 }
@@ -143,5 +155,30 @@ mod tests {
         .unwrap();
         let config = read_project_config(dir.path());
         assert!(config.permission_mode.is_none());
+    }
+
+    #[test]
+    fn test_ollama_url_and_embedding_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"ollamaUrl": "http://gpu-server:11434", "embeddingModel": "custom-model"}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(
+            config.ollama_url.as_deref(),
+            Some("http://gpu-server:11434")
+        );
+        assert_eq!(config.embedding_model.as_deref(), Some("custom-model"));
+    }
+
+    #[test]
+    fn test_ollama_url_and_embedding_model_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.ollama_url.is_none());
+        assert!(config.embedding_model.is_none());
     }
 }

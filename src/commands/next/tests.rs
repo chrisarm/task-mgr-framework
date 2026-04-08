@@ -786,7 +786,9 @@ mod next_command_tests {
         // Verify task was claimed but no run_tasks entry was created
         let conn = crate::db::open_connection(temp_dir.path()).unwrap();
         let task_status: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 'US-001'", [], |r| r.get(0))
+            .query_row("SELECT status FROM tasks WHERE id = 'US-001'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(task_status, "in_progress");
 

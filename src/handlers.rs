@@ -20,8 +20,8 @@ use clap_mangen::Man;
 
 use crate::cli::{Cli, OutputFormat, Shell};
 use crate::commands::curate::{
-    format_dedup_text, format_enrich_text, format_retire_text, format_unretire_text, DedupResult,
-    EnrichResult, RetireResult, UnretireResult,
+    format_dedup_text, format_embed_text, format_enrich_text, format_retire_text,
+    format_unretire_text, DedupResult, EmbedResult, EnrichResult, RetireResult, UnretireResult,
 };
 use crate::commands::{
     format_apply_learning_text, format_begin_text, format_complete_text,
@@ -102,6 +102,7 @@ impl_text_formattable!(RetireResult, format_retire_text);
 impl_text_formattable!(UnretireResult, format_unretire_text);
 impl_text_formattable!(EnrichResult, format_enrich_text);
 impl_text_formattable!(DedupResult, format_dedup_text);
+impl_text_formattable!(EmbedResult, format_embed_text);
 impl_text_formattable!(InvalidateLearningResult, format_invalidate_learning_text);
 impl_text_formattable!(DecisionsListResult, format_decisions_list_text);
 impl_text_formattable!(DecisionResolveResult, format_resolve_text);

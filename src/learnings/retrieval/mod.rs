@@ -13,6 +13,7 @@
 pub mod composite;
 pub mod fts5;
 pub mod patterns;
+pub mod vector;
 
 #[cfg(test)]
 mod tests;
@@ -85,3 +86,4 @@ pub trait RetrievalBackend: Send + Sync {
 pub use composite::CompositeBackend;
 pub use fts5::Fts5Backend;
 pub use patterns::PatternsBackend;
+pub use vector::VectorBackend;

@@ -9,21 +9,34 @@ mod json_utils;
 pub mod output;
 pub mod types;
 
-pub use dedup::{build_dedup_prompt, parse_dedup_response};
-pub use output::{format_dedup_text, format_enrich_text, format_retire_text, format_unretire_text};
+pub use dedup::{build_dedup_prompt, cluster_by_embedding_similarity, parse_dedup_response};
+pub use output::{
+    format_dedup_text, format_embed_text, format_enrich_text, format_retire_text,
+    format_unretire_text,
+};
 pub use types::{
-    DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EnrichCandidate, EnrichParams,
-    EnrichResult, MergeClusterParams, MergeClusterResult, RawDedupCluster, RetireParams,
-    RetireResult, RetirementCandidate, UnretireResult,
+    DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams, EmbedResult,
+    EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, MergeClusterResult,
+    RawDedupCluster, RetireParams, RetireResult, RetirementCandidate, UnretireResult,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{mpsc, Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
 use crate::loop_engine::claude::spawn_claude;
 use crate::loop_engine::config::PermissionMode;
+
+/// Rank confidence levels for comparison: High=2, Medium=1, Low=0.
+fn confidence_rank(s: &str) -> u8 {
+    match s {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
 
@@ -388,12 +401,6 @@ pub fn merge_cluster(
     let mut total_shown: i64 = 0;
     let mut total_applied: i64 = 0;
 
-    // Confidence rank: High=2, Medium=1, Low=0.
-    let confidence_rank = |s: &str| match s {
-        "high" => 2u8,
-        "medium" => 1,
-        _ => 0,
-    };
     let mut best_confidence_str = "low";
 
     for row in &active_rows {
@@ -507,6 +514,117 @@ pub fn merge_cluster(
     })
 }
 
+/// Result of one LLM batch dispatched by `process_batches_parallel`.
+struct BatchOutput {
+    /// Original batch index, used to restore processing order.
+    batch_idx: usize,
+    /// Parsed raw clusters on success, or `Err(())` on any LLM/parse failure.
+    raw_clusters: Result<Vec<RawDedupCluster>, ()>,
+}
+
+/// Dispatches LLM batch calls in parallel using `std::thread` + `mpsc`.
+///
+/// Spawns `min(concurrency, batches.len())` worker threads. Each worker pulls
+/// batches from a shared work queue, calls `spawn_claude`, and sends the result
+/// back via a channel. Workers do not access the database. The returned vec is
+/// sorted by `batch_idx` so the caller can apply merge tracking in order.
+///
+/// An error in one batch does not block other batches; the failed batch is
+/// represented as `BatchOutput { raw_clusters: Err(()) }`.
+fn process_batches_parallel(
+    batches: Vec<Vec<DeduplicateLearningItem>>,
+    threshold: f64,
+    concurrency: usize,
+) -> Vec<BatchOutput> {
+    let batch_count = batches.len();
+    if batch_count == 0 {
+        return Vec::new();
+    }
+
+    type WorkQueue = Arc<Mutex<VecDeque<(usize, Vec<DeduplicateLearningItem>)>>>;
+    let work_queue: WorkQueue = Arc::new(Mutex::new(batches.into_iter().enumerate().collect()));
+
+    let (tx, rx) = mpsc::channel::<BatchOutput>();
+    let num_threads = concurrency.max(1).min(batch_count);
+
+    let mut handles = Vec::with_capacity(num_threads);
+    for _ in 0..num_threads {
+        let queue = Arc::clone(&work_queue);
+        let tx = tx.clone();
+        let handle = std::thread::spawn(move || loop {
+            let item = {
+                let mut guard = queue.lock().expect("work queue lock poisoned");
+                guard.pop_front()
+            };
+            let (batch_idx, batch_items) = match item {
+                Some(x) => x,
+                None => break,
+            };
+
+            let eligible_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
+            let prompt = build_dedup_prompt(&batch_items, threshold);
+
+            let raw_clusters = match spawn_claude(
+                &prompt,
+                None,
+                None,
+                None,
+                None,
+                false,
+                &PermissionMode::text_only(),
+            ) {
+                Err(e) => {
+                    eprintln!(
+                        "Warning: spawn_claude failed for batch {}: {}",
+                        batch_idx + 1,
+                        e
+                    );
+                    Err(())
+                }
+                Ok(r) if r.exit_code != 0 => {
+                    eprintln!(
+                        "Warning: claude exited with code {} for batch {}",
+                        r.exit_code,
+                        batch_idx + 1
+                    );
+                    Err(())
+                }
+                Ok(r) => match parse_dedup_response(&r.output, &eligible_ids) {
+                    Ok(clusters) => Ok(clusters),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to parse dedup response for batch {}: {}",
+                            batch_idx + 1,
+                            e
+                        );
+                        Err(())
+                    }
+                },
+            };
+
+            let _ = tx.send(BatchOutput {
+                batch_idx,
+                raw_clusters,
+            });
+        });
+        handles.push(handle);
+    }
+
+    // Drop the sender clone owned by main so rx closes when all workers finish.
+    drop(tx);
+
+    let mut results: Vec<BatchOutput> = rx.into_iter().collect();
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    // Restore original batch order so the caller applies merged_ids tracking
+    // deterministically regardless of which worker finished first.
+    results.sort_by_key(|r| r.batch_idx);
+    results
+}
+
 /// Orchestrates the full dedup flow: loads active learnings, batches them,
 /// calls Claude to identify duplicate clusters, and merges each cluster via
 /// `merge_cluster()`.
@@ -568,21 +686,140 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         })
         .collect();
 
-    // Auto-calculate batch size: single batch if total content < 150K chars,
-    // otherwise ~20 learnings per batch.
-    let batch_size = params.batch_size.unwrap_or_else(|| {
-        let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
-        if total_chars < 150_000 {
-            items.len()
-        } else {
-            20
-        }
-    });
-    // Guard against zero batch_size from caller override.
-    let batch_size = batch_size.max(1);
+    // Build LLM batches.
+    //
+    // Pre-filter path (embed_model set and embeddings exist in the DB):
+    //   - Load stored embeddings; split items into embedded vs unembedded.
+    //   - Cluster the embedded subset by cosine similarity (threshold slightly
+    //     below the LLM threshold to avoid false negatives at the pre-filter stage).
+    //   - Each cluster (2+ members) → one LLM batch; singletons are skipped.
+    //   - Unembedded learnings → standard-size fallback batches sent to the LLM.
+    //
+    // Standard path (zero embeddings stored, or embed_model empty):
+    //   - Original auto-calculated batch size logic, unchanged.
+    let batches: Vec<Vec<DeduplicateLearningItem>> = if !params.embed_model.is_empty() {
+        use crate::learnings::embeddings::load_all_active_embeddings;
 
-    let batches: Vec<&[DeduplicateLearningItem]> = items.chunks(batch_size).collect();
+        let emb_list = match load_all_active_embeddings(conn, &params.embed_model) {
+            Ok(list) => list,
+            Err(e) => {
+                eprintln!("Warning: failed to load embeddings for pre-filter: {e}");
+                Vec::new()
+            }
+        };
+
+        if emb_list.is_empty() {
+            // No embeddings stored — standard batch path.
+            let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
+            let batch_size = params
+                .batch_size
+                .unwrap_or_else(|| {
+                    if total_chars < 150_000 {
+                        items.len()
+                    } else {
+                        let avg = total_chars / items.len();
+                        (200_000 / avg.max(1)).clamp(20, 100)
+                    }
+                })
+                .max(1);
+            items.chunks(batch_size).map(|s| s.to_vec()).collect()
+        } else {
+            // Pre-filter: cluster embedded learnings; send clusters to the LLM;
+            // route unembedded learnings to standard-size fallback batches.
+            let emb_map: HashMap<i64, Vec<f32>> = emb_list
+                .into_iter()
+                .map(|le| (le.learning_id, le.embedding))
+                .collect();
+
+            // Clone items into a lookup map for fast cluster→item resolution.
+            let item_map: HashMap<i64, DeduplicateLearningItem> =
+                items.iter().map(|i| (i.id, i.clone())).collect();
+
+            let mut emb_pairs: Vec<(i64, Vec<f32>)> = Vec::new();
+            let mut without_emb: Vec<DeduplicateLearningItem> = Vec::new();
+
+            for item in &items {
+                match emb_map.get(&item.id) {
+                    Some(emb) => emb_pairs.push((item.id, emb.clone())),
+                    None => without_emb.push(item.clone()),
+                }
+            }
+
+            // Use a threshold slightly below the LLM threshold so borderline pairs
+            // still reach the LLM rather than being silently dropped.
+            let emb_threshold = ((params.threshold as f32) - 0.05_f32).max(0.0_f32);
+            let clusters = cluster_by_embedding_similarity(&emb_pairs, emb_threshold);
+
+            let clustered_count: usize = clusters.iter().map(|c| c.len()).sum();
+            let singleton_count = emb_pairs.len().saturating_sub(clustered_count);
+            eprintln!(
+                "Embedding pre-filter: {} cluster(s) ({} items), {} singleton(s) skipped, {} unembedded",
+                clusters.len(),
+                clustered_count,
+                singleton_count,
+                without_emb.len(),
+            );
+
+            let mut batches: Vec<Vec<DeduplicateLearningItem>> = Vec::new();
+
+            // Each embedding cluster → one LLM batch.
+            for cluster_ids in clusters {
+                let batch: Vec<DeduplicateLearningItem> = cluster_ids
+                    .iter()
+                    .filter_map(|id| item_map.get(id).cloned())
+                    .collect();
+                if batch.len() >= 2 {
+                    batches.push(batch);
+                }
+            }
+
+            // Unembedded learnings → standard-size fallback batches.
+            if !without_emb.is_empty() {
+                let total_chars: usize = without_emb.iter().map(|i| i.content.len()).sum();
+                let batch_size = params
+                    .batch_size
+                    .unwrap_or_else(|| {
+                        if total_chars < 150_000 {
+                            without_emb.len()
+                        } else {
+                            let avg = total_chars / without_emb.len();
+                            (200_000 / avg.max(1)).clamp(20, 100)
+                        }
+                    })
+                    .max(1);
+                for chunk in without_emb.chunks(batch_size) {
+                    batches.push(chunk.to_vec());
+                }
+            }
+
+            batches
+        }
+    } else {
+        // embed_model empty — standard batch path (original behaviour).
+        let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
+        let batch_size = params
+            .batch_size
+            .unwrap_or_else(|| {
+                if total_chars < 150_000 {
+                    items.len()
+                } else {
+                    let avg = total_chars / items.len();
+                    (200_000 / avg.max(1)).clamp(20, 100)
+                }
+            })
+            .max(1);
+        items.chunks(batch_size).map(|s| s.to_vec()).collect()
+    };
+
     let total_batches = batches.len();
+    if total_batches > 1 {
+        eprintln!(
+            "Processing {} batches (concurrency={})...",
+            total_batches, params.concurrency
+        );
+    }
+
+    let batch_outputs = process_batches_parallel(batches, params.threshold, params.concurrency);
 
     // Track IDs merged across batches to handle cross-batch duplicates.
     let mut merged_ids: HashSet<i64> = HashSet::new();
@@ -592,64 +829,10 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     let mut learnings_merged: usize = 0;
     let mut learnings_created: usize = 0;
 
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        if total_batches > 1 {
-            eprintln!("Processing batch {}/{}...", batch_idx + 1, total_batches);
-        }
-
-        // Filter out already-merged learnings from this batch before sending to LLM.
-        let eligible: Vec<DeduplicateLearningItem> = batch
-            .iter()
-            .filter(|i| !merged_ids.contains(&i.id))
-            .cloned()
-            .collect();
-
-        if eligible.is_empty() {
-            continue;
-        }
-
-        let eligible_ids: Vec<i64> = eligible.iter().map(|i| i.id).collect();
-        let prompt = build_dedup_prompt(&eligible, params.threshold);
-
-        let claude_result = match spawn_claude(
-            &prompt,
-            None,
-            None,
-            None,
-            None,
-            false,
-            &PermissionMode::text_only(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "Warning: spawn_claude failed for batch {}: {}",
-                    batch_idx + 1,
-                    e
-                );
-                llm_errors += 1;
-                continue;
-            }
-        };
-
-        if claude_result.exit_code != 0 {
-            eprintln!(
-                "Warning: claude exited with code {} for batch {}",
-                claude_result.exit_code,
-                batch_idx + 1
-            );
-            llm_errors += 1;
-            continue;
-        }
-
-        let raw_clusters = match parse_dedup_response(&claude_result.output, &eligible_ids) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to parse dedup response for batch {}: {}",
-                    batch_idx + 1,
-                    e
-                );
+    for output in batch_outputs {
+        let raw_clusters = match output.raw_clusters {
+            Ok(clusters) => clusters,
+            Err(()) => {
                 llm_errors += 1;
                 continue;
             }
@@ -679,11 +862,6 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 .collect();
 
             // Best confidence among sources: high > medium > low.
-            let confidence_rank = |s: &str| match s {
-                "high" => 2u8,
-                "medium" => 1,
-                _ => 0,
-            };
             let merged_confidence = source_ids
                 .iter()
                 .filter_map(|id| id_info.get(id).map(|(_, c)| c.as_str()))
@@ -738,6 +916,201 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         learnings_created,
         llm_errors,
         clusters: all_clusters,
+    })
+}
+
+/// Embeds active learnings via Ollama and stores the vectors in `learning_embeddings`.
+///
+/// Behaviour:
+/// - `params.status = true`: returns counts without embedding.
+/// - `params.force = true`: re-embeds ALL active learnings (replaces existing).
+/// - Default: embeds only active learnings that have no entry for `params.model`.
+///
+/// Learnings whose embedding text (title + content) is empty are skipped with
+/// a warning printed to stderr.  All other errors (Ollama call failures, store
+/// failures) are counted and reported in the result without aborting the run.
+pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<EmbedResult> {
+    use crate::learnings::embeddings::{count_embedded, store_embedding, OllamaEmbedder};
+
+    // Status counts are always computed (needed for both modes).
+    let total_active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let already_embedded = count_embedded(conn, &params.model)?;
+
+    if params.status {
+        return Ok(EmbedResult {
+            status_only: true,
+            total_active,
+            already_embedded,
+            embedded_this_run: 0,
+            skipped_empty: 0,
+            errors: 0,
+            model: params.model,
+        });
+    }
+
+    // Verify Ollama is reachable and the model is available.
+    let embedder = OllamaEmbedder::new(&params.ollama_url, &params.model);
+    match embedder.is_available() {
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!(
+                    "Ollama not reachable at {}: {e}. Is Ollama running?",
+                    params.ollama_url
+                ),
+            )
+            .into());
+        }
+        Ok(false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Model '{}' not found in Ollama. Run: ollama pull {}",
+                    params.model, params.model
+                ),
+            )
+            .into());
+        }
+        Ok(true) => {}
+    }
+
+    // Load learnings: either all active (force) or only those without an embedding.
+    struct LearningRow {
+        id: i64,
+        title: String,
+        content: String,
+    }
+
+    // Use explicit let bindings inside each branch so the borrow of `stmt`
+    // is provably released before `stmt` is dropped (avoids E0597).
+    let rows: Vec<LearningRow> = if params.force {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, COALESCE(content, '') AS content
+             FROM learnings
+             WHERE retired_at IS NULL
+             ORDER BY id ASC",
+        )?;
+        let collected: Vec<LearningRow> = stmt
+            .query_map([], |row| {
+                Ok(LearningRow {
+                    id: row.get("id")?,
+                    title: row.get("title")?,
+                    content: row.get("content")?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        collected
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT l.id, l.title, COALESCE(l.content, '') AS content
+             FROM learnings l
+             LEFT JOIN learning_embeddings le
+               ON le.learning_id = l.id AND le.model = ?1
+             WHERE l.retired_at IS NULL
+               AND le.learning_id IS NULL
+             ORDER BY l.id ASC",
+        )?;
+        let collected: Vec<LearningRow> = stmt
+            .query_map([&params.model], |row| {
+                Ok(LearningRow {
+                    id: row.get("id")?,
+                    title: row.get("title")?,
+                    content: row.get("content")?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        collected
+    };
+
+    // Build embedding items. Title-only learnings use just the title; skip if empty.
+    struct EmbedItem {
+        id: i64,
+        text: String,
+    }
+
+    let mut items: Vec<EmbedItem> = Vec::new();
+    let mut skipped_empty: usize = 0;
+
+    for row in &rows {
+        let text = if row.content.is_empty() {
+            row.title.trim().to_string()
+        } else {
+            format!("{}\n\n{}", row.title, row.content)
+        };
+
+        if text.is_empty() {
+            eprintln!(
+                "Warning: skipping learning {} '{}': zero-length content",
+                row.id, row.title
+            );
+            skipped_empty += 1;
+            continue;
+        }
+
+        items.push(EmbedItem { id: row.id, text });
+    }
+
+    let total_to_embed = items.len();
+    if total_to_embed == 0 {
+        eprintln!("No learnings to embed.");
+    } else {
+        eprintln!("Embedding {} learning(s)...", total_to_embed);
+    }
+
+    // Batch-embed and store; count errors without aborting.
+    const BATCH_SIZE: usize = 50;
+    let mut embedded_this_run: usize = 0;
+    let mut errors: usize = 0;
+    let mut done: usize = 0;
+
+    for chunk in items.chunks(BATCH_SIZE) {
+        done += chunk.len();
+        eprintln!("  [{}/{}] embedding batch...", done, total_to_embed);
+
+        let texts: Vec<&str> = chunk.iter().map(|i| i.text.as_str()).collect();
+
+        match embedder.embed_batch(&texts) {
+            Ok(embeddings) => {
+                if embeddings.len() != chunk.len() {
+                    eprintln!(
+                        "Warning: Ollama returned {} embeddings for {} inputs; processing available",
+                        embeddings.len(),
+                        chunk.len()
+                    );
+                }
+                for (item, embedding) in chunk.iter().zip(embeddings.iter()) {
+                    match store_embedding(conn, item.id, &params.model, embedding) {
+                        Ok(()) => embedded_this_run += 1,
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to store embedding for learning {}: {e}",
+                                item.id
+                            );
+                            errors += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: embedding batch failed: {e}");
+                errors += chunk.len();
+            }
+        }
+    }
+
+    Ok(EmbedResult {
+        status_only: false,
+        total_active,
+        already_embedded,
+        embedded_this_run,
+        skipped_empty,
+        errors,
+        model: params.model,
     })
 }
 

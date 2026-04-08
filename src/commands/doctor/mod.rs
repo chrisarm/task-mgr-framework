@@ -26,8 +26,8 @@ use crate::models::RunStatus;
 use crate::TaskMgrResult;
 
 use checks::{
-    find_active_runs_without_end, find_git_reconciliation_tasks, has_active_loop_lock,
-    find_orphaned_relationships, find_stale_in_progress_tasks,
+    find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
+    find_stale_in_progress_tasks, has_active_loop_lock,
 };
 use fixes::{fix_active_run, fix_git_reconciliation, fix_orphaned_relationship, fix_stale_task};
 

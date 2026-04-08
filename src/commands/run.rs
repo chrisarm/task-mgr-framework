@@ -190,7 +190,7 @@ pub fn end(conn: &Connection, run_id: &str, status: RunStatus) -> TaskMgrResult<
 
         return Ok(EndResult {
             run_id: run_id.to_string(),
-            previous_status: run.status.clone(),
+            previous_status: run.status,
             new_status: run.status,
             duration_seconds,
         });
@@ -554,7 +554,10 @@ mod tests {
         // Calling end() on an already-ended run should succeed idempotently,
         // returning the existing terminal status rather than erroring.
         let result = end(&conn, "run-done", RunStatus::Aborted);
-        assert!(result.is_ok(), "end() should be idempotent for terminal runs");
+        assert!(
+            result.is_ok(),
+            "end() should be idempotent for terminal runs"
+        );
 
         let end_result = result.unwrap();
         assert_eq!(end_result.previous_status, RunStatus::Completed);

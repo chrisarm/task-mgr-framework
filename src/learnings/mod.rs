@@ -11,6 +11,7 @@
 
 pub mod bandit;
 pub mod crud;
+pub mod embeddings;
 pub mod ingestion;
 pub mod recall;
 pub mod retrieval;
@@ -33,5 +34,5 @@ pub use recall::{
 };
 pub use retrieval::{
     CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery,
-    ScoredLearning,
+    ScoredLearning, VectorBackend,
 };

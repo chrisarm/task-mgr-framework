@@ -1,6 +1,6 @@
 //! Text output formatting for the `curate` subcommands.
 
-use super::types::{DedupResult, EnrichResult, RetireResult, UnretireResult};
+use super::types::{DedupResult, EmbedResult, EnrichResult, RetireResult, UnretireResult};
 
 /// Format `curate retire` output as human-readable text.
 pub fn format_retire_text(result: &RetireResult) -> String {
@@ -101,6 +101,29 @@ pub fn format_dedup_text(result: &DedupResult) -> String {
         }
     }
 
+    out
+}
+
+/// Format `curate embed` output as human-readable text.
+pub fn format_embed_text(result: &EmbedResult) -> String {
+    if result.status_only {
+        return format!(
+            "Embeddings: {}/{} active learnings embedded (model: {})\n",
+            result.already_embedded, result.total_active, result.model
+        );
+    }
+
+    let mut out = format!("Embedded {} learning(s)", result.embedded_this_run);
+    if result.skipped_empty > 0 {
+        out.push_str(&format!(
+            ", {} skipped (empty content)",
+            result.skipped_empty
+        ));
+    }
+    if result.errors > 0 {
+        out.push_str(&format!(", {} error(s)", result.errors));
+    }
+    out.push_str(".\n");
     out
 }
 

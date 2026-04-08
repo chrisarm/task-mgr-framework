@@ -1022,6 +1022,10 @@ THRESHOLD:
         /// Maximum number of learnings per LLM call (None = auto)
         #[arg(long = "batch-size")]
         batch_size: Option<usize>,
+
+        /// Number of LLM batches to process in parallel (default: 2)
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
     },
 
     /// Enrich learning metadata using LLM analysis
@@ -1065,6 +1069,32 @@ FIELD VALUES:
         /// Accepted values: applies_to_files, applies_to_task_types, applies_to_errors
         #[arg(long)]
         field: Option<String>,
+    },
+
+    /// Generate and store Ollama embeddings for active learnings
+    #[command(after_help = "\
+EXAMPLES:
+    # Show embedding status (counts and model) without embedding
+    task-mgr curate embed --status
+
+    # Embed all unembedded active learnings (default)
+    task-mgr curate embed
+
+    # Re-embed ALL active learnings (force refresh)
+    task-mgr curate embed --force
+
+MODEL:
+    Configured via .task-mgr/config.json field 'embeddingModel'.
+    Default: hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0
+")]
+    Embed {
+        /// Re-embed ALL active learnings, not just those without embeddings
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Show embedded/total counts and model name without performing any embedding
+        #[arg(long, default_value_t = false)]
+        status: bool,
     },
 }
 

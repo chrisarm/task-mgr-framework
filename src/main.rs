@@ -820,9 +820,11 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         Commands::Curate { action } => {
             use task_mgr::commands::curate::enrich::curate_enrich;
             use task_mgr::commands::curate::{
-                curate_dedup, curate_retire, curate_unretire, DedupParams, EnrichParams,
-                RetireParams,
+                curate_dedup, curate_embed, curate_retire, curate_unretire, DedupParams,
+                EmbedParams, EnrichParams, RetireParams,
             };
+            use task_mgr::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
+            use task_mgr::loop_engine::project_config::read_project_config;
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
             match action {
@@ -875,13 +877,37 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     dry_run,
                     threshold,
                     batch_size,
+                    concurrency,
                 } => {
+                    let proj_config = read_project_config(&cli.dir);
+                    let embed_model = proj_config
+                        .embedding_model
+                        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
                     let params = DedupParams {
                         dry_run,
                         threshold,
                         batch_size,
+                        concurrency,
+                        embed_model,
                     };
                     let result = curate_dedup(&conn, params)?;
+                    output_result(&result, cli.format);
+                }
+                CurateAction::Embed { force, status } => {
+                    let proj_config = read_project_config(&cli.dir);
+                    let ollama_url = proj_config
+                        .ollama_url
+                        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+                    let model = proj_config
+                        .embedding_model
+                        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+                    let params = EmbedParams {
+                        force,
+                        status,
+                        ollama_url,
+                        model,
+                    };
+                    let result = curate_embed(&conn, params)?;
                     output_result(&result, cli.format);
                 }
             }

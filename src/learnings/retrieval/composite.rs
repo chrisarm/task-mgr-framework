@@ -19,12 +19,13 @@ pub struct CompositeBackend {
 }
 
 impl CompositeBackend {
-    /// Creates a composite with the default built-in backends: FTS5 + Patterns.
+    /// Creates a composite with the default built-in backends: FTS5 + Patterns + Vector.
     pub fn default_backends() -> Self {
         Self {
             backends: vec![
                 Box::new(super::Fts5Backend),
                 Box::new(super::PatternsBackend),
+                Box::new(super::VectorBackend::default()),
             ],
         }
     }

@@ -22,7 +22,7 @@ pub mod oauth;
 pub mod output_parsing;
 pub mod prd_reconcile;
 pub mod progress;
-pub(crate) mod project_config;
+pub mod project_config;
 pub mod prompt;
 pub mod prompt_sections;
 pub mod signals;
