@@ -30,6 +30,17 @@ impl CompositeBackend {
         }
     }
 
+    /// Creates a composite with the default backends but a config-aware VectorBackend.
+    pub fn with_ollama_config(ollama_url: &str, model: &str) -> Self {
+        Self {
+            backends: vec![
+                Box::new(super::Fts5Backend),
+                Box::new(super::PatternsBackend),
+                Box::new(super::VectorBackend::new(ollama_url, model)),
+            ],
+        }
+    }
+
     /// Creates a composite with custom backends.
     pub fn new(backends: Vec<Box<dyn RetrievalBackend>>) -> Self {
         Self { backends }

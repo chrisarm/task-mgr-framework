@@ -354,7 +354,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             outcome,
             limit,
         } => {
+            use task_mgr::loop_engine::project_config::read_project_config;
+
             let conn = open_connection(&cli.dir)?;
+            let proj_config = read_project_config(&cli.dir);
 
             let params = RecallCmdParams {
                 query,
@@ -362,6 +365,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 tags,
                 outcome,
                 limit,
+                ollama_url: proj_config.ollama_url,
+                embedding_model: proj_config.embedding_model,
             };
 
             let result = recall(&conn, params)?;

@@ -6,7 +6,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::LearningOutcome as CliOutcome;
-use crate::learnings::{recall_learnings, RecallParams as LibRecallParams, RecallResult};
+use crate::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
+use crate::learnings::{
+    recall_learnings_with_backend, CompositeBackend, RecallParams as LibRecallParams, RecallResult,
+};
 use crate::models::LearningOutcome;
 use crate::TaskMgrResult;
 
@@ -23,6 +26,10 @@ pub struct RecallCmdParams {
     pub outcome: Option<CliOutcome>,
     /// Maximum number of results to return
     pub limit: usize,
+    /// Ollama server URL from config.json (None = default)
+    pub ollama_url: Option<String>,
+    /// Embedding model from config.json (None = default)
+    pub embedding_model: Option<String>,
 }
 
 /// Result of the recall command (wrapper for serialization).
@@ -98,7 +105,19 @@ pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<Recal
         limit: params.limit,
     };
 
-    let result = recall_learnings(conn, lib_params)?;
+    // Build composite backend with config-aware VectorBackend
+    let ollama_url = params
+        .ollama_url
+        .as_deref()
+        .unwrap_or(DEFAULT_OLLAMA_URL);
+    let model = params
+        .embedding_model
+        .as_deref()
+        .unwrap_or(DEFAULT_EMBEDDING_MODEL);
+
+    let backend = CompositeBackend::with_ollama_config(ollama_url, model);
+
+    let result = recall_learnings_with_backend(conn, lib_params, &backend)?;
 
     // Convert to command result
     Ok(RecallCmdResult::from_recall_result(result, &params))
