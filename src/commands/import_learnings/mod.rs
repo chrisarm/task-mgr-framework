@@ -72,6 +72,7 @@ pub fn import_learnings(
     let mut imported = 0;
     let mut skipped = 0;
     let mut tags_imported = 0;
+    let mut created: Vec<(i64, String, String)> = Vec::new();
 
     for learning in &learnings {
         let key = compute_dedup_key(&learning.title, &learning.content);
@@ -90,11 +91,26 @@ pub fn import_learnings(
             update_stats(&tx, result.learning_id, learning)?;
         }
 
+        created.push((
+            result.learning_id,
+            learning.title.clone(),
+            learning.content.clone(),
+        ));
         imported += 1;
         tags_imported += result.tags_added;
     }
 
     tx.commit()?;
+
+    // Best-effort: embed newly imported learnings if Ollama is available.
+    if !created.is_empty() {
+        use crate::learnings::embeddings::try_embed_learnings_batch;
+        let embedded =
+            try_embed_learnings_batch(&conn, dir, &created);
+        if embedded > 0 {
+            eprintln!("Embedded {embedded}/{imported} imported learning(s).");
+        }
+    }
 
     Ok(ImportLearningsResult {
         source_file: from_file.display().to_string(),

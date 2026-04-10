@@ -535,6 +535,7 @@ fn process_batches_parallel(
     batches: Vec<Vec<DeduplicateLearningItem>>,
     threshold: f64,
     concurrency: usize,
+    model: &str,
 ) -> Vec<BatchOutput> {
     let batch_count = batches.len();
     if batch_count == 0 {
@@ -547,10 +548,12 @@ fn process_batches_parallel(
     let (tx, rx) = mpsc::channel::<BatchOutput>();
     let num_threads = concurrency.max(1).min(batch_count);
 
+    let model = Arc::new(model.to_owned());
     let mut handles = Vec::with_capacity(num_threads);
     for _ in 0..num_threads {
         let queue = Arc::clone(&work_queue);
         let tx = tx.clone();
+        let model = Arc::clone(&model);
         let handle = std::thread::spawn(move || loop {
             let item = {
                 let mut guard = queue.lock().expect("work queue lock poisoned");
@@ -568,7 +571,7 @@ fn process_batches_parallel(
                 &prompt,
                 None,
                 None,
-                None,
+                Some(&model),
                 None,
                 false,
                 &PermissionMode::text_only(),
@@ -819,7 +822,8 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         );
     }
 
-    let batch_outputs = process_batches_parallel(batches, params.threshold, params.concurrency);
+    let batch_outputs =
+        process_batches_parallel(batches, params.threshold, params.concurrency, &params.model);
 
     // Track IDs merged across batches to handle cross-batch duplicates.
     let mut merged_ids: HashSet<i64> = HashSet::new();

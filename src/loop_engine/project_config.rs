@@ -34,6 +34,11 @@ pub struct ProjectConfig {
     /// Defaults to `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`.
     #[serde(default)]
     pub embedding_model: Option<String>,
+
+    /// Claude model to use for `curate dedup` LLM calls.
+    /// Defaults to `"haiku"` (latest Haiku via CLI alias).
+    #[serde(default)]
+    pub dedup_model: Option<String>,
 }
 
 impl Default for ProjectConfig {
@@ -44,6 +49,7 @@ impl Default for ProjectConfig {
             permission_mode: None,
             ollama_url: None,
             embedding_model: None,
+            dedup_model: None,
         }
     }
 }

@@ -225,7 +225,13 @@ pub struct DedupParams {
     pub concurrency: usize,
     /// Embedding model name to use for pre-filtering. Empty string disables pre-filter.
     pub embed_model: String,
+    /// Claude model for dedup LLM calls (e.g. `"haiku"`, `"sonnet"`).
+    pub model: String,
 }
+
+/// Default Claude model for `curate dedup` LLM calls.
+/// Uses the CLI alias so it auto-resolves to the latest Haiku release.
+pub const DEFAULT_DEDUP_MODEL: &str = "haiku";
 
 impl Default for DedupParams {
     fn default() -> Self {
@@ -236,6 +242,7 @@ impl Default for DedupParams {
             batch_size: None,
             concurrency: 2,
             embed_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            model: DEFAULT_DEDUP_MODEL.to_string(),
         }
     }
 }

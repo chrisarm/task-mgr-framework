@@ -304,6 +304,148 @@ pub fn count_embedded(conn: &Connection, model: &str) -> TaskMgrResult<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// Best-effort inline embedding
+// ---------------------------------------------------------------------------
+
+/// Compose the embedding input text from title and content.
+///
+/// Matches the logic in `curate embed`: `"title\n\ncontent"`, or just `title`
+/// when content is empty.
+pub fn compose_embed_text(title: &str, content: &str) -> String {
+    let content = content.trim();
+    if content.is_empty() {
+        title.trim().to_string()
+    } else {
+        format!("{}\n\n{}", title.trim(), content)
+    }
+}
+
+/// Best-effort embedding of a single learning right after creation.
+///
+/// Reads Ollama config from `ProjectConfig`, checks availability, embeds, and
+/// stores. On any failure (Ollama down, model missing, network timeout, etc.)
+/// prints a warning to stderr and returns `Ok(false)`. Returns `Ok(true)` when
+/// the embedding was stored successfully.
+///
+/// This is intentionally fire-and-forget: callers should never propagate the
+/// error since a missing embedding is recoverable via `curate embed`.
+pub fn try_embed_learning(
+    conn: &Connection,
+    db_dir: &std::path::Path,
+    learning_id: i64,
+    title: &str,
+    content: &str,
+) -> bool {
+    use crate::loop_engine::project_config::read_project_config;
+
+    let proj = read_project_config(db_dir);
+    let ollama_url = proj
+        .ollama_url
+        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+    let model = proj
+        .embedding_model
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+
+    let text = compose_embed_text(title, content);
+    if text.is_empty() {
+        return false;
+    }
+
+    let embedder = OllamaEmbedder::new(&ollama_url, &model);
+
+    match embedder.is_available() {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(_) => return false,
+    }
+
+    let embedding = match embedder.embed(&text) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Warning: failed to embed learning {learning_id}: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = store_embedding(conn, learning_id, &model, &embedding) {
+        eprintln!("Warning: failed to store embedding for learning {learning_id}: {e}");
+        return false;
+    }
+
+    true
+}
+
+/// Best-effort batch embedding of multiple learnings after bulk creation.
+///
+/// Similar to [`try_embed_learning`] but batches the Ollama calls for
+/// efficiency. Returns the count of successfully embedded learnings.
+pub fn try_embed_learnings_batch(
+    conn: &Connection,
+    db_dir: &std::path::Path,
+    learnings: &[(i64, String, String)], // (id, title, content)
+) -> usize {
+    use crate::loop_engine::project_config::read_project_config;
+
+    if learnings.is_empty() {
+        return 0;
+    }
+
+    let proj = read_project_config(db_dir);
+    let ollama_url = proj
+        .ollama_url
+        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+    let model = proj
+        .embedding_model
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+
+    let embedder = OllamaEmbedder::new(&ollama_url, &model);
+
+    match embedder.is_available() {
+        Ok(true) => {}
+        Ok(false) => return 0,
+        Err(_) => return 0,
+    }
+
+    // Build texts, skipping empty ones
+    let items: Vec<(i64, String)> = learnings
+        .iter()
+        .filter_map(|(id, title, content)| {
+            let text = compose_embed_text(title, content);
+            if text.is_empty() {
+                None
+            } else {
+                Some((*id, text))
+            }
+        })
+        .collect();
+
+    if items.is_empty() {
+        return 0;
+    }
+
+    const BATCH_SIZE: usize = 50;
+    let mut stored = 0;
+
+    for chunk in items.chunks(BATCH_SIZE) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+        match embedder.embed_batch(&texts) {
+            Ok(embeddings) => {
+                for ((id, _), emb) in chunk.iter().zip(embeddings.iter()) {
+                    if store_embedding(conn, *id, &model, emb).is_ok() {
+                        stored += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: batch embedding failed: {e}");
+            }
+        }
+    }
+
+    stored
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

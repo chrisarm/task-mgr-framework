@@ -327,6 +327,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
 
+            // Capture for post-insert embedding (title/content are moved into params).
+            let embed_title = title.clone();
+            let embed_content = content.clone();
+
             let params = LearnParams {
                 outcome,
                 title,
@@ -343,6 +347,16 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             };
 
             let result = learn(&conn, params)?;
+
+            // Best-effort: embed the new learning if Ollama is available.
+            task_mgr::learnings::embeddings::try_embed_learning(
+                &conn,
+                &cli.dir,
+                result.learning_id,
+                &embed_title,
+                &embed_content,
+            );
+
             output_result(&result, cli.format);
             Ok(())
         }
@@ -888,12 +902,16 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     let embed_model = proj_config
                         .embedding_model
                         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+                    let dedup_model = proj_config.dedup_model.unwrap_or_else(|| {
+                        task_mgr::commands::curate::types::DEFAULT_DEDUP_MODEL.to_string()
+                    });
                     let params = DedupParams {
                         dry_run,
                         threshold,
                         batch_size,
                         concurrency,
                         embed_model,
+                        model: dedup_model,
                     };
                     let result = curate_dedup(&conn, params)?;
                     output_result(&result, cli.format);
