@@ -515,3 +515,115 @@ fn test_autogen_prefix_consistent_without_branch_name() {
     let _guard = LockGuard::acquire_named(temp_dir.path(), &lock_name)
         .expect("Should acquire lock with no-branch prefix name");
 }
+
+/// Regression test: loop→batch transition must reuse the same prefix.
+///
+/// Simulates: (1) loop run with Auto writes prefix + tasks, (2) batch run with
+/// Auto + append + update_existing must find existing tasks, not create duplicates.
+#[test]
+fn test_loop_to_batch_prefix_continuity() {
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = temp_dir.path().join("04-predictive-intelligence.json");
+
+    let prd_json = serde_json::json!({
+        "project": "loop-batch-continuity",
+        "branchName": "feat/predictive-intelligence",
+        "userStories": [
+            {
+                "id": "FEAT-501b",
+                "title": "Predictive task",
+                "description": "Tests loop to batch prefix continuity",
+                "priority": 10,
+                "status": "todo",
+                "passes": false,
+                "acceptanceCriteria": ["prefix is consistent"],
+                "dependsOn": [],
+                "batchWith": [],
+                "conflictsWith": []
+            }
+        ]
+    });
+    fs::write(
+        &prd_path,
+        serde_json::to_string_pretty(&prd_json).unwrap(),
+    )
+    .unwrap();
+
+    // Step 1: Simulate loop run — init with PrefixMode::Auto
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false, // force
+        false, // append
+        false, // update_existing
+        false, // dry_run
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    // Capture the prefix and task ID from the first run
+    let hints_after_loop = read_prd_hints(&prd_path);
+    let loop_prefix = hints_after_loop
+        .task_prefix
+        .expect("loop run should have written taskPrefix");
+
+    let conn = open_connection(temp_dir.path()).unwrap();
+    let task_count_after_loop: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        task_count_after_loop, 1,
+        "should have exactly 1 task after loop"
+    );
+
+    let task_id_after_loop: String = conn
+        .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        task_id_after_loop.starts_with(&format!("{}-", loop_prefix)),
+        "Task ID '{}' should be prefixed with '{}-'",
+        task_id_after_loop,
+        loop_prefix
+    );
+
+    // Step 2: Simulate batch run — init again with PrefixMode::Auto (append + update)
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false, // force
+        true,  // append
+        true,  // update_existing
+        false, // dry_run
+        PrefixMode::Auto,
+    )
+    .unwrap();
+
+    // Step 3: Verify no duplicate tasks were created
+    let task_count_after_batch: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        task_count_after_batch, 1,
+        "batch run with Auto prefix must NOT create duplicates (got {} tasks)",
+        task_count_after_batch
+    );
+
+    // Step 4: Verify the task ID is unchanged
+    let task_id_after_batch: String = conn
+        .query_row("SELECT id FROM tasks LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        task_id_after_loop, task_id_after_batch,
+        "Task ID must remain the same after loop to batch transition"
+    );
+
+    // Step 5: Verify the prefix in JSON is unchanged
+    let hints_after_batch = read_prd_hints(&prd_path);
+    let batch_prefix = hints_after_batch
+        .task_prefix
+        .expect("batch run should preserve taskPrefix");
+    assert_eq!(
+        loop_prefix, batch_prefix,
+        "Prefix must be identical between loop and batch runs"
+    );
+}

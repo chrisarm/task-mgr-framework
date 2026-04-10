@@ -240,29 +240,6 @@ impl WorktreeCleanupContext<'_> {
     }
 }
 
-/// Generate a unique batch prefix for a PRD file.
-///
-/// Reads the PRD's `taskPrefix` (if any) and combines it with an MD5 hash of the
-/// canonical path to guarantee uniqueness across PRDs in a batch run.
-///
-/// Format: `{taskPrefix}.{md5(canonical_path)[:8]}` (or just the hash if no taskPrefix).
-fn generate_batch_prefix(prd_file: &Path) -> PrefixMode {
-    let canonical = std::fs::canonicalize(prd_file).unwrap_or_else(|_| prd_file.to_path_buf());
-    let path_str = canonical.to_string_lossy();
-    let digest = md5::compute(path_str.as_bytes());
-    let path_hash = &format!("{:x}", digest)[..8];
-
-    // Read existing taskPrefix from the PRD JSON
-    let task_prefix = status_queries::read_prd_hints(prd_file).task_prefix;
-
-    let combined = match task_prefix {
-        Some(ref pfx) if !pfx.is_empty() => format!("{}.{}", pfx, path_hash),
-        _ => path_hash.to_string(),
-    };
-
-    PrefixMode::Explicit(combined)
-}
-
 /// Return a `BatchResult` representing a single early-exit failure (validation error, etc.).
 fn batch_fail_early() -> BatchResult {
     BatchResult {
@@ -435,6 +412,38 @@ pub async fn run_batch(
         }
     };
 
+    // Step 2.5: Warn if two PRDs would produce the same Auto prefix (same filename + branchName).
+    {
+        use std::collections::HashMap;
+        let mut prefix_to_files: HashMap<String, Vec<&Path>> = HashMap::new();
+        for (prd_file, _) in &pairs {
+            let filename = prd_file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown.json");
+            let branch = status_queries::read_branch_name_from_prd(prd_file);
+            let prefix =
+                crate::commands::init::generate_prefix(branch.as_deref(), filename);
+            prefix_to_files
+                .entry(prefix)
+                .or_default()
+                .push(prd_file.as_path());
+        }
+        for (prefix, files) in &prefix_to_files {
+            if files.len() > 1 {
+                eprintln!(
+                    "Warning: {} PRDs would share prefix '{}' (same filename + branchName):",
+                    files.len(),
+                    prefix
+                );
+                for f in files {
+                    eprintln!("  - {}", f.display());
+                }
+                eprintln!("Their tasks will collide. Consider renaming the PRD files to be unique.");
+            }
+        }
+    }
+
     // Step 3: Chain validation — all PRDs must have branchName when --chain is active.
     // This runs upfront so we fail fast before any work begins.
     if chain {
@@ -488,9 +497,10 @@ pub async fn run_batch(
             .map(|(p, _)| p.clone())
             .collect();
 
-        // Generate a unique prefix for this PRD to avoid task ID collisions
-        // across PRDs sharing the same database.
-        let prefix_mode = generate_batch_prefix(prd_file);
+        // Use Auto prefix mode so each PRD gets the same deterministic prefix
+        // (md5(branchName:filename)[:8]) that a standalone loop run would use.
+        // This ensures loop→batch transitions reuse existing task IDs.
+        let prefix_mode = PrefixMode::Auto;
 
         let run_config = LoopRunConfig {
             db_dir: dir.to_path_buf(),
@@ -603,6 +613,28 @@ mod tests {
     use crate::loop_engine::STOP_FILE;
     use std::fs;
     use tempfile::TempDir;
+
+    // --- auto prefix uniqueness tests ---
+
+    #[test]
+    fn test_auto_prefix_uniqueness_across_different_filenames() {
+        use crate::commands::init::generate_prefix;
+
+        // Different filenames → different prefixes (the common case in batch)
+        let p1 = generate_prefix(Some("feat/main"), "04-predictive.json");
+        let p2 = generate_prefix(Some("feat/main"), "05-gcp-ops.json");
+        assert_ne!(p1, p2, "different filenames must produce different prefixes");
+
+        // Same filename + same branch → same prefix (edge case, warns user)
+        let p3 = generate_prefix(Some("feat/main"), "tasks.json");
+        let p4 = generate_prefix(Some("feat/main"), "tasks.json");
+        assert_eq!(p3, p4, "same filename + branch must produce same prefix");
+
+        // Same filename + different branch → different prefix
+        let p5 = generate_prefix(Some("feat/alpha"), "tasks.json");
+        let p6 = generate_prefix(Some("feat/beta"), "tasks.json");
+        assert_ne!(p5, p6, "same filename but different branches must differ");
+    }
 
     // --- derive_prompt_file tests ---
 

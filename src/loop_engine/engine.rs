@@ -767,8 +767,9 @@ pub struct LoopRunConfig {
     pub chain_base: Option<String>,
     /// Prefix mode for task ID namespacing during `init()`.
     ///
-    /// `Auto` (default for single runs): reads `taskPrefix` from JSON or auto-generates.
-    /// `Explicit(prefix)`: used by batch mode to inject a unique combined prefix per PRD.
+    /// `Auto` (default for single and batch runs): generates a deterministic prefix
+    /// from `md5(branchName:filename)[:8]`, ensuring loop→batch continuity.
+    /// `Explicit(prefix)`: CLI `--prefix` override.
     /// `Disabled`: no prefix (CLI `--no-prefix` flag).
     pub prefix_mode: PrefixMode,
 }
