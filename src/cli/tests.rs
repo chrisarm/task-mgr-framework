@@ -731,11 +731,13 @@ fn test_doctor_no_flags() {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
             assert!(!auto_fix);
             assert!(!dry_run);
             assert_eq!(decay_threshold, 32);
             assert!(!reconcile_git);
+            assert!(!setup);
         }
         _ => panic!("Expected Doctor command"),
     }
@@ -750,11 +752,13 @@ fn test_doctor_with_auto_fix() {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
             assert!(auto_fix);
             assert!(!dry_run);
             assert_eq!(decay_threshold, 32);
             assert!(!reconcile_git);
+            assert!(!setup);
         }
         _ => panic!("Expected Doctor command"),
     }
@@ -769,11 +773,13 @@ fn test_doctor_with_dry_run() {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
             assert!(!auto_fix);
             assert!(dry_run);
             assert_eq!(decay_threshold, 32);
             assert!(!reconcile_git);
+            assert!(!setup);
         }
         _ => panic!("Expected Doctor command"),
     }
@@ -788,11 +794,13 @@ fn test_doctor_with_auto_fix_and_dry_run() {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
             assert!(auto_fix);
             assert!(dry_run);
             assert_eq!(decay_threshold, 32);
             assert!(!reconcile_git);
+            assert!(!setup);
         }
         _ => panic!("Expected Doctor command"),
     }
@@ -807,11 +815,34 @@ fn test_doctor_with_reconcile_git() {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
             assert!(auto_fix);
             assert!(!dry_run);
             assert_eq!(decay_threshold, 32);
             assert!(reconcile_git);
+            assert!(!setup);
+        }
+        _ => panic!("Expected Doctor command"),
+    }
+}
+
+#[test]
+fn test_doctor_with_setup_flag() {
+    let cli = Cli::parse_from(["task-mgr", "doctor", "--setup"]);
+    match cli.command {
+        Commands::Doctor {
+            auto_fix,
+            dry_run,
+            decay_threshold,
+            reconcile_git,
+            setup,
+        } => {
+            assert!(!auto_fix);
+            assert!(!dry_run);
+            assert_eq!(decay_threshold, 32);
+            assert!(!reconcile_git);
+            assert!(setup);
         }
         _ => panic!("Expected Doctor command"),
     }

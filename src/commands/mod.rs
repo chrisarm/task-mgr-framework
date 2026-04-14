@@ -63,8 +63,9 @@ pub use decisions::{
     DecisionSummary, DecisionsListResult,
 };
 pub use doctor::{
-    doctor, format_doctor_verbose, format_text as format_doctor_text, DoctorResult, DoctorSummary,
-    Fix, Issue, IssueType,
+    audit_setup, doctor, format_doctor_verbose, format_setup_text,
+    format_text as format_doctor_text, DoctorResult, DoctorSummary, Fix, Issue, IssueType,
+    SetupAuditResult,
 };
 pub use export::{export, format_text as format_export_text, ExportResult};
 pub use fail::{fail, format_text as format_fail_text, FailResult, TaskFailResult};

@@ -9,10 +9,11 @@ use std::process;
 use clap::Parser;
 
 use task_mgr::cli::{
-    Cli, Commands, CurateAction, DecisionAction, MigrateAction, RunAction, WorktreesAction,
+    Cli, Commands, CurateAction, DecisionAction, MigrateAction, OutputFormat, RunAction,
+    WorktreesAction,
 };
 use task_mgr::commands::{
-    apply_learning, auto_unblock_all, begin, complete, count_resettable_tasks,
+    apply_learning, audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks,
     decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
     format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail,
     import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
@@ -255,27 +256,58 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             dry_run,
             decay_threshold,
             reconcile_git,
+            setup,
         } => {
-            let _lock = if (auto_fix || reconcile_git) && !dry_run {
-                Some(LockGuard::acquire(&cli.dir)?)
-            } else {
-                None
-            };
+            // Determine which checks to run:
+            // --setup alone: run only setup checks (text or JSON)
+            // No DB flags + text mode: run both DB and setup checks
+            // No DB flags + JSON mode: run only DB checks (avoid invalid multi-JSON output)
+            // DB-specific flags without --setup: run only DB checks
+            let no_db_flags = !auto_fix && !dry_run && !reconcile_git;
+            let run_setup = setup || (no_db_flags && cli.format == OutputFormat::Text);
+            let run_db = !setup;
 
-            let conn = open_connection(&cli.dir)?;
-            let result = doctor(
-                &conn,
-                auto_fix,
-                dry_run,
-                decay_threshold,
-                reconcile_git,
-                &cli.dir,
-            )?;
-
-            if cli.verbose {
-                eprint!("{}", format_doctor_verbose(&result));
+            // Run setup audit (printed directly; not JSON-routed when combined with DB output)
+            if run_setup {
+                // Derive project root from the db_dir: ".task-mgr" -> "."
+                let project_dir = cli
+                    .dir
+                    .parent()
+                    .map(|p| {
+                        if p == std::path::Path::new("") {
+                            std::path::Path::new(".")
+                        } else {
+                            p
+                        }
+                    })
+                    .unwrap_or(std::path::Path::new("."));
+                let setup_result = audit_setup(project_dir, auto_fix);
+                output_result(&setup_result, cli.format);
             }
-            output_result(&result, cli.format);
+
+            // Run DB health checks
+            if run_db {
+                let _lock = if (auto_fix || reconcile_git) && !dry_run {
+                    Some(LockGuard::acquire(&cli.dir)?)
+                } else {
+                    None
+                };
+
+                let conn = open_connection(&cli.dir)?;
+                let result = doctor(
+                    &conn,
+                    auto_fix,
+                    dry_run,
+                    decay_threshold,
+                    reconcile_git,
+                    &cli.dir,
+                )?;
+
+                if cli.verbose {
+                    eprint!("{}", format_doctor_verbose(&result));
+                }
+                output_result(&result, cli.format);
+            }
             Ok(())
         }
 

@@ -9,6 +9,9 @@
 mod checks;
 mod fixes;
 mod output;
+pub mod setup_checks;
+pub mod setup_fixes;
+pub mod setup_output;
 
 #[cfg(test)]
 mod tests;
@@ -16,6 +19,12 @@ mod tests;
 pub use output::{
     format_doctor_verbose, format_text, DoctorResult, DoctorSummary, Fix, Issue, IssueType,
 };
+pub use setup_checks::EXPECTED_SKILLS;
+pub use setup_fixes::{
+    detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
+    fix_install_skills, fix_patch_hook,
+};
+pub use setup_output::{format_setup_text, SetupAuditResult};
 
 use std::path::Path;
 
@@ -233,4 +242,382 @@ pub fn doctor(
         dry_run,
         summary,
     })
+}
+
+/// Run all setup checks against the Claude Code configuration for this project.
+///
+/// Derives paths from `project_dir` (the project root, not `.task-mgr`):
+/// - `~/.claude/settings.json` — defaultMode and deny-conflict checks
+/// - `~/.claude/hooks/guard-destructive.sh` — hook bypass check
+/// - `~/.claude/commands/` — skill installation checks
+/// - `<project_dir>/.task-mgr/config.json` — project config check
+/// - `<project_dir>/CLAUDE.md` — documentation check
+///
+/// The home directory is read from the `HOME` environment variable.
+///
+/// # Auto-fix behaviour
+/// When `auto_fix` is `true`, repairs are applied for every `auto_fixable`
+/// check that is not already passing.  **`~/.claude/settings.json` is never
+/// modified automatically** — the `fix_command` suggestion for those checks
+/// is printed to the user via the normal check output.
+///
+/// # Returns
+/// A `SetupAuditResult` with one `SetupCheck` per check run, plus applied
+/// `SetupFix` entries when `auto_fix` is true.
+pub fn audit_setup(project_dir: &Path, auto_fix: bool) -> SetupAuditResult {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let claude_dir = std::path::PathBuf::from(&home).join(".claude");
+    audit_setup_with_claude_dir(project_dir, &claude_dir, auto_fix)
+}
+
+/// Run the full set of setup checks and return one entry per check.
+///
+/// Extracted to eliminate the duplicate check-running block that otherwise
+/// appears both before and after the auto-fix pass in [`audit_setup_with_claude_dir`].
+fn run_all_setup_checks(
+    settings_path: &Path,
+    hook_path: &Path,
+    commands_dir: &Path,
+    db_dir: &Path,
+    project_dir: &Path,
+) -> Vec<setup_output::SetupCheck> {
+    use setup_checks::{
+        check_claude_md, check_default_mode, check_deny_conflicts, check_hook_bypass,
+        check_project_config, check_skills_installed, EXPECTED_SKILLS,
+    };
+    let mut checks = Vec::new();
+    checks.push(check_default_mode(settings_path));
+    checks.extend(check_deny_conflicts(settings_path));
+    checks.push(check_hook_bypass(hook_path));
+    checks.extend(check_skills_installed(commands_dir, EXPECTED_SKILLS));
+    checks.push(check_project_config(db_dir));
+    checks.push(check_claude_md(project_dir));
+    checks
+}
+
+/// Inner implementation of `audit_setup` with an explicit `claude_dir`.
+///
+/// Used directly by tests to avoid depending on the `HOME` environment variable.
+fn audit_setup_with_claude_dir(
+    project_dir: &Path,
+    claude_dir: &Path,
+    auto_fix: bool,
+) -> SetupAuditResult {
+    use setup_checks::EXPECTED_SKILLS;
+    use setup_fixes::{
+        detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
+        fix_install_skills, fix_patch_hook,
+    };
+    use setup_output::SetupSeverity;
+
+    let settings_path = claude_dir.join("settings.json");
+    let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");
+    let commands_dir = claude_dir.join("commands");
+    let db_dir = project_dir.join(".task-mgr");
+    let local_skills_dir = project_dir.join(".claude").join("commands");
+
+    let checks = run_all_setup_checks(
+        &settings_path,
+        &hook_path,
+        &commands_dir,
+        &db_dir,
+        project_dir,
+    );
+
+    if !auto_fix {
+        return SetupAuditResult::new(checks);
+    }
+
+    // ── Apply auto-fixes for `auto_fixable` checks that are not passing ──
+
+    let mut applied_fixes = Vec::new();
+
+    // Fix missing skills (copy from local .claude/commands/ to ~/.claude/commands/).
+    let missing_skills: Vec<&str> = EXPECTED_SKILLS
+        .iter()
+        .filter(|&&skill| !commands_dir.join(format!("{skill}.md")).exists())
+        .copied()
+        .collect();
+    if !missing_skills.is_empty() {
+        applied_fixes.extend(fix_install_skills(
+            &local_skills_dir,
+            &commands_dir,
+            &missing_skills,
+        ));
+    }
+
+    // Fix missing project config.
+    let needs_config = checks
+        .iter()
+        .any(|c| c.name == "project_config" && c.severity != SetupSeverity::Pass);
+    if needs_config {
+        let detected = detect_additional_tools(project_dir);
+        applied_fixes.push(fix_generate_project_config(&db_dir, &detected));
+    }
+
+    // Fix hook missing bypass.
+    let needs_hook_patch = checks
+        .iter()
+        .any(|c| c.name == "hook_bypass" && c.auto_fixable && c.severity != SetupSeverity::Pass);
+    if needs_hook_patch {
+        applied_fixes.push(fix_patch_hook(&hook_path));
+    }
+
+    // Fix missing CLAUDE.md.
+    let needs_claude_md = checks
+        .iter()
+        .any(|c| c.name == "claude_md" && c.severity != SetupSeverity::Pass);
+    if needs_claude_md {
+        let db_path = db_dir.join("tasks.db");
+        applied_fixes.push(fix_generate_claude_md(project_dir, &db_path));
+    }
+
+    // Re-run checks so the result reflects the post-fix state.
+    let updated_checks = run_all_setup_checks(
+        &settings_path,
+        &hook_path,
+        &commands_dir,
+        &db_dir,
+        project_dir,
+    );
+
+    SetupAuditResult::new_with_fixes(updated_checks, applied_fixes)
+}
+
+// ─── End-to-end audit_setup tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod audit_setup_tests {
+    use super::*;
+    use setup_checks::EXPECTED_SKILLS;
+    use setup_output::SetupSeverity;
+    use tempfile::TempDir;
+
+    /// Create a minimal Claude dir: settings.json and hooks dir (no hook file).
+    fn make_claude_dir(base: &std::path::Path) -> std::path::PathBuf {
+        let claude_dir = base.join(".claude");
+        std::fs::create_dir_all(claude_dir.join("hooks")).unwrap();
+        std::fs::create_dir_all(claude_dir.join("commands")).unwrap();
+        claude_dir
+    }
+
+    /// Write a settings.json with a safe defaultMode and empty deny list.
+    fn write_clean_settings(claude_dir: &std::path::Path) {
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto","deny":[]}}"#,
+        )
+        .unwrap();
+    }
+
+    // ─── Test: full audit on a clean (unconfigured) project ──────────────────
+
+    /// A clean project (no settings, no hook, no skills, no config.json, no
+    /// CLAUDE.md) should have zero Blockers and produce the expected Warnings
+    /// and Info findings.
+    #[test]
+    fn test_full_audit_clean_project_reports_expected_warnings() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+
+        // Bare claude_dir: no settings.json, no hook, no skills installed.
+        let claude_dir = make_claude_dir(home.path());
+
+        // No .task-mgr/ dir and no CLAUDE.md in project.
+        let db_dir = project.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let result = audit_setup_with_claude_dir(project.path(), &claude_dir, false);
+
+        // No settings.json → defaultMode check is Pass (safe default).
+        // No hook file → hook_bypass is Pass (nothing to bypass).
+        // All 6 expected skills are missing → 6 Warnings.
+        // No config.json → 1 Warning.
+        // No CLAUDE.md → 1 Info.
+
+        assert!(
+            !result.has_blockers(),
+            "clean project must have no blockers: {:#?}",
+            result.checks
+        );
+
+        let warn_count = result.warning_count();
+        assert!(
+            warn_count >= EXPECTED_SKILLS.len() + 1,
+            "expected ≥ {} warnings (skills + config.json), got {warn_count}",
+            EXPECTED_SKILLS.len() + 1
+        );
+
+        let info_count = result
+            .checks
+            .iter()
+            .filter(|c| c.severity == SetupSeverity::Info)
+            .count();
+        assert_eq!(
+            info_count, 1,
+            "missing CLAUDE.md must produce exactly 1 Info"
+        );
+    }
+
+    // ─── Test: full audit on a correctly configured project ──────────────────
+
+    /// A fully configured project must report all Pass — no Warnings, no
+    /// Blockers, no Info findings.
+    #[test]
+    fn test_full_audit_configured_project_all_pass() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+
+        let claude_dir = make_claude_dir(home.path());
+        write_clean_settings(&claude_dir);
+
+        // Install all expected skills.
+        let commands_dir = claude_dir.join("commands");
+        for skill in EXPECTED_SKILLS {
+            std::fs::write(commands_dir.join(format!("{skill}.md")), "# skill").unwrap();
+        }
+
+        // Install a hook with the bypass.
+        std::fs::write(
+            claude_dir.join("hooks").join("guard-destructive.sh"),
+            "#!/bin/bash\n[ -n \"$LOOP_ALLOW_DESTRUCTIVE\" ] && exit 0\necho guard\n",
+        )
+        .unwrap();
+
+        // Project config and CLAUDE.md.
+        let db_dir = project.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(project.path().join("CLAUDE.md"), "# project").unwrap();
+
+        let result = audit_setup_with_claude_dir(project.path(), &claude_dir, false);
+
+        assert!(
+            !result.has_blockers(),
+            "configured project must have no blockers"
+        );
+        assert_eq!(
+            result.warning_count(),
+            0,
+            "configured project must have no warnings"
+        );
+        let non_pass = result
+            .checks
+            .iter()
+            .filter(|c| c.severity != SetupSeverity::Pass)
+            .count();
+        assert_eq!(
+            non_pass, 0,
+            "every check must pass on a correctly configured project: {:#?}",
+            result.checks
+        );
+    }
+
+    // ─── Test: auto-fix then re-audit shows fixed issues now pass ─────────────
+
+    /// After running auto-fix, a re-audit must report Pass for every issue that
+    /// was auto-fixable.  The items that cannot be auto-fixed (settings.json
+    /// problems) are not present here — this test uses a clean settings.json.
+    #[test]
+    fn test_auto_fix_then_reaudit_shows_fixed_issues_pass() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+
+        let claude_dir = make_claude_dir(home.path());
+        write_clean_settings(&claude_dir);
+
+        // Provide source skills in local .claude/commands/ so auto-fix can copy.
+        let local_commands = project.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&local_commands).unwrap();
+        for skill in EXPECTED_SKILLS {
+            std::fs::write(local_commands.join(format!("{skill}.md")), "# skill").unwrap();
+        }
+
+        // Provide a hook that needs patching.
+        let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");
+        std::fs::write(&hook_path, "#!/bin/bash\necho guard\n").unwrap();
+
+        // Create .task-mgr/ dir (so the fix can write config.json there).
+        let db_dir = project.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        // Run auto-fix.
+        let result = audit_setup_with_claude_dir(project.path(), &claude_dir, true);
+
+        // Fixes must have been applied.
+        assert!(
+            !result.fixes.is_empty(),
+            "auto-fix should apply at least one fix"
+        );
+
+        // The checks in the result are the post-fix re-run — auto-fixable
+        // checks that were failing should now be Pass.
+        let auto_fixable_non_pass: Vec<_> = result
+            .checks
+            .iter()
+            .filter(|c| c.auto_fixable && c.severity != SetupSeverity::Pass)
+            .collect();
+        assert!(
+            auto_fixable_non_pass.is_empty(),
+            "all auto-fixable checks must pass after auto-fix: {auto_fixable_non_pass:#?}"
+        );
+    }
+
+    // ─── Test: auto-fix is idempotent ─────────────────────────────────────────
+
+    /// Running auto-fix twice must produce the same end state as running it once.
+    /// The second run must not fail and must not produce more fixes.
+    #[test]
+    fn test_auto_fix_is_idempotent() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+
+        let claude_dir = make_claude_dir(home.path());
+        write_clean_settings(&claude_dir);
+
+        // Provide source skills so auto-fix can copy them.
+        let local_commands = project.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&local_commands).unwrap();
+        for skill in EXPECTED_SKILLS {
+            std::fs::write(local_commands.join(format!("{skill}.md")), "# skill").unwrap();
+        }
+
+        // Provide a hook that needs patching.
+        let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");
+        std::fs::write(&hook_path, "#!/bin/bash\necho guard\n").unwrap();
+
+        let db_dir = project.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        // First auto-fix run.
+        let result1 = audit_setup_with_claude_dir(project.path(), &claude_dir, true);
+
+        // Second auto-fix run — should be idempotent.
+        let result2 = audit_setup_with_claude_dir(project.path(), &claude_dir, true);
+
+        // After the second run, all fixes must succeed (idempotent ops return success).
+        let failed_fixes: Vec<_> = result2.fixes.iter().filter(|f| !f.success).collect();
+        assert!(
+            failed_fixes.is_empty(),
+            "second auto-fix run must not produce failures: {failed_fixes:#?}"
+        );
+
+        // The set of non-passing checks must be the same after both runs.
+        let non_pass1: Vec<_> = result1
+            .checks
+            .iter()
+            .filter(|c| c.severity != SetupSeverity::Pass)
+            .map(|c| &c.name)
+            .collect();
+        let non_pass2: Vec<_> = result2
+            .checks
+            .iter()
+            .filter(|c| c.severity != SetupSeverity::Pass)
+            .map(|c| &c.name)
+            .collect();
+        assert_eq!(
+            non_pass1, non_pass2,
+            "idempotent: non-passing checks must be the same after both runs"
+        );
+    }
 }

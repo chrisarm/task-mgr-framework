@@ -23,6 +23,8 @@ use rusqlite::Connection;
 
 use crate::commands::complete as complete_cmd;
 use crate::commands::decisions::find_option;
+use crate::commands::doctor::setup_checks::pre_check_loop_setup;
+use crate::commands::doctor::setup_output::SetupSeverity;
 use crate::commands::init::{generate_prefix, PrefixMode};
 use crate::commands::run as run_cmd;
 use crate::db::prefix::{prefix_and, validate_prefix};
@@ -1147,6 +1149,50 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // This catches tasks completed in a previous run where the DB status was never
     // updated (e.g., rate limit interrupted git detection, or loop exit reset them).
     reconcile_passes_with_db(&conn, &run_config.prd_file, task_prefix.as_deref());
+
+    // Step 7.2: Setup pre-check for new task lists only.
+    // "New" = no tasks are done yet (first-ever run, or all tasks were reset).
+    // Non-blocking: prints a yellow warning banner but always continues.
+    {
+        let (pfx_clause, pfx_param) = prefix_and(task_prefix.as_deref());
+        let done_sql = format!("SELECT COUNT(*) FROM tasks WHERE status = 'done' {pfx_clause}");
+        let done_params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+        let done_count: i64 = conn
+            .query_row(&done_sql, done_params.as_slice(), |row| row.get(0))
+            .unwrap_or(0);
+        let is_new_task_list = done_count == 0;
+
+        if is_new_task_list {
+            if let Ok(home) = std::env::var("HOME") {
+                let global_dir = PathBuf::from(home).join(".claude");
+                let checks = pre_check_loop_setup(&global_dir);
+                let blockers: Vec<_> = checks
+                    .iter()
+                    .filter(|c| c.severity == SetupSeverity::Blocker)
+                    .collect();
+                if !blockers.is_empty() {
+                    eprintln!(
+                        "\x1b[33m⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:\x1b[0m",
+                        blockers.len()
+                    );
+                    for b in &blockers {
+                        eprintln!("  \x1b[33m•\x1b[0m {}", b.message);
+                        if let Some(ref fix) = b.fix_command {
+                            eprintln!("    Fix: {fix}");
+                        }
+                    }
+                    eprintln!(
+                        "\x1b[33m  The loop will continue but tool calls may be blocked.\x1b[0m"
+                    );
+                    eprintln!("  Run `task-mgr doctor --setup` for a full audit.");
+                    eprintln!();
+                }
+            }
+        }
+    }
 
     // Resolve external git repo path: CLI flag overrides PRD metadata
     let external_repo_path: Option<PathBuf> = run_config

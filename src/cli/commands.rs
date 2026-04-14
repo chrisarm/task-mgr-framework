@@ -266,6 +266,10 @@ COMMON USE CASES:
         /// Reconcile git commit history with task status (parse [TASK-ID] from commits)
         #[arg(long = "reconcile-git", default_value_t = false)]
         reconcile_git: bool,
+
+        /// Audit Claude Code configuration (settings.json, hooks, skills, project config)
+        #[arg(long = "setup", default_value_t = false)]
+        setup: bool,
     },
 
     /// Skip one or more tasks intentionally (defer for later without marking as failed)
