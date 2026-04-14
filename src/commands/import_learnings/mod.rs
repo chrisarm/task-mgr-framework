@@ -16,7 +16,7 @@ use serde::Serialize;
 use chrono::{DateTime, Utc};
 
 use crate::db::open_and_migrate as open_connection;
-use crate::learnings::{record_learning, RecordLearningParams};
+use crate::learnings::{LearningWriter, RecordLearningParams};
 use crate::models::{LearningExport, ProgressExport};
 use crate::{TaskMgrError, TaskMgrResult};
 
@@ -66,13 +66,16 @@ pub fn import_learnings(
     // Load existing keys BEFORE conn.transaction() to avoid mutable borrow conflict
     let mut seen = load_existing_keys(&conn)?;
 
+    // Construct writer before the transaction so flush() runs AFTER commit.
+    // writer.record() defers Ollama calls — no HTTP inside the tx.
+    let mut writer = LearningWriter::new(Some(dir));
+
     // Wrap all inserts in a transaction for atomicity
     let tx = conn.transaction()?;
 
     let mut imported = 0;
     let mut skipped = 0;
     let mut tags_imported = 0;
-    let mut created: Vec<(i64, String, String)> = Vec::new();
 
     for learning in &learnings {
         let key = compute_dedup_key(&learning.title, &learning.content);
@@ -84,32 +87,29 @@ pub fn import_learnings(
         }
 
         let params = learning_to_params(learning);
-        let result = record_learning(&tx, params)?;
+        // Pass &tx — Transaction derefs to Connection (learning 111).
+        let result = writer.record(&tx, params)?;
 
         // Preserve stats from export when not resetting
         if !reset_stats {
             update_stats(&tx, result.learning_id, learning)?;
         }
 
-        created.push((
-            result.learning_id,
-            learning.title.clone(),
-            learning.content.clone(),
-        ));
         imported += 1;
         tags_imported += result.tags_added;
+        // Failure mode: if record() fails mid-loop, ? propagates and tx rolls back on drop.
+        // writer drops with pending items from successful iterations — Drop prints a warning.
+        // Those pending items correspond to rolled-back rows so the phantom count is misleading
+        // but not harmful; the DB is consistent.
     }
 
     tx.commit()?;
 
     // Best-effort: embed newly imported learnings if Ollama is available.
-    if !created.is_empty() {
-        use crate::learnings::embeddings::try_embed_learnings_batch;
-        let embedded =
-            try_embed_learnings_batch(&conn, dir, &created);
-        if embedded > 0 {
-            eprintln!("Embedded {embedded}/{imported} imported learning(s).");
-        }
+    // flush() MUST run after tx.commit() to avoid holding DB locks during HTTP calls.
+    let embedded = writer.flush(&conn);
+    if embedded > 0 {
+        eprintln!("Embedded {embedded}/{imported} imported learning(s).");
     }
 
     Ok(ImportLearningsResult {

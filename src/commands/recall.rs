@@ -106,10 +106,7 @@ pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<Recal
     };
 
     // Build composite backend with config-aware VectorBackend
-    let ollama_url = params
-        .ollama_url
-        .as_deref()
-        .unwrap_or(DEFAULT_OLLAMA_URL);
+    let ollama_url = params.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
     let model = params
         .embedding_model
         .as_deref()

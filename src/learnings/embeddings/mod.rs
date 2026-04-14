@@ -324,11 +324,15 @@ pub fn compose_embed_text(title: &str, content: &str) -> String {
     }
 }
 
-/// Best-effort embedding of a single learning right after creation.
+/// Best-effort embedding of a single learning.
+///
+/// **Note:** Production creation paths now use [`LearningWriter`](crate::learnings::LearningWriter)
+/// which calls [`try_embed_learnings_batch`] via `flush()`. This single-learning variant
+/// is retained as a standalone utility but is not called from any production path.
 ///
 /// Reads Ollama config from `ProjectConfig`, checks availability, embeds, and
 /// stores. On any failure (Ollama down, model missing, network timeout, etc.)
-/// prints a warning to stderr and returns `Ok(false)`. Returns `Ok(true)` when
+/// prints a warning to stderr and returns `false`. Returns `true` when
 /// the embedding was stored successfully.
 ///
 /// This is intentionally fire-and-forget: callers should never propagate the

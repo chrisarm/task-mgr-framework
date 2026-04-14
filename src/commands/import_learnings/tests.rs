@@ -194,6 +194,34 @@ fn test_import_deduplicates_by_title_content_hash() {
 }
 
 #[test]
+fn test_import_two_duplicates_of_existing_skips_both() {
+    // AC: importing 2 duplicates of an existing learning → 0 created, 2 skipped.
+    // Verifies LearningWriter.pending stays empty and flush() returns 0.
+    let (dir, _conn) = setup_test_db();
+
+    // First: establish the existing learning
+    let learnings = vec![make_learning("Dup Title", "Dup Content")];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let first_file = dir.path().join("first.json");
+    fs::write(&first_file, &json).unwrap();
+    let result1 = import_learnings(dir.path(), &first_file, false).unwrap();
+    assert_eq!(result1.learnings_imported, 1);
+
+    // Second: import a file containing 2 copies of the same learning
+    let learnings = vec![
+        make_learning("Dup Title", "Dup Content"),
+        make_learning("Dup Title", "Dup Content"),
+    ];
+    let json = serde_json::to_string_pretty(&learnings).unwrap();
+    let second_file = dir.path().join("second.json");
+    fs::write(&second_file, &json).unwrap();
+
+    let result2 = import_learnings(dir.path(), &second_file, false).unwrap();
+    assert_eq!(result2.learnings_imported, 0, "expected 0 created");
+    assert_eq!(result2.learnings_skipped, 2, "expected 2 skipped");
+}
+
+#[test]
 fn test_import_with_tags() {
     let (dir, _conn) = setup_test_db();
 

@@ -152,6 +152,10 @@ pub struct MergeClusterParams {
 pub struct MergeClusterResult {
     /// Database ID of the newly-created merged learning.
     pub merged_learning_id: i64,
+    /// Merged title that was written to the database.
+    pub merged_title: String,
+    /// Merged content that was written to the database.
+    pub merged_content: String,
     /// Source IDs that were retired as part of this merge.
     pub retired_source_ids: Vec<i64>,
     /// Source IDs skipped because they were already retired (e.g. merged by a
@@ -227,6 +231,9 @@ pub struct DedupParams {
     pub embed_model: String,
     /// Claude model for dedup LLM calls (e.g. `"haiku"`, `"sonnet"`).
     pub model: String,
+    /// Directory that holds `.task-mgr/` (needed for Ollama embedding after merge).
+    /// `None` disables post-merge embedding (used in tests).
+    pub db_dir: Option<std::path::PathBuf>,
 }
 
 /// Default Claude model for `curate dedup` LLM calls.
@@ -243,6 +250,7 @@ impl Default for DedupParams {
             concurrency: 2,
             embed_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             model: DEFAULT_DEDUP_MODEL.to_string(),
+            db_dir: None,
         }
     }
 }

@@ -1027,6 +1027,7 @@ fn test_e2e_learn_auto_populate_then_recall_for_task() {
     // learn() with task_id — auto-populate kicks in
     let learn_result = learn(
         &conn,
+        None,
         LearnParams {
             outcome: CliOutcome::Pattern,
             title: "Auto-populated integration learning".to_string(),

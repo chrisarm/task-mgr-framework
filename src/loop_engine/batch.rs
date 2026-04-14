@@ -422,8 +422,7 @@ pub async fn run_batch(
                 .and_then(|f| f.to_str())
                 .unwrap_or("unknown.json");
             let branch = status_queries::read_branch_name_from_prd(prd_file);
-            let prefix =
-                crate::commands::init::generate_prefix(branch.as_deref(), filename);
+            let prefix = crate::commands::init::generate_prefix(branch.as_deref(), filename);
             prefix_to_files
                 .entry(prefix)
                 .or_default()
@@ -439,7 +438,9 @@ pub async fn run_batch(
                 for f in files {
                     eprintln!("  - {}", f.display());
                 }
-                eprintln!("Their tasks will collide. Consider renaming the PRD files to be unique.");
+                eprintln!(
+                    "Their tasks will collide. Consider renaming the PRD files to be unique."
+                );
             }
         }
     }
@@ -596,7 +597,15 @@ pub async fn run_batch(
     }
 
     // Step 5: Print batch summary
-    print_batch_summary(&results, pairs.len(), succeeded, failed, skipped, stopped, chain);
+    print_batch_summary(
+        &results,
+        pairs.len(),
+        succeeded,
+        failed,
+        skipped,
+        stopped,
+        chain,
+    );
 
     BatchResult {
         succeeded,
@@ -623,7 +632,10 @@ mod tests {
         // Different filenames → different prefixes (the common case in batch)
         let p1 = generate_prefix(Some("feat/main"), "04-predictive.json");
         let p2 = generate_prefix(Some("feat/main"), "05-gcp-ops.json");
-        assert_ne!(p1, p2, "different filenames must produce different prefixes");
+        assert_ne!(
+            p1, p2,
+            "different filenames must produce different prefixes"
+        );
 
         // Same filename + same branch → same prefix (edge case, warns user)
         let p3 = generate_prefix(Some("feat/main"), "tasks.json");

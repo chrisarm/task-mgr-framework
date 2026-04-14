@@ -20,6 +20,7 @@ mod read;
 mod tests;
 mod types;
 mod update;
+pub mod writer;
 
 // Re-export all public items for convenience
 pub use create::record_learning;
@@ -31,3 +32,4 @@ pub use types::{
     RecordLearningResult,
 };
 pub use update::edit_learning;
+pub use writer::LearningWriter;

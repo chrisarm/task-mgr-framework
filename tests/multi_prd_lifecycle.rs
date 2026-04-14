@@ -543,11 +543,7 @@ fn test_loop_to_batch_prefix_continuity() {
             }
         ]
     });
-    fs::write(
-        &prd_path,
-        serde_json::to_string_pretty(&prd_json).unwrap(),
-    )
-    .unwrap();
+    fs::write(&prd_path, serde_json::to_string_pretty(&prd_json).unwrap()).unwrap();
 
     // Step 1: Simulate loop run — init with PrefixMode::Auto
     init::init(

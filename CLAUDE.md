@@ -15,6 +15,29 @@ The Ralph loop database is at `.task-mgr/tasks.db` (relative to the project/work
 - Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
 - Progress log: `.task-mgr/tasks/progress.txt`
 
+## Learning Creation Chokepoint
+
+All production code paths that create learnings must go through `LearningWriter` in
+`src/learnings/crud/writer.rs`. This ensures every new learning automatically gets an
+Ollama embedding scheduled (best-effort, graceful degradation when Ollama is down).
+
+**Pattern:**
+1. Construct `LearningWriter::new(db_dir)` — pass `Some(path)` for embedding, `None` in tests.
+2. Call `writer.record(conn, params)` (or `writer.push_existing(id, title, content)` for
+   callers like `merge_cluster` that do their own `record_learning` inside a transaction).
+3. Call `writer.flush(conn)` **after** any enclosing transaction has committed — this is
+   where the Ollama HTTP call happens. Never flush inside a `rusqlite::Transaction`.
+
+**Production paths using LearningWriter:**
+- `learn()` in `src/commands/learn.rs`
+- `import_learnings()` in `src/commands/import_learnings/mod.rs`
+- `curate_dedup()` in `src/commands/curate/mod.rs` (via `push_existing` after `merge_cluster`)
+- `extract_learnings_from_output()` in `src/learnings/ingestion/mod.rs` (loop engine path)
+
+The low-level `record_learning()` primitive in `src/learnings/crud/create.rs` is still
+public for tests and `curate enrich`, but new production creation paths should use
+`LearningWriter` to get automatic embedding scheduling.
+
 ## Embedding / Ollama Configuration
 
 `curate embed` generates local embeddings via Ollama for the dedup pre-filter. Configure in `.task-mgr/config.json`:

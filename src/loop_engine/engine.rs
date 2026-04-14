@@ -641,6 +641,7 @@ pub fn run_iteration(
             learning_source,
             Some(&task_id),
             Some(params.run_id),
+            Some(params.db_dir),
         ) {
             Ok(r) if r.learnings_extracted > 0 => {
                 eprintln!(
@@ -869,7 +870,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
-        was_stopped: false,
+            was_stopped: false,
         };
     }
 
@@ -890,7 +891,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     };
@@ -902,7 +903,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
-        was_stopped: false,
+            was_stopped: false,
         };
     }
 
@@ -971,7 +972,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     };
@@ -1025,7 +1026,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: None,
             branch_name: None,
-        was_stopped: false,
+            was_stopped: false,
         };
     }
 
@@ -1043,7 +1044,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     };
@@ -1098,7 +1099,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     }
@@ -1127,7 +1128,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: None,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     };
@@ -1184,7 +1185,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         exit_code: 1,
                         worktree_path: None,
                         branch_name: None,
-                    was_stopped: false,
+                        was_stopped: false,
                     };
                 }
             }
@@ -1198,7 +1199,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     exit_code: 1,
                     worktree_path: None,
                     branch_name: None,
-                was_stopped: false,
+                    was_stopped: false,
                 };
             }
             run_config.source_root.clone()
@@ -1308,7 +1309,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
             branch_name: None,
-        was_stopped: false,
+            was_stopped: false,
         };
     }
 
@@ -1334,7 +1335,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     }
@@ -1349,7 +1350,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
                 branch_name: None,
-            was_stopped: false,
+                was_stopped: false,
             };
         }
     };

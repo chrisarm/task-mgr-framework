@@ -12,9 +12,11 @@
 
 pub mod extraction;
 
+use std::path::Path;
+
 use rusqlite::Connection;
 
-use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::crud::{LearningWriter, RecordLearningParams};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
@@ -61,11 +63,15 @@ pub fn is_extraction_disabled() -> bool {
 /// * `output` - Raw output from a Claude iteration
 /// * `task_id` - Optional task ID for context
 /// * `run_id` - Optional run ID for association
+/// * `db_dir` - Optional database directory for scheduling embeddings after recording.
+///   Pass `Some(path)` in production paths to auto-embed learnings. Pass `None` in
+///   tests or callers that don't need embeddings (writer no-ops, behavior matches pre-refactor).
 pub fn extract_learnings_from_output(
     conn: &Connection,
     output: &str,
     task_id: Option<&str>,
     run_id: Option<&str>,
+    db_dir: Option<&Path>,
 ) -> TaskMgrResult<ExtractionResult> {
     if output.trim().is_empty() {
         return Ok(ExtractionResult::empty());
@@ -124,6 +130,7 @@ pub fn extract_learnings_from_output(
     });
 
     // Record each extracted learning, skipping duplicates
+    let mut writer = LearningWriter::new(db_dir);
     let mut learning_ids = Vec::new();
     let mut deduped = 0usize;
     for params in params_list {
@@ -132,7 +139,7 @@ pub fn extract_learnings_from_output(
             deduped += 1;
             continue;
         }
-        match record_learning(conn, params) {
+        match writer.record(conn, params) {
             Ok(result) => {
                 learning_ids.push(result.learning_id);
             }
@@ -145,6 +152,8 @@ pub fn extract_learnings_from_output(
     if deduped > 0 {
         eprintln!("Learning extraction: {} duplicate(s) skipped", deduped);
     }
+
+    writer.flush(conn);
 
     Ok(ExtractionResult {
         learnings_extracted: learning_ids.len(),

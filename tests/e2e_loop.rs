@@ -185,6 +185,7 @@ fn test_failure_flow_with_learning() {
     // Record a learning about the failure
     let learn_result = learn::learn(
         &conn,
+        None,
         LearnParams {
             outcome: LearningOutcome::Failure,
             title: "External API credentials required".to_string(),

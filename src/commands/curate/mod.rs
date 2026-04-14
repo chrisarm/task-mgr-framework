@@ -27,6 +27,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
+use crate::learnings::LearningWriter;
 use crate::loop_engine::claude::spawn_claude;
 use crate::loop_engine::config::PermissionMode;
 
@@ -371,10 +372,8 @@ pub fn find_enrichment_candidates(
 /// 4. Returns the merged learning ID plus the lists of retired / skipped IDs.
 ///
 /// All DB writes are performed inside a single transaction so the operation is
-/// atomic.
-///
-/// # Stub
-/// Not yet implemented — tracked as FEAT-004.
+/// atomic. The caller (typically `curate_dedup`) is responsible for scheduling
+/// embeddings via [`LearningWriter::push_existing`] after this returns.
 pub fn merge_cluster(
     conn: &Connection,
     params: MergeClusterParams,
@@ -486,6 +485,10 @@ pub fn merge_cluster(
     // Phase 2: all DB writes in a single transaction.
     let tx = conn.unchecked_transaction()?;
 
+    // Clone before moving into RecordLearningParams so we can populate MergeClusterResult.
+    let merged_title = params.merged_title.clone();
+    let merged_content = params.merged_content.clone();
+
     let record_params = RecordLearningParams {
         outcome: LearningOutcome::Pattern,
         title: params.merged_title,
@@ -537,6 +540,8 @@ pub fn merge_cluster(
 
     Ok(MergeClusterResult {
         merged_learning_id: merged_id,
+        merged_title,
+        merged_content,
         retired_source_ids: active_ids,
         skipped_source_ids,
     })
@@ -856,6 +861,8 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     // Track IDs merged across batches to handle cross-batch duplicates.
     let mut merged_ids: HashSet<i64> = HashSet::new();
 
+    let mut writer = LearningWriter::new(params.db_dir.as_deref());
+
     let mut all_clusters: Vec<DedupCluster> = Vec::new();
     let mut llm_errors: usize = 0;
     let mut learnings_merged: usize = 0;
@@ -913,7 +920,9 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                     Ok(result) => {
                         learnings_merged += result.retired_source_ids.len();
                         learnings_created += 1;
-                        Some(result.merged_learning_id)
+                        let id = result.merged_learning_id;
+                        writer.push_existing(id, result.merged_title, result.merged_content);
+                        Some(id)
                     }
                     Err(e) => {
                         eprintln!("Warning: merge_cluster failed: {}", e);
@@ -941,6 +950,8 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     }
 
     let clusters_found = all_clusters.len();
+    // Flush deferred embeddings once, after all merges are committed.
+    let _ = writer.flush(conn);
     Ok(DedupResult {
         dry_run: params.dry_run,
         clusters_found,

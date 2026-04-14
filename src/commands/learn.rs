@@ -2,12 +2,14 @@
 //!
 //! Records learnings from task outcomes into the institutional memory system.
 
+use std::path::Path;
+
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
-use crate::learnings::{record_learning, RecordLearningParams, RecordLearningResult};
+use crate::learnings::{LearningWriter, RecordLearningParams, RecordLearningResult};
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
 
@@ -88,6 +90,7 @@ fn cli_confidence_to_model(confidence: CliConfidence) -> Confidence {
 /// # Arguments
 ///
 /// * `conn` - Database connection
+/// * `db_dir` - Project directory for embedding scheduling; `None` skips embedding (tests)
 /// * `params` - Learn command parameters from CLI
 ///
 /// # Returns
@@ -100,7 +103,11 @@ fn cli_confidence_to_model(confidence: CliConfidence) -> Confidence {
 /// - Database insert fails
 /// - Task ID doesn't exist (foreign key violation)
 /// - Run ID doesn't exist (foreign key violation)
-pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResult> {
+pub fn learn(
+    conn: &Connection,
+    db_dir: Option<&Path>,
+    params: LearnParams,
+) -> TaskMgrResult<LearnResult> {
     // Auto-populate applies_to_files and applies_to_task_types from task context
     // when task_id is provided and --files/--task-types are not explicitly set.
     let (effective_files, effective_task_types) = if let Some(ref task_id) = params.task_id {
@@ -151,7 +158,9 @@ pub fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResul
         confidence: cli_confidence_to_model(params.confidence),
     };
 
-    let result = record_learning(conn, record_params)?;
+    let mut writer = LearningWriter::new(db_dir);
+    let result = writer.record(conn, record_params)?;
+    writer.flush(conn);
     Ok(LearnResult::from(result))
 }
 
@@ -211,7 +220,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
 
         assert!(result.learning_id > 0);
         assert_eq!(result.title, "Test failure");
@@ -247,7 +256,7 @@ mod tests {
             confidence: CliConfidence::High,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
 
         assert!(result.learning_id > 0);
         assert_eq!(result.title, "Successful pattern");
@@ -282,7 +291,7 @@ mod tests {
                 confidence: CliConfidence::Medium,
             };
 
-            let result = learn(&conn, params).unwrap();
+            let result = learn(&conn, None, params).unwrap();
             assert_eq!(result.outcome, expected_str);
         }
     }
@@ -306,7 +315,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params);
+        let result = learn(&conn, None, params);
         assert!(result.is_err(), "Should fail with invalid task_id");
     }
 
@@ -397,7 +406,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
 
         assert!(
             get_applies_to_files(&conn, result.learning_id).is_none(),
@@ -431,7 +440,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let files_json = get_applies_to_files(&conn, result.learning_id);
 
         assert!(
@@ -471,7 +480,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let types_json = get_applies_to_task_types(&conn, result.learning_id);
 
         assert!(
@@ -508,7 +517,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let files_json = get_applies_to_files(&conn, result.learning_id)
             .expect("applies_to_files should be set");
 
@@ -543,7 +552,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let types_json = get_applies_to_task_types(&conn, result.learning_id)
             .expect("applies_to_task_types should be set");
 
@@ -588,7 +597,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
 
         assert!(
             get_applies_to_files(&conn, result.learning_id).is_none(),
@@ -627,7 +636,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let files_json = get_applies_to_files(&conn, result.learning_id);
 
         // Auto-populate should have run (treating [] as not-explicitly-set),
@@ -672,7 +681,7 @@ mod tests {
         };
 
         // FK constraint: learnings.task_id must reference tasks.id
-        let result = learn(&conn, params);
+        let result = learn(&conn, None, params);
         assert!(
             result.is_err(),
             "learn() should fail with FK violation when task_id not in DB"
@@ -707,7 +716,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let types_json = get_applies_to_task_types(&conn, result.learning_id)
             .expect("applies_to_task_types should be populated");
 
@@ -746,7 +755,7 @@ mod tests {
         };
 
         // No panic — clean error from FK constraint
-        let result = learn(&conn, params);
+        let result = learn(&conn, None, params);
         assert!(
             result.is_err(),
             "Empty task_id should return FK error, not panic"
@@ -790,7 +799,7 @@ mod tests {
 
         // Even though resolve_task_context errors (missing table),
         // learn() must still create the learning without panic.
-        let result = learn(&conn, params);
+        let result = learn(&conn, None, params);
         assert!(
             result.is_ok(),
             "Learning creation must succeed even when resolve_task_context fails, got: {:?}",
@@ -831,7 +840,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let files_json = get_applies_to_files(&conn, result.learning_id);
 
         // Files should be populated regardless of whether the prefix is standard
@@ -869,7 +878,7 @@ mod tests {
             confidence: CliConfidence::Medium,
         };
 
-        let result = learn(&conn, params).unwrap();
+        let result = learn(&conn, None, params).unwrap();
         let files_json = get_applies_to_files(&conn, result.learning_id)
             .expect("applies_to_files should be populated for task with files");
 
