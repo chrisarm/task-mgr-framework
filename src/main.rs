@@ -839,8 +839,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         Commands::Curate { action } => {
             use task_mgr::commands::curate::enrich::curate_enrich;
             use task_mgr::commands::curate::{
-                curate_dedup, curate_embed, curate_retire, curate_unretire, DedupParams,
-                EmbedParams, EnrichParams, RetireParams,
+                curate_count, curate_dedup, curate_embed, curate_retire, curate_unretire,
+                DedupParams, EmbedParams, EnrichParams, RetireParams,
             };
             use task_mgr::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
             use task_mgr::loop_engine::project_config::read_project_config;
@@ -914,6 +914,10 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                         model: dedup_model,
                     };
                     let result = curate_dedup(&conn, params)?;
+                    output_result(&result, cli.format);
+                }
+                CurateAction::Count => {
+                    let result = curate_count(&conn)?;
                     output_result(&result, cli.format);
                 }
                 CurateAction::Embed { force, status } => {

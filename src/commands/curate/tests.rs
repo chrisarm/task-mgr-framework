@@ -19,8 +19,8 @@ use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
-    build_dedup_prompt, curate_retire, curate_unretire, merge_cluster, parse_dedup_response,
-    DeduplicateLearningItem, MergeClusterParams, RetireParams,
+    build_dedup_prompt, curate_count, curate_retire, curate_unretire, merge_cluster,
+    parse_dedup_response, DeduplicateLearningItem, MergeClusterParams, RetireParams,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -4262,4 +4262,71 @@ fn test_parallel_result_ordering_clusters_processed_in_batch_order() {
         result.clusters_found
     );
     assert_eq!(result.llm_errors, 0, "no LLM errors expected");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEST: curate count
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_count_learnings_stats_returns_correct_counts_with_mixed_data() {
+    let (_tmp, conn) = setup_db();
+
+    // Insert 3 active learnings
+    let id1 = insert_learning(
+        &conn,
+        "active 1",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id2 = insert_learning(
+        &conn,
+        "active 2",
+        Confidence::High,
+        LearningOutcome::Pattern,
+    );
+    let id3 = insert_learning(&conn, "active 3", Confidence::Low, LearningOutcome::Failure);
+    // Insert 2 retired learnings
+    let id4 = insert_learning(
+        &conn,
+        "retired 1",
+        Confidence::Low,
+        LearningOutcome::Failure,
+    );
+    let id5 = insert_learning(
+        &conn,
+        "retired 2",
+        Confidence::Low,
+        LearningOutcome::Failure,
+    );
+    retire_learning(&conn, id4);
+    retire_learning(&conn, id5);
+
+    // Add embedding for one active learning (id1)
+    conn.execute(
+        "INSERT INTO learning_embeddings (learning_id, model, dimensions, embedding) \
+         VALUES (?1, 'test-model', 3, X'000000000000803F00000040')",
+        [id1],
+    )
+    .expect("insert embedding");
+
+    let result = curate_count(&conn).expect("curate_count");
+
+    assert_eq!(result.total, 5, "total: 3 active + 2 retired");
+    assert_eq!(result.active, 3);
+    assert_eq!(result.retired, 2);
+    assert_eq!(result.embedded, 1, "only id1 has an embedding");
+
+    // Suppress unused-variable warnings from borrow checker
+    let _ = (id2, id3);
+}
+
+#[test]
+fn test_count_returns_zeros_on_empty_db() {
+    let (_tmp, conn) = setup_db();
+    let result = curate_count(&conn).expect("curate_count on empty db");
+    assert_eq!(result.total, 0);
+    assert_eq!(result.active, 0);
+    assert_eq!(result.retired, 0);
+    assert_eq!(result.embedded, 0);
 }

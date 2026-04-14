@@ -51,7 +51,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Follow the Retire/Unretire/Dedup pattern. The count queries are simple SQL: SELECT COUNT(*) FROM learnings, SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL, SELECT COUNT(*) FROM learnings WHERE retired_at IS NOT NULL, SELECT COUNT(DISTINCT le.learning_id) FROM learning_embeddings le JOIN learnings l ON l.id = le.learning_id WHERE l.retired_at IS NULL.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": {
         "correctness": [
@@ -91,7 +91,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final gate. Quick verification.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "requiresHuman": false,
       "synergyWith": [],
@@ -117,7 +117,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Final checkpoint.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "requiresHuman": false,
       "synergyWith": [],

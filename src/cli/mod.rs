@@ -31,12 +31,17 @@ pub use enums::{
 /// with SQLite as working state.
 #[derive(Parser, Debug)]
 #[command(name = "task-mgr")]
-#[command(author, version, about, long_about = "\
+#[command(
+    author,
+    version,
+    about,
+    long_about = "\
 A standalone CLI tool for managing AI agent loop tasks with SQLite as working state.
 
 task-mgr tracks tasks from PRD JSON files through their lifecycle (todo → in_progress → done),
 manages autonomous agent loop sessions, records learnings from task outcomes, and provides
-intelligent task prioritization using file-locality scoring and UCB bandit ranking.")]
+intelligent task prioritization using file-locality scoring and UCB bandit ranking."
+)]
 #[command(after_help = "\
 COMMAND REFERENCE (by category):
 

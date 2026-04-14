@@ -11,13 +11,14 @@ pub mod types;
 
 pub use dedup::{build_dedup_prompt, cluster_by_embedding_similarity, parse_dedup_response};
 pub use output::{
-    format_dedup_text, format_embed_text, format_enrich_text, format_retire_text,
-    format_unretire_text,
+    format_count_text, format_dedup_text, format_embed_text, format_enrich_text,
+    format_retire_text, format_unretire_text,
 };
 pub use types::{
-    DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams, EmbedResult,
-    EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams, MergeClusterResult,
-    RawDedupCluster, RetireParams, RetireResult, RetirementCandidate, UnretireResult,
+    CountResult, DedupCluster, DedupParams, DedupResult, DeduplicateLearningItem, EmbedParams,
+    EmbedResult, EnrichCandidate, EnrichParams, EnrichResult, MergeClusterParams,
+    MergeClusterResult, RawDedupCluster, RetireParams, RetireResult, RetirementCandidate,
+    UnretireResult,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,6 +40,33 @@ fn confidence_rank(s: &str) -> u8 {
 }
 use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
+
+/// Returns learning statistics: total, active, retired, and embedded counts.
+pub fn curate_count(conn: &Connection) -> TaskMgrResult<CountResult> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM learnings", [], |r| r.get(0))?;
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let retired: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM learnings WHERE retired_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let embedded: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT le.learning_id) FROM learning_embeddings le \
+         JOIN learnings l ON l.id = le.learning_id WHERE l.retired_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(CountResult {
+        total,
+        active,
+        retired,
+        embedded,
+    })
+}
 
 /// Identifies retirement candidates and optionally soft-archives them.
 ///

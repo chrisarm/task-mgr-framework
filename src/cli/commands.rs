@@ -1096,6 +1096,9 @@ MODEL:
         #[arg(long, default_value_t = false)]
         status: bool,
     },
+
+    /// Show learning statistics: total, active, retired, and embedded counts
+    Count,
 }
 
 /// Worktrees subcommand actions

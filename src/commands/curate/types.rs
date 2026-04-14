@@ -312,6 +312,19 @@ pub struct EmbedResult {
     pub model: String,
 }
 
+/// Result of the `curate count` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountResult {
+    /// Total number of learnings (active + retired)
+    pub total: i64,
+    /// Active learnings (retired_at IS NULL)
+    pub active: i64,
+    /// Retired learnings (retired_at IS NOT NULL)
+    pub retired: i64,
+    /// Active learnings with embeddings
+    pub embedded: i64,
+}
+
 /// Result of the `curate dedup` command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedupResult {

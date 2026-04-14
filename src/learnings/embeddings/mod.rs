@@ -111,12 +111,16 @@ impl OllamaEmbedder {
             "input": texts,
         });
 
-        let resp = self.embed_agent.post(&url).send_json(&payload).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!("Ollama embed request failed: {e}"),
-            )
-        })?;
+        let resp = self
+            .embed_agent
+            .post(&url)
+            .send_json(&payload)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Ollama embed request failed: {e}"),
+                )
+            })?;
 
         let body: serde_json::Value = resp.into_json().map_err(|e| {
             std::io::Error::new(

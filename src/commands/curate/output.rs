@@ -1,6 +1,8 @@
 //! Text output formatting for the `curate` subcommands.
 
-use super::types::{DedupResult, EmbedResult, EnrichResult, RetireResult, UnretireResult};
+use super::types::{
+    CountResult, DedupResult, EmbedResult, EnrichResult, RetireResult, UnretireResult,
+};
 
 /// Format `curate retire` output as human-readable text.
 pub fn format_retire_text(result: &RetireResult) -> String {
@@ -125,6 +127,14 @@ pub fn format_embed_text(result: &EmbedResult) -> String {
     }
     out.push_str(".\n");
     out
+}
+
+/// Format `curate count` output as human-readable text.
+pub fn format_count_text(result: &CountResult) -> String {
+    format!(
+        "Total: {}\nActive: {}\nRetired: {}\nEmbedded: {}\n",
+        result.total, result.active, result.retired, result.embedded
+    )
 }
 
 /// Format `curate unretire` output as human-readable text.
