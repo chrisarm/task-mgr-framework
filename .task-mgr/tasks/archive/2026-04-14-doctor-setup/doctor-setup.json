@@ -1,0 +1,544 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "feat/doctor-setup",
+  "description": "Enhance task-mgr doctor with --setup flag to audit Claude Code settings (permissions, hooks, skills, CLAUDE.md, project config) and auto-fix issues.",
+  "requires": [],
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. PHASE 2 FOUNDATION — Extensible check registry so new checks can be added as functions without changing the orchestrator",
+      "3. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "4. CORRECTNESS — Self-critique after code. Code compiles, type-checks, passes all tests deterministically",
+      "5. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings",
+      "6. POLISH — Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Edge cases = test cases — every known edge case must have a corresponding test; boundaries are where bugs hide",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Ship solid working code with tests to prove it",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Auto-fix that modifies ~/.claude/settings.json without explicit user confirmation",
+    "False positive checks that waste user time on correct configurations",
+    "Error messages that don't include a copy-pasteable fix command"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing doctor command behavior"
+    ]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to hardening phase"
+    }
+  },
+  "userStories": [
+    {
+      "id": "TEST-INIT-001",
+      "title": "Initial tests for setup audit types and check infrastructure",
+      "taskType": "test",
+      "description": "Write tests for the new SetupCheck, SetupSeverity, SetupCategory types and the check registry pattern. Tests should verify severity classification, JSON serialization, and the audit orchestrator contract.",
+      "acceptanceCriteria": [
+        "Test: SetupSeverity ordering (Blocker > Warning > Info > Pass)",
+        "Test: SetupCheck serializes to JSON with all fields",
+        "Test: SetupAuditResult correctly counts blockers/warnings/passing",
+        "Test: empty audit returns all-passing result",
+        "Known-bad discriminator: check with fix_command=None still serializes correctly",
+        "Tests compile (may use #[ignore] for unimplemented check functions)"
+      ],
+      "priority": 1,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Follow existing output.rs patterns (IssueType, Issue, Fix). The new types go in a new file src/commands/doctor/setup_output.rs or extend output.rs.",
+      "qualityDimensions": {
+        "correctness": ["Types must serialize cleanly for --json output"],
+        "performance": ["N/A"],
+        "style": ["Follow existing output.rs patterns: derive Serialize, Debug, Clone"]
+      },
+      "edgeCases": [
+        "settings.json doesn't exist: check should report Info, not error",
+        "guard-destructive.sh has custom modifications: only check for LOOP_ALLOW_DESTRUCTIVE bypass, don't overwrite",
+        "Skills source dir doesn't exist in repo: skip skill installation, only warn about missing global skills",
+        "Settings.json has deny rules matching CODING_ALLOWED_TOOLS: report as Blocker",
+        "Worktree missing .claude/settings.local.json: report as Warning with suggestion",
+        "Multiple projects with different tool needs: recommend per-project config over global changes"
+      ],
+      "invariants": [
+        "Audit never modifies any files (read-only operation)",
+        "Every check has a severity, message, and category",
+        "Blocker count + Warning count + Pass count = total checks"
+      ],
+      "failureModes": [
+        {"cause": "settings.json is malformed JSON", "expectedBehavior": "Report as Warning with parse error message, don't crash"},
+        {"cause": "Home directory can't be determined", "expectedBehavior": "Skip global checks, report as Warning"}
+      ],
+      "touchesFiles": ["src/commands/doctor/setup_output.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "TEST-INIT-002",
+      "title": "Initial tests for individual check functions",
+      "taskType": "test",
+      "description": "Write tests for each check function: defaultMode check, deny conflict check, hook bypass check, skills check, project config check, CLAUDE.md check. Use temp directories with controlled settings files.",
+      "acceptanceCriteria": [
+        "Test: defaultMode 'default' reports Blocker; 'auto' reports Pass",
+        "Test: deny rule matching CODING_ALLOWED_TOOLS tool reports Blocker",
+        "Test: hook without LOOP_ALLOW_DESTRUCTIVE reports Warning",
+        "Test: missing skill reports Warning with install command",
+        "Test: missing .task-mgr/config.json reports Warning",
+        "Test: missing CLAUDE.md reports Info",
+        "Test: all checks pass on correctly configured project",
+        "Tests compile with temp file fixtures"
+      ],
+      "priority": 2,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Create test fixtures with controlled settings.json files in temp directories. Use std::env::set_var cautiously for HOME override in tests (or pass paths explicitly).",
+      "qualityDimensions": {
+        "correctness": ["Each check must be tested in both pass and fail states"],
+        "performance": ["N/A"],
+        "style": ["Test names: test_check_{name}_{pass|fail}_{scenario}"]
+      },
+      "edgeCases": [
+        "settings.json doesn't exist: should not crash, report Info",
+        "settings.json is empty object {}: should report defaultMode missing as Pass (no defaultMode = OK)",
+        "hook file doesn't exist: should report Info about missing hook",
+        "hook file exists but isn't readable: should report Warning with permission error"
+      ],
+      "invariants": [
+        "No check function should panic on missing/malformed input",
+        "Every check returns a SetupCheck with all required fields populated"
+      ],
+      "failureModes": [
+        {"cause": "Temp directory cleanup fails", "expectedBehavior": "Tests still pass (TempDir handles cleanup)"},
+        {"cause": "settings.json has unexpected structure", "expectedBehavior": "Graceful degradation — report what we can check, skip what we can't"}
+      ],
+      "touchesFiles": ["src/commands/doctor/setup_checks.rs"],
+      "dependsOn": [],
+      "synergyWith": ["TEST-INIT-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-001",
+      "title": "Setup audit types and result structs",
+      "taskType": "implementation",
+      "description": "Create the new types for the setup audit: SetupSeverity, SetupCategory, SetupCheck, SetupAuditResult, SetupFix. Add to a new file src/commands/doctor/setup_output.rs. Follow existing output.rs patterns.",
+      "acceptanceCriteria": [
+        "SetupSeverity enum: Blocker, Warning, Info, Pass (with Serialize, Debug, Clone)",
+        "SetupCategory enum: Permissions, Hooks, Skills, ProjectConfig, Documentation",
+        "SetupCheck struct: name, category, severity, message, fix_command (Option<String>), auto_fixable (bool)",
+        "SetupAuditResult struct: checks Vec, blockers/warnings/passing counts",
+        "SetupFix struct: name, action, success (bool)",
+        "format_setup_text() function for human-readable output",
+        "All types implement Serialize for --json output",
+        "TEST-INIT-001 tests pass"
+      ],
+      "priority": 6,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Keep output types separate from check logic. The format function should use colors: red for Blocker, yellow for Warning, cyan for Info, green for Pass.",
+      "qualityDimensions": {
+        "correctness": ["Serialization must produce clean JSON for tooling integration"],
+        "performance": ["N/A — type definitions"],
+        "style": ["Follow output.rs patterns exactly: derive macros, Display impl, format functions"]
+      },
+      "touchesFiles": ["src/commands/doctor/setup_output.rs", "src/commands/doctor/mod.rs"],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": ["FEAT-002"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Individual check functions for settings audit",
+      "taskType": "implementation",
+      "description": "Implement check functions in a new file src/commands/doctor/setup_checks.rs. Each function takes paths/config and returns a SetupCheck. Checks: defaultMode, deny conflicts, ask conflicts, hook bypass, skills installed, project config, CLAUDE.md.",
+      "acceptanceCriteria": [
+        "check_default_mode(settings_path) -> SetupCheck: reads settings.json, checks defaultMode field",
+        "check_deny_conflicts(settings_path) -> Vec<SetupCheck>: checks deny rules against CODING_ALLOWED_TOOLS",
+        "check_hook_bypass(hook_path) -> SetupCheck: greps hook file for LOOP_ALLOW_DESTRUCTIVE",
+        "check_skills_installed(global_dir, expected) -> Vec<SetupCheck>: checks each skill file exists",
+        "check_project_config(db_dir) -> SetupCheck: checks .task-mgr/config.json exists",
+        "check_claude_md(project_dir) -> SetupCheck: checks CLAUDE.md exists",
+        "Each check returns appropriate severity and copy-pasteable fix_command",
+        "TEST-INIT-002 tests pass"
+      ],
+      "priority": 7,
+      "estimatedEffort": "high",
+      "passes": false,
+      "notes": "Import CODING_ALLOWED_TOOLS from loop_engine::config (make it pub if not already). Parse settings.json with serde_json::Value (don't need full typed struct — settings format may change). For hook check, read file as string and grep for the bypass pattern. Reference EXPECTED_GLOBAL_SKILLS from engine.rs.",
+      "qualityDimensions": {
+        "correctness": ["Must never crash on missing/malformed files — graceful degradation", "Must correctly identify defaultMode: 'default' as problematic"],
+        "performance": ["Each check should return in <10ms (local file reads only)"],
+        "style": ["Pure functions: path in, SetupCheck out. No side effects in check functions."]
+      },
+      "touchesFiles": ["src/commands/doctor/setup_checks.rs", "src/loop_engine/config.rs", "src/loop_engine/engine.rs"],
+      "dependsOn": ["FEAT-001", "TEST-INIT-002"],
+      "synergyWith": ["FEAT-001"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Setup audit orchestrator and --setup CLI flag",
+      "taskType": "implementation",
+      "description": "Wire the check functions into an audit_setup() orchestrator function. Add --setup flag to the Doctor CLI command. When --setup is passed, run setup checks. When neither --setup nor DB flags, run both.",
+      "acceptanceCriteria": [
+        "audit_setup(project_dir) -> SetupAuditResult: runs all checks, collects results",
+        "CLI: --setup flag added to Doctor command in commands.rs",
+        "main.rs: dispatches to setup audit when --setup is passed",
+        "Output: human-readable summary with severity-colored checks",
+        "Output: --json flag produces machine-readable JSON (reuse existing --format pattern if available)",
+        "When no flags: runs both DB health checks and setup checks",
+        "cargo test passes"
+      ],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "The orchestrator determines paths: ~/.claude/settings.json, ~/.claude/hooks/guard-destructive.sh, ~/.claude/commands/, .task-mgr/config.json, CLAUDE.md. Use dirs::home_dir() or std::env::var('HOME').",
+      "qualityDimensions": {
+        "correctness": ["Must determine correct paths for all platforms (Linux primarily)"],
+        "performance": ["Full audit <500ms"],
+        "style": ["Follow existing doctor() function pattern: collect issues, optionally fix, return result"]
+      },
+      "touchesFiles": ["src/commands/doctor/mod.rs", "src/cli/commands.rs", "src/main.rs"],
+      "dependsOn": ["FEAT-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Auto-fix engine for repairable issues",
+      "taskType": "implementation",
+      "description": "Implement auto-fix functions for issues that can be repaired automatically: install missing skills, generate .task-mgr/config.json, patch guard-destructive.sh hook, generate template CLAUDE.md. Never auto-modify ~/.claude/settings.json.",
+      "acceptanceCriteria": [
+        "fix_install_skills(source_dir, global_dir, missing_skills) -> Vec<SetupFix>: copies .md files",
+        "fix_generate_project_config(db_dir, detected_tools) -> SetupFix: writes config.json",
+        "fix_patch_hook(hook_path) -> SetupFix: adds LOOP_ALLOW_DESTRUCTIVE bypass, creates .bak backup",
+        "fix_generate_claude_md(project_dir, db_path) -> SetupFix: generates template CLAUDE.md",
+        "Auto-fix is idempotent: running twice produces same result",
+        "Settings.json suggestions printed to stderr but NOT auto-applied",
+        "Hook patch preserves all existing checks, only adds bypass at top",
+        "cargo test passes"
+      ],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "For hook patching: read the file, check if bypass already exists, if not insert after the #!/bin/bash line and before the first command. Create .bak backup before modifying. For project config auto-detection: check for .proto files -> add protoc, Dockerfile -> add docker, pyproject.toml -> add python3/uv, etc.",
+      "qualityDimensions": {
+        "correctness": ["NEVER modify settings.json", "Hook patch must preserve existing checks", "Backup before modifying hook"],
+        "performance": ["N/A"],
+        "style": ["Each fix function is pure: takes inputs, returns result. Side effects (file writes) happen inside the function but are clearly documented."]
+      },
+      "touchesFiles": ["src/commands/doctor/setup_fixes.rs", "src/commands/doctor/mod.rs"],
+      "dependsOn": ["FEAT-003"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-005",
+      "title": "Loop start pre-check for new task lists",
+      "taskType": "implementation",
+      "description": "Add a lightweight setup pre-check at loop startup that runs only when starting a new task list (not resuming). Checks blocker-level issues only and prints a warning banner.",
+      "acceptanceCriteria": [
+        "pre_check_loop_setup(dir) -> Vec<SetupCheck>: runs blocker checks only (defaultMode, deny conflicts)",
+        "Called in engine.rs run_loop() during startup sequence, after check_global_skills",
+        "Only runs when is_new_task_list is true (not on resume)",
+        "Prints yellow warning banner if blockers found",
+        "Non-blocking: loop continues regardless of check results",
+        "Adds <100ms to startup time",
+        "cargo test passes"
+      ],
+      "priority": 10,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Determine 'new vs resume' by checking if iteration_counter > 0 in global_state or if there's an existing run for this PRD. The check should be fast — only read settings.json and check defaultMode + deny rules. Skip skills/config/CLAUDE.md checks (those are for the full --setup audit).",
+      "qualityDimensions": {
+        "correctness": ["Must correctly distinguish new task list from resume", "Non-blocking — must not prevent loop from starting"],
+        "performance": ["<100ms total for pre-check"],
+        "style": ["Follow existing check_global_skills pattern in engine.rs for warning output"]
+      },
+      "touchesFiles": ["src/loop_engine/engine.rs", "src/commands/doctor/setup_checks.rs"],
+      "dependsOn": ["FEAT-002"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review implementation for quality, security, and integration",
+      "taskType": "review",
+      "description": "Review all implementation tasks for code quality, error handling, security (especially file operations in auto-fix), and verify integration wiring.",
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "All errors properly propagated with context",
+        "Security: auto-fix doesn't follow symlinks or write outside expected paths",
+        "Security: hook patch preserves existing checks",
+        "Security: settings.json contents never logged",
+        "All new code is exported and wired into the doctor command",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added to JSON"
+      ],
+      "priority": 13,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Pay special attention to file write operations in setup_fixes.rs. Verify symlink safety. Check that the hook backup (.bak) is created before modification.",
+      "touchesFiles": [
+        "src/commands/doctor/setup_output.rs",
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/setup_fixes.rs",
+        "src/commands/doctor/mod.rs",
+        "src/loop_engine/engine.rs"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review implementation for refactoring opportunities",
+      "taskType": "review",
+      "description": "Analyze implementation code for DRY violations, complexity, coupling, and maintainability.",
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle)",
+        "Functions under 30 lines (flag complex ones)",
+        "Check functions follow consistent pattern (extensible registry)",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON"
+      ],
+      "priority": 17,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Focus on check function consistency. All checks should follow the same input/output pattern for easy extensibility.",
+      "touchesFiles": [
+        "src/commands/doctor/setup_output.rs",
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/setup_fixes.rs"
+      ],
+      "dependsOn": ["CODE-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-1",
+      "title": "Checkpoint: Core implementation complete",
+      "taskType": "milestone",
+      "description": "All check functions, auto-fix, CLI wiring, and loop pre-check implemented. Verify everything works together.",
+      "acceptanceCriteria": [
+        "All TEST-INIT tests pass",
+        "All FEAT tasks pass",
+        "CODE-REVIEW-1 passes",
+        "REFACTOR-REVIEW-1 passes",
+        "No unused warnings in cargo check/clippy",
+        "task-mgr doctor --setup runs without error",
+        "Remaining tasks reviewed and updated"
+      ],
+      "priority": 20,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Review-and-update checkpoint.",
+      "touchesFiles": [],
+      "dependsOn": ["TEST-INIT-001", "TEST-INIT-002", "FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "CODE-REVIEW-1", "REFACTOR-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "TEST-001",
+      "title": "Comprehensive setup audit tests",
+      "taskType": "test",
+      "description": "Expand test coverage: end-to-end audit with various configurations, auto-fix idempotency, JSON output format, edge cases.",
+      "acceptanceCriteria": [
+        "Test: full audit on clean temp project reports expected warnings",
+        "Test: full audit on correctly configured project reports all Pass",
+        "Test: auto-fix then re-audit shows all fixed issues now pass",
+        "Test: auto-fix is idempotent (running twice = same result)",
+        "Test: JSON output parses back to SetupAuditResult",
+        "Test: hook patch creates .bak backup",
+        "Test: hook patch preserves existing custom checks",
+        "Test: project config auto-detection finds protoc for .proto files",
+        "80%+ coverage for setup_checks.rs and setup_fixes.rs"
+      ],
+      "priority": 25,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "qualityDimensions": {
+        "correctness": ["Test real file operations, not mocks"],
+        "performance": ["N/A"],
+        "style": ["Use TempDir for all file operations"]
+      },
+      "touchesFiles": ["src/commands/doctor/setup_checks.rs", "src/commands/doctor/setup_fixes.rs"],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-2",
+      "title": "Review test code for refactoring",
+      "taskType": "review",
+      "description": "Analyze test code for duplication and helper extraction opportunities.",
+      "acceptanceCriteria": [
+        "No duplicated test setup code",
+        "Helper functions extracted for common patterns",
+        "Any issues found have corresponding REFACTOR-2-xxx tasks added to JSON"
+      ],
+      "priority": 43,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": ["src/commands/doctor/setup_checks.rs", "src/commands/doctor/setup_fixes.rs"],
+      "dependsOn": ["TEST-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-2",
+      "title": "Checkpoint: Testing complete",
+      "taskType": "milestone",
+      "description": "All tests pass, code is clean.",
+      "acceptanceCriteria": [
+        "All TEST-xxx tests pass",
+        "REFACTOR-REVIEW-2 passes",
+        "Remaining tasks reviewed and updated"
+      ],
+      "priority": 50,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-1", "TEST-001", "REFACTOR-REVIEW-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "INT-001",
+      "title": "End-to-end integration verification",
+      "taskType": "verification",
+      "description": "Run full test suite and verify doctor --setup works end-to-end.",
+      "acceptanceCriteria": [
+        "cargo test — all tests pass",
+        "cargo clippy -- -D warnings — no warnings",
+        "cargo fmt --check — passes",
+        "task-mgr doctor --setup runs and produces expected output",
+        "task-mgr doctor (no flags) runs both DB and setup checks"
+      ],
+      "priority": 55,
+      "estimatedEffort": "low",
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["MILESTONE-2"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final refactoring review",
+      "taskType": "review",
+      "description": "Final code review for maintainability.",
+      "acceptanceCriteria": [
+        "No code duplication",
+        "All functions under 30 lines or documented exceptions",
+        "Any issues found have REFACTOR-3-xxx tasks"
+      ],
+      "priority": 70,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "touchesFiles": ["src/commands/doctor/setup_output.rs", "src/commands/doctor/setup_checks.rs", "src/commands/doctor/setup_fixes.rs"],
+      "dependsOn": ["INT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "VERIFY-001",
+      "title": "Final verification",
+      "taskType": "verification",
+      "description": "Final verification gate.",
+      "acceptanceCriteria": [
+        "All tests pass",
+        "All clippy/fmt checks pass",
+        "CLAUDE.md updated with doctor --setup reference"
+      ],
+      "priority": 90,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": ["CLAUDE.md"],
+      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-FINAL",
+      "title": "Final checkpoint — ready for merge",
+      "taskType": "milestone",
+      "description": "All work complete, ready for merge.",
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "REFACTOR-REVIEW-3 passes",
+        "Ready for merge to main"
+      ],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "touchesFiles": [],
+      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    }
+  ]
+}

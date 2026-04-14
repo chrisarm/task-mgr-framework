@@ -1,0 +1,487 @@
+{
+  "branchName": "feat/learning-writer-refactor",
+  "description": "Introduce LearningWriter facade as the common chokepoint for creating learnings + scheduling embedding refresh. Migrate all four production creation paths (learn, import-learnings, curate_dedup/merge_cluster, extract_learnings_from_output) to use it. Goal: a future dev cannot add a fifth creation path and silently forget the embedding step.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "cargo check passes with zero warnings",
+      "cargo clippy -- -D warnings passes clean",
+      "cargo fmt --check passes",
+      "cargo test passes — all ~2854 existing tests still green plus new tests",
+      "No new unwrap() in production code paths (tests OK); prefer .expect(\"invariant reason\")",
+      "record_learning stays public — do not rename, remove, or change its signature"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "3. CORRECTNESS — Self-critique after code. Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Each task delivers working code + tests together",
+      "Self-critique after code — verify all acceptance criteria, especially negative ones",
+      "Ollama HTTP calls MUST NOT happen inside SQLite transactions — verify this invariant in every path",
+      "Handle Option/Result explicitly; prefer .expect(\"invariant\") over .unwrap() in production paths"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Any production creation path that bypasses LearningWriter and calls record_learning directly",
+    "Ollama HTTP calls issued inside an active rusqlite Transaction (would hold DB locks during network I/O)",
+    "LearningWriter that panics from Drop (stack-unwind UB) — use eprintln! only",
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "MergeClusterResult missing the new merged_title/merged_content fields that curate_dedup needs",
+    "Silent failures: embedding errors must log to stderr with learning_id context",
+    "Breaking changes to record_learning signature or behavior — 25+ test files depend on it"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "19d673b2",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: src/learnings/crud/writer.rs exists with `pub struct LearningWriter<'a>` holding `db_dir: Option<&'a Path>` and `pending: Vec<PendingEmbed>`",
+        "Positive: `pub fn new(db_dir: Option<&'a Path>) -> Self` constructor",
+        "Positive: `pub fn record(&mut self, conn: &Connection, params: RecordLearningParams) -> TaskMgrResult<RecordLearningResult>` — clones title/content, calls record_learning, pushes to pending only if db_dir.is_some()",
+        "Positive: `pub fn flush(mut self, conn: &Connection) -> usize` — consumes self; drains pending; calls try_embed_learnings_batch; returns stored count. No-op (returns 0) if db_dir is None or pending is empty.",
+        "Positive: Drop impl prints eprintln!(\"Warning: LearningWriter dropped with N un-flushed pending embedding(s). Call .flush() before dropping.\") when pending is non-empty on drop",
+        "Positive: pub mod + pub use wired through src/learnings/crud/mod.rs AND src/learnings/mod.rs so callers can write `use crate::learnings::LearningWriter`",
+        "Positive: Doc comment on record() says: `Accepts &Connection or &Transaction (Transaction derefs to Connection). When inside a conn.transaction() block, pass &tx — not &conn — because conn is mutably borrowed.`",
+        "Positive: Doc comment on flush() says: `Consumes self to prevent reuse. Call AFTER any active transaction has committed. Ollama errors are swallowed; the returned count is advisory — callers can ignore it.`",
+        "Unit test: `test_record_without_db_dir_skips_pending` — new(None), record a learning, verify pending is empty (via flush returning 0)",
+        "Unit test: `test_record_with_db_dir_queues_pending` — new(Some(&tempdir)), record, verify flush would attempt embedding (use a tempdir where Ollama is unavailable — flush returns 0 gracefully)",
+        "Unit test: `test_flush_empty_returns_zero` — new(Some(dir)), no record calls, flush returns 0",
+        "Unit test: `test_record_inside_transaction` — open tx via conn.unchecked_transaction(), pass &tx to record(), commit tx, then flush",
+        "Unit test: `test_drop_warning_fires` — use std::panic::catch_unwind or scope + drop; verify the warning is emitted (can use gag crate or just `eprintln` + manual inspection — simplest: verify drop doesn't panic and pending.is_empty() after drain)",
+        "Negative: Drop does NOT panic — verified by a test that drops a writer with pending items inside a `#[test]` (a panicking Drop would abort the test)",
+        "Negative: No #[must_use] attribute on LearningWriter — it doesn't enforce what we want (it applies to return values, not dropped locals)",
+        "Known-bad: if record() is written to call record_learning AFTER pushing to pending, an error in record_learning would leak a phantom pending entry. Verify record_learning runs BEFORE the push.",
+        "CONTRACT: `try_embed_learnings_batch` in src/learnings/embeddings/mod.rs expects `&[(i64, String, String)]` — verify the flush() conversion matches this exact shape (grep the function signature)",
+        "Failure mode: if try_embed_learnings_batch returns an error internally, it already eprintln!s; flush() must NOT propagate and must still return a count (0 if all failed)"
+      ],
+      "dependsOn": [],
+      "description": "Create the LearningWriter facade in a new file src/learnings/crud/writer.rs. This is the single chokepoint all production paths will use for creating learnings. It defers Ollama HTTP calls until flush() so they never run inside a SQLite transaction.\n\nDO: Create src/learnings/crud/writer.rs with the LearningWriter struct, PendingEmbed private struct, record() method, flush(self) consuming method, and Drop impl that warns to stderr (NEVER panics).\nDO: Export from src/learnings/crud/mod.rs via `pub mod writer; pub use writer::LearningWriter;`\nDO: Re-export from src/learnings/mod.rs at the top level alongside the existing crud re-exports.\nDO: Unit tests that cover: (a) record with db_dir=None does NOT populate pending (graceful no-op), (b) record with db_dir=Some populates pending, (c) flush with empty pending returns 0, (d) Drop with non-empty pending prints to stderr (use a scope + drop(writer) pattern), (e) record accepts both &Connection and &Transaction (call from inside a conn.unchecked_transaction()).\nDO NOT: Add a panic! in Drop — panicking during stack unwinding is UB. Use eprintln! only.\nDO NOT: Issue Ollama HTTP calls in record(); the whole point is to defer them to flush().\nDO NOT: Make record_learning private or rename it — 25+ test files use it.\nDO NOT: Try to abstract over Connection/Transaction with a trait; rusqlite Transaction derefs to Connection — pass &tx directly (learning 111).\n\nEdge cases:\n- db_dir=None: record() still calls record_learning() and returns the result, but does NOT push to pending. flush() returns 0.\n- Empty pending on flush: return 0, no Ollama call attempted.\n- Drop with un-flushed pending: print eprintln! warning with the count; do NOT panic.\n- Transaction passthrough: caller passes &tx (Transaction derefs to Connection). Record works normally; the tx wrapping is the caller's concern.\n\nKnown-bad to guard against:\n- A future dev adds `.flush()` that takes `&mut self` instead of `self` — this allows flush-then-record-then-forget, defeating the point. Use consuming `self`.\n- A Drop impl that calls panic! instead of eprintln! — compiles fine but aborts the process on any error path that drops an un-flushed writer during stack unwinding.",
+      "edgeCases": [
+        "db_dir=None: record succeeds, pending stays empty, flush returns 0",
+        "Empty pending on flush: return 0 without touching Ollama",
+        "Drop with non-empty pending: eprintln warning, never panic",
+        "record inside conn.unchecked_transaction(): &tx works via Deref",
+        "Ollama unreachable at flush time: try_embed_learnings_batch logs warning and returns 0"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "record_learning fails (e.g., FK violation)",
+          "expectedBehavior": "return Err immediately; pending stays unchanged; no phantom entry"
+        },
+        {
+          "cause": "Ollama server down at flush() time",
+          "expectedBehavior": "try_embed_learnings_batch returns 0 (it already handles this); flush() returns 0; no error propagated"
+        },
+        {
+          "cause": "Writer dropped without flush() (e.g., early return on error)",
+          "expectedBehavior": "Drop prints eprintln warning with count; never panics"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Foundation task — sets the pattern all later tasks follow.\n\nKey functions to reuse:\n- record_learning at src/learnings/crud/create.rs:27 — the low-level primitive\n- try_embed_learnings_batch at src/learnings/embeddings/mod.rs — batches Ollama calls, already swallows errors\n- RecordLearningParams at src/learnings/crud/types.rs\n\nLearning 111: rusqlite Transaction auto-derefs to &Connection for function calls — pass `&tx` directly, no wrapper needed.\nLearning 1182: Clippy rejects `&*tx` explicit auto-deref; use `&tx`.\nLearning 885: conn.transaction() requires &mut Connection, not &Connection — the caller manages tx lifecycle.\nLearning 1400: Graceful degradation pattern — return empty/zero results when Ollama is unavailable, don't error.\nLearning 74: New pure-logic modules with comprehensive tests pass review cleanly.\nLearning 55: Clean test patterns — use pure functions and a single shared setup helper.\n\nImplementation sketch:\n```rust\npub struct LearningWriter<'a> {\n    db_dir: Option<&'a Path>,\n    pending: Vec<PendingEmbed>,\n}\nstruct PendingEmbed { learning_id: i64, title: String, content: String }\n\nimpl<'a> LearningWriter<'a> {\n    pub fn new(db_dir: Option<&'a Path>) -> Self { Self { db_dir, pending: Vec::new() } }\n    pub fn record(&mut self, conn: &Connection, params: RecordLearningParams) -> TaskMgrResult<RecordLearningResult> {\n        let title = params.title.clone();\n        let content = params.content.clone();\n        let result = record_learning(conn, params)?;\n        if self.db_dir.is_some() {\n            self.pending.push(PendingEmbed { learning_id: result.learning_id, title, content });\n        }\n        Ok(result)\n    }\n    pub fn flush(mut self, conn: &Connection) -> usize {\n        let Some(dir) = self.db_dir else { return 0; };\n        if self.pending.is_empty() { return 0; }\n        let items: Vec<(i64, String, String)> = std::mem::take(&mut self.pending)\n            .into_iter().map(|p| (p.learning_id, p.title, p.content)).collect();\n        try_embed_learnings_batch(conn, dir, &items)\n    }\n}\nimpl Drop for LearningWriter<'_> {\n    fn drop(&mut self) {\n        if !self.pending.is_empty() {\n            eprintln!(\"Warning: LearningWriter dropped with {} un-flushed pending embedding(s). Call .flush() before dropping.\", self.pending.len());\n        }\n    }\n}\n```\n\nFor tests, use the existing test helper pattern from src/learnings/embeddings/mod.rs (setup_db / insert_learning). Tempdir for db_dir. Ollama will be unavailable in CI so flush() returns 0 — that's the expected path.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "record_learning is called BEFORE the push to pending — on DB error, pending stays clean",
+          "flush consumes self so writer cannot be reused after flushing",
+          "Drop never panics, even during stack unwinding",
+          "record accepts &Transaction via Deref — no extra trait bounds"
+        ],
+        "performance": [
+          "record() does 2 string clones (title, content) per call — acceptable, avoids lifetime complexity",
+          "flush() batches all pending embeddings into a single try_embed_learnings_batch call"
+        ],
+        "style": [
+          "Rustdoc on every pub item explaining the tx/conn rule",
+          "No #[must_use] (doesn't apply to local drops)",
+          "Match existing module style: pub struct, impl block, tests module"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "title": "LearningWriter facade: struct, record(), flush(), Drop + unit tests",
+      "touchesFiles": [
+        "src/learnings/crud/writer.rs",
+        "src/learnings/crud/mod.rs",
+        "src/learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: learn() signature is `fn learn(conn: &Connection, db_dir: Option<&Path>, params: LearnParams) -> TaskMgrResult<LearnResult>`",
+        "Positive: learn() imports `use crate::learnings::LearningWriter` (or `crud::LearningWriter`)",
+        "Positive: learn() body uses `let mut writer = LearningWriter::new(db_dir); let result = writer.record(conn, record_params)?; writer.flush(conn); Ok(LearnResult::from(result))`",
+        "Positive: src/main.rs passes `Some(&cli.dir)` at the learn() call in Commands::Learn arm",
+        "Positive: All 17 unit tests in src/commands/learn.rs updated to pass `None` as the 2nd argument — `learn(&conn, None, params)`",
+        "Positive: tests/e2e_loop.rs learn call updated with `None`",
+        "Positive: tests/learnings.rs learn call updated with `None`",
+        "Positive: `cargo test commands::learn` passes clean",
+        "Positive: `cargo test --test learnings` passes clean",
+        "Positive: `cargo test --test e2e_loop` passes clean",
+        "Negative: No direct call to `record_learning(conn, ...)` in learn.rs body — only through writer.record",
+        "Negative: No direct call to `try_embed_learning` anywhere in learn.rs",
+        "Known-bad: if flush() is accidentally placed AFTER the `Ok(LearnResult::from(result))` return, the writer drops without flushing — verify flush runs BEFORE the return",
+        "Known-bad: if any test caller is missed, cargo test fails with `this function takes 3 arguments but 2 arguments were supplied` — grep for `learn(&conn` across the whole repo to catch all callers",
+        "Failure mode: if writer.record returns Err, the `?` propagates it. Writer drops with empty pending (no embedding was queued yet). No stderr warning."
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add a `db_dir: Option<&Path>` parameter to `learn()` and replace the current `record_learning` call with a `LearningWriter`. This is the simplest migration path — no transaction involved — and serves as a reference for the other migrations.\n\nDO: Change `learn()` signature from `fn learn(conn: &Connection, params: LearnParams) -> TaskMgrResult<LearnResult>` to `fn learn(conn: &Connection, db_dir: Option<&Path>, params: LearnParams) -> TaskMgrResult<LearnResult>`.\nDO: Inside `learn()`, construct `LearningWriter::new(db_dir)`, call `writer.record(conn, record_params)?`, then `writer.flush(conn)` before returning.\nDO: Update ALL callers to pass the new param:\n- `src/main.rs` (Commands::Learn arm, ~line 345): pass `Some(&cli.dir)`\n- 17 unit tests inside `src/commands/learn.rs` (calls like `learn(&conn, params)`): pass `None`\n- 2 integration tests: `tests/e2e_loop.rs` (~line 186) and `tests/learnings.rs` (~line 1028): pass `None`\nDO: Remove the existing auto-embed helper imports from main.rs's Learn arm (if any become dead).\nDO NOT: Change the LearnResult type or the auto-populate logic for applies_to_files/applies_to_task_types.\nDO NOT: Propagate errors from writer.flush — flush returns usize (best-effort), never Err.\n\nEdge cases:\n- db_dir=None (tests): writer.record() still runs record_learning; flush() returns 0. Net effect matches old behavior.\n- Ollama down, db_dir=Some: flush() logs warning, returns 0. learn() still returns the successful LearnResult.\n\nKnown-bad to guard against:\n- Calling writer.flush(conn) BEFORE writer.record(conn, params) — no-op but obviously wrong.\n- Forgetting to call writer.flush() — Drop warns but embeddings are lost for this run. Verify flush() is called on every code path that returns Ok.",
+      "edgeCases": [
+        "db_dir=None (tests): record runs, flush returns 0, LearnResult returned normally",
+        "db_dir=Some, Ollama down: flush logs warning, returns 0, LearnResult still returned",
+        "record_learning fails: ? propagates Err; writer drops with empty pending; no warning"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "record_learning fails mid-call",
+          "expectedBehavior": "? propagates Err; no phantom embedding queued"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "The simplest migration. Use it as a template for FEAT-003/004/005.\n\nCurrent state (clean main): learn() takes (conn, params) with no db_dir. 17 unit tests in the same file call `learn(&conn, params)`. 2 integration tests (tests/e2e_loop.rs, tests/learnings.rs) also call it. All must be updated to pass `None`.\n\nFiles to read first:\n- src/commands/learn.rs (~650 lines total, function body at 103-160)\n- src/main.rs Commands::Learn arm (~line 313-348)\n- tests/e2e_loop.rs ~line 186 (search for `learn::learn(`)\n- tests/learnings.rs ~line 1028 (search for `learn(` inside the integration tests)\n- src/learnings/crud/writer.rs (from FEAT-001, now exists)\n\nUse `git grep 'learn(&conn'` to catch every caller before modifying the signature.\n\nLearning 1195: Read all consumers before refactoring.\nLearning 111: Transaction→Connection Deref — not needed here (learn has no tx).\nLearning 1271: Engine integration pattern — minimal touch points.\n\nKey validation: after the change, `cargo test` passes clean (no call site missed).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "flush() is called before the Ok(...) return in every code path",
+          "Error propagation via ? is preserved",
+          "LearnResult construction is unchanged"
+        ],
+        "performance": [
+          "One writer per learn() call — minimal overhead",
+          "flush on empty pending (db_dir=None in tests) is a cheap no-op"
+        ],
+        "style": [
+          "Match existing code patterns in learn.rs",
+          "Use the top-level re-export `crate::learnings::LearningWriter` if available"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "Migrate learn command to LearningWriter (adds db_dir param)",
+      "touchesFiles": [
+        "src/commands/learn.rs",
+        "src/main.rs",
+        "tests/e2e_loop.rs",
+        "tests/learnings.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: src/commands/import_learnings/mod.rs imports LearningWriter",
+        "Positive: LearningWriter::new(Some(dir)) is constructed BEFORE `let tx = conn.transaction()?;`",
+        "Positive: The loop body calls `writer.record(&tx, params)?` — verify grep for `writer.record(&tx`",
+        "Positive: After `tx.commit()?`, there is a `let embedded = writer.flush(&conn);` call",
+        "Positive: The eprintln log still reports `Embedded N/M imported learning(s).` using the count from flush",
+        "Negative: The `created: Vec<(i64, String, String)>` local variable is REMOVED from import_learnings — grep confirms",
+        "Negative: The direct call to `try_embed_learnings_batch` is REMOVED from import_learnings",
+        "Negative: writer.flush is NOT called before tx.commit — verify line ordering",
+        "Positive: All existing tests in src/commands/import_learnings/tests.rs still pass",
+        "Positive: `cargo test import_learnings` passes clean",
+        "Unit test (new or existing): importing an empty learnings list leaves pending empty and returns 0 imported",
+        "Unit test: importing 2 duplicates of an existing learning results in 0 created, 0 embedded, 2 skipped",
+        "Known-bad: if flush is called INSIDE the loop (once per learning), every call re-reads ProjectConfig and re-runs the Ollama health check — 50x slower. Verify flush is called ONCE after the loop.",
+        "CONTRACT: writer.record accepts `&Transaction` via Deref (learning 111) — verify by passing `&tx` where `&Connection` is expected",
+        "Failure mode: if record_learning fails on iteration N, ? propagates; tx implicitly rolls back when dropped; writer drops with pending from iters 0..N (Drop warning fires but records were rolled back)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Replace the current `created: Vec<(i64,String,String)>` + explicit `try_embed_learnings_batch` dance in src/commands/import_learnings/mod.rs with a LearningWriter. The tx wrapping stays the same — writer.record works fine inside a tx because Ollama calls are deferred to flush().\n\nDO: Construct `LearningWriter::new(Some(dir))` before opening the transaction.\nDO: Inside the loop, call `writer.record(&tx, params)?` instead of `record_learning(&tx, params)?`. This is valid because Transaction derefs to Connection (learning 111).\nDO: After `tx.commit()?`, call `writer.flush(&conn)` to run the Ollama batch outside the transaction.\nDO: Delete the `created: Vec<(i64, String, String)>` collection and the explicit `try_embed_learnings_batch` call — the writer owns both now.\nDO: Keep all existing behavior: dedup via HashSet, stats preservation when reset_stats is false, tags counting.\nDO NOT: Move Ollama calls inside the transaction — writer.record() does NOT issue Ollama calls, only flush() does, and flush() must run AFTER commit.\nDO NOT: Change the function signature of `import_learnings(dir, from_file, reset_stats)` — callers are unchanged.\nDO NOT: Remove the `eprintln!(\"Embedded {}/{} imported...\")` log line — move it to use the count from writer.flush().\n\nEdge cases:\n- Zero imported (all duplicates skipped): writer has empty pending; flush returns 0; no log output.\n- reset_stats=true: stats aren't preserved, but the create path is identical.\n- Partial success: if record_learning fails mid-loop, the ? propagates and the entire tx rolls back. Writer drops with pending items (from successful records before the failure) — Drop prints a warning. ACCEPTABLE — those records are rolled back anyway, so the phantom warning count is slightly misleading but not wrong. Document this in a code comment.\n\nKnown-bad to guard against:\n- Calling writer.flush(&tx) instead of writer.flush(&conn) — after commit, `tx` is consumed/dropped, so this wouldn't even compile. But if flush is called BEFORE tx.commit(), the Ollama call happens while the tx is still open, holding DB locks. Verify flush runs AFTER commit.\n- Collecting `created` in addition to writer.pending — would double the memory and tag the refactor as incomplete.",
+      "edgeCases": [
+        "Zero learnings imported (all duplicates): writer.pending empty, flush returns 0",
+        "All imports succeed: writer.pending full, flush runs batch Ollama call after commit",
+        "Mid-loop record failure: ? propagates, tx rolls back, writer drops with partial pending (Drop warning fires — acceptable since records were rolled back)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "record_learning fails on learning N",
+          "expectedBehavior": "? propagates Err; tx rolls back; function returns Err; writer drops with pending items from 0..N-1 and prints Drop warning"
+        },
+        {
+          "cause": "Ollama unreachable during flush",
+          "expectedBehavior": "flush returns 0; import_learnings still returns Ok with the correct imported count; no Err propagated"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Current state: import_learnings already collects `created: Vec<(i64, String, String)>` and calls try_embed_learnings_batch after commit — this is equivalent to what LearningWriter does internally. The migration is mostly deletion + substitution.\n\nFiles to read first:\n- src/commands/import_learnings/mod.rs (full function, ~115 lines)\n- src/commands/import_learnings/tests.rs (to verify test coverage)\n\nLearning 111: `&tx` passes where `&Connection` is expected via Deref.\nLearning 110: Load existing state (seen HashSet) BEFORE opening the transaction — already done, keep it.\nLearning 112: Within-batch dedup using HashSet::insert return value — already done, keep it.\nLearning 1182: Use `&tx` not `&*tx`.\n\nDiff sketch:\n```rust\n// Before:\nlet mut created: Vec<(i64, String, String)> = Vec::new();\n// ... loop with record_learning ...\n//     created.push((result.learning_id, learning.title.clone(), learning.content.clone()));\n// tx.commit()?;\n// let embedded = try_embed_learnings_batch(&conn, dir, &created);\n\n// After:\nlet mut writer = LearningWriter::new(Some(dir));\nlet tx = conn.transaction()?;\n// ... loop with writer.record(&tx, params)? ...\ntx.commit()?;\nlet embedded = writer.flush(&conn);\nif embedded > 0 { eprintln!(\"Embedded {embedded}/{imported} imported learning(s).\"); }\n```\n\nData contract: writer.record requires `RecordLearningParams` — same as record_learning. The existing `learning_to_params(learning)` helper is reused unchanged.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "writer.flush runs AFTER tx.commit() — Ollama never holds a DB lock",
+          "record_learning is still called inside the tx (via writer.record)",
+          "Partial failure rolls back via tx drop"
+        ],
+        "performance": [
+          "Single flush call after the entire batch — batched Ollama HTTP",
+          "HashSet dedup is preserved",
+          "No duplicate tracking (writer.pending replaces the ad-hoc `created` vec)"
+        ],
+        "style": [
+          "Delete unused code — do not leave the old `created` vec as dead code",
+          "Match existing error-handling style in import_learnings"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-002"
+      ],
+      "title": "Migrate import_learnings to LearningWriter",
+      "touchesFiles": [
+        "src/commands/import_learnings/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: DedupParams in src/commands/curate/types.rs has `pub db_dir: Option<std::path::PathBuf>` field, defaulting to None in Default impl — grep confirms",
+        "Positive: MergeClusterResult in src/commands/curate/types.rs has `pub merged_title: String` and `pub merged_content: String` fields — grep confirms",
+        "Positive: merge_cluster() populates both new fields in the returned MergeClusterResult — verify with a test that calls merge_cluster directly",
+        "Positive: LearningWriter has a new `pub fn push_existing(&mut self, learning_id: i64, title: String, content: String)` method",
+        "Positive: push_existing is a no-op when db_dir is None (mirrors record behavior — no push to pending)",
+        "Positive: curate_dedup() constructs `LearningWriter::new(params.db_dir.as_deref())` and calls writer.push_existing after each successful merge_cluster",
+        "Positive: curate_dedup() calls `let _ = writer.flush(conn);` ONCE after the cluster loop, before the final Ok(DedupResult) return",
+        "Positive: src/main.rs Commands::Curate::Dedup arm constructs DedupParams with `db_dir: Some(cli.dir.clone())`",
+        "Negative: merge_cluster's signature is UNCHANGED — `fn merge_cluster(conn: &Connection, params: MergeClusterParams) -> TaskMgrResult<MergeClusterResult>`",
+        "Negative: No direct call to `try_embed_learnings_batch` in curate/mod.rs — only LearningWriter.flush calls it (which lives in writer.rs)",
+        "Positive: All 26 existing merge_cluster test call sites in src/commands/curate/tests.rs still compile — any test that destructures MergeClusterResult needs the two new fields added",
+        "Positive: All existing tests that construct `DedupParams::default()` still compile and pass (default db_dir is None — no behavior change)",
+        "Positive: `cargo test curate` passes clean — especially tests: test_merge_cluster_*, test_curate_dedup_*",
+        "Unit test: curate_dedup with DedupParams::default() (db_dir=None, dry_run=false) — merge_cluster runs, writer.pending stays empty, flush returns 0, no eprintln",
+        "Unit test: merge_cluster returns MergeClusterResult where merged_title and merged_content match the input MergeClusterParams",
+        "Known-bad: if merge_cluster forgets to clone title/content before moving into RecordLearningParams, the result fields can't be populated — the build will fail to compile",
+        "Known-bad: if curate_dedup calls writer.flush INSIDE the cluster loop (once per cluster), N Ollama calls happen instead of 1 batched call. Verify flush is called ONCE after the loop",
+        "CONTRACT: DedupParams.db_dir is Option<PathBuf>, curate_dedup calls `params.db_dir.as_deref()` to get Option<&Path> for LearningWriter::new"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "The most involved migration. merge_cluster does its DB insert inside its own atomic transaction (combined with bandit-stat updates and source retirement), so it cannot take a &mut LearningWriter without breaking 26 curate tests. Instead: (a) add `db_dir: Option<PathBuf>` to DedupParams, (b) add `merged_title`/`merged_content` to MergeClusterResult, (c) have curate_dedup construct a LearningWriter and push_existing after each successful merge.\n\nDO: Add `pub db_dir: Option<std::path::PathBuf>` field to `DedupParams` in src/commands/curate/types.rs. Default to `None` in `impl Default for DedupParams`. This keeps all existing tests that use `DedupParams::default()` working (they get None, writer no-ops).\nDO: Add `pub merged_title: String` and `pub merged_content: String` fields to `MergeClusterResult` in src/commands/curate/types.rs.\nDO: In merge_cluster() at src/commands/curate/mod.rs:~350, clone `params.merged_title` and `params.merged_content` BEFORE moving them into `RecordLearningParams`. Use the clones to populate the new result fields.\nDO: In curate_dedup() at src/commands/curate/mod.rs:~638, construct `LearningWriter::new(params.db_dir.as_deref())` at the top. After each successful `merge_cluster()` call, call `writer.push_existing(result.merged_learning_id, result.merged_title.clone(), result.merged_content.clone())` — clone because `all_clusters.push(DedupCluster { ... })` later also needs the strings. At the end (after the full loop), call `writer.flush(conn)`.\nDO: Add a new `push_existing(&mut self, learning_id: i64, title: String, content: String)` method to LearningWriter. Document it clearly: \"For callers that manage their own atomic multi-statement transactions (e.g., merge_cluster, which combines insert + bandit-stat updates atomically) and need to queue the embedding without going through `record()`.\"\nDO: Update src/main.rs Commands::Curate::Dedup arm to set `db_dir: Some(cli.dir.clone())` when constructing DedupParams.\nDO NOT: Add a &mut LearningWriter parameter to merge_cluster() — 26 tests call merge_cluster directly. Keep its signature (&Connection, MergeClusterParams) -> Result<MergeClusterResult>.\nDO NOT: Change MergeClusterParams — only MergeClusterResult grows.\nDO NOT: Run Ollama calls inside merge_cluster's transaction.\nDO NOT: Break any existing test that calls `curate_dedup(conn, DedupParams::default())` — default db_dir to None.\n\nEdge cases:\n- params.db_dir = None (tests use DedupParams::default()): writer is constructed with None; push_existing is a no-op; flush returns 0. 26 merge_cluster tests continue to pass because merge_cluster's signature is unchanged.\n- dry_run=true: curate_dedup never calls merge_cluster; writer.pending stays empty; flush returns 0.\n- Empty cluster list: same as dry_run — flush returns 0.\n- Partial merge failure: curate_dedup's loop has `eprintln!(\"Warning: merge_cluster failed: {}\", e); continue;` — failed clusters are skipped. Writer only receives successful merges. ACCEPTABLE.\n\nKnown-bad to guard against:\n- Pushing to writer BEFORE calling merge_cluster (e.g., from the cluster plan) — the merged_learning_id wouldn't exist yet. Push AFTER successful merge_cluster() returns.\n- Forgetting to update MergeClusterResult pattern destructures in tests — search curate/tests.rs for `MergeClusterResult { `.\n- Calling writer.record() in curate_dedup — no, merge_cluster already did the record via record_learning inside its own tx. Use push_existing.",
+      "edgeCases": [
+        "db_dir=None (test default): writer no-ops; 0 embedded; merge_cluster tests unchanged",
+        "dry_run=true: merge_cluster never called; flush returns 0",
+        "Zero clusters: flush returns 0",
+        "Partial merge failure: writer only holds successful clusters"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "merge_cluster fails for cluster N",
+          "expectedBehavior": "curate_dedup's existing warning + continue logic kicks in; writer does NOT receive a push_existing for N; flush only processes successful clusters"
+        },
+        {
+          "cause": "Ollama down at flush time",
+          "expectedBehavior": "flush returns 0; curate_dedup still returns the DedupResult with correct clusters_found / learnings_merged / learnings_created counts"
+        }
+      ],
+      "id": "FEAT-004",
+      "modifiesBehavior": true,
+      "notes": "This task extends FEAT-001's LearningWriter with a `push_existing` method. Place the method in the same impl block, grouped with `record`. Document clearly that push_existing is for callers that manage their own atomic transactions (e.g., merge_cluster inserts + updates bandit stats atomically).\n\nFiles to read first:\n- src/commands/curate/mod.rs merge_cluster (~lines 350-515)\n- src/commands/curate/mod.rs curate_dedup (~lines 638-925)\n- src/commands/curate/types.rs DedupParams (lines ~217-245) and MergeClusterResult (lines ~150-160)\n- src/commands/curate/tests.rs — grep for `MergeClusterResult {` and `DedupParams {` to find any destructures or explicit field-list constructors\n- src/main.rs Commands::Curate::Dedup arm (~lines 895-915) — where DedupParams is constructed from CLI flags\n\nCurrent state (clean main): DedupParams has {dry_run, threshold, batch_size, concurrency, embed_model, model}. No db_dir field. curate_dedup takes (conn, params) and has NO embedding block at the end. This task ADDS all of that.\n\nLearning 488/487: Skip extraction when SRP benefit is marginal — merge_cluster stays as-is. Only add the output fields and use the writer at curate_dedup level.\nLearning 1429: New curate subcommand requires changes to 5 files — NOT applicable here; this is an internal refactor.\nLearning 1195: Read all consumers before refactoring — grep for `MergeClusterResult {`, `DedupParams {`, and `DedupParams::default()` to find every destructure and explicit construction.\nLearning 1123: Additive changes to shared files avoid conflicts — adding a field with a default of None is fully additive.\n\nImplementation sketch for push_existing (adds to src/learnings/crud/writer.rs from FEAT-001):\n```rust\nimpl<'a> LearningWriter<'a> {\n    /// Register an already-recorded learning for later embedding.\n    /// Use when the DB insert happened outside this writer — e.g. merge_cluster\n    /// which combines insert + bandit-stat updates in a single atomic tx and\n    /// cannot route through `record()`.\n    pub fn push_existing(&mut self, learning_id: i64, title: String, content: String) {\n        if self.db_dir.is_some() {\n            self.pending.push(PendingEmbed { learning_id, title, content });\n        }\n    }\n}\n```\n\nImplementation sketch for curate_dedup:\n```rust\nlet mut writer = LearningWriter::new(params.db_dir.as_deref());\n// ... existing batch loop ...\n// Inside the cluster handling, AFTER merge_cluster() Ok:\nmatch merge_cluster(conn, merge_params) {\n    Ok(result) => {\n        learnings_merged += result.retired_source_ids.len();\n        learnings_created += 1;\n        writer.push_existing(\n            result.merged_learning_id,\n            result.merged_title.clone(),\n            result.merged_content.clone(),\n        );\n        Some(result.merged_learning_id)\n    }\n    Err(e) => { eprintln!(\"Warning: merge_cluster failed: {}\", e); continue; }\n}\n// ... after the full loop, before Ok(DedupResult):\nlet _ = writer.flush(conn);\n```",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": {
+        "correctness": [
+          "merge_cluster's tx is unchanged — insert + bandit + retire all atomic",
+          "writer.flush runs OUTSIDE merge_cluster's tx (after the whole cluster loop)",
+          "26 merge_cluster tests still compile and pass (signature unchanged)",
+          "MergeClusterResult destructures in tests are updated with the two new fields"
+        ],
+        "performance": [
+          "Single writer.flush call per curate_dedup run — one batched Ollama call",
+          "No per-cluster Ollama overhead"
+        ],
+        "style": [
+          "Delete the ad-hoc embedding block — do not leave it commented out",
+          "Group push_existing next to record in the impl block",
+          "Doc comment explaining why push_existing exists (merge_cluster's atomic multi-statement tx)"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-005"
+      ],
+      "title": "Migrate curate_dedup/merge_cluster to LearningWriter (adds DedupParams.db_dir + MergeClusterResult fields)",
+      "touchesFiles": [
+        "src/commands/curate/types.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/tests.rs",
+        "src/learnings/crud/writer.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: extract_learnings_from_output signature is `fn extract_learnings_from_output(conn: &Connection, output: &str, task_id: Option<&str>, run_id: Option<&str>, db_dir: Option<&Path>) -> TaskMgrResult<ExtractionResult>` — db_dir added as 5th param",
+        "Positive: Inside the function, `LearningWriter::new(db_dir)` is constructed AFTER parse_extraction_response succeeds and BEFORE the record loop",
+        "Positive: The loop body calls `writer.record(conn, params)` instead of `record_learning(conn, params)` — grep confirms",
+        "Positive: After the loop, `writer.flush(conn)` is called before returning Ok(ExtractionResult)",
+        "Positive: src/loop_engine/engine.rs:~639 passes `Some(params.db_dir)` — grep confirms",
+        "Positive: src/main.rs ExtractLearnings command arm passes `Some(&cli.dir)` — grep confirms",
+        "Positive: All existing tests in src/learnings/ingestion/ pass with updated signatures (test callers pass `None`)",
+        "Positive: `cargo test learnings::ingestion` passes clean",
+        "Positive: `cargo test loop_engine` passes clean",
+        "Negative: No direct `record_learning(conn, params)` call remains in extract_learnings_from_output — grep confirms",
+        "Negative: writer.flush is NOT called inside the record loop — only ONCE after it",
+        "Unit test: extract_learnings_from_output with db_dir=None still records learnings and returns ExtractionResult with the correct learning_ids — same as pre-refactor behavior",
+        "Known-bad: if the loop engine passes None instead of Some(params.db_dir), the whole refactor is neutralized for the main production path. Verify with a grep: `extract_learnings_from_output` in engine.rs must pass Some(_) for db_dir.",
+        "CONTRACT: LoopExecutionParams in src/loop_engine/engine.rs has `pub db_dir: &'a Path` (line ~106) — verify by reading the struct; the call site passes `Some(params.db_dir)`",
+        "Failure mode: individual record_learning failure inside the loop is already logged via eprintln!+continue; writer.record wraps that — the ? would propagate and break the loop. Instead, match on writer.record's result and preserve the continue behavior."
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Close the silent gap: extract_learnings_from_output in src/learnings/ingestion/mod.rs currently calls record_learning in a loop with NO embedding step. This is the path used by the loop engine after every agent iteration — embeddings for loop-extracted learnings only get created when someone manually runs `curate embed`. After this refactor, loop-extracted learnings get embeddings automatically.\n\nDO: Add a `db_dir: Option<&Path>` parameter to extract_learnings_from_output() in src/learnings/ingestion/mod.rs:64. Use Option so existing test callers can pass None.\nDO: Inside extract_learnings_from_output, construct `LearningWriter::new(db_dir)` before the record loop. Replace `record_learning(conn, params)` with `writer.record(conn, params)`. After the loop, call `writer.flush(conn)`.\nDO: Update the caller in src/loop_engine/engine.rs:~639 to pass `Some(params.db_dir)` — the LoopExecutionParams struct already has `db_dir: &Path`.\nDO: Update the caller in src/main.rs (the ExtractLearnings command arm, around line 939) to pass `Some(&cli.dir)`.\nDO: Any tests in src/learnings/ingestion/ that call extract_learnings_from_output need the new parameter added — pass None.\nDO NOT: Change the error handling (`eprintln!(\"Warning: failed to record extracted learning: {}\"`)) — keep it. Individual record failures log and continue.\nDO NOT: Move the Claude LLM spawn_claude call or the enrichment logic — only the record loop + flush changes.\nDO NOT: Make db_dir required (non-Option) — unit tests in src/learnings/ingestion/tests.rs may not have a db_dir.\n\nEdge cases:\n- db_dir=None (unit tests): writer no-ops; behavior matches pre-refactor (records only, no embeddings).\n- LLM returns 0 learnings: existing early return; writer is constructed but never used; flush returns 0.\n- Individual record fails but others succeed: writer.record returns Err for that one; existing eprintln!+continue logic logs it; writer continues for subsequent records. Embedding is queued only for successful records.\n- Ollama down at flush time: graceful no-op; loop engine sees successful extraction; embeddings backfill later via curate embed.\n\nKnown-bad to guard against:\n- Placing writer.flush INSIDE the Claude spawn or parse block — it must run after the record loop completes.\n- Passing `None` from the loop engine accidentally — this would make loop-extracted learnings still skip embeddings. Verify engine.rs passes `Some(params.db_dir)`.\n- Test callers not updated — verify `cargo test learnings::ingestion` passes.",
+      "edgeCases": [
+        "db_dir=None: record loop runs as before; flush no-op; embeddings skipped",
+        "db_dir=Some but Ollama down: flush logs warning, returns 0; learning_ids still populated",
+        "LLM returns empty params_list: existing early return; writer never touched",
+        "Individual record_learning fails: matched, logged, loop continues; only successful records queued"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "One record_learning call fails in the middle of the loop",
+          "expectedBehavior": "eprintln warning, continue loop; writer only holds successful records; flush runs over successful subset"
+        },
+        {
+          "cause": "Loop engine call site passes None",
+          "expectedBehavior": "BUG — verify the engine.rs call site explicitly passes `Some(params.db_dir)`; this is a regression risk"
+        }
+      ],
+      "id": "FEAT-005",
+      "modifiesBehavior": true,
+      "notes": "Critical: preserve the existing per-learning error handling. The current code does:\n```rust\nmatch record_learning(conn, params) {\n    Ok(result) => { learning_ids.push(result.learning_id); }\n    Err(e) => { eprintln!(\"Warning: failed to record extracted learning: {}\", e); }\n}\n```\nAfter migration, it must still be a match (NOT `writer.record(conn, params)?`) so one failure doesn't abort the whole loop:\n```rust\nmatch writer.record(conn, params) {\n    Ok(result) => { learning_ids.push(result.learning_id); }\n    Err(e) => { eprintln!(\"Warning: failed to record extracted learning: {}\", e); }\n}\n```\n\nFiles to read first:\n- src/learnings/ingestion/mod.rs (full file, ~200 lines)\n- src/loop_engine/engine.rs:639 (the call site)\n- src/main.rs:935-950 (the other call site)\n- src/learnings/ingestion/tests.rs if any (check for direct callers)\n\nLearning 261: Enrichment wired after parse_extraction_response in pipeline — keep that order; writer construction goes AFTER enrichment, right before the record loop.\nLearning 1271: Engine integration pattern — (1) ensure the call site passes the config value through, (2) no new startup log needed for this refactor, (3) loop body hook is the existing call site at line 639.\n\nRisk: LoopExecutionParams might not have db_dir exposed to the engine.rs:639 call site. Check the struct definition around line 106. If it's `pub db_dir: &'a Path`, we're good. If it's private, make it pub(crate).",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "Per-learning error handling is preserved (log + continue, not ?)",
+          "db_dir is passed from loop engine via params.db_dir",
+          "writer.flush runs AFTER the record loop, before the function returns",
+          "Test callers pass None and still work"
+        ],
+        "performance": [
+          "Single batched Ollama call at the end of extraction",
+          "No per-learning Ollama overhead inside the loop"
+        ],
+        "style": [
+          "Preserve existing eprintln formatting for backward compat",
+          "Parameter order: db_dir as the LAST parameter (5th), so it's additive"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "Migrate extract_learnings_from_output to LearningWriter (loop engine path)",
+      "touchesFiles": [
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicate embedding logic across learn.rs, import_learnings, curate_dedup, ingestion — all route through LearningWriter",
+        "Grep `record_learning(` in src/commands/ and src/learnings/ingestion/ returns only: the writer's internal call, and any test-helper/setup code. Production paths go through writer.record.",
+        "Grep `try_embed_learnings_batch` returns only: its definition in embeddings/mod.rs and the call inside LearningWriter.flush. No production path calls it directly.",
+        "LearningWriter has rustdoc explaining: (a) the tx rule, (b) that it's the production chokepoint, (c) push_existing's purpose for atomic multi-statement tx callers",
+        "Functions under 40 lines (flag any >40 lines introduced by this refactor)",
+        "Clear separation: LearningWriter in src/learnings/crud/writer.rs; callers in src/commands/ and src/learnings/ingestion/",
+        "cargo clippy -- -D warnings clean",
+        "cargo fmt --check clean"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Review all modified files for DRY violations, dead code, doc drift, and chokepoint leaks. The LearningWriter is the common interface — verify no production path bypasses it.\n\nDO: Grep src/commands/ and src/learnings/ingestion/ for direct calls to `record_learning(` — only LearningWriter's internal implementation should call it (and tests + src/learnings/crud/ itself).\nDO: Grep for `try_embed_learning` and `try_embed_learnings_batch` — only LearningWriter.flush should call the batch variant; the singular variant may still be useful as a lower-level primitive but should not be called from any production path.\nDO: Check that the LearningWriter doc comments clearly explain the tx rule (Ollama never inside tx) and point future devs at the writer as the production chokepoint.\nDO: Check function lengths — if any modified function is >40 lines due to the refactor, consider extraction.\nDO: Run the simplify skill (if available) for a fresh-eyes pass.\nDO NOT: Refactor code not touched by this PR — scope creep.\nDO NOT: Mark passes=true without actually running cargo clippy -- -D warnings and cargo fmt --check.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add REFACTOR-FIX-xxx tasks to JSON (priority 50-97), commit JSON changes.\n\nIf clean: mark passes:true with note 'No refactoring needed — LearningWriter is the sole production chokepoint; verified by grep.'\n\nLearning 488/487: Skip extraction when SRP benefit is marginal — don't split LearningWriter into sub-modules if it fits in one ~150 line file. Only extract if the refactor reveals a genuinely independent concern.\nLearning 880: Inline orchestrator blocks are the real refactoring targets — check that curate_dedup's orchestration (batch loop + merge loop) wasn't left bloated.\nLearning 454: Module extraction workflow: write-edit-register-repoint.",
+      "passes": true,
+      "priority": 98,
+      "title": "Review for refactoring opportunities across the 5 migrations",
+      "touchesFiles": [
+        "src/learnings/crud/writer.rs",
+        "src/commands/learn.rs",
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (learn/import-learnings/curate dedup/loop iteration)",
+        "Positive: cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean",
+        "Positive: ~2854 existing tests + new LearningWriter tests all pass — verify via `grep '^test result' /tmp/test-results.txt`",
+        "Positive: Manual smoke test: `task-mgr learn ...` on a DB with Ollama running results in an embedding stored (verify via `curate embed --status` delta)",
+        "Positive: Manual smoke test: `task-mgr import-learnings --from-json <file>` produces embeddings for newly imported learnings",
+        "Positive: Manual smoke test: `task-mgr curate dedup` (non-dry-run) produces embeddings for merged learnings",
+        "Positive: CLAUDE.md updated with a 'Learning creation chokepoint' section pointing at src/learnings/crud/writer.rs and documenting the tx rule",
+        "Negative: No unwrap() in production code paths (tests OK)",
+        "Negative: No dead code warnings (unused `created` vec, unused imports of try_embed_learning, etc.)",
+        "Negative: No production path bypasses LearningWriter — grep confirms",
+        "Documentation: doc drift in src/learnings/embeddings/mod.rs addressed (if try_embed_learning is no longer called from production, note it as 'primitive used only by LearningWriter.flush')",
+        "Task update: Remaining tasks reviewed; progress.txt has a summary of what changed and why",
+        "If issues found: FIX-xxx tasks added to JSON with priority 50-97"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "REFACTOR-001"
+      ],
+      "description": "Final review of all changes. Verify: (1) every production learning-creation path goes through LearningWriter; (2) no Ollama HTTP call happens inside a rusqlite Transaction; (3) graceful degradation works when Ollama is down; (4) documentation reflects the new pattern.\n\nDO: Read every touched file and verify each acceptance criterion from the FEAT tasks.\nDO: Run the full test suite — cargo test 2>&1 | tee /tmp/test-results.txt | grep '^test result' — verify ~2854 tests still pass.\nDO: Manual smoke tests (if Ollama is running locally): (a) `task-mgr learn --outcome pattern --title test --content test`, (b) `task-mgr curate embed --status` — embed count should increment; (c) run a short loop iteration that triggers extract_learnings_from_output and check the extracted learning got an embedding.\nDO: Update CLAUDE.md with a 'Learning creation chokepoint' note: point future devs at LearningWriter in src/learnings/crud/writer.rs as the required entry point for any new creation path.\nDO: Check for documentation drift in src/learnings/embeddings/mod.rs — if the 'best-effort inline embedding' section's doc comments reference try_embed_learning directly and those functions are no longer called from production, update them.\nDO: Review remaining tasks — if implementation changed APIs, update remaining task descriptions/criteria to match reality (e.g., if push_existing was renamed).\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode. Verify LearningWriter is actually reached from main.rs and engine.rs via grep traces.\nDO NOT: Skip the manual smoke test of curate embed --status before/after a learn command.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "If issues found: add FIX-xxx tasks to JSON, commit JSON changes. Loop picks them up automatically.\n\nIf no issues: mark passes:true with note 'Clean review — LearningWriter is the sole production chokepoint; all paths migrated; manual smoke tests verified embedding creation for learn/import/dedup/loop-extraction.'\n\nManual smoke test commands (require Ollama running):\n```bash\ntask-mgr curate embed --status  # note count\ntask-mgr learn --outcome pattern --title 'writer smoke' --content 'verify writer path'\ntask-mgr curate embed --status  # should be +1\n```\n\nLearning 824/1244: cargo test may surface warnings that cargo clippy didn't — run both.\nLearning 693: `.expect(\"invariant\")` is acceptable in production when the invariant is genuinely upheld; `.unwrap()` is not.\nLearning 1426: CLAUDE.md has an Embedding/Ollama config section — extend it rather than duplicating.",
+      "passes": true,
+      "priority": 99,
+      "title": "Code review + final verification + documentation update",
+      "touchesFiles": [
+        "src/learnings/crud/writer.rs",
+        "src/commands/learn.rs",
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/engine.rs",
+        "src/main.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

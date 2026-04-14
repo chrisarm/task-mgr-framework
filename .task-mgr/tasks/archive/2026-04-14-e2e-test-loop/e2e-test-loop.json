@@ -1,0 +1,131 @@
+{
+  "branchName": "feat/e2e-test-loop",
+  "description": "E2E test: add 'curate count' subcommand that prints learning statistics (total, active, retired, embedded).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. FUNCTIONING CODE — Make it work",
+      "2. CORRECTNESS — Compiles, tests pass",
+      "3. CODE QUALITY — Clean, no warnings"
+    ],
+    "principles": [
+      "Keep it simple — this is a small feature",
+      "Follow existing CurateAction patterns exactly",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Over-engineering a simple count query",
+    "Adding unnecessary abstractions",
+    "Modifying unrelated code"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "9c1897a0",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "CurateAction::Count variant added to CLI enum",
+        "Handler queries: total learnings, active (retired_at IS NULL), retired (retired_at IS NOT NULL), embedded (JOIN learning_embeddings)",
+        "Output formatted as a table: Total: N, Active: N, Retired: N, Embedded: N",
+        "Unit test: count_learnings_stats returns correct counts with mixed active/retired/embedded learnings",
+        "Integration: `task-mgr curate count` runs without error on an empty DB"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Add a 'curate count' subcommand that queries the database and prints learning statistics: total, active, retired, and embedded counts. Follow the existing CurateAction pattern.",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Follow the Retire/Unretire/Dedup pattern. The count queries are simple SQL: SELECT COUNT(*) FROM learnings, SELECT COUNT(*) FROM learnings WHERE retired_at IS NULL, SELECT COUNT(*) FROM learnings WHERE retired_at IS NOT NULL, SELECT COUNT(DISTINCT le.learning_id) FROM learning_embeddings le JOIN learnings l ON l.id = le.learning_id WHERE l.retired_at IS NULL.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Counts must be accurate for mixed active/retired/embedded learnings"
+        ],
+        "style": [
+          "Follow existing CurateAction pattern",
+          "Use TaskMgrResult<T> for error handling"
+        ]
+      },
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "Add curate count subcommand",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/output.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test: all pass",
+        "cargo clippy -- -D warnings: clean",
+        "cargo fmt --check: clean"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Run full test suite, clippy, fmt. Verify curate count works.",
+      "estimatedEffort": "low",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final gate. Quick verification.",
+      "passes": true,
+      "priority": 90,
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "verification",
+      "timeoutSecs": 600,
+      "title": "Final verification — all checks pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "VERIFY-001 passes",
+        "All acceptance criteria met",
+        "Branch clean and ready for merge"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "All work complete, tests pass, ready for merge.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-6",
+      "modifiesBehavior": false,
+      "notes": "Final checkpoint.",
+      "passes": true,
+      "priority": 99,
+      "requiresHuman": false,
+      "synergyWith": [],
+      "taskType": "milestone",
+      "timeoutSecs": 600,
+      "title": "Final checkpoint — ready for merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
