@@ -746,3 +746,188 @@ fn test_retired_excluded_from_export_calculate_statistics() {
         "retired failure learning must not be counted in calculate_statistics outcome breakdown"
     );
 }
+
+// ============ requires_human / human_review_timeout export tests ============
+
+/// ExportedUserStory with requires_human=None must not include the field in JSON.
+#[test]
+fn test_exported_story_requires_human_absent_when_none() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: false,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        synergy_with: vec![],
+        batch_with: vec![],
+        conflicts_with: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: None,
+        human_review_timeout: None,
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    assert!(
+        !json.contains("requiresHuman"),
+        "requiresHuman must be absent from JSON when None"
+    );
+    assert!(
+        !json.contains("humanReviewTimeout"),
+        "humanReviewTimeout must be absent from JSON when None"
+    );
+}
+
+/// ExportedUserStory with requires_human=Some(true) must include requiresHuman:true in JSON.
+#[test]
+fn test_exported_story_requires_human_true_in_json() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: false,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        synergy_with: vec![],
+        batch_with: vec![],
+        conflicts_with: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: Some(true),
+        human_review_timeout: None,
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    assert!(
+        json.contains("\"requiresHuman\":true"),
+        "requiresHuman:true must be in JSON when Some(true)"
+    );
+}
+
+/// ExportedUserStory with human_review_timeout=Some(60) must include humanReviewTimeout:60.
+#[test]
+fn test_exported_story_human_review_timeout_in_json() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: false,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        synergy_with: vec![],
+        batch_with: vec![],
+        conflicts_with: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: Some(true),
+        human_review_timeout: Some(60),
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    assert!(
+        json.contains("\"humanReviewTimeout\":60"),
+        "humanReviewTimeout:60 must be in JSON when Some(60)"
+    );
+}
+
+/// ExportedUserStory JSON round-trip: requires_human and human_review_timeout survive serde.
+#[test]
+fn test_exported_story_requires_human_round_trip() {
+    let story = prd::ExportedUserStory {
+        id: "US-001".to_string(),
+        title: "Test".to_string(),
+        description: None,
+        priority: 1,
+        passes: false,
+        notes: None,
+        acceptance_criteria: vec![],
+        review_scope: None,
+        severity: None,
+        source_review: None,
+        touches_files: vec![],
+        depends_on: vec![],
+        synergy_with: vec![],
+        batch_with: vec![],
+        conflicts_with: vec![],
+        model: None,
+        difficulty: None,
+        escalation_note: None,
+        max_retries: 3,
+        requires_human: Some(true),
+        human_review_timeout: Some(120),
+    };
+    let json = serde_json::to_string(&story).unwrap();
+    let deserialized: prd::ExportedUserStory = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized.requires_human, Some(true));
+    assert_eq!(deserialized.human_review_timeout, Some(120));
+}
+
+/// Full import → export round-trip preserves requiresHuman and humanReviewTimeout.
+/// Requires v15 DB columns — v15 migration is implemented, columns exist.
+#[test]
+fn test_export_round_trips_requires_human_field() {
+    let prd_json = r#"{
+        "project": "test-project",
+        "userStories": [
+            {
+                "id": "US-001",
+                "title": "Human Review Gate",
+                "priority": 1,
+                "passes": false,
+                "requiresHuman": true,
+                "humanReviewTimeout": 60
+            }
+        ]
+    }"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let json_path = temp_dir.path().join("prd.json");
+    fs::write(&json_path, prd_json).unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&json_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let export_path = temp_dir.path().join("exported.json");
+    export(temp_dir.path(), &export_path, false, None).unwrap();
+
+    let exported_json = fs::read_to_string(&export_path).unwrap();
+    let exported: prd::ExportedPrd = serde_json::from_str(&exported_json).unwrap();
+
+    let story = exported
+        .user_stories
+        .iter()
+        .find(|s| s.id == "US-001")
+        .unwrap();
+    assert_eq!(story.requires_human, Some(true));
+    assert_eq!(story.human_review_timeout, Some(60));
+}

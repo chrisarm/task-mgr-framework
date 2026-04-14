@@ -54,16 +54,15 @@ mod tests {
         (temp_dir, conn)
     }
 
-    /// Schema version must be 15 after full migration run.
+    /// After running all migrations, v15 artifacts must be present.
     #[test]
-    fn test_v15_schema_version_is_15() {
+    fn test_v15_migration_was_applied() {
         let (_temp_dir, conn) = setup_migrated_db();
-        assert_eq!(
-            CURRENT_SCHEMA_VERSION, 15,
-            "CURRENT_SCHEMA_VERSION constant must be 15"
-        );
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 15, "DB schema_version must be 15 after migration");
+        assert!(
+            version >= 15,
+            "DB schema_version must be >= 15 after running migrations"
+        );
     }
 
     /// learning_embeddings table must exist with correct columns.

@@ -50,11 +50,12 @@ use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
 use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
 use crate::loop_engine::prd_reconcile::{
-    hash_file, mark_task_done, read_prd_metadata, reconcile_passes_with_db, update_prd_task_passes,
+    self as prd_reconcile, hash_file, mark_task_done, read_prd_metadata, reconcile_passes_with_db,
+    update_prd_task_passes,
 };
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
-use crate::loop_engine::signals::{self, SignalFlag};
+use crate::loop_engine::signals::{self, handle_human_review, SignalFlag};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::usage::{self, UsageCheckResult};
@@ -1493,6 +1494,20 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 15.7: Log requires_human task count so the user knows pauses are coming
+    {
+        let review_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE requires_human = 1 AND status != 'done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if review_count > 0 {
+            eprintln!("{} task(s) require human review", review_count);
+        }
+    }
+
     // Step 16: Build usage params
     let usage_params = UsageParams {
         enabled: run_config.config.usage_check_enabled,
@@ -1648,6 +1663,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         ) {
             eprintln!("Warning: failed to update run: {}", e);
         }
+
+        // Record epoch before completion detection so we can later identify tasks
+        // completed this iteration (used for human review triggering).
+        let completion_epoch_start: i64 = conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
 
         // Check for task completion via multiple detection paths.
         // Priority: <completed> tags > git commit > output scan > already-complete
@@ -1878,6 +1901,24 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             }
         }
 
+        // Trigger human review for requires_human tasks completed this iteration.
+        // Queries by timestamp to capture all detection paths (tags, git, output scan,
+        // external reconciliation). Pre-completed tasks have older timestamps and are skipped.
+        if !matches!(result.outcome, IterationOutcome::Empty) {
+            trigger_human_reviews(
+                &conn,
+                HumanReviewParams {
+                    completion_epoch_start,
+                    iteration,
+                    session_guidance: &mut ctx.session_guidance,
+                    prd_file: &paths.prd_file,
+                    task_prefix: task_prefix.as_deref(),
+                    default_model: default_model.as_deref(),
+                    permission_mode: &permission_mode,
+                },
+            );
+        }
+
         // Track iteration count (skip reorders and rate limits)
         match result.outcome {
             IterationOutcome::Reorder(_) | IterationOutcome::RateLimit => {
@@ -2053,6 +2094,100 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         worktree_path: actual_worktree_path,
         branch_name: branch_name.clone(),
         was_stopped,
+    }
+}
+
+/// Context parameters for `trigger_human_reviews`.
+struct HumanReviewParams<'a> {
+    completion_epoch_start: i64,
+    iteration: u32,
+    session_guidance: &'a mut SessionGuidance,
+    prd_file: &'a Path,
+    task_prefix: Option<&'a str>,
+    default_model: Option<&'a str>,
+    permission_mode: &'a PermissionMode,
+}
+
+/// Query tasks that need human review for the current iteration.
+///
+/// Returns `(id, title, notes, timeout_secs)` tuples for all `requires_human=1` tasks
+/// with `status='done'` and `completed_at >= epoch_start`. This captures every completion
+/// path (tag detection, git commit, output scan, external reconciliation) because they all
+/// write the same DB state; the caller filters by timestamp to skip pre-completed tasks.
+///
+/// Exposed as `pub(crate)` so tests can verify query semantics without stdin interaction.
+pub(crate) fn query_human_review_tasks(
+    conn: &Connection,
+    epoch_start: i64,
+) -> Vec<(String, String, Option<String>, Option<u32>)> {
+    match conn.prepare(
+        "SELECT id, title, notes, human_review_timeout \
+         FROM tasks \
+         WHERE requires_human = 1 AND status = 'done' \
+         AND CAST(strftime('%s', completed_at) AS INTEGER) >= ?",
+    ) {
+        Ok(mut stmt) => match stmt.query_map([epoch_start], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?
+                    .and_then(|v| u32::try_from(v).ok()),
+            ))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                eprintln!("Warning: could not execute human review query: {}", e);
+                vec![]
+            }
+        },
+        Err(e) => {
+            eprintln!("Warning: could not prepare human review query: {}", e);
+            vec![]
+        }
+    }
+}
+
+/// Trigger interactive human review for any `requires_human` tasks completed this iteration.
+///
+/// Queries tasks completed at or after `completion_epoch_start` to capture all detection
+/// paths (tags, git, output scan, external reconciliation). For each such task, calls
+/// `handle_human_review` and — if feedback was provided — calls `mutate_prd_from_feedback`
+/// to update downstream tasks.
+fn trigger_human_reviews(conn: &Connection, params: HumanReviewParams<'_>) {
+    let HumanReviewParams {
+        completion_epoch_start,
+        iteration,
+        session_guidance,
+        prd_file,
+        task_prefix,
+        default_model,
+        permission_mode,
+    } = params;
+
+    let review_tasks = query_human_review_tasks(conn, completion_epoch_start);
+
+    for (task_id, title, notes, timeout) in review_tasks {
+        let had_feedback = handle_human_review(
+            io::BufReader::new(io::stdin()),
+            &task_id,
+            &title,
+            notes.as_deref(),
+            iteration,
+            session_guidance,
+            timeout,
+        );
+        if had_feedback {
+            let feedback = session_guidance.last_text().unwrap_or("").to_string();
+            prd_reconcile::mutate_prd_from_feedback(
+                prd_file,
+                &feedback,
+                conn,
+                task_prefix,
+                default_model,
+                permission_mode,
+            );
+        }
     }
 }
 
@@ -2585,7 +2720,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
-    use crate::loop_engine::test_utils::setup_test_db;
+    use crate::loop_engine::test_utils::{setup_test_db, EnvGuard};
 
     // --- pre_lock_prefix fallback tests ---
 
@@ -2862,11 +2997,7 @@ mod tests {
         assert_eq!(count, 1, "Should reset exactly 1 in_progress task");
 
         // Verify T-001 is now todo
-        let status: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 'T-001'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "T-001");
         assert_eq!(status, "todo");
     }
 
@@ -2891,16 +3022,8 @@ mod tests {
         assert_eq!(count, 0, "Should not touch done or irrelevant tasks");
 
         // Verify statuses unchanged
-        let status1: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 'T-001'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let status2: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 'T-002'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
+        let status1 = crate::loop_engine::test_utils::get_task_status(&conn, "T-001");
+        let status2 = crate::loop_engine::test_utils::get_task_status(&conn, "T-002");
         assert_eq!(status1, "done");
         assert_eq!(status2, "irrelevant");
     }
@@ -3024,35 +3147,17 @@ mod tests {
         assert_eq!(recovered, 1, "Should recover exactly 1 in_progress task");
 
         // Verify the task was reset
-        let status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'FEAT-001'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
         assert_eq!(status, "todo", "in_progress task should be reset to todo");
 
         // Verify other tasks are unaffected
-        let blocked_status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'FEAT-002'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let blocked_status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-002");
         assert_eq!(
             blocked_status, "blocked",
             "Blocked task should be unaffected"
         );
 
-        let done_status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'FEAT-003'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let done_status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-003");
         assert_eq!(done_status, "done", "Done task should be unaffected");
     }
 
@@ -3297,46 +3402,47 @@ mod tests {
         .unwrap();
     }
 
-    // --- Initial recovery scoping ---
-
-    #[test]
-    fn test_initial_recovery_resets_only_p1_in_progress() {
+    /// Build the full SQL and params for a prefix-scoped query, then call `execute_fn`.
+    ///
+    /// Eliminates the `prefix_and` → `format!` → params-Vec boilerplate shared by
+    /// the initial-recovery and remaining-count prefix scope tests.
+    fn run_with_prefix<T>(
+        sql_template: &str,
+        prefix: Option<&str>,
+        execute_fn: impl FnOnce(&str, &[&dyn rusqlite::types::ToSql]) -> T,
+    ) -> T {
         use crate::db::prefix::prefix_and;
-
-        let (_temp_dir, conn) = setup_test_db();
-        insert_dual_prd_tasks(&conn);
-
-        // Simulate initial recovery with P1 prefix (as done in run_loop)
-        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
-        let sql = format!(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
-        );
+        let (pfx_clause, pfx_param) = prefix_and(prefix);
+        let sql = format!("{sql_template} {pfx_clause}");
         let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
             Some(p) => vec![p],
             None => vec![],
         };
-        let count = conn.execute(&sql, params.as_slice()).unwrap();
+        execute_fn(&sql, params.as_slice())
+    }
+
+    // --- Initial recovery scoping ---
+
+    #[test]
+    fn test_initial_recovery_resets_only_p1_in_progress() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_dual_prd_tasks(&conn);
+
+        // Simulate initial recovery with P1 prefix (as done in run_loop)
+        let count = run_with_prefix(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
+            Some("P1"),
+            |sql, params| conn.execute(sql, params).unwrap(),
+        );
 
         assert_eq!(count, 1, "Should reset only P1's in_progress task");
 
         // P1-TASK-001 should now be todo
-        let p1_status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'P1-TASK-001'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let p1_status = crate::loop_engine::test_utils::get_task_status(&conn, "P1-TASK-001");
         assert_eq!(p1_status, "todo");
 
         // P2-TASK-001 must still be in_progress — untouched by P1 recovery
-        let p2_status: String = conn
-            .query_row(
-                "SELECT status FROM tasks WHERE id = 'P2-TASK-001'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let p2_status = crate::loop_engine::test_utils::get_task_status(&conn, "P2-TASK-001");
         assert_eq!(
             p2_status, "in_progress",
             "P2 task must not be affected by P1 recovery"
@@ -3345,21 +3451,15 @@ mod tests {
 
     #[test]
     fn test_initial_recovery_none_prefix_resets_all_in_progress() {
-        use crate::db::prefix::prefix_and;
-
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
 
         // None prefix → no WHERE clause addition → resets all in_progress
-        let (pfx_clause, pfx_param) = prefix_and(None);
-        let sql = format!(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress' {pfx_clause}"
+        let count = run_with_prefix(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE status = 'in_progress'",
+            None,
+            |sql, params| conn.execute(sql, params).unwrap(),
         );
-        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
-            Some(p) => vec![p],
-            None => vec![],
-        };
-        let count = conn.execute(&sql, params.as_slice()).unwrap();
 
         assert_eq!(
             count, 2,
@@ -3371,23 +3471,15 @@ mod tests {
 
     #[test]
     fn test_remaining_count_scoped_to_p1() {
-        use crate::db::prefix::prefix_and;
-
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
 
         // Count remaining (not done/irrelevant) for P1 only
-        let (pfx_clause, pfx_param) = prefix_and(Some("P1"));
-        let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
+        let remaining: i64 = run_with_prefix(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL",
+            Some("P1"),
+            |sql, params| conn.query_row(sql, params, |row| row.get(0)).unwrap(),
         );
-        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
-            Some(p) => vec![p],
-            None => vec![],
-        };
-        let remaining: i64 = conn
-            .query_row(&sql, params.as_slice(), |row| row.get(0))
-            .unwrap();
 
         // P1 has in_progress + todo = 2 remaining (P1-TASK-003 is done)
         assert_eq!(remaining, 2, "P1 remaining should be 2 (not counting P2)");
@@ -3395,22 +3487,14 @@ mod tests {
 
     #[test]
     fn test_remaining_count_none_prefix_counts_all() {
-        use crate::db::prefix::prefix_and;
-
         let (_temp_dir, conn) = setup_test_db();
         insert_dual_prd_tasks(&conn);
 
-        let (pfx_clause, pfx_param) = prefix_and(None);
-        let sql = format!(
-            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
+        let remaining: i64 = run_with_prefix(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL",
+            None,
+            |sql, params| conn.query_row(sql, params, |row| row.get(0)).unwrap(),
         );
-        let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
-            Some(p) => vec![p],
-            None => vec![],
-        };
-        let remaining: i64 = conn
-            .query_row(&sql, params.as_slice(), |row| row.get(0))
-            .unwrap();
 
         // 4 tasks total (P1: 2 + P2: 2), done is excluded
         assert_eq!(remaining, 4, "None prefix should count all remaining tasks");
@@ -3480,10 +3564,9 @@ mod tests {
     #[test]
     fn test_hint_fires_when_available_true_and_mode_scoped() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let _env = EnvGuard::set("LOOP_AUTO_MODE_AVAILABLE", "true");
         let mode = config::PermissionMode::text_only();
         let fires = hint_should_fire(&mode);
-        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
         assert!(
             fires,
             "Hint should fire when available=true and mode=Scoped"
@@ -3493,10 +3576,9 @@ mod tests {
     #[test]
     fn test_hint_fires_when_available_true_and_mode_dangerous() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let _env = EnvGuard::set("LOOP_AUTO_MODE_AVAILABLE", "true");
         let mode = config::PermissionMode::Dangerous;
         let fires = hint_should_fire(&mode);
-        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
         assert!(
             fires,
             "Hint should fire when available=true and mode=Dangerous"
@@ -3506,7 +3588,7 @@ mod tests {
     #[test]
     fn test_hint_does_not_fire_when_available_unset() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
+        let _env = EnvGuard::remove("LOOP_AUTO_MODE_AVAILABLE");
         let mode = config::PermissionMode::text_only();
         assert!(
             !hint_should_fire(&mode),
@@ -3517,22 +3599,20 @@ mod tests {
     #[test]
     fn test_hint_does_not_fire_when_available_false() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "false");
+        let _env = EnvGuard::set("LOOP_AUTO_MODE_AVAILABLE", "false");
         let mode = config::PermissionMode::text_only();
         let fires = hint_should_fire(&mode);
-        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
         assert!(!fires, "Hint must not fire when available=false");
     }
 
     #[test]
     fn test_hint_does_not_fire_when_mode_is_auto() {
         let _guard = HINT_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_AUTO_MODE_AVAILABLE", "true");
+        let _env = EnvGuard::set("LOOP_AUTO_MODE_AVAILABLE", "true");
         let mode = config::PermissionMode::Auto {
             allowed_tools: None,
         };
         let fires = hint_should_fire(&mode);
-        std::env::remove_var("LOOP_AUTO_MODE_AVAILABLE");
         assert!(!fires, "Hint must not fire when mode is already Auto");
     }
 
@@ -3964,6 +4044,163 @@ mod tests {
             model,
             Some(OPUS_MODEL.to_string()),
             "opus model in DB must remain opus"
+        );
+    }
+
+    // --- query_human_review_tasks tests (TEST-001) ---
+
+    /// Helper: insert a task with requires_human flag and a specific completed_at timestamp.
+    ///
+    /// `completed_at` is an ISO-8601 string (e.g. `datetime('now', '-10 seconds')` evaluated
+    /// beforehand, or a literal like `"2020-01-01T00:00:00"`).
+    fn insert_requires_human_task(
+        conn: &Connection,
+        id: &str,
+        requires_human: i32,
+        completed_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, requires_human, completed_at) \
+             VALUES (?, ?, 'done', 10, ?, ?)",
+            rusqlite::params![id, format!("Task {id}"), requires_human, completed_at],
+        )
+        .unwrap();
+    }
+
+    /// Returns the current Unix epoch as i64.
+    fn now_epoch() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Task with requires_human=0 must NOT appear in query results (criterion 8).
+    #[test]
+    fn test_human_review_query_no_requires_human_skipped() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        insert_requires_human_task(&conn, "T-NRH", 0, "2099-01-01T12:00:00");
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert!(
+            tasks.is_empty(),
+            "requires_human=0 task must not be returned by human review query"
+        );
+    }
+
+    /// Task with requires_human=1 and recent completed_at must be returned (criteria 1-4).
+    ///
+    /// All completion detection paths (tag, git commit, output scan, external reconciliation)
+    /// write the same DB state: status='done' + completed_at=<now>. The query selects by
+    /// timestamp, so this single test covers all four detection paths.
+    #[test]
+    fn test_human_review_query_recent_completion_returned() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        // completed_at in the future (well after epoch) simulates "completed this iteration"
+        insert_requires_human_task(&conn, "T-RH", 1, "2099-01-01T12:00:00");
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert_eq!(tasks.len(), 1, "one requires_human=1 task must be returned");
+        assert_eq!(tasks[0].0, "T-RH");
+        assert_eq!(tasks[0].1, "Task T-RH");
+    }
+
+    /// Task completed before epoch (pre-completed at import) must be skipped (criterion 6).
+    #[test]
+    fn test_human_review_query_precompeted_task_skipped() {
+        let (_dir, conn) = setup_test_db();
+        // epoch = now; completed_at = far in the past → completed_at epoch < epoch
+        let epoch = now_epoch();
+        insert_requires_human_task(&conn, "T-OLD", 1, "2000-01-01T00:00:00");
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert!(
+            tasks.is_empty(),
+            "task completed before epoch (pre-completed at import) must be skipped"
+        );
+    }
+
+    /// Multiple requires_human=1 tasks completed this iteration must all be returned (criterion 7).
+    ///
+    /// Each task in the returned list will be passed to handle_human_review in trigger_human_reviews,
+    /// so returning all tasks here guarantees each gets reviewed.
+    #[test]
+    fn test_human_review_query_multiple_tasks_all_returned() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        insert_requires_human_task(&conn, "T-A", 1, "2099-01-01T12:00:00");
+        insert_requires_human_task(&conn, "T-B", 1, "2099-01-01T12:00:01");
+        insert_requires_human_task(&conn, "T-C", 1, "2099-01-01T12:00:02");
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert_eq!(
+            tasks.len(),
+            3,
+            "all three requires_human=1 tasks must be returned"
+        );
+        let ids: Vec<&str> = tasks.iter().map(|(id, _, _, _)| id.as_str()).collect();
+        assert!(ids.contains(&"T-A"), "T-A must be in results");
+        assert!(ids.contains(&"T-B"), "T-B must be in results");
+        assert!(ids.contains(&"T-C"), "T-C must be in results");
+    }
+
+    /// Mix of requires_human=1 and requires_human=0: only the flagged task is returned.
+    #[test]
+    fn test_human_review_query_mixed_flags_only_flagged_returned() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        insert_requires_human_task(&conn, "T-YES", 1, "2099-01-01T12:00:00");
+        insert_requires_human_task(&conn, "T-NO", 0, "2099-01-01T12:00:00");
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "only requires_human=1 task must be returned"
+        );
+        assert_eq!(tasks[0].0, "T-YES");
+    }
+
+    /// yes_mode does NOT suppress human review for requiresHuman tasks (criterion 5).
+    ///
+    /// `query_human_review_tasks` (and by extension `trigger_human_reviews`) has no
+    /// yes_mode parameter — the review is unconditional. This test documents that a
+    /// requires_human=1 task is always returned regardless of run configuration.
+    #[test]
+    fn test_human_review_yes_mode_not_gated() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        insert_requires_human_task(&conn, "T-BATCH", 1, "2099-01-01T12:00:00");
+
+        // Simulate yes_mode=true: query_human_review_tasks takes no yes_mode parameter,
+        // so it always returns requiresHuman tasks — yes_mode cannot suppress the review.
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "requiresHuman task must be returned even in yes_mode (no mode gate in query)"
+        );
+    }
+
+    /// Task with status != 'done' must not be returned even if requires_human=1.
+    #[test]
+    fn test_human_review_query_non_done_status_skipped() {
+        let (_dir, conn) = setup_test_db();
+        let epoch = now_epoch() - 100;
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, requires_human) \
+             VALUES ('T-IP', 'Task T-IP', 'in_progress', 10, 1)",
+            [],
+        )
+        .unwrap();
+
+        let tasks = query_human_review_tasks(&conn, epoch);
+        assert!(
+            tasks.is_empty(),
+            "in_progress task must not trigger human review (status != 'done')"
         );
     }
 

@@ -6,18 +6,14 @@
 //!
 //! # Function signatures
 //!
-//! | Function                  | Path argument(s)                       | Returns           |
-//! |---------------------------|----------------------------------------|-------------------|
-//! | `check_default_mode`      | `settings_path: &Path`                 | `SetupCheck`      |
-//! | `check_deny_conflicts`    | `settings_path: &Path`                 | `Vec<SetupCheck>` |
-//! | `check_hook_bypass`       | `hook_path: &Path`                     | `SetupCheck`      |
-//! | `check_skills_installed`  | `global_dir: &Path, expected: &[&str]` | `Vec<SetupCheck>` |
-//! | `check_project_config`    | `db_dir: &Path`                        | `SetupCheck`      |
-//! | `check_claude_md`         | `project_dir: &Path`                   | `SetupCheck`      |
+//! All check functions take `&CheckContext` (path bundle) as their first argument.
+//! `check_skills_installed` also takes `expected: &[&str]` as a second argument.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::commands::doctor::setup_output::{SetupCategory, SetupCheck, SetupSeverity};
+use crate::commands::doctor::setup_output::{
+    CheckContext, SetupCategory, SetupCheck, SetupSeverity,
+};
 use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
 
 /// Read and parse `settings_path`.
@@ -60,9 +56,10 @@ pub const EXPECTED_SKILLS: &[&str] = &[
 /// - `Blocker` if `defaultMode` is `"default"`
 /// - `Pass` if `defaultMode` is absent, `"auto"`, or any other non-blocking value
 /// - `Warning` if `settings.json` exists but cannot be read or parsed
-pub fn check_default_mode(settings_path: &Path) -> SetupCheck {
+pub fn check_default_mode(ctx: &CheckContext) -> SetupCheck {
     let name = "default_mode".to_string();
     let category = SetupCategory::Permissions;
+    let settings_path = &ctx.settings_path;
 
     let json = match read_settings_json(settings_path) {
         Ok(None) => {
@@ -138,7 +135,8 @@ pub fn check_default_mode(settings_path: &Path) -> SetupCheck {
 /// # Returns
 /// One `Blocker` `SetupCheck` per conflicting deny rule. Returns an empty `Vec`
 /// when there are no conflicts, or when `settings.json` is absent/unreadable.
-pub fn check_deny_conflicts(settings_path: &Path) -> Vec<SetupCheck> {
+pub fn check_deny_conflicts(ctx: &CheckContext) -> Vec<SetupCheck> {
+    let settings_path = &ctx.settings_path;
     let json = match read_settings_json(settings_path) {
         Ok(Some(v)) => v,
         _ => return Vec::new(),
@@ -234,9 +232,10 @@ fn deny_rule_conflicts_with(deny_rule: &str, allowed_tool: &str) -> bool {
 /// - `Pass` if the hook contains `LOOP_ALLOW_DESTRUCTIVE`
 /// - `Warning` if the hook exists but does not contain the bypass
 /// - `Warning` if the hook file cannot be read
-pub fn check_hook_bypass(hook_path: &Path) -> SetupCheck {
+pub fn check_hook_bypass(ctx: &CheckContext) -> SetupCheck {
     let name = "hook_bypass".to_string();
     let category = SetupCategory::Hooks;
+    let hook_path = &ctx.hook_path;
 
     if !hook_path.exists() {
         return SetupCheck {
@@ -287,13 +286,14 @@ pub fn check_hook_bypass(hook_path: &Path) -> SetupCheck {
     }
 }
 
-/// Check that each expected skill is installed in `global_dir` (typically
+/// Check that each expected skill is installed in `ctx.commands_dir` (typically
 /// `~/.claude/commands/`).
 ///
 /// # Returns
 /// One `SetupCheck` per skill: `Pass` when present, `Warning` with a
 /// copy-pasteable install command when absent.
-pub fn check_skills_installed(global_dir: &Path, expected: &[&str]) -> Vec<SetupCheck> {
+pub fn check_skills_installed(ctx: &CheckContext, expected: &[&str]) -> Vec<SetupCheck> {
+    let global_dir = &ctx.commands_dir;
     expected
         .iter()
         .map(|name| {
@@ -321,7 +321,7 @@ pub fn check_skills_installed(global_dir: &Path, expected: &[&str]) -> Vec<Setup
         .collect()
 }
 
-/// Check that `.task-mgr/config.json` exists in `db_dir`.
+/// Check that `.task-mgr/config.json` exists in `ctx.db_dir`.
 ///
 /// The project config file enables project-specific tool allowlists and
 /// configuration for the loop engine.
@@ -329,7 +329,8 @@ pub fn check_skills_installed(global_dir: &Path, expected: &[&str]) -> Vec<Setup
 /// # Returns
 /// - `Pass` when `db_dir/config.json` exists
 /// - `Warning` when it is absent
-pub fn check_project_config(db_dir: &Path) -> SetupCheck {
+pub fn check_project_config(ctx: &CheckContext) -> SetupCheck {
+    let db_dir = &ctx.db_dir;
     let config_path = db_dir.join("config.json");
     if config_path.exists() {
         SetupCheck {
@@ -355,7 +356,7 @@ pub fn check_project_config(db_dir: &Path) -> SetupCheck {
     }
 }
 
-/// Check that `CLAUDE.md` exists in `project_dir`.
+/// Check that `CLAUDE.md` exists in `ctx.project_dir`.
 ///
 /// `CLAUDE.md` provides project-specific instructions to Claude. Its absence
 /// is informational — the loop will still work, but Claude won't have project
@@ -364,7 +365,8 @@ pub fn check_project_config(db_dir: &Path) -> SetupCheck {
 /// # Returns
 /// - `Pass` when `project_dir/CLAUDE.md` exists
 /// - `Info` when it is absent
-pub fn check_claude_md(project_dir: &Path) -> SetupCheck {
+pub fn check_claude_md(ctx: &CheckContext) -> SetupCheck {
+    let project_dir = &ctx.project_dir;
     let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
         SetupCheck {
@@ -390,6 +392,54 @@ pub fn check_claude_md(project_dir: &Path) -> SetupCheck {
     }
 }
 
+// ─── SetupCheckRegistry ─────────────────────────────────────────────────────
+
+/// A registry of setup check functions.
+///
+/// Each entry is a function pointer `fn(&CheckContext) -> Vec<SetupCheck>`.
+/// Single-result checks are wrapped by private adapter functions to fit the
+/// uniform `Vec`-returning signature.
+pub struct SetupCheckRegistry(pub Vec<fn(&CheckContext) -> Vec<SetupCheck>>);
+
+impl SetupCheckRegistry {
+    /// Run every registered check and return all results in registration order.
+    pub fn run_all(&self, ctx: &CheckContext) -> Vec<SetupCheck> {
+        self.0.iter().flat_map(|f| f(ctx)).collect()
+    }
+}
+
+fn check_default_mode_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+    vec![check_default_mode(ctx)]
+}
+
+fn check_hook_bypass_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+    vec![check_hook_bypass(ctx)]
+}
+
+fn check_project_config_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+    vec![check_project_config(ctx)]
+}
+
+fn check_claude_md_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+    vec![check_claude_md(ctx)]
+}
+
+fn check_skills_installed_default(ctx: &CheckContext) -> Vec<SetupCheck> {
+    check_skills_installed(ctx, EXPECTED_SKILLS)
+}
+
+/// Build the default registry containing all 6 setup checks.
+pub fn default_registry() -> SetupCheckRegistry {
+    SetupCheckRegistry(vec![
+        check_default_mode_vec,
+        check_deny_conflicts,
+        check_hook_bypass_vec,
+        check_skills_installed_default,
+        check_project_config_vec,
+        check_claude_md_vec,
+    ])
+}
+
 /// Run blocker-level pre-checks for loop startup on a new task list.
 ///
 /// Checks only `defaultMode` and deny conflicts — the two settings that can
@@ -405,10 +455,16 @@ pub fn check_claude_md(project_dir: &Path) -> SetupCheck {
 /// filter for [`SetupSeverity::Blocker`] entries to decide whether to emit
 /// a warning banner.
 pub fn pre_check_loop_setup(global_dir: &Path) -> Vec<SetupCheck> {
-    let settings_path = global_dir.join("settings.json");
+    let ctx = CheckContext {
+        settings_path: global_dir.join("settings.json"),
+        hook_path: PathBuf::new(),
+        commands_dir: PathBuf::new(),
+        db_dir: PathBuf::new(),
+        project_dir: PathBuf::new(),
+    };
     let mut checks = Vec::new();
-    checks.push(check_default_mode(&settings_path));
-    checks.extend(check_deny_conflicts(&settings_path));
+    checks.push(check_default_mode(&ctx));
+    checks.extend(check_deny_conflicts(&ctx));
     checks
 }
 
@@ -427,6 +483,58 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // ─── test helpers ─────────────────────────────────────────────────────────
+
+    fn ctx_settings(settings_path: PathBuf) -> CheckContext {
+        CheckContext {
+            settings_path,
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir: PathBuf::new(),
+            project_dir: PathBuf::new(),
+        }
+    }
+
+    fn ctx_hook(hook_path: PathBuf) -> CheckContext {
+        CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path,
+            commands_dir: PathBuf::new(),
+            db_dir: PathBuf::new(),
+            project_dir: PathBuf::new(),
+        }
+    }
+
+    fn ctx_commands(commands_dir: PathBuf) -> CheckContext {
+        CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir,
+            db_dir: PathBuf::new(),
+            project_dir: PathBuf::new(),
+        }
+    }
+
+    fn ctx_db(db_dir: PathBuf) -> CheckContext {
+        CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir,
+            project_dir: PathBuf::new(),
+        }
+    }
+
+    fn ctx_project(project_dir: PathBuf) -> CheckContext {
+        CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir: PathBuf::new(),
+            project_dir,
+        }
+    }
+
     // ─── check_default_mode ───────────────────────────────────────────────────
 
     /// `defaultMode: "default"` must produce a Blocker with a fix command.
@@ -439,7 +547,7 @@ mod tests {
             r#"{"permissions":{"defaultMode":"default"}}"#,
         );
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(
             check.severity,
@@ -465,7 +573,7 @@ mod tests {
             r#"{"permissions":{"defaultMode":"auto"}}"#,
         );
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(
             check.severity,
@@ -482,7 +590,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -493,7 +601,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_fixture(dir.path(), "settings.json", "{}");
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -504,7 +612,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_fixture(dir.path(), "settings.json", "{not valid json");
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(check.severity, SetupSeverity::Warning);
     }
@@ -519,7 +627,7 @@ mod tests {
             r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
         );
 
-        let check = check_default_mode(&path);
+        let check = check_default_mode(&ctx_settings(path));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -537,7 +645,7 @@ mod tests {
             r#"{"permissions":{"deny":["Bash(cargo:*)"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(!checks.is_empty(), "expected at least one conflict");
         assert!(
@@ -561,7 +669,7 @@ mod tests {
             r#"{"permissions":{"deny":["SomeUnknownTool"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(
             checks.is_empty(),
@@ -580,7 +688,7 @@ mod tests {
             r#"{"permissions":{"deny":["Bash"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(
             !checks.is_empty(),
@@ -606,7 +714,7 @@ mod tests {
             r#"{"permissions":{"deny":["Bash(*)"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(
             !checks.is_empty(),
@@ -628,7 +736,7 @@ mod tests {
             r#"{"permissions":{"deny":["FooTool"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(
             checks.is_empty(),
@@ -642,7 +750,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(checks.is_empty());
     }
@@ -657,7 +765,7 @@ mod tests {
             r#"{"permissions":{"deny":[]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert!(checks.is_empty());
     }
@@ -673,7 +781,7 @@ mod tests {
             r#"{"permissions":{"deny":["Read","Bash(git:*)"]}}"#,
         );
 
-        let checks = check_deny_conflicts(&path);
+        let checks = check_deny_conflicts(&ctx_settings(path));
 
         assert_eq!(checks.len(), 2, "expected one Blocker per conflicting rule");
         assert!(checks.iter().all(|c| c.severity == SetupSeverity::Blocker));
@@ -691,7 +799,7 @@ mod tests {
             "#!/bin/bash\necho 'guard hook'\n",
         );
 
-        let check = check_hook_bypass(&hook);
+        let check = check_hook_bypass(&ctx_hook(hook));
 
         assert_eq!(
             check.severity,
@@ -715,7 +823,7 @@ mod tests {
             "#!/bin/bash\n[ -n \"$LOOP_ALLOW_DESTRUCTIVE\" ] && exit 0\necho 'guard'\n",
         );
 
-        let check = check_hook_bypass(&hook);
+        let check = check_hook_bypass(&ctx_hook(hook));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -726,7 +834,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let hook = dir.path().join("guard-destructive.sh");
 
-        let check = check_hook_bypass(&hook);
+        let check = check_hook_bypass(&ctx_hook(hook));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -738,7 +846,10 @@ mod tests {
     fn test_check_skills_installed_fail_missing_skill_is_warning_with_command() {
         let dir = TempDir::new().unwrap();
 
-        let checks = check_skills_installed(dir.path(), &["tm-apply", "tm-learn"]);
+        let checks = check_skills_installed(
+            &ctx_commands(dir.path().to_path_buf()),
+            &["tm-apply", "tm-learn"],
+        );
 
         assert_eq!(checks.len(), 2);
         for check in &checks {
@@ -761,7 +872,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_fixture(dir.path(), "tm-apply.md", "# tm-apply");
 
-        let checks = check_skills_installed(dir.path(), &["tm-apply"]);
+        let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &["tm-apply"]);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].severity, SetupSeverity::Pass);
@@ -774,7 +885,10 @@ mod tests {
         write_fixture(dir.path(), "tm-apply.md", "# tm-apply");
         // tm-learn is absent
 
-        let checks = check_skills_installed(dir.path(), &["tm-apply", "tm-learn"]);
+        let checks = check_skills_installed(
+            &ctx_commands(dir.path().to_path_buf()),
+            &["tm-apply", "tm-learn"],
+        );
 
         assert_eq!(checks.len(), 2);
         let pass_count = checks
@@ -794,7 +908,7 @@ mod tests {
     fn test_check_skills_installed_pass_empty_expected_is_empty() {
         let dir = TempDir::new().unwrap();
 
-        let checks = check_skills_installed(dir.path(), &[]);
+        let checks = check_skills_installed(&ctx_commands(dir.path().to_path_buf()), &[]);
 
         assert!(checks.is_empty());
     }
@@ -806,7 +920,7 @@ mod tests {
     fn test_check_project_config_fail_missing_is_warning() {
         let dir = TempDir::new().unwrap();
 
-        let check = check_project_config(dir.path());
+        let check = check_project_config(&ctx_db(dir.path().to_path_buf()));
 
         assert_eq!(
             check.severity,
@@ -823,7 +937,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_fixture(dir.path(), "config.json", "{}");
 
-        let check = check_project_config(dir.path());
+        let check = check_project_config(&ctx_db(dir.path().to_path_buf()));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -836,7 +950,7 @@ mod tests {
     fn test_check_claude_md_fail_missing_is_info() {
         let dir = TempDir::new().unwrap();
 
-        let check = check_claude_md(dir.path());
+        let check = check_claude_md(&ctx_project(dir.path().to_path_buf()));
 
         assert_eq!(
             check.severity,
@@ -852,7 +966,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_fixture(dir.path(), "CLAUDE.md", "# project");
 
-        let check = check_claude_md(dir.path());
+        let check = check_claude_md(&ctx_project(dir.path().to_path_buf()));
 
         assert_eq!(check.severity, SetupSeverity::Pass);
     }
@@ -913,10 +1027,15 @@ mod tests {
 
         // ── assert all Pass ──
 
-        let settings_path = claude_dir.join("settings.json");
-        let hook_path = hooks_dir.join("guard-destructive.sh");
+        let ctx = CheckContext {
+            settings_path: claude_dir.join("settings.json"),
+            hook_path: hooks_dir.join("guard-destructive.sh"),
+            commands_dir: commands_dir.clone(),
+            db_dir: db_dir.clone(),
+            project_dir: project.path().to_path_buf(),
+        };
 
-        let mode_check = check_default_mode(&settings_path);
+        let mode_check = check_default_mode(&ctx);
         assert_eq!(
             mode_check.severity,
             SetupSeverity::Pass,
@@ -924,13 +1043,13 @@ mod tests {
             mode_check.message
         );
 
-        let deny_checks = check_deny_conflicts(&settings_path);
+        let deny_checks = check_deny_conflicts(&ctx);
         assert!(
             deny_checks.is_empty(),
             "no deny conflicts expected, got: {deny_checks:?}"
         );
 
-        let hook_check = check_hook_bypass(&hook_path);
+        let hook_check = check_hook_bypass(&ctx);
         assert_eq!(
             hook_check.severity,
             SetupSeverity::Pass,
@@ -938,7 +1057,7 @@ mod tests {
             hook_check.message
         );
 
-        let skill_checks = check_skills_installed(&commands_dir, EXPECTED_SKILLS);
+        let skill_checks = check_skills_installed(&ctx, EXPECTED_SKILLS);
         for check in &skill_checks {
             assert_eq!(
                 check.severity,
@@ -949,7 +1068,7 @@ mod tests {
             );
         }
 
-        let config_check = check_project_config(&db_dir);
+        let config_check = check_project_config(&ctx);
         assert_eq!(
             config_check.severity,
             SetupSeverity::Pass,
@@ -957,7 +1076,7 @@ mod tests {
             config_check.message
         );
 
-        let claude_md_check = check_claude_md(project.path());
+        let claude_md_check = check_claude_md(&ctx);
         assert_eq!(
             claude_md_check.severity,
             SetupSeverity::Pass,
@@ -1036,6 +1155,170 @@ mod tests {
         assert!(
             checks.iter().all(|c| c.severity != SetupSeverity::Blocker),
             "clean settings must have no Blockers: {checks:?}"
+        );
+    }
+
+    // ─── SetupCheckRegistry ───────────────────────────────────────────────────
+
+    /// A custom registry containing only `check_project_config` and
+    /// `check_claude_md` must produce exactly those two results and nothing else.
+    #[test]
+    fn test_custom_registry_with_subset_produces_only_those_results() {
+        let dir = TempDir::new().unwrap();
+        let db_dir = dir.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let ctx = CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir,
+            project_dir: dir.path().to_path_buf(),
+        };
+
+        fn project_config_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+            vec![check_project_config(ctx)]
+        }
+        fn claude_md_vec(ctx: &CheckContext) -> Vec<SetupCheck> {
+            vec![check_claude_md(ctx)]
+        }
+
+        let registry = SetupCheckRegistry(vec![project_config_vec, claude_md_vec]);
+        let results = registry.run_all(&ctx);
+
+        assert_eq!(
+            results.len(),
+            2,
+            "subset registry must produce exactly 2 results"
+        );
+        assert_eq!(results[0].name, "project_config");
+        assert_eq!(results[1].name, "claude_md");
+    }
+
+    /// `default_registry()` must contain exactly 8+ results for a minimal project
+    /// (1 default_mode + 0 deny conflicts + 1 hook_bypass + 6 skills + 1 project_config + 1 claude_md).
+    #[test]
+    fn test_default_registry_runs_all_checks() {
+        let dir = TempDir::new().unwrap();
+        let db_dir = dir.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let commands_dir = dir.path().join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let ctx = CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir,
+            db_dir,
+            project_dir: dir.path().to_path_buf(),
+        };
+
+        let results = default_registry().run_all(&ctx);
+
+        // 1 default_mode + 1 hook_bypass + 6 skills + 1 project_config + 1 claude_md = 10
+        assert!(
+            results.len() >= 10,
+            "default registry must run all 6 check groups, got {} results",
+            results.len()
+        );
+
+        let names: Vec<&str> = results.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"default_mode"),
+            "missing default_mode check"
+        );
+        assert!(names.contains(&"hook_bypass"), "missing hook_bypass check");
+        assert!(
+            names.contains(&"project_config"),
+            "missing project_config check"
+        );
+        assert!(names.contains(&"claude_md"), "missing claude_md check");
+    }
+
+    /// An empty registry is valid and must return an empty `Vec`.
+    #[test]
+    fn test_empty_registry_returns_empty_vec() {
+        let ctx = CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir: PathBuf::new(),
+            project_dir: PathBuf::new(),
+        };
+
+        let registry = SetupCheckRegistry(vec![]);
+        let results = registry.run_all(&ctx);
+
+        assert!(results.is_empty(), "empty registry must return empty Vec");
+    }
+
+    /// A registry containing only `check_claude_md` must return exactly one
+    /// result whose category is `Documentation`.
+    #[test]
+    fn test_single_check_registry_returns_only_that_check() {
+        let dir = TempDir::new().unwrap();
+
+        let ctx = CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir: PathBuf::new(),
+            db_dir: PathBuf::new(),
+            project_dir: dir.path().to_path_buf(),
+        };
+
+        fn only_claude_md(ctx: &CheckContext) -> Vec<SetupCheck> {
+            vec![check_claude_md(ctx)]
+        }
+
+        let registry = SetupCheckRegistry(vec![only_claude_md]);
+        let results = registry.run_all(&ctx);
+
+        assert_eq!(
+            results.len(),
+            1,
+            "single-check registry must return 1 result"
+        );
+        assert_eq!(
+            results[0].category,
+            SetupCategory::Documentation,
+            "check_claude_md must have Documentation category"
+        );
+        assert_eq!(results[0].name, "claude_md");
+    }
+
+    /// Running the default registry twice on the same context must produce
+    /// results in the same order.
+    #[test]
+    fn test_registry_ordering_is_deterministic() {
+        let dir = TempDir::new().unwrap();
+        let db_dir = dir.path().join(".task-mgr");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let commands_dir = dir.path().join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let ctx = CheckContext {
+            settings_path: PathBuf::new(),
+            hook_path: PathBuf::new(),
+            commands_dir,
+            db_dir,
+            project_dir: dir.path().to_path_buf(),
+        };
+
+        let run1: Vec<String> = default_registry()
+            .run_all(&ctx)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let run2: Vec<String> = default_registry()
+            .run_all(&ctx)
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        assert_eq!(
+            run1, run2,
+            "registry results must be in the same order across runs"
         );
     }
 }

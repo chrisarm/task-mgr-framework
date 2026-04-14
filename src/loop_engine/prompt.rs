@@ -779,6 +779,7 @@ mod tests {
             model: None,
             difficulty: None,
             escalation_note: None,
+            requires_human: false,
             score: ScoreOutput {
                 total: 995,
                 priority: 995,
@@ -1597,6 +1598,7 @@ pub enum ApiError {
             model: Some("claude-opus-4-6".to_string()),
             difficulty: Some("high".to_string()),
             escalation_note: Some("Complex architectural task".to_string()),
+            requires_human: false,
             score: ScoreOutput {
                 total: 1003,
                 priority: 997,
@@ -1684,6 +1686,7 @@ pub enum ApiError {
             model: None,
             difficulty: None,
             escalation_note: None,
+            requires_human: false,
             score: ScoreOutput {
                 total: 999,
                 priority: 999,
@@ -1764,6 +1767,7 @@ pub enum ApiError {
             model: model.map(String::from),
             difficulty: difficulty.map(String::from),
             escalation_note: escalation_note.map(String::from),
+            requires_human: false,
             score: ScoreOutput {
                 total: 990,
                 priority: 990,

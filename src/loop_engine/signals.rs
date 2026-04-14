@@ -6,7 +6,7 @@
 ///
 /// Session guidance accumulation lives in [`super::guidance`].
 use std::fs;
-use std::io::{self, BufRead};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -81,27 +81,8 @@ pub fn handle_pause(
     eprintln!("║  Enter guidance (empty line to resume):  ║");
     eprintln!("╚══════════════════════════════════════════╝\n");
 
-    let mut lines = Vec::new();
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) if line.trim().is_empty() => break,
-            Ok(line) => lines.push(line),
-            Err(_) => break, // EOF or error
-        }
-    }
-
-    // Delete the session-specific or global .pause file
-    let pause_filename = match prefix {
-        Some(p) => format!("{PAUSE_FILE}-{p}"),
-        None => PAUSE_FILE.to_string(),
-    };
-    let pause_path = tasks_dir.join(&pause_filename);
-    if pause_path.exists() {
-        let _ = fs::remove_file(&pause_path);
-    }
+    let lines = read_lines_with_timeout(io::BufReader::new(io::stdin()), None);
+    let _ = fs::remove_file(pause_file_path(tasks_dir, prefix));
 
     let text = lines.join("\n");
     let has_guidance = !text.trim().is_empty();
@@ -215,6 +196,158 @@ pub fn pause_file_path(tasks_dir: &Path, prefix: Option<&str>) -> PathBuf {
     match prefix {
         Some(p) => tasks_dir.join(format!("{PAUSE_FILE}-{p}")),
         None => tasks_dir.join(PAUSE_FILE),
+    }
+}
+
+/// Handle a human review checkpoint after a `requires_human` task completes.
+///
+/// Displays a banner with `task_id`, `task_title`, and optional `task_notes`,
+/// then reads multi-line input from `reader` until an empty line or EOF.
+/// Guidance is tagged as `[Human Review for {task_id}] {input}` and added to
+/// `session_guidance`.
+///
+/// Returns `true` if guidance was provided, `false` if the user skipped or
+/// input was EOF.
+///
+/// `timeout_secs: None` or `Some(0)` means a blocking read (no timeout).
+/// `timeout_secs: Some(n)` where `n > 0` means return `false` after `n` seconds
+/// without input.
+///
+/// # Panics
+/// Never panics. EOF or I/O errors are treated as "no guidance provided".
+pub fn handle_human_review<R: io::BufRead + Send + 'static>(
+    reader: R,
+    task_id: &str,
+    task_title: &str,
+    task_notes: Option<&str>,
+    iteration: u32,
+    session_guidance: &mut SessionGuidance,
+    timeout_secs: Option<u32>,
+) -> bool {
+    let banner = format_human_review_banner(task_id, task_title, task_notes);
+    eprint!("{banner}");
+
+    let lines = read_lines_with_timeout(reader, timeout_secs);
+    let text = lines.join("\n");
+    let has_guidance = !text.trim().is_empty();
+
+    if has_guidance {
+        let tagged = format!("[Human Review for {task_id}] {text}");
+        eprintln!("Guidance recorded. Continuing...\n");
+        session_guidance.add(iteration, tagged);
+    } else {
+        eprintln!("Skipping human review (no input).\n");
+    }
+
+    has_guidance
+}
+
+/// Format the human review banner string for display.
+///
+/// Returns a multi-line string containing the banner with task ID, title,
+/// and notes (when present). The caller prints it to stderr.
+pub fn format_human_review_banner(
+    task_id: &str,
+    task_title: &str,
+    task_notes: Option<&str>,
+) -> String {
+    let sep = "═".repeat(44);
+    let mut banner = format!("\n╔{sep}╗\n");
+    banner.push_str("║           HUMAN REVIEW CHECKPOINT           ║\n");
+    banner.push_str(&format!("╠{sep}╣\n"));
+    banner.push_str(&format!("  Task:  {task_id}\n"));
+    banner.push_str(&format!("  Title: {task_title}\n"));
+    if let Some(notes) = task_notes {
+        banner.push_str(&format!("  Notes: {notes}\n"));
+    }
+    banner.push_str(&format!("╠{sep}╣\n"));
+    banner.push_str("  Enter feedback (empty line to skip):\n");
+    banner.push_str(&format!("╚{sep}╝\n"));
+    banner
+}
+
+/// Read lines from `reader` until an empty line or EOF, with optional timeout.
+///
+/// `timeout_secs: None` or `Some(0)` → blocking read.
+/// `timeout_secs: Some(n > 0)` → spawn reader thread; collect lines until timeout fires.
+pub(crate) fn read_lines_with_timeout<R: io::BufRead + Send + 'static>(
+    reader: R,
+    timeout_secs: Option<u32>,
+) -> Vec<String> {
+    match timeout_secs {
+        None | Some(0) => {
+            let mut lines = Vec::new();
+            let mut saw_eof = true;
+            for line_result in reader.lines() {
+                saw_eof = false;
+                match line_result {
+                    Ok(line) if line.trim().is_empty() => break,
+                    Ok(line) => lines.push(line),
+                    Err(_) => break,
+                }
+            }
+            if saw_eof && lines.is_empty() {
+                eprintln!("Warning: EOF reached reading human review input. No guidance provided.");
+            }
+            lines
+        }
+        Some(n) => {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let (tx, rx) = mpsc::channel::<Option<String>>();
+            std::thread::spawn(move || {
+                for line_result in reader.lines() {
+                    match line_result {
+                        Ok(line) => {
+                            let is_empty = line.trim().is_empty();
+                            let _ = tx.send(Some(line));
+                            if is_empty {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx.send(None);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(n));
+            let mut lines = Vec::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    if lines.is_empty() {
+                        eprintln!("Human review timeout reached. No input provided.");
+                    } else {
+                        eprintln!("Human review timeout reached. Using partial input.");
+                    }
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(Some(line)) if line.trim().is_empty() => break,
+                    Ok(Some(line)) => lines.push(line),
+                    Ok(None) => {
+                        eprintln!(
+                            "Warning: EOF reached reading human review input. No guidance provided."
+                        );
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if lines.is_empty() {
+                            eprintln!("Human review timeout reached. No input provided.");
+                        } else {
+                            eprintln!("Human review timeout reached. Using partial input.");
+                        }
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            lines
+        }
     }
 }
 
@@ -568,5 +701,167 @@ mod tests {
         // cleanup with a prefix when no matching files exist must not panic
         let temp_dir = TempDir::new().unwrap();
         cleanup_signal_files_for_prefix(temp_dir.path(), Some("P1"));
+    }
+
+    // --- handle_human_review tests (require FEAT-004) ---
+
+    #[test]
+    fn test_handle_human_review_with_input_returns_true_and_records_guidance() {
+        // Non-empty line followed by empty line terminates the read.
+        let input = "my feedback\n\n";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        let result = handle_human_review(
+            cursor,
+            "TASK-123",
+            "Some task title",
+            None,
+            1,
+            &mut guidance,
+            None,
+        );
+
+        assert!(result, "Should return true when guidance was provided");
+        assert!(!guidance.is_empty(), "Guidance should be recorded");
+    }
+
+    #[test]
+    fn test_handle_human_review_with_empty_input_returns_false_no_guidance() {
+        // Just pressing Enter (empty line) — no guidance provided.
+        let input = "\n";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        let result = handle_human_review(
+            cursor,
+            "TASK-123",
+            "Some task title",
+            None,
+            1,
+            &mut guidance,
+            None,
+        );
+
+        assert!(!result, "Should return false when only empty input given");
+        assert!(
+            guidance.is_empty(),
+            "Guidance must not be recorded for empty input"
+        );
+    }
+
+    #[test]
+    fn test_handle_human_review_guidance_tagged_with_task_id() {
+        // Guidance must be stored as "[Human Review for TASK-ID] {input}".
+        let input = "review feedback\n\n";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        handle_human_review(
+            cursor,
+            "FEAT-007",
+            "Some feature",
+            None,
+            5,
+            &mut guidance,
+            None,
+        );
+
+        let formatted = guidance.format_for_prompt();
+        assert!(
+            formatted.contains("[Human Review for FEAT-007]"),
+            "Guidance must be tagged with task ID; got: '{formatted}'"
+        );
+        assert!(
+            formatted.contains("review feedback"),
+            "Guidance must contain the input text; got: '{formatted}'"
+        );
+    }
+
+    #[test]
+    fn test_handle_human_review_stdin_eof_returns_false_no_panic() {
+        // Empty reader simulates headless/piped stdin hitting EOF immediately.
+        let input = "";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        let result = handle_human_review(
+            cursor,
+            "TASK-123",
+            "Some task title",
+            None,
+            1,
+            &mut guidance,
+            None,
+        );
+
+        assert!(!result, "Should return false on EOF");
+        assert!(guidance.is_empty(), "Must not record guidance on EOF");
+    }
+
+    #[test]
+    fn test_handle_human_review_timeout_none_means_blocking_read() {
+        // timeout=None: reads input normally (does not immediately return).
+        let input = "blocking feedback\n\n";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        let result = handle_human_review(cursor, "TASK-123", "title", None, 1, &mut guidance, None);
+
+        assert!(result, "timeout=None must read input and return true");
+        assert!(!guidance.is_empty());
+    }
+
+    #[test]
+    fn test_handle_human_review_timeout_zero_means_blocking_read() {
+        // timeout=Some(0): treated as blocking (same as None), not an immediate return.
+        let input = "zero timeout feedback\n\n";
+        let cursor = io::Cursor::new(input);
+        let mut guidance = SessionGuidance::new();
+
+        let result =
+            handle_human_review(cursor, "TASK-123", "title", None, 1, &mut guidance, Some(0));
+
+        assert!(
+            result,
+            "timeout=Some(0) must read input and return true (blocking)"
+        );
+        assert!(!guidance.is_empty());
+    }
+
+    // --- format_human_review_banner tests (require FEAT-004) ---
+
+    #[test]
+    fn test_human_review_banner_includes_task_id_title_and_notes() {
+        let banner = format_human_review_banner(
+            "TASK-456",
+            "Deploy the feature",
+            Some("Check that database migrations ran successfully"),
+        );
+
+        assert!(
+            banner.contains("TASK-456"),
+            "Banner must include task ID; got: '{banner}'"
+        );
+        assert!(
+            banner.contains("Deploy the feature"),
+            "Banner must include task title; got: '{banner}'"
+        );
+        assert!(
+            banner.contains("Check that database migrations ran successfully"),
+            "Banner must include notes; got: '{banner}'"
+        );
+    }
+
+    #[test]
+    fn test_human_review_banner_includes_task_id_and_title_without_notes() {
+        let banner = format_human_review_banner("TASK-123", "Some task title", None);
+
+        assert!(banner.contains("TASK-123"), "Banner must include task ID");
+        assert!(
+            banner.contains("Some task title"),
+            "Banner must include task title"
+        );
+        // notes=None: must not panic and should not include a notes section with garbage
     }
 }

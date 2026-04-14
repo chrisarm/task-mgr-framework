@@ -64,6 +64,14 @@ pub struct ExportedUserStory {
     /// Defaults to 3 on deserialization (handles old exported JSONs that lack this field).
     #[serde(default = "default_max_retries_value")]
     pub max_retries: i32,
+    /// Whether the loop pauses after this task for human review.
+    /// Absent from JSON when false/absent (preserves backward compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_human: Option<bool>,
+    /// Seconds to wait for human input (None = no timeout).
+    /// Absent from JSON when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_review_timeout: Option<u32>,
 }
 
 /// JSON structure for the exported PRD file.
@@ -162,7 +170,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
     let mut stmt = conn.prepare(
         r#"SELECT id, title, description, priority, status, notes,
            acceptance_criteria, review_scope, severity, source_review,
-           model, difficulty, escalation_note, max_retries
+           model, difficulty, escalation_note, max_retries,
+           requires_human, human_review_timeout
            FROM tasks WHERE archived_at IS NULL ORDER BY id"#,
     )?;
 
@@ -182,6 +191,17 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         let escalation_note: Option<String> = row.get("escalation_note")?;
         // Graceful fallback: column may not exist on pre-migration DBs
         let max_retries: i32 = row.get::<_, i32>("max_retries").unwrap_or(3);
+        // Graceful fallback: columns don't exist until v15 migration runs
+        let requires_human: Option<bool> = row
+            .get::<_, i32>("requires_human")
+            .ok()
+            .map(|v| v != 0)
+            .filter(|&v| v); // only Some(true) — None when 0/absent
+        let human_review_timeout: Option<u32> = row
+            .get::<_, Option<i64>>("human_review_timeout")
+            .ok()
+            .flatten()
+            .and_then(|v| u32::try_from(v).ok());
 
         Ok((
             id,
@@ -198,6 +218,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             difficulty,
             escalation_note,
             max_retries,
+            requires_human,
+            human_review_timeout,
         ))
     })?;
 
@@ -225,6 +247,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             difficulty,
             escalation_note,
             max_retries,
+            requires_human,
+            human_review_timeout,
         ) = row?;
 
         // Map status to passes boolean
@@ -276,6 +300,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             difficulty,
             escalation_note,
             max_retries,
+            requires_human,
+            human_review_timeout,
         });
     }
 

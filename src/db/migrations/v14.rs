@@ -61,18 +61,19 @@ mod tests {
         (temp_dir, conn)
     }
 
-    /// Schema version must be at least 14 after full migration run.
+    /// Schema version must be at least 14 after v14 migration runs.
+    /// (CURRENT_SCHEMA_VERSION reflects the latest migration, not v14 specifically.)
     #[test]
-    fn test_v14_schema_version_at_least_14() {
+    fn test_v14_migration_was_applied() {
         let (_temp_dir, conn) = setup_migrated_db();
         assert!(
             CURRENT_SCHEMA_VERSION >= 14,
-            "CURRENT_SCHEMA_VERSION must be at least 14"
+            "CURRENT_SCHEMA_VERSION must be >= 14"
         );
         let version = get_schema_version(&conn).unwrap();
         assert!(
             version >= 14,
-            "DB schema_version must be at least 14 after migration"
+            "DB schema_version must be >= 14 after migrations run"
         );
     }
 

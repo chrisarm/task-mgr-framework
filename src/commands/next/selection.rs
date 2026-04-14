@@ -301,7 +301,8 @@ fn get_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult
          created_at, updated_at, started_at, completed_at, \
          last_error, error_count, \
          blocked_at_iteration, skipped_at_iteration, \
-         model, difficulty, escalation_note \
+         model, difficulty, escalation_note, \
+         requires_human, human_review_timeout \
          FROM tasks WHERE status = 'todo' AND archived_at IS NULL {prefix_clause} ORDER BY priority ASC"
     );
     let mut stmt = conn.prepare(&sql)?;

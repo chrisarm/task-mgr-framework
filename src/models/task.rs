@@ -243,6 +243,16 @@ pub struct Task {
     /// Number of consecutive failed iterations for this task (resets on success)
     #[serde(default)]
     pub consecutive_failures: i32,
+
+    /// Whether the loop must pause after this task completes for human review.
+    /// Stored as INTEGER (0/1) in the DB; maps from `requires_human` column.
+    #[serde(default)]
+    pub requires_human: bool,
+
+    /// Optional seconds to wait for human input before timing out (None = no timeout).
+    /// Stored as INTEGER or NULL in the DB; maps from `human_review_timeout` column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_review_timeout: Option<u32>,
 }
 
 fn default_max_retries() -> i32 {
@@ -279,6 +289,8 @@ impl Task {
             required_tests: Vec::new(),
             max_retries: 3,
             consecutive_failures: 0,
+            requires_human: false,
+            human_review_timeout: None,
         }
     }
 
@@ -360,6 +372,17 @@ impl TryFrom<&Row<'_>> for Task {
             // Graceful fallback: column doesn't exist until v13 migration runs (FEAT-001)
             max_retries: row.get::<_, i32>("max_retries").unwrap_or(3),
             consecutive_failures: row.get::<_, i32>("consecutive_failures").unwrap_or(0),
+            // Graceful fallback: column doesn't exist until v15 migration runs
+            requires_human: row
+                .get::<_, i32>("requires_human")
+                .ok()
+                .map(|v| v != 0)
+                .unwrap_or(false),
+            human_review_timeout: row
+                .get::<_, Option<i64>>("human_review_timeout")
+                .ok()
+                .flatten()
+                .and_then(|v| u32::try_from(v).ok()),
         })
     }
 }
@@ -705,4 +728,108 @@ mod tests {
     }
 
     // Datetime parsing tests are in models/datetime.rs
+
+    // ============ requires_human / human_review_timeout tests ============
+
+    #[test]
+    fn test_task_new_requires_human_defaults_to_false() {
+        let task = Task::new("US-001", "Test Task");
+        assert_eq!(
+            task.requires_human, false,
+            "Task::new() must default requires_human to false"
+        );
+    }
+
+    #[test]
+    fn test_task_new_human_review_timeout_defaults_to_none() {
+        let task = Task::new("US-001", "Test Task");
+        assert_eq!(
+            task.human_review_timeout, None,
+            "Task::new() must default human_review_timeout to None"
+        );
+    }
+
+    #[test]
+    fn test_task_requires_human_serialize() {
+        let task = Task::new("US-001", "Test Task");
+        let json = serde_json::to_string(&task).unwrap();
+        // requires_human=false must always serialize (same pattern as consecutive_failures)
+        assert!(
+            json.contains("\"requires_human\":false"),
+            "requires_human must serialize to false by default"
+        );
+    }
+
+    #[test]
+    fn test_task_requires_human_true_serialize() {
+        let mut task = Task::new("US-001", "Test Task");
+        task.requires_human = true;
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            json.contains("\"requires_human\":true"),
+            "requires_human=true must serialize correctly"
+        );
+    }
+
+    #[test]
+    fn test_task_human_review_timeout_absent_when_none() {
+        let task = Task::new("US-001", "Test Task");
+        let json = serde_json::to_string(&task).unwrap();
+        // None → skip_serializing_if = "Option::is_none" → absent from JSON
+        assert!(
+            !json.contains("human_review_timeout"),
+            "human_review_timeout must be absent from JSON when None"
+        );
+    }
+
+    #[test]
+    fn test_task_human_review_timeout_present_when_set() {
+        let mut task = Task::new("US-001", "Test Task");
+        task.human_review_timeout = Some(60);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            json.contains("\"human_review_timeout\":60"),
+            "human_review_timeout must serialize when set"
+        );
+    }
+
+    #[test]
+    fn test_task_deserialize_requires_human_with_defaults() {
+        let json = r#"{
+            "id": "US-001",
+            "title": "Test Task",
+            "priority": 1,
+            "status": "todo",
+            "created_at": "2026-01-18T12:00:00Z",
+            "updated_at": "2026-01-18T12:00:00Z",
+            "error_count": 0
+        }"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            task.requires_human, false,
+            "missing requires_human must deserialize to false"
+        );
+        assert_eq!(
+            task.human_review_timeout, None,
+            "missing human_review_timeout must deserialize to None"
+        );
+    }
+
+    #[test]
+    fn test_task_deserialize_requires_human_explicit() {
+        let json = r#"{
+            "id": "US-001",
+            "title": "Test Task",
+            "priority": 1,
+            "status": "todo",
+            "created_at": "2026-01-18T12:00:00Z",
+            "updated_at": "2026-01-18T12:00:00Z",
+            "error_count": 0,
+            "requires_human": true,
+            "human_review_timeout": 90
+        }"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(task.requires_human, true);
+        assert_eq!(task.human_review_timeout, Some(90));
+    }
 }

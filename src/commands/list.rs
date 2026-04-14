@@ -641,6 +641,8 @@ mod tests {
             required_tests: vec![],
             max_retries: 3,
             consecutive_failures: 0,
+            requires_human: false,
+            human_review_timeout: None,
         };
 
         let summary = TaskSummary::from(&task);

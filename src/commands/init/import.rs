@@ -317,8 +317,8 @@ pub fn insert_task(
         r#"INSERT INTO tasks
            (id, title, description, priority, status, notes, acceptance_criteria,
             review_scope, severity, source_review, model, difficulty, escalation_note,
-            required_tests, max_retries)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            required_tests, max_retries, requires_human, human_review_timeout)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             story.id,
             story.title,
@@ -335,6 +335,8 @@ pub fn insert_task(
             story.escalation_note,
             required_tests,
             max_retries,
+            story.requires_human.unwrap_or(false) as i32,
+            story.human_review_timeout,
         ],
     )?;
 
@@ -410,6 +412,7 @@ pub fn update_task(
            acceptance_criteria = ?, review_scope = ?, severity = ?,
            source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
            required_tests = ?, max_retries = ?,
+           requires_human = ?, human_review_timeout = ?,
            updated_at = datetime('now')
            WHERE id = ?"#,
         rusqlite::params![
@@ -426,6 +429,8 @@ pub fn update_task(
             story.escalation_note,
             required_tests,
             max_retries,
+            story.requires_human.unwrap_or(false) as i32,
+            story.human_review_timeout,
             story.id,
         ],
     )?;
@@ -460,6 +465,159 @@ pub fn insert_prd_file(
         rusqlite::params![prd_id, file_path, file_type],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::init::parse::PrdUserStory;
+    use crate::db::{create_schema, open_connection, run_migrations};
+    use tempfile::TempDir;
+
+    fn setup_db() -> (TempDir, Connection) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut conn = open_connection(temp_dir.path()).unwrap();
+        create_schema(&conn).unwrap();
+        run_migrations(&mut conn).unwrap();
+        (temp_dir, conn)
+    }
+
+    fn minimal_story(id: &str, requires_human: Option<bool>) -> PrdUserStory {
+        PrdUserStory {
+            id: id.to_string(),
+            title: "Test Task".to_string(),
+            description: None,
+            priority: 1,
+            passes: false,
+            notes: None,
+            acceptance_criteria: vec![],
+            review_scope: None,
+            severity: None,
+            source_review: None,
+            touches_files: vec![],
+            depends_on: vec![],
+            synergy_with: vec![],
+            batch_with: vec![],
+            conflicts_with: vec![],
+            model: None,
+            difficulty: None,
+            escalation_note: None,
+            required_tests: vec![],
+            max_retries: None,
+            requires_human,
+            human_review_timeout: None,
+        }
+    }
+
+    /// insert_task stores requires_human=1 when story.requires_human = Some(true).
+    /// Requires v15 DB column — ignored until FEAT task adds ALTER TABLE SQL.
+    #[test]
+    fn test_insert_task_stores_requires_human_true() {
+        let (_temp_dir, conn) = setup_db();
+        let story = minimal_story("US-001", Some(true));
+        insert_task(&conn, &story, None).unwrap();
+
+        let requires_human: i32 = conn
+            .query_row(
+                "SELECT requires_human FROM tasks WHERE id = 'US-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            requires_human, 1,
+            "requires_human must be stored as 1 when true"
+        );
+    }
+
+    /// insert_task stores requires_human=0 when story.requires_human is None (absent).
+    /// Requires v15 DB column — ignored until FEAT task adds ALTER TABLE SQL.
+    #[test]
+    fn test_insert_task_stores_requires_human_false_by_default() {
+        let (_temp_dir, conn) = setup_db();
+        let story = minimal_story("US-001", None);
+        insert_task(&conn, &story, None).unwrap();
+
+        let requires_human: i32 = conn
+            .query_row(
+                "SELECT requires_human FROM tasks WHERE id = 'US-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            requires_human, 0,
+            "requires_human must be 0 when absent in story"
+        );
+    }
+
+    /// update_task preserves requires_human field (does not reset it to 0).
+    /// Requires v15 DB column — ignored until FEAT task adds ALTER TABLE SQL.
+    #[test]
+    fn test_update_task_preserves_requires_human() {
+        let (_temp_dir, conn) = setup_db();
+
+        // Insert with requires_human=true
+        let story = minimal_story("US-001", Some(true));
+        insert_task(&conn, &story, None).unwrap();
+
+        // Update without changing requires_human
+        let updated_story = minimal_story("US-001", Some(true));
+        update_task(&conn, &updated_story, None).unwrap();
+
+        let requires_human: i32 = conn
+            .query_row(
+                "SELECT requires_human FROM tasks WHERE id = 'US-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            requires_human, 1,
+            "requires_human must still be 1 after update_task"
+        );
+    }
+
+    /// Task::try_from reads requires_human correctly from a v15 DB row.
+    /// Requires v15 DB column — ignored until FEAT task adds ALTER TABLE SQL.
+    #[test]
+    fn test_task_try_from_reads_requires_human_from_db() {
+        use crate::models::Task;
+
+        let (_temp_dir, conn) = setup_db();
+        // Insert directly using raw SQL (after v15 column exists)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, requires_human) \
+             VALUES ('US-001', 'Test', 'todo', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, description, priority, status, notes, \
+                 acceptance_criteria, review_scope, severity, source_review, \
+                 created_at, updated_at, started_at, completed_at, \
+                 last_error, error_count, requires_human, human_review_timeout \
+                 FROM tasks WHERE id = 'US-001'",
+            )
+            .unwrap();
+
+        let task = stmt
+            .query_row([], |row| {
+                Task::try_from(row).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .unwrap();
+
+        assert_eq!(task.requires_human, true);
+        assert_eq!(task.human_review_timeout, None);
+    }
 }
 
 /// Register all files associated with a PRD in the prd_files table.

@@ -612,12 +612,13 @@ mod tests {
     use crate::loop_engine::watchdog::{exit_code_from_status, TimeoutConfig};
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
-    use std::sync::Mutex;
     use std::time::Duration;
 
-    // Serialize tests that mutate CLAUDE_BINARY to avoid race conditions
-    // when cargo test runs threads in parallel.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // Serialize tests that mutate CLAUDE_BINARY — use the shared mutex from
+    // test_utils so prd_reconcile.rs tests also serialize against these.
+    use crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX;
+    #[allow(unused_imports)]
+    use std::sync::Mutex;
 
     /// Scoped mode with the full coding tool allowlist. Used in tests that
     /// need a valid PermissionMode but are testing something else (model flags,
@@ -653,7 +654,9 @@ mod tests {
         stream_json: bool,
         permission_mode: &PermissionMode,
     ) -> TaskMgrResult<ClaudeResult> {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let script = make_echo_args_stdin_script("echo");
         std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
         let result = spawn_claude(
@@ -894,7 +897,9 @@ mod tests {
         // The script drains stdin first (so the stdin write completes), then
         // sleeps long enough for the watchdog to kill it.
         use std::io::Write as _;
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let script_path = std::env::temp_dir().join("task_mgr_test_watchdog_signal_sleep.sh");
         {
             let mut f = std::fs::File::create(&script_path).unwrap();
@@ -973,7 +978,9 @@ mod tests {
     #[test]
     fn test_broken_pipe_on_immediate_exit() {
         use std::io::Write as _;
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let script_path = std::env::temp_dir().join("task_mgr_test_epipe_immediate_exit.sh");
         {
             let mut f = std::fs::File::create(&script_path).unwrap();
@@ -1383,7 +1390,9 @@ mod tests {
         // processed as stream-json.  Since echo's output is not valid JSON, output_text is
         // empty, but the subprocess arg list is still written to stderr.
         // We verify behaviour by using a shell script that writes its args into a result JSON.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let script_path = make_stream_json_result_script("args");
         std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
@@ -1979,7 +1988,9 @@ mod tests {
     /// --permission-mode dontAsk, --model <model>, -p <prompt>
     #[test]
     fn test_stream_json_true_with_model_and_timeout_arg_ordering() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let script_path = make_stream_json_result_script("stream_model_timeout");
         let timeout = TimeoutConfig::from_difficulty(Some("medium"), Arc::new(AtomicU64::new(0)));
@@ -2053,7 +2064,9 @@ mod tests {
         #[case] expect_print: bool,
         #[case] expect_output_format: bool,
     ) {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let output = if stream_json {
             // Need a script that emits valid result JSON so the stream-json parser yields args
@@ -2073,7 +2086,7 @@ mod tests {
             let _ = std::fs::remove_file(&script_path);
             result.expect("spawn should succeed").output
         } else {
-            // Call spawn_claude directly — ENV_MUTEX is already held by this function.
+            // Call spawn_claude directly — CLAUDE_BINARY_MUTEX is already held by this function.
             // Using spawn_claude_echo here would deadlock (std::sync::Mutex is not reentrant).
             let script = make_echo_args_stdin_script("4callers_echo");
             std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
@@ -2182,7 +2195,9 @@ mod tests {
 
     /// Helper: run spawn_claude with CLAUDE_BINARY pointing to mock_stream_json.sh.
     fn spawn_claude_mock_stream_json(stream_json: bool) -> TaskMgrResult<ClaudeResult> {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Locate the fixture relative to CARGO_MANIFEST_DIR
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let script = format!("{}/tests/fixtures/mock_stream_json.sh", manifest_dir);

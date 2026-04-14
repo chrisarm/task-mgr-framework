@@ -24,7 +24,7 @@ pub use setup_fixes::{
     detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
     fix_install_skills, fix_patch_hook,
 };
-pub use setup_output::{format_setup_text, SetupAuditResult};
+pub use setup_output::{format_setup_text, CheckContext, SetupAuditResult};
 
 use std::path::Path;
 
@@ -270,31 +270,6 @@ pub fn audit_setup(project_dir: &Path, auto_fix: bool) -> SetupAuditResult {
     audit_setup_with_claude_dir(project_dir, &claude_dir, auto_fix)
 }
 
-/// Run the full set of setup checks and return one entry per check.
-///
-/// Extracted to eliminate the duplicate check-running block that otherwise
-/// appears both before and after the auto-fix pass in [`audit_setup_with_claude_dir`].
-fn run_all_setup_checks(
-    settings_path: &Path,
-    hook_path: &Path,
-    commands_dir: &Path,
-    db_dir: &Path,
-    project_dir: &Path,
-) -> Vec<setup_output::SetupCheck> {
-    use setup_checks::{
-        check_claude_md, check_default_mode, check_deny_conflicts, check_hook_bypass,
-        check_project_config, check_skills_installed, EXPECTED_SKILLS,
-    };
-    let mut checks = Vec::new();
-    checks.push(check_default_mode(settings_path));
-    checks.extend(check_deny_conflicts(settings_path));
-    checks.push(check_hook_bypass(hook_path));
-    checks.extend(check_skills_installed(commands_dir, EXPECTED_SKILLS));
-    checks.push(check_project_config(db_dir));
-    checks.push(check_claude_md(project_dir));
-    checks
-}
-
 /// Inner implementation of `audit_setup` with an explicit `claude_dir`.
 ///
 /// Used directly by tests to avoid depending on the `HOME` environment variable.
@@ -303,26 +278,24 @@ fn audit_setup_with_claude_dir(
     claude_dir: &Path,
     auto_fix: bool,
 ) -> SetupAuditResult {
-    use setup_checks::EXPECTED_SKILLS;
+    use setup_checks::{default_registry, EXPECTED_SKILLS};
     use setup_fixes::{
         detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
         fix_install_skills, fix_patch_hook,
     };
     use setup_output::SetupSeverity;
 
-    let settings_path = claude_dir.join("settings.json");
-    let hook_path = claude_dir.join("hooks").join("guard-destructive.sh");
-    let commands_dir = claude_dir.join("commands");
-    let db_dir = project_dir.join(".task-mgr");
+    let ctx = setup_output::CheckContext {
+        settings_path: claude_dir.join("settings.json"),
+        hook_path: claude_dir.join("hooks").join("guard-destructive.sh"),
+        commands_dir: claude_dir.join("commands"),
+        db_dir: project_dir.join(".task-mgr"),
+        project_dir: project_dir.to_path_buf(),
+    };
     let local_skills_dir = project_dir.join(".claude").join("commands");
 
-    let checks = run_all_setup_checks(
-        &settings_path,
-        &hook_path,
-        &commands_dir,
-        &db_dir,
-        project_dir,
-    );
+    let registry = default_registry();
+    let checks = registry.run_all(&ctx);
 
     if !auto_fix {
         return SetupAuditResult::new(checks);
@@ -335,13 +308,13 @@ fn audit_setup_with_claude_dir(
     // Fix missing skills (copy from local .claude/commands/ to ~/.claude/commands/).
     let missing_skills: Vec<&str> = EXPECTED_SKILLS
         .iter()
-        .filter(|&&skill| !commands_dir.join(format!("{skill}.md")).exists())
+        .filter(|&&skill| !ctx.commands_dir.join(format!("{skill}.md")).exists())
         .copied()
         .collect();
     if !missing_skills.is_empty() {
         applied_fixes.extend(fix_install_skills(
             &local_skills_dir,
-            &commands_dir,
+            &ctx.commands_dir,
             &missing_skills,
         ));
     }
@@ -351,8 +324,8 @@ fn audit_setup_with_claude_dir(
         .iter()
         .any(|c| c.name == "project_config" && c.severity != SetupSeverity::Pass);
     if needs_config {
-        let detected = detect_additional_tools(project_dir);
-        applied_fixes.push(fix_generate_project_config(&db_dir, &detected));
+        let detected = detect_additional_tools(&ctx.project_dir);
+        applied_fixes.push(fix_generate_project_config(&ctx.db_dir, &detected));
     }
 
     // Fix hook missing bypass.
@@ -360,7 +333,7 @@ fn audit_setup_with_claude_dir(
         .iter()
         .any(|c| c.name == "hook_bypass" && c.auto_fixable && c.severity != SetupSeverity::Pass);
     if needs_hook_patch {
-        applied_fixes.push(fix_patch_hook(&hook_path));
+        applied_fixes.push(fix_patch_hook(&ctx.hook_path));
     }
 
     // Fix missing CLAUDE.md.
@@ -368,18 +341,12 @@ fn audit_setup_with_claude_dir(
         .iter()
         .any(|c| c.name == "claude_md" && c.severity != SetupSeverity::Pass);
     if needs_claude_md {
-        let db_path = db_dir.join("tasks.db");
-        applied_fixes.push(fix_generate_claude_md(project_dir, &db_path));
+        let db_path = ctx.db_dir.join("tasks.db");
+        applied_fixes.push(fix_generate_claude_md(&ctx.project_dir, &db_path));
     }
 
     // Re-run checks so the result reflects the post-fix state.
-    let updated_checks = run_all_setup_checks(
-        &settings_path,
-        &hook_path,
-        &commands_dir,
-        &db_dir,
-        project_dir,
-    );
+    let updated_checks = registry.run_all(&ctx);
 
     SetupAuditResult::new_with_fixes(updated_checks, applied_fixes)
 }

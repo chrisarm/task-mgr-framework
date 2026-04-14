@@ -1,0 +1,41 @@
+{
+  "branchName": "feature/human-review-test",
+  "description": "PRD with requiresHuman and humanReviewTimeout fields for integration testing.",
+  "project": "human-review-test-project",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Human review gate passes"
+      ],
+      "dependsOn": [],
+      "description": "Task that requires human review after completion.",
+      "id": "HR-001",
+      "notes": "This task is a human review checkpoint.",
+      "passes": false,
+      "priority": 1,
+      "requiresHuman": true,
+      "humanReviewTimeout": 120,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Human review checkpoint task",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Normal task completes"
+      ],
+      "dependsOn": [],
+      "description": "Regular task with no human review requirement.",
+      "id": "HR-002",
+      "notes": "No human review needed.",
+      "passes": false,
+      "priority": 2,
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "title": "Regular task",
+      "touchesFiles": []
+    }
+  ]
+}

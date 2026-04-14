@@ -5,7 +5,56 @@
 //! and engine.rs tests.
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tempfile::TempDir;
+
+/// Shared mutex for tests that mutate the `CLAUDE_BINARY` environment variable.
+///
+/// All test modules that read or write `CLAUDE_BINARY` must hold this lock
+/// for the duration of the test to prevent env-var races across parallel threads.
+/// Using a single shared static ensures cross-module serialization.
+pub static CLAUDE_BINARY_MUTEX: Mutex<()> = Mutex::new(());
+
+/// RAII guard that sets an environment variable and restores it on drop.
+///
+/// Prevents env-var leaks when a test panics before the cleanup line.
+/// The mutex guard (e.g., `CLAUDE_BINARY_MUTEX`) must still be held separately
+/// for serialization across threads; `EnvGuard` only handles the cleanup.
+pub struct EnvGuard {
+    key: String,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    /// Set `key` to `value`, saving the previous value for restoration on drop.
+    pub fn set(key: &str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+
+    /// Remove `key`, saving the previous value for restoration on drop.
+    pub fn remove(key: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(val) => std::env::set_var(&self.key, val),
+            None => std::env::remove_var(&self.key),
+        }
+    }
+}
 
 use crate::db::migrations::run_migrations;
 use crate::db::{create_schema, open_connection};
@@ -75,6 +124,14 @@ pub fn insert_task(conn: &Connection, id: &str, title: &str, status: &str, prior
 /// Insert a done task (convenience wrapper for calibration tests).
 pub fn insert_done_task(conn: &Connection, id: &str) {
     insert_task(conn, id, "Test task", "done", 10);
+}
+
+/// Fetch the status of a task by ID, panicking if the task does not exist.
+pub fn get_task_status(conn: &Connection, id: &str) -> String {
+    conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |row| {
+        row.get(0)
+    })
+    .unwrap()
 }
 
 /// Insert a task with description and acceptance criteria.

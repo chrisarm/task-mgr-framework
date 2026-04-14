@@ -258,6 +258,22 @@ Schema migrations are versioned (v1, v2, v3) and tracked in a `schema_migrations
 
 **`--force` flag**: The `complete` and `fail` commands accept `--force` to override invalid transitions (e.g., `todo` directly to `done`). This is an escape hatch for recovery scenarios, not normal workflow.
 
+### Human review checkpoints
+
+Tasks in the PRD JSON can be marked with `"requiresHuman": true` to designate them as human review gates. When such a task completes, the loop engine pauses for interactive feedback before continuing.
+
+**Data flow**: The `requiresHuman` boolean is parsed from the PRD JSON (`PrdUserStory.requires_human`), stored in the `tasks` table as `requires_human INTEGER DEFAULT 0`, and queried by the engine after each iteration completes.
+
+**Trigger mechanism**: After a task is marked `done`, `trigger_human_reviews()` queries for tasks with `requires_human = 1` that were completed since the current loop run started (`completed_at >= epoch`). For each matching task:
+
+1. `handle_human_review()` (in `signals.rs`) displays an interactive banner with the task ID, title, and notes
+2. Reads multi-line feedback from stdin until an empty line or EOF
+3. An optional per-task timeout (`humanReviewTimeout` in seconds) uses a channel-based reader thread — if the timeout expires with no input, the review is skipped gracefully
+4. If feedback is provided, it is tagged as `[Human Review for {task_id}] {text}` and accumulated in `SessionGuidance` for injection into subsequent iteration prompts
+5. `mutate_prd_from_feedback()` (in `prd_reconcile.rs`) spawns a Claude subprocess to analyze the feedback against remaining todo tasks and atomically updates the PRD JSON with any modifications
+
+**Batch mode interaction**: In batch/yes mode, `trigger_human_reviews()` temporarily overrides `yes_mode` to ensure the interactive pause still occurs — human review gates are never silently skipped.
+
 ---
 
 ## Task Selection Algorithm
@@ -378,8 +394,9 @@ The loop engine (`src/loop_engine/`) is the largest subsystem with 18 modules:
 │    4. claude.rs → spawn subprocess       │   - crash.rs        ││
 │    5. detection.rs → analyze output      │   - stale.rs        ││
 │    6. Handle outcome (complete/fail/skip)│   (no I/O, fully    ││
-│    7. feedback.rs → close learning loop  │    testable)        ││
-│    8. calibrate.rs → adjust weights      └─────────────────────┘│
+│    7. trigger_human_reviews() → pause    │    testable)        ││
+│    8. feedback.rs → close learning loop  └─────────────────────┘│
+│    9. calibrate.rs → adjust weights                              │
 │                                                                  │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐ │
 │  │  signals.rs  │ │  deadline.rs │ │      env.rs              │ │
@@ -460,6 +477,7 @@ The loop supports runtime steering without restart:
 | `.task-mgr/.stop` | Touch file | Stop after current iteration |
 | `.task-mgr/.pause` | Touch file | Pause for interactive guidance input |
 | `.task-mgr/steering.md` | Write file | Inject guidance into remaining iterations |
+| `requiresHuman` | PRD field | Auto-pause after task completion for human review |
 | Ctrl+C | Signal | Graceful shutdown |
 
 Steering guidance accumulates across iterations (concatenated with separators), allowing progressive refinement of agent behavior.

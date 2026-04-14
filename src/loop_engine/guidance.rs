@@ -59,6 +59,11 @@ impl SessionGuidance {
         self.entries.is_empty()
     }
 
+    /// Get the text of the most recently added guidance entry, if any.
+    pub fn last_text(&self) -> Option<&str> {
+        self.entries.last().map(|e| e.text.as_str())
+    }
+
     /// Format all accumulated guidance for recording to progress.txt.
     ///
     /// Produces a structured progress entry with a "Session Guidance" header

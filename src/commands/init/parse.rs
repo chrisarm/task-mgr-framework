@@ -44,6 +44,91 @@ pub struct PrdUserStory {
     pub required_tests: Vec<String>,
     #[serde(default)]
     pub max_retries: Option<i32>,
+    /// Whether the loop must pause after this task for human review.
+    /// Maps to `tasks.requires_human` (INTEGER DEFAULT 0).
+    #[serde(default)]
+    pub requires_human: Option<bool>,
+    /// Seconds to wait for human input before timing out (NULL = no timeout).
+    /// Maps to `tasks.human_review_timeout` (INTEGER DEFAULT NULL).
+    #[serde(default)]
+    pub human_review_timeout: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_story(json: &str) -> PrdUserStory {
+        serde_json::from_str(json).expect("should deserialize")
+    }
+
+    fn minimal_story(extra: &str) -> String {
+        format!(
+            r#"{{
+                "id": "US-001",
+                "title": "Test",
+                "priority": 1,
+                "passes": false
+                {extra}
+            }}"#
+        )
+    }
+
+    // ---- requiresHuman deserialization ----
+
+    #[test]
+    fn test_prd_story_deserializes_requires_human_true() {
+        let json = minimal_story(r#","requiresHuman": true"#);
+        let story = parse_story(&json);
+        assert_eq!(story.requires_human, Some(true));
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_requires_human_false() {
+        let json = minimal_story(r#","requiresHuman": false"#);
+        let story = parse_story(&json);
+        assert_eq!(story.requires_human, Some(false));
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_requires_human_absent() {
+        let json = minimal_story("");
+        let story = parse_story(&json);
+        assert_eq!(story.requires_human, None);
+    }
+
+    // ---- humanReviewTimeout deserialization ----
+
+    #[test]
+    fn test_prd_story_deserializes_human_review_timeout_set() {
+        let json = minimal_story(r#","humanReviewTimeout": 60"#);
+        let story = parse_story(&json);
+        assert_eq!(story.human_review_timeout, Some(60));
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_human_review_timeout_absent() {
+        let json = minimal_story("");
+        let story = parse_story(&json);
+        assert_eq!(story.human_review_timeout, None);
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_human_review_timeout_null() {
+        let json = minimal_story(r#","humanReviewTimeout": null"#);
+        let story = parse_story(&json);
+        assert_eq!(story.human_review_timeout, None);
+    }
+
+    // ---- combined: both fields ----
+
+    #[test]
+    fn test_prd_story_deserializes_requires_human_with_timeout() {
+        let json = minimal_story(r#","requiresHuman": true,"humanReviewTimeout": 120"#);
+        let story = parse_story(&json);
+        assert_eq!(story.requires_human, Some(true));
+        assert_eq!(story.human_review_timeout, Some(120));
+    }
 }
 
 /// JSON structure for the PRD file.

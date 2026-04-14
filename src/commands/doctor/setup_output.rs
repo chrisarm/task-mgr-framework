@@ -6,7 +6,26 @@
 //! - `SetupCheck` struct for individual check results
 //! - `SetupAuditResult` for the aggregated audit outcome
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+
+/// Path parameters bundle for setup check functions.
+///
+/// Groups all filesystem inputs into one struct so that each check function
+/// takes `&CheckContext` instead of 1-2 `&Path` arguments.
+pub struct CheckContext {
+    /// Path to `~/.claude/settings.json`
+    pub settings_path: PathBuf,
+    /// Path to the destructive-guard hook script (e.g. `~/.claude/hooks/guard-destructive.sh`)
+    pub hook_path: PathBuf,
+    /// Path to the global Claude commands directory (e.g. `~/.claude/commands/`)
+    pub commands_dir: PathBuf,
+    /// Path to the project's `.task-mgr/` directory
+    pub db_dir: PathBuf,
+    /// Path to the project root (where `CLAUDE.md` lives)
+    pub project_dir: PathBuf,
+}
 
 /// Severity level of a setup check result.
 ///

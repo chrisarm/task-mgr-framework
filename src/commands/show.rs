@@ -99,7 +99,7 @@ fn query_task(conn: &Connection, task_id: &str) -> TaskMgrResult<Task> {
         "SELECT id, title, description, priority, status, notes, \
          acceptance_criteria, review_scope, severity, source_review, \
          created_at, updated_at, started_at, completed_at, \
-         last_error, error_count \
+         last_error, error_count, requires_human, human_review_timeout \
          FROM tasks WHERE id = ?",
     )?;
 
@@ -178,6 +178,14 @@ pub fn format_text(result: &ShowResult) -> String {
     // Status and priority
     output.push_str(&format!("Status:   {}\n", result.task.status));
     output.push_str(&format!("Priority: {}\n", result.task.priority));
+
+    // Human review flag
+    if result.task.requires_human {
+        output.push_str("Requires Human Review: Yes\n");
+        if let Some(timeout) = result.task.human_review_timeout {
+            output.push_str(&format!("Human Review Timeout: {}s\n", timeout));
+        }
+    }
 
     // Description
     if let Some(ref desc) = result.task.description {
@@ -566,5 +574,63 @@ mod tests {
         assert_eq!(result.files[0], "src/a_first.rs");
         assert_eq!(result.files[1], "src/m_middle.rs");
         assert_eq!(result.files[2], "src/z_last.rs");
+    }
+
+    // ============ format_text requires_human display tests ============
+
+    fn make_show_result(requires_human: bool, human_review_timeout: Option<u32>) -> ShowResult {
+        use crate::models::Task;
+        let mut task = Task::new("US-001", "Test Task");
+        task.requires_human = requires_human;
+        task.human_review_timeout = human_review_timeout;
+        ShowResult {
+            task,
+            files: vec![],
+            depends_on: vec![],
+            synergy_with: vec![],
+            batch_with: vec![],
+            conflicts_with: vec![],
+            depended_on_by: vec![],
+        }
+    }
+
+    #[test]
+    fn test_format_text_shows_requires_human_yes_when_true() {
+        let result = make_show_result(true, None);
+        let output = format_text(&result);
+        assert!(
+            output.contains("Requires Human Review: Yes"),
+            "format_text must display 'Requires Human Review: Yes' when requires_human=true"
+        );
+    }
+
+    #[test]
+    fn test_format_text_omits_requires_human_when_false() {
+        let result = make_show_result(false, None);
+        let output = format_text(&result);
+        assert!(
+            !output.contains("Requires Human Review"),
+            "format_text must not display requires_human section when false"
+        );
+    }
+
+    #[test]
+    fn test_format_text_shows_timeout_when_set() {
+        let result = make_show_result(true, Some(90));
+        let output = format_text(&result);
+        assert!(
+            output.contains("Human Review Timeout: 90s"),
+            "format_text must display timeout in seconds when set"
+        );
+    }
+
+    #[test]
+    fn test_format_text_omits_timeout_when_none() {
+        let result = make_show_result(true, None);
+        let output = format_text(&result);
+        assert!(
+            !output.contains("Human Review Timeout"),
+            "format_text must not display timeout line when human_review_timeout is None"
+        );
     }
 }

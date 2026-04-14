@@ -78,6 +78,9 @@ pub struct NextTaskOutput {
     /// Note explaining why this task was escalated to a higher-tier model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub escalation_note: Option<String>,
+    /// Whether this task requires human review after completion.
+    #[serde(default)]
+    pub requires_human: bool,
     /// Score breakdown for transparency
     pub score: ScoreOutput,
 }
@@ -202,6 +205,7 @@ pub fn build_task_output(scored_task: &ScoredTask, claimed: bool) -> NextTaskOut
         model: scored_task.task.model.clone(),
         difficulty: scored_task.task.difficulty.clone(),
         escalation_note: scored_task.task.escalation_note.clone(),
+        requires_human: scored_task.task.requires_human,
         score: ScoreOutput::from(&scored_task.score_breakdown),
     }
 }

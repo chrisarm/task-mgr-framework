@@ -94,7 +94,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: Write these tests first. Use the v14 migration tests as a template for v15 tests. For Task::try_from tests, use the existing test helpers that create in-memory SQLite DBs.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": {
         "correctness": [
@@ -158,7 +158,7 @@
       ],
       "modifiesBehavior": false,
       "notes": "TDD: The handle_human_review function will reuse handle_pause patterns. For stdin mocking, consider extracting stdin reading into a trait or accepting a BufRead parameter instead of hardcoding io::stdin(). This makes testing possible without actually blocking on stdin.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": {
         "correctness": [
@@ -202,7 +202,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Use v14.rs as the exact template. INTEGER for boolean (SQLite convention, 0=false 1=true). The update statement should set schema_version=15 in up and =14 in down.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": {
         "correctness": [
@@ -245,7 +245,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "PrdUserStory uses camelCase via #[serde(rename_all = \"camelCase\")] so field names `requires_human` and `human_review_timeout` will map to JSON `requiresHuman` and `humanReviewTimeout` automatically. For Task::try_from, use the same unwrap_or pattern as max_retries for graceful fallback on pre-v15 DBs.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": {
         "correctness": [
@@ -292,7 +292,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "For import: story.requires_human.unwrap_or(false) as i32 for the DB bind. For show: only display human review lines when requires_human=true. For next: add to NextTaskOutput struct. For export: add to ExportedUserStory and the DB query in export/prd.rs. Selection query in selection.rs also needs the columns added to its SELECT.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": {
         "correctness": [
@@ -340,7 +340,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "For timeout: spawn a reader thread that sends lines over mpsc::channel. Main thread uses recv_timeout. If timeout fires, collect whatever lines arrived. For testability, consider accepting a generic BufRead instead of hardcoding stdin — but this changes the signature from handle_pause. Pragmatic approach: keep stdin hardcoded for now (matching handle_pause), test banner output via captured stderr.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": {
         "correctness": [
@@ -387,7 +387,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": false,
       "notes": "The key insight: requiresHuman overrides yes_mode at the ENGINE level (the caller), not inside handle_human_review. The function itself doesn't know about yes_mode. Engine code: `if task.requires_human { handle_human_review(...) }` — no yes_mode check wrapping it. For collecting completed task IDs: look at completed_tags Vec, the git detection branch, scan_output_for_completed_tasks return, and external reconciliation count. A practical approach: maintain a Vec<String> of completed_this_iteration IDs and append to it in each detection path.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": {
         "correctness": [
@@ -434,7 +434,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "This is the most complex task. The mutation prompt should be focused: only include todo tasks (not done/blocked), include the human's feedback, and instruct Claude to output a JSON array of task modifications. Format: [{\"id\": \"FEAT-005\", \"action\": \"modify\", \"fields\": {\"notes\": \"updated notes\", \"acceptanceCriteria\": [...]}}]. For new tasks, action=\"add\" with full task object. For removal, action=\"irrelevant\". Re-sync: read modified PRD JSON, call update_task for each changed task. The backup (.json.bak) is critical — if mutation corrupts the JSON, the user can recover.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": {
         "correctness": [
@@ -488,7 +488,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Key areas to review: (1) handle_human_review timeout implementation for thread safety, (2) mutation prompt injection safety, (3) atomic JSON write correctness, (4) yes_mode override scoping. For each issue: add CODE-FIX-xxx task (priority 14-16), add to MILESTONE-1 dependsOn.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "synergyWith": [],
       "taskType": "review",
@@ -504,6 +504,57 @@
         "src/commands/show.rs",
         "src/commands/next/output.rs",
         "src/commands/export/prd.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "apply_modifications_to_prd only allows whitelisted fields: title, description, notes, priority, acceptanceCriteria",
+        "Attempts to set non-whitelisted fields (passes, id, requiresHuman, mutationStatus) are logged and skipped",
+        "Existing tests continue to pass",
+        "New test: verify non-whitelisted field mutation is rejected"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "apply_modifications_to_prd allows Claude to overwrite ANY field on story objects via `story[key] = value.clone()`, including passes, id, and requiresHuman. The DB sync has a proper whitelist but the PRD JSON does not. Add a whitelist to the PRD JSON mutation to match the DB sync whitelist.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-001",
+      "modifiesBehavior": false,
+      "notes": "Found during CODE-REVIEW-1. The DB sync_mutations_to_db already whitelists fields (title, description, notes, priority, acceptanceCriteria). Mirror this whitelist in apply_modifications_to_prd. The prompt instructs Claude to only modify certain fields, but prompt instructions aren't a reliable security boundary.",
+      "passes": true,
+      "priority": 14,
+      "synergyWith": [],
+      "title": "Whitelist allowed fields in apply_modifications_to_prd",
+      "touchesFiles": [
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "human_review_timeout i64-to-u32 conversion uses defensive clamping (negative values become None or 0)",
+        "All three sites updated: task.rs TryFrom<Row>, export/prd.rs load_tasks, engine.rs review query",
+        "Existing tests continue to pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Multiple locations cast i64 to u32 for human_review_timeout via `v as u32`. A negative i64 would silently wrap to a large u32 (~136 years). Add defensive clamping: use `u32::try_from(v).ok()` or `v.max(0) as u32`.",
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-002",
+      "modifiesBehavior": false,
+      "notes": "Found during CODE-REVIEW-1. Three sites: task.rs:385, export/prd.rs:203, engine.rs:1852. While negative values are unlikely from the DB, defensive coding prevents silent wrapping.",
+      "passes": true,
+      "priority": 16,
+      "synergyWith": [],
+      "title": "Defensive i64-to-u32 cast for human_review_timeout",
+      "touchesFiles": [
+        "src/models/task.rs",
+        "src/commands/export/prd.rs",
+        "src/loop_engine/engine.rs"
       ]
     },
     {
@@ -525,7 +576,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Key concern: handle_pause and handle_human_review may share 80%+ of their stdin-reading logic. If so, extract a shared helper (e.g., read_multiline_stdin) and have both functions call it. For each issue: add REFACTOR-1-xxx task (priority 18-19), add to MILESTONE-1 dependsOn.",
-      "passes": false,
+      "passes": true,
       "priority": 17,
       "synergyWith": [],
       "taskType": "review",
@@ -534,6 +585,59 @@
         "src/loop_engine/signals.rs",
         "src/loop_engine/engine.rs",
         "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "handle_pause calls read_lines_with_timeout(stdin.lock(), None) instead of inline loop",
+        "handle_pause is under 30 lines after refactor",
+        "All existing handle_pause and handle_human_review tests pass unchanged",
+        "No behavior change: empty-line termination and guidance recording work identically"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "handle_pause (signals.rs lines 84-94) has an inline stdin-reading loop nearly identical to the blocking branch of read_lines_with_timeout (lines 298-311). Refactor handle_pause to call read_lines_with_timeout(stdin.lock(), None) instead, eliminating the duplication and bringing handle_pause under 30 lines.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-001",
+      "modifiesBehavior": false,
+      "notes": "Found during REFACTOR-REVIEW-1. The blocking branch of read_lines_with_timeout already handles the same pattern (read lines until empty/EOF). The only difference is handle_pause doesn't track saw_eof, but gaining the EOF warning is harmless. Make read_lines_with_timeout pub(crate) if needed.",
+      "passes": true,
+      "priority": 18,
+      "synergyWith": [],
+      "title": "DRY: handle_pause should reuse read_lines_with_timeout for stdin reading",
+      "touchesFiles": [
+        "src/loop_engine/signals.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Human review trigger logic extracted from run_loop into a standalone helper function",
+        "Helper function takes conn, epoch, iteration, session_guidance, prd_path, task_prefix, default_model, permission_mode",
+        "run_loop calls the helper in place of the inline block",
+        "All existing tests pass unchanged",
+        "No behavior change"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-1"
+      ],
+      "description": "Lines 1839-1889 of engine.rs embed ~50 lines of human review SQL query + loop + mutate_prd_from_feedback call inside the already-4000-line run_loop. Extract into a helper function (e.g., trigger_human_reviews) to reduce run_loop complexity.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-1-002",
+      "modifiesBehavior": false,
+      "notes": "Found during REFACTOR-REVIEW-1. The block queries for requires_human tasks completed since completion_epoch_start, iterates them, calls handle_human_review, and optionally mutate_prd_from_feedback. This is a self-contained unit of work that can be cleanly extracted. Consider placing in prd_reconcile.rs or signals.rs depending on which module owns the concept.",
+      "passes": true,
+      "priority": 19,
+      "synergyWith": [
+        "REFACTOR-1-001"
+      ],
+      "title": "Extract human review trigger logic from run_loop into helper function",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
       ]
     },
     {
@@ -558,7 +662,11 @@
         "FEAT-005",
         "FEAT-006",
         "CODE-REVIEW-1",
-        "REFACTOR-REVIEW-1"
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "REFACTOR-REVIEW-1",
+        "REFACTOR-1-001",
+        "REFACTOR-1-002"
       ],
       "description": "Review-and-update checkpoint. All implementation tasks complete, code review done, refactoring done. Review remaining tasks and update based on implementation learnings. Verify: requiresHuman field round-trips through PRD JSON -> DB -> show/next/export, handle_human_review pauses correctly, engine triggers review after completion.",
       "estimatedEffort": "medium",
@@ -566,13 +674,131 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Review-and-update checkpoint. Read the progress file and git log, identify deviations from plan, update all remaining tasks to reflect actual implementation.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "synergyWith": [],
       "taskType": "milestone",
       "timeoutSecs": 1800,
       "title": "Review and update checkpoint — data model + interactive handler + engine integration",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "CheckContext struct defined with fields: settings_path, hook_path, commands_dir, db_dir, project_dir",
+        "All 6 check functions updated to take &CheckContext instead of individual path args",
+        "run_all_setup_checks updated to construct CheckContext and pass it to each check",
+        "All existing setup audit tests pass unchanged",
+        "No behavior change — same checks, same results, same output"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Create a CheckContext struct bundling all path parameters (settings_path, hook_path, commands_dir, db_dir, project_dir). Refactor all 6 check functions (check_default_mode, check_deny_conflicts, check_hook_bypass, check_skills_installed, check_project_config, check_claude_md) to accept &CheckContext instead of individual paths. Update run_all_setup_checks to construct CheckContext once and pass it through. Prerequisite: feat/doctor-setup must be merged first.",
+      "estimatedEffort": "medium",
+      "id": "REGISTRY-001",
+      "modifiesBehavior": false,
+      "notes": "Merge feat/doctor-setup before starting. The CheckContext struct lives in setup_output.rs alongside SetupCheck. Each check function currently takes 1-2 path args; after this change they all take &CheckContext and pick out what they need. check_skills_installed also takes &[&str] for expected skills — keep that as a second parameter or add expected_skills to CheckContext.",
+      "passes": true,
+      "priority": 21,
+      "qualityDimensions": {
+        "correctness": [
+          "All existing tests must pass without modification",
+          "CheckContext must derive Debug, Clone for testability"
+        ],
+        "style": [
+          "CheckContext belongs in setup_output.rs with the other types",
+          "Follow existing patterns — no new crates or abstractions beyond the struct"
+        ]
+      },
+      "synergyWith": [
+        "REGISTRY-002"
+      ],
+      "taskType": "implementation",
+      "title": "CheckContext struct and check function signature refactor",
+      "touchesFiles": [
+        "src/commands/doctor/setup_output.rs",
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "SetupCheckRegistry type defined as Vec<fn(&CheckContext) -> Vec<SetupCheck>>",
+        "default_registry() function returns registry pre-loaded with all 6 checks",
+        "Each check function wrapped to return Vec<SetupCheck> (single checks wrapped in vec![])",
+        "run_all_setup_checks replaced by registry.run_all(&ctx) -> Vec<SetupCheck>",
+        "audit_setup_with_claude_dir uses registry instead of direct calls",
+        "All existing setup audit tests pass unchanged",
+        "New test: custom registry with subset of checks produces only those results"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REGISTRY-001"
+      ],
+      "description": "Define SetupCheckRegistry as a collection of fn(&CheckContext) -> Vec<SetupCheck> function pointers. Implement default_registry() that registers all 6 existing checks. Replace run_all_setup_checks with registry iteration. Wire into audit_setup_with_claude_dir so the orchestrator never names individual checks — new checks are added by registering a function pointer.",
+      "estimatedEffort": "medium",
+      "id": "REGISTRY-002",
+      "modifiesBehavior": false,
+      "notes": "Keep it simple: type SetupCheckRegistry = Vec<fn(&CheckContext) -> Vec<SetupCheck>> or a newtype wrapper. The key win is that audit_setup_with_claude_dir no longer calls check functions by name — it iterates the registry. check_default_mode and similar single-result functions need a wrapper: |ctx| vec![check_default_mode(ctx)]. check_deny_conflicts and check_skills_installed already return Vec. Auto-fix logic remains separate — it keys off SetupCheck::name, not the registry.",
+      "passes": true,
+      "priority": 22,
+      "qualityDimensions": {
+        "correctness": [
+          "Registry must produce identical results to direct calls in all cases",
+          "Ordering of checks in output must be deterministic"
+        ],
+        "style": [
+          "Prefer newtype over type alias for SetupCheckRegistry",
+          "default_registry() is the single source of truth for which checks run"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "implementation",
+      "title": "SetupCheckRegistry with fn(&CheckContext) -> Vec<SetupCheck> function pointers",
+      "touchesFiles": [
+        "src/commands/doctor/setup_output.rs",
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: default_registry() returns all 6 checks when run against a valid context",
+        "Test: custom registry with single check returns only that check's results",
+        "Test: empty registry returns empty Vec",
+        "Test: check ordering is deterministic across runs",
+        "All existing doctor setup tests still pass"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REGISTRY-002"
+      ],
+      "description": "Add targeted tests for the registry itself: default registry coverage, custom/subset registries, empty registry edge case, deterministic ordering.",
+      "estimatedEffort": "low",
+      "id": "REGISTRY-003",
+      "modifiesBehavior": false,
+      "notes": "Test the registry mechanism, not the individual checks (those are already tested). Focus on: (1) default_registry contains all expected checks, (2) custom registry with only check_claude_md produces only Documentation results, (3) empty registry is valid and returns empty vec.",
+      "passes": true,
+      "priority": 23,
+      "qualityDimensions": {
+        "correctness": [
+          "Tests must verify check count matches expected number of registered checks"
+        ],
+        "style": [
+          "Use in-memory temp dirs for CheckContext paths"
+        ]
+      },
+      "synergyWith": [],
+      "taskType": "test",
+      "title": "Tests for SetupCheckRegistry and CheckContext",
+      "touchesFiles": [
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/mod.rs"
+      ]
     },
     {
       "acceptanceCriteria": [
@@ -594,8 +820,8 @@
       "estimatedEffort": "high",
       "id": "TEST-001",
       "modifiesBehavior": false,
-      "notes": "Engine integration tests are challenging because run_iteration is complex. Consider testing the requiresHuman check logic in isolation (extract a helper function) and testing it with mock DB state, rather than trying to run full iterations.",
-      "passes": false,
+      "notes": "REFACTOR-1-002 already extracted trigger_human_reviews(conn, HumanReviewParams) helper from run_loop. Test this function directly with mock DB state (in-memory SQLite with v15 schema). Key paths: (1) requires_human=1 + completed_at >= epoch triggers review, (2) requires_human=0 skips, (3) pre-completed tasks (older timestamp) skipped, (4) multiple completions each get reviewed. The function queries DB for tasks WHERE requires_human=1 AND status='done' AND completed_at >= epoch.",
+      "passes": true,
       "priority": 25,
       "qualityDimensions": {
         "correctness": [
@@ -605,7 +831,7 @@
           "Tests should be fast — use in-memory DB"
         ],
         "style": [
-          "Extract testable helper functions from engine.rs if needed"
+          "trigger_human_reviews helper already extracted — test it directly"
         ]
       },
       "synergyWith": [
@@ -637,8 +863,8 @@
       "estimatedEffort": "medium",
       "id": "TEST-002",
       "modifiesBehavior": false,
-      "notes": "For testing Claude subprocess calls, mock the subprocess or test the prompt construction and output parsing in isolation. The atomic write and backup logic can be tested with real filesystem operations in a temp directory.",
-      "passes": false,
+      "notes": "Private functions (build_mutation_prompt, apply_modifications_to_prd, sync_mutations_to_db) are testable within the existing #[cfg(test)] mod tests in prd_reconcile.rs. CODE-FIX-001 added field whitelist to apply_modifications_to_prd — test that non-whitelisted fields (passes, id, dependsOn) are rejected. Atomic write and backup logic can be tested with real filesystem ops in a temp directory. build_mutation_prompt takes (human_feedback, todo_tasks_json) — verify it includes feedback text and task list.",
+      "passes": true,
       "priority": 26,
       "qualityDimensions": {
         "correctness": [
@@ -680,7 +906,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "For each issue: add REFACTOR-2-xxx task (priority 44-48), add to MILESTONE-2 dependsOn.",
-      "passes": false,
+      "passes": true,
       "priority": 43,
       "synergyWith": [],
       "taskType": "review",
@@ -688,7 +914,102 @@
       "touchesFiles": [
         "src/db/migrations/v15.rs",
         "src/loop_engine/signals.rs",
-        "src/loop_engine/prd_reconcile.rs"
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "get_task_status(conn, id) -> String helper exists in test_utils.rs",
+        "All ~20 occurrences of SELECT status FROM tasks WHERE id = ? in prd_reconcile.rs and engine.rs tests use the helper",
+        "cargo test passes after refactor",
+        "No net change in test count"
+      ],
+      "batchWith": [
+        "REFACTOR-2-003"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Extract get_task_status(conn, id) -> String helper into test_utils.rs. The pattern conn.query_row(\"SELECT status FROM tasks WHERE id = ?\", [id], |row| row.get(0)).unwrap() is repeated ~20 times across prd_reconcile.rs and engine.rs test modules.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-001",
+      "modifiesBehavior": false,
+      "notes": "Straightforward extraction. The helper goes in test_utils.rs alongside insert_task and insert_done_task. Only touches test code — no production changes.",
+      "passes": true,
+      "priority": 44,
+      "synergyWith": [
+        "REFACTOR-2-003"
+      ],
+      "taskType": "refactor",
+      "title": "Extract get_task_status test helper for repeated DB queries",
+      "touchesFiles": [
+        "src/loop_engine/test_utils.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "EnvGuard RAII struct exists in test_utils.rs (set on new, remove on drop)",
+        "prd_reconcile.rs mutation tests (3 tests) use EnvGuard instead of manual set_var/remove_var",
+        "engine.rs hint tests (6 tests) use EnvGuard instead of manual set_var/remove_var",
+        "cargo test passes after refactor",
+        "No net change in test count"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Extract an EnvGuard RAII wrapper for env var test cleanup. Currently 9 tests across prd_reconcile.rs (CLAUDE_BINARY_MUTEX, 3 tests) and engine.rs (HINT_ENV_MUTEX, 6 tests) manually call set_var/remove_var. If a test panics before remove_var, the env var leaks to other tests. An EnvGuard that restores/removes the var on Drop fixes this.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-002",
+      "modifiesBehavior": false,
+      "notes": "Pattern: let _guard = EnvGuard::set(\"KEY\", \"value\"); — Drop restores previous value or removes var. The existing mutex guards should remain for serialization; EnvGuard handles cleanup only.",
+      "passes": true,
+      "priority": 45,
+      "synergyWith": [],
+      "taskType": "refactor",
+      "title": "Extract EnvGuard RAII wrapper for panic-safe env var test cleanup",
+      "touchesFiles": [
+        "src/loop_engine/test_utils.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "column_exists(conn, table, column) -> bool helper exists in v15.rs test module",
+        "All 4 pragma_table_info queries in v15.rs tests use the helper",
+        "execute_prefixed_sql helper exists in engine.rs test module (or test_utils)",
+        "All 4 prefix query tests in engine.rs use the helper",
+        "cargo test passes after refactor",
+        "No net change in test count"
+      ],
+      "batchWith": [
+        "REFACTOR-2-001"
+      ],
+      "conflictsWith": [],
+      "dependsOn": [
+        "REFACTOR-REVIEW-2"
+      ],
+      "description": "Two smaller DRY violations: (1) v15.rs has 4 near-identical pragma_table_info column-existence queries — extract column_exists(conn, table, column) -> bool helper. (2) engine.rs has 4 prefix-scoped query tests with identical boilerplate: prefix_and() → format SQL → build params Vec → execute — extract a helper that takes SQL template, prefix, and returns the query result.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-2-003",
+      "modifiesBehavior": false,
+      "notes": "column_exists can be local to v15.rs test module (only used there). The prefix query helper could be local to engine.rs tests or in test_utils if useful elsewhere.",
+      "passes": true,
+      "priority": 46,
+      "synergyWith": [
+        "REFACTOR-2-001"
+      ],
+      "taskType": "refactor",
+      "title": "Extract column_exists and prefix query test helpers",
+      "touchesFiles": [
+        "src/db/migrations/v15.rs",
+        "src/loop_engine/engine.rs"
       ]
     },
     {
@@ -703,7 +1024,10 @@
         "MILESTONE-1",
         "TEST-001",
         "TEST-002",
-        "REFACTOR-REVIEW-2"
+        "REFACTOR-REVIEW-2",
+        "REFACTOR-2-001",
+        "REFACTOR-2-002",
+        "REFACTOR-2-003"
       ],
       "description": "Review-and-update checkpoint after comprehensive testing. All tests pass, coverage adequate. Update remaining tasks based on test findings.",
       "estimatedEffort": "low",
@@ -711,7 +1035,7 @@
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
       "notes": "Review-and-update checkpoint. Update remaining tasks to reflect test findings, implementation changes, and API evolution.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "synergyWith": [],
       "taskType": "milestone",
@@ -738,8 +1062,8 @@
       "estimatedEffort": "medium",
       "id": "INT-001",
       "modifiesBehavior": false,
-      "notes": "For the loop simulation: create a minimal test PRD JSON with 2 tasks (one requiresHuman: true, one normal). Verify the init/show/next/export commands handle the field correctly. The actual loop pause behavior requires manual testing.",
-      "passes": false,
+      "notes": "Unit tests (TEST-001/002) already cover trigger_human_reviews query logic, mutation prompt construction, atomic writes, and graceful degradation. INT-001 should focus on CLI-level round-trip: (1) create a test PRD JSON with requiresHuman:true task, (2) task-mgr init imports it, (3) task-mgr show displays 'Requires Human Review: Yes', (4) task-mgr next includes requires_human in JSON, (5) task-mgr export round-trips both fields. The actual loop pause behavior requires manual testing or a scripted stdin pipe. Use test_utils::setup_test_db and insert_task_full for DB setup where needed.",
+      "passes": true,
       "priority": 55,
       "qualityDimensions": {
         "correctness": [
@@ -775,8 +1099,8 @@
       "id": "REFACTOR-REVIEW-3",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "notes": "Final opportunity to improve code before merge. For each issue: add REFACTOR-3-xxx task (priority 71-85), add to MILESTONE-FINAL dependsOn.",
-      "passes": false,
+      "notes": "Final opportunity to improve code before merge. REFACTOR-2 phase added get_task_status, EnvGuard, column_exists, and prefix query helpers to test_utils.rs and local test modules — verify these are used consistently. Review trigger_human_reviews (extracted in REFACTOR-1-002) and query_human_review_tasks for clarity. For each issue: add REFACTOR-3-xxx task (priority 71-85), add to MILESTONE-FINAL dependsOn.",
+      "passes": true,
       "priority": 70,
       "synergyWith": [],
       "taskType": "review",
@@ -789,6 +1113,7 @@
         "src/loop_engine/signals.rs",
         "src/loop_engine/engine.rs",
         "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/test_utils.rs",
         "src/commands/show.rs",
         "src/commands/next/output.rs",
         "src/commands/export/prd.rs"
@@ -813,8 +1138,8 @@
       "id": "VERIFY-001",
       "model": "claude-opus-4-6",
       "modifiesBehavior": false,
-      "notes": "Documentation scope: ARCHITECTURE.md needs a section on human review checkpoints in the loop flow. CLAUDE.md needs a note about the requiresHuman and humanReviewTimeout fields.",
-      "passes": false,
+      "notes": "Documentation scope: ARCHITECTURE.md needs a section on human review checkpoints covering: (1) requiresHuman field in PRD JSON triggers interactive pause, (2) handle_human_review reads stdin with optional timeout, (3) feedback injected as session guidance, (4) mutate_prd_from_feedback spawns Claude to update downstream tasks, (5) trigger_human_reviews queries tasks WHERE requires_human=1 AND completed_at >= epoch. CLAUDE.md needs: requiresHuman (bool) and humanReviewTimeout (seconds) PRD field reference for PRD authors.",
+      "passes": true,
       "priority": 90,
       "synergyWith": [],
       "taskType": "verification",

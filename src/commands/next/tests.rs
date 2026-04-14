@@ -846,6 +846,7 @@ mod next_command_tests {
                 model: None,
                 difficulty: None,
                 escalation_note: None,
+                requires_human: false,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -895,6 +896,7 @@ mod next_command_tests {
                 model: None,
                 difficulty: None,
                 escalation_note: None,
+                requires_human: false,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -1122,6 +1124,7 @@ mod next_command_tests {
                 model: Some("claude-opus-4-6".to_string()),
                 difficulty: Some("high".to_string()),
                 escalation_note: Some("Complex task needing opus".to_string()),
+                requires_human: false,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
@@ -1180,6 +1183,7 @@ mod next_command_tests {
                 model: None,
                 difficulty: None,
                 escalation_note: None,
+                requires_human: false,
                 score: ScoreOutput {
                     total: 990,
                     priority: 990,
