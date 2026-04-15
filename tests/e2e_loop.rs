@@ -876,9 +876,9 @@ fn test_run_loop_with_mock_claude() {
     let task_mgr_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_task-mgr"));
 
     // Set env vars for mock
-    std::env::set_var("CLAUDE_BINARY", &mock_claude_path);
-    std::env::set_var("TASK_MGR_BIN", &task_mgr_bin);
-    std::env::set_var("TASK_MGR_DIR", temp_dir.path());
+    unsafe { std::env::set_var("CLAUDE_BINARY", &mock_claude_path) };
+    unsafe { std::env::set_var("TASK_MGR_BIN", &task_mgr_bin) };
+    unsafe { std::env::set_var("TASK_MGR_DIR", temp_dir.path()) };
 
     // Build loop config
     let mut config = task_mgr::loop_engine::config::LoopConfig::from_env();
@@ -909,9 +909,9 @@ fn test_run_loop_with_mock_claude() {
     let exit_code = loop_result.exit_code;
 
     // Clean up env vars
-    std::env::remove_var("CLAUDE_BINARY");
-    std::env::remove_var("TASK_MGR_BIN");
-    std::env::remove_var("TASK_MGR_DIR");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+    unsafe { std::env::remove_var("TASK_MGR_BIN") };
+    unsafe { std::env::remove_var("TASK_MGR_DIR") };
 
     // Verify exit code 0 (success)
     assert_eq!(exit_code, 0, "Loop should exit with code 0");

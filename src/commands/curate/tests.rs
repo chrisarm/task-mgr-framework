@@ -3199,9 +3199,9 @@ fn test_dedup_batch_auto_calc_large_corpus_uses_multiple_batches() {
         insert_learning_with_content(&conn, &format!("Learning {i}"), &long_content);
     }
 
-    std::env::set_var("CLAUDE_BINARY", "false");
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
     let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup large corpus");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     // Auto batch_size=20: 25 learnings → ceil(25/20) = 2 batches → 2 LLM failures.
     assert_eq!(
@@ -3230,7 +3230,7 @@ fn test_dedup_batch_size_override_explicit() {
         );
     }
 
-    std::env::set_var("CLAUDE_BINARY", "false");
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3239,7 +3239,7 @@ fn test_dedup_batch_size_override_explicit() {
         },
     )
     .expect("curate_dedup batch_size override");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.llm_errors, 3,
@@ -3286,7 +3286,7 @@ fn test_dedup_already_merged_tracking_prevents_double_merge() {
     );
     let (_mock_dir, script) = setup_claude_mock(&mock_json);
 
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3295,7 +3295,7 @@ fn test_dedup_already_merged_tracking_prevents_double_merge() {
         },
     )
     .expect("curate_dedup already-merged tracking");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.clusters_found, 1,
@@ -3324,7 +3324,7 @@ fn test_dedup_multiple_consecutive_llm_failures_counted_accurately() {
         );
     }
 
-    std::env::set_var("CLAUDE_BINARY", "false");
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3333,7 +3333,7 @@ fn test_dedup_multiple_consecutive_llm_failures_counted_accurately() {
         },
     )
     .expect("curate_dedup with consecutive LLM failures must not crash");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.llm_errors, 3,
@@ -3362,7 +3362,7 @@ fn test_dedup_threshold_zero_accepted_without_crash() {
     insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
 
     let (_mock_dir, script) = setup_claude_mock("[]");
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3372,7 +3372,7 @@ fn test_dedup_threshold_zero_accepted_without_crash() {
         },
     )
     .expect("curate_dedup with threshold=0.0 must succeed");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.llm_errors, 0,
@@ -3394,7 +3394,7 @@ fn test_dedup_threshold_one_accepted_without_crash() {
     insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
 
     let (_mock_dir, script) = setup_claude_mock("[]");
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3404,7 +3404,7 @@ fn test_dedup_threshold_one_accepted_without_crash() {
         },
     )
     .expect("curate_dedup with threshold=1.0 must succeed");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.llm_errors, 0,
@@ -3429,7 +3429,7 @@ fn test_dedup_progress_output_uses_stderr_not_stdout() {
     insert_learning(&conn, "L1", Confidence::High, LearningOutcome::Pattern);
     insert_learning(&conn, "L2", Confidence::High, LearningOutcome::Pattern);
 
-    std::env::set_var("CLAUDE_BINARY", "false");
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3437,7 +3437,7 @@ fn test_dedup_progress_output_uses_stderr_not_stdout() {
             ..DedupParams::default()
         },
     );
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     // curate_dedup returns structured data (Ok(DedupResult)), confirming results
     // are not mixed into stdout. Batch progress went to stderr via eprintln!.
@@ -3610,7 +3610,7 @@ fn test_e2e_dry_run_shows_two_clusters_no_db_changes() {
 
     let mock_response = two_cluster_json(&ids);
     let (_mock_dir, script) = setup_claude_mock(&mock_response);
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -3619,7 +3619,7 @@ fn test_e2e_dry_run_shows_two_clusters_no_db_changes() {
         },
     )
     .expect("curate_dedup dry-run must succeed");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     // Dry-run: DB unchanged.
     assert_eq!(
@@ -3697,9 +3697,9 @@ fn test_e2e_dedup_creates_two_merged_learnings_and_retires_six_originals() {
 
     let mock_response = two_cluster_json(&ids);
     let (_mock_dir, script) = setup_claude_mock(&mock_response);
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup must succeed");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(result.clusters_found, 2, "2 clusters found");
     assert_eq!(result.learnings_merged, 6, "6 originals merged (retired)");
@@ -3751,9 +3751,9 @@ fn test_e2e_merged_learning_has_union_metadata_and_summed_bandit_stats() {
         r#"[{{"source_ids": [{id1},{id2},{id3}], "merged_title": "Merged ABC", "merged_content": "Merged content", "merged_outcome": "pattern", "reason": "dup"}}]"#
     );
     let (_mock_dir, script) = setup_claude_mock(&mock_json);
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(result.clusters_found, 1);
     let merged_id = result.clusters[0]
@@ -3826,9 +3826,9 @@ fn test_e2e_retired_originals_excluded_from_recall_merged_included() {
         r#"[{{"source_ids": [{id1},{id2}], "merged_title": "Merged Recall Test", "merged_content": "Merged recall content", "merged_outcome": "pattern", "reason": "dup"}}]"#
     );
     let (_mock_dir, script) = setup_claude_mock(&mock_json);
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(result.clusters_found, 1);
     let merged_id = result.clusters[0]
@@ -3882,9 +3882,9 @@ fn test_e2e_rerun_after_dedup_finds_zero_clusters_idempotent() {
     let (_mock_dir, script) = setup_claude_mock(&mock_json);
 
     // First run: merges the 2 learnings.
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
     let first_result = curate_dedup(&conn, DedupParams::default()).expect("first dedup");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         first_result.clusters_found, 1,
@@ -3898,9 +3898,9 @@ fn test_e2e_rerun_after_dedup_finds_zero_clusters_idempotent() {
     // Second run: the merged learning is the only active one, LLM returns [].
     // No 2-item clusters possible from a single learning → 0 clusters.
     let (_mock_dir2, script2) = setup_claude_mock("[]");
-    std::env::set_var("CLAUDE_BINARY", script2.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script2.to_str().unwrap()) };
     let second_result = curate_dedup(&conn, DedupParams::default()).expect("second dedup");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         second_result.clusters_found, 0,
@@ -4090,7 +4090,7 @@ fn test_parallel_concurrency_1_same_as_sequential() {
         r#"[{{"source_ids": [{id1},{id2}], "merged_title": "Merged P", "merged_content": "Content", "merged_outcome": "pattern", "reason": "dup"}}]"#
     );
     let (_mock_dir, script) = setup_claude_mock(&mock_json);
-    std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
 
     // Run with concurrency=1 (single batch handles all items).
     let result = curate_dedup(
@@ -4101,7 +4101,7 @@ fn test_parallel_concurrency_1_same_as_sequential() {
         },
     )
     .expect("curate_dedup concurrency=1");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(
         result.clusters_found, 1,
@@ -4167,7 +4167,7 @@ fn test_parallel_error_isolation_one_batch_fails_others_succeed() {
     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod script");
 
-    std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -4177,7 +4177,7 @@ fn test_parallel_error_isolation_one_batch_fails_others_succeed() {
         },
     )
     .expect("curate_dedup error isolation");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     // One batch failed, one succeeded.
     assert_eq!(result.llm_errors, 1, "exactly 1 LLM error expected");
@@ -4240,7 +4240,7 @@ fn test_parallel_result_ordering_clusters_processed_in_batch_order() {
     .expect("write script");
     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+    unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
     let result = curate_dedup(
         &conn,
         DedupParams {
@@ -4250,7 +4250,7 @@ fn test_parallel_result_ordering_clusters_processed_in_batch_order() {
         },
     )
     .expect("curate_dedup result ordering");
-    std::env::remove_var("CLAUDE_BINARY");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     // Each batch returns all 3 clusters but parse_dedup_response filters to only
     // IDs present in that batch's eligible_ids — so each batch produces at most

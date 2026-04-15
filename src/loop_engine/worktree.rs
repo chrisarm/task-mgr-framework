@@ -13,13 +13,11 @@ use super::env::{get_current_branch, prompt_user_yn};
 
 /// Silently ignore errors (best-effort cleanup).
 fn cleanup_empty_dir(path: &Path) {
-    if path.exists() {
-        if let Ok(mut entries) = std::fs::read_dir(path) {
-            if entries.next().is_none() {
+    if path.exists()
+        && let Ok(mut entries) = std::fs::read_dir(path)
+            && entries.next().is_none() {
                 let _ = std::fs::remove_dir(path);
             }
-        }
-    }
 }
 
 /// Replace `/`, spaces, and other problematic characters with `-`.

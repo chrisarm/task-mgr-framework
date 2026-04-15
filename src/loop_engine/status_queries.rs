@@ -231,25 +231,21 @@ pub(crate) fn read_active_lock_prefixes(dir: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("loop-") && name_str.ends_with(".lock") {
-                if let Some(info) = LockGuard::read_holder_info(&entry.path()) {
-                    if let Some(p) = info.prefix {
+            if name_str.starts_with("loop-") && name_str.ends_with(".lock")
+                && let Some(info) = LockGuard::read_holder_info(&entry.path())
+                    && let Some(p) = info.prefix {
                         prefixes.push(p);
                     }
-                }
-            }
         }
     }
 
     // Check legacy global lock file
     let global_lock = dir.join("loop.lock");
-    if let Some(info) = LockGuard::read_holder_info(&global_lock) {
-        if let Some(p) = info.prefix {
-            if !prefixes.contains(&p) {
+    if let Some(info) = LockGuard::read_holder_info(&global_lock)
+        && let Some(p) = info.prefix
+            && !prefixes.contains(&p) {
                 prefixes.push(p);
             }
-        }
-    }
 
     prefixes
 }

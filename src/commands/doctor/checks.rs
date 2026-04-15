@@ -92,11 +92,10 @@ pub fn has_active_loop_lock(dir: &Path) -> bool {
         if name_str.starts_with("loop") && name_str.ends_with(".lock") {
             let path = entry.path();
             // If we can read a holder PID and it's still alive, the lock is active
-            if let Some(info) = LockGuard::read_holder_info(&path) {
-                if is_pid_alive(info.pid) {
+            if let Some(info) = LockGuard::read_holder_info(&path)
+                && is_pid_alive(info.pid) {
                     return true;
                 }
-            }
         }
     }
 

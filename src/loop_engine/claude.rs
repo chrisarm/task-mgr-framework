@@ -76,6 +76,7 @@ pub struct ClaudeResult {
 ///
 /// Returns `TaskMgrError::IoError` if the binary is not found or
 /// the process fails to spawn.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_claude(
     prompt: &str,
     signal_flag: Option<&SignalFlag>,
@@ -84,6 +85,7 @@ pub(crate) fn spawn_claude(
     timeout: Option<TimeoutConfig>,
     stream_json: bool,
     permission_mode: &PermissionMode,
+    effort: Option<&str>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -120,12 +122,16 @@ pub(crate) fn spawn_claude(
             }
         }
     }
-    if let Some(m) = model {
-        if !m.trim().is_empty() {
+    if let Some(m) = model
+        && !m.trim().is_empty() {
             args.push("--model".to_string());
             args.push(m.to_string());
         }
-    }
+    if let Some(e) = effort
+        && !e.trim().is_empty() {
+            args.push("--effort".to_string());
+            args.push(e.to_string());
+        }
     args.push("-p".to_string());
     // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
     // limits when prompts are large (e.g. curate dedup with many learnings).
@@ -317,11 +323,10 @@ fn extract_error_text(val: &serde_json::Value) -> Option<String> {
     if error.is_null() {
         return None;
     }
-    if let Some(s) = error.as_str() {
-        if !s.is_empty() {
+    if let Some(s) = error.as_str()
+        && !s.is_empty() {
             return Some(s.to_string());
         }
-    }
     error
         .get("message")
         .and_then(|m| m.as_str())
@@ -341,11 +346,10 @@ fn tee_assistant_text(val: &serde_json::Value) {
     }
     if let Some(content) = assistant_content(val) {
         for block in content {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                     eprintln!("{}", text);
                 }
-            }
         }
     }
 }
@@ -658,7 +662,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let script = make_echo_args_stdin_script("echo");
-        std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+        unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
         let result = spawn_claude(
             prompt,
             signal,
@@ -667,8 +671,9 @@ mod tests {
             None,
             stream_json,
             permission_mode,
+            None,
         );
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script);
         result
     }
@@ -912,7 +917,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
         let flag = SignalFlag::new();
 
         // Set the signal flag after a short delay in a background thread
@@ -931,10 +936,11 @@ mod tests {
             None,
             false,
             &PermissionMode::Dangerous,
+            None,
         );
         let elapsed = start.elapsed();
 
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
 
         assert!(
@@ -993,7 +999,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
 
         let result = spawn_claude(
             "this prompt will not be read",
@@ -1003,9 +1009,10 @@ mod tests {
             None,
             false,
             &PermissionMode::Dangerous,
+            None,
         );
 
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
 
         assert!(
@@ -1395,7 +1402,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
 
         let script_path = make_stream_json_result_script("args");
-        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
         let result = spawn_claude(
             "prompt",
             None,
@@ -1404,8 +1411,9 @@ mod tests {
             None,
             true,
             &PermissionMode::Dangerous,
+            None,
         );
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
 
         let res = result.expect("spawn should succeed");
@@ -1994,7 +2002,7 @@ mod tests {
 
         let script_path = make_stream_json_result_script("stream_model_timeout");
         let timeout = TimeoutConfig::from_difficulty(Some("medium"), Arc::new(AtomicU64::new(0)));
-        std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+        unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
         let result = spawn_claude(
             "my-prompt",
             None,
@@ -2003,8 +2011,9 @@ mod tests {
             Some(timeout),
             true,
             &scoped_coding(),
+            None,
         );
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
 
         let output = result.expect("spawn should succeed").output;
@@ -2072,7 +2081,7 @@ mod tests {
             // Need a script that emits valid result JSON so the stream-json parser yields args
             let script_path =
                 make_stream_json_result_script(&format!("4callers_{}", model.unwrap_or("none")));
-            std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap());
+            unsafe { std::env::set_var("CLAUDE_BINARY", script_path.to_str().unwrap()) };
             let result = spawn_claude(
                 "test-prompt",
                 None,
@@ -2081,15 +2090,16 @@ mod tests {
                 None,
                 stream_json,
                 &PermissionMode::Dangerous,
+                None,
             );
-            std::env::remove_var("CLAUDE_BINARY");
+            unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script_path);
             result.expect("spawn should succeed").output
         } else {
             // Call spawn_claude directly — CLAUDE_BINARY_MUTEX is already held by this function.
             // Using spawn_claude_echo here would deadlock (std::sync::Mutex is not reentrant).
             let script = make_echo_args_stdin_script("4callers_echo");
-            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
             let result = spawn_claude(
                 "test-prompt",
                 None,
@@ -2098,8 +2108,9 @@ mod tests {
                 None,
                 stream_json,
                 &PermissionMode::Dangerous,
+                None,
             );
-            std::env::remove_var("CLAUDE_BINARY");
+            unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script);
             result.expect("spawn should succeed").output
         };
@@ -2201,7 +2212,7 @@ mod tests {
         // Locate the fixture relative to CARGO_MANIFEST_DIR
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let script = format!("{}/tests/fixtures/mock_stream_json.sh", manifest_dir);
-        std::env::set_var("CLAUDE_BINARY", &script);
+        unsafe { std::env::set_var("CLAUDE_BINARY", &script) };
         let result = spawn_claude(
             "ignored_prompt",
             None,
@@ -2210,8 +2221,9 @@ mod tests {
             None,
             stream_json,
             &PermissionMode::Dangerous,
+            None,
         );
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
         result
     }
 

@@ -207,15 +207,14 @@ fn query_runs(
     }
 
     // Apply optional limit to archived runs
-    if let Some(Some(arch_limit)) = include_archived {
-        if arch_limit > 0 {
+    if let Some(Some(arch_limit)) = include_archived
+        && arch_limit > 0 {
             let active_count = runs.iter().filter(|r| !r.archived).count();
             let archived_count = runs.len() - active_count;
             if archived_count > arch_limit {
                 runs.truncate(active_count + arch_limit);
             }
         }
-    }
 
     Ok(runs)
 }

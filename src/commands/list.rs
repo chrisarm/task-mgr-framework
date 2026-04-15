@@ -171,8 +171,8 @@ fn query_tasks(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Apply optional limit to archived records
-    if let Some(Some(limit)) = include_archived {
-        if limit > 0 {
+    if let Some(Some(limit)) = include_archived
+        && limit > 0 {
             let active_count = summaries.iter().filter(|t| !t.archived).count();
             let archived_count = summaries.len() - active_count;
             if archived_count > limit {
@@ -180,7 +180,6 @@ fn query_tasks(
                 summaries.truncate(active_count + limit);
             }
         }
-    }
 
     Ok(summaries)
 }

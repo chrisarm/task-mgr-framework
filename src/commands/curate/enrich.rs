@@ -240,6 +240,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             None,
             false,
             &PermissionMode::text_only(),
+            None,
         ) {
             Ok(r) => r,
             Err(e) => {

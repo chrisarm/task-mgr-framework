@@ -190,13 +190,13 @@ fn load_ucb_fallback(
             WHERE retired_at IS NULL
             "#,
         )?;
-        let result = stmt
+        
+        stmt
             .query_map([], |row| {
                 Learning::try_from(row)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-        result
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         let placeholders: Vec<String> =
             (1..=exclude_ids.len()).map(|i| format!("?{}", i)).collect();
@@ -217,13 +217,13 @@ fn load_ucb_fallback(
             .map(|id| id as &dyn rusqlite::ToSql)
             .collect();
         let mut stmt = conn.prepare(&sql)?;
-        let result = stmt
+        
+        stmt
             .query_map(params.as_slice(), |row| {
                 Learning::try_from(row)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-        result
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Rank by UCB

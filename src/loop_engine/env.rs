@@ -355,11 +355,11 @@ pub fn resolve_paths(
                 .unwrap_or_default()
                 .to_string_lossy();
             let prompt_name = format!("{}-prompt.md", stem);
-            let prompt_path = prd_absolute
+            
+            prd_absolute
                 .parent()
                 .unwrap_or(&prd_absolute)
-                .join(prompt_name);
-            prompt_path
+                .join(prompt_name)
         }
     };
 

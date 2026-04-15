@@ -161,8 +161,8 @@ pub fn wait_for_usage_reset(
         }
 
         // Periodic probe: check if rate limit has been lifted early
-        if let Some(ref probe) = probe_fn {
-            if since_last_probe >= PROBE_INTERVAL_SECS {
+        if let Some(ref probe) = probe_fn
+            && since_last_probe >= PROBE_INTERVAL_SECS {
                 since_last_probe = 0;
                 eprintln!("  Probing whether rate limit has been lifted...");
                 if probe() {
@@ -171,7 +171,6 @@ pub fn wait_for_usage_reset(
                 }
                 eprintln!("  Still rate-limited. Continuing wait...");
             }
-        }
 
         // Display countdown every interval
         let sleep_time = remaining.min(WAIT_CHECK_INTERVAL_SECS);

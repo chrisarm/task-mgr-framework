@@ -96,8 +96,8 @@ fn append_common_filters(
         conditions.push(format!("{} = ?{}", outcome_column, param_num));
         sql_params.push(Box::new(outcome.as_db_str().to_string()));
     }
-    if let Some(ref tags) = query.tags {
-        if !tags.is_empty() {
+    if let Some(ref tags) = query.tags
+        && !tags.is_empty() {
             let param_start = sql_params.len() + 1;
             let placeholders: Vec<String> = (0..tags.len())
                 .map(|i| format!("?{}", param_start + i))
@@ -111,7 +111,6 @@ fn append_common_filters(
                 sql_params.push(Box::new(tag.clone()));
             }
         }
-    }
 }
 
 /// Executes FTS5 query with BM25 scoring, returning ScoredLearning results.

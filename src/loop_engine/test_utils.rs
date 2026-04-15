@@ -29,7 +29,7 @@ impl EnvGuard {
     /// Set `key` to `value`, saving the previous value for restoration on drop.
     pub fn set(key: &str, value: &str) -> Self {
         let previous = std::env::var(key).ok();
-        std::env::set_var(key, value);
+        unsafe { std::env::set_var(key, value) };
         Self {
             key: key.to_string(),
             previous,
@@ -39,7 +39,7 @@ impl EnvGuard {
     /// Remove `key`, saving the previous value for restoration on drop.
     pub fn remove(key: &str) -> Self {
         let previous = std::env::var(key).ok();
-        std::env::remove_var(key);
+        unsafe { std::env::remove_var(key) };
         Self {
             key: key.to_string(),
             previous,
@@ -50,8 +50,8 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {
-            Some(val) => std::env::set_var(&self.key, val),
-            None => std::env::remove_var(&self.key),
+            Some(val) => unsafe { std::env::set_var(&self.key, val) },
+            None => unsafe { std::env::remove_var(&self.key) },
         }
     }
 }

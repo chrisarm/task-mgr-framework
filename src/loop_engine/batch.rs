@@ -447,12 +447,11 @@ pub async fn run_batch(
 
     // Step 3: Chain validation — all PRDs must have branchName when --chain is active.
     // This runs upfront so we fail fast before any work begins.
-    if chain {
-        if let Err(e) = validate_chain_branches(&pairs) {
+    if chain
+        && let Err(e) = validate_chain_branches(&pairs) {
             eprintln!("Error: {}", e);
             return batch_fail_early();
         }
-    }
 
     // Step 4: Resolve tasks dir for .stop signal checking
     let tasks_dir = dir.join("tasks");

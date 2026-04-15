@@ -291,13 +291,12 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
     }
 
     // 3. Custom allowlist → explicit scoped mode, no project config merge.
-    if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS") {
-        if !tools.is_empty() {
+    if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS")
+        && !tools.is_empty() {
             return PermissionMode::Scoped {
                 allowed_tools: Some(tools),
             };
         }
-    }
 
     // 4. Project config permissionMode (from .task-mgr/config.json).
     let project_config = super::project_config::read_project_config(db_dir);
@@ -416,13 +415,12 @@ pub fn permission_mode_from_env() -> PermissionMode {
     }
 
     // 3. Custom allowlist → explicit scoped mode.
-    if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS") {
-        if !tools.is_empty() {
+    if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS")
+        && !tools.is_empty() {
             return PermissionMode::Scoped {
                 allowed_tools: Some(tools),
             };
         }
-    }
 
     // 4. Default → Scoped with coding allowlist.
     PermissionMode::Scoped {
@@ -1097,9 +1095,9 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_default_is_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
         assert!(
@@ -1117,24 +1115,24 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_dangerous_mode() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "dangerous") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         assert_eq!(mode, PermissionMode::Dangerous);
     }
 
     #[test]
     fn test_permission_mode_from_env_auto_mode() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
         assert!(
             matches!(
                 mode,
@@ -1150,12 +1148,12 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_custom_allowed_tools() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
         assert_eq!(
             mode,
             PermissionMode::Scoped {
@@ -1169,25 +1167,25 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_dangerous_beats_auto() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
-        std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "dangerous") };
+        unsafe { std::env::set_var("LOOP_ENABLE_AUTO_MODE", "true") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
         assert_eq!(mode, PermissionMode::Dangerous);
     }
 
     #[test]
     fn test_permission_mode_from_env_unknown_mode_falls_through_to_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "unknown");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "unknown") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         assert!(
             matches!(mode, PermissionMode::Scoped { .. }),
             "Unknown mode should fall back to Scoped, got {:?}",
@@ -1198,12 +1196,12 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_scoped() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::set_var("LOOP_ALLOWED_TOOLS", "");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::set_var("LOOP_ALLOWED_TOOLS", "") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
         assert!(
             matches!(
                 mode,
@@ -1219,12 +1217,12 @@ mod tests {
     #[test]
     fn test_permission_mode_from_env_scoped_explicit() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "scoped");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "scoped") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         assert_eq!(
             mode,
             PermissionMode::Scoped {
@@ -1419,9 +1417,9 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_default_is_scoped_with_tools() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         // Use a temp dir with no config.json
         let dir = tempfile::tempdir().unwrap();
@@ -1440,9 +1438,9 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_env_override_skips_project_config() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::set_var("LOOP_ALLOWED_TOOLS", "Read,Bash") };
 
         // Create a dir WITH config.json — it should be ignored
         let dir = tempfile::tempdir().unwrap();
@@ -1453,7 +1451,7 @@ mod tests {
         .unwrap();
 
         let mode = resolve_permission_mode(dir.path());
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
         assert_eq!(
             mode,
             PermissionMode::Scoped {
@@ -1465,22 +1463,22 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_dangerous_skips_all() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "dangerous");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "dangerous") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let dir = tempfile::tempdir().unwrap();
         let mode = resolve_permission_mode(dir.path());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         assert_eq!(mode, PermissionMode::Dangerous);
     }
 
     #[test]
     fn test_resolve_permission_mode_scoped_merges_project_config() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "scoped");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "scoped") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1490,7 +1488,7 @@ mod tests {
         .unwrap();
 
         let mode = resolve_permission_mode(dir.path());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         if let PermissionMode::Scoped {
             allowed_tools: Some(tools),
         } = &mode
@@ -1506,9 +1504,9 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_default_merges_project_config() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1539,9 +1537,9 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_project_config_dangerous() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1557,9 +1555,9 @@ mod tests {
     #[test]
     fn test_resolve_permission_mode_env_overrides_project_config() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LOOP_PERMISSION_MODE", "scoped");
-        std::env::remove_var("LOOP_ENABLE_AUTO_MODE");
-        std::env::remove_var("LOOP_ALLOWED_TOOLS");
+        unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "scoped") };
+        unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
+        unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let dir = tempfile::tempdir().unwrap();
         // Project config says dangerous, but env says scoped — env wins
@@ -1570,7 +1568,7 @@ mod tests {
         .unwrap();
 
         let mode = resolve_permission_mode(dir.path());
-        std::env::remove_var("LOOP_PERMISSION_MODE");
+        unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         assert!(
             matches!(mode, PermissionMode::Scoped { .. }),
             "Env var should override project config, got {:?}",

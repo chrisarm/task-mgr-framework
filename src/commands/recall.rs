@@ -258,11 +258,10 @@ pub fn format_verbose(result: &RecallCmdResult) -> String {
                 }
             }
 
-            if let Some(ref outcome) = result.outcome_filter {
-                if learning.outcome == *outcome {
+            if let Some(ref outcome) = result.outcome_filter
+                && learning.outcome == *outcome {
                     match_reasons.push(format!("outcome is {}", outcome));
                 }
-            }
 
             if result.for_task.is_some() {
                 if let Some(ref files) = learning.applies_to_files {

@@ -36,7 +36,11 @@ pub struct PrdUserStory {
     pub conflicts_with: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
+    /// Task effort level ("low", "medium", "high").
+    /// Canonical JSON key is `estimatedEffort`; `difficulty` is also accepted
+    /// for older PRDs. The internal Rust name is kept as `difficulty` for
+    /// historical reasons (DB column, Task struct field).
+    #[serde(default, rename = "estimatedEffort", alias = "difficulty")]
     pub difficulty: Option<String>,
     #[serde(default)]
     pub escalation_note: Option<String>,

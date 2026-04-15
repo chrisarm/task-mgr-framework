@@ -608,6 +608,7 @@ fn process_batches_parallel(
                 None,
                 false,
                 &PermissionMode::text_only(),
+                None,
             ) {
                 Err(e) => {
                     eprintln!(

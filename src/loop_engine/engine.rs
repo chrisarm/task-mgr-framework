@@ -76,6 +76,19 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
     "Your current settings continue to work in the meantime."
 );
 
+/// Map task difficulty to Claude CLI `--effort` level.
+///
+/// Scaling: low difficulty → medium effort, medium → high, high → max.
+/// Returns `None` when difficulty is unset, letting Claude use its default.
+fn effort_for_difficulty(difficulty: Option<&str>) -> Option<&'static str> {
+    match difficulty.map(|d| d.to_ascii_lowercase()).as_deref() {
+        Some("low") => Some("medium"),
+        Some("medium") => Some("high"),
+        Some("high") => Some("max"),
+        _ => None,
+    }
+}
+
 /// Parameters for usage API monitoring within an iteration.
 #[derive(Debug, Clone)]
 pub struct UsageParams {
@@ -476,6 +489,7 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
+    let effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
     let claude_result = claude::spawn_claude(
         &prompt_result.prompt,
         Some(params.signal_flag),
@@ -484,6 +498,7 @@ pub fn run_iteration(
         Some(timeout_config),
         true,
         params.permission_mode,
+        effort,
     );
     monitor::stop_monitor(monitor_handle);
     let claude_result = claude_result?;
@@ -494,10 +509,10 @@ pub fn run_iteration(
         let config_path = params.db_dir.join("config.json");
         let allowed_str = match params.permission_mode {
             PermissionMode::Scoped {
-                allowed_tools: Some(ref t),
+                allowed_tools: Some(t),
             }
             | PermissionMode::Auto {
-                allowed_tools: Some(ref t),
+                allowed_tools: Some(t),
             } => t.as_str(),
             _ => "",
         };
@@ -1166,8 +1181,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             .unwrap_or(0);
         let is_new_task_list = done_count == 0;
 
-        if is_new_task_list {
-            if let Ok(home) = std::env::var("HOME") {
+        if is_new_task_list
+            && let Ok(home) = std::env::var("HOME") {
                 let global_dir = PathBuf::from(home).join(".claude");
                 let checks = pre_check_loop_setup(&global_dir);
                 let blockers: Vec<_> = checks
@@ -1192,7 +1207,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     eprintln!();
                 }
             }
-        }
     }
 
     // Resolve external git repo path: CLI flag overrides PRD metadata
@@ -1292,9 +1306,9 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         copy_if_missing(&paths.prompt_file);
 
         // PRD markdown (from prdFile field in JSON, if present)
-        if let Ok(content) = std::fs::read_to_string(&paths.prd_file) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str()) {
+        if let Ok(content) = std::fs::read_to_string(&paths.prd_file)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str()) {
                     let prd_md_path = paths
                         .prd_file
                         .parent()
@@ -1302,8 +1316,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         .join(prd_md);
                     copy_if_missing(&prd_md_path);
                 }
-            }
-        }
     }
 
     // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
@@ -1331,8 +1343,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // If using a worktree, re-import from the worktree PRD to pick up any tasks
     // that were added in the worktree but not in source_root (e.g., tasks created
     // by Claude during a previous run that only exist in the worktree copy).
-    if live_prd_file != run_config.prd_file && live_prd_file.exists() {
-        if let Err(e) = crate::commands::init(
+    if live_prd_file != run_config.prd_file && live_prd_file.exists()
+        && let Err(e) = crate::commands::init(
             &run_config.db_dir,
             &[&live_prd_file],
             false, // force
@@ -1343,7 +1355,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         ) {
             eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
         }
-    }
     prd_hash = hash_file(&live_prd_file);
     // Override paths.prd_file so all iteration code (mark_task_done, reconcile, etc.)
     // reads/writes the worktree copy, not the source_root copy.
@@ -1375,8 +1386,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         .to_string_lossy()
         .to_string();
 
-    if let Some(hours) = run_config.config.hours {
-        if let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours) {
+    if let Some(hours) = run_config.config.hours
+        && let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours) {
             eprintln!("Error creating deadline: {}", e);
             return LoopResult {
                 exit_code: 1,
@@ -1385,7 +1396,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 was_stopped: false,
             };
         }
-    }
 
     // Step 12: Begin run session
     let begin_result = match run_cmd::begin(&conn) {
@@ -1486,13 +1496,12 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Step 15.6: Print auto-mode availability hint if applicable.
     // Fires when LOOP_AUTO_MODE_AVAILABLE=true and user is NOT already in Auto mode.
     // Informs the user that the current permission model will be deprecated.
-    if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE") {
-        if config::parse_bool_value(&val) == Some(true)
+    if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE")
+        && config::parse_bool_value(&val) == Some(true)
             && !matches!(permission_mode, config::PermissionMode::Auto { .. })
         {
             eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
         }
-    }
 
     // Step 15.7: Log requires_human task count so the user knows pauses are coming
     {
@@ -1674,8 +1683,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
         // Check for task completion via multiple detection paths.
         // Priority: <completed> tags > git commit > output scan > already-complete
-        if let Some(ref task_id) = result.task_id {
-            if !matches!(result.outcome, IterationOutcome::Empty) {
+        if let Some(ref task_id) = result.task_id
+            && !matches!(result.outcome, IterationOutcome::Empty) {
                 let mut task_marked_done_this_iteration = false;
 
                 // Primary: parse <completed> tags from output
@@ -1825,8 +1834,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         task_id,
                         task_prefix.as_deref(),
                     )
-                {
-                    if let Ok(()) = mark_task_done(
+                    && let Ok(()) = mark_task_done(
                         &mut conn,
                         task_id,
                         &run_id,
@@ -1840,7 +1848,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         ctx.crash_tracker.record_success();
                         eprintln!("Task {} completed (reported as already done)", task_id);
                     }
-                }
 
                 // Wrapper commit: if task was completed but no git commit exists
                 // (Claude couldn't commit in scoped permission mode), commit on its behalf.
@@ -1851,20 +1858,17 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                         run_config.config.git_scan_depth,
                     )
                     .is_none()
-                {
-                    if let Some(hash) =
+                    && let Some(hash) =
                         wrapper_commit(&working_root, task_id, "loop wrapper commit")
                     {
                         ctx.last_commit = Some(hash);
                     }
-                }
             }
-        }
 
         // Post-iteration: reconcile external git completions
         // Catches tasks completed in the current iteration (and any missed from prior)
-        if let Some(ref ext_repo) = external_repo_path {
-            if !matches!(result.outcome, IterationOutcome::Empty) {
+        if let Some(ref ext_repo) = external_repo_path
+            && !matches!(result.outcome, IterationOutcome::Empty) {
                 let count = reconcile_external_git_completions(
                     ext_repo,
                     &mut conn,
@@ -1899,7 +1903,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     }
                 }
             }
-        }
 
         // Trigger human review for requires_human tasks completed this iteration.
         // Queries by timestamp to capture all detection paths (tags, git, output scan,
@@ -1935,19 +1938,17 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
-        if let Some(ref task_id) = result.task_id {
-            if !matches!(
+        if let Some(ref task_id) = result.task_id
+            && !matches!(
                 result.outcome,
                 IterationOutcome::Completed
                     | IterationOutcome::Empty
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
-            ) {
-                if let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64) {
+            )
+                && let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64) {
                     eprintln!("Warning: failed to start retry tracking transaction: {}", e);
                 }
-            }
-        }
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
@@ -2574,11 +2575,10 @@ pub fn handle_task_failure(
         .unwrap_or(3);
 
     // Only escalate if auto-block won't immediately follow (escalated model would never be used)
-    if !should_auto_block(new_count, max_retries) {
-        if let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
+    if !should_auto_block(new_count, max_retries)
+        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
             eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
         }
-    }
 
     if should_auto_block(new_count, max_retries) {
         if let Err(e) = auto_block_task(&tx, task_id, new_count, current_iteration) {
@@ -4254,5 +4254,18 @@ mod tests {
             Some(SONNET_MODEL.to_string()),
             "model in DB must be unchanged at 1 failure"
         );
+    }
+
+    #[test]
+    fn test_effort_for_difficulty_mapping() {
+        assert_eq!(effort_for_difficulty(Some("low")), Some("medium"));
+        assert_eq!(effort_for_difficulty(Some("medium")), Some("high"));
+        assert_eq!(effort_for_difficulty(Some("high")), Some("max"));
+        // Case-insensitive
+        assert_eq!(effort_for_difficulty(Some("LOW")), Some("medium"));
+        assert_eq!(effort_for_difficulty(Some("High")), Some("max"));
+        // Unknown / None → None (use CLI default)
+        assert_eq!(effort_for_difficulty(None), None);
+        assert_eq!(effort_for_difficulty(Some("unknown")), None);
     }
 }

@@ -293,9 +293,9 @@ fn test_full_loop_worktree_created_and_cleaned_up() {
         .join("mock-claude.sh");
     let task_mgr_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_task-mgr"));
 
-    std::env::set_var("CLAUDE_BINARY", &mock_claude);
-    std::env::set_var("TASK_MGR_BIN", &task_mgr_bin);
-    std::env::set_var("TASK_MGR_DIR", repo.path());
+    unsafe { std::env::set_var("CLAUDE_BINARY", &mock_claude) };
+    unsafe { std::env::set_var("TASK_MGR_BIN", &task_mgr_bin) };
+    unsafe { std::env::set_var("TASK_MGR_DIR", repo.path()) };
 
     let mut config = LoopConfig::from_env();
     config.yes_mode = true;
@@ -322,9 +322,9 @@ fn test_full_loop_worktree_created_and_cleaned_up() {
         .unwrap();
     let loop_result = rt.block_on(async { run_loop(run_config).await });
 
-    std::env::remove_var("CLAUDE_BINARY");
-    std::env::remove_var("TASK_MGR_BIN");
-    std::env::remove_var("TASK_MGR_DIR");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+    unsafe { std::env::remove_var("TASK_MGR_BIN") };
+    unsafe { std::env::remove_var("TASK_MGR_DIR") };
 
     // Verify loop exited successfully
     assert_eq!(loop_result.exit_code, 0, "loop should exit with code 0");

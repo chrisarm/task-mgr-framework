@@ -131,15 +131,14 @@ pub(crate) fn watchdog_loop(
 
     while !stop.load(Ordering::Acquire) {
         // Check signal
-        if let Some(flag) = signal_flag {
-            if flag.is_signaled() {
+        if let Some(flag) = signal_flag
+            && flag.is_signaled() {
                 kill_process_group(child_pid, stop, "Signal received");
                 return;
             }
-        }
 
         // Check timeout
-        if let (Some(ref mut dl), Some(tc)) = (&mut deadline, timeout) {
+        if let (Some(dl), Some(tc)) = (&mut deadline, timeout) {
             // Check for new activity
             let current_activity = tc.last_activity_epoch.load(Ordering::Acquire);
             if current_activity > last_seen_activity {
@@ -296,7 +295,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
         let script = create_sleep_script(tmp.path());
-        std::env::set_var("CLAUDE_BINARY", &script);
+        unsafe { std::env::set_var("CLAUDE_BINARY", &script) };
         let activity = Arc::new(AtomicU64::new(0));
         let timeout = TimeoutConfig {
             base_timeout: Duration::from_secs(2),
@@ -313,10 +312,11 @@ mod tests {
             Some(timeout),
             false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
+            None,
         );
         let elapsed = start.elapsed();
 
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
         assert!(result.is_ok());
         let res = result.unwrap();
@@ -339,7 +339,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
         let script = create_sleep_script(tmp.path());
-        std::env::set_var("CLAUDE_BINARY", &script);
+        unsafe { std::env::set_var("CLAUDE_BINARY", &script) };
         let activity = Arc::new(AtomicU64::new(0));
         let activity_clone = Arc::clone(&activity);
         let timeout = TimeoutConfig {
@@ -367,10 +367,11 @@ mod tests {
             Some(timeout),
             false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
+            None,
         );
         let elapsed = start.elapsed();
 
-        std::env::remove_var("CLAUDE_BINARY");
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
         assert!(result.is_ok());
         let res = result.unwrap();

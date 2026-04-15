@@ -120,11 +120,10 @@ fn type_prefix_score(
     learning: &Learning,
     task_prefix: Option<&str>,
 ) -> (i32, Option<&'static str>) {
-    if let (Some(ref prefixes), Some(tp)) = (&learning.applies_to_task_types, task_prefix) {
-        if prefixes.iter().any(|p| tp.starts_with(p)) {
+    if let (Some(prefixes), Some(tp)) = (&learning.applies_to_task_types, task_prefix)
+        && prefixes.iter().any(|p| tp.starts_with(p)) {
             return (TYPE_MATCH_SCORE, Some("task type match"));
         }
-    }
     (0, None)
 }
 
@@ -134,14 +133,13 @@ fn error_pattern_score(
     learning: &Learning,
     task_error: Option<&str>,
 ) -> (i32, Option<&'static str>) {
-    if let (Some(te), Some(ref patterns)) = (task_error, &learning.applies_to_errors) {
-        if patterns
+    if let (Some(te), Some(patterns)) = (task_error, &learning.applies_to_errors)
+        && patterns
             .iter()
             .any(|p| te.to_lowercase().contains(&p.to_lowercase()))
         {
             return (ERROR_MATCH_SCORE, Some("error pattern match"));
         }
-    }
     (0, None)
 }
 
@@ -190,20 +188,18 @@ fn passes_query_filters(
     query: &RetrievalQuery,
     tags_map: &HashMap<i64, Vec<String>>,
 ) -> bool {
-    if let Some(ref outcome_filter) = query.outcome {
-        if learning.outcome != *outcome_filter {
+    if let Some(ref outcome_filter) = query.outcome
+        && learning.outcome != *outcome_filter {
             return false;
         }
-    }
-    if let Some(ref tags_filter) = query.tags {
-        if !tags_filter.is_empty() {
+    if let Some(ref tags_filter) = query.tags
+        && !tags_filter.is_empty() {
             let id = learning.id.unwrap_or(0);
             let learning_tags = tags_map.get(&id).map(Vec::as_slice).unwrap_or(&[]);
             if !tags_filter.iter().any(|t| learning_tags.contains(t)) {
                 return false;
             }
         }
-    }
     true
 }
 
@@ -405,13 +401,11 @@ pub(crate) fn file_matches_pattern(file_path: &str, pattern: &str) -> bool {
     }
 
     // For last part, must match at end if pattern doesn't end with *
-    if !pattern.ends_with('*') {
-        if let Some(last_part) = parts.last() {
-            if !last_part.is_empty() && !file_lower.ends_with(last_part) {
+    if !pattern.ends_with('*')
+        && let Some(last_part) = parts.last()
+            && !last_part.is_empty() && !file_lower.ends_with(last_part) {
                 return false;
             }
-        }
-    }
 
     true
 }

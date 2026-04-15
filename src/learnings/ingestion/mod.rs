@@ -89,6 +89,7 @@ pub fn extract_learnings_from_output(
         None,
         false,
         &PermissionMode::text_only(),
+        None,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -202,11 +203,10 @@ pub(crate) fn enrich_extracted_params(
                 p.applies_to_files = Some(task_files.clone());
             }
             // Preserve LLM-provided applies_to_task_types; derive from task prefix only when absent.
-            if p.applies_to_task_types.is_none() {
-                if let Some(ref prefix) = type_prefix {
+            if p.applies_to_task_types.is_none()
+                && let Some(ref prefix) = type_prefix {
                     p.applies_to_task_types = Some(vec![prefix.clone()]);
                 }
-            }
             p
         })
         .collect();

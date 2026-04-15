@@ -106,15 +106,14 @@ pub fn check_deadline(tasks_dir: &Path, prd_basename: &str) -> bool {
 /// No-op if the file doesn't exist.
 pub fn cleanup_deadline(tasks_dir: &Path, prd_basename: &str) {
     let path = deadline_path(tasks_dir, prd_basename);
-    if path.exists() {
-        if let Err(e) = fs::remove_file(&path) {
+    if path.exists()
+        && let Err(e) = fs::remove_file(&path) {
             eprintln!(
                 "Warning: could not remove deadline file {}: {}",
                 path.display(),
                 e
             );
         }
-    }
 }
 
 /// Get the deadline file path for a PRD basename.

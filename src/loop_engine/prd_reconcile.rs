@@ -633,6 +633,7 @@ pub(crate) fn mutate_prd_from_feedback(
         None,
         false,
         permission_mode,
+        None,
     ) {
         Ok(r) => r,
         Err(e) => {
