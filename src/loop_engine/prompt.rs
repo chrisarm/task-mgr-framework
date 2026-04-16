@@ -97,6 +97,10 @@ pub struct BuildPromptParams<'a> {
     pub verbose: bool,
     /// Default model from PRD metadata (threaded from engine, not queried here).
     pub default_model: Option<&'a str>,
+    /// Default model from the per-project config (`.task-mgr/config.json`).
+    pub project_default_model: Option<&'a str>,
+    /// Default model from the per-user config (`$XDG_CONFIG_HOME/task-mgr/config.json`).
+    pub user_default_model: Option<&'a str>,
     /// Optional PRD task prefix for scoping task selection to a specific PRD.
     pub task_prefix: Option<&'a str>,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
@@ -133,12 +137,18 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     };
 
     // Step 2: Resolve model (needed for escalation section in Phase 1)
+    let defaults = crate::loop_engine::model::ModelResolutionContext {
+        prd_default: params.default_model,
+        project_default: params.project_default_model,
+        user_default: params.user_default_model,
+        ..Default::default()
+    };
     let resolved_model = resolve_synergy_cluster_model(
         params.conn,
         &task_output.id,
         task_output.model.as_deref(),
         task_output.difficulty.as_deref(),
-        params.default_model,
+        &defaults,
     );
 
     // ============================================================
@@ -650,6 +660,8 @@ mod tests {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -875,6 +887,8 @@ mod tests {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -1244,6 +1258,8 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -1362,6 +1378,8 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -1409,6 +1427,8 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -2042,6 +2062,8 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -2095,6 +2117,8 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -2140,6 +2164,8 @@ pub enum ApiError {
             steering_path: None,
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -2990,6 +3016,8 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -3079,6 +3107,8 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,
@@ -3181,6 +3211,8 @@ pub enum ApiError {
             steering_path: Some(&steering_path),
             verbose: false,
             default_model: None,
+            project_default_model: None,
+            user_default_model: None,
             task_prefix: None,
             batch_sibling_prds: &[],
             permission_mode: &DEFAULT_PERM,

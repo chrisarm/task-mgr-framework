@@ -63,31 +63,56 @@ pub fn model_tier(model: Option<&str>) -> ModelTier {
     }
 }
 
+/// Inputs to [`resolve_task_model`]. Built with `..Default::default()` so
+/// callers only name the fields they have; absent fields contribute nothing to
+/// the resolution chain. Using a struct over positional args avoids the
+/// silent-swap footgun from a 5-parameter signature.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ModelResolutionContext<'a> {
+    /// Model explicitly set on the task (empty/whitespace-only normalized to `None`).
+    pub task_model: Option<&'a str>,
+    /// Task difficulty — triggers `OPUS_MODEL` escalation when equal to `"high"`.
+    pub difficulty: Option<&'a str>,
+    /// Default from PRD metadata (`prd_metadata.default_model`).
+    pub prd_default: Option<&'a str>,
+    /// Default from the per-project config (`.task-mgr/config.json`).
+    pub project_default: Option<&'a str>,
+    /// Default from the per-user config (`$XDG_CONFIG_HOME/task-mgr/config.json`).
+    pub user_default: Option<&'a str>,
+}
+
 /// Resolve which model a single task should use.
 ///
 /// Precedence (highest to lowest):
-/// 1. `task_model` — explicit model set on the task (empty/whitespace-only normalized to `None`)
+/// 1. `task_model` — explicit model set on the task
 /// 2. `difficulty == "high"` (case-insensitive) → `OPUS_MODEL`
-/// 3. `prd_default` — default model from the PRD metadata
-/// 4. `None` — no model preference
-pub fn resolve_task_model(
-    task_model: Option<&str>,
-    difficulty: Option<&str>,
-    prd_default: Option<&str>,
-) -> Option<String> {
-    if let Some(m) = task_model.filter(|m| !m.trim().is_empty()) {
+/// 3. `prd_default` — default from PRD metadata
+/// 4. `project_default` — default from `.task-mgr/config.json`
+/// 5. `user_default` — default from `$XDG_CONFIG_HOME/task-mgr/config.json`
+/// 6. `None` — no preference
+///
+/// Empty / whitespace-only strings in any field are normalized to `None` so
+/// missing config values don't override real ones.
+pub fn resolve_task_model(ctx: &ModelResolutionContext<'_>) -> Option<String> {
+    if let Some(m) = normalize(ctx.task_model) {
         return Some(m.to_string());
     }
-
-    if difficulty.is_some_and(|d| d.eq_ignore_ascii_case("high")) {
+    if ctx.difficulty.is_some_and(|d| d.eq_ignore_ascii_case("high")) {
         return Some(OPUS_MODEL.to_string());
     }
-
-    if let Some(d) = prd_default {
-        return Some(d.to_string());
+    for fallback in [ctx.prd_default, ctx.project_default, ctx.user_default] {
+        if let Some(m) = normalize(fallback) {
+            return Some(m.to_string());
+        }
     }
-
     None
+}
+
+fn normalize(s: Option<&str>) -> Option<&str> {
+    s.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() { None } else { Some(v) }
+    })
 }
 
 /// Resolve the model for an iteration by selecting the highest-tier model
@@ -216,205 +241,159 @@ mod tests {
 
     // ============ resolve_task_model tests ============
 
+    fn ctx<'a>() -> ModelResolutionContext<'a> {
+        ModelResolutionContext::default()
+    }
+
     #[test]
-    fn test_resolve_task_model_task_model_wins_over_everything() {
-        let result = resolve_task_model(Some(HAIKU_MODEL), Some("high"), Some(SONNET_MODEL));
+    fn test_resolve_task_model_task_wins_over_everything() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            task_model: Some(HAIKU_MODEL),
+            difficulty: Some("high"),
+            prd_default: Some(SONNET_MODEL),
+            project_default: Some(OPUS_MODEL),
+            user_default: Some(OPUS_MODEL),
+        });
         assert_eq!(result, Some(HAIKU_MODEL.to_string()));
     }
 
     #[test]
-    fn test_resolve_task_model_task_model_overrides_difficulty() {
-        let result = resolve_task_model(Some(SONNET_MODEL), Some("high"), None);
+    fn test_resolve_task_model_high_difficulty_beats_all_defaults() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            difficulty: Some("high"),
+            prd_default: Some(SONNET_MODEL),
+            project_default: Some(HAIKU_MODEL),
+            user_default: Some(HAIKU_MODEL),
+            ..ctx()
+        });
         assert_eq!(
             result,
-            Some(SONNET_MODEL.to_string()),
-            "explicit task model must override high difficulty"
+            Some(OPUS_MODEL.to_string()),
+            "high difficulty must force OPUS_MODEL regardless of any default",
         );
     }
 
     #[test]
-    fn test_resolve_task_model_high_difficulty_forces_opus() {
-        let result = resolve_task_model(None, Some("high"), Some(SONNET_MODEL));
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_task_model_high_difficulty_without_prd_default() {
-        let result = resolve_task_model(None, Some("high"), None);
-        assert_eq!(result, Some(OPUS_MODEL.to_string()));
-    }
-
-    #[test]
-    fn test_resolve_task_model_prd_default_fallback() {
-        let result = resolve_task_model(None, None, Some(SONNET_MODEL));
+    fn test_resolve_task_model_prd_default_beats_both_configs() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            prd_default: Some(SONNET_MODEL),
+            project_default: Some(HAIKU_MODEL),
+            user_default: Some(OPUS_MODEL),
+            ..ctx()
+        });
         assert_eq!(result, Some(SONNET_MODEL.to_string()));
     }
 
     #[test]
+    fn test_resolve_task_model_project_default_beats_user() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            project_default: Some(SONNET_MODEL),
+            user_default: Some(OPUS_MODEL),
+            ..ctx()
+        });
+        assert_eq!(result, Some(SONNET_MODEL.to_string()));
+    }
+
+    #[test]
+    fn test_resolve_task_model_user_default_last_resort() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            user_default: Some(HAIKU_MODEL),
+            ..ctx()
+        });
+        assert_eq!(result, Some(HAIKU_MODEL.to_string()));
+    }
+
+    #[test]
     fn test_resolve_task_model_all_none_returns_none() {
-        let result = resolve_task_model(None, None, None);
-        assert_eq!(result, None);
+        assert_eq!(resolve_task_model(&ctx()), None);
     }
 
     /// Known-bad discriminator: "medium" difficulty must NOT escalate to opus.
-    /// A naive implementation that treats any difficulty as "force opus" would fail this.
     #[test]
-    fn test_resolve_task_model_medium_difficulty_does_not_escalate() {
-        let result = resolve_task_model(None, Some("medium"), None);
-        assert_eq!(result, None, "medium difficulty must NOT escalate to opus");
+    fn test_resolve_task_model_medium_does_not_escalate() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            difficulty: Some("medium"),
+            ..ctx()
+        });
+        assert_eq!(result, None);
     }
 
+    /// Empty / whitespace-only strings anywhere in the chain are normalized
+    /// to `None` so missing config values don't shadow real ones.
     #[test]
-    fn test_resolve_task_model_low_difficulty_falls_through_to_prd_default() {
-        let result = resolve_task_model(None, Some("low"), Some(HAIKU_MODEL));
-        assert_eq!(
-            result,
-            Some(HAIKU_MODEL.to_string()),
-            "low difficulty should fall through to prd_default"
-        );
-    }
-
-    #[test]
-    fn test_resolve_task_model_medium_difficulty_with_prd_default() {
-        let result = resolve_task_model(None, Some("medium"), Some(HAIKU_MODEL));
-        assert_eq!(
-            result,
-            Some(HAIKU_MODEL.to_string()),
-            "medium difficulty should fall through to prd_default, not force opus"
-        );
-    }
-
-    /// AC: empty string task_model normalizes to None, falling through to difficulty/prd_default.
-    #[test]
-    fn test_resolve_task_model_empty_string_falls_through() {
-        let result = resolve_task_model(Some(""), Some("high"), Some(SONNET_MODEL));
-        assert_eq!(
-            result,
-            Some(OPUS_MODEL.to_string()),
-            "empty string task_model should normalize to None, falling through to high difficulty"
-        );
-    }
-
-    #[test]
-    fn test_resolve_task_model_empty_string_without_fallbacks() {
-        let result = resolve_task_model(Some(""), None, None);
-        assert_eq!(
-            result, None,
-            "empty string task_model should normalize to None with no fallbacks"
-        );
-    }
-
-    #[test]
-    fn test_resolve_task_model_unknown_difficulty_falls_through() {
-        let result = resolve_task_model(None, Some("critical"), None);
-        assert_eq!(
-            result, None,
-            "unrecognized difficulty should not trigger any escalation"
-        );
-    }
-
-    #[test]
-    fn test_resolve_task_model_unknown_difficulty_with_prd_default() {
-        let result = resolve_task_model(None, Some("critical"), Some(HAIKU_MODEL));
-        assert_eq!(
-            result,
-            Some(HAIKU_MODEL.to_string()),
-            "unrecognized difficulty should fall through to prd_default"
-        );
-    }
-
-    #[test]
-    fn test_resolve_task_model_empty_difficulty_falls_through() {
-        let result = resolve_task_model(None, Some(""), Some(SONNET_MODEL));
-        assert_eq!(
-            result,
-            Some(SONNET_MODEL.to_string()),
-            "empty difficulty string should fall through to prd_default"
-        );
+    fn test_resolve_task_model_empty_strings_are_ignored() {
+        let result = resolve_task_model(&ModelResolutionContext {
+            task_model: Some(""),
+            prd_default: Some("   "),
+            project_default: Some("\t"),
+            user_default: Some(HAIKU_MODEL),
+            ..ctx()
+        });
+        assert_eq!(result, Some(HAIKU_MODEL.to_string()));
     }
 
     // ============ Parameterized precedence table ============
 
-    /// Exhaustive precedence combinations: task_model × difficulty × prd_default.
-    /// Each row tests one combination to verify the full precedence chain.
+    /// Exhaustive precedence combinations across all five inputs.
+    /// Each row documents which field is expected to win.
     #[test]
     fn test_resolve_task_model_precedence_table() {
-        // (task_model, difficulty, prd_default) → expected
-        let cases: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>)> = vec![
-            // Row 1: all None
-            (None, None, None, None),
-            // Row 2: only prd_default set
-            (None, None, Some(SONNET_MODEL), Some(SONNET_MODEL)),
-            // Row 3: high difficulty, no prd_default
-            (None, Some("high"), None, Some(OPUS_MODEL)),
-            // Row 4: high difficulty beats prd_default
-            (None, Some("high"), Some(SONNET_MODEL), Some(OPUS_MODEL)),
-            // Row 5: medium difficulty, no fallback
-            (None, Some("medium"), None, None),
-            // Row 6: medium difficulty, falls through to prd_default
-            (None, Some("medium"), Some(HAIKU_MODEL), Some(HAIKU_MODEL)),
-            // Row 7: low difficulty, no fallback
-            (None, Some("low"), None, None),
-            // Row 8: low difficulty, falls through to prd_default
-            (None, Some("low"), Some(SONNET_MODEL), Some(SONNET_MODEL)),
-            // Row 9: task_model alone
-            (Some(HAIKU_MODEL), None, None, Some(HAIKU_MODEL)),
-            // Row 10: task_model beats prd_default
-            (Some(HAIKU_MODEL), None, Some(OPUS_MODEL), Some(HAIKU_MODEL)),
-            // Row 11: task_model beats high difficulty
-            (Some(HAIKU_MODEL), Some("high"), None, Some(HAIKU_MODEL)),
-            // Row 12: task_model wins over everything
-            (
-                Some(HAIKU_MODEL),
-                Some("high"),
-                Some(OPUS_MODEL),
-                Some(HAIKU_MODEL),
-            ),
-            // Row 13: task_model wins with medium difficulty
-            (
-                Some(SONNET_MODEL),
-                Some("medium"),
-                Some(OPUS_MODEL),
-                Some(SONNET_MODEL),
-            ),
-            // Row 14: task_model wins with low difficulty
-            (
-                Some(OPUS_MODEL),
-                Some("low"),
-                Some(HAIKU_MODEL),
-                Some(OPUS_MODEL),
-            ),
-            // Row 15: empty-string task_model falls through to high difficulty
-            (Some(""), Some("high"), None, Some(OPUS_MODEL)),
-            // Row 16: whitespace-only task_model falls through to prd_default
-            (Some("  "), None, Some(SONNET_MODEL), Some(SONNET_MODEL)),
-            // Row 17: empty-string task_model with no fallbacks returns None
-            (Some(""), None, None, None),
-            // Row 18: case-variant "High" triggers opus escalation
-            (None, Some("High"), None, Some(OPUS_MODEL)),
-            // Row 19: case-variant "HIGH" triggers opus escalation
-            (None, Some("HIGH"), None, Some(OPUS_MODEL)),
-            // Row 20: case-variant "hIgH" triggers opus escalation
-            (None, Some("hIgH"), None, Some(OPUS_MODEL)),
-            // Row 21: whitespace-only task_model with "HIGH" difficulty
-            (
-                Some("\t"),
-                Some("HIGH"),
-                Some(HAIKU_MODEL),
-                Some(OPUS_MODEL),
-            ),
+        struct Row<'a> {
+            task_model: Option<&'a str>,
+            difficulty: Option<&'a str>,
+            prd_default: Option<&'a str>,
+            project_default: Option<&'a str>,
+            user_default: Option<&'a str>,
+            expected: Option<&'a str>,
+            reason: &'a str,
+        }
+        let cases = [
+            Row { task_model: None, difficulty: None, prd_default: None, project_default: None, user_default: None, expected: None, reason: "all None" },
+            Row { task_model: None, difficulty: None, prd_default: Some(SONNET_MODEL), project_default: None, user_default: None, expected: Some(SONNET_MODEL), reason: "only prd_default" },
+            Row { task_model: None, difficulty: Some("high"), prd_default: None, project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "high diff forces opus" },
+            Row { task_model: None, difficulty: Some("high"), prd_default: Some(SONNET_MODEL), project_default: Some(HAIKU_MODEL), user_default: Some(HAIKU_MODEL), expected: Some(OPUS_MODEL), reason: "high diff beats all defaults" },
+            Row { task_model: None, difficulty: Some("medium"), prd_default: None, project_default: None, user_default: None, expected: None, reason: "medium no fallback" },
+            Row { task_model: None, difficulty: Some("medium"), prd_default: Some(HAIKU_MODEL), project_default: None, user_default: None, expected: Some(HAIKU_MODEL), reason: "medium falls to prd" },
+            Row { task_model: None, difficulty: Some("low"), prd_default: None, project_default: None, user_default: None, expected: None, reason: "low no fallback" },
+            Row { task_model: None, difficulty: Some("low"), prd_default: Some(SONNET_MODEL), project_default: None, user_default: None, expected: Some(SONNET_MODEL), reason: "low falls to prd" },
+            Row { task_model: Some(HAIKU_MODEL), difficulty: None, prd_default: None, project_default: None, user_default: None, expected: Some(HAIKU_MODEL), reason: "task_model alone" },
+            Row { task_model: Some(HAIKU_MODEL), difficulty: None, prd_default: Some(OPUS_MODEL), project_default: Some(OPUS_MODEL), user_default: Some(OPUS_MODEL), expected: Some(HAIKU_MODEL), reason: "task beats all defaults" },
+            Row { task_model: Some(HAIKU_MODEL), difficulty: Some("high"), prd_default: None, project_default: None, user_default: None, expected: Some(HAIKU_MODEL), reason: "task beats high" },
+            Row { task_model: Some(HAIKU_MODEL), difficulty: Some("high"), prd_default: Some(OPUS_MODEL), project_default: Some(OPUS_MODEL), user_default: Some(OPUS_MODEL), expected: Some(HAIKU_MODEL), reason: "task wins over everything" },
+            Row { task_model: Some(SONNET_MODEL), difficulty: Some("medium"), prd_default: Some(OPUS_MODEL), project_default: None, user_default: None, expected: Some(SONNET_MODEL), reason: "task with medium" },
+            Row { task_model: Some(OPUS_MODEL), difficulty: Some("low"), prd_default: Some(HAIKU_MODEL), project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "task with low" },
+            Row { task_model: Some(""), difficulty: Some("high"), prd_default: None, project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "empty task falls to high" },
+            Row { task_model: Some("  "), difficulty: None, prd_default: Some(SONNET_MODEL), project_default: None, user_default: None, expected: Some(SONNET_MODEL), reason: "whitespace task falls to prd" },
+            Row { task_model: Some(""), difficulty: None, prd_default: None, project_default: None, user_default: None, expected: None, reason: "empty task, no fallbacks" },
+            Row { task_model: None, difficulty: Some("High"), prd_default: None, project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "case 'High'" },
+            Row { task_model: None, difficulty: Some("HIGH"), prd_default: None, project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "case 'HIGH'" },
+            Row { task_model: Some("\t"), difficulty: Some("HIGH"), prd_default: Some(HAIKU_MODEL), project_default: None, user_default: None, expected: Some(OPUS_MODEL), reason: "tab task + HIGH diff" },
+            // ---- New rows for project + user defaults ----
+            Row { task_model: None, difficulty: None, prd_default: None, project_default: Some(SONNET_MODEL), user_default: None, expected: Some(SONNET_MODEL), reason: "project default alone" },
+            Row { task_model: None, difficulty: None, prd_default: None, project_default: None, user_default: Some(HAIKU_MODEL), expected: Some(HAIKU_MODEL), reason: "user default alone" },
+            Row { task_model: None, difficulty: None, prd_default: Some(SONNET_MODEL), project_default: Some(HAIKU_MODEL), user_default: None, expected: Some(SONNET_MODEL), reason: "prd beats project" },
+            Row { task_model: None, difficulty: None, prd_default: None, project_default: Some(SONNET_MODEL), user_default: Some(OPUS_MODEL), expected: Some(SONNET_MODEL), reason: "project beats user" },
+            Row { task_model: None, difficulty: Some("medium"), prd_default: None, project_default: Some(HAIKU_MODEL), user_default: None, expected: Some(HAIKU_MODEL), reason: "medium falls past to project" },
+            Row { task_model: None, difficulty: Some("low"), prd_default: None, project_default: None, user_default: Some(SONNET_MODEL), expected: Some(SONNET_MODEL), reason: "low falls past to user" },
+            Row { task_model: None, difficulty: Some("high"), prd_default: None, project_default: Some(HAIKU_MODEL), user_default: Some(HAIKU_MODEL), expected: Some(OPUS_MODEL), reason: "high beats configs" },
+            Row { task_model: Some(HAIKU_MODEL), difficulty: None, prd_default: None, project_default: Some(SONNET_MODEL), user_default: Some(OPUS_MODEL), expected: Some(HAIKU_MODEL), reason: "task beats configs" },
+            Row { task_model: Some(""), difficulty: None, prd_default: None, project_default: Some("  "), user_default: Some(HAIKU_MODEL), expected: Some(HAIKU_MODEL), reason: "empty project falls to user" },
         ];
 
-        for (i, (task_model, difficulty, prd_default, expected)) in cases.iter().enumerate() {
-            let result = resolve_task_model(*task_model, *difficulty, *prd_default);
+        for (i, row) in cases.iter().enumerate() {
+            let result = resolve_task_model(&ModelResolutionContext {
+                task_model: row.task_model,
+                difficulty: row.difficulty,
+                prd_default: row.prd_default,
+                project_default: row.project_default,
+                user_default: row.user_default,
+            });
             assert_eq!(
                 result,
-                expected.map(String::from),
-                "precedence row {} failed: task={:?}, diff={:?}, prd={:?}",
+                row.expected.map(String::from),
+                "precedence row {} ({}) failed",
                 i + 1,
-                task_model,
-                difficulty,
-                prd_default,
+                row.reason,
             );
         }
     }

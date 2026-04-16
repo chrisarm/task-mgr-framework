@@ -9,8 +9,8 @@ use std::process;
 use clap::Parser;
 
 use task_mgr::cli::{
-    Cli, Commands, CurateAction, DecisionAction, MigrateAction, OutputFormat, RunAction,
-    WorktreesAction,
+    Cli, Commands, CurateAction, DecisionAction, MigrateAction, ModelsAction, OutputFormat,
+    RunAction, WorktreesAction,
 };
 use task_mgr::commands::{
     apply_learning, audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks,
@@ -833,6 +833,28 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                 branch_filter.as_deref(),
             )?;
             output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Models { action } => {
+            use task_mgr::commands::models::{
+                handle_list, handle_set_default, handle_show, handle_unset_default, ListOpts,
+                SetDefaultOpts, UnsetDefaultOpts,
+            };
+            match action {
+                ModelsAction::List { remote, refresh } => {
+                    handle_list(&cli.dir, ListOpts { remote, refresh })?;
+                }
+                ModelsAction::SetDefault { model, project } => {
+                    handle_set_default(&cli.dir, SetDefaultOpts { model, project })?;
+                }
+                ModelsAction::UnsetDefault { project } => {
+                    handle_unset_default(&cli.dir, UnsetDefaultOpts { project })?;
+                }
+                ModelsAction::Show => {
+                    handle_show(&cli.dir)?;
+                }
+            }
             Ok(())
         }
 

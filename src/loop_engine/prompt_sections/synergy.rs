@@ -73,19 +73,24 @@ fn get_synergy_tasks_in_run(
 /// 4. Combines all resolved models via `model::resolve_iteration_model()` (highest tier wins).
 /// 5. Normalizes `Some("")` to `None`.
 ///
+/// `defaults` supplies the non-task-specific fallbacks (PRD / project / user defaults).
 /// When no synergyWith partners exist, the cluster is just the selected task.
 pub(crate) fn resolve_synergy_cluster_model(
     conn: &Connection,
     task_id: &str,
     task_model: Option<&str>,
     task_difficulty: Option<&str>,
-    default_model: Option<&str>,
+    defaults: &model::ModelResolutionContext<'_>,
 ) -> Option<String> {
-    // Resolve the primary task's model
-    let primary_model = model::resolve_task_model(task_model, task_difficulty, default_model);
+    // Resolve the primary task's model: merge task-specific fields into the defaults ctx.
+    let primary_model = model::resolve_task_model(&model::ModelResolutionContext {
+        task_model,
+        difficulty: task_difficulty,
+        ..*defaults
+    });
 
     // Query pending synergyWith partners' model and difficulty
-    let synergy_models = get_synergy_partner_models(conn, task_id, default_model);
+    let synergy_models = get_synergy_partner_models(conn, task_id, defaults);
 
     // Combine: primary task + all synergy partners
     let mut all_models = vec![primary_model];
@@ -102,7 +107,7 @@ pub(crate) fn resolve_synergy_cluster_model(
 fn get_synergy_partner_models(
     conn: &Connection,
     task_id: &str,
-    default_model: Option<&str>,
+    defaults: &model::ModelResolutionContext<'_>,
 ) -> Vec<Option<String>> {
     let mut stmt = match conn.prepare(
         "SELECT t.model, t.difficulty
@@ -120,11 +125,11 @@ fn get_synergy_partner_models(
     let rows = match stmt.query_map([task_id], |row| {
         let partner_model: Option<String> = row.get("model")?;
         let partner_difficulty: Option<String> = row.get("difficulty")?;
-        Ok(model::resolve_task_model(
-            partner_model.as_deref(),
-            partner_difficulty.as_deref(),
-            default_model,
-        ))
+        Ok(model::resolve_task_model(&model::ModelResolutionContext {
+            task_model: partner_model.as_deref(),
+            difficulty: partner_difficulty.as_deref(),
+            ..*defaults
+        }))
     }) {
         Ok(rows) => rows,
         Err(_) => return Vec::new(),

@@ -39,6 +39,7 @@ pub mod learn;
 pub mod learnings;
 pub mod list;
 pub mod migrate;
+pub mod models;
 pub mod next;
 pub mod recall;
 pub mod reset;

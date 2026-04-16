@@ -32,6 +32,38 @@ Tests import the constants; JSON fixtures use `{{OPUS_MODEL}}` placeholders in
 (`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep back
 in outside `model.rs`.
 
+## `task-mgr models` subcommand
+
+List and pin Claude models:
+
+```sh
+task-mgr models list                     # offline — built-in model IDs + effort table
+task-mgr models list --remote            # live /v1/models (requires both env vars below)
+task-mgr models list --refresh           # busts cache before fetch; implies --remote
+task-mgr models set-default [<model>]    # prompts interactively when model omitted
+task-mgr models set-default <id> --project   # writes .task-mgr/config.json instead
+task-mgr models unset-default [--project]
+task-mgr models show                     # resolved default + source label
+```
+
+**Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
+
+- `ANTHROPIC_API_KEY` — your Anthropic API key
+- `TASK_MGR_USE_API=1` — explicit opt-in; both must be set or we silently fall
+  back to the built-in list
+
+Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as miss).
+
+**Config locations & precedence** (highest to lowest): explicit task `model` →
+`difficulty==high` → PRD `defaultModel` → `.task-mgr/config.json defaultModel`
+→ `$XDG_CONFIG_HOME/task-mgr/config.json defaultModel` → none.
+`difficulty==high` always escalates to `OPUS_MODEL`, independent of any
+default.
+
+The interactive picker fires from `task-mgr init` when nothing resolves and
+stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr
+hint and skip — no hang.
+
 ## Learning Creation Chokepoint
 
 All production code paths that create learnings must go through `LearningWriter` in

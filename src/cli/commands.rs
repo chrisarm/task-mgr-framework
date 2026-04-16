@@ -917,6 +917,49 @@ GENERATED MAN PAGES:
         #[command(subcommand)]
         action: DecisionAction,
     },
+
+    /// List Claude models and pin a default
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+}
+
+/// `task-mgr models` subcommand actions.
+///
+/// Remote fetches are gated behind `ANTHROPIC_API_KEY` + `TASK_MGR_USE_API=1`;
+/// without both, the offline list from `loop_engine::model` is used.
+#[derive(Subcommand, Debug)]
+pub enum ModelsAction {
+    /// Print the available model IDs
+    List {
+        /// Consult the Anthropic /v1/models endpoint if a key is present and
+        /// `TASK_MGR_USE_API=1`. Falls back silently to the built-in list.
+        #[arg(long)]
+        remote: bool,
+        /// Bust the cache before fetching. Implies `--remote`.
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Pin a default model (user config by default, `--project` for project)
+    SetDefault {
+        /// Model id. When omitted, prompts interactively.
+        model: Option<String>,
+        /// Write to `.task-mgr/config.json` instead of the per-user config.
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Clear the pinned default model
+    UnsetDefault {
+        /// Clear the project-level default instead of the per-user default.
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Show the currently resolved default model and where it came from
+    Show,
 }
 
 /// Decisions subcommand actions

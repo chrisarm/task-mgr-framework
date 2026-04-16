@@ -21,7 +21,8 @@ mod tests;
 
 // Re-export commonly used types at the module level for convenience
 pub use commands::{
-    Commands, CurateAction, DecisionAction, MigrateAction, RunAction, WorktreesAction,
+    Commands, CurateAction, DecisionAction, MigrateAction, ModelsAction, RunAction,
+    WorktreesAction,
 };
 pub use enums::{
     Confidence, FailStatus, LearningOutcome, OutputFormat, RunEndStatus, Shell, TaskStatusFilter,

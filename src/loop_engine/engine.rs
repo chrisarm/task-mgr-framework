@@ -150,6 +150,10 @@ pub struct IterationParams<'a> {
     pub task_prefix: Option<&'a str>,
     /// Default model from PRD metadata (threaded from run_loop via PrdMetadata).
     pub default_model: Option<&'a str>,
+    /// Default model from the per-project config (`.task-mgr/config.json`).
+    pub project_default_model: Option<&'a str>,
+    /// Default model from the per-user config (`$XDG_CONFIG_HOME/task-mgr/config.json`).
+    pub user_default_model: Option<&'a str>,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: &'a PermissionMode,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
@@ -345,6 +349,8 @@ pub fn run_iteration(
         steering_path: params.steering_path,
         verbose: params.verbose,
         default_model: params.default_model,
+        project_default_model: params.project_default_model,
+        user_default_model: params.user_default_model,
         task_prefix: params.task_prefix,
         batch_sibling_prds: params.batch_sibling_prds,
         permission_mode: params.permission_mode,
@@ -1173,6 +1179,14 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let task_count = prd_metadata.task_count;
     let task_prefix = prd_metadata.task_prefix;
     let default_model = prd_metadata.default_model;
+    // Config-level defaults: fall below PRD default in the resolution chain.
+    // The loop engine never prompts — it runs non-interactively — so these
+    // are pure reads. Users pin a default via `task-mgr init` or
+    // `task-mgr models set-default`.
+    let project_default_model =
+        crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
+            .default_model;
+    let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
 
     // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
     let mut paths = paths;
@@ -1624,6 +1638,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             prd_path: Some(paths.prd_file.as_path()),
             task_prefix: task_prefix.as_deref(),
             default_model: default_model.as_deref(),
+            project_default_model: project_default_model.as_deref(),
+            user_default_model: user_default_model.as_deref(),
             permission_mode: &permission_mode,
             batch_sibling_prds: &run_config.batch_sibling_prds,
         };

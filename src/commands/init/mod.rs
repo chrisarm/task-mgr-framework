@@ -509,6 +509,14 @@ pub fn init(
 
     tx.commit()?;
 
+    // Offer an interactive default-model picker on fresh (non-dry-run) imports.
+    // No-ops when a default already resolves, in auto-mode, or when stdin/stderr
+    // aren't TTYs. `init` passes `auto_mode=false` because this is always a
+    // human-initiated command (loop/batch paths pass `true`).
+    if !dry_run {
+        let _ = crate::commands::models::ensure_default::ensure_default_model(dir, false);
+    }
+
     Ok(InitResult {
         tasks_imported,
         tasks_updated,
