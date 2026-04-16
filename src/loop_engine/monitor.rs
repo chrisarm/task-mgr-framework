@@ -18,6 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Interval between git status polls in seconds.
 const POLL_INTERVAL_SECS: u64 = 10;
 
+/// Grace period before the first poll. Early file changes (task JSON status
+/// updates, prompt file writes) are the loop's own bookkeeping — not real
+/// Claude activity — and should not trigger a timeout extension.
+const INITIAL_GRACE_SECS: u64 = 12;
+
 /// Interval between heartbeat messages in seconds.
 const HEARTBEAT_INTERVAL_SECS: u64 = 180;
 
@@ -90,7 +95,10 @@ fn git_status_porcelain(dir: &Path) -> Option<String> {
 fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &Arc<AtomicU64>) {
     let mut last_status: Option<String> = None;
     let mut last_change_time = Instant::now();
-    let mut next_poll = Instant::now();
+    // Delay the first poll so the loop's own bookkeeping (task JSON status
+    // updates, prompt file writes) settles before we start tracking activity.
+    let mut next_poll = Instant::now() + Duration::from_secs(INITIAL_GRACE_SECS);
+    let mut needs_baseline = true;
 
     while !stop_flag.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -98,22 +106,29 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &A
         // Poll git status at the configured interval
         if now >= next_poll {
             if let Some(current_status) = git_status_porcelain(dir) {
-                let changed = match &last_status {
-                    Some(prev) => prev != &current_status,
-                    None => !current_status.is_empty(),
-                };
+                if needs_baseline {
+                    // First poll after grace period: capture baseline without
+                    // treating bookkeeping changes as activity.
+                    needs_baseline = false;
+                    last_status = Some(current_status);
+                } else {
+                    let changed = match &last_status {
+                        Some(prev) => prev != &current_status,
+                        None => !current_status.is_empty(),
+                    };
 
-                if changed && !current_status.is_empty() {
-                    print_status_change(&current_status);
-                    last_change_time = Instant::now();
-                    let epoch = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    last_activity_epoch.store(epoch, Ordering::Release);
+                    if changed && !current_status.is_empty() {
+                        print_status_change(&current_status);
+                        last_change_time = Instant::now();
+                        let epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        last_activity_epoch.store(epoch, Ordering::Release);
+                    }
+
+                    last_status = Some(current_status);
                 }
-
-                last_status = Some(current_status);
             }
 
             next_poll = now + Duration::from_secs(POLL_INTERVAL_SECS);
