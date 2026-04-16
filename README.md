@@ -169,6 +169,7 @@ task-mgr loop tasks/my-project.json --yes --hours 4
 | `doctor` | Health check and repair (stale tasks, decay, git reconciliation) |
 | `migrate` | Database schema migrations (status, up, down, all) |
 | `review` | Review blocked/skipped tasks |
+| `models` | List Claude models and pin a default (see [Model Selection](#model-selection)) |
 | `completions` | Generate shell completions (bash, zsh, fish, powershell) |
 | `man-pages` | Generate man pages |
 
@@ -264,7 +265,7 @@ Use `--no-worktree` to revert to the old behavior of checking out branches direc
 
 ### Project Configuration
 
-Create `.task-mgr/config.json` to add project-specific tool permissions:
+Create `.task-mgr/config.json` to add project-specific tool permissions and pin a default Claude model:
 
 ```json
 {
@@ -274,11 +275,12 @@ Create `.task-mgr/config.json` to add project-specific tool permissions:
     "Bash(docker-compose:*)",
     "Bash(curl:*)",
     "Bash(./scripts/*:*)"
-  ]
+  ],
+  "defaultModel": "claude-sonnet-4-6"
 }
 ```
 
-These tools are appended to the built-in defaults. Common opt-in tools:
+`additionalAllowedTools` is appended to the built-in defaults. Common opt-in tools:
 
 | Tool | When to add |
 |------|-------------|
@@ -290,6 +292,39 @@ These tools are appended to the built-in defaults. Common opt-in tools:
 | `Bash(source:*)` | Projects that source env files in scripts |
 
 Note: The `LOOP_ALLOWED_TOOLS` env var fully overrides — when set, project config is not merged.
+
+### Model Selection
+
+Pin a preferred Claude model for all tasks with `task-mgr models`:
+
+```sh
+task-mgr models list                       # print built-in model IDs + difficulty→effort mapping
+task-mgr models list --remote              # live list from Anthropic (requires opt-in, below)
+task-mgr models set-default                # interactive picker (user-level)
+task-mgr models set-default claude-opus-4-7 --project   # pin at project level
+task-mgr models show                       # resolved default + source label
+task-mgr models unset-default [--project]
+```
+
+**Resolution precedence** (highest to lowest):
+
+1. `task.model` — explicit override on the task
+2. `difficulty == "high"` → always escalates to Opus
+3. PRD `model` (in the PRD JSON)
+4. `.task-mgr/config.json` `defaultModel` (per-project)
+5. `$XDG_CONFIG_HOME/task-mgr/config.json` `defaultModel` (per-user, follows across worktrees)
+6. None (CLI default)
+
+**Remote opt-in** (prevents surprise HTTP calls on a globally-exported SDK key):
+
+| Env var | Purpose |
+|---------|---------|
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `TASK_MGR_USE_API=1` | Explicit opt-in — both must be set to hit `/v1/models` |
+
+Without both, `--remote` silently falls back to the built-in list. Live responses are cached at `$XDG_CACHE_HOME/task-mgr/models-cache.json` with a 24h TTL; stale cache is treated as a miss rather than served (no stale-on-error).
+
+The interactive picker fires automatically from `task-mgr init` when nothing resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr hint and skip — loops never hang waiting for input.
 
 ## Iterative Build Workflow
 
