@@ -8,17 +8,14 @@ use tempfile::TempDir;
 
 use task_mgr::commands::{export, init};
 use task_mgr::db::open_connection;
+use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
-fn fixture_path(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
-}
+mod common;
+use common::render_fixture_tmpl;
 
 fn import_and_export(fixture_name: &str) -> (TempDir, Value) {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path(fixture_name);
+    let prd_path = render_fixture_tmpl(fixture_name, temp_dir.path());
 
     init::init(
         temp_dir.path(),
@@ -56,7 +53,7 @@ fn test_round_trip_all_model_fields() {
     // Verify top-level model field round-trips
     assert_eq!(
         exported.get("model").and_then(|v| v.as_str()),
-        Some("claude-sonnet-4-6"),
+        Some(SONNET_MODEL),
         "Top-level model should round-trip"
     );
 
@@ -69,7 +66,7 @@ fn test_round_trip_all_model_fields() {
     let mt001 = get_story(stories, "MT-001");
     assert_eq!(
         mt001.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "MT-001 model should round-trip"
     );
     assert_eq!(
@@ -87,7 +84,7 @@ fn test_round_trip_all_model_fields() {
     let mt002 = get_story(stories, "MT-002");
     assert_eq!(
         mt002.get("model").and_then(|v| v.as_str()),
-        Some("claude-haiku-4-5-20251001"),
+        Some(HAIKU_MODEL),
         "MT-002 model should round-trip"
     );
     assert_eq!(
@@ -111,7 +108,7 @@ fn test_round_trip_partial_model_overrides() {
     // Top-level model present
     assert_eq!(
         exported.get("model").and_then(|v| v.as_str()),
-        Some("claude-sonnet-4-6"),
+        Some(SONNET_MODEL),
         "Top-level model should be present"
     );
 
@@ -124,7 +121,7 @@ fn test_round_trip_partial_model_overrides() {
     let pm001 = get_story(stories, "PM-001");
     assert_eq!(
         pm001.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "PM-001 should have model"
     );
     assert_eq!(
@@ -235,7 +232,7 @@ fn test_round_trip_no_model_fields_backward_compat() {
 #[test]
 fn test_update_task_preserves_model_fields_on_reimport() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_with_all_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     // First import
     init::init(
@@ -258,7 +255,7 @@ fn test_update_task_preserves_model_fields_on_reimport() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(model.as_deref(), Some(OPUS_MODEL));
     assert_eq!(difficulty.as_deref(), Some("high"));
     assert_eq!(
         escalation_note.as_deref(),
@@ -289,7 +286,7 @@ fn test_update_task_preserves_model_fields_on_reimport() {
         .unwrap();
     assert_eq!(
         model.as_deref(),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "model should be preserved after re-import"
     );
     assert_eq!(
@@ -371,7 +368,7 @@ fn test_null_fields_omitted_from_exported_json() {
 #[test]
 fn test_db_state_after_import_with_all_model_fields() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_with_all_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     init::init(
         temp_dir.path(),
@@ -396,7 +393,7 @@ fn test_db_state_after_import_with_all_model_fields() {
         .unwrap();
     assert_eq!(
         default_model.as_deref(),
-        Some("claude-sonnet-4-6"),
+        Some(SONNET_MODEL),
         "prd_metadata.default_model should store the top-level model"
     );
 
@@ -408,7 +405,7 @@ fn test_db_state_after_import_with_all_model_fields() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(model.as_deref(), Some(OPUS_MODEL));
     assert_eq!(difficulty.as_deref(), Some("high"));
     assert_eq!(
         escalation_note.as_deref(),
@@ -423,7 +420,7 @@ fn test_db_state_after_import_with_all_model_fields() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    assert_eq!(model.as_deref(), Some(HAIKU_MODEL));
     assert_eq!(difficulty.as_deref(), Some("low"));
     assert_eq!(
         escalation_note.as_deref(),
@@ -434,7 +431,7 @@ fn test_db_state_after_import_with_all_model_fields() {
 #[test]
 fn test_db_state_after_import_with_no_model_fields() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_no_model_fields.json");
+    let prd_path = common::fixtures_dir().join("prd_no_model_fields.json");
 
     init::init(
         temp_dir.path(),
@@ -486,7 +483,7 @@ fn test_db_state_after_import_with_no_model_fields() {
 #[test]
 fn test_full_pipeline_reimport_exported_json() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_with_all_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     // Import original
     init::init(

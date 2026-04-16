@@ -15,6 +15,23 @@ The Ralph loop database is at `.task-mgr/tasks.db` (relative to the project/work
 - Loop prompts: `.task-mgr/tasks/<prd-name>-prompt.md`
 - Progress log: `.task-mgr/tasks/progress.txt`
 
+## Model IDs and Effort Mapping
+
+All Claude model IDs and the difficulty→effort mapping live in a single file:
+`src/loop_engine/model.rs` (`OPUS_MODEL` / `SONNET_MODEL` / `HAIKU_MODEL` constants
+and the `EFFORT_FOR_DIFFICULTY` table). After bumping a value there:
+
+```sh
+cargo run --bin gen-docs   # regenerates the MODELS block in .claude/commands/tasks.md
+```
+
+CI runs `cargo run --bin gen-docs -- --check` which fails if the doc is stale.
+Tests import the constants; JSON fixtures use `{{OPUS_MODEL}}` placeholders in
+`tests/fixtures/*.json.tmpl` rendered at load time by
+`tests/common/mod.rs::render_fixture_tmpl`. A regression test
+(`tests/no_hardcoded_models.rs`) ensures literal model strings don't creep back
+in outside `model.rs`.
+
 ## Learning Creation Chokepoint
 
 All production code paths that create learnings must go through `LearningWriter` in

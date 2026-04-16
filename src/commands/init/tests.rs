@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::db::open_connection;
+use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use std::fs;
 use tempfile::TempDir;
 
@@ -1378,19 +1379,21 @@ fn test_init_prefix_stable_across_reimports() {
 
 #[test]
 fn test_parse_prd_user_story_with_model_difficulty_escalation() {
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "id": "US-001",
         "title": "Task with model",
         "priority": 1,
         "passes": false,
-        "model": "claude-sonnet-4-6",
+        "model": "{SONNET_MODEL}",
         "difficulty": "high",
         "escalationNote": "Retried after OOM"
-    }"#;
+    }}"#
+    );
 
-    let story: super::parse::PrdUserStory = serde_json::from_str(json).unwrap();
+    let story: super::parse::PrdUserStory = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(story.model, Some("claude-sonnet-4-6".to_string()));
+    assert_eq!(story.model, Some(SONNET_MODEL.to_string()));
     assert_eq!(story.difficulty, Some("high".to_string()));
     assert_eq!(story.escalation_note, Some("Retried after OOM".to_string()));
 }
@@ -1451,16 +1454,18 @@ fn test_parse_escalation_note_camel_case_works() {
 
 #[test]
 fn test_parse_prd_file_with_model() {
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "project": "test",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "{HAIKU_MODEL}",
         "userStories": [
-            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+            {{"id": "US-001", "title": "Task", "priority": 1, "passes": false}}
         ]
-    }"#;
+    }}"#
+    );
 
-    let prd: super::parse::PrdFile = serde_json::from_str(json).unwrap();
-    assert_eq!(prd.model, Some("claude-haiku-4-5-20251001".to_string()));
+    let prd: super::parse::PrdFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(prd.model, Some(HAIKU_MODEL.to_string()));
 }
 
 #[test]
@@ -1479,22 +1484,24 @@ fn test_parse_prd_file_backward_compat_without_model() {
 #[test]
 fn test_insert_task_with_model_difficulty_escalation_note() {
     let temp_dir = TempDir::new().unwrap();
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "project": "test",
         "userStories": [
-            {
+            {{
                 "id": "US-001",
                 "title": "Model task",
                 "priority": 1,
                 "passes": false,
-                "model": "claude-opus-4-6",
+                "model": "{OPUS_MODEL}",
                 "difficulty": "high",
                 "escalationNote": "Bumped from sonnet after failure"
-            }
+            }}
         ]
-    }"#;
+    }}"#
+    );
     let path = temp_dir.path().join("prd.json");
-    fs::write(&path, json).unwrap();
+    fs::write(&path, &json).unwrap();
 
     init(
         temp_dir.path(),
@@ -1516,7 +1523,7 @@ fn test_insert_task_with_model_difficulty_escalation_note() {
         )
         .unwrap();
 
-    assert_eq!(model, Some("claude-opus-4-6".to_string()));
+    assert_eq!(model, Some(OPUS_MODEL.to_string()));
     assert_eq!(difficulty, Some("high".to_string()));
     assert_eq!(
         escalation_note,
@@ -1564,15 +1571,17 @@ fn test_insert_task_without_model_fields_stores_null() {
 #[test]
 fn test_insert_prd_metadata_with_model() {
     let temp_dir = TempDir::new().unwrap();
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "project": "model-test",
-        "model": "claude-sonnet-4-6",
+        "model": "{SONNET_MODEL}",
         "userStories": [
-            {"id": "US-001", "title": "Task", "priority": 1, "passes": false}
+            {{"id": "US-001", "title": "Task", "priority": 1, "passes": false}}
         ]
-    }"#;
+    }}"#
+    );
     let path = temp_dir.path().join("prd.json");
-    fs::write(&path, json).unwrap();
+    fs::write(&path, &json).unwrap();
 
     init(
         temp_dir.path(),
@@ -1594,7 +1603,7 @@ fn test_insert_prd_metadata_with_model() {
         )
         .unwrap();
 
-    assert_eq!(default_model, Some("claude-sonnet-4-6".to_string()));
+    assert_eq!(default_model, Some(SONNET_MODEL.to_string()));
 }
 
 #[test]

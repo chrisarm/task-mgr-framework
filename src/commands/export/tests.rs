@@ -4,6 +4,7 @@ use super::*;
 use crate::commands::init;
 use crate::commands::init::PrefixMode;
 use crate::db::{create_schema, run_migrations};
+use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use std::fs;
 use tempfile::TempDir;
 
@@ -446,30 +447,32 @@ fn test_calculate_statistics() {
 #[test]
 fn test_round_trip_preserves_model_fields() {
     let temp_dir = TempDir::new().unwrap();
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "project": "round-trip-test",
-        "model": "claude-sonnet-4-6",
+        "model": "{SONNET_MODEL}",
         "userStories": [
-            {
+            {{
                 "id": "US-001",
                 "title": "Task with model",
                 "priority": 1,
                 "passes": false,
-                "model": "claude-opus-4-6",
+                "model": "{OPUS_MODEL}",
                 "difficulty": "high",
                 "escalationNote": "Bumped after compile failure"
-            },
-            {
+            }},
+            {{
                 "id": "US-002",
                 "title": "Task without model",
                 "priority": 2,
                 "passes": false
-            }
+            }}
         ]
-    }"#;
+    }}"#
+    );
 
     let json_path = temp_dir.path().join("prd.json");
-    fs::write(&json_path, json).unwrap();
+    fs::write(&json_path, &json).unwrap();
 
     // Import
     init::init(
@@ -494,7 +497,7 @@ fn test_round_trip_preserves_model_fields() {
     // Verify PRD-level model preserved
     assert_eq!(
         exported.model,
-        Some("claude-sonnet-4-6".to_string()),
+        Some(SONNET_MODEL.to_string()),
         "model should survive round-trip"
     );
 
@@ -504,7 +507,7 @@ fn test_round_trip_preserves_model_fields() {
         .iter()
         .find(|s| s.id == "US-001")
         .expect("US-001 should be exported");
-    assert_eq!(us001.model, Some("claude-opus-4-6".to_string()));
+    assert_eq!(us001.model, Some(OPUS_MODEL.to_string()));
     assert_eq!(us001.difficulty, Some("high".to_string()));
     assert_eq!(
         us001.escalation_note,
@@ -572,24 +575,26 @@ fn test_round_trip_model_fields_omitted_from_json_when_none() {
 #[test]
 fn test_export_preserves_model_fields_in_json_format() {
     let temp_dir = TempDir::new().unwrap();
-    let json = r#"{
+    let json = format!(
+        r#"{{
         "project": "json-format-test",
-        "model": "claude-haiku-4-5-20251001",
+        "model": "{HAIKU_MODEL}",
         "userStories": [
-            {
+            {{
                 "id": "US-001",
                 "title": "Formatted task",
                 "priority": 1,
                 "passes": false,
-                "model": "claude-sonnet-4-6",
+                "model": "{SONNET_MODEL}",
                 "difficulty": "medium",
                 "escalationNote": "Test note"
-            }
+            }}
         ]
-    }"#;
+    }}"#
+    );
 
     let json_path = temp_dir.path().join("prd.json");
-    fs::write(&json_path, json).unwrap();
+    fs::write(&json_path, &json).unwrap();
 
     init::init(
         temp_dir.path(),

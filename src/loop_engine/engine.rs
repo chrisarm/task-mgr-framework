@@ -78,15 +78,15 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
 
 /// Map task difficulty to Claude CLI `--effort` level.
 ///
-/// Scaling: low difficulty → medium effort, medium → high, high → max.
-/// Returns `None` when difficulty is unset, letting Claude use its default.
+/// Mapping is defined by `model::EFFORT_FOR_DIFFICULTY`. Difficulty matching is
+/// case-insensitive. Returns `None` for unset / unknown difficulty, letting
+/// Claude use its default.
 fn effort_for_difficulty(difficulty: Option<&str>) -> Option<&'static str> {
-    match difficulty.map(|d| d.to_ascii_lowercase()).as_deref() {
-        Some("low") => Some("medium"),
-        Some("medium") => Some("high"),
-        Some("high") => Some("max"),
-        _ => None,
-    }
+    let d = difficulty?.to_ascii_lowercase();
+    crate::loop_engine::model::EFFORT_FOR_DIFFICULTY
+        .iter()
+        .find(|(k, _)| *k == d)
+        .map(|(_, v)| *v)
 }
 
 /// Parameters for usage API monitoring within an iteration.
@@ -172,6 +172,9 @@ pub struct IterationResult {
     /// Effective model used for this iteration (post-crash-escalation).
     /// None for early exits (signal, rate-limit, etc.).
     pub effective_model: Option<String>,
+    /// Effective `--effort` level used for this iteration, derived from task difficulty.
+    /// None when difficulty is unset/unknown or for early exits.
+    pub effective_effort: Option<&'static str>,
     /// Number of key decisions extracted and stored this iteration.
     pub key_decisions_count: u32,
 }
@@ -234,6 +237,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            effective_effort: None,
             key_decisions_count: 0,
         });
     }
@@ -248,6 +252,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            effective_effort: None,
             key_decisions_count: 0,
         });
     }
@@ -278,6 +283,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    effective_effort: None,
                     key_decisions_count: 0,
                 });
             }
@@ -307,6 +313,7 @@ pub fn run_iteration(
             should_stop: true,
             output: String::new(),
             effective_model: None,
+            effective_effort: None,
             key_decisions_count: 0,
         });
     }
@@ -368,6 +375,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    effective_effort: None,
                     key_decisions_count: 0,
                 });
             }
@@ -414,6 +422,7 @@ pub fn run_iteration(
                             should_stop: false,
                             output: String::new(),
                             effective_model: None,
+                            effective_effort: None,
                             key_decisions_count: 0,
                         });
                     }
@@ -438,6 +447,7 @@ pub fn run_iteration(
                     should_stop: false,
                     output: String::new(),
                     effective_model: None,
+                    effective_effort: None,
                     key_decisions_count: 0,
                 });
             }
@@ -474,13 +484,17 @@ pub fn run_iteration(
         }
     };
 
-    // Step 5: Print iteration header (with post-escalation effective_model)
+    // Derive effort from task difficulty so we can show it in the header.
+    let effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
+
+    // Step 5: Print iteration header (with post-escalation effective_model + effort)
     display::print_iteration_header(
         params.iteration,
         params.max_iterations,
         &task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
+        effort,
     );
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
@@ -489,7 +503,6 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
-    let effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
     let claude_result = claude::spawn_claude(
         &prompt_result.prompt,
         Some(params.signal_flag),
@@ -555,6 +568,7 @@ pub fn run_iteration(
             should_stop: false,
             output: claude_result.output,
             effective_model,
+            effective_effort: effort,
             key_decisions_count: 0,
         });
     }
@@ -577,6 +591,7 @@ pub fn run_iteration(
             should_stop: true,
             output: claude_result.output,
             effective_model: None,
+            effective_effort: None,
             key_decisions_count: 0,
         });
     }
@@ -609,6 +624,7 @@ pub fn run_iteration(
                         should_stop: true,
                         output: String::new(),
                         effective_model: None,
+                        effective_effort: None,
                         key_decisions_count: 0,
                     });
                 }
@@ -645,6 +661,7 @@ pub fn run_iteration(
                     should_stop: true,
                     output: String::new(),
                     effective_model: None,
+                    effective_effort: None,
                     key_decisions_count: 0,
                 });
             }
@@ -719,6 +736,7 @@ pub fn run_iteration(
         should_stop,
         output: claude_output,
         effective_model,
+        effective_effort: effort,
         key_decisions_count: 0,
     })
 }
@@ -1636,6 +1654,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             &result.outcome,
             &result.files_modified,
             result.effective_model.as_deref(),
+            result.effective_effort,
         );
 
         // Extract and store key decisions (non-fatal: DB errors are warnings only)
@@ -2611,6 +2630,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         should_stop: true,
         output: String::new(),
         effective_model: None,
+        effective_effort: None,
         key_decisions_count: 0,
     }
 }
@@ -2807,6 +2827,7 @@ mod tests {
             should_stop: false,
             output: String::new(),
             effective_model: None,
+            effective_effort: None,
             key_decisions_count: 0,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
@@ -3997,7 +4018,7 @@ mod tests {
     fn test_model_escalation_sonnet_to_opus_at_two_failures() {
         let (_dir, conn) = setup_test_db();
         conn.execute(
-            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
             [],
         )
         .unwrap();
@@ -4025,7 +4046,7 @@ mod tests {
     fn test_model_escalation_opus_stays_at_ceiling() {
         let (_dir, conn) = setup_test_db();
         conn.execute(
-            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-opus-4-6', 0)",
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{OPUS_MODEL}', 0)"),
             [],
         )
         .unwrap();
@@ -4238,7 +4259,7 @@ mod tests {
     fn test_model_escalation_not_triggered_at_one_failure() {
         let (_dir, conn) = setup_test_db();
         conn.execute(
-            "INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', 'claude-sonnet-4-6', 0)",
+            &format!("INSERT INTO tasks (id, title, status, model, consecutive_failures) VALUES ('T-001', 'Test', 'in_progress', '{SONNET_MODEL}', 0)"),
             [],
         )
         .unwrap();
@@ -4259,14 +4280,29 @@ mod tests {
 
     #[test]
     fn test_effort_for_difficulty_mapping() {
-        assert_eq!(effort_for_difficulty(Some("low")), Some("medium"));
-        assert_eq!(effort_for_difficulty(Some("medium")), Some("high"));
-        assert_eq!(effort_for_difficulty(Some("high")), Some("max"));
-        // Case-insensitive
-        assert_eq!(effort_for_difficulty(Some("LOW")), Some("medium"));
-        assert_eq!(effort_for_difficulty(Some("High")), Some("max"));
-        // Unknown / None → None (use CLI default)
+        use crate::loop_engine::model::EFFORT_FOR_DIFFICULTY;
+
+        // Every row in the canonical table must round-trip through the fn.
+        assert!(
+            !EFFORT_FOR_DIFFICULTY.is_empty(),
+            "EFFORT_FOR_DIFFICULTY must not be empty"
+        );
+        for (difficulty, expected_effort) in EFFORT_FOR_DIFFICULTY {
+            assert_eq!(
+                effort_for_difficulty(Some(difficulty)),
+                Some(*expected_effort),
+                "table row {difficulty} → {expected_effort} must round-trip",
+            );
+            // Case-insensitive: uppercase must map the same way.
+            assert_eq!(
+                effort_for_difficulty(Some(&difficulty.to_ascii_uppercase())),
+                Some(*expected_effort),
+                "case-insensitive mapping failed for {difficulty}",
+            );
+        }
+        // Unknown / None → None (use CLI default).
         assert_eq!(effort_for_difficulty(None), None);
         assert_eq!(effort_for_difficulty(Some("unknown")), None);
+        assert_eq!(effort_for_difficulty(Some("")), None);
     }
 }

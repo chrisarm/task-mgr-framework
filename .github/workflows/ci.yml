@@ -48,6 +48,9 @@ jobs:
       - name: Lint with clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Verify generated docs are in sync with model.rs
+        run: cargo run --bin gen-docs -- --check
+
       - name: Run tests
         run: cargo test --all-targets
 

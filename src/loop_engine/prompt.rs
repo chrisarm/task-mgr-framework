@@ -1595,7 +1595,7 @@ pub enum ApiError {
             notes: Some("Important: check edge cases".to_string()),
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             batch_with: vec!["FEAT-043".to_string()],
-            model: Some("claude-opus-4-6".to_string()),
+            model: Some(OPUS_MODEL.to_string()),
             difficulty: Some("high".to_string()),
             escalation_note: Some("Complex architectural task".to_string()),
             requires_human: false,
@@ -1650,7 +1650,7 @@ pub enum ApiError {
             "Should contain eligible batch tasks when non-empty"
         );
         assert!(
-            json.contains("claude-opus-4-6"),
+            json.contains(OPUS_MODEL),
             "Should contain model when present"
         );
         assert!(
@@ -1797,7 +1797,7 @@ pub enum ApiError {
 
     #[test]
     fn test_build_task_json_model_field_only() {
-        let task = task_output_with_model_fields(Some("claude-haiku-4-5-20251001"), None, None);
+        let task = task_output_with_model_fields(Some(HAIKU_MODEL), None, None);
         let result = empty_next_result(&task);
         let json = build_task_json(&task, &result);
 
@@ -1806,7 +1806,7 @@ pub enum ApiError {
             "JSON should contain model key when model is set"
         );
         assert!(
-            json.contains("claude-haiku-4-5-20251001"),
+            json.contains(HAIKU_MODEL),
             "JSON should contain model value"
         );
         assert!(
@@ -1878,7 +1878,7 @@ pub enum ApiError {
         // Set model fields directly via SQL since insert_task doesn't support them
         conn.execute(
             "UPDATE tasks SET model = ?1, difficulty = ?2, escalation_note = ?3 WHERE id = 'MOD-001'",
-            params!["claude-opus-4-6", "high", "Complex multi-file refactor"],
+            params![OPUS_MODEL, "high", "Complex multi-file refactor"],
         )
         .unwrap();
 
@@ -1891,7 +1891,7 @@ pub enum ApiError {
 
         // Verify model fields appear in the task JSON block
         assert!(
-            result.prompt.contains("claude-opus-4-6"),
+            result.prompt.contains(OPUS_MODEL),
             "Prompt JSON should contain model value"
         );
         assert!(
@@ -2161,7 +2161,7 @@ pub enum ApiError {
     // TDD tests defining expected behavior for PromptResult.resolved_model.
     // Tests marked #[ignore] will pass once FEAT-004 implements model resolution.
 
-    /// AC1: Task with explicit model='claude-opus-4-6' → resolved_model is Some('claude-opus-4-6').
+    /// AC1: Task with explicit model=Some(OPUS_MODEL) → resolved_model is Some(OPUS_MODEL).
     #[test]
 
     fn test_resolved_model_explicit_model_on_task() {

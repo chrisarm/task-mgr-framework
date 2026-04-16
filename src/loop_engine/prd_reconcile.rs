@@ -10,6 +10,7 @@ use crate::commands::dependency_checker;
 use crate::db::prefix::prefix_and;
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::model::SONNET_MODEL;
 use crate::loop_engine::output_parsing::strip_task_prefix;
 use crate::TaskMgrResult;
 
@@ -624,7 +625,7 @@ pub(crate) fn mutate_prd_from_feedback(
 
     // 4. Spawn Claude subprocess
     eprintln!("Running task mutation via Claude...");
-    let effective_model = model.unwrap_or("claude-sonnet-4-6");
+    let effective_model = model.unwrap_or(SONNET_MODEL);
     let result = match claude::spawn_claude(
         &prompt,
         None,

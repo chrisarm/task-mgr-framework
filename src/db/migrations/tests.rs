@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::db::{create_schema, open_connection};
+use crate::loop_engine::model::{HAIKU_MODEL, SONNET_MODEL};
 use tempfile::TempDir;
 
 fn setup_db() -> (TempDir, Connection) {
@@ -475,7 +476,9 @@ fn test_migration_v7_columns_writable_after_migration() {
 
     // Insert a task with model selection fields
     conn.execute(
-        "INSERT INTO tasks (id, title, status, model, difficulty, escalation_note) VALUES ('US-001', 'Test', 'todo', 'claude-sonnet-4-6', 'high', 'Previous attempt failed')",
+        &format!(
+            "INSERT INTO tasks (id, title, status, model, difficulty, escalation_note) VALUES ('US-001', 'Test', 'todo', '{SONNET_MODEL}', 'high', 'Previous attempt failed')"
+        ),
         [],
     )
     .unwrap();
@@ -489,7 +492,7 @@ fn test_migration_v7_columns_writable_after_migration() {
         )
         .unwrap();
 
-    assert_eq!(model, Some("claude-sonnet-4-6".to_string()));
+    assert_eq!(model, Some(SONNET_MODEL.to_string()));
     assert_eq!(difficulty, Some("high".to_string()));
     assert_eq!(escalation_note, Some("Previous attempt failed".to_string()));
 }
@@ -502,7 +505,9 @@ fn test_migration_v7_default_model_writable_on_prd_metadata() {
 
     // Insert prd_metadata with default_model
     conn.execute(
-        "INSERT INTO prd_metadata (id, project, default_model) VALUES (1, 'test', 'claude-haiku-4-5-20251001')",
+        &format!(
+            "INSERT INTO prd_metadata (id, project, default_model) VALUES (1, 'test', '{HAIKU_MODEL}')"
+        ),
         [],
     )
     .unwrap();
@@ -515,7 +520,7 @@ fn test_migration_v7_default_model_writable_on_prd_metadata() {
         )
         .unwrap();
 
-    assert_eq!(default_model, Some("claude-haiku-4-5-20251001".to_string()));
+    assert_eq!(default_model, Some(HAIKU_MODEL.to_string()));
 }
 
 // ========== Migration v8 Tests (FTS5 Tag Indexing) ==========

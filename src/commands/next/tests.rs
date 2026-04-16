@@ -625,6 +625,7 @@ mod next_command_tests {
     };
     use crate::commands::next::selection::{ScoreBreakdown, ScoredTask};
     use crate::db::open_connection;
+    use crate::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 
     #[test]
     fn test_next_no_tasks() {
@@ -989,7 +990,7 @@ mod next_command_tests {
     #[test]
     fn test_build_task_output_populates_model_fields() {
         let mut task = crate::models::Task::new("FEAT-001", "Model test task");
-        task.model = Some("claude-opus-4-6".to_string());
+        task.model = Some(OPUS_MODEL.to_string());
         task.difficulty = Some("high".to_string());
         task.escalation_note = Some("Complex architectural decision".to_string());
 
@@ -1013,7 +1014,7 @@ mod next_command_tests {
 
         assert_eq!(
             output.model,
-            Some("claude-opus-4-6".to_string()),
+            Some(OPUS_MODEL.to_string()),
             "model should be populated from scored_task"
         );
         assert_eq!(
@@ -1064,7 +1065,7 @@ mod next_command_tests {
     #[test]
     fn test_build_task_output_claimed_preserves_model_fields() {
         let mut task = crate::models::Task::new("FEAT-003", "Claimed with model");
-        task.model = Some("claude-sonnet-4-6".to_string());
+        task.model = Some(SONNET_MODEL.to_string());
         task.difficulty = Some("medium".to_string());
         task.escalation_note = None;
 
@@ -1092,7 +1093,7 @@ mod next_command_tests {
         );
         assert_eq!(
             output.model,
-            Some("claude-sonnet-4-6".to_string()),
+            Some(SONNET_MODEL.to_string()),
             "model should be preserved when claimed"
         );
         assert_eq!(
@@ -1121,7 +1122,7 @@ mod next_command_tests {
                 notes: None,
                 files: vec!["src/lib.rs".to_string()],
                 batch_with: vec![],
-                model: Some("claude-opus-4-6".to_string()),
+                model: Some(OPUS_MODEL.to_string()),
                 difficulty: Some("high".to_string()),
                 escalation_note: Some("Complex task needing opus".to_string()),
                 requires_human: false,

@@ -220,7 +220,7 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_at_iteration: Option<i64>,
 
-    /// Preferred model for this task (e.g., "claude-opus-4-6")
+    /// Preferred model for this task (e.g., the value of `loop_engine::model::OPUS_MODEL`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 

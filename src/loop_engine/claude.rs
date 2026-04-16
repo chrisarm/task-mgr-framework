@@ -645,6 +645,7 @@ pub(crate) fn cleanup_ghost_sessions() {
 mod tests {
     use super::*;
     use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
+    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::watchdog::{exit_code_from_status, TimeoutConfig};
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
@@ -1097,13 +1098,13 @@ mod tests {
         );
     }
 
-    /// model=Some("claude-opus-4-6") → --model flag present with correct value in echoed args.
+    /// model=Some(OPUS_MODEL) → --model flag present with correct value in echoed args.
     #[test]
     fn test_spawn_model_some_opus_includes_model_flag() {
         let result = spawn_claude_echo(
             "test_prompt",
             None,
-            Some("claude-opus-4-6"),
+            Some(OPUS_MODEL),
             false,
             &scoped_coding(),
         );
@@ -1112,9 +1113,10 @@ mod tests {
         let res = result.unwrap();
         let output = res.output.trim();
 
+        let expected = format!("--model {OPUS_MODEL}");
         assert!(
-            output.contains("--model claude-opus-4-6"),
-            "model=Some('claude-opus-4-6') should include --model flag, got: '{}'",
+            output.contains(&expected),
+            "model=Some(OPUS_MODEL) should include --model flag, got: '{}'",
             output
         );
     }
@@ -1143,7 +1145,7 @@ mod tests {
         let result = spawn_claude_echo(
             "test_prompt",
             None,
-            Some("claude-opus-4-6"),
+            Some(OPUS_MODEL),
             false,
             &scoped_coding(),
         );
@@ -1174,7 +1176,7 @@ mod tests {
         let result = spawn_claude_echo(
             "test_prompt",
             None,
-            Some("claude-opus-4-6"),
+            Some(OPUS_MODEL),
             false,
             &scoped_coding(),
         );
@@ -1199,7 +1201,7 @@ mod tests {
             output
         );
         assert!(
-            output.contains("--model claude-opus-4-6"),
+            output.contains(&format!("--model {OPUS_MODEL}")),
             "Must have --model flag, got: '{}'",
             output
         );
@@ -1212,9 +1214,9 @@ mod tests {
     /// AC: Parameterized tests for multiple model strings (opus, sonnet, haiku, custom).
     /// Verifies each model string produces correct --model <name> before -p.
     #[rstest]
-    #[case("claude-opus-4-6")]
-    #[case("claude-sonnet-4-6")]
-    #[case("claude-haiku-4-5-20251001")]
+    #[case(OPUS_MODEL)]
+    #[case(SONNET_MODEL)]
+    #[case(HAIKU_MODEL)]
     #[case("my-custom-model")]
     fn test_spawn_claude_model_variants(#[case] model: &str) {
         let result = spawn_claude_echo("test prompt", None, Some(model), false, &scoped_coding());
@@ -1268,7 +1270,7 @@ mod tests {
     /// AC: --model does not interfere with --permission-mode or --print flags.
     /// Verifies exact ordering: --print --no-session-persistence --permission-mode dontAsk [--model <m>] -p <prompt>
     #[rstest]
-    #[case(Some("claude-sonnet-4-6"))]
+    #[case(Some(SONNET_MODEL))]
     #[case(None)]
     fn test_spawn_claude_model_does_not_interfere_with_flags(#[case] model: Option<&str>) {
         let result = spawn_claude_echo("my prompt", None, model, false, &scoped_coding());
@@ -1995,7 +1997,7 @@ mod tests {
         let result = spawn_claude_echo(
             "prompt",
             None,
-            Some("claude-opus-4-6"),
+            Some(OPUS_MODEL),
             false,
             &scoped_coding(),
         );
@@ -2013,7 +2015,7 @@ mod tests {
             "stream_json=false with model must include --model"
         );
         assert!(
-            output.contains("claude-opus-4-6"),
+            output.contains(OPUS_MODEL),
             "stream_json=false with model must include the model value"
         );
         assert!(
@@ -2039,7 +2041,7 @@ mod tests {
             "my-prompt",
             None,
             None,
-            Some("claude-sonnet-4-6"),
+            Some(SONNET_MODEL),
             Some(timeout),
             true,
             &scoped_coding(),
@@ -2069,7 +2071,7 @@ mod tests {
 
         // model value must be present
         assert!(
-            output.contains("claude-sonnet-4-6"),
+            output.contains(SONNET_MODEL),
             "model value must be in args"
         );
 
@@ -2466,7 +2468,7 @@ mod tests {
         let mode = PermissionMode::Scoped {
             allowed_tools: Some("Read,Edit".to_string()),
         };
-        let result = spawn_claude_echo("my-prompt", None, Some("claude-sonnet-4-6"), false, &mode);
+        let result = spawn_claude_echo("my-prompt", None, Some(SONNET_MODEL), false, &mode);
         let output = result.expect("echo should succeed").output;
         let output = output.trim();
 

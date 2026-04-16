@@ -15,18 +15,16 @@ use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
 
-/// Get the path to a fixture file by name.
-fn fixture_path(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
-}
+use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
-/// Initialize a tempdir from a named fixture, returning the tempdir.
+mod common;
+use common::render_fixture_tmpl;
+
+/// Initialize a tempdir from a named fixture (rendered from `<name>.tmpl`),
+/// returning the tempdir.
 fn init_from_fixture(fixture_name: &str) -> TempDir {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path(fixture_name);
+    let prd_path = render_fixture_tmpl(fixture_name, temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
@@ -49,7 +47,7 @@ fn init_from_fixture(fixture_name: &str) -> TempDir {
 #[test]
 fn test_init_with_model_fields_succeeds() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_with_all_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
@@ -68,7 +66,7 @@ fn test_init_with_model_fields_succeeds() {
 #[test]
 fn test_init_with_partial_model_fields_succeeds() {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path("prd_with_partial_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_partial_model_fields.json", temp_dir.path());
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
@@ -116,7 +114,7 @@ fn test_next_json_includes_model_fields() {
 
     assert_eq!(
         task.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "next --json should include task model"
     );
 
@@ -160,7 +158,7 @@ fn test_next_json_omits_null_model_fields() {
     // PM-001 has model and difficulty but no escalationNote
     assert_eq!(
         task.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
     );
     assert_eq!(
         task.get("difficulty").and_then(|v| v.as_str()),
@@ -195,7 +193,7 @@ fn test_export_preserves_model_fields() {
     // Top-level model field
     assert_eq!(
         exported.get("model").and_then(|v| v.as_str()),
-        Some("claude-sonnet-4-6"),
+        Some(SONNET_MODEL),
         "Export should preserve top-level model"
     );
 
@@ -212,7 +210,7 @@ fn test_export_preserves_model_fields() {
 
     assert_eq!(
         mt001.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "Export should preserve per-task model"
     );
     assert_eq!(
@@ -234,7 +232,7 @@ fn test_export_preserves_model_fields() {
 
     assert_eq!(
         mt002.get("model").and_then(|v| v.as_str()),
-        Some("claude-haiku-4-5-20251001"),
+        Some(HAIKU_MODEL),
     );
     assert_eq!(
         mt002.get("difficulty").and_then(|v| v.as_str()),
@@ -293,7 +291,7 @@ fn test_export_omits_null_model_fields() {
 #[test]
 fn test_reimport_preserves_model_fields() {
     let temp_dir = init_from_fixture("prd_with_all_model_fields.json");
-    let prd_path = fixture_path("prd_with_all_model_fields.json");
+    let prd_path = render_fixture_tmpl("prd_with_all_model_fields.json", temp_dir.path());
 
     // Re-import with --append --update-existing
     Command::new(cargo_bin("task-mgr"))
@@ -332,7 +330,7 @@ fn test_reimport_preserves_model_fields() {
 
     assert_eq!(
         mt001.get("model").and_then(|v| v.as_str()),
-        Some("claude-opus-4-6"),
+        Some(OPUS_MODEL),
         "model should survive re-import"
     );
     assert_eq!(

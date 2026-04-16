@@ -2,11 +2,29 @@
 //!
 //! Pure functions for determining which Claude model to use for task execution.
 //! No I/O dependencies — all inputs are passed as parameters.
+//!
+//! # Source of Truth
+//!
+//! This file is the canonical source of truth for Claude model IDs and the
+//! difficulty→effort mapping. `.claude/commands/tasks.md` is regenerated from
+//! this file by `cargo run --bin gen-docs`; CI enforces sync via
+//! `cargo run --bin gen-docs -- --check`.
+//!
+//! When bumping a model ID or effort value, edit ONLY this file, then run
+//! `cargo run --bin gen-docs` to refresh the slash-command doc. Tests import
+//! these constants and pick up changes automatically.
 
 /// Well-known model identifiers.
-pub const OPUS_MODEL: &str = "claude-opus-4-6";
+pub const OPUS_MODEL: &str = "claude-opus-4-7";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Mapping from task difficulty to Claude CLI `--effort` level.
+///
+/// Scaling: low difficulty → high effort, medium → xhigh, high → max.
+/// Unset / unknown difficulty → no `--effort` flag (CLI default applies).
+pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
+    &[("low", "high"), ("medium", "xhigh"), ("high", "max")];
 
 /// Model tier ordering for comparison.
 ///
@@ -118,7 +136,7 @@ mod tests {
     #[test]
     fn test_model_tier_opus_constants_and_substrings() {
         assert_eq!(model_tier(Some(OPUS_MODEL)), ModelTier::Opus);
-        assert_eq!(model_tier(Some("claude-opus-4-6")), ModelTier::Opus);
+        assert_eq!(model_tier(Some("claude-opus-4-7")), ModelTier::Opus);
         assert_eq!(model_tier(Some("some-opus-variant")), ModelTier::Opus);
     }
 

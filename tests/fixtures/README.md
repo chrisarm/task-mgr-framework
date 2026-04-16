@@ -11,6 +11,7 @@ Test PRDs and mock Claude scripts for testing the loop engine.
 | `test-loop-prd.json` | 3-task PRD used by E2E integration tests in `e2e_loop.rs`. |
 | `mock-claude.sh` | Mock Claude binary for E2E tests. Requires `TASK_MGR_BIN`, `TASK_MGR_DIR`, and `MOCK_RUN_ID` env vars. |
 | `sample_prd.json` | 7-task PRD with various relationships (dependencies, synergy, batch, conflicts). Used by task selection tests. |
+| `*.json.tmpl`     | Templated PRD fixtures. `{{OPUS_MODEL}}` / `{{SONNET_MODEL}}` / `{{HAIKU_MODEL}}` are substituted at test time by `tests/common/mod.rs::render_fixture_tmpl` using the constants in `src/loop_engine/model.rs`, so model bumps only touch one file. To add a new template, drop `foo.json.tmpl` here and call `render_fixture_tmpl("foo.json", temp_dir)` from the test. |
 
 ## Smoke Test Usage
 

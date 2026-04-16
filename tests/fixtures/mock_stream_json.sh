@@ -4,6 +4,10 @@
 #
 # Outputs: system init, assistant message (text + tool_use), user message (tool_result),
 # and a final result line.
+#
+# NOTE: the "model" string below is arbitrary test data for the parser — it is
+# intentionally NOT synced with src/loop_engine/model.rs. The regression scan
+# in tests/no_hardcoded_models.rs explicitly excludes this file.
 
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"test-session","data":{}}

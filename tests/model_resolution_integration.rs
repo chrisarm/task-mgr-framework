@@ -13,17 +13,14 @@ use task_mgr::loop_engine::display::format_iteration_header;
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::prompt::{build_prompt, BuildPromptParams};
 
-fn fixture_path(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
-}
+mod common;
+use common::render_fixture_tmpl;
 
-/// Initialize a PRD fixture into a temp directory and return (temp_dir, conn).
+/// Initialize a PRD fixture (rendered from a `.json.tmpl`) into a temp
+/// directory and return (temp_dir, conn).
 fn init_prd(fixture_name: &str) -> (TempDir, rusqlite::Connection) {
     let temp_dir = TempDir::new().unwrap();
-    let prd_path = fixture_path(fixture_name);
+    let prd_path = render_fixture_tmpl(fixture_name, temp_dir.path());
 
     init::init(
         temp_dir.path(),
@@ -288,13 +285,17 @@ fn test_e2e_escalation_template_present_for_haiku_absent_for_opus() {
 #[test]
 fn test_e2e_iteration_header_displays_model() {
     // format_iteration_header is a pure function — verify it formats correctly
-    let header_opus = format_iteration_header(1, 10, "MR-001", 60, Some(OPUS_MODEL));
+    let header_opus = format_iteration_header(1, 10, "MR-001", 60, Some(OPUS_MODEL), Some("max"));
     assert!(
-        header_opus.contains("Model: claude-opus-4-6"),
+        header_opus.contains(&format!("Model: {OPUS_MODEL}")),
         "Header should display opus model name"
     );
+    assert!(
+        header_opus.contains("Effort: max"),
+        "Header should display the effort level"
+    );
 
-    let header_none = format_iteration_header(2, 10, "MR-003", 120, None);
+    let header_none = format_iteration_header(2, 10, "MR-003", 120, None, None);
     assert!(
         header_none.contains("Model: (default)"),
         "Header should display '(default)' when model is None"
@@ -317,11 +318,12 @@ fn test_e2e_progress_log_records_model() {
         &task_mgr::loop_engine::config::IterationOutcome::Completed,
         &["src/core.rs".to_string()],
         Some(OPUS_MODEL),
+        Some("max"),
     );
 
     let content = fs::read_to_string(&progress_path).unwrap();
     assert!(
-        content.contains("- Model: claude-opus-4-6"),
+        content.contains(&format!("- Model: {OPUS_MODEL}")),
         "Progress log should contain model name"
     );
 
@@ -332,6 +334,7 @@ fn test_e2e_progress_log_records_model() {
         Some("MR-003"),
         &task_mgr::loop_engine::config::IterationOutcome::Completed,
         &[],
+        None,
         None,
     );
 

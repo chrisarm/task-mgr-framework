@@ -169,14 +169,17 @@ pub fn format_iteration_header(
     task_id: &str,
     elapsed_secs: u64,
     model: Option<&str>,
+    effort: Option<&str>,
 ) -> String {
     let model_display = model.unwrap_or("(default)");
+    let effort_display = effort.unwrap_or("(default)");
     format!(
-        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {} ═══ Elapsed: {} ═══",
+        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {} ═══ Effort: {} ═══ Elapsed: {} ═══",
         iteration,
         max_iterations,
         task_id,
         model_display,
+        effort_display,
         format_duration(elapsed_secs)
     )
 }
@@ -188,10 +191,18 @@ pub fn print_iteration_header(
     task_id: &str,
     elapsed_secs: u64,
     model: Option<&str>,
+    effort: Option<&str>,
 ) {
     eprintln!(
         "{}",
-        format_iteration_header(iteration, max_iterations, task_id, elapsed_secs, model)
+        format_iteration_header(
+            iteration,
+            max_iterations,
+            task_id,
+            elapsed_secs,
+            model,
+            effort,
+        )
     );
 }
 
@@ -291,6 +302,7 @@ fn truncate_display(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::model::SONNET_MODEL;
 
     // --- format_duration tests ---
 
@@ -359,24 +371,27 @@ mod tests {
 
     #[test]
     fn test_print_iteration_header_no_panic() {
-        print_iteration_header(3, 10, "FEAT-001", 125, None);
+        print_iteration_header(3, 10, "FEAT-001", 125, None, None);
     }
 
     #[test]
     fn test_format_iteration_header_with_none_model() {
-        let header = format_iteration_header(3, 10, "FEAT-001", 125, None);
+        let header = format_iteration_header(3, 10, "FEAT-001", 125, None, None);
         assert!(header.contains("Iteration 3/10"));
         assert!(header.contains("Task: FEAT-001"));
         assert!(header.contains("Model: (default)"));
+        assert!(header.contains("Effort: (default)"));
         assert!(header.contains("Elapsed: 2m 5s"));
     }
 
     #[test]
     fn test_format_iteration_header_with_some_model() {
-        let header = format_iteration_header(1, 5, "TEST-002", 60, Some("claude-sonnet-4-6"));
+        let header =
+            format_iteration_header(1, 5, "TEST-002", 60, Some(SONNET_MODEL), Some("xhigh"));
         assert!(header.contains("Iteration 1/5"));
         assert!(header.contains("Task: TEST-002"));
-        assert!(header.contains("Model: claude-sonnet-4-6"));
+        assert!(header.contains(&format!("Model: {SONNET_MODEL}")));
+        assert!(header.contains("Effort: xhigh"));
         assert!(header.contains("Elapsed: 1m 0s"));
     }
 

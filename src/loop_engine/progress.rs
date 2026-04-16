@@ -31,6 +31,7 @@ pub fn log_iteration(
     outcome: &IterationOutcome,
     files: &[String],
     model: Option<&str>,
+    effort: Option<&str>,
 ) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let task = task_id.unwrap_or("(none)");
@@ -41,10 +42,11 @@ pub fn log_iteration(
         files.join(", ")
     };
     let model_display = model.unwrap_or("(default)");
+    let effort_display = effort.unwrap_or("(default)");
 
     let entry = format!(
-        "\n## {} - Iteration {}\n- Task: {}\n- Model: {}\n- Outcome: {}\n- Files: {}\n---\n",
-        timestamp, iteration, task, model_display, outcome_str, files_str
+        "\n## {} - Iteration {}\n- Task: {}\n- Model: {}\n- Effort: {}\n- Outcome: {}\n- Files: {}\n---\n",
+        timestamp, iteration, task, model_display, effort_display, outcome_str, files_str
     );
 
     match OpenOptions::new()
@@ -140,6 +142,7 @@ pub fn rotate_progress(progress_path: &Path) {
 mod tests {
     use super::*;
     use crate::loop_engine::config::CrashType;
+    use crate::loop_engine::model::SONNET_MODEL;
     use tempfile::TempDir;
 
     // --- log_iteration tests ---
@@ -155,6 +158,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &["src/lib.rs".to_string()],
+            None,
             None,
         );
 
@@ -182,6 +186,7 @@ mod tests {
             &IterationOutcome::Completed,
             &[],
             None,
+            None,
         );
         log_iteration(
             &progress_path,
@@ -189,6 +194,7 @@ mod tests {
             Some("FEAT-002"),
             &IterationOutcome::Blocked,
             &[],
+            None,
             None,
         );
 
@@ -203,7 +209,15 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
 
-        log_iteration(&progress_path, 1, None, &IterationOutcome::Empty, &[], None);
+        log_iteration(
+            &progress_path,
+            1,
+            None,
+            &IterationOutcome::Empty,
+            &[],
+            None,
+            None,
+        );
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("(none)"));
@@ -220,6 +234,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
             None,
         );
 
@@ -239,6 +254,7 @@ mod tests {
             &IterationOutcome::Completed,
             &["src/a.rs".to_string(), "src/b.rs".to_string()],
             None,
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -255,6 +271,7 @@ mod tests {
             &IterationOutcome::Completed,
             &[],
             None,
+            None,
         );
     }
 
@@ -270,10 +287,12 @@ mod tests {
             &IterationOutcome::Completed,
             &[],
             None,
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains("- Model: (default)"));
+        assert!(content.contains("- Effort: (default)"));
     }
 
     #[test]
@@ -287,11 +306,13 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
-            Some("claude-sonnet-4-6"),
+            Some(SONNET_MODEL),
+            Some("xhigh"),
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
-        assert!(content.contains("- Model: claude-sonnet-4-6"));
+        assert!(content.contains(&format!("- Model: {SONNET_MODEL}")));
+        assert!(content.contains("- Effort: xhigh"));
     }
 
     // --- format_outcome tests ---

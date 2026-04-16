@@ -981,7 +981,7 @@ fn test_full_loop_retry_lifecycle() {
                 "acceptanceCriteria": ["Should be auto-blocked after 3 failures"],
                 "priority": 1,
                 "passes": false,
-                "model": "claude-sonnet-4-6",
+                "model": SONNET_MODEL,
                 "maxRetries": 3,
                 "dependsOn": [],
                 "synergyWith": [],
