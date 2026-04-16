@@ -90,6 +90,7 @@ pub(crate) fn spawn_claude(
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
         vec![
+            "--print".to_string(),
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
@@ -1424,8 +1425,8 @@ mod tests {
             output
         );
         assert!(
-            !output.contains("--print"),
-            "stream_json=true must NOT use --print"
+            output.contains("--print"),
+            "stream_json=true must also use --print (required for --no-session-persistence)"
         );
         assert!(
             output.contains("--no-session-persistence"),
@@ -1992,7 +1993,7 @@ mod tests {
 
     /// AC: stream_json=true with model + timeout — correct arg ordering.
     ///
-    /// Expected order: --output-format stream-json, --no-session-persistence,
+    /// Expected order: --print, --output-format stream-json, --no-session-persistence,
     /// --permission-mode dontAsk, --model <model>, -p <prompt>
     #[test]
     fn test_stream_json_true_with_model_and_timeout_arg_ordering() {
@@ -2047,10 +2048,10 @@ mod tests {
             "--no-session-persistence must be present"
         );
 
-        // --print must NOT be present
+        // --print must be present (required for --no-session-persistence and --output-format)
         assert!(
-            !output.contains("--print"),
-            "--print must NOT be present for stream_json=true"
+            output.contains("--print"),
+            "--print must be present for stream_json=true"
         );
     }
 
@@ -2065,8 +2066,8 @@ mod tests {
     #[rstest]
     #[case(false, None, true, false)] // curate/ingestion: --print, no --output-format
     #[case(false, Some("opus"), true, false)] // utility+model: --print, no --output-format, has --model
-    #[case(true, None, false, true)] // engine no model: --output-format, no --print
-    #[case(true, Some("sonnet"), false, true)] // engine+model: --output-format, no --print, has --model
+    #[case(true, None, true, true)] // engine no model: --print + --output-format
+    #[case(true, Some("sonnet"), true, true)] // engine+model: --print + --output-format, has --model
     fn test_spawn_claude_four_caller_patterns(
         #[case] stream_json: bool,
         #[case] model: Option<&str>,
