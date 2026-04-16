@@ -501,6 +501,7 @@ pub fn run_iteration(
         effort,
     );
     monitor::stop_monitor(monitor_handle);
+    claude::cleanup_ghost_sessions();
     let claude_result = claude_result?;
 
     // Step 6.1: Print hints for denied tools

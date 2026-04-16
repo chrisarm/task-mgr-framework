@@ -610,6 +610,37 @@ fn extract_binary(command: &str) -> String {
     sanitized
 }
 
+/// Maximum size in bytes for a Claude session file to be considered a ghost
+/// (auto-mode classifier artifact with no real conversation).
+const GHOST_SESSION_MAX_BYTES: u64 = 300;
+
+/// Remove tiny "ghost" session files left behind by Claude's auto-mode
+/// classifier subprocess. These are interactive sessions with no real
+/// conversation content — just metadata stubs.
+pub(crate) fn cleanup_ghost_sessions() {
+    let sessions_dir = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h).join(".claude").join("sessions"),
+        Err(_) => return,
+    };
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let size = match entry.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if size <= GHOST_SESSION_MAX_BYTES {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
