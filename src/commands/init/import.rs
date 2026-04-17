@@ -8,9 +8,9 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::db::prefix::make_like_pattern;
 use crate::models::TaskStatus;
-use crate::TaskMgrResult;
 
 use super::output::DryRunDeletePreview;
 use super::parse::{PrdFile, PrdUserStory};

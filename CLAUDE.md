@@ -64,6 +64,14 @@ The interactive picker fires from `task-mgr init` when nothing resolves and
 stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr
 hint and skip — no hang.
 
+## Loop CLI Cheat Sheet
+
+- **Add a task**: `echo '{"id":"X-FIX-001","title":"...","difficulty":"medium","touchesFiles":[]}' | task-mgr add --stdin`
+- **Link into milestone**: append `--depended-on-by MILESTONE-ID`
+- **Mark status**: emit `<task-status>TASK-ID:done</task-status>` (also: `failed`, `skipped`, `irrelevant`, `blocked`)
+- **Permission guard**: loop iterations deny Edit/Write on `tasks/*.json` via `--disallowedTools`
+- **Never edit** `.task-mgr/tasks/*.json` directly — use the CLI and tags above
+
 ## Learning Creation Chokepoint
 
 All production code paths that create learnings must go through `LearningWriter` in

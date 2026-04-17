@@ -20,8 +20,8 @@ mod tests;
 
 use rusqlite::Connection;
 
-use crate::models::{Learning, LearningOutcome};
 use crate::TaskMgrResult;
+use crate::models::{Learning, LearningOutcome};
 
 /// Everything a retrieval backend needs to find relevant learnings.
 #[derive(Debug, Clone, Default)]

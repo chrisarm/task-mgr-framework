@@ -25,13 +25,13 @@ pub mod progress;
 pub mod project_config;
 pub mod prompt;
 pub mod prompt_sections;
-pub mod user_config;
 pub mod signals;
 pub mod stale;
 pub mod status;
 pub mod status_display;
 pub mod status_queries;
 pub mod usage;
+pub mod user_config;
 pub mod watchdog;
 pub mod worktree;
 

@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `task-mgr add` subcommand: accepts a task JSON object on stdin (`--stdin`),
+  auto-assigns priority relative to existing tasks, and syncs the PRD JSON file
+  atomically. Supports `--depended-on-by <task-id>` to wire the new task into
+  an existing task's `dependsOn` list immediately upon creation.
+- `<task-status>TASK-ID:status</task-status>` side-band tag: loop agents emit
+  this tag to drive task state transitions (done / fail / skip / irrelevant)
+  without ever touching the PRD JSON directly. The loop engine parses and
+  dispatches each tag after every iteration.
+- Loop iteration prompt now includes a `task_ops` section that instructs agents
+  to use the `task-mgr` CLI and `<task-status>` tag for all task lifecycle
+  operations, and explicitly forbids direct edits to `tasks/*.json`.
+- Loop permission policy: `tasks/*.json` paths are added to
+  `--disallowedTools` (Edit/Write) so the permission guard is enforced at the
+  Claude subprocess level, with a stderr hint pointing agents to `task-mgr add
+  --stdin` instead.
 - `task-mgr models` subcommand family: `list [--remote/--refresh]`,
   `set-default [<id>] [--project]`, `unset-default [--project]`, `show`.
   Supports live `/v1/models` discovery when `ANTHROPIC_API_KEY` and

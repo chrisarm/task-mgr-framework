@@ -7,11 +7,11 @@
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::commands::curate::types::{EnrichCandidate, EnrichParams, EnrichProposal, EnrichResult};
-use crate::learnings::{edit_learning, get_learning, get_learning_tags, EditLearningParams};
+use crate::learnings::{EditLearningParams, edit_learning, get_learning, get_learning_tags};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
-use crate::TaskMgrResult;
 
 use std::collections::HashSet;
 
@@ -240,6 +240,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             None,
             false,
             &PermissionMode::text_only(),
+            None,
             None,
         ) {
             Ok(r) => r,

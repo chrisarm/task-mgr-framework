@@ -6,8 +6,8 @@
 
 use rusqlite::Connection;
 
-use crate::models::Learning;
 use crate::TaskMgrResult;
+use crate::models::Learning;
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
 
@@ -97,20 +97,21 @@ fn append_common_filters(
         sql_params.push(Box::new(outcome.as_db_str().to_string()));
     }
     if let Some(ref tags) = query.tags
-        && !tags.is_empty() {
-            let param_start = sql_params.len() + 1;
-            let placeholders: Vec<String> = (0..tags.len())
-                .map(|i| format!("?{}", param_start + i))
-                .collect();
-            conditions.push(format!(
-                "{} IN (SELECT learning_id FROM learning_tags WHERE tag IN ({}))",
-                id_column,
-                placeholders.join(", ")
-            ));
-            for tag in tags {
-                sql_params.push(Box::new(tag.clone()));
-            }
+        && !tags.is_empty()
+    {
+        let param_start = sql_params.len() + 1;
+        let placeholders: Vec<String> = (0..tags.len())
+            .map(|i| format!("?{}", param_start + i))
+            .collect();
+        conditions.push(format!(
+            "{} IN (SELECT learning_id FROM learning_tags WHERE tag IN ({}))",
+            id_column,
+            placeholders.join(", ")
+        ));
+        for tag in tags {
+            sql_params.push(Box::new(tag.clone()));
         }
+    }
 }
 
 /// Executes FTS5 query with BM25 scoring, returning ScoredLearning results.

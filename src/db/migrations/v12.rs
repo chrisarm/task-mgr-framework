@@ -42,7 +42,7 @@ pub static MIGRATION: Migration = Migration {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::migrations::{run_migrations, MIGRATIONS};
+    use crate::db::migrations::{MIGRATIONS, run_migrations};
     use crate::db::{create_schema, open_connection};
     use rusqlite::Connection;
     use tempfile::TempDir;

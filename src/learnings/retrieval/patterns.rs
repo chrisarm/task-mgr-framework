@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
-use crate::models::Learning;
 use crate::TaskMgrResult;
+use crate::models::Learning;
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
 
@@ -121,9 +121,10 @@ fn type_prefix_score(
     task_prefix: Option<&str>,
 ) -> (i32, Option<&'static str>) {
     if let (Some(prefixes), Some(tp)) = (&learning.applies_to_task_types, task_prefix)
-        && prefixes.iter().any(|p| tp.starts_with(p)) {
-            return (TYPE_MATCH_SCORE, Some("task type match"));
-        }
+        && prefixes.iter().any(|p| tp.starts_with(p))
+    {
+        return (TYPE_MATCH_SCORE, Some("task type match"));
+    }
     (0, None)
 }
 
@@ -137,9 +138,9 @@ fn error_pattern_score(
         && patterns
             .iter()
             .any(|p| te.to_lowercase().contains(&p.to_lowercase()))
-        {
-            return (ERROR_MATCH_SCORE, Some("error pattern match"));
-        }
+    {
+        return (ERROR_MATCH_SCORE, Some("error pattern match"));
+    }
     (0, None)
 }
 
@@ -189,17 +190,19 @@ fn passes_query_filters(
     tags_map: &HashMap<i64, Vec<String>>,
 ) -> bool {
     if let Some(ref outcome_filter) = query.outcome
-        && learning.outcome != *outcome_filter {
+        && learning.outcome != *outcome_filter
+    {
+        return false;
+    }
+    if let Some(ref tags_filter) = query.tags
+        && !tags_filter.is_empty()
+    {
+        let id = learning.id.unwrap_or(0);
+        let learning_tags = tags_map.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+        if !tags_filter.iter().any(|t| learning_tags.contains(t)) {
             return false;
         }
-    if let Some(ref tags_filter) = query.tags
-        && !tags_filter.is_empty() {
-            let id = learning.id.unwrap_or(0);
-            let learning_tags = tags_map.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-            if !tags_filter.iter().any(|t| learning_tags.contains(t)) {
-                return false;
-            }
-        }
+    }
     true
 }
 
@@ -403,9 +406,11 @@ pub(crate) fn file_matches_pattern(file_path: &str, pattern: &str) -> bool {
     // For last part, must match at end if pattern doesn't end with *
     if !pattern.ends_with('*')
         && let Some(last_part) = parts.last()
-            && !last_part.is_empty() && !file_lower.ends_with(last_part) {
-                return false;
-            }
+        && !last_part.is_empty()
+        && !file_lower.ends_with(last_part)
+    {
+        return false;
+    }
 
     true
 }

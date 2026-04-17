@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 
+use super::Cli;
 use super::commands::{Commands, MigrateAction, RunAction};
 use super::enums::{
     Confidence, FailStatus, LearningOutcome, OutputFormat, RunEndStatus, Shell, TaskStatusFilter,
 };
-use super::Cli;
 
 #[test]
 fn verify_cli() {

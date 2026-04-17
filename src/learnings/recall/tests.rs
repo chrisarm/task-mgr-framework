@@ -6,9 +6,9 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use super::{format_text, recall_learnings, RecallParams, RecallResult};
+use super::{RecallParams, RecallResult, format_text, recall_learnings};
 use crate::db::{create_schema, migrations::run_migrations, open_connection};
-use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::crud::{RecordLearningParams, record_learning};
 use crate::models::{Confidence, Learning, LearningOutcome};
 
 fn setup_db() -> (TempDir, Connection) {
@@ -140,10 +140,12 @@ fn test_recall_with_outcome_filter() {
     let result = recall_learnings(&conn, params).unwrap();
 
     assert_eq!(result.count, 1);
-    assert!(result
-        .learnings
-        .iter()
-        .all(|l| l.outcome == LearningOutcome::Failure));
+    assert!(
+        result
+            .learnings
+            .iter()
+            .all(|l| l.outcome == LearningOutcome::Failure)
+    );
 }
 
 #[test]

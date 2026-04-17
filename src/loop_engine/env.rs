@@ -355,7 +355,7 @@ pub fn resolve_paths(
                 .unwrap_or_default()
                 .to_string_lossy();
             let prompt_name = format!("{}-prompt.md", stem);
-            
+
             prd_absolute
                 .parent()
                 .unwrap_or(&prd_absolute)
@@ -518,10 +518,12 @@ mod tests {
 
         let resolved = resolve_paths(&prd, Some(&prompt), tmp.path(), None).expect("resolve paths");
         assert!(resolved.prompt_file.is_absolute());
-        assert!(resolved
-            .prompt_file
-            .to_string_lossy()
-            .contains("custom-prompt.md"),);
+        assert!(
+            resolved
+                .prompt_file
+                .to_string_lossy()
+                .contains("custom-prompt.md"),
+        );
     }
 
     #[test]
@@ -545,10 +547,12 @@ mod tests {
         fs::write(&prd, "{}").expect("write prd");
 
         let resolved = resolve_paths(&prd, None, tmp.path(), None).expect("resolve paths");
-        assert!(resolved
-            .progress_file
-            .to_string_lossy()
-            .contains("progress.txt"),);
+        assert!(
+            resolved
+                .progress_file
+                .to_string_lossy()
+                .contains("progress.txt"),
+        );
     }
 
     #[test]
@@ -584,14 +588,18 @@ mod tests {
             no_prefix.progress_file, with_prefix.progress_file,
             "Different prefix should yield different progress files"
         );
-        assert!(no_prefix
-            .progress_file
-            .to_string_lossy()
-            .ends_with("progress.txt"));
-        assert!(with_prefix
-            .progress_file
-            .to_string_lossy()
-            .ends_with("progress-ABC.txt"));
+        assert!(
+            no_prefix
+                .progress_file
+                .to_string_lossy()
+                .ends_with("progress.txt")
+        );
+        assert!(
+            with_prefix
+                .progress_file
+                .to_string_lossy()
+                .ends_with("progress-ABC.txt")
+        );
     }
 
     #[test]

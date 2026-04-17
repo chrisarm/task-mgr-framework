@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use crate::db::{create_schema, open_connection};
-use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::crud::{RecordLearningParams, record_learning};
 use crate::models::{Confidence, LearningOutcome};
 
 use super::fts5::{escape_fts5_query, is_fts5_available};

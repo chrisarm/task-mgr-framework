@@ -5,13 +5,13 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::TaskMgrResult;
 use crate::cli::LearningOutcome as CliOutcome;
 use crate::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
 use crate::learnings::{
-    recall_learnings_with_backend, CompositeBackend, RecallParams as LibRecallParams, RecallResult,
+    CompositeBackend, RecallParams as LibRecallParams, RecallResult, recall_learnings_with_backend,
 };
 use crate::models::LearningOutcome;
-use crate::TaskMgrResult;
 
 /// Parameters for the recall command from CLI.
 #[derive(Debug, Clone, Default)]
@@ -259,9 +259,10 @@ pub fn format_verbose(result: &RecallCmdResult) -> String {
             }
 
             if let Some(ref outcome) = result.outcome_filter
-                && learning.outcome == *outcome {
-                    match_reasons.push(format!("outcome is {}", outcome));
-                }
+                && learning.outcome == *outcome
+            {
+                match_reasons.push(format!("outcome is {}", outcome));
+            }
 
             if result.for_task.is_some() {
                 if let Some(ref files) = learning.applies_to_files {
@@ -294,7 +295,7 @@ pub fn format_verbose(result: &RecallCmdResult) -> String {
 mod tests {
     use super::*;
     use crate::db::{create_schema, migrations::run_migrations, open_connection};
-    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::learnings::{RecordLearningParams, record_learning};
     use crate::models::Confidence;
     use tempfile::TempDir;
 

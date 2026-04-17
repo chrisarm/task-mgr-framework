@@ -104,10 +104,12 @@ fn test_detects_active_run_without_end() {
     let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.active_runs, 1);
-    assert!(result
-        .issues
-        .iter()
-        .any(|i| i.issue_type == IssueType::ActiveRunWithoutEnd && i.entity_id == "run-orphan"));
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::ActiveRunWithoutEnd && i.entity_id == "run-orphan")
+    );
 }
 
 #[test]
@@ -205,10 +207,12 @@ fn test_auto_fix_aborts_active_run() {
 
     let result = doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
-    assert!(result
-        .fixed
-        .iter()
-        .any(|f| f.entity_id == "run-stuck" && f.issue_type == IssueType::ActiveRunWithoutEnd));
+    assert!(
+        result
+            .fixed
+            .iter()
+            .any(|f| f.entity_id == "run-stuck" && f.issue_type == IssueType::ActiveRunWithoutEnd)
+    );
 
     // Verify run was aborted
     let status: String = conn
@@ -244,10 +248,12 @@ fn test_auto_fix_deletes_orphaned_relationship() {
 
     let result = doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
-    assert!(result
-        .fixed
-        .iter()
-        .any(|f| f.issue_type == IssueType::OrphanedRelationship));
+    assert!(
+        result
+            .fixed
+            .iter()
+            .any(|f| f.issue_type == IssueType::OrphanedRelationship)
+    );
 
     // Verify relationship was deleted
     let count: i32 = conn
@@ -807,10 +813,12 @@ fn test_reconcile_git_detects_completed_task() {
     let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.reconciled, 1);
-    assert!(result
-        .issues
-        .iter()
-        .any(|i| { i.issue_type == IssueType::GitReconciliation && i.entity_id == "FEAT-001" }));
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|i| { i.issue_type == IssueType::GitReconciliation && i.entity_id == "FEAT-001" })
+    );
 }
 
 #[test]
@@ -849,10 +857,12 @@ fn test_reconcile_git_auto_fix_marks_done() {
 
     assert_eq!(result.summary.reconciled, 1);
     assert_eq!(result.summary.total_fixed, 1);
-    assert!(result
-        .fixed
-        .iter()
-        .any(|f| { f.entity_id == "FEAT-001" && f.issue_type == IssueType::GitReconciliation }));
+    assert!(
+        result
+            .fixed
+            .iter()
+            .any(|f| { f.entity_id == "FEAT-001" && f.issue_type == IssueType::GitReconciliation })
+    );
 
     // Verify task was marked done
     let status: String = conn

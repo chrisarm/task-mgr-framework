@@ -95,8 +95,9 @@ pub fn write_default_model(db_dir: &Path, model: Option<&str>) -> std::io::Resul
     }
 
     let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s)
-            .unwrap_or_else(|_| serde_json::json!({ "version": 1 })),
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({ "version": 1 }))
+        }
         _ => serde_json::json!({ "version": 1 }),
     };
     let obj = value.as_object_mut().ok_or_else(|| {
@@ -107,7 +108,10 @@ pub fn write_default_model(db_dir: &Path, model: Option<&str>) -> std::io::Resul
     })?;
     match model {
         Some(m) => {
-            obj.insert("defaultModel".to_string(), serde_json::Value::String(m.to_string()));
+            obj.insert(
+                "defaultModel".to_string(),
+                serde_json::Value::String(m.to_string()),
+            );
         }
         None => {
             obj.remove("defaultModel");
@@ -275,7 +279,10 @@ mod tests {
         .unwrap();
         write_default_model(dir.path(), Some(HAIKU_MODEL)).unwrap();
         let raw = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        assert!(raw.contains("futureField"), "unknown field must survive the write");
+        assert!(
+            raw.contains("futureField"),
+            "unknown field must survive the write"
+        );
         assert!(raw.contains("nested"));
         assert!(raw.contains("Bash(docker:*)"));
         assert!(raw.contains(HAIKU_MODEL));

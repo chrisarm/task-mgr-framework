@@ -9,8 +9,8 @@
 // Allow deprecated cargo_bin function - the macro alternative requires more boilerplate
 #![allow(deprecated)]
 
-use assert_cmd::cargo::cargo_bin;
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
@@ -156,10 +156,7 @@ fn test_next_json_omits_null_model_fields() {
     );
 
     // PM-001 has model and difficulty but no escalationNote
-    assert_eq!(
-        task.get("model").and_then(|v| v.as_str()),
-        Some(OPUS_MODEL),
-    );
+    assert_eq!(task.get("model").and_then(|v| v.as_str()), Some(OPUS_MODEL),);
     assert_eq!(
         task.get("difficulty").and_then(|v| v.as_str()),
         Some("high"),

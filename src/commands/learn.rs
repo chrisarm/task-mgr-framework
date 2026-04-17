@@ -7,11 +7,11 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::TaskMgrResult;
 use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::learnings::{LearningWriter, RecordLearningParams, RecordLearningResult};
 use crate::models::{Confidence, LearningOutcome};
-use crate::TaskMgrResult;
 
 /// Parameters for the learn command.
 #[derive(Debug, Clone)]

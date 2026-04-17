@@ -21,8 +21,8 @@ mod tests;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Learning, LearningOutcome};
 use crate::TaskMgrResult;
+use crate::models::{Learning, LearningOutcome};
 
 use super::bandit;
 use super::retrieval::patterns::resolve_task_context;
@@ -190,13 +190,12 @@ fn load_ucb_fallback(
             WHERE retired_at IS NULL
             "#,
         )?;
-        
-        stmt
-            .query_map([], |row| {
-                Learning::try_from(row)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+
+        stmt.query_map([], |row| {
+            Learning::try_from(row)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     } else {
         let placeholders: Vec<String> =
             (1..=exclude_ids.len()).map(|i| format!("?{}", i)).collect();
@@ -217,13 +216,12 @@ fn load_ucb_fallback(
             .map(|id| id as &dyn rusqlite::ToSql)
             .collect();
         let mut stmt = conn.prepare(&sql)?;
-        
-        stmt
-            .query_map(params.as_slice(), |row| {
-                Learning::try_from(row)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+
+        stmt.query_map(params.as_slice(), |row| {
+            Learning::try_from(row)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
     };
 
     // Rank by UCB

@@ -19,18 +19,17 @@ pub mod retrieval;
 pub(crate) mod test_helpers;
 
 pub use bandit::{
-    calculate_ucb_score, get_total_window_shows, get_window_stats, rank_learnings_by_ucb,
-    record_learning_applied, record_learning_shown, refresh_sliding_window, WindowStats,
-    WINDOW_SIZE,
+    WINDOW_SIZE, WindowStats, calculate_ucb_score, get_total_window_shows, get_window_stats,
+    rank_learnings_by_ucb, record_learning_applied, record_learning_shown, refresh_sliding_window,
 };
 pub use crud::{
-    delete_learning, edit_learning, format_delete_text, format_edit_text, get_learning,
-    get_learning_tags, record_learning, DeleteLearningResult, EditLearningParams,
-    EditLearningResult, LearningWriter, RecordLearningParams, RecordLearningResult,
+    DeleteLearningResult, EditLearningParams, EditLearningResult, LearningWriter,
+    RecordLearningParams, RecordLearningResult, delete_learning, edit_learning, format_delete_text,
+    format_edit_text, get_learning, get_learning_tags, record_learning,
 };
 pub use recall::{
-    format_text as format_recall_text, recall_learnings, recall_learnings_with_backend,
-    RecallParams, RecallResult,
+    RecallParams, RecallResult, format_text as format_recall_text, recall_learnings,
+    recall_learnings_with_backend,
 };
 pub use retrieval::{
     CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery,

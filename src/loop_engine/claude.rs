@@ -10,13 +10,13 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::watchdog::{exit_code_from_status, watchdog_loop, TimeoutConfig};
+use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 
 /// Maximum bytes for the formatted conversation in stream-json mode.
 /// Byte-based for O(1) checking; limits are approximate and mostly-ASCII content means bytes ≈ chars.
@@ -86,6 +86,7 @@ pub(crate) fn spawn_claude(
     stream_json: bool,
     permission_mode: &PermissionMode,
     effort: Option<&str>,
+    disallowed_tools: Option<&str>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -123,16 +124,24 @@ pub(crate) fn spawn_claude(
             }
         }
     }
+    if let Some(tools) = disallowed_tools
+        && !tools.trim().is_empty()
+    {
+        args.push("--disallowedTools".to_string());
+        args.push(tools.to_string());
+    }
     if let Some(m) = model
-        && !m.trim().is_empty() {
-            args.push("--model".to_string());
-            args.push(m.to_string());
-        }
+        && !m.trim().is_empty()
+    {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
     if let Some(e) = effort
-        && !e.trim().is_empty() {
-            args.push("--effort".to_string());
-            args.push(e.to_string());
-        }
+        && !e.trim().is_empty()
+    {
+        args.push("--effort".to_string());
+        args.push(e.to_string());
+    }
     args.push("-p".to_string());
     // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
     // limits when prompts are large (e.g. curate dedup with many learnings).
@@ -325,9 +334,10 @@ fn extract_error_text(val: &serde_json::Value) -> Option<String> {
         return None;
     }
     if let Some(s) = error.as_str()
-        && !s.is_empty() {
-            return Some(s.to_string());
-        }
+        && !s.is_empty()
+    {
+        return Some(s.to_string());
+    }
     error
         .get("message")
         .and_then(|m| m.as_str())
@@ -348,9 +358,10 @@ fn tee_assistant_text(val: &serde_json::Value) {
     if let Some(content) = assistant_content(val) {
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                && let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    eprintln!("{}", text);
-                }
+                && let Some(text) = block.get("text").and_then(|t| t.as_str())
+            {
+                eprintln!("{}", text);
+            }
         }
     }
 }
@@ -610,6 +621,43 @@ fn extract_binary(command: &str) -> String {
     sanitized
 }
 
+/// Check whether a file path targets a PRD task JSON file.
+///
+/// Matches paths containing `.task-mgr/tasks/` that end with `.json`.
+fn is_tasks_json_path(path: &str) -> bool {
+    path.ends_with(".json")
+        && (path.starts_with(".task-mgr/tasks/") || path.contains("/.task-mgr/tasks/"))
+}
+
+/// Extract Edit/Write denials on `.task-mgr/tasks/*.json` from permission_denials.
+///
+/// Returns `(tool_name, file_path)` pairs for denied Edit or Write calls that
+/// targeted PRD task files. Used to emit targeted hints in the loop engine
+/// (prefer `task-mgr add --stdin` / `<task-status>` tags instead of direct edits).
+///
+/// Non-matching denials (Bash, other paths) are silently skipped.
+pub(crate) fn extract_tasks_json_denials(denials: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for denial in denials {
+        let tool_name = denial
+            .get("tool_name")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if tool_name != "Edit" && tool_name != "Write" {
+            continue;
+        }
+        let file_path = denial
+            .get("tool_input")
+            .and_then(|i| i.get("file_path"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        if is_tasks_json_path(file_path) {
+            result.push((tool_name.to_string(), file_path.to_string()));
+        }
+    }
+    result
+}
+
 /// Maximum size in bytes for a Claude session file to be considered a ghost
 /// (auto-mode classifier artifact with no real conversation).
 const GHOST_SESSION_MAX_BYTES: u64 = 300;
@@ -646,7 +694,7 @@ mod tests {
     use super::*;
     use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
-    use crate::loop_engine::watchdog::{exit_code_from_status, TimeoutConfig};
+    use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status};
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -704,6 +752,7 @@ mod tests {
             None,
             stream_json,
             permission_mode,
+            None,
             None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
@@ -970,6 +1019,7 @@ mod tests {
             false,
             &PermissionMode::Dangerous,
             None,
+            None,
         );
         let elapsed = start.elapsed();
 
@@ -1042,6 +1092,7 @@ mod tests {
             None,
             false,
             &PermissionMode::Dangerous,
+            None,
             None,
         );
 
@@ -1445,6 +1496,7 @@ mod tests {
             None,
             true,
             &PermissionMode::Dangerous,
+            None,
             None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
@@ -1994,13 +2046,7 @@ mod tests {
     /// AC: stream_json=false with a model — --print, --no-session-persistence, and --model all present.
     #[test]
     fn test_stream_json_false_with_model_has_print_and_model() {
-        let result = spawn_claude_echo(
-            "prompt",
-            None,
-            Some(OPUS_MODEL),
-            false,
-            &scoped_coding(),
-        );
+        let result = spawn_claude_echo("prompt", None, Some(OPUS_MODEL), false, &scoped_coding());
         let output = result.unwrap().output;
         assert!(
             output.contains("--print"),
@@ -2046,6 +2092,7 @@ mod tests {
             true,
             &scoped_coding(),
             None,
+            None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
@@ -2070,10 +2117,7 @@ mod tests {
         assert!(pos_model < pos_prompt_flag, "--model must appear before -p");
 
         // model value must be present
-        assert!(
-            output.contains(SONNET_MODEL),
-            "model value must be in args"
-        );
+        assert!(output.contains(SONNET_MODEL), "model value must be in args");
 
         // --no-session-persistence present
         assert!(
@@ -2125,6 +2169,7 @@ mod tests {
                 stream_json,
                 &PermissionMode::Dangerous,
                 None,
+                None,
             );
             unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script_path);
@@ -2142,6 +2187,7 @@ mod tests {
                 None,
                 stream_json,
                 &PermissionMode::Dangerous,
+                None,
                 None,
             );
             unsafe { std::env::remove_var("CLAUDE_BINARY") };
@@ -2255,6 +2301,7 @@ mod tests {
             None,
             stream_json,
             &PermissionMode::Dangerous,
+            None,
             None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
@@ -2641,5 +2688,112 @@ mod tests {
     #[test]
     fn test_extract_binary_env_multiple_vars() {
         assert_eq!(extract_binary("env FOO=bar BAZ=qux npm install"), "npm");
+    }
+
+    // --- extract_tasks_json_denials ---
+
+    #[test]
+    fn test_extract_tasks_json_denials_edit_match() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Edit",
+            "tool_use_id": "t1",
+            "tool_input": {
+                "file_path": ".task-mgr/tasks/my-prd.json",
+                "old_string": "foo",
+                "new_string": "bar"
+            }
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert_eq!(
+            result,
+            vec![(
+                "Edit".to_string(),
+                ".task-mgr/tasks/my-prd.json".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_write_match() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Write",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": ".task-mgr/tasks/new.json", "content": "{}"}
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert_eq!(
+            result,
+            vec![("Write".to_string(), ".task-mgr/tasks/new.json".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_non_tasks_path_skipped() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Edit",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": "src/commands/add.rs", "old_string": "a", "new_string": "b"}
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert!(result.is_empty(), "src/**/*.rs edits must NOT be flagged");
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_bash_skipped() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Bash",
+            "tool_use_id": "t1",
+            "tool_input": {"command": "cat .task-mgr/tasks/foo.json"}
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_read_skipped() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Read",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": ".task-mgr/tasks/foo.json"}
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert!(result.is_empty(), "Read denials must not produce hints");
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_nested_path() {
+        let denials = vec![serde_json::json!({
+            "tool_name": "Write",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": "/some/project/.task-mgr/tasks/prd.json", "content": "{}"}
+        })];
+        let result = extract_tasks_json_denials(&denials);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_tasks_json_denials_empty() {
+        let result = extract_tasks_json_denials(&[]);
+        assert!(result.is_empty());
+    }
+
+    // --- is_tasks_json_path ---
+
+    #[test]
+    fn test_is_tasks_json_path_relative() {
+        assert!(is_tasks_json_path(".task-mgr/tasks/foo.json"));
+        assert!(is_tasks_json_path(".task-mgr/tasks/my-prd.json"));
+    }
+
+    #[test]
+    fn test_is_tasks_json_path_non_json_not_matched() {
+        assert!(!is_tasks_json_path(".task-mgr/tasks/foo.rs"));
+        assert!(!is_tasks_json_path(".task-mgr/tasks/foo.txt"));
+    }
+
+    #[test]
+    fn test_is_tasks_json_path_src_path_not_matched() {
+        assert!(!is_tasks_json_path("src/commands/add.rs"));
+        assert!(!is_tasks_json_path("src/loop_engine/config.rs"));
     }
 }

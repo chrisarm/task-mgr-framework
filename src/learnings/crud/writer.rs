@@ -6,8 +6,8 @@ use rusqlite::Connection;
 
 use super::create::record_learning;
 use super::types::{RecordLearningParams, RecordLearningResult};
-use crate::learnings::embeddings::try_embed_learnings_batch;
 use crate::TaskMgrResult;
+use crate::learnings::embeddings::try_embed_learnings_batch;
 
 struct PendingEmbed {
     learning_id: i64,
@@ -90,7 +90,9 @@ impl Drop for LearningWriter<'_> {
     fn drop(&mut self) {
         let n = self.pending.len();
         if n > 0 {
-            eprintln!("Warning: LearningWriter dropped with {n} un-flushed pending embedding(s). Call .flush() before dropping.");
+            eprintln!(
+                "Warning: LearningWriter dropped with {n} un-flushed pending embedding(s). Call .flush() before dropping."
+            );
         }
     }
 }

@@ -490,6 +490,49 @@ MATCHING BEHAVIOR:
         task_id: String,
     },
 
+    /// Add a single task from JSON (stdin or --json).
+    ///
+    /// Ranks the new task ahead of the current `task-mgr next` pick by default
+    /// (priority = top_task.priority - 1). Use --priority to override, or
+    /// include `"priority": N` in the JSON itself.
+    #[command(after_help = "\
+EXAMPLES:
+    # Add from a pipe (preferred for loop agents — no shell-quoting issues)
+    echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"]}' \\
+      | task-mgr add --stdin
+
+    # Add from an inline string
+    task-mgr add --json '{\"id\":\"REFACTOR-001\",\"title\":\"Split module\"}'
+
+    # Override priority explicitly
+    task-mgr add --priority 10 --json '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race\"}'
+
+PRIORITY:
+    When --priority is absent and the JSON omits \"priority\", the command
+    runs the same scoring as `task-mgr next`, reads the top task's priority,
+    and assigns (top.priority - 1). Empty queue → 0.
+")]
+    Add {
+        /// Inline JSON string (mutually exclusive with --stdin)
+        #[arg(long, conflicts_with = "stdin")]
+        json: Option<String>,
+
+        /// Read JSON from stdin
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
+
+        /// Override the auto-computed priority
+        #[arg(long)]
+        priority: Option<i32>,
+
+        /// Existing task ID(s) that should depend on the new task. For each id,
+        /// inserts a reverse `dependsOn` relationship (existing task now depends
+        /// on the new one) and appends the new id to that task's `dependsOn`
+        /// array in the PRD JSON. Repeat the flag for multiple targets.
+        #[arg(long = "depended-on-by")]
+        depended_on_by: Vec<String>,
+    },
+
     /// Reset task(s) to todo status for re-running
     Reset {
         /// Task ID(s) to reset (omit for --all)

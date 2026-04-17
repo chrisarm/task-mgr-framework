@@ -2,59 +2,70 @@
 //!
 //! This module contains the data structures used to deserialize PRD JSON files.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// JSON structure for a user story in the PRD.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is implemented so `task-mgr add` can round-trip a task back
+/// into the PRD JSON on disk. `skip_serializing_if` attributes mirror the
+/// `#[serde(default)]` attributes on the `Deserialize` side so a task that
+/// comes in minimal goes out minimal.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrdUserStory {
     pub id: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub priority: i32,
     pub passes: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance_criteria: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_scope: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_review: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touches_files: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub synergy_with: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub batch_with: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts_with: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Task effort level ("low", "medium", "high").
     /// Canonical JSON key is `estimatedEffort`; `difficulty` is also accepted
     /// for older PRDs. The internal Rust name is kept as `difficulty` for
     /// historical reasons (DB column, Task struct field).
-    #[serde(default, rename = "estimatedEffort", alias = "difficulty")]
+    #[serde(
+        default,
+        rename = "estimatedEffort",
+        alias = "difficulty",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub difficulty: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_note: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_tests: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<i32>,
     /// Whether the loop must pause after this task for human review.
     /// Maps to `tasks.requires_human` (INTEGER DEFAULT 0).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_human: Option<bool>,
     /// Seconds to wait for human input before timing out (NULL = no timeout).
     /// Maps to `tasks.human_review_timeout` (INTEGER DEFAULT NULL).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_review_timeout: Option<u32>,
 }
 

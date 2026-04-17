@@ -5,8 +5,8 @@
 //! and `kill_process_group` for SIGTERM → grace → SIGKILL termination on Unix.
 
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::loop_engine::signals::SignalFlag;
@@ -132,10 +132,11 @@ pub(crate) fn watchdog_loop(
     while !stop.load(Ordering::Acquire) {
         // Check signal
         if let Some(flag) = signal_flag
-            && flag.is_signaled() {
-                kill_process_group(child_pid, stop, "Signal received");
-                return;
-            }
+            && flag.is_signaled()
+        {
+            kill_process_group(child_pid, stop, "Signal received");
+            return;
+        }
 
         // Check timeout
         if let (Some(dl), Some(tc)) = (&mut deadline, timeout) {
@@ -313,6 +314,7 @@ mod tests {
             false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
             None,
+            None,
         );
         let elapsed = start.elapsed();
 
@@ -367,6 +369,7 @@ mod tests {
             Some(timeout),
             false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
+            None,
             None,
         );
         let elapsed = start.elapsed();

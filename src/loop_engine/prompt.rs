@@ -30,6 +30,7 @@ use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
 use crate::loop_engine::prompt_sections::synergy::{
     build_synergy_section, resolve_synergy_cluster_model,
 };
+use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 
 /// Byte budget for enriched task context in the prompt.
@@ -184,6 +185,9 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let escalation_section =
         build_escalation_section(params.base_prompt_path, resolved_model.as_deref());
 
+    // Critical: Task lifecycle rules — non-negotiable, always injected
+    let task_ops = task_ops_section().to_string();
+
     // Critical: Reorder instruction
     let reorder_instr_section =
         "If you have a strong reason to work on a different eligible task, \
@@ -194,6 +198,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     let base_prompt_section = build_base_prompt_section(params.base_prompt_path);
 
     let critical_total = task_section.len()
+        + task_ops.len()
         + completion_section.len()
         + escalation_section.len()
         + reorder_instr_section.len()
@@ -348,6 +353,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     prompt.push_str(&synergy_section);
     prompt.push_str(&sibling_section);
     prompt.push_str(&task_section);
+    prompt.push_str(&task_ops);
     prompt.push_str(&learnings_section);
     prompt.push_str(&completion_section);
     prompt.push_str(&escalation_section);
@@ -3231,5 +3237,74 @@ pub enum ApiError {
             result.prompt.contains("## Model Escalation Policy"),
             "Escalation header must be present"
         );
+    }
+
+    // --- Integration test: task_ops section present and positioned above learnings ---
+
+    #[test]
+    fn test_iteration_prompt_includes_task_ops_section() {
+        let (temp_dir, conn) = setup_test_db();
+
+        // Insert a learning so the learnings section appears in the prompt
+        insert_test_learning(&conn, "A test learning about something useful");
+
+        insert_task(&conn, "OPS-001", "Dummy task for task_ops test", "todo", 5);
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        let p = &result.prompt;
+
+        // Section must be present
+        assert!(
+            p.contains("MUST NOT edit"),
+            "task_ops section must contain 'MUST NOT edit'"
+        );
+        assert!(
+            p.contains("task-mgr add --stdin"),
+            "task_ops section must contain 'task-mgr add --stdin'"
+        );
+        assert!(
+            p.contains("<task-status>"),
+            "task_ops section must contain '<task-status>'"
+        );
+        assert!(
+            p.contains("tasks/*.json"),
+            "task_ops section must reference 'tasks/*.json'"
+        );
+
+        // Section must NOT be in dropped_sections — it's critical, not trimmable
+        assert!(
+            !result.dropped_sections.contains(&"Task Ops".to_string()),
+            "task_ops must not appear in dropped_sections — it is a critical section"
+        );
+
+        // Section must be positioned ABOVE the learnings section
+        let task_ops_pos = p
+            .find("MUST NOT edit")
+            .expect("task_ops content must be present");
+
+        // task_ops is assembled after ## Current Task and before ## Relevant Learnings
+        let task_section_pos = p.find("## Current Task").expect("Task section present");
+        assert!(
+            task_section_pos < task_ops_pos,
+            "task_ops (pos={}) should come AFTER task section (pos={})",
+            task_ops_pos,
+            task_section_pos
+        );
+
+        // If learnings section is present, task_ops must come before it
+        if let Some(learnings_pos) = p.find("## Relevant Learnings") {
+            assert!(
+                task_ops_pos < learnings_pos,
+                "task_ops (pos={}) must be positioned ABOVE learnings (pos={})",
+                task_ops_pos,
+                learnings_pos
+            );
+        }
     }
 }

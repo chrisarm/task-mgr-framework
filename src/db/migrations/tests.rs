@@ -265,7 +265,7 @@ fn test_migration_creates_fts5_triggers() {
 
 #[test]
 fn test_fts5_migration_populates_existing_learnings() {
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -567,7 +567,7 @@ fn test_migration_v8_adds_tags_text_column() {
 #[test]
 fn test_migration_v8_populates_tags_text_from_existing_tags() {
     // Happy path: tags_text column populated from existing learning_tags (migration path v7→v8)
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -621,7 +621,7 @@ fn test_migration_v8_populates_tags_text_from_existing_tags() {
 #[test]
 fn test_migration_v8_learning_with_no_tags_has_empty_tags_text() {
     // Edge case: learning with no tags has empty tags_text (not NULL, not garbage)
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -668,7 +668,7 @@ fn test_migration_v8_learning_with_no_tags_has_empty_tags_text() {
 fn test_migration_v8_fts5_searches_tags_text() {
     // Happy path: after migration, FTS5 search for 'chrono' finds learning tagged 'chrono-date-handling'
     // FTS5 ascii tokenizer splits on '-': 'chrono-date-handling' → tokens 'chrono', 'date', 'handling'
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -709,7 +709,7 @@ fn test_migration_v8_fts5_searches_tags_text() {
 fn test_migration_v8_tag_add_updates_tags_text_and_fts5() {
     // Edge case: inserting a new row into learning_tags triggers tags_text update
     use crate::learnings::crud::{
-        edit_learning, record_learning, EditLearningParams, RecordLearningParams,
+        EditLearningParams, RecordLearningParams, edit_learning, record_learning,
     };
     use crate::models::{Confidence, LearningOutcome};
 
@@ -764,7 +764,7 @@ fn test_migration_v8_tag_add_updates_tags_text_and_fts5() {
 fn test_migration_v8_tag_remove_updates_tags_text_and_fts5() {
     // Edge case: deleting a row from learning_tags triggers tags_text update
     use crate::learnings::crud::{
-        edit_learning, record_learning, EditLearningParams, RecordLearningParams,
+        EditLearningParams, RecordLearningParams, edit_learning, record_learning,
     };
     use crate::models::{Confidence, LearningOutcome};
 
@@ -819,7 +819,7 @@ fn test_migration_v8_tag_remove_updates_tags_text_and_fts5() {
 fn test_migration_v8_workflow_tag_found_when_title_content_lack_keyword() {
     // Known-bad discriminator: FTS5 search for 'workflow' returns tag-matched result
     // even when title and content don't contain the word 'workflow'
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -881,7 +881,7 @@ fn test_migration_v8_pto_token_finds_hyphenated_tag() {
     // AC6: searching 'pto' finds learning tagged 'pto-workflow-ux-fixes-v2'.
     // FTS5 ascii tokenizer splits hyphens: 'pto-workflow-ux-fixes-v2' → tokens
     // 'pto', 'workflow', 'ux', 'fixes', 'v2'.
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -1021,7 +1021,7 @@ fn test_migration_v8_down_reverts_to_v7() {
 fn test_migration_v8_preserves_existing_title_content_search() {
     // Invariant: existing FTS5 queries on title/content return same results after v8 migration.
     // Pre-v8 data must not be lost when FTS5 table is rebuilt with 3 columns.
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -1079,7 +1079,7 @@ fn test_migration_v8_preserves_existing_title_content_search() {
 #[test]
 fn test_migration_v8_multiple_tags_stored_space_separated() {
     // Edge case: learning with multiple tags has space-separated tags_text.
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();
@@ -1364,7 +1364,7 @@ fn test_migration_v9_down_restores_singleton_constraint() {
 #[test]
 fn test_migration_v8_fts5_rebuild_succeeds() {
     // Edge case from TEST-INIT-004: FTS5 rebuild command must succeed after migration.
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let (_temp_dir, mut conn) = setup_db();

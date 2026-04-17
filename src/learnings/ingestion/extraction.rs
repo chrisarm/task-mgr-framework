@@ -3,9 +3,9 @@
 //! Builds a prompt that instructs Claude to extract structured learnings from
 //! iteration output, and parses the JSON array response.
 
+use crate::TaskMgrResult;
 use crate::learnings::crud::RecordLearningParams;
 use crate::models::{Confidence, LearningOutcome};
-use crate::TaskMgrResult;
 
 /// Maximum chars of output to include in the extraction prompt.
 /// Prevents context overflow for large outputs.

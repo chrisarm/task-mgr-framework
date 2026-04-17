@@ -1,10 +1,13 @@
 //! PRD metadata and pass reconciliation: read PRD state from DB, update JSON files,
 //! and synchronise task completion status between the PRD JSON and the task database.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::commands::complete as complete_cmd;
 use crate::commands::dependency_checker;
 use crate::db::prefix::prefix_and;
@@ -12,7 +15,29 @@ use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::model::SONNET_MODEL;
 use crate::loop_engine::output_parsing::strip_task_prefix;
-use crate::TaskMgrResult;
+
+/// Build a per-writer tmp path next to `prd_path` for atomic rename.
+///
+/// The name embeds pid + a process-local counter + wall-clock nanos so two
+/// concurrent writers (e.g. `<task-status>` dispatcher vs.
+/// `mutate_prd_from_feedback`) don't race on a shared `.json.tmp` name and
+/// silently clobber each other's pending write. Any leftover tmp file after
+/// a crash is still obvious (`.<basename>.<pid>-<n>-<nanos>.tmp`).
+fn unique_tmp_path(prd_path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let parent = prd_path.parent().unwrap_or_else(|| Path::new("."));
+    let base = prd_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "prd.json".to_string());
+    parent.join(format!(".{base}.{pid}-{n}-{nanos}.tmp"))
+}
 
 /// PRD metadata read from the database.
 pub(crate) struct PrdMetadata {
@@ -139,18 +164,22 @@ pub(crate) fn update_prd_task_passes(
         });
     }
 
-    // Write back atomically
-    let tmp_path = prd_path.with_extension("json.tmp");
+    // Write back atomically. The tmp name is unique per writer so two
+    // concurrent PRD writers can't clobber each other's rename target.
+    let tmp_path = unique_tmp_path(prd_path);
     let json = serde_json::to_string_pretty(&prd)?;
     fs::write(&tmp_path, &json).map_err(|e| crate::TaskMgrError::IoErrorWithContext {
         file_path: tmp_path.display().to_string(),
         operation: "writing temp PRD file".to_string(),
         source: e,
     })?;
-    fs::rename(&tmp_path, prd_path).map_err(|e| crate::TaskMgrError::IoErrorWithContext {
-        file_path: prd_path.display().to_string(),
-        operation: "renaming temp PRD file".to_string(),
-        source: e,
+    fs::rename(&tmp_path, prd_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        crate::TaskMgrError::IoErrorWithContext {
+            file_path: prd_path.display().to_string(),
+            operation: "renaming temp PRD file".to_string(),
+            source: e,
+        }
     })?;
 
     Ok(())
@@ -191,8 +220,9 @@ pub(crate) fn reconcile_passes_with_db(
 
     // Get all todo/in_progress task IDs from the DB, scoped to this PRD's prefix.
     let (rpdb_pfx_clause, rpdb_pfx_param) = prefix_and(task_prefix);
-    let rpdb_sql =
-        format!("SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND archived_at IS NULL {rpdb_pfx_clause}");
+    let rpdb_sql = format!(
+        "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND archived_at IS NULL {rpdb_pfx_clause}"
+    );
     let mut stmt = match conn.prepare(&rpdb_sql) {
         Ok(s) => s,
         Err(_) => return,
@@ -635,6 +665,7 @@ pub(crate) fn mutate_prd_from_feedback(
         false,
         permission_mode,
         None,
+        None,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -686,8 +717,9 @@ pub(crate) fn mutate_prd_from_feedback(
         }
     };
 
-    // 8. Write updated PRD atomically (temp file + rename)
-    let tmp_path = prd_path.with_extension("json.tmp");
+    // 8. Write updated PRD atomically (temp file + rename). Unique tmp name
+    // so two concurrent PRD writers don't race on a shared rename target.
+    let tmp_path = unique_tmp_path(prd_path);
     let updated_json = match serde_json::to_string_pretty(&updated_prd) {
         Ok(j) => j,
         Err(e) => {
@@ -704,6 +736,7 @@ pub(crate) fn mutate_prd_from_feedback(
         return;
     }
     if let Err(e) = std::fs::rename(&tmp_path, prd_path) {
+        let _ = std::fs::remove_file(&tmp_path);
         eprintln!(
             "Warning: task mutation failed (rename to {}): {}",
             prd_path.display(),
@@ -1162,7 +1195,7 @@ mod tests {
 
     // Use the shared CLAUDE_BINARY_MUTEX from test_utils so that these tests
     // serialize against claude.rs tests that also set CLAUDE_BINARY.
-    use crate::loop_engine::test_utils::{EnvGuard, CLAUDE_BINARY_MUTEX};
+    use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard};
 
     /// Write a shell script to a predictable temp path that drains stdin and
     /// prints `json_output`. Caller must hold `CLAUDE_BINARY_MUTEX` for the
@@ -1244,7 +1277,6 @@ mod tests {
     fn test_atomic_write_leaves_no_tmp_file() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let prd_path = temp_dir.path().join("prd.json");
-        let tmp_path = prd_path.with_extension("json.tmp");
 
         std::fs::write(
             &prd_path,
@@ -1254,13 +1286,33 @@ mod tests {
 
         update_prd_task_passes(&prd_path, "X-1", true, None).unwrap();
 
+        // No tmp file of either the legacy shape (`prd.json.tmp`) or the
+        // per-writer shape (`.prd.json.<pid>-<n>-<nanos>.tmp`) may remain.
+        let leftovers: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
         assert!(
-            !tmp_path.exists(),
-            ".json.tmp must not remain after atomic write completes"
+            leftovers.is_empty(),
+            "no .tmp files may remain after atomic write, found: {leftovers:?}"
         );
         let content = std::fs::read_to_string(&prd_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["userStories"][0]["passes"], true);
+    }
+
+    #[test]
+    fn test_unique_tmp_path_distinct_per_call() {
+        let prd = Path::new("/tmp/tasks/prd.json");
+        let a = unique_tmp_path(prd);
+        let b = unique_tmp_path(prd);
+        assert_ne!(a, b, "successive calls must yield distinct tmp paths");
+        let a_name = a.file_name().unwrap().to_string_lossy();
+        assert!(a_name.starts_with(".prd.json."));
+        assert!(a_name.ends_with(".tmp"));
+        assert_eq!(a.parent(), Some(Path::new("/tmp/tasks")));
     }
 
     // ─── AC: DB re-sync — sync_mutations_to_db ─────────────────────────────────

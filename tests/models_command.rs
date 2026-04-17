@@ -7,8 +7,8 @@
 
 #![allow(deprecated)]
 
-use assert_cmd::cargo::cargo_bin;
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -59,7 +59,10 @@ fn list_offline_prints_built_in_models() {
         .stdout
         .clone();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains(OPUS_MODEL), "output should contain opus id:\n{s}");
+    assert!(
+        s.contains(OPUS_MODEL),
+        "output should contain opus id:\n{s}"
+    );
     assert!(s.contains(SONNET_MODEL));
     assert!(s.contains(HAIKU_MODEL));
     assert!(s.contains("Difficulty"), "effort table expected:\n{s}");

@@ -17,22 +17,22 @@ pub mod setup_output;
 mod tests;
 
 pub use output::{
-    format_doctor_verbose, format_text, DoctorResult, DoctorSummary, Fix, Issue, IssueType,
+    DoctorResult, DoctorSummary, Fix, Issue, IssueType, format_doctor_verbose, format_text,
 };
 pub use setup_checks::EXPECTED_SKILLS;
 pub use setup_fixes::{
     detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
     fix_install_skills, fix_patch_hook,
 };
-pub use setup_output::{format_setup_text, CheckContext, SetupAuditResult};
+pub use setup_output::{CheckContext, SetupAuditResult, format_setup_text};
 
 use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::commands::next::find_decay_warnings;
 use crate::models::RunStatus;
-use crate::TaskMgrResult;
 
 use checks::{
     find_active_runs_without_end, find_git_reconciliation_tasks, find_orphaned_relationships,
@@ -278,7 +278,7 @@ fn audit_setup_with_claude_dir(
     claude_dir: &Path,
     auto_fix: bool,
 ) -> SetupAuditResult {
-    use setup_checks::{default_registry, EXPECTED_SKILLS};
+    use setup_checks::{EXPECTED_SKILLS, default_registry};
     use setup_fixes::{
         detect_additional_tools, fix_generate_claude_md, fix_generate_project_config,
         fix_install_skills, fix_patch_hook,

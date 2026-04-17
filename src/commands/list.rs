@@ -6,10 +6,10 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::TaskMgrResult;
 use crate::cli::TaskStatusFilter;
 use crate::db::open_and_migrate as open_connection;
 use crate::models::Task;
-use crate::TaskMgrResult;
 
 /// Result of the list command.
 #[derive(Debug, Serialize)]
@@ -172,14 +172,15 @@ fn query_tasks(
 
     // Apply optional limit to archived records
     if let Some(Some(limit)) = include_archived
-        && limit > 0 {
-            let active_count = summaries.iter().filter(|t| !t.archived).count();
-            let archived_count = summaries.len() - active_count;
-            if archived_count > limit {
-                // Active tasks come first in the result; truncate excess archived tasks
-                summaries.truncate(active_count + limit);
-            }
+        && limit > 0
+    {
+        let active_count = summaries.iter().filter(|t| !t.archived).count();
+        let archived_count = summaries.len() - active_count;
+        if archived_count > limit {
+            // Active tasks come first in the result; truncate excess archived tasks
+            summaries.truncate(active_count + limit);
         }
+    }
 
     Ok(summaries)
 }

@@ -21,20 +21,23 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::commands::complete as complete_cmd;
 use crate::commands::decisions::find_option;
 use crate::commands::doctor::setup_checks::pre_check_loop_setup;
 use crate::commands::doctor::setup_output::SetupSeverity;
-use crate::commands::init::{generate_prefix, PrefixMode};
+use crate::commands::init::{PrefixMode, generate_prefix};
 use crate::commands::run as run_cmd;
+use crate::db::LockGuard;
 use crate::db::prefix::{prefix_and, validate_prefix};
 use crate::db::schema::key_decisions as key_decisions_db;
-use crate::db::LockGuard;
 use crate::error::TaskMgrError;
 use crate::loop_engine::branch;
 use crate::loop_engine::calibrate;
 use crate::loop_engine::claude;
-use crate::loop_engine::config::{self, IterationOutcome, LoopConfig, PermissionMode};
+use crate::loop_engine::config::{
+    self, IterationOutcome, LoopConfig, PermissionMode, TASKS_JSON_DISALLOWED_TOOLS,
+};
 use crate::loop_engine::crash::CrashTracker;
 use crate::loop_engine::deadline;
 use crate::loop_engine::detection;
@@ -55,14 +58,13 @@ use crate::loop_engine::prd_reconcile::{
 };
 use crate::loop_engine::progress;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
-use crate::loop_engine::signals::{self, handle_human_review, SignalFlag};
+use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status_queries::read_prd_hints;
 use crate::loop_engine::usage::{self, UsageCheckResult};
 use crate::loop_engine::watchdog;
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
-use crate::TaskMgrResult;
 
 /// Maximum consecutive reorder attempts before forcing algorithmic pick.
 const MAX_CONSECUTIVE_REORDERS: u32 = 2;
@@ -498,11 +500,7 @@ pub fn run_iteration(
     // Derive effort from task difficulty so we can show it in the header.
     // Apply any per-task override left by a prior PromptTooLong crash.
     let base_effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
-    let effort = ctx
-        .effort_overrides
-        .get(&task_id)
-        .copied()
-        .or(base_effort);
+    let effort = ctx.effort_overrides.get(&task_id).copied().or(base_effort);
     if effort != base_effort {
         eprintln!(
             "Effort override (prior prompt overflow): {} → {}",
@@ -536,6 +534,7 @@ pub fn run_iteration(
         true,
         params.permission_mode,
         effort,
+        Some(TASKS_JSON_DISALLOWED_TOOLS),
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
@@ -575,6 +574,25 @@ pub fn run_iteration(
                     cmd,
                 );
             }
+        }
+    }
+
+    // Step 6.1b: Targeted hints for Edit/Write denials on .task-mgr/tasks/*.json.
+    // These are denied by --disallowedTools to prevent the agent from corrupting PRD JSON.
+    // The agent should use `task-mgr add --stdin` or `<task-status>` tags instead.
+    let tasks_json_denials = claude::extract_tasks_json_denials(&claude_result.permission_denials);
+    for (tool, path) in &tasks_json_denials {
+        match tool.as_str() {
+            "Write" => eprintln!(
+                "\x1b[33m[hint]\x1b[0m Tool denied: {} on {} \u{2014} \
+                 use 'task-mgr init --from-json --append' to create new PRDs",
+                tool, path,
+            ),
+            _ => eprintln!(
+                "\x1b[33m[hint]\x1b[0m Tool denied: {} on {} \u{2014} \
+                 use 'task-mgr add --stdin' or <task-status> tag instead",
+                tool, path,
+            ),
         }
     }
 
@@ -1245,8 +1263,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // are pure reads. Users pin a default via `task-mgr init` or
     // `task-mgr models set-default`.
     let project_default_model =
-        crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
-            .default_model;
+        crate::loop_engine::project_config::read_project_config(&run_config.db_dir).default_model;
     let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
 
     // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
@@ -1275,32 +1292,29 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             .unwrap_or(0);
         let is_new_task_list = done_count == 0;
 
-        if is_new_task_list
-            && let Ok(home) = std::env::var("HOME") {
-                let global_dir = PathBuf::from(home).join(".claude");
-                let checks = pre_check_loop_setup(&global_dir);
-                let blockers: Vec<_> = checks
-                    .iter()
-                    .filter(|c| c.severity == SetupSeverity::Blocker)
-                    .collect();
-                if !blockers.is_empty() {
-                    eprintln!(
-                        "\x1b[33m⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:\x1b[0m",
-                        blockers.len()
-                    );
-                    for b in &blockers {
-                        eprintln!("  \x1b[33m•\x1b[0m {}", b.message);
-                        if let Some(ref fix) = b.fix_command {
-                            eprintln!("    Fix: {fix}");
-                        }
+        if is_new_task_list && let Ok(home) = std::env::var("HOME") {
+            let global_dir = PathBuf::from(home).join(".claude");
+            let checks = pre_check_loop_setup(&global_dir);
+            let blockers: Vec<_> = checks
+                .iter()
+                .filter(|c| c.severity == SetupSeverity::Blocker)
+                .collect();
+            if !blockers.is_empty() {
+                eprintln!(
+                    "\x1b[33m⚠ Setup warning: {} blocker(s) detected in ~/.claude/settings.json:\x1b[0m",
+                    blockers.len()
+                );
+                for b in &blockers {
+                    eprintln!("  \x1b[33m•\x1b[0m {}", b.message);
+                    if let Some(ref fix) = b.fix_command {
+                        eprintln!("    Fix: {fix}");
                     }
-                    eprintln!(
-                        "\x1b[33m  The loop will continue but tool calls may be blocked.\x1b[0m"
-                    );
-                    eprintln!("  Run `task-mgr doctor --setup` for a full audit.");
-                    eprintln!();
                 }
+                eprintln!("\x1b[33m  The loop will continue but tool calls may be blocked.\x1b[0m");
+                eprintln!("  Run `task-mgr doctor --setup` for a full audit.");
+                eprintln!();
             }
+        }
     }
 
     // Resolve external git repo path: CLI flag overrides PRD metadata
@@ -1402,14 +1416,15 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         // PRD markdown (from prdFile field in JSON, if present)
         if let Ok(content) = std::fs::read_to_string(&paths.prd_file)
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-                && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str()) {
-                    let prd_md_path = paths
-                        .prd_file
-                        .parent()
-                        .unwrap_or(&paths.prd_file)
-                        .join(prd_md);
-                    copy_if_missing(&prd_md_path);
-                }
+            && let Some(prd_md) = json.get("prdFile").and_then(|v| v.as_str())
+        {
+            let prd_md_path = paths
+                .prd_file
+                .parent()
+                .unwrap_or(&paths.prd_file)
+                .join(prd_md);
+            copy_if_missing(&prd_md_path);
+        }
     }
 
     // Step 8.5: Compute live PRD path (worktree copy if using worktrees, else source_root)
@@ -1437,7 +1452,8 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // If using a worktree, re-import from the worktree PRD to pick up any tasks
     // that were added in the worktree but not in source_root (e.g., tasks created
     // by Claude during a previous run that only exist in the worktree copy).
-    if live_prd_file != run_config.prd_file && live_prd_file.exists()
+    if live_prd_file != run_config.prd_file
+        && live_prd_file.exists()
         && let Err(e) = crate::commands::init(
             &run_config.db_dir,
             &[&live_prd_file],
@@ -1446,9 +1462,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             true,  // update_existing
             false, // dry_run
             run_config.prefix_mode.clone(),
-        ) {
-            eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
-        }
+        )
+    {
+        eprintln!("Warning: worktree PRD re-import failed: {} (continuing)", e);
+    }
     prd_hash = hash_file(&live_prd_file);
     // Override paths.prd_file so all iteration code (mark_task_done, reconcile, etc.)
     // reads/writes the worktree copy, not the source_root copy.
@@ -1481,15 +1498,16 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
         .to_string();
 
     if let Some(hours) = run_config.config.hours
-        && let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours) {
-            eprintln!("Error creating deadline: {}", e);
-            return LoopResult {
-                exit_code: 1,
-                worktree_path: actual_worktree_path,
-                branch_name: None,
-                was_stopped: false,
-            };
-        }
+        && let Err(e) = deadline::create_deadline(&paths.tasks_dir, &prd_basename, hours)
+    {
+        eprintln!("Error creating deadline: {}", e);
+        return LoopResult {
+            exit_code: 1,
+            worktree_path: actual_worktree_path,
+            branch_name: None,
+            was_stopped: false,
+        };
+    }
 
     // Step 12: Begin run session
     let begin_result = match run_cmd::begin(&conn) {
@@ -1592,10 +1610,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     // Informs the user that the current permission model will be deprecated.
     if let Ok(val) = std::env::var("LOOP_AUTO_MODE_AVAILABLE")
         && config::parse_bool_value(&val) == Some(true)
-            && !matches!(permission_mode, config::PermissionMode::Auto { .. })
-        {
-            eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
-        }
+        && !matches!(permission_mode, config::PermissionMode::Auto { .. })
+    {
+        eprintln!("{}", AUTO_MODE_DEPRECATION_HINT);
+    }
 
     // Step 15.7: Log requires_human task count so the user knows pauses are coming
     {
@@ -1636,7 +1654,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let mut iteration: u32 = 0;
     while iteration < max_iterations as u32 {
         iteration += 1; // 1-based, incremented at top
-                        // Pre-iteration: refresh OAuth token if usage checking enabled
+        // Pre-iteration: refresh OAuth token if usage checking enabled
         if usage_params.enabled {
             oauth::ensure_valid_token();
         }
@@ -1778,228 +1796,268 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             })
             .unwrap_or(0);
 
+        // Side-band `<task-status>` tag dispatch (FEAT-003).
+        // Parses every tag regardless of claimed task_id, dispatches through
+        // the existing command handlers, and (for Done) syncs PRD JSON.
+        // Runs BEFORE `<completed>` detection so a Done tag that maps to the
+        // claimed task sets task_marked_done_this_iteration below via outcome.
+        let status_updates = detection::extract_status_updates(&result.output);
+        let status_updates_applied = if !status_updates.is_empty() {
+            apply_status_updates(
+                &mut conn,
+                &status_updates,
+                Some(&run_id),
+                Some(&paths.prd_file),
+                task_prefix.as_deref(),
+            )
+        } else {
+            0
+        };
+
         // Check for task completion via multiple detection paths.
         // Priority: <completed> tags > git commit > output scan > already-complete
         if let Some(ref task_id) = result.task_id
-            && !matches!(result.outcome, IterationOutcome::Empty) {
-                let mut task_marked_done_this_iteration = false;
+            && !matches!(result.outcome, IterationOutcome::Empty)
+        {
+            let mut task_marked_done_this_iteration = false;
 
-                // Primary: parse <completed> tags from output
-                let completed_tags = parse_completed_tasks(&result.output);
-                if !completed_tags.is_empty() {
-                    for completed_id in &completed_tags {
-                        if let Ok(()) = mark_task_done(
-                            &mut conn,
-                            completed_id,
-                            &run_id,
-                            None,
-                            &paths.prd_file,
-                            task_prefix.as_deref(),
-                        ) {
-                            if completed_id == task_id {
-                                last_claimed_task = None;
-                                task_marked_done_this_iteration = true;
-                            }
-                            tasks_completed += 1;
-                            result.outcome = IterationOutcome::Completed;
-                            ctx.crash_tracker.record_success();
-                            eprintln!(
-                                "Task {} completed (detected from <completed> tag)",
-                                completed_id
-                            );
-                        }
-                    }
-                }
+            // If a <task-status>...:done</task-status> referenced the claimed
+            // task, treat it identically to a <completed> tag: mark the task
+            // as done for this iteration, clear claim tracking, and push the
+            // outcome to Completed so stale/crash trackers reset.
+            if status_updates_applied > 0
+                && status_updates.iter().any(|u| {
+                    matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == task_id
+                })
+            {
+                task_marked_done_this_iteration = true;
+                last_claimed_task = None;
+                tasks_completed += 1;
+                result.outcome = IterationOutcome::Completed;
+                ctx.crash_tracker.record_success();
+                eprintln!(
+                    "Task {} completed (detected from <task-status> tag)",
+                    task_id,
+                );
+            }
 
-                // Fallback 1: git commit detection (only if no <completed> tags found)
-                if completed_tags.is_empty() {
-                    if let Some(commit_hash) = check_git_for_task_completion(
-                        &working_root,
-                        task_id,
-                        run_config.config.git_scan_depth,
-                    ) {
-                        // Mark task done in DB
-                        let task_ids = [task_id.clone()];
-                        match complete_cmd::complete(
-                            &mut conn,
-                            &task_ids,
-                            Some(&run_id),
-                            Some(&commit_hash),
-                            false, // force
-                        ) {
-                            Ok(_) => {
-                                last_claimed_task = None;
-                                tasks_completed += 1;
-                                task_marked_done_this_iteration = true;
-
-                                // Override outcome so stale/crash trackers reset — task was actually completed
-                                result.outcome = IterationOutcome::Completed;
-                                ctx.crash_tracker.record_success();
-
-                                // Update PRD JSON to set passes: true
-                                if let Err(e) = update_prd_task_passes(
-                                    &paths.prd_file,
-                                    task_id,
-                                    true,
-                                    task_prefix.as_deref(),
-                                ) {
-                                    eprintln!(
-                                        "Warning: failed to update PRD for task {}: {}",
-                                        task_id, e
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Task {} completed (commit {})",
-                                        task_id,
-                                        &commit_hash[..7.min(commit_hash.len())]
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to mark task {} as done in DB: {}",
-                                    task_id, e
-                                );
-                            }
-                        }
-                    } else {
-                        // Fallback: scan Claude's output for ANY completed task IDs.
-                        // Claude may complete the claimed task or others in a single iteration,
-                        // and commits happen in a different repo (e.g. restaurant_agent_ex/).
-                        let completed_ids = scan_output_for_completed_tasks(
-                            &result.output,
-                            &conn,
-                            task_prefix.as_deref(),
-                        );
-                        for completed_id in &completed_ids {
-                            let ids = [completed_id.clone()];
-                            match complete_cmd::complete(
-                                &mut conn,
-                                &ids,
-                                Some(&run_id),
-                                None, // no commit hash — different repo
-                                false,
-                            ) {
-                                Ok(_) => {
-                                    // Clear tracker if the claimed task was completed via output scan
-                                    if result.task_id.as_deref() == Some(completed_id.as_str()) {
-                                        last_claimed_task = None;
-                                        task_marked_done_this_iteration = true;
-                                    }
-
-                                    tasks_completed += 1;
-
-                                    // Override outcome so stale/crash trackers reset — task was actually completed
-                                    result.outcome = IterationOutcome::Completed;
-                                    ctx.crash_tracker.record_success();
-
-                                    if let Err(e) = update_prd_task_passes(
-                                        &paths.prd_file,
-                                        completed_id,
-                                        true,
-                                        task_prefix.as_deref(),
-                                    ) {
-                                        eprintln!(
-                                            "Warning: failed to update PRD for task {}: {}",
-                                            completed_id, e
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "Task {} completed (detected from output)",
-                                            completed_id
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "Warning: failed to mark task {} as done: {}",
-                                        completed_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } // end: if completed_tags.is_empty()
-
-                // Final fallback: Claude reports the task as "already complete" without committing.
-                // This catches tasks completed in a prior run where the DB was never updated.
-                // Use task_marked_done_this_iteration (not outcome) to avoid skipping when
-                // <promise>COMPLETE</promise> set outcome to Completed but no prior path marked the task done.
-                if !task_marked_done_this_iteration
-                    && detection::is_task_reported_already_complete(
-                        &result.output,
-                        task_id,
-                        task_prefix.as_deref(),
-                    )
-                    && let Ok(()) = mark_task_done(
+            // Primary: parse <completed> tags from output
+            let completed_tags = parse_completed_tasks(&result.output);
+            if !completed_tags.is_empty() {
+                for completed_id in &completed_tags {
+                    if let Ok(()) = mark_task_done(
                         &mut conn,
-                        task_id,
+                        completed_id,
                         &run_id,
                         None,
                         &paths.prd_file,
                         task_prefix.as_deref(),
                     ) {
-                        last_claimed_task = None;
+                        if completed_id == task_id {
+                            last_claimed_task = None;
+                            task_marked_done_this_iteration = true;
+                        }
                         tasks_completed += 1;
                         result.outcome = IterationOutcome::Completed;
                         ctx.crash_tracker.record_success();
-                        eprintln!("Task {} completed (reported as already done)", task_id);
+                        eprintln!(
+                            "Task {} completed (detected from <completed> tag)",
+                            completed_id
+                        );
                     }
-
-                // Wrapper commit: if task was completed but no git commit exists
-                // (Claude couldn't commit in scoped permission mode), commit on its behalf.
-                if task_marked_done_this_iteration
-                    && check_git_for_task_completion(
-                        &working_root,
-                        task_id,
-                        run_config.config.git_scan_depth,
-                    )
-                    .is_none()
-                    && let Some(hash) =
-                        wrapper_commit(&working_root, task_id, "loop wrapper commit")
-                    {
-                        ctx.last_commit = Some(hash);
-                    }
+                }
             }
+
+            // Fallback 1: git commit detection (only if no <completed> tags found)
+            if completed_tags.is_empty() {
+                if let Some(commit_hash) = check_git_for_task_completion(
+                    &working_root,
+                    task_id,
+                    run_config.config.git_scan_depth,
+                ) {
+                    // Mark task done in DB
+                    let task_ids = [task_id.clone()];
+                    match complete_cmd::complete(
+                        &mut conn,
+                        &task_ids,
+                        Some(&run_id),
+                        Some(&commit_hash),
+                        false, // force
+                    ) {
+                        Ok(_) => {
+                            last_claimed_task = None;
+                            tasks_completed += 1;
+                            task_marked_done_this_iteration = true;
+
+                            // Override outcome so stale/crash trackers reset — task was actually completed
+                            result.outcome = IterationOutcome::Completed;
+                            ctx.crash_tracker.record_success();
+
+                            // Update PRD JSON to set passes: true
+                            if let Err(e) = update_prd_task_passes(
+                                &paths.prd_file,
+                                task_id,
+                                true,
+                                task_prefix.as_deref(),
+                            ) {
+                                eprintln!(
+                                    "Warning: failed to update PRD for task {}: {}",
+                                    task_id, e
+                                );
+                            } else {
+                                eprintln!(
+                                    "Task {} completed (commit {})",
+                                    task_id,
+                                    &commit_hash[..7.min(commit_hash.len())]
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to mark task {} as done in DB: {}",
+                                task_id, e
+                            );
+                        }
+                    }
+                } else {
+                    // Fallback: scan Claude's output for ANY completed task IDs.
+                    // Claude may complete the claimed task or others in a single iteration,
+                    // and commits happen in a different repo (e.g. restaurant_agent_ex/).
+                    let completed_ids = scan_output_for_completed_tasks(
+                        &result.output,
+                        &conn,
+                        task_prefix.as_deref(),
+                    );
+                    for completed_id in &completed_ids {
+                        let ids = [completed_id.clone()];
+                        match complete_cmd::complete(
+                            &mut conn,
+                            &ids,
+                            Some(&run_id),
+                            None, // no commit hash — different repo
+                            false,
+                        ) {
+                            Ok(_) => {
+                                // Clear tracker if the claimed task was completed via output scan
+                                if result.task_id.as_deref() == Some(completed_id.as_str()) {
+                                    last_claimed_task = None;
+                                    task_marked_done_this_iteration = true;
+                                }
+
+                                tasks_completed += 1;
+
+                                // Override outcome so stale/crash trackers reset — task was actually completed
+                                result.outcome = IterationOutcome::Completed;
+                                ctx.crash_tracker.record_success();
+
+                                if let Err(e) = update_prd_task_passes(
+                                    &paths.prd_file,
+                                    completed_id,
+                                    true,
+                                    task_prefix.as_deref(),
+                                ) {
+                                    eprintln!(
+                                        "Warning: failed to update PRD for task {}: {}",
+                                        completed_id, e
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Task {} completed (detected from output)",
+                                        completed_id
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: failed to mark task {} as done: {}",
+                                    completed_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            } // end: if completed_tags.is_empty()
+
+            // Final fallback: Claude reports the task as "already complete" without committing.
+            // This catches tasks completed in a prior run where the DB was never updated.
+            // Use task_marked_done_this_iteration (not outcome) to avoid skipping when
+            // <promise>COMPLETE</promise> set outcome to Completed but no prior path marked the task done.
+            if !task_marked_done_this_iteration
+                && detection::is_task_reported_already_complete(
+                    &result.output,
+                    task_id,
+                    task_prefix.as_deref(),
+                )
+                && let Ok(()) = mark_task_done(
+                    &mut conn,
+                    task_id,
+                    &run_id,
+                    None,
+                    &paths.prd_file,
+                    task_prefix.as_deref(),
+                )
+            {
+                last_claimed_task = None;
+                tasks_completed += 1;
+                result.outcome = IterationOutcome::Completed;
+                ctx.crash_tracker.record_success();
+                eprintln!("Task {} completed (reported as already done)", task_id);
+            }
+
+            // Wrapper commit: if task was completed but no git commit exists
+            // (Claude couldn't commit in scoped permission mode), commit on its behalf.
+            if task_marked_done_this_iteration
+                && check_git_for_task_completion(
+                    &working_root,
+                    task_id,
+                    run_config.config.git_scan_depth,
+                )
+                .is_none()
+                && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
+            {
+                ctx.last_commit = Some(hash);
+            }
+        }
 
         // Post-iteration: reconcile external git completions
         // Catches tasks completed in the current iteration (and any missed from prior)
         if let Some(ref ext_repo) = external_repo_path
-            && !matches!(result.outcome, IterationOutcome::Empty) {
-                let count = reconcile_external_git_completions(
-                    ext_repo,
-                    &mut conn,
-                    &run_id,
-                    &paths.prd_file,
-                    task_prefix.as_deref(),
-                    run_config.config.external_git_scan_depth,
+            && !matches!(result.outcome, IterationOutcome::Empty)
+        {
+            let count = reconcile_external_git_completions(
+                ext_repo,
+                &mut conn,
+                &run_id,
+                &paths.prd_file,
+                task_prefix.as_deref(),
+                run_config.config.external_git_scan_depth,
+            );
+            if count > 0 {
+                tasks_completed += count as u32;
+
+                // Override outcome so stale/crash trackers reset — task was actually completed
+                result.outcome = IterationOutcome::Completed;
+                ctx.crash_tracker.record_success();
+
+                eprintln!(
+                    "Post-iteration reconciliation: marked {} task(s) done",
+                    count
                 );
-                if count > 0 {
-                    tasks_completed += count as u32;
-
-                    // Override outcome so stale/crash trackers reset — task was actually completed
-                    result.outcome = IterationOutcome::Completed;
-                    ctx.crash_tracker.record_success();
-
-                    eprintln!(
-                        "Post-iteration reconciliation: marked {} task(s) done",
-                        count
-                    );
-                    // Clear tracker if the claimed task was reconciled as done
-                    if let Some(ref claimed) = last_claimed_task {
-                        let status: Option<String> = conn
-                            .query_row(
-                                "SELECT status FROM tasks WHERE id = ?",
-                                [claimed.as_str()],
-                                |row| row.get(0),
-                            )
-                            .ok();
-                        if status.as_deref() == Some("done") {
-                            last_claimed_task = None;
-                        }
+                // Clear tracker if the claimed task was reconciled as done
+                if let Some(ref claimed) = last_claimed_task {
+                    let status: Option<String> = conn
+                        .query_row(
+                            "SELECT status FROM tasks WHERE id = ?",
+                            [claimed.as_str()],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if status.as_deref() == Some("done") {
+                        last_claimed_task = None;
                     }
                 }
             }
+        }
 
         // Trigger human review for requires_human tasks completed this iteration.
         // Queries by timestamp to capture all detection paths (tags, git, output scan,
@@ -2043,9 +2101,10 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
             )
-                && let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64) {
-                    eprintln!("Warning: failed to start retry tracking transaction: {}", e);
-                }
+            && let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64)
+        {
+            eprintln!("Warning: failed to start retry tracking transaction: {}", e);
+        }
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
@@ -2509,6 +2568,89 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
     }
 }
 
+/// Dispatch a list of `<task-status>` side-band updates.
+///
+/// For each update:
+/// 1. Call the existing status command handler (`complete`, `fail`, `skip`,
+///    `irrelevant`, `unblock`, or `reset_tasks`) — NEVER bypass via raw SQL.
+/// 2. On a successful `Done` transition, flip the matching PRD JSON entry's
+///    `passes` field to `true` (symmetric with `task-mgr add`'s DB + JSON
+///    sync). JSON-sync failures log a warning but do NOT roll back the DB,
+///    mirroring `add.rs` behavior.
+///
+/// Dispatch failures (e.g. task not `in_progress` when `done` is claimed —
+/// learning [1475]) are logged to stderr with the task id + status and the
+/// loop continues to the next tag. Never silently swallow errors.
+///
+/// Returns the number of updates that dispatched successfully.
+pub fn apply_status_updates(
+    conn: &mut Connection,
+    updates: &[detection::TaskStatusUpdate],
+    run_id: Option<&str>,
+    prd_path: Option<&Path>,
+    task_prefix: Option<&str>,
+) -> u32 {
+    use detection::TaskStatusChange;
+
+    let mut applied: u32 = 0;
+    for update in updates {
+        let task_ids = [update.task_id.clone()];
+        let dispatch: Result<(), TaskMgrError> = match update.status {
+            TaskStatusChange::Done => {
+                complete_cmd::complete(conn, &task_ids, run_id, None, false).map(|_| ())
+            }
+            TaskStatusChange::Failed => crate::commands::fail(
+                conn,
+                &task_ids,
+                None,
+                crate::cli::FailStatus::Blocked,
+                run_id,
+                false,
+            )
+            .map(|_| ()),
+            TaskStatusChange::Skipped => {
+                crate::commands::skip(conn, &task_ids, "<task-status> tag", run_id).map(|_| ())
+            }
+            TaskStatusChange::Irrelevant => {
+                crate::commands::irrelevant(conn, &task_ids, "<task-status> tag", run_id, None)
+                    .map(|_| ())
+            }
+            TaskStatusChange::Unblock => {
+                crate::commands::unblock(conn, &update.task_id).map(|_| ())
+            }
+            TaskStatusChange::Reset => {
+                crate::commands::reset::reset_tasks(conn, &task_ids).map(|_| ())
+            }
+        };
+
+        match dispatch {
+            Ok(()) => {
+                applied += 1;
+                // Only Done flips PRD JSON `passes` — other transitions leave
+                // `passes: false` unchanged.
+                if matches!(update.status, TaskStatusChange::Done)
+                    && let Some(path) = prd_path
+                    && let Err(e) = update_prd_task_passes(path, &update.task_id, true, task_prefix)
+                {
+                    eprintln!(
+                        "Warning: <task-status> dispatched {} to done in DB but PRD JSON sync failed ({}): {}",
+                        update.task_id,
+                        path.display(),
+                        e,
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: <task-status>{}:{:?}</task-status> dispatch failed: {}",
+                    update.task_id, update.status, e,
+                );
+            }
+        }
+    }
+    applied
+}
+
 /// Check whether crash recovery should escalate the model for this iteration.
 ///
 /// Returns `Some(escalated_model)` when BOTH conditions are met:
@@ -2673,9 +2815,10 @@ pub fn handle_task_failure(
 
     // Only escalate if auto-block won't immediately follow (escalated model would never be used)
     if !should_auto_block(new_count, max_retries)
-        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count) {
-            eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
-        }
+        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count)
+    {
+        eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+    }
 
     if should_auto_block(new_count, max_retries) {
         if let Err(e) = auto_block_task(&tx, task_id, new_count, current_iteration) {
@@ -2818,7 +2961,7 @@ fn update_trackers(ctx: &mut IterationContext, outcome: &IterationOutcome) -> bo
 mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
-    use crate::loop_engine::test_utils::{setup_test_db, EnvGuard};
+    use crate::loop_engine::test_utils::{EnvGuard, setup_test_db};
 
     // --- pre_lock_prefix fallback tests ---
 
@@ -4381,5 +4524,224 @@ mod tests {
         assert_eq!(effort_for_difficulty(None), None);
         assert_eq!(effort_for_difficulty(Some("unknown")), None);
         assert_eq!(effort_for_difficulty(Some("")), None);
+    }
+
+    // --- apply_status_updates dispatcher tests (FEAT-003) ---
+    //
+    // These exercise the DB side of the side-band <task-status> path. The
+    // engine's in-iteration wiring (outcome flip, tasks_completed bump, claim
+    // clearing) is covered by the iteration-level tests elsewhere in this
+    // file; here we cover the pure dispatcher contract: command dispatch,
+    // PRD JSON sync, warning-on-state-violation.
+
+    /// Seed a minimal task row. `status` is set verbatim so tests can simulate
+    /// pre-claimed (in_progress) vs unclaimed (todo) state machines.
+    fn seed_task_with_status(conn: &Connection, id: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, priority, status) VALUES (?1, 't', 50, ?2)",
+            rusqlite::params![id, status],
+        )
+        .unwrap();
+    }
+
+    /// Write a minimal PRD JSON with a `userStories` array containing the
+    /// given ids (each with `passes: false`). Returns the path.
+    fn write_minimal_prd(dir: &std::path::Path, ids: &[&str]) -> PathBuf {
+        use serde_json::json;
+        let stories: Vec<_> = ids
+            .iter()
+            .map(|id| json!({"id": id, "title": "t", "priority": 50, "passes": false}))
+            .collect();
+        let doc = json!({"userStories": stories});
+        let path = dir.join("test-prd.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_apply_status_update_marks_task_done_after_claim() {
+        // Seeds task as in_progress (as if claimed), runs dispatcher with a
+        // Done update, asserts DB transitions to done.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-001", "in_progress");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-001"]);
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-001".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(applied, 1);
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-001'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "done", "Done dispatch must transition DB status");
+    }
+
+    #[test]
+    fn test_apply_status_update_logs_warning_when_task_not_claimed() {
+        // Seeds task as todo (NOT claimed). Dispatching Done via complete()
+        // must fail the state-machine check per learning [1475]: the engine
+        // logs and skips instead of auto-claiming.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-002", "todo");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-002"]);
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-002".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(
+            applied, 0,
+            "unclaimed todo task must not transition on <task-status>:done",
+        );
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-002'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "todo", "DB status must be unchanged");
+
+        // PRD JSON must be untouched too — no silent auto-pass.
+        let prd_text = std::fs::read_to_string(&prd_path).unwrap();
+        assert!(
+            prd_text.contains("\"passes\": false"),
+            "PRD JSON passes must remain false on failed dispatch",
+        );
+    }
+
+    #[test]
+    fn test_apply_status_update_done_flips_prd_json_passes() {
+        // Two tasks in PRD; only FEAT-001 is dispatched. Verify FEAT-001's
+        // passes flips true and the other task's entry is untouched.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-001", "in_progress");
+        seed_task_with_status(&conn, "FEAT-002", "todo");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-001", "FEAT-002"]);
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-001".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(applied, 1);
+
+        let prd: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prd_path).unwrap()).unwrap();
+        let stories = prd.get("userStories").unwrap().as_array().unwrap();
+        assert_eq!(stories.len(), 2);
+        let by_id = |id: &str| {
+            stories
+                .iter()
+                .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(id))
+                .unwrap()
+        };
+        assert_eq!(
+            by_id("FEAT-001").get("passes").and_then(|v| v.as_bool()),
+            Some(true),
+            "dispatched task's passes must flip to true",
+        );
+        assert_eq!(
+            by_id("FEAT-002").get("passes").and_then(|v| v.as_bool()),
+            Some(false),
+            "unaffected task's passes must stay false",
+        );
+    }
+
+    #[test]
+    fn test_apply_status_update_json_sync_failure_does_not_rollback_db() {
+        // Read-only PRD path: update_prd_task_passes will fail at the rename,
+        // but the DB transition has already committed. Warning is logged
+        // (stderr — not asserted here) and the DB state stands.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-003", "in_progress");
+        // Point PRD at a non-existent path under the temp dir so the read
+        // fails — mirrors the "missing PRD" failure mode.
+        let prd_path = temp_dir.path().join("nonexistent.json");
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-003".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(
+            applied, 1,
+            "DB dispatch succeeded even though PRD sync failed",
+        );
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-003'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            status, "done",
+            "DB transition must stand after JSON failure"
+        );
+    }
+
+    #[test]
+    fn test_apply_status_update_task_missing_from_prd_json() {
+        // Task exists in DB but NOT in PRD userStories. DB transition must
+        // succeed; JSON is left unchanged; no panic.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-004", "in_progress");
+        // PRD has only SEED-001 — FEAT-004 is absent.
+        let prd_path = write_minimal_prd(temp_dir.path(), &["SEED-001"]);
+        let before = std::fs::read_to_string(&prd_path).unwrap();
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-004".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(applied, 1);
+
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-004'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "done");
+
+        // PRD JSON content unchanged.
+        let after = std::fs::read_to_string(&prd_path).unwrap();
+        assert_eq!(before, after, "PRD JSON must be unchanged when task absent");
+    }
+
+    #[test]
+    fn test_apply_status_update_continues_past_failed_dispatch() {
+        // Two updates: the first targets a todo task (dispatch fails), the
+        // second targets an in_progress task (dispatch succeeds). The engine
+        // must log + continue, not abort on the first failure.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-A", "todo");
+        seed_task_with_status(&conn, "FEAT-B", "in_progress");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-A", "FEAT-B"]);
+
+        let updates = vec![
+            detection::TaskStatusUpdate {
+                task_id: "FEAT-A".to_string(),
+                status: detection::TaskStatusChange::Done,
+            },
+            detection::TaskStatusUpdate {
+                task_id: "FEAT-B".to_string(),
+                status: detection::TaskStatusChange::Done,
+            },
+        ];
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        assert_eq!(applied, 1, "one dispatch failed, one succeeded");
+
+        let status_b: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-B'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status_b, "done");
     }
 }

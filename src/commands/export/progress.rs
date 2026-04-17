@@ -7,12 +7,12 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::models::{
-    parse_datetime, parse_optional_datetime, Confidence, LearningOutcome, RunStatus, RunTaskStatus,
-    TaskStatus,
+    Confidence, LearningOutcome, RunStatus, RunTaskStatus, TaskStatus, parse_datetime,
+    parse_optional_datetime,
 };
 use crate::models::{LearningExport, ProgressExport, ProgressStatistics, RunExport, RunTaskExport};
-use crate::TaskMgrResult;
 
 use super::write_json_atomic;
 

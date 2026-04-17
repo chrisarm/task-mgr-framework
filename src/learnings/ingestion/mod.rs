@@ -16,12 +16,12 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::learnings::crud::{LearningWriter, RecordLearningParams};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
 use crate::models::LearningOutcome;
-use crate::TaskMgrResult;
 
 pub use extraction::{build_extraction_prompt, parse_extraction_response};
 
@@ -89,6 +89,7 @@ pub fn extract_learnings_from_output(
         None,
         false,
         &PermissionMode::text_only(),
+        None,
         None,
     ) {
         Ok(result) => result,
@@ -204,9 +205,10 @@ pub(crate) fn enrich_extracted_params(
             }
             // Preserve LLM-provided applies_to_task_types; derive from task prefix only when absent.
             if p.applies_to_task_types.is_none()
-                && let Some(ref prefix) = type_prefix {
-                    p.applies_to_task_types = Some(vec![prefix.clone()]);
-                }
+                && let Some(ref prefix) = type_prefix
+            {
+                p.applies_to_task_types = Some(vec![prefix.clone()]);
+            }
             p
         })
         .collect();

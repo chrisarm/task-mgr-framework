@@ -6,8 +6,8 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::db::open_and_migrate as open_connection;
 use crate::TaskMgrResult;
+use crate::db::open_and_migrate as open_connection;
 
 /// Result of the stats command.
 #[derive(Debug, Serialize)]
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn test_retired_excluded_from_stats_query_learning_counts() {
         // AC: retired learning excluded from stats query_learning_counts
-        use crate::learnings::{record_learning, RecordLearningParams};
+        use crate::learnings::{RecordLearningParams, record_learning};
         use crate::models::{Confidence, LearningOutcome};
 
         let (temp_dir, conn) = setup_test_db();

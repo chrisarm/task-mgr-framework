@@ -2214,7 +2214,7 @@ mod scoped_import_tests {
 // ============================================================================
 
 mod multi_prd_import_tests {
-    use crate::commands::init::{init, PrefixMode};
+    use crate::commands::init::{PrefixMode, init};
     use crate::db::open_connection;
     use std::fs;
     use tempfile::TempDir;

@@ -33,7 +33,10 @@ fn main() -> ExitCode {
     let block = match render_block(&model_rs) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("gen-docs: failed to render block from {}: {e}", model_rs.display());
+            eprintln!(
+                "gen-docs: failed to render block from {}: {e}",
+                model_rs.display()
+            );
             return ExitCode::from(2);
         }
     };

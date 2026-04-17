@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use task_mgr::cli::{Confidence, FailStatus, LearningOutcome};
 use task_mgr::commands::{
-    begin, complete, doctor, end, export, fail, init, learn, next, LearnParams,
+    LearnParams, begin, complete, doctor, end, export, fail, init, learn, next,
 };
 use task_mgr::db::open_connection;
 use task_mgr::loop_engine::engine::handle_task_failure;

@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use task_mgr::cli::FailStatus;
 use task_mgr::commands::{complete, fail, init, show, skip};
-use task_mgr::db::{create_schema, open_connection, LockGuard};
+use task_mgr::db::{LockGuard, create_schema, open_connection};
 use task_mgr::error::TaskMgrError;
 
 /// Get the path to the sample PRD fixture file.

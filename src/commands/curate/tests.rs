@@ -14,13 +14,13 @@
 use rusqlite::Connection;
 
 use crate::db::{create_schema, open_connection};
-use crate::learnings::{record_learning, RecordLearningParams};
+use crate::learnings::{RecordLearningParams, record_learning};
 use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
-    build_dedup_prompt, curate_count, curate_retire, curate_unretire, merge_cluster,
-    parse_dedup_response, DeduplicateLearningItem, MergeClusterParams, RetireParams,
+    DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt, curate_count,
+    curate_retire, curate_unretire, merge_cluster, parse_dedup_response,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ fn test_non_matching_learning_not_candidate() {
         LearningOutcome::Success,
     );
     set_show_stats(&conn, id, 10, 8); // high application rate, criterion 2 won't match (applied > 0)
-                                      // created_at is recent by default (criterion 1 won't match)
+    // created_at is recent by default (criterion 1 won't match)
 
     let result = curate_retire(&conn, RetireParams::default()).expect("curate_retire");
 
@@ -945,7 +945,7 @@ fn test_unretire_result_json_serialization() {
 // All tests are #[ignore] until FEAT-003 implements find_enrichment_candidates.
 // ──────────────────────────────────────────────────────────────────────────────
 
-use super::{find_enrichment_candidates, EnrichParams};
+use super::{EnrichParams, find_enrichment_candidates};
 use crate::commands::curate::types::EnrichFieldFilter;
 
 /// Sets `applies_to_files` on a learning to a JSON array (simulates enriched field).
@@ -1200,7 +1200,7 @@ fn test_enrich_empty_database_returns_empty_vec() {
 // FEAT-005 (parse_enrich_response) are implemented.
 // ──────────────────────────────────────────────────────────────────────────────
 
-use super::enrich::{build_enrich_prompt, curate_enrich, parse_enrich_response, EnrichBatchItem};
+use super::enrich::{EnrichBatchItem, build_enrich_prompt, curate_enrich, parse_enrich_response};
 
 /// Returns a minimal batch of two items for prompt/parser tests.
 fn make_batch() -> Vec<EnrichBatchItem> {
@@ -2900,7 +2900,7 @@ fn test_parse_dedup_response_single_id_cluster_rejected() {
 use std::sync::Mutex;
 
 use super::types::{DedupCluster, DedupResult};
-use super::{curate_dedup, DedupParams};
+use super::{DedupParams, curate_dedup};
 
 // Serialise tests that mutate CLAUDE_BINARY to avoid race conditions when cargo
 // runs test threads in parallel.
@@ -3509,7 +3509,7 @@ fn test_dedup_result_json_serialization_all_fields() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 use super::output::format_dedup_text;
-use crate::learnings::recall::{recall_learnings, RecallParams};
+use crate::learnings::recall::{RecallParams, recall_learnings};
 
 /// Inserts a learning with custom metadata for integration tests.
 #[cfg(unix)]

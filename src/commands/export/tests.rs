@@ -636,7 +636,7 @@ use crate::learnings::test_helpers::retire_learning as retire_learning_export;
 #[test]
 fn test_retired_excluded_from_export_load_learnings() {
     // AC: retired learning excluded from export load_learnings query
-    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::learnings::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let temp_dir = TempDir::new().unwrap();
@@ -695,7 +695,7 @@ fn test_retired_excluded_from_export_load_learnings() {
 #[test]
 fn test_retired_excluded_from_export_calculate_statistics() {
     // AC: retired learning excluded from export calculate_statistics outcome counts
-    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::learnings::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
 
     let temp_dir = TempDir::new().unwrap();

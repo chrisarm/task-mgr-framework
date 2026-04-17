@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use chrono::Local;
 use serde::Serialize;
 
+use crate::TaskMgrResult;
 use crate::db::open_and_migrate as open_connection;
 use crate::db::prefix::make_like_pattern;
-use crate::TaskMgrResult;
 
 pub use super::archive_display::format_text;
 
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_run_archive_preserves_learnings() {
-        use crate::learnings::crud::{record_learning, RecordLearningParams};
+        use crate::learnings::crud::{RecordLearningParams, record_learning};
         use crate::models::{Confidence, LearningOutcome};
 
         let dir = TempDir::new().unwrap();
@@ -1314,7 +1314,7 @@ mod tests {
 
     #[test]
     fn test_init_registers_prd_files() {
-        use crate::commands::init::{init, PrefixMode};
+        use crate::commands::init::{PrefixMode, init};
 
         let dir = TempDir::new().unwrap();
         let tasks_dir = dir.path().join("tasks");
@@ -1398,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_clear_prd_a_leaves_learnings_intact() {
-        use crate::learnings::crud::{record_learning, RecordLearningParams};
+        use crate::learnings::crud::{RecordLearningParams, record_learning};
         use crate::models::{Confidence, LearningOutcome};
 
         let dir = TempDir::new().unwrap();

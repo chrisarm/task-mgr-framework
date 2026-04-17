@@ -7,8 +7,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::db::open_and_migrate as open_connection;
 use crate::TaskMgrResult;
+use crate::db::open_and_migrate as open_connection;
 
 use super::status_queries::{
     query_dashboard_task_counts, query_distinct_prefixes, query_pending_tasks, query_project_info,

@@ -9,8 +9,7 @@ use super::Migration;
 /// Migration 7: Add model selection fields to tasks and prd_metadata
 pub static MIGRATION: Migration = Migration {
     version: 7,
-    description:
-        "Add model, difficulty, escalation_note to tasks and default_model to prd_metadata",
+    description: "Add model, difficulty, escalation_note to tasks and default_model to prd_metadata",
     up_sql: r#"
         ALTER TABLE tasks ADD COLUMN model TEXT;
         ALTER TABLE tasks ADD COLUMN difficulty TEXT;

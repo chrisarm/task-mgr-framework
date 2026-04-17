@@ -17,6 +17,6 @@ pub mod picker;
 
 mod handlers;
 pub use handlers::{
-    handle_list, handle_set_default, handle_show, handle_unset_default, DefaultSource, ListOpts,
-    SetDefaultOpts, UnsetDefaultOpts,
+    DefaultSource, ListOpts, SetDefaultOpts, UnsetDefaultOpts, handle_list, handle_set_default,
+    handle_show, handle_unset_default,
 };

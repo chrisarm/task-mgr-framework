@@ -1,10 +1,10 @@
 //! Tests for the fail command.
 
 use super::*;
+use crate::TaskMgrError;
 use crate::cli::FailStatus;
 use crate::db::{create_schema, open_connection};
 use crate::models::TaskStatus;
-use crate::TaskMgrError;
 use tempfile::TempDir;
 
 fn setup_test_db() -> (TempDir, rusqlite::Connection) {
@@ -515,11 +515,13 @@ fn test_next_steps_for_each_status() {
         false,
     )
     .unwrap();
-    assert!(result.tasks[0]
-        .next_steps
-        .as_ref()
-        .unwrap()
-        .contains("doctor"));
+    assert!(
+        result.tasks[0]
+            .next_steps
+            .as_ref()
+            .unwrap()
+            .contains("doctor")
+    );
 
     // Test skipped
     insert_test_task(&conn, "SKIP-1", "in_progress");
@@ -532,11 +534,13 @@ fn test_next_steps_for_each_status() {
         false,
     )
     .unwrap();
-    assert!(result.tasks[0]
-        .next_steps
-        .as_ref()
-        .unwrap()
-        .contains("picked up later"));
+    assert!(
+        result.tasks[0]
+            .next_steps
+            .as_ref()
+            .unwrap()
+            .contains("picked up later")
+    );
 
     // Test irrelevant
     insert_test_task(&conn, "IRREL-1", "in_progress");
@@ -549,9 +553,11 @@ fn test_next_steps_for_each_status() {
         false,
     )
     .unwrap();
-    assert!(result.tasks[0]
-        .next_steps
-        .as_ref()
-        .unwrap()
-        .contains("permanently excluded"));
+    assert!(
+        result.tasks[0]
+            .next_steps
+            .as_ref()
+            .unwrap()
+            .contains("permanently excluded")
+    );
 }

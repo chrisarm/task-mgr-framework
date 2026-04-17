@@ -17,8 +17,8 @@
 
 use rusqlite::Connection;
 
-use crate::db::prefix::prefix_and;
 use crate::TaskMgrResult;
+use crate::db::prefix::prefix_and;
 
 /// Apply automatic decay to blocked/skipped tasks that have exceeded the threshold.
 ///

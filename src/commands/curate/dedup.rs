@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::commands::curate::types::{DeduplicateLearningItem, RawDedupCluster};
 use crate::TaskMgrResult;
+use crate::commands::curate::types::{DeduplicateLearningItem, RawDedupCluster};
 
 use super::json_utils::extract_json_array;
 

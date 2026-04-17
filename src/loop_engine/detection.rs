@@ -240,6 +240,96 @@ fn extract_options(block: &str) -> Vec<KeyDecisionOption> {
     options
 }
 
+// --- `<task-status>` Side-Band Tag Extraction ---
+
+/// Status change requested by a `<task-status>TASK-ID:status</task-status>` tag.
+///
+/// Mirrors the subset of task state transitions the loop engine can apply by
+/// dispatching through the existing command handlers (`complete`, `fail`,
+/// `skip`, `irrelevant`, `unblock`, `reset_tasks`). Unknown statuses cause the
+/// tag to be skipped entirely rather than producing a sentinel variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatusChange {
+    Done,
+    Failed,
+    Skipped,
+    Irrelevant,
+    Unblock,
+    Reset,
+}
+
+/// One parsed `<task-status>TASK-ID:status</task-status>` tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatusUpdate {
+    pub task_id: String,
+    pub status: TaskStatusChange,
+}
+
+/// Extract all `<task-status>TASK-ID:status</task-status>` tags from Claude output.
+///
+/// Multiple tags in the same output are each returned in document order. Tags
+/// with empty task IDs, missing colons, empty statuses, or unknown statuses
+/// are silently skipped — the whole-output scan continues past the malformed
+/// block so one bad tag does not suppress later valid ones.
+///
+/// Status parsing is case-insensitive: `done`, `Done`, and `DONE` all map to
+/// [`TaskStatusChange::Done`].
+pub fn extract_status_updates(output: &str) -> Vec<TaskStatusUpdate> {
+    let open_tag = "<task-status>";
+    let close_tag = "</task-status>";
+    let mut results = Vec::new();
+    let mut remaining = output;
+
+    while let Some(start) = remaining.find(open_tag) {
+        let after_open = &remaining[start + open_tag.len()..];
+        let Some(end) = after_open.find(close_tag) else {
+            break;
+        };
+        let body = &after_open[..end];
+        if let Some(update) = parse_status_tag_body(body) {
+            results.push(update);
+        }
+        remaining = &after_open[end + close_tag.len()..];
+    }
+
+    results
+}
+
+/// Parse the body between `<task-status>` and `</task-status>`.
+///
+/// Expected form: `TASK-ID:status` (with optional whitespace around either
+/// side of the colon). Returns `None` when the shape is wrong or either side
+/// does not resolve to a real value.
+fn parse_status_tag_body(body: &str) -> Option<TaskStatusUpdate> {
+    let (id_part, status_part) = body.split_once(':')?;
+    let task_id = id_part.trim();
+    let status_raw = status_part.trim();
+    if task_id.is_empty() || status_raw.is_empty() {
+        return None;
+    }
+    let status = parse_status_keyword(status_raw)?;
+    Some(TaskStatusUpdate {
+        task_id: task_id.to_string(),
+        status,
+    })
+}
+
+/// Map a (case-insensitive) status keyword to [`TaskStatusChange`].
+///
+/// Returns `None` for anything outside the known dispatch surface so unknown
+/// keywords never silently match a catch-all.
+fn parse_status_keyword(raw: &str) -> Option<TaskStatusChange> {
+    match raw.to_ascii_lowercase().as_str() {
+        "done" | "completed" | "complete" => Some(TaskStatusChange::Done),
+        "failed" | "fail" | "blocked" => Some(TaskStatusChange::Failed),
+        "skipped" | "skip" => Some(TaskStatusChange::Skipped),
+        "irrelevant" => Some(TaskStatusChange::Irrelevant),
+        "unblock" | "unblocked" => Some(TaskStatusChange::Unblock),
+        "reset" | "todo" => Some(TaskStatusChange::Reset),
+        _ => None,
+    }
+}
+
 /// Check if Claude's output reports a specific task as already complete.
 ///
 /// Catches the case where a task was completed in a prior run but the DB
@@ -1305,8 +1395,7 @@ mod tests {
 
     #[test]
     fn test_complete_beats_prompt_too_long() {
-        let output =
-            "Prompt is too long earlier\nrecovered\n<promise>COMPLETE</promise>\n";
+        let output = "Prompt is too long earlier\nrecovered\n<promise>COMPLETE</promise>\n";
         assert_eq!(
             analyze_output(output, 0, &test_dir()),
             IterationOutcome::Completed,
@@ -1358,5 +1447,140 @@ mod tests {
         let output = make_kd("DB Choice", "Which DB?", &[("A: SQLite", "easy")]);
         let result = analyze_output(&output, 0, &test_dir());
         assert_eq!(result, IterationOutcome::NoEligibleTasks);
+    }
+
+    // ======================================================================
+    // `<task-status>` side-band extraction tests (FEAT-003)
+    // ======================================================================
+
+    #[test]
+    fn test_extract_status_updates_single() {
+        let output = "<task-status>FEAT-001:done</task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(
+            updates,
+            vec![TaskStatusUpdate {
+                task_id: "FEAT-001".to_string(),
+                status: TaskStatusChange::Done,
+            }],
+        );
+    }
+
+    #[test]
+    fn test_extract_status_updates_multiple() {
+        // Three tags in one output; must be returned in document order.
+        let output = "noise <task-status>FEAT-001:done</task-status> \
+                      and <task-status>FEAT-002:failed</task-status> \
+                      plus <task-status>FEAT-003:skipped</task-status> trailing";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0].task_id, "FEAT-001");
+        assert_eq!(updates[0].status, TaskStatusChange::Done);
+        assert_eq!(updates[1].task_id, "FEAT-002");
+        assert_eq!(updates[1].status, TaskStatusChange::Failed);
+        assert_eq!(updates[2].task_id, "FEAT-003");
+        assert_eq!(updates[2].status, TaskStatusChange::Skipped);
+    }
+
+    #[test]
+    fn test_extract_status_updates_case_insensitive_status() {
+        for keyword in ["done", "DONE", "Done", "DoNe"] {
+            let output = format!("<task-status>FEAT-001:{keyword}</task-status>");
+            let updates = extract_status_updates(&output);
+            assert_eq!(
+                updates,
+                vec![TaskStatusUpdate {
+                    task_id: "FEAT-001".to_string(),
+                    status: TaskStatusChange::Done,
+                }],
+                "status '{}' should parse as Done",
+                keyword,
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_status_updates_malformed_skipped() {
+        // No colon → malformed body → skipped; following well-formed tag is still parsed.
+        let output = "<task-status>FEAT-001-NO-COLON</task-status> \
+                      <task-status>FEAT-002:done</task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].task_id, "FEAT-002");
+        assert_eq!(updates[0].status, TaskStatusChange::Done);
+    }
+
+    #[test]
+    fn test_extract_status_updates_unknown_status_skipped() {
+        let output = "<task-status>FEAT-001:exploded</task-status> \
+                      <task-status>FEAT-002:done</task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 1, "unknown status must not dispatch");
+        assert_eq!(updates[0].task_id, "FEAT-002");
+    }
+
+    #[test]
+    fn test_extract_status_updates_empty_id_skipped() {
+        let output = "<task-status>:done</task-status> \
+                      <task-status>FEAT-002:done</task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].task_id, "FEAT-002");
+    }
+
+    #[test]
+    fn test_extract_status_updates_whitespace_trimmed() {
+        let output = "<task-status>  FEAT-001  :  done  </task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(
+            updates,
+            vec![TaskStatusUpdate {
+                task_id: "FEAT-001".to_string(),
+                status: TaskStatusChange::Done,
+            }],
+        );
+    }
+
+    #[test]
+    fn test_extract_status_updates_two_tags_not_greedy_matched() {
+        // Learning [193]/known-bad: a naive find() that closes on the LAST
+        // </task-status> would produce one giant task_id. The open+close slice
+        // advance pattern must yield TWO separate updates.
+        let output = "<task-status>A:done</task-status> noise <task-status>B:done</task-status>";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].task_id, "A");
+        assert_eq!(updates[1].task_id, "B");
+    }
+
+    #[test]
+    fn test_extract_status_updates_missing_close_tag_stops_cleanly() {
+        // Second tag has no </task-status>; first valid tag is kept.
+        let output = "<task-status>FEAT-001:done</task-status><task-status>FEAT-002:done";
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].task_id, "FEAT-001");
+    }
+
+    #[test]
+    fn test_status_tag_does_not_change_iteration_outcome() {
+        // Output contains BOTH a <task-status> tag and <promise>COMPLETE</promise>.
+        // analyze_output must return Completed (ignoring the status tag entirely),
+        // and extract_status_updates must still pick up the task-status tag.
+        let output = "<task-status>FEAT-001:done</task-status>\n<promise>COMPLETE</promise>";
+        let outcome = analyze_output(output, 0, &test_dir());
+        assert_eq!(outcome, IterationOutcome::Completed);
+        let updates = extract_status_updates(output);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].task_id, "FEAT-001");
+    }
+
+    #[test]
+    fn test_status_tag_does_not_change_outcome_without_promise() {
+        // Without a promise, the status tag alone must NOT push the outcome to
+        // Completed — side-band tags are parsed separately from analyze_output.
+        let output = "<task-status>FEAT-001:done</task-status>";
+        let outcome = analyze_output(output, 0, &test_dir());
+        assert_ne!(outcome, IterationOutcome::Completed);
     }
 }

@@ -113,7 +113,9 @@ pub enum TaskMgrError {
     },
 
     /// Prompt critical sections exceed the total character budget.
-    #[error("Prompt critical sections ({critical_size} bytes) exceed budget ({budget} bytes) for task {task_id}. Reduce base prompt.md size or split the task.")]
+    #[error(
+        "Prompt critical sections ({critical_size} bytes) exceed budget ({budget} bytes) for task {task_id}. Reduce base prompt.md size or split the task."
+    )]
     PromptOverflow {
         /// Total size of all critical sections in bytes
         critical_size: usize,
@@ -124,7 +126,9 @@ pub enum TaskMgrError {
     },
 
     /// Required tests did not pass for task completion.
-    #[error("Cannot complete task '{task_id}': required tests failed: {failed_tests}\n\nHint: Fix the failing tests, or use --force to override.")]
+    #[error(
+        "Cannot complete task '{task_id}': required tests failed: {failed_tests}\n\nHint: Fix the failing tests, or use --force to override."
+    )]
     RequiredTestsFailed {
         /// Task identifier
         task_id: String,

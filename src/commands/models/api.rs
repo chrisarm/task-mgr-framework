@@ -147,15 +147,17 @@ pub fn check_opt_in() -> Result<(), ApiError> {
     }
 }
 
-fn parse_optional_timestamp<'de, D>(
-    deserializer: D,
-) -> Result<Option<DateTime<Utc>>, D::Error>
+fn parse_optional_timestamp<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     // Accept either a string or null; unparseable strings become None.
     let opt: Option<String> = Option::deserialize(deserializer)?;
-    Ok(opt.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))))
+    Ok(opt.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
 }
 
 #[cfg(test)]

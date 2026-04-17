@@ -3,7 +3,7 @@
 //! Consolidates duplicated test setup code (setup_test_db, insert_test_learning,
 //! and common DB insert helpers) used across feedback.rs, calibrate.rs, prompt.rs,
 //! and engine.rs tests.
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -58,7 +58,7 @@ impl Drop for EnvGuard {
 
 use crate::db::migrations::run_migrations;
 use crate::db::{create_schema, open_connection};
-use crate::learnings::crud::{record_learning, RecordLearningParams};
+use crate::learnings::crud::{RecordLearningParams, record_learning};
 use crate::models::{Confidence, LearningOutcome};
 
 /// Set up a test database with schema and migrations.

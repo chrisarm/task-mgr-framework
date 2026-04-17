@@ -5,8 +5,8 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::models::Learning;
 use crate::TaskMgrResult;
+use crate::models::Learning;
 
 /// Parameters for the learnings list command.
 #[derive(Debug, Clone, Default)]
@@ -205,7 +205,7 @@ pub fn format_text(result: &LearningsListResult) -> String {
 mod tests {
     use super::*;
     use crate::db::{create_schema, migrations::run_migrations, open_connection};
-    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::learnings::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
     use tempfile::TempDir;
 

@@ -8,8 +8,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::models::TaskStatus;
 use crate::TaskMgrResult;
+use crate::models::TaskStatus;
 
 /// Type alias for relationship maps loaded from database.
 pub(crate) type RelationshipMaps = (

@@ -8,8 +8,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::guidance::SessionGuidance;
 use super::{DEADLINE_FILE_PREFIX, PAUSE_FILE, STOP_FILE};
@@ -20,9 +20,10 @@ use super::{DEADLINE_FILE_PREFIX, PAUSE_FILE, STOP_FILE};
 /// to the global `.stop` file. When `prefix` is `None`, checks only `.stop`.
 pub fn check_stop_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
     if let Some(p) = prefix
-        && tasks_dir.join(format!("{STOP_FILE}-{p}")).exists() {
-            return true;
-        }
+        && tasks_dir.join(format!("{STOP_FILE}-{p}")).exists()
+    {
+        return true;
+    }
     tasks_dir.join(STOP_FILE).exists()
 }
 
@@ -32,9 +33,10 @@ pub fn check_stop_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
 /// to the global `.pause` file. When `prefix` is `None`, checks only `.pause`.
 pub fn check_pause_signal(tasks_dir: &Path, prefix: Option<&str>) -> bool {
     if let Some(p) = prefix
-        && tasks_dir.join(format!("{PAUSE_FILE}-{p}")).exists() {
-            return true;
-        }
+        && tasks_dir.join(format!("{PAUSE_FILE}-{p}")).exists()
+    {
+        return true;
+    }
     tasks_dir.join(PAUSE_FILE).exists()
 }
 
@@ -53,9 +55,10 @@ pub fn cleanup_signal_files_for_prefix(tasks_dir: &Path, prefix: Option<&str>) {
     }
     for path in &files_to_remove {
         if path.exists()
-            && let Err(e) = fs::remove_file(path) {
-                eprintln!("Warning: could not remove {}: {}", path.display(), e);
-            }
+            && let Err(e) = fs::remove_file(path)
+        {
+            eprintln!("Warning: could not remove {}: {}", path.display(), e);
+        }
     }
 }
 
@@ -142,9 +145,10 @@ pub fn cleanup_signal_files(tasks_dir: &Path) {
     for filename in &[STOP_FILE, PAUSE_FILE] {
         let path = tasks_dir.join(filename);
         if path.exists()
-            && let Err(e) = fs::remove_file(&path) {
-                eprintln!("Warning: could not remove {}: {}", path.display(), e);
-            }
+            && let Err(e) = fs::remove_file(&path)
+        {
+            eprintln!("Warning: could not remove {}: {}", path.display(), e);
+        }
     }
 
     // Remove .deadline-* files
@@ -161,13 +165,14 @@ fn cleanup_deadline_files(tasks_dir: &Path) {
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str()
             && name.starts_with(DEADLINE_FILE_PREFIX)
-                && let Err(e) = fs::remove_file(entry.path()) {
-                    eprintln!(
-                        "Warning: could not remove deadline file {}: {}",
-                        entry.path().display(),
-                        e
-                    );
-                }
+            && let Err(e) = fs::remove_file(entry.path())
+        {
+            eprintln!(
+                "Warning: could not remove deadline file {}: {}",
+                entry.path().display(),
+                e
+            );
+        }
     }
 }
 

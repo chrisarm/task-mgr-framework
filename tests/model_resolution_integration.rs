@@ -11,7 +11,7 @@ use task_mgr::commands::init;
 use task_mgr::db::open_connection;
 use task_mgr::loop_engine::display::format_iteration_header;
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
-use task_mgr::loop_engine::prompt::{build_prompt, BuildPromptParams};
+use task_mgr::loop_engine::prompt::{BuildPromptParams, build_prompt};
 
 mod common;
 use common::render_fixture_tmpl;

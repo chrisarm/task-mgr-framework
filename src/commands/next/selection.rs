@@ -17,10 +17,10 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::TaskMgrResult;
 use crate::db::prefix::{prefix_and, prefix_and_col, prefix_where_col};
 use crate::loop_engine::calibrate;
 use crate::models::Task;
-use crate::TaskMgrResult;
 
 /// Scoring weights for task selection
 pub const FILE_OVERLAP_SCORE: i32 = 10;
@@ -423,11 +423,7 @@ fn get_eligible_batch_tasks(
         .into_iter()
         .filter_map(|(id, status)| {
             // Task is eligible if it's todo and not blocked by dependencies
-            if status == "todo" {
-                Some(id)
-            } else {
-                None
-            }
+            if status == "todo" { Some(id) } else { None }
         })
         .collect();
 

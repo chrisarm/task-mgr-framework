@@ -35,12 +35,7 @@ fn no_hardcoded_model_strings_outside_model_rs() {
 
     let mut offenders: Vec<String> = Vec::new();
     for dir in ["src", "tests"] {
-        scan_dir(
-            &repo_root.join(dir),
-            &repo_root,
-            &pattern,
-            &mut offenders,
-        );
+        scan_dir(&repo_root.join(dir), &repo_root, &pattern, &mut offenders);
     }
 
     assert!(

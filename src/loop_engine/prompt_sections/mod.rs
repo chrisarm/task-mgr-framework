@@ -9,6 +9,7 @@ pub mod escalation;
 pub mod learnings;
 pub mod siblings;
 pub mod synergy;
+pub mod task_ops;
 
 /// Truncate a string to fit within a byte budget.
 ///
@@ -77,7 +78,7 @@ mod tests {
         // "café" = 5 chars, 6 bytes (é is 2 bytes: 0xC3 0xA9)
         let text = "café";
         assert_eq!(text.len(), 5); // 5 bytes
-                                   // Budget 4 falls after 'f' but before 'é' starts — safe
+        // Budget 4 falls after 'f' but before 'é' starts — safe
         let result = truncate_to_budget(text, 4);
         assert!(result.contains("[truncated to 4 bytes]"));
         assert!(result.starts_with("caf"));
@@ -91,7 +92,7 @@ mod tests {
         // Each emoji is 4 bytes
         let text = "🍕🍔🌮🍣";
         assert_eq!(text.len(), 16); // 4 emoji × 4 bytes
-                                    // Budget 5 falls mid-second emoji (byte 5 is inside 🍔)
+        // Budget 5 falls mid-second emoji (byte 5 is inside 🍔)
         let result = truncate_to_budget(text, 5);
         assert!(result.contains("[truncated to 5 bytes]"));
         // Should contain only first emoji (4 bytes), not a partial second
@@ -104,7 +105,7 @@ mod tests {
         // CJK characters are 3 bytes each
         let text = "你好世界";
         assert_eq!(text.len(), 12); // 4 chars × 3 bytes
-                                    // Budget 4 falls mid-second character (byte 4 is inside 好)
+        // Budget 4 falls mid-second character (byte 4 is inside 好)
         let result = truncate_to_budget(text, 4);
         assert!(result.contains("[truncated to 4 bytes]"));
         assert!(result.starts_with("你"));

@@ -12,8 +12,8 @@
 // and the function works fine for our use case
 #![allow(deprecated)]
 
-use assert_cmd::cargo::cargo_bin;
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;

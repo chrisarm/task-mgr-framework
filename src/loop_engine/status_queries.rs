@@ -10,12 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::db::lock::LockGuard;
 use crate::db::prefix::prefix_and;
-use crate::TaskMgrResult;
 
-use super::status::{DashboardTaskCounts, DeadlineInfo, PendingTask, ProjectInfo};
 use super::DEADLINE_FILE_PREFIX;
+use super::status::{DashboardTaskCounts, DeadlineInfo, PendingTask, ProjectInfo};
 
 /// PRD hints read from the JSON file before lock acquisition.
 pub struct PrdHints {
@@ -231,11 +231,13 @@ pub(crate) fn read_active_lock_prefixes(dir: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("loop-") && name_str.ends_with(".lock")
+            if name_str.starts_with("loop-")
+                && name_str.ends_with(".lock")
                 && let Some(info) = LockGuard::read_holder_info(&entry.path())
-                    && let Some(p) = info.prefix {
-                        prefixes.push(p);
-                    }
+                && let Some(p) = info.prefix
+            {
+                prefixes.push(p);
+            }
         }
     }
 
@@ -243,9 +245,10 @@ pub(crate) fn read_active_lock_prefixes(dir: &Path) -> Vec<String> {
     let global_lock = dir.join("loop.lock");
     if let Some(info) = LockGuard::read_holder_info(&global_lock)
         && let Some(p) = info.prefix
-            && !prefixes.contains(&p) {
-                prefixes.push(p);
-            }
+        && !prefixes.contains(&p)
+    {
+        prefixes.push(p);
+    }
 
     prefixes
 }

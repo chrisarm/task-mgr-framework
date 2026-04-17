@@ -8,9 +8,9 @@ use tempfile::TempDir;
 use task_mgr::commands::init;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{
-    get_learning, get_learning_tags, record_learning, RecordLearningParams,
+    RecordLearningParams, get_learning, get_learning_tags, record_learning,
 };
-use task_mgr::learnings::recall::{recall_learnings, RecallParams};
+use task_mgr::learnings::recall::{RecallParams, recall_learnings};
 use task_mgr::models::{Confidence, LearningOutcome};
 
 /// Get the path to the sample PRD fixture file.
@@ -1007,7 +1007,7 @@ fn test_recall_empty_database() {
 #[test]
 fn test_e2e_learn_auto_populate_then_recall_for_task() {
     use task_mgr::cli::enums::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
-    use task_mgr::commands::learn::{learn, LearnParams};
+    use task_mgr::commands::learn::{LearnParams, learn};
     use task_mgr::learnings::{PatternsBackend, RetrievalBackend, RetrievalQuery};
 
     let (_temp_dir, conn) = setup_db();

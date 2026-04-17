@@ -12,8 +12,8 @@ use std::process::Command;
 
 use rusqlite::Connection;
 
-use crate::db::LockGuard;
 use crate::TaskMgrResult;
+use crate::db::LockGuard;
 
 /// Find tasks that are in_progress but have no active run tracking them.
 ///
@@ -93,9 +93,10 @@ pub fn has_active_loop_lock(dir: &Path) -> bool {
             let path = entry.path();
             // If we can read a holder PID and it's still alive, the lock is active
             if let Some(info) = LockGuard::read_holder_info(&path)
-                && is_pid_alive(info.pid) {
-                    return true;
-                }
+                && is_pid_alive(info.pid)
+            {
+                return true;
+            }
         }
     }
 

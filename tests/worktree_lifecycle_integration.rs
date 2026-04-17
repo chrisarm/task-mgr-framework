@@ -12,7 +12,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use task_mgr::db::lock::LockGuard;
-use task_mgr::loop_engine::display::{format_session_banner, SessionBannerHints};
+use task_mgr::loop_engine::display::{SessionBannerHints, format_session_banner};
 use task_mgr::loop_engine::worktree::{ensure_worktree, remove_worktree};
 
 // ============================================================================
@@ -263,7 +263,7 @@ fn test_remove_worktree_nonexistent_returns_false() {
 #[ignore]
 fn test_full_loop_worktree_created_and_cleaned_up() {
     use task_mgr::loop_engine::config::LoopConfig;
-    use task_mgr::loop_engine::engine::{run_loop, LoopRunConfig};
+    use task_mgr::loop_engine::engine::{LoopRunConfig, run_loop};
 
     let repo = TempDir::new().unwrap();
     init_git_repo(repo.path(), "main");

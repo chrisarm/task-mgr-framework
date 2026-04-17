@@ -7,10 +7,10 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::learnings::crud::get_learning;
-use crate::learnings::crud::{edit_learning, EditLearningParams};
-use crate::models::Confidence;
 use crate::TaskMgrResult;
+use crate::learnings::crud::get_learning;
+use crate::learnings::crud::{EditLearningParams, edit_learning};
+use crate::models::Confidence;
 
 /// Result of invalidating a learning.
 #[derive(Debug, Clone, Serialize)]
@@ -127,7 +127,7 @@ pub fn format_text(result: &InvalidateLearningResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::learnings::test_helpers::{retire_learning, setup_db};
     use crate::models::{Confidence, LearningOutcome};
 

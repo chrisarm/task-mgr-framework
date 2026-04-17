@@ -160,6 +160,24 @@ fn parse_env_bool(key: &str) -> Option<bool> {
 /// container or VM.
 pub const CODING_ALLOWED_TOOLS: &str = "Read,Edit,Write,WebFetch,WebSearch,NotebookEdit,Agent,LSP,Bash(cargo:*),Bash(git:*),Bash(task-mgr:*),Bash(mkdir:*),Bash(ls:*),Bash(wc:*),Bash(head:*),Bash(tail:*),Bash(cat:*),Bash(find:*),Bash(rg:*),Bash(sed:*),Bash(cd:*),Bash(ruff:*),Bash(mypy:*),Bash(uv:*),Bash(pytest:*),Bash(python:*),Bash(pip:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(bun:*),Bash(pnpm:*),Bash(yarn:*),Bash(make:*),Bash(grep:*),Bash(awk:*),Bash(sort:*),Bash(uniq:*),Bash(tr:*),Bash(cut:*),Bash(diff:*),Bash(touch:*),Bash(cp:*),Bash(mv:*),Bash(rm:*),Bash(chmod:*),Bash(echo:*),Bash(printf:*),Bash(tee:*),Bash(xargs:*),Bash(jq:*),Bash(yq:*),Bash(tree:*),Bash(which:*),Bash(command:*),Bash(pwd:*),Bash(realpath:*),Bash(dirname:*),Bash(basename:*),Bash(date:*),Bash(stat:*),Bash(env:*),Bash(rustup:*),Bash(mix:*),Bash(elixir:*),Bash(iex:*),Bash(hex:*),Bash(rebar3:*),Bash(shellcheck:*),Bash(shfmt:*),Bash(strings:*),Bash(file:*),Glob,Grep";
 
+/// Tools to deny for the coding agent, passed via `--disallowedTools`.
+///
+/// Prevents the loop agent from directly editing or creating `.task-mgr/tasks/*.json`
+/// files. The loop engine is the sole writer of PRD JSON; agents must use
+/// `task-mgr add --stdin` or `<task-status>` tags instead.
+///
+/// # Research note
+///
+/// The Claude CLI does not support negative patterns within `--allowedTools`
+/// (e.g. `Edit(!tasks/*.json)` is not a documented syntax). The separate
+/// `--disallowedTools` flag is the correct mechanism for path-scoped denials.
+///
+/// `Read` on tasks/*.json is intentionally NOT denied — agents may read the PRD
+/// for context. `Bash(task-mgr:*)` is intentionally NOT denied — it is the
+/// approved replacement for JSON edits.
+pub(crate) const TASKS_JSON_DISALLOWED_TOOLS: &str =
+    "Edit(.task-mgr/tasks/*.json),Write(.task-mgr/tasks/*.json)";
+
 /// Permission mode for Claude subprocess invocation.
 ///
 /// Determines which permission flags are passed to `claude` when spawning a
@@ -292,11 +310,12 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
 
     // 3. Custom allowlist → explicit scoped mode, no project config merge.
     if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS")
-        && !tools.is_empty() {
-            return PermissionMode::Scoped {
-                allowed_tools: Some(tools),
-            };
-        }
+        && !tools.is_empty()
+    {
+        return PermissionMode::Scoped {
+            allowed_tools: Some(tools),
+        };
+    }
 
     // 4. Project config permissionMode (from .task-mgr/config.json).
     let project_config = super::project_config::read_project_config(db_dir);
@@ -416,11 +435,12 @@ pub fn permission_mode_from_env() -> PermissionMode {
 
     // 3. Custom allowlist → explicit scoped mode.
     if let Ok(tools) = std::env::var("LOOP_ALLOWED_TOOLS")
-        && !tools.is_empty() {
-            return PermissionMode::Scoped {
-                allowed_tools: Some(tools),
-            };
-        }
+        && !tools.is_empty()
+    {
+        return PermissionMode::Scoped {
+            allowed_tools: Some(tools),
+        };
+    }
 
     // 4. Default → Scoped with coding allowlist.
     PermissionMode::Scoped {
@@ -981,7 +1001,37 @@ mod tests {
         assert_eq!(mode.to_string(), "Scoped (3 tools)");
     }
 
-    // --- CODING_ALLOWED_TOOLS constant ---
+    // --- CODING_ALLOWED_TOOLS / TASKS_JSON_DISALLOWED_TOOLS constants ---
+
+    #[test]
+    fn test_coding_allowed_tools_permits_task_mgr_bash() {
+        assert!(
+            CODING_ALLOWED_TOOLS.contains("Bash(task-mgr:*)"),
+            "CODING_ALLOWED_TOOLS must contain 'Bash(task-mgr:*)' so the loop agent can use task-mgr CLI"
+        );
+    }
+
+    #[test]
+    fn test_tasks_json_disallowed_tools_is_path_scoped() {
+        // Known-bad guard: a blanket "Edit" deny would block legitimate src/**/*.rs edits.
+        // The constant must reference path patterns, not deny the tool wholesale.
+        assert!(
+            !TASKS_JSON_DISALLOWED_TOOLS.starts_with("Edit,")
+                && TASKS_JSON_DISALLOWED_TOOLS != "Edit"
+                && !TASKS_JSON_DISALLOWED_TOOLS.starts_with("Write,")
+                && TASKS_JSON_DISALLOWED_TOOLS != "Write",
+            "TASKS_JSON_DISALLOWED_TOOLS must use path-scoped patterns, not blanket Edit/Write denials"
+        );
+        // Must target the tasks JSON path specifically.
+        assert!(
+            TASKS_JSON_DISALLOWED_TOOLS.contains(".task-mgr/tasks/"),
+            "TASKS_JSON_DISALLOWED_TOOLS must reference .task-mgr/tasks/ path"
+        );
+        assert!(
+            TASKS_JSON_DISALLOWED_TOOLS.contains(".json"),
+            "TASKS_JSON_DISALLOWED_TOOLS must target .json files"
+        );
+    }
 
     #[test]
     fn test_coding_allowed_tools_contains_required_tools() {

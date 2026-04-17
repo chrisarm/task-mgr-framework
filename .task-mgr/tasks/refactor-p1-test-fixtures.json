@@ -1,0 +1,872 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "main",
+  "mergeStrategy": "Direct commits to main. Each FEAT task is a clean atomic commit; CODE-REVIEW-1, REFACTOR-REVIEW-1, MILESTONE-1, INT-001, REFACTOR-REVIEW-3, VERIFY-001, MILESTONE-FINAL gate progress. No merge step needed since work is on main.",
+  "description": "Refactor P1 of approved 4-phase plan: introduce a single crate-wide TestDb test fixture (src/db/test_utils.rs) and migrate ~40 hand-rolled TempDir+open_connection+create_schema+run_migrations blocks across src/commands/, src/loop_engine/, src/db/, and src/learnings/. Deletes both legacy helpers (src/learnings/test_helpers.rs::setup_db and src/loop_engine/test_utils.rs::setup_test_db) while preserving every other symbol they export. Pure refactor — no production behavior change.",
+  "requires": [],
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. PHASE 2 FOUNDATION — If a more sophisticated solution costs ~1 day now but saves ~2+ weeks post-launch, take that trade-off (1:10 ratio or better). We are pre-launch; foundations compound enormously",
+      "3. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "4. CORRECTNESS — Self-critique after code. Code compiles, type-checks, passes all tests deterministically",
+      "5. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings",
+      "6. POLISH — Documentation, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations; if ~1 day now saves ~2+ weeks later (1:10+ ratio), take the sophisticated path",
+      "Edge cases = test cases — every known edge case must have a corresponding test; boundaries are where bugs hide",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Ship solid working code with tests to prove it",
+      "Handle Option/Result explicitly; avoid unwrap() in production code (test setup MAY use .expect() with diagnostic messages)"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Skipping or weakening any pre-existing test to make migration easier",
+    "Silently converting a partial-migration test (which calls migrate_up directly) into a fully-migrated test — would mask version-specific bugs",
+    "Exposing TestDb / setup_test_db to release builds — must be #[cfg(test)] gated"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks in this PRD",
+    "criteria": [
+      "Rust: No warnings in `cargo check`",
+      "Rust: `cargo clippy -- -D warnings` passes",
+      "Rust: All tests pass with `cargo test` (test count must equal pre-refactor count)",
+      "Rust: `cargo fmt --check` passes",
+      "No skipped, ignored (#[ignore]), or weakened tests",
+      "All sweep tasks: `git diff` shows ONLY mechanical replacements of the 4-line setup pattern with `let db = setup_test_db();` (or unmigrated variant) and the corresponding rebinding of `&db.conn` / `&mut db.conn` / `db.db_dir()` at use sites — no logic changes",
+      "Helper module is `#[cfg(test)] pub(crate) mod test_utils;` so it contributes zero bytes to release binary"
+    ]
+  },
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before MILESTONE-1",
+      "medium": "21-50: Fix in current phase if time permits",
+      "low": "51-99: Defer to MILESTONE-FINAL"
+    }
+  },
+  "userStories": [
+    {
+      "id": "TEST-INIT-001",
+      "title": "Initial tests for TestDb and setup_test_db helpers",
+      "taskType": "test",
+      "description": "Write unit tests for the new TestDb struct and both setup helpers BEFORE the helper module is created. Tests must distinguish 'fully migrated' from 'schema-only' state, and ensure the tempdir actually outlives the connection.",
+      "acceptanceCriteria": [
+        "Test: `setup_test_db()` returns a TestDb whose conn reports schema_version == CURRENT_SCHEMA_VERSION (verifies all migrations applied)",
+        "Test: `setup_test_db_unmigrated()` returns a TestDb whose conn reports schema_version < CURRENT_SCHEMA_VERSION when any migrations exist (verifies migrations NOT applied)",
+        "Test: `TestDb::db_dir()` returns the same Path the tempdir was created at, and the path exists on disk while TestDb is alive",
+        "Test: dropping TestDb removes the tempdir from disk (assert directory exists before drop, gone after) — verifies RAII cleanup",
+        "Known-bad discriminator: at least one test would PASS for a stub helper that returned a fresh in-memory `Connection::open_in_memory()` but FAIL for the real helper (e.g., asserts the file at db_dir() exists)",
+        "Tests live in `#[cfg(test)] mod tests` block at the bottom of `src/db/test_utils.rs`",
+        "All tests use `assert_eq!` / `assert!` with descriptive messages; no `assert!(true)` or empty bodies"
+      ],
+      "priority": 1,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "TDD: write these tests first. They will fail to compile until FEAT-001 creates the module — that's expected. Use #[ignore] with a clear TODO comment if you want to commit the tests separately from the implementation, OR commit them together with FEAT-001. Reference: existing setup_db in src/learnings/test_helpers.rs:9-15 is the proven pattern; src/loop_engine/test_utils.rs:69-75 has the second copy. Learning [55] explicitly endorses 'single shared setup' as this codebase's preferred pattern.",
+      "qualityDimensions": {
+        "correctness": [
+          "Tests assert schema_version, NOT just 'no panic' — must distinguish fully migrated from schema-only",
+          "Tests verify TempDir lifetime is tied to TestDb (drop semantics)",
+          "Test for db_dir() must use a real filesystem assertion, not just type-check"
+        ],
+        "performance": [
+          "Each test runs in <100ms"
+        ],
+        "style": [
+          "Use `.expect(\"test DB setup: <step>\")` not `.unwrap()` so failures point to test_utils.rs",
+          "Tests use `let db = setup_test_db();` style — no tuple destructuring"
+        ]
+      },
+      "edgeCases": [
+        "TempDir dropped before connection is closed: must be impossible by ownership (TestDb owns both)",
+        "Schema-only DB asked for migrated state: caller used the wrong helper — verify schema_version reflects choice",
+        "Two consecutive `setup_test_db()` calls return distinct TempDirs (no shared state)",
+        "Migration tests calling `migrate_up` after `setup_test_db_unmigrated()` arrive at the same state as `setup_test_db()` (helpers are equivalent up to migration application)"
+      ],
+      "invariants": [
+        "TestDb owns BOTH `conn: Connection` and `tmp: TempDir`; neither field can outlive the other",
+        "`setup_test_db()` always returns a connection at `CURRENT_SCHEMA_VERSION`",
+        "`setup_test_db_unmigrated()` returns a connection at the schema's bootstrap version (whatever `create_schema` produces, before migrations)",
+        "`db.db_dir()` is `&Path` borrowed from `db.tmp.path()` — never returns a fresh allocation"
+      ],
+      "failureModes": [
+        {
+          "cause": "Tempdir creation fails (out of disk, permissions)",
+          "expectedBehavior": "Helper panics via `.expect(\"test DB setup: create tempdir\")` — diagnostic message points to test_utils.rs"
+        },
+        {
+          "cause": "Schema creation fails on existing migration",
+          "expectedBehavior": "Helper panics via `.expect(\"test DB setup: create schema\")` — diagnostic message points to test_utils.rs"
+        }
+      ],
+      "touchesFiles": [
+        "src/db/test_utils.rs"
+      ],
+      "dependsOn": [],
+      "synergyWith": ["FEAT-001"],
+      "batchWith": ["FEAT-001"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-001",
+      "title": "Foundation: create src/db/test_utils.rs with TestDb + setup_test_db + setup_test_db_unmigrated",
+      "taskType": "implementation",
+      "description": "Create the new test fixture module at src/db/test_utils.rs containing the TestDb struct and both helper functions. Wire it into src/db/mod.rs behind #[cfg(test)] pub(crate). This is the foundation — every later sweep task depends on it.",
+      "acceptanceCriteria": [
+        "New file `src/db/test_utils.rs` exists with: `pub struct TestDb { pub conn: Connection, pub tmp: TempDir }`, `impl TestDb { pub fn db_dir(&self) -> &Path }`, `pub fn setup_test_db() -> TestDb`, `pub fn setup_test_db_unmigrated() -> TestDb`",
+        "Helpers use `.expect(\"test DB setup: <step>\")` with distinct messages per step (tempdir, open, schema, migrations) — NOT `.unwrap()`",
+        "`src/db/mod.rs` adds `#[cfg(test)] pub(crate) mod test_utils;`",
+        "All TEST-INIT-001 tests pass",
+        "`cargo build --release` shows no test_utils symbols in the binary (verify with `cargo build --release && nm target/release/task-mgr 2>&1 | grep -c test_utils` returns 0, OR document why this can't be checked locally)",
+        "Module body is < 60 lines including doc comments and the test mod"
+      ],
+      "priority": 6,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Foundation task — uses opus because architectural decisions here propagate to ~40 call sites. Imports: `use crate::db::{create_schema, migrations::run_migrations, open_connection};` and `use rusqlite::Connection; use std::path::Path; use tempfile::TempDir;`. Mirror src/learnings/test_helpers.rs:9-15 verbatim for the body (literally the same 4 calls), but wrap in `TestDb { conn, tmp }` instead of returning a tuple. Learning [55] (high confidence, 10/19 applied) endorses this consolidation. Reference src/loop_engine/test_utils.rs lines 69-75 to see the existing duplicated copy.",
+      "qualityDimensions": {
+        "correctness": [
+          "Helper bodies are functionally identical to existing 4-line pattern — same pragmas, same schema, same migration order",
+          "Both helpers return `TestDb` (not `Result<TestDb, _>`) — tests are allowed to panic on setup failure",
+          "Module gated by `#[cfg(test)]` so it contributes zero bytes to release binary"
+        ],
+        "performance": [
+          "No fixture caching, no shared state — each call gets a fresh tempdir + connection",
+          "Helper itself adds no measurable overhead vs the inlined 4-liner"
+        ],
+        "style": [
+          "Use `.expect(msg)` not `.unwrap()`; messages start with 'test DB setup:'",
+          "`pub` fields on TestDb (not getters) — call sites write `&db.conn`, `&mut db.conn` directly",
+          "Doc comments on the struct and both functions explaining when to use which",
+          "Follow existing import organization in nearby modules"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/test_utils.rs",
+        "src/db/mod.rs"
+      ],
+      "dependsOn": ["TEST-INIT-001"],
+      "synergyWith": ["TEST-INIT-001"],
+      "batchWith": ["TEST-INIT-001"],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-002",
+      "title": "Migrate src/learnings/ test sites + delete legacy setup_db",
+      "taskType": "implementation",
+      "description": "Replace 4-line setup blocks in src/learnings/ tests with the new helper. After all 5 callers are migrated, delete `setup_db()` from src/learnings/test_helpers.rs (lines 9-15). Preserve `retire_learning` and `insert_task_with_files` in that file.",
+      "acceptanceCriteria": [
+        "Each of these files imports `crate::db::test_utils::setup_test_db` and uses `let db = setup_test_db();`: src/learnings/bandit.rs, src/learnings/crud/tests.rs, src/learnings/embeddings/mod.rs, src/learnings/recall/tests.rs, src/learnings/retrieval/tests.rs",
+        "src/learnings/test_helpers.rs::setup_db (lines 9-15) is DELETED",
+        "src/learnings/test_helpers.rs still exports retire_learning and insert_task_with_files (no other deletions)",
+        "All learnings/ tests pass: `cargo test --lib learnings`",
+        "No `temp_dir.path()` / `TempDir::new()` references remain in any of the 5 migrated files (use `db.db_dir()` and `setup_test_db()` instead)",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 7,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Mechanical sweep. Pattern: replace `let temp_dir = TempDir::new()...; let mut conn = open_connection(temp_dir.path())...; create_schema(&conn)...; run_migrations(&mut conn)...;` with `let db = setup_test_db();`. Then update use sites: `&conn` → `&db.conn`, `&mut conn` → `&mut db.conn`, `temp_dir.path()` → `db.db_dir()`. Note that some callers use `let mut conn` for transactions — `db.conn` is a field, so write `&mut db.conn` for those uses. Existing local helpers in learnings/test_helpers.rs (`retire_learning`, `insert_task_with_files`) are KEPT.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count before and after migration is identical (no skipped/disabled tests)",
+          "Borrow-checker handling: `&mut db.conn` works for transaction sites that previously had `&mut conn`",
+          "Imports are minimal: `use crate::db::test_utils::setup_test_db;` (do NOT re-import open_connection / create_schema / run_migrations)"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline (`cargo test --lib learnings`)"
+        ],
+        "style": [
+          "No leftover unused imports (`open_connection`, `create_schema`, `run_migrations`, `TempDir`)",
+          "`use rusqlite::Connection;` removed if no longer used in test module",
+          "Imports grouped per existing file conventions"
+        ]
+      },
+      "touchesFiles": [
+        "src/learnings/bandit.rs",
+        "src/learnings/crud/tests.rs",
+        "src/learnings/embeddings/mod.rs",
+        "src/learnings/recall/tests.rs",
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/test_helpers.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-003a",
+      "title": "Migrate src/loop_engine/ batch A (5 files)",
+      "taskType": "implementation",
+      "description": "Migrate the first batch of loop_engine test files from `crate::loop_engine::test_utils::setup_test_db` to `crate::db::test_utils::setup_test_db`. This batch covers heavy-hitter files. Old helper STAYS for now (deleted in FEAT-003c).",
+      "acceptanceCriteria": [
+        "Each file imports `crate::db::test_utils::setup_test_db` (was `crate::loop_engine::test_utils::setup_test_db`) and uses `let db = setup_test_db();` style",
+        "Tuple destructuring `let (tmp, conn) = setup_test_db();` is fully replaced; subsequent uses become `&db.conn`, `&mut db.conn`, `db.db_dir()` as appropriate",
+        "Other imports from `loop_engine::test_utils` (e.g., `EnvGuard`, `CLAUDE_BINARY_MUTEX`, `insert_test_learning`, `setup_git_repo`) are PRESERVED — only `setup_test_db` import path changes",
+        "`cargo test --lib loop_engine::archive`, `loop_engine::batch`, `loop_engine::context`, `loop_engine::deadline`, `loop_engine::engine` all pass",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "loop_engine/ tests already use the EXISTING `setup_test_db` from `crate::loop_engine::test_utils`. The migration is two parts: (1) change the import path, (2) rebind the return type from `(TempDir, Connection)` to `TestDb` — `let (tmp, conn) = setup_test_db();` becomes `let db = setup_test_db();`. Many call sites bind `let mut conn` for transactions; these become `&mut db.conn`. Watch for lines like `tmp.path()` → `db.db_dir()`. Files in this batch: archive.rs, batch.rs, context.rs, deadline.rs, engine.rs.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "Borrow checker: every `&mut conn` use site becomes `&mut db.conn` — verify no aliasing violations introduced",
+          "Other helpers from loop_engine::test_utils are untouched (verify by re-running affected tests)"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports adjusted minimally (only setup_test_db path changes)",
+          "Variable name conventions preserved (tests that named the binding `temp_dir` may rename to `db` — preferred — or stay descriptive)"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/archive.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/context.rs",
+        "src/loop_engine/deadline.rs",
+        "src/loop_engine/engine.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-003b", "FEAT-003c"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-003b",
+      "title": "Migrate src/loop_engine/ batch B (6 files)",
+      "taskType": "implementation",
+      "description": "Migrate the second batch of loop_engine test files. Same pattern as FEAT-003a. Old helper STAYS for now.",
+      "acceptanceCriteria": [
+        "Each file imports `crate::db::test_utils::setup_test_db` and uses `let db = setup_test_db();`",
+        "Other test_utils symbols (EnvGuard etc.) preserved",
+        "`cargo test --lib loop_engine` passes for the affected modules",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 8,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files in this batch: git_reconcile.rs, monitor.rs, oauth.rs, prd_reconcile.rs (multiple call sites), progress.rs, prompt.rs. Same migration mechanics as FEAT-003a.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "Borrow checker passes",
+          "prd_reconcile.rs has many setup_test_db sites — verify all migrated, none missed"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports adjusted minimally"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/monitor.rs",
+        "src/loop_engine/oauth.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/prompt.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-003a", "FEAT-003c"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-003c",
+      "title": "Migrate src/loop_engine/ batch C + delete legacy setup_test_db",
+      "taskType": "implementation",
+      "description": "Migrate the final batch of loop_engine test files, then delete `setup_test_db()` (lines 69-75) from src/loop_engine/test_utils.rs. All other symbols in that file (EnvGuard, CLAUDE_BINARY_MUTEX, insert_test_learning, setup_git_repo, get_task_status, insert_task, insert_relationship, insert_prd_metadata, insert_done_task, etc.) MUST be preserved.",
+      "acceptanceCriteria": [
+        "Each file imports `crate::db::test_utils::setup_test_db` and uses `let db = setup_test_db();`",
+        "src/loop_engine/test_utils.rs lines 69-75 (the `setup_test_db` function) are DELETED — verify with `grep -n 'fn setup_test_db' src/loop_engine/test_utils.rs` returning zero hits",
+        "Every other symbol in src/loop_engine/test_utils.rs is still present and exported — verify with `grep -E 'pub (fn|struct|static)' src/loop_engine/test_utils.rs` matching the pre-edit list",
+        "`cargo test --lib loop_engine` passes for all loop_engine modules",
+        "`cargo clippy -- -D warnings` clean",
+        "No file outside src/db/test_utils.rs declares a fn named `setup_test_db` or `setup_db`"
+      ],
+      "priority": 9,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files in this batch: prompt_sections/escalation.rs, signals.rs, status_queries.rs, usage.rs, watchdog.rs PLUS the deletion in test_utils.rs. The deletion MUST happen after FEAT-003a and FEAT-003b are merged (dependsOn enforces this). Be surgical: only delete the function body lines 69-75 (and any preceding doc comment about it). Do NOT touch any other declaration. After edit, run the full test suite to catch any straggler that imports from the old path.",
+      "qualityDimensions": {
+        "correctness": [
+          "All other helpers in loop_engine/test_utils.rs remain importable",
+          "Final grep `grep -rn 'loop_engine::test_utils::setup_test_db' src/` returns zero results"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Doc comments orphaned by the deletion are also removed",
+          "If `use crate::db::{create_schema, migrations::run_migrations, open_connection};` becomes unused at the top of test_utils.rs (after deleting setup_test_db), remove that import too"
+        ]
+      },
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/escalation.rs",
+        "src/loop_engine/signals.rs",
+        "src/loop_engine/status_queries.rs",
+        "src/loop_engine/usage.rs",
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/test_utils.rs"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-003a", "FEAT-003b"],
+      "synergyWith": ["FEAT-003a", "FEAT-003b"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004a",
+      "title": "Migrate src/commands/ batch A (8 files)",
+      "taskType": "implementation",
+      "description": "Replace 4-line setup blocks with `let db = setup_test_db();` across the first batch of src/commands/ test sites. Mechanical sweep.",
+      "acceptanceCriteria": [
+        "Each file's tests use `let db = setup_test_db();` instead of the 4-line pattern",
+        "Imports cleaned: `use crate::db::test_utils::setup_test_db;` added; unused `open_connection`, `create_schema`, `run_migrations`, `TempDir`, `Connection` imports removed from test modules",
+        "`cargo test --lib commands` passes for the affected modules",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 10,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files: apply_learning.rs, complete.rs, curate/tests.rs, decisions.rs, dependency_checker.rs, doctor/mod.rs, doctor/setup_checks.rs, doctor/setup_fixes.rs. Some of these files have multiple test functions each containing the 4-liner — migrate ALL occurrences. Some sites use `.expect(\"create temp dir\")` instead of `.unwrap()` — switch to `setup_test_db()` regardless; the helper has its own diagnostic messages.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged per file",
+          "All call sites in each file migrated (use `grep TempDir::new <file>` to verify zero hits after edit, allowing for non-DB tempdir uses if any)"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline per file"
+        ],
+        "style": [
+          "Removed unused imports cleanly (no leftover commas / blank lines in the import block)",
+          "Variable rebound to `db` (preferred) rather than maintaining `temp_dir`/`conn` names"
+        ]
+      },
+      "touchesFiles": [
+        "src/commands/apply_learning.rs",
+        "src/commands/complete.rs",
+        "src/commands/curate/tests.rs",
+        "src/commands/decisions.rs",
+        "src/commands/dependency_checker.rs",
+        "src/commands/doctor/mod.rs",
+        "src/commands/doctor/setup_checks.rs",
+        "src/commands/doctor/setup_fixes.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-004b", "FEAT-004c", "FEAT-004d"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004b",
+      "title": "Migrate src/commands/ batch B (8 files)",
+      "taskType": "implementation",
+      "description": "Continuation of commands/ sweep.",
+      "acceptanceCriteria": [
+        "Each file's tests migrated; imports cleaned",
+        "`cargo test --lib commands` passes",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 10,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files: doctor/tests.rs, export/tests.rs, fail/tests.rs, history.rs, import_learnings/mod.rs, import_learnings/tests.rs, init/import.rs, init/tests.rs. Some sites use `.expect(\"create temp dir\")` and similar variations — replace with `setup_test_db()` regardless.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "All sites migrated in each file"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports cleaned"
+        ]
+      },
+      "touchesFiles": [
+        "src/commands/doctor/tests.rs",
+        "src/commands/export/tests.rs",
+        "src/commands/fail/tests.rs",
+        "src/commands/history.rs",
+        "src/commands/import_learnings/mod.rs",
+        "src/commands/import_learnings/tests.rs",
+        "src/commands/init/import.rs",
+        "src/commands/init/tests.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-004a", "FEAT-004c", "FEAT-004d"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004c",
+      "title": "Migrate src/commands/ batch C (8 files)",
+      "taskType": "implementation",
+      "description": "Continuation of commands/ sweep.",
+      "acceptanceCriteria": [
+        "Each file's tests migrated; imports cleaned",
+        "`cargo test --lib commands` passes",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 11,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files: irrelevant.rs, learnings.rs, list.rs, migrate.rs, next/tests.rs, recall.rs, reset.rs, review.rs.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "All sites migrated"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports cleaned"
+        ]
+      },
+      "touchesFiles": [
+        "src/commands/irrelevant.rs",
+        "src/commands/learnings.rs",
+        "src/commands/list.rs",
+        "src/commands/migrate.rs",
+        "src/commands/next/tests.rs",
+        "src/commands/recall.rs",
+        "src/commands/reset.rs",
+        "src/commands/review.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-004a", "FEAT-004b", "FEAT-004d"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-004d",
+      "title": "Migrate src/commands/ batch D (6 files)",
+      "taskType": "implementation",
+      "description": "Final batch of commands/ sweep.",
+      "acceptanceCriteria": [
+        "Each file's tests migrated; imports cleaned",
+        "`cargo test --lib commands` passes",
+        "`cargo clippy -- -D warnings` clean",
+        "After this task: `grep -lE 'TempDir::new' src/commands/*.rs src/commands/*/*.rs` shows ZERO files containing the 4-line setup pattern (some files may still use TempDir for non-DB fixtures — those are fine)"
+      ],
+      "priority": 12,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files: run.rs, show.rs, skip.rs, stats.rs, unblock.rs, worktrees.rs. Final commands/ batch — do the post-batch grep verification listed in acceptance criteria.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "All sites migrated; final grep is the gate"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports cleaned"
+        ]
+      },
+      "touchesFiles": [
+        "src/commands/run.rs",
+        "src/commands/show.rs",
+        "src/commands/skip.rs",
+        "src/commands/stats.rs",
+        "src/commands/unblock.rs",
+        "src/commands/worktrees.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-004a", "FEAT-004b", "FEAT-004c"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-005a",
+      "title": "Migrate src/db/ non-migration test sites (5 files)",
+      "taskType": "implementation",
+      "description": "Sweep src/db/ test files that are NOT in src/db/migrations/ — these all want a fully-migrated DB.",
+      "acceptanceCriteria": [
+        "Each file uses `let db = setup_test_db();`",
+        "Imports cleaned; tests pass",
+        "`cargo test --lib db::connection`, `db::lock`, `db::schema::key_decisions`, `db::schema::tests`, `db::soft_archive` all pass",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 12,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Files: src/db/connection.rs, src/db/lock.rs, src/db/schema/key_decisions.rs, src/db/schema/tests.rs, src/db/soft_archive.rs. These tests want full migration — use the `setup_test_db()` helper (NOT the unmigrated variant). Use `crate::db::test_utils::setup_test_db` since these files are inside src/db/.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count unchanged",
+          "All sites migrated in each file"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Imports cleaned"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/connection.rs",
+        "src/db/lock.rs",
+        "src/db/schema/key_decisions.rs",
+        "src/db/schema/tests.rs",
+        "src/db/soft_archive.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-005b"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "FEAT-005b",
+      "title": "Migrate src/db/migrations/ test sites with care for stepwise tests (6 files)",
+      "taskType": "implementation",
+      "description": "Migrate src/db/migrations/ test sites. CRITICAL: tests that explicitly call `migrate_up` to step through versions need `setup_test_db_unmigrated()` (NOT `setup_test_db()`) — converting them to the fully-migrated helper would silently destroy version-stepping coverage. Tests that only assert the final fully-migrated state can use `setup_test_db()`.",
+      "acceptanceCriteria": [
+        "Each file's tests migrated to the appropriate helper variant",
+        "Tests that call `migrate_up`/`migrate_down` directly use `setup_test_db_unmigrated()` so the migration call is meaningful (not a no-op)",
+        "Tests that only assert the post-migration steady state use `setup_test_db()`",
+        "Each test that calls `migrate_up()` after `setup_test_db_unmigrated()` produces the same final schema_version as the previous test — verify with at least one before/after comparison test that proves equivalence",
+        "All migration tests pass: `cargo test --lib db::migrations`",
+        "`cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 12,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "notes": "Files: src/db/migrations/tests.rs, src/db/migrations/v12.rs, src/db/migrations/v13.rs, src/db/migrations/v14.rs, src/db/migrations/v15.rs, src/db/migrations/v16.rs. The vN.rs files each have a `setup_migrated_db()` local helper — DELETE these locals and replace calls with the new shared helper. For v13.rs:49-55 (and analogous in other vN files), the pattern uses `run_migrations`, so `setup_test_db()` is the correct replacement. For tests.rs, look for tests that build up from a clean state with explicit `migrate_up(&mut conn).unwrap();` calls — those need `setup_test_db_unmigrated()`. Risk R3 from the PRD applies here — be deliberate.",
+      "qualityDimensions": {
+        "correctness": [
+          "NO test silently switches from 'partial migration' to 'full migration' — preserve the test author's intent",
+          "Test count unchanged per file",
+          "Schema version assertions in migration tests still hold (these tests typically check `get_schema_version(&conn) == 13` etc.)"
+        ],
+        "performance": [
+          "Test runtime within ±10% of baseline"
+        ],
+        "style": [
+          "Local `setup_migrated_db` helpers in vN.rs files are DELETED (replaced by the shared helper)",
+          "Imports cleaned"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/migrations/tests.rs",
+        "src/db/migrations/v12.rs",
+        "src/db/migrations/v13.rs",
+        "src/db/migrations/v14.rs",
+        "src/db/migrations/v15.rs",
+        "src/db/migrations/v16.rs"
+      ],
+      "dependsOn": ["FEAT-001"],
+      "synergyWith": ["FEAT-005a"],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "CODE-REVIEW-1",
+      "title": "Review test-fixture refactor for quality, wiring, and lurking issues",
+      "taskType": "review",
+      "description": "Review all migrated files for: (1) borrow-checker correctness on `&db.conn` / `&mut db.conn` rebinding, (2) imports cleaned (no orphans), (3) preserved test count, (4) preserved test author intent (especially in migration tests), (5) helper actually exists and is exported correctly.",
+      "acceptanceCriteria": [
+        "Run `grep -U -rn 'TempDir::new\\(\\).*\\n.*open_connection.*\\n.*create_schema' src/ --include='*.rs'` — must return ZERO hits outside src/db/test_utils.rs",
+        "Run `grep -rn 'fn setup_db\\(\\)\\|fn setup_test_db\\(\\)' src/ --include='*.rs'` — must return ONLY the canonical declarations in src/db/test_utils.rs",
+        "Run `cargo test 2>&1 | tee /tmp/test-results.txt | tail -3 && grep 'FAILED\\|error\\[' /tmp/test-results.txt | head -10` — exit code 0, no failures",
+        "Run `cargo clippy -- -D warnings 2>&1 | tee /tmp/clippy.txt | tail -3 && grep '^error' /tmp/clippy.txt | head -10` — exit code 0, no warnings",
+        "Run `cargo fmt --check` — exit code 0",
+        "Confirm `src/learnings/test_helpers.rs` still exports `retire_learning` and `insert_task_with_files` (grep)",
+        "Confirm `src/loop_engine/test_utils.rs` still exports `EnvGuard`, `CLAUDE_BINARY_MUTEX`, `insert_test_learning`, `setup_git_repo`, `get_task_status`, `insert_task`, `insert_relationship`, `insert_prd_metadata`, `insert_done_task` (grep)",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added to the JSON with priority 14-16 and added to MILESTONE-1 dependsOn"
+      ],
+      "priority": 13,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Pure refactor → focus on completeness and integration wiring. Use the rust-python-code-reviewer subagent if available. The most likely failure modes are: (a) a file has TWO independent test functions, only one was migrated; (b) borrow checker panics in a transaction-using site; (c) a migration test silently lost stepwise coverage by switching to setup_test_db (per Risk R3). For each issue: add a CODE-FIX-xxx (priority 14-16), add it to MILESTONE-1 dependsOn, commit JSON. Mark passes:true once all issues have spawned tasks (or 'No issues found' note).",
+      "qualityDimensions": {
+        "correctness": [
+          "Every grep listed in acceptanceCriteria is actually run and reported in progress",
+          "Every preserved-symbol verification is actually grep'd"
+        ],
+        "performance": [
+          "n/a"
+        ],
+        "style": [
+          "n/a — review only"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/test_utils.rs",
+        "src/db/mod.rs",
+        "src/learnings/test_helpers.rs",
+        "src/loop_engine/test_utils.rs"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003a",
+        "FEAT-003b",
+        "FEAT-003c",
+        "FEAT-004a",
+        "FEAT-004b",
+        "FEAT-004c",
+        "FEAT-004d",
+        "FEAT-005a",
+        "FEAT-005b"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-1",
+      "title": "Review the new test_utils.rs for refactoring opportunities",
+      "taskType": "review",
+      "description": "Review the new src/db/test_utils.rs (and the deletions in legacy helpers) for: DRY violations between setup_test_db and setup_test_db_unmigrated, function length, doc clarity, and whether the TestDb struct surface should grow or stay minimal at this stage.",
+      "acceptanceCriteria": [
+        "src/db/test_utils.rs body is well-organized: imports → struct → impl → setup helpers → tests",
+        "No code duplication between `setup_test_db` and `setup_test_db_unmigrated` worth extracting (this PRD prefers small duplication over premature abstraction since the bodies are 4 vs 5 lines)",
+        "Doc comments answer 'when do I use which helper?' clearly",
+        "Any issues found have corresponding REFACTOR-1-xxx tasks added to JSON with priority 18-19 and added to MILESTONE-1 dependsOn"
+      ],
+      "priority": 17,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Light review for a pure-refactor PRD. Prefer 'no refactoring needed' over premature abstraction. The two helpers diverge by exactly one line (`run_migrations` call) — extracting a private inner helper for the shared 4 lines is acceptable but not required.",
+      "qualityDimensions": {
+        "correctness": [
+          "n/a — review only"
+        ],
+        "performance": [
+          "n/a"
+        ],
+        "style": [
+          "n/a"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/test_utils.rs",
+        "src/db/mod.rs"
+      ],
+      "dependsOn": ["CODE-REVIEW-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-1",
+      "title": "MILESTONE-1: All migration sweeps complete, reviews passed",
+      "taskType": "milestone",
+      "description": "Review-and-update checkpoint. All call sites migrated, both legacy helpers deleted, full test suite green, clippy clean. Update remaining tasks (INT-001, REFACTOR-REVIEW-3, VERIFY-001, MILESTONE-FINAL) based on what was actually shipped.",
+      "acceptanceCriteria": [
+        "All initial tests (TEST-INIT-001) pass",
+        "All FEAT-xxx tasks pass",
+        "CODE-REVIEW-1 passes (and any spawned CODE-FIX-xxx tasks)",
+        "REFACTOR-REVIEW-1 passes (and any spawned REFACTOR-1-xxx tasks)",
+        "All new code is reachable from production entry points (no dead code)",
+        "No unused warnings for new code in `cargo check`/`cargo clippy`",
+        "Remaining tasks in this PRD reviewed and updated based on implementation learnings (any stragglers found during sweep added to INT-001 or VERIFY-001 scope)",
+        "Sibling PRDs (refactor-p2, p3, p4) NOT updated — they don't exist yet; this is the first phase"
+      ],
+      "priority": 20,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Review-and-update checkpoint. Read the progress file and git log; identify any deviations from this PRD's plan (e.g., a file that turned out to need different treatment, a test that exposed a gap in the helper). Update INT-001 / REFACTOR-REVIEW-3 / VERIFY-001 / MILESTONE-FINAL as needed. No sibling PRDs to update yet — Phase 2-4 PRDs will be generated after this phase ships.",
+      "touchesFiles": [
+        ".task-mgr/tasks/refactor-p1-test-fixtures.json"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003a",
+        "FEAT-003b",
+        "FEAT-003c",
+        "FEAT-004a",
+        "FEAT-004b",
+        "FEAT-004c",
+        "FEAT-004d",
+        "FEAT-005a",
+        "FEAT-005b",
+        "CODE-REVIEW-1",
+        "REFACTOR-REVIEW-1"
+      ],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "INT-001",
+      "title": "Verify cross-module integration: helper reachable from every test module",
+      "taskType": "verification",
+      "description": "Trace the data/control path: src/db/test_utils.rs → consumers across src/commands/, src/loop_engine/, src/db/, src/learnings/. Confirm imports resolve, helper is callable, and the #[cfg(test)] gating actually keeps it out of release builds.",
+      "acceptanceCriteria": [
+        "Trace path: `src/db/mod.rs` declares `#[cfg(test)] pub(crate) mod test_utils;` → `crate::db::test_utils::setup_test_db` is importable from every other module under `src/`",
+        "Run `cargo test --lib 2>&1 | tee /tmp/int.txt | tail -5 && grep 'test result' /tmp/int.txt` — total test count equals the count BEFORE this refactor began (record both numbers in the progress file)",
+        "Run `cargo build --release 2>&1 | tee /tmp/release.txt | tail -3` — succeeds with no warnings",
+        "CONTRACT: `let db = setup_test_db(); &db.conn` returns a `&rusqlite::Connection` (verify by compiling a one-line snippet in the test_utils unit-test mod)",
+        "CONTRACT: `db.db_dir()` returns `&std::path::Path` (compile-time check)",
+        "No dead code along the traced path — `cargo clippy -- -D warnings` clean"
+      ],
+      "priority": 55,
+      "estimatedEffort": "low",
+      "passes": false,
+      "notes": "Pure verification — no new code unless wiring is missing. The 'baseline test count' should be captured BEFORE FEAT-001 starts (record it during TEST-INIT-001 progress note). If baseline wasn't captured, use `git stash` + `cargo test` on a clean main as a fallback.",
+      "qualityDimensions": {
+        "correctness": [
+          "Test count parity is the gate; do not skip it"
+        ],
+        "performance": [
+          "Release build time within ±5% of baseline"
+        ],
+        "style": [
+          "n/a"
+        ]
+      },
+      "touchesFiles": [
+        "src/db/test_utils.rs",
+        "src/db/mod.rs"
+      ],
+      "dependsOn": ["MILESTONE-1"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "REFACTOR-REVIEW-3",
+      "title": "Final refactoring review for the entire P1 scope",
+      "taskType": "review",
+      "description": "Final review across all files touched: are imports clean, are leftover helpers/comments removed, did any test get accidentally weakened, is the new helper well-documented?",
+      "acceptanceCriteria": [
+        "All implementation and test files reviewed",
+        "No dead imports, no leftover `setup_db()` references in comments, no commented-out 4-line blocks",
+        "Test author intent preserved across all migration tests",
+        "Any issues found have corresponding REFACTOR-3-xxx tasks added to JSON with priority 71-85 and added to MILESTONE-FINAL dependsOn"
+      ],
+      "priority": 70,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "passes": false,
+      "notes": "Last chance to improve before merge. Light-touch for a refactor-only PRD. If no issues, mark passes:true with note 'No refactoring needed'.",
+      "touchesFiles": [
+        "src/db/test_utils.rs"
+      ],
+      "dependsOn": ["INT-001"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "VERIFY-001",
+      "title": "Final verification: full test suite, clippy, fmt, grep sweeps, doc updates",
+      "taskType": "verification",
+      "description": "Run the full quality gate one more time. Update CLAUDE.md with a brief 'Testing Database Setup' note pointing at src/db/test_utils.rs.",
+      "acceptanceCriteria": [
+        "`cargo test 2>&1 | tee /tmp/test-results.txt | tail -3 && grep 'FAILED\\|error\\[' /tmp/test-results.txt | head -10` — exit 0, no failures",
+        "`cargo clippy -- -D warnings 2>&1 | tee /tmp/clippy.txt | tail -3 && grep '^error' /tmp/clippy.txt | head -10` — exit 0, no warnings",
+        "`cargo fmt --check` — exit 0",
+        "`rg -U 'TempDir::new\\(\\).*\\n.*open_connection.*\\n.*create_schema' src/ --type rust` returns ONLY src/db/test_utils.rs",
+        "`rg 'fn setup_db\\(\\)|fn setup_test_db\\(\\)' src/ --type rust` returns ONLY src/db/test_utils.rs",
+        "`cargo build --release` succeeds with no warnings; release binary contains no 'test_utils' symbols (best-effort grep on `nm`/`strings` output)",
+        "CLAUDE.md (project-level) updated with a short 'Testing Database Setup' section linking src/db/test_utils.rs and explaining the two helpers (3-5 lines, not a full doc page)",
+        "`docs/` directory NOT updated — this is test plumbing, not architecture (skip unless something architectural changed)",
+        "All new public functions reachable from at least one entry point (test modules count)",
+        "No `.unwrap()` in production code paths (test setup is allowed to use `.expect()`)"
+      ],
+      "priority": 90,
+      "estimatedEffort": "medium",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Final gate. The grep sweeps are the most important — they prove the duplication is gone. CLAUDE.md update should be terse: 'Tests use `crate::db::test_utils::setup_test_db()` to get a fully-migrated TestDb (or `setup_test_db_unmigrated()` for stepwise migration tests).' That's it.",
+      "qualityDimensions": {
+        "correctness": [
+          "Every grep listed in acceptanceCriteria is actually run and reported"
+        ],
+        "performance": [
+          "Final test suite runtime within ±10% of baseline"
+        ],
+        "style": [
+          "CLAUDE.md note is terse and accurate"
+        ]
+      },
+      "touchesFiles": [
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["INT-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    },
+    {
+      "id": "MILESTONE-FINAL",
+      "title": "MILESTONE-FINAL: P1 complete, ready to start P2",
+      "taskType": "milestone",
+      "description": "Final review-and-update checkpoint. P1 is shippable; P2 (warn/error helpers) can begin after this passes.",
+      "acceptanceCriteria": [
+        "REFACTOR-REVIEW-3 passes",
+        "VERIFY-001 passes",
+        "All acceptance criteria across all tasks met",
+        "Sibling PRDs (P2, P3, P4) NOT updated yet — they don't exist; the next step is to invoke `/prd` for refactor-p2-output-helpers",
+        "CLAUDE.md updated per VERIFY-001",
+        "Plan file at $HOME/.claude/plans/drifting-soaring-ocean.md need NOT be edited (it's the plan, not a deliverable)",
+        "Final progress note in `tasks/progress-{prefix}.txt` summarizes: total files touched, total LOC removed, total test count parity confirmed"
+      ],
+      "priority": 99,
+      "estimatedEffort": "low",
+      "model": "claude-opus-4-6",
+      "timeoutSecs": 1800,
+      "passes": false,
+      "notes": "Phase 1 of 4. Next phase (P2 — warn/error helpers) is a separate PRD generated via `/prd` after this milestone passes. Do NOT auto-generate P2's PRD here; that's a deliberate manual step. Output `<promise>COMPLETE</promise>` once all dependencies pass.",
+      "touchesFiles": [
+        ".task-mgr/tasks/refactor-p1-test-fixtures.json"
+      ],
+      "dependsOn": ["VERIFY-001", "REFACTOR-REVIEW-3"],
+      "synergyWith": [],
+      "batchWith": [],
+      "conflictsWith": [],
+      "modifiesBehavior": false
+    }
+  ]
+}

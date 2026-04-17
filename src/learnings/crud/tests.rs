@@ -592,9 +592,11 @@ fn test_edit_learning_add_files() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_files".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_files".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let files = learning.applies_to_files.unwrap();
@@ -613,9 +615,11 @@ fn test_edit_learning_remove_files() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_files".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_files".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     // Files should be empty or None now
@@ -674,9 +678,11 @@ fn test_edit_learning_all_fields() {
     assert!(result.updated_fields.contains(&"solution".to_string()));
     assert!(result.updated_fields.contains(&"root_cause".to_string()));
     assert!(result.updated_fields.contains(&"confidence".to_string()));
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_files".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_files".to_string())
+    );
     assert!(result.updated_fields.contains(&"tags".to_string()));
     assert_eq!(result.tags_added, 1);
     assert_eq!(result.tags_removed, 1);
@@ -762,9 +768,11 @@ fn test_edit_learning_add_task_types() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let task_types = learning.applies_to_task_types.unwrap();
@@ -799,9 +807,11 @@ fn test_edit_learning_remove_task_types() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let task_types = learning.applies_to_task_types.unwrap();
@@ -820,9 +830,11 @@ fn test_edit_learning_add_errors() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let errors = learning.applies_to_errors.unwrap();
@@ -857,9 +869,11 @@ fn test_edit_learning_remove_errors() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let errors = learning.applies_to_errors.unwrap();
@@ -879,9 +893,11 @@ fn test_edit_learning_task_types_null_field_creates_array() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     assert_eq!(
@@ -904,9 +920,11 @@ fn test_edit_learning_errors_null_field_remove_is_noop() {
     // Should not error
     let result = edit_learning(&conn, learning_id, params).unwrap();
     // Field still updated (even though nothing changed)
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     // applies_to_errors should remain None/empty after removing from NULL
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
@@ -1039,12 +1057,16 @@ fn test_edit_learning_all_four_new_fields_simultaneously() {
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
     assert!(result.updated_fields.contains(&"title".to_string()));
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     assert_eq!(learning.title, "Updated title");
@@ -1085,9 +1107,11 @@ fn test_edit_learning_add_and_remove_task_types_in_same_call() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let task_types = learning.applies_to_task_types.unwrap();
@@ -1119,9 +1143,11 @@ fn test_edit_learning_add_errors_long_patterns() {
     };
 
     let result = edit_learning(&conn, learning_id, params).unwrap();
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();
     let errors = learning.applies_to_errors.unwrap();
@@ -1213,12 +1239,16 @@ fn test_edit_learning_only_new_fields_no_existing_fields() {
 
     // Only task_types and errors should be in updated_fields
     assert_eq!(result.updated_fields.len(), 2);
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_task_types".to_string()));
-    assert!(result
-        .updated_fields
-        .contains(&"applies_to_errors".to_string()));
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_task_types".to_string())
+    );
+    assert!(
+        result
+            .updated_fields
+            .contains(&"applies_to_errors".to_string())
+    );
 
     // Verify original fields remain unchanged
     let learning = get_learning(&conn, learning_id).unwrap().unwrap();

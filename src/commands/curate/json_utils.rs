@@ -6,9 +6,10 @@ pub(super) fn extract_json_array(text: &str) -> Option<String> {
 
     // Try raw JSON array first
     if trimmed.starts_with('[')
-        && let Some(end) = find_matching_bracket(trimmed) {
-            return Some(trimmed[..=end].to_string());
-        }
+        && let Some(end) = find_matching_bracket(trimmed)
+    {
+        return Some(trimmed[..=end].to_string());
+    }
 
     // Try markdown code block: ```json\n...\n```
     if let Some(start) = trimmed.find("```json") {

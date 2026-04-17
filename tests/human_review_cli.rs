@@ -9,8 +9,8 @@
 // Allow deprecated cargo_bin function - the macro alternative requires more boilerplate
 #![allow(deprecated)]
 
-use assert_cmd::cargo::cargo_bin;
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;

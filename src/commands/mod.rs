@@ -22,6 +22,7 @@
 //! - `import-learnings` - Import learnings from JSON
 //! - `apply-learning` - Record that a learning was applied
 
+pub mod add;
 pub mod apply_learning;
 pub mod complete;
 pub mod curate;
@@ -51,86 +52,87 @@ pub mod stats;
 pub mod unblock;
 pub mod worktrees;
 
+pub use add::{AddResult, AddTaskInput, PrioritySource, add, format_text as format_add_text};
 pub use apply_learning::{
-    apply_learning, format_text as format_apply_learning_text, ApplyLearningResult,
+    ApplyLearningResult, apply_learning, format_text as format_apply_learning_text,
 };
 pub use complete::{
-    complete, format_text as format_complete_text, CompleteResult, TaskCompletionResult,
+    CompleteResult, TaskCompletionResult, complete, format_text as format_complete_text,
 };
 pub use decisions::{
-    decline_decision_cmd, format_decline_text, format_list_text as format_decisions_list_text,
-    format_resolve_text, format_revert_text, list_decisions, resolve_decision_cmd,
-    revert_decision_cmd, DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult,
-    DecisionSummary, DecisionsListResult,
+    DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult, DecisionSummary,
+    DecisionsListResult, decline_decision_cmd, format_decline_text,
+    format_list_text as format_decisions_list_text, format_resolve_text, format_revert_text,
+    list_decisions, resolve_decision_cmd, revert_decision_cmd,
 };
 pub use doctor::{
-    audit_setup, doctor, format_doctor_verbose, format_setup_text,
-    format_text as format_doctor_text, DoctorResult, DoctorSummary, Fix, Issue, IssueType,
-    SetupAuditResult,
+    DoctorResult, DoctorSummary, Fix, Issue, IssueType, SetupAuditResult, audit_setup, doctor,
+    format_doctor_verbose, format_setup_text, format_text as format_doctor_text,
 };
-pub use export::{export, format_text as format_export_text, ExportResult};
-pub use fail::{fail, format_text as format_fail_text, FailResult, TaskFailResult};
+pub use export::{ExportResult, export, format_text as format_export_text};
+pub use fail::{FailResult, TaskFailResult, fail, format_text as format_fail_text};
 pub use history::{
+    HistoryResult, RunDetailResult, RunSummary, TaskAttempt,
     format_detail_text as format_history_detail_text, format_text as format_history_text, history,
-    history_detail, HistoryResult, RunDetailResult, RunSummary, TaskAttempt,
+    history_detail,
 };
 pub use import_learnings::{
-    format_text as format_import_learnings_text, import_learnings, ImportLearningsResult,
+    ImportLearningsResult, format_text as format_import_learnings_text, import_learnings,
 };
 pub use init::{
-    format_init_verbose, format_text as format_init_text, init, DryRunDeletePreview, InitResult,
-    PrefixMode,
+    DryRunDeletePreview, InitResult, PrefixMode, format_init_verbose,
+    format_text as format_init_text, init,
 };
 pub use invalidate_learning::{
-    format_text as format_invalidate_learning_text, invalidate_learning, InvalidateLearningResult,
+    InvalidateLearningResult, format_text as format_invalidate_learning_text, invalidate_learning,
 };
 pub use irrelevant::{
-    format_text as format_irrelevant_text, irrelevant, IrrelevantResult, TaskIrrelevantResult,
+    IrrelevantResult, TaskIrrelevantResult, format_text as format_irrelevant_text, irrelevant,
 };
-pub use learn::{format_text as format_learn_text, learn, LearnParams, LearnResult};
+pub use learn::{LearnParams, LearnResult, format_text as format_learn_text, learn};
 pub use learnings::{
-    format_text as format_learnings_text, list_learnings,
     LearningSummary as LearningsLearningSummary, LearningsListParams, LearningsListResult,
+    format_text as format_learnings_text, list_learnings,
 };
-pub use list::{format_text as format_list_text, list, ListResult, TaskSummary};
+pub use list::{ListResult, TaskSummary, format_text as format_list_text, list};
 pub use migrate::{
-    all as migrate_all, down as migrate_down_cmd, format_migrate_text, format_status_text,
-    status as migrate_status, up as migrate_up_cmd, MigrateResult, MigrationInfo, StatusResult,
+    MigrateResult, MigrationInfo, StatusResult, all as migrate_all, down as migrate_down_cmd,
+    format_migrate_text, format_status_text, status as migrate_status, up as migrate_up_cmd,
 };
 pub use next::{
-    apply_decay, find_decay_warnings, format_next_text, format_next_verbose,
-    format_text as format_selection_text, next, select_next_task, CandidateSummary, ClaimMetadata,
-    DecayWarning, LearningSummaryOutput, NextResult, NextTaskOutput, ScoreBreakdown, ScoreOutput,
-    ScoredTask, SelectionMetadata, SelectionResult, CONFLICT_PENALTY, FILE_OVERLAP_SCORE,
-    PRIORITY_BASE, SYNERGY_BONUS,
+    CONFLICT_PENALTY, CandidateSummary, ClaimMetadata, DecayWarning, FILE_OVERLAP_SCORE,
+    LearningSummaryOutput, NextResult, NextTaskOutput, PRIORITY_BASE, SYNERGY_BONUS,
+    ScoreBreakdown, ScoreOutput, ScoredTask, SelectionMetadata, SelectionResult, apply_decay,
+    find_decay_warnings, format_next_text, format_next_verbose,
+    format_text as format_selection_text, next, select_next_task,
 };
 pub use recall::{
-    format_text as format_recall_text, format_verbose as format_recall_verbose, recall,
     LearningSummary as RecallLearningSummary, RecallCmdParams, RecallCmdResult,
+    format_text as format_recall_text, format_verbose as format_recall_verbose, recall,
 };
 pub use reset::{
-    count_resettable_tasks, format_text as format_reset_text, reset_all_tasks, reset_tasks,
-    ResetResult, TaskResetResult,
+    ResetResult, TaskResetResult, count_resettable_tasks, format_text as format_reset_text,
+    reset_all_tasks, reset_tasks,
 };
 pub use review::{
-    auto_unblock_all, format_text as format_review_text, get_reviewable_tasks, resolve_task,
-    ReviewAction, ReviewActionType, ReviewOptions, ReviewResult, ReviewTask,
+    ReviewAction, ReviewActionType, ReviewOptions, ReviewResult, ReviewTask, auto_unblock_all,
+    format_text as format_review_text, get_reviewable_tasks, resolve_task,
 };
 pub use run::{
-    begin, end, format_begin_text, format_end_text, format_update_text, update, BeginResult,
-    EndResult, UpdateResult,
+    BeginResult, EndResult, UpdateResult, begin, end, format_begin_text, format_end_text,
+    format_update_text, update,
 };
-pub use show::{format_text as format_show_text, show, ShowResult};
-pub use skip::{format_text as format_skip_text, skip, SkipResult, TaskSkipResult};
+pub use show::{ShowResult, format_text as format_show_text, show};
+pub use skip::{SkipResult, TaskSkipResult, format_text as format_skip_text, skip};
 pub use stats::{
-    format_text as format_stats_text, stats, ActiveRunInfo, LearningCounts, StatsResult, TaskCounts,
+    ActiveRunInfo, LearningCounts, StatsResult, TaskCounts, format_text as format_stats_text, stats,
 };
 pub use unblock::{
-    format_unblock_text, format_unskip_text, unblock, unskip, UnblockResult, UnskipResult,
+    UnblockResult, UnskipResult, format_unblock_text, format_unskip_text, unblock, unskip,
 };
 pub use worktrees::{
-    format_text as format_worktrees_text, list as worktrees_list, prune as worktrees_prune,
-    remove as worktrees_remove, WorktreesResult,
+    WorktreesResult, format_text as format_worktrees_text, list as worktrees_list,
+    prune as worktrees_prune, remove as worktrees_remove,
 };
 
 /// Truncate a string to at most `max_chars` Unicode characters, appending "..." if truncated.

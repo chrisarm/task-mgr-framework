@@ -5,11 +5,11 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::db::{
-    get_migration_status, migrate_down, migrate_up, run_migrations, MigrationResult,
-    MigrationStatus,
-};
 use crate::TaskMgrResult;
+use crate::db::{
+    MigrationResult, MigrationStatus, get_migration_status, migrate_down, migrate_up,
+    run_migrations,
+};
 
 /// Result of migration status command
 #[derive(Debug, Clone, Serialize)]
@@ -169,7 +169,7 @@ pub fn format_migrate_text(result: &MigrateResult, action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{create_schema, open_connection, CURRENT_SCHEMA_VERSION};
+    use crate::db::{CURRENT_SCHEMA_VERSION, create_schema, open_connection};
     use tempfile::TempDir;
 
     fn setup_db() -> (TempDir, Connection) {

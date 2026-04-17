@@ -22,12 +22,12 @@ pub use types::{
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::learnings::crud::{get_learning_tags, record_learning, RecordLearningParams};
 use crate::learnings::LearningWriter;
+use crate::learnings::crud::{RecordLearningParams, get_learning_tags, record_learning};
 use crate::loop_engine::claude::spawn_claude;
 use crate::loop_engine::config::PermissionMode;
 
@@ -39,8 +39,8 @@ fn confidence_rank(s: &str) -> u8 {
         _ => 0,
     }
 }
-use crate::models::{Confidence, LearningOutcome};
 use crate::TaskMgrResult;
+use crate::models::{Confidence, LearningOutcome};
 
 /// Returns learning statistics: total, active, retired, and embedded counts.
 pub fn curate_count(conn: &Connection) -> TaskMgrResult<CountResult> {
@@ -587,62 +587,65 @@ fn process_batches_parallel(
         let queue = Arc::clone(&work_queue);
         let tx = tx.clone();
         let model = Arc::clone(&model);
-        let handle = std::thread::spawn(move || loop {
-            let item = {
-                let mut guard = queue.lock().expect("work queue lock poisoned");
-                guard.pop_front()
-            };
-            let (batch_idx, batch_items) = match item {
-                Some(x) => x,
-                None => break,
-            };
+        let handle = std::thread::spawn(move || {
+            loop {
+                let item = {
+                    let mut guard = queue.lock().expect("work queue lock poisoned");
+                    guard.pop_front()
+                };
+                let (batch_idx, batch_items) = match item {
+                    Some(x) => x,
+                    None => break,
+                };
 
-            let eligible_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
-            let prompt = build_dedup_prompt(&batch_items, threshold);
+                let eligible_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
+                let prompt = build_dedup_prompt(&batch_items, threshold);
 
-            let raw_clusters = match spawn_claude(
-                &prompt,
-                None,
-                None,
-                Some(&model),
-                None,
-                false,
-                &PermissionMode::text_only(),
-                None,
-            ) {
-                Err(e) => {
-                    eprintln!(
-                        "Warning: spawn_claude failed for batch {}: {}",
-                        batch_idx + 1,
-                        e
-                    );
-                    Err(())
-                }
-                Ok(r) if r.exit_code != 0 => {
-                    eprintln!(
-                        "Warning: claude exited with code {} for batch {}",
-                        r.exit_code,
-                        batch_idx + 1
-                    );
-                    Err(())
-                }
-                Ok(r) => match parse_dedup_response(&r.output, &eligible_ids) {
-                    Ok(clusters) => Ok(clusters),
+                let raw_clusters = match spawn_claude(
+                    &prompt,
+                    None,
+                    None,
+                    Some(&model),
+                    None,
+                    false,
+                    &PermissionMode::text_only(),
+                    None,
+                    None,
+                ) {
                     Err(e) => {
                         eprintln!(
-                            "Warning: failed to parse dedup response for batch {}: {}",
+                            "Warning: spawn_claude failed for batch {}: {}",
                             batch_idx + 1,
                             e
                         );
                         Err(())
                     }
-                },
-            };
+                    Ok(r) if r.exit_code != 0 => {
+                        eprintln!(
+                            "Warning: claude exited with code {} for batch {}",
+                            r.exit_code,
+                            batch_idx + 1
+                        );
+                        Err(())
+                    }
+                    Ok(r) => match parse_dedup_response(&r.output, &eligible_ids) {
+                        Ok(clusters) => Ok(clusters),
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to parse dedup response for batch {}: {}",
+                                batch_idx + 1,
+                                e
+                            );
+                            Err(())
+                        }
+                    },
+                };
 
-            let _ = tx.send(BatchOutput {
-                batch_idx,
-                raw_clusters,
-            });
+                let _ = tx.send(BatchOutput {
+                    batch_idx,
+                    raw_clusters,
+                });
+            }
         });
         handles.push(handle);
     }
@@ -974,7 +977,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 /// a warning printed to stderr.  All other errors (Ollama call failures, store
 /// failures) are counted and reported in the result without aborting the run.
 pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<EmbedResult> {
-    use crate::learnings::embeddings::{count_embedded, store_embedding, OllamaEmbedder};
+    use crate::learnings::embeddings::{OllamaEmbedder, count_embedded, store_embedding};
 
     // Status counts are always computed (needed for both modes).
     let total_active: i64 = conn.query_row(

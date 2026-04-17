@@ -8,27 +8,27 @@ use std::process;
 
 use clap::Parser;
 
+use task_mgr::TaskMgrError;
 use task_mgr::cli::{
     Cli, Commands, CurateAction, DecisionAction, MigrateAction, ModelsAction, OutputFormat,
     RunAction, WorktreesAction,
 };
 use task_mgr::commands::{
-    apply_learning, audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks,
-    decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
-    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail,
-    import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
-    list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
-    reset_all_tasks, reset_tasks, resolve_decision_cmd, revert_decision_cmd, show, skip, stats,
-    unblock, unskip, update, worktrees_list, worktrees_prune, worktrees_remove, LearnParams,
-    LearningsListParams, RecallCmdParams, ReviewOptions,
+    LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
+    audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks, decline_decision_cmd,
+    doctor, end, export, fail, format_doctor_verbose, format_init_verbose, format_next_verbose,
+    format_recall_verbose, get_reviewable_tasks, history, history_detail, import_learnings, init,
+    invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
+    migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
+    resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
+    worktrees_list, worktrees_prune, worktrees_remove,
 };
-use task_mgr::db::{open_connection, LockGuard};
+use task_mgr::db::{LockGuard, open_connection};
 use task_mgr::handlers::{
     convert_run_end_status, generate_completions, generate_man_pages, output_migrate_result,
     output_result,
 };
-use task_mgr::learnings::{delete_learning, edit_learning, EditLearningParams};
-use task_mgr::TaskMgrError;
+use task_mgr::learnings::{EditLearningParams, delete_learning, edit_learning};
 
 /// Derive the project root from the git repository root.
 ///
@@ -451,6 +451,34 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             Ok(())
         }
 
+        Commands::Add {
+            json,
+            stdin,
+            priority,
+            depended_on_by,
+        } => {
+            let input_json = if let Some(j) = json {
+                j
+            } else if stdin {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| TaskMgrError::io_error("stdin", "reading JSON input", e))?;
+                buf
+            } else {
+                return Err(TaskMgrError::invalid_state(
+                    "add",
+                    "input",
+                    "either --json or --stdin",
+                    "neither provided",
+                ));
+            };
+            let result = add(&cli.dir, &input_json, priority, &depended_on_by)?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
         Commands::Reset { task_ids, all, yes } => {
             if all {
                 let _lock = LockGuard::acquire(&cli.dir)?;
@@ -838,8 +866,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
 
         Commands::Models { action } => {
             use task_mgr::commands::models::{
-                handle_list, handle_set_default, handle_show, handle_unset_default, ListOpts,
-                SetDefaultOpts, UnsetDefaultOpts,
+                ListOpts, SetDefaultOpts, UnsetDefaultOpts, handle_list, handle_set_default,
+                handle_show, handle_unset_default,
             };
             match action {
                 ModelsAction::List { remote, refresh } => {
@@ -880,8 +908,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         Commands::Curate { action } => {
             use task_mgr::commands::curate::enrich::curate_enrich;
             use task_mgr::commands::curate::{
-                curate_count, curate_dedup, curate_embed, curate_retire, curate_unretire,
-                DedupParams, EmbedParams, EnrichParams, RetireParams,
+                DedupParams, EmbedParams, EnrichParams, RetireParams, curate_count, curate_dedup,
+                curate_embed, curate_retire, curate_unretire,
             };
             use task_mgr::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
             use task_mgr::loop_engine::project_config::read_project_config;

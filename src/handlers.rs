@@ -15,16 +15,23 @@ use std::path::Path;
 use std::process;
 
 use clap::CommandFactory;
-use clap_complete::{generate, Shell as CompletionShell};
+use clap_complete::{Shell as CompletionShell, generate};
 use clap_mangen::Man;
 
+use crate::TaskMgrError;
 use crate::cli::{Cli, OutputFormat, Shell};
 use crate::commands::curate::{
+    CountResult, DedupResult, EmbedResult, EnrichResult, RetireResult, UnretireResult,
     format_count_text, format_dedup_text, format_embed_text, format_enrich_text,
-    format_retire_text, format_unretire_text, CountResult, DedupResult, EmbedResult, EnrichResult,
-    RetireResult, UnretireResult,
+    format_retire_text, format_unretire_text,
 };
 use crate::commands::{
+    ApplyLearningResult, BeginResult, CompleteResult, DecisionDeclineResult, DecisionResolveResult,
+    DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult, ExportResult, FailResult,
+    HistoryResult, ImportLearningsResult, InitResult, InvalidateLearningResult, IrrelevantResult,
+    LearnResult, LearningsListResult, ListResult, MigrateResult, NextResult, RecallCmdResult,
+    ResetResult, ReviewResult, RunDetailResult, SetupAuditResult, ShowResult, SkipResult,
+    StatsResult, StatusResult, UnblockResult, UnskipResult, UpdateResult, WorktreesResult,
     format_apply_learning_text, format_begin_text, format_complete_text,
     format_decisions_list_text, format_decline_text, format_doctor_text, format_end_text,
     format_export_text, format_fail_text, format_history_detail_text, format_history_text,
@@ -33,19 +40,12 @@ use crate::commands::{
     format_migrate_text, format_next_text, format_recall_text, format_reset_text,
     format_resolve_text, format_revert_text, format_review_text, format_setup_text,
     format_show_text, format_skip_text, format_stats_text, format_status_text, format_unblock_text,
-    format_unskip_text, format_update_text, format_worktrees_text, ApplyLearningResult,
-    BeginResult, CompleteResult, DecisionDeclineResult, DecisionResolveResult,
-    DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult, ExportResult, FailResult,
-    HistoryResult, ImportLearningsResult, InitResult, InvalidateLearningResult, IrrelevantResult,
-    LearnResult, LearningsListResult, ListResult, MigrateResult, NextResult, RecallCmdResult,
-    ResetResult, ReviewResult, RunDetailResult, SetupAuditResult, ShowResult, SkipResult,
-    StatsResult, StatusResult, UnblockResult, UnskipResult, UpdateResult, WorktreesResult,
+    format_unskip_text, format_update_text, format_worktrees_text,
 };
 use crate::learnings::{
-    format_delete_text, format_edit_text, DeleteLearningResult, EditLearningResult,
+    DeleteLearningResult, EditLearningResult, format_delete_text, format_edit_text,
 };
 use crate::models::RunStatus;
-use crate::TaskMgrError;
 
 // ============================================================================
 // TextFormattable trait + generic output
@@ -71,6 +71,7 @@ macro_rules! impl_text_formattable {
     };
 }
 
+impl_text_formattable!(crate::commands::AddResult, crate::commands::format_add_text);
 impl_text_formattable!(InitResult, format_init_text);
 impl_text_formattable!(ListResult, format_list_text);
 impl_text_formattable!(ShowResult, format_show_text);

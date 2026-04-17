@@ -10,12 +10,12 @@ mod transition;
 #[cfg(test)]
 mod tests;
 
-pub use output::{format_text, FailResult, TaskFailResult};
+pub use output::{FailResult, TaskFailResult, format_text};
 
 use rusqlite::Connection;
 
-use crate::cli::FailStatus;
 use crate::TaskMgrResult;
+use crate::cli::FailStatus;
 
 /// Mark one or more tasks as failed (blocked, skipped, or irrelevant).
 ///

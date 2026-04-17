@@ -475,11 +475,13 @@ mod tests {
         assert_eq!(result.completed_count, 1);
         assert!(!result.tasks[0].was_already_done);
         assert!(result.tasks[0].warning.is_some());
-        assert!(result.tasks[0]
-            .warning
-            .as_ref()
-            .unwrap()
-            .contains("--force"));
+        assert!(
+            result.tasks[0]
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("--force")
+        );
     }
 
     #[test]

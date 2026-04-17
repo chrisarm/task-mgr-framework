@@ -36,8 +36,8 @@
 
 use rusqlite::Connection;
 
-use crate::models::{Confidence, Learning};
 use crate::TaskMgrResult;
+use crate::models::{Confidence, Learning};
 
 /// Size of the sliding window in iterations.
 /// Stats are reset after 720 iterations to allow learnings to regain exploration potential.
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use crate::db::migrations::run_migrations;
     use crate::db::{create_schema, open_connection};
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::LearningOutcome;
     use tempfile::TempDir;
 

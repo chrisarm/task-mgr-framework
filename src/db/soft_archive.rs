@@ -6,8 +6,8 @@
 
 use rusqlite::Connection;
 
-use crate::db::prefix::make_like_pattern;
 use crate::TaskMgrResult;
+use crate::db::prefix::make_like_pattern;
 
 /// Soft-archive `run_tasks`, `key_decisions`, and `runs` matching `prefix`.
 ///

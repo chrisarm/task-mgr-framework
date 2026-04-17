@@ -6,8 +6,8 @@
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::learnings::bandit::record_learning_applied;
 use crate::TaskMgrResult;
+use crate::learnings::bandit::record_learning_applied;
 
 /// Result of applying a learning.
 #[derive(Debug, Clone, Serialize)]
@@ -85,7 +85,7 @@ pub fn format_text(result: &ApplyLearningResult) -> String {
 mod tests {
     use super::*;
     use crate::db::{create_schema, migrations::run_migrations, open_connection};
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
     use tempfile::TempDir;
 

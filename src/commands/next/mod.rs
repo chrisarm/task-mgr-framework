@@ -97,20 +97,20 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::db::open_and_migrate as open_connection;
-use crate::learnings::recall::{recall_learnings, RecallParams};
 use crate::TaskMgrError;
 use crate::TaskMgrResult;
+use crate::db::open_and_migrate as open_connection;
+use crate::learnings::recall::{RecallParams, recall_learnings};
 
 // Re-export public types
-pub use decay::{apply_decay, find_decay_warnings, DecayWarning};
+pub use decay::{DecayWarning, apply_decay, find_decay_warnings};
 pub use output::{
-    build_task_output, format_next_text, format_next_verbose, CandidateSummary, ClaimMetadata,
-    LearningSummaryOutput, NextResult, NextTaskOutput, ScoreOutput, SelectionMetadata,
+    CandidateSummary, ClaimMetadata, LearningSummaryOutput, NextResult, NextTaskOutput,
+    ScoreOutput, SelectionMetadata, build_task_output, format_next_text, format_next_verbose,
 };
 pub use selection::{
-    format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult, CONFLICT_PENALTY,
-    FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS,
+    CONFLICT_PENALTY, FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS, ScoreBreakdown, ScoredTask,
+    SelectionResult, format_text, select_next_task,
 };
 
 /// Main entry point for the next command.

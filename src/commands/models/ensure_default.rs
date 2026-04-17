@@ -14,11 +14,13 @@ use std::path::Path;
 
 use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use crate::loop_engine::project_config::read_project_config;
-use crate::loop_engine::user_config::{read_user_config, write_default_model as write_user_default};
+use crate::loop_engine::user_config::{
+    read_user_config, write_default_model as write_user_default,
+};
 
-use super::api::{check_opt_in, fetch_models, sort_newest_first, RemoteModel};
+use super::api::{RemoteModel, check_opt_in, fetch_models, sort_newest_first};
 use super::cache;
-use super::picker::{select_model_interactive, ModelChoice};
+use super::picker::{ModelChoice, select_model_interactive};
 
 /// Resolve the default Claude model, prompting the user if nothing is set and
 /// the environment is interactive.
@@ -62,9 +64,7 @@ pub fn ensure_default_model(db_dir: &Path, auto_mode: bool) -> Option<String> {
     if let Some(ref id) = picked
         && let Err(e) = write_user_default(Some(id))
     {
-        eprintln!(
-            "\x1b[33m[warn]\x1b[0m could not persist default model to user config: {e}"
-        );
+        eprintln!("\x1b[33m[warn]\x1b[0m could not persist default model to user config: {e}");
     }
 
     picked

@@ -459,6 +459,12 @@ The per-file budget (1500 chars) prevents one large file from consuming the enti
 - Maximum 2 consecutive reorders before forcing the algorithm's recommendation
 - Prevents Claude from thrashing between tasks indefinitely
 
+**Task lifecycle via CLI + side-band tag** (replaces direct PRD JSON edits by the loop agent): the agent never reads or writes `tasks/*.json`. Instead:
+
+- **New tasks** are created by piping a task JSON to `task-mgr add --stdin`. Priority is auto-computed as `top_task.priority - 1`, so the new task is picked next. `--depended-on-by <existing-id>` atomically wires the new task into an existing task's `dependsOn` array (both DB row and PRD JSON). DB + JSON are always updated together via a temp-file + atomic-rename write.
+- **Status transitions** emit a `<task-status>TASK-ID:done</task-status>` side-band tag (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). `detection::extract_status_updates` parses all tags in the output; `engine::apply_status_updates` dispatches each through the existing `complete` / `fail` / `skip` / `irrelevant` / `reset_tasks` command handlers. Unknown status keywords are logged and skipped; malformed tags don't corrupt well-formed tags later in the output. Side-band tags do NOT change `IterationOutcome` — they're metadata applied alongside whatever outcome detection returned.
+- **Permission guard**: `--disallowedTools` passed to the Claude subprocess scopes-deny `Edit`/`Write` on `tasks/*.json` paths. `Read` on the PRD and `Bash(task-mgr:*)` remain allowed. The iteration prompt (`prompt_sections::task_ops`) documents the rules directly so the agent knows the intended alternative before hitting the guard.
+
 ### Crash recovery strategy
 
 Recovery operates at multiple levels:

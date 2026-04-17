@@ -118,6 +118,7 @@ task-mgr loop tasks/my-project.json --yes --hours 4
 | Command | Description |
 |---------|-------------|
 | `init` | Import tasks from JSON PRD file(s) |
+| `add` | Add a single task from JSON (stdin or `--json`); auto-ranks ahead of `next` |
 | `list` | List tasks with status/file/type filtering |
 | `show` | Show detailed task information |
 | `next` | Get next recommended task (with smart selection) |

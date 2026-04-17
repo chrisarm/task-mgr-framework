@@ -169,11 +169,7 @@ mod tests {
     fn write_none_removes_key() {
         let (_dir, path) = test_config_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            format!(r#"{{"defaultModel": "{HAIKU_MODEL}"}}"#),
-        )
-        .unwrap();
+        fs::write(&path, format!(r#"{{"defaultModel": "{HAIKU_MODEL}"}}"#)).unwrap();
         write_default_model_at(&path, None).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("defaultModel"), "key should be gone: {raw}");

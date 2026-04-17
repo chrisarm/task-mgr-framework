@@ -4,7 +4,7 @@
 mod test_helpers {
     use crate::db::migrations::run_migrations;
     use crate::db::{create_schema, open_connection};
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
     use tempfile::TempDir;
 
     pub fn setup_test_db() -> (TempDir, Connection) {
@@ -51,7 +51,7 @@ mod selection_tests {
         insert_test_relationship, insert_test_task, insert_test_task_file, setup_test_db,
     };
     use crate::commands::next::selection::{
-        format_text, select_next_task, ScoreBreakdown, ScoredTask, SelectionResult,
+        ScoreBreakdown, ScoredTask, SelectionResult, format_text, select_next_task,
     };
     use crate::models::Task;
 
@@ -620,8 +620,8 @@ mod next_command_tests {
     use super::test_helpers::{insert_test_relationship, insert_test_task, setup_test_db};
     use crate::commands::next::next;
     use crate::commands::next::output::{
-        build_task_output, format_next_text, format_next_verbose, CandidateSummary, ClaimMetadata,
-        LearningSummaryOutput, NextResult, NextTaskOutput, ScoreOutput, SelectionMetadata,
+        CandidateSummary, ClaimMetadata, LearningSummaryOutput, NextResult, NextTaskOutput,
+        ScoreOutput, SelectionMetadata, build_task_output, format_next_text, format_next_verbose,
     };
     use crate::commands::next::selection::{ScoreBreakdown, ScoredTask};
     use crate::db::open_connection;

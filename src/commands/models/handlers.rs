@@ -3,7 +3,7 @@
 use std::io;
 use std::path::Path;
 
-use super::api::{check_opt_in, fetch_models, sort_newest_first, ApiError};
+use super::api::{ApiError, check_opt_in, fetch_models, sort_newest_first};
 use super::cache;
 use super::ensure_default::{fallback_choices, prompt_with_choices};
 use super::picker::ModelChoice;

@@ -12,10 +12,10 @@
 use std::fs;
 use tempfile::TempDir;
 
-use task_mgr::commands::init::{self, generate_prefix, PrefixMode};
+use task_mgr::commands::init::{self, PrefixMode, generate_prefix};
 use task_mgr::commands::next::selection::select_next_task;
 use task_mgr::db::prefix::validate_prefix;
-use task_mgr::db::{open_connection, LockGuard};
+use task_mgr::db::{LockGuard, open_connection};
 use task_mgr::loop_engine::signals::check_stop_signal;
 use task_mgr::loop_engine::status_queries::read_prd_hints;
 

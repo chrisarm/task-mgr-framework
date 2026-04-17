@@ -268,7 +268,7 @@ pub fn format_text(result: &ImportLearningsResult) -> String {
 mod retired_tests {
     use super::load_existing_keys;
     use crate::db::{create_schema, open_connection, run_migrations};
-    use crate::learnings::{record_learning, RecordLearningParams};
+    use crate::learnings::{RecordLearningParams, record_learning};
     use crate::models::{Confidence, LearningOutcome};
     use tempfile::TempDir;
 

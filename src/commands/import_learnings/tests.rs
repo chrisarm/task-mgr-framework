@@ -10,16 +10,16 @@ use rstest::rstest;
 use clap::CommandFactory;
 
 use super::{
-    compute_dedup_key, format_text, import_learnings, parse_learnings, ImportLearningsResult,
+    ImportLearningsResult, compute_dedup_key, format_text, import_learnings, parse_learnings,
 };
 use crate::cli::Cli;
 use crate::commands::export::export as export_cmd;
-use crate::commands::init::{init, PrefixMode};
+use crate::commands::init::{PrefixMode, init};
 use crate::db::migrations;
 use crate::db::open_connection;
 use crate::db::schema;
 use crate::error::TaskMgrError;
-use crate::learnings::{record_learning, RecordLearningParams};
+use crate::learnings::{RecordLearningParams, record_learning};
 use crate::models::{Confidence, LearningExport, LearningOutcome, ProgressExport};
 
 /// Set up a test database with schema and migrations.

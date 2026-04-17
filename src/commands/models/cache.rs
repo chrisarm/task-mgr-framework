@@ -43,11 +43,7 @@ pub fn read_fresh() -> Option<Vec<RemoteModel>> {
 }
 
 /// Testable variant: explicit path, TTL, and "now" clock.
-pub fn read_fresh_at(
-    path: &Path,
-    ttl: Duration,
-    now: DateTime<Utc>,
-) -> Option<Vec<RemoteModel>> {
+pub fn read_fresh_at(path: &Path, ttl: Duration, now: DateTime<Utc>) -> Option<Vec<RemoteModel>> {
     let contents = std::fs::read_to_string(path).ok()?;
     let cache: CacheFile = serde_json::from_str(&contents).ok()?;
     if cache.schema_version != CURRENT_SCHEMA_VERSION {
@@ -77,11 +73,7 @@ pub fn write(models: &[RemoteModel]) {
 }
 
 /// Testable variant: explicit path and "now" clock.
-pub fn write_at(
-    path: &Path,
-    models: &[RemoteModel],
-    now: DateTime<Utc>,
-) -> std::io::Result<()> {
+pub fn write_at(path: &Path, models: &[RemoteModel], now: DateTime<Utc>) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

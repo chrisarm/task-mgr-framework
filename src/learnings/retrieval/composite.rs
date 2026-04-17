@@ -7,8 +7,8 @@
 
 use rusqlite::Connection;
 
-use crate::models::Learning;
 use crate::TaskMgrResult;
+use crate::models::Learning;
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
 

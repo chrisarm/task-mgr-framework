@@ -9,6 +9,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::TaskMgrResult;
 use crate::commands::next::selection::{
     CONFLICT_PENALTY, FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS,
 };
@@ -16,7 +17,6 @@ use crate::db::prefix::prefix_and;
 use crate::loop_engine::calibrate_math::{
     adjust_weight, clamp_negative_weight, clamp_weight, compute_correlation,
 };
-use crate::TaskMgrResult;
 
 /// Minimum number of completed tasks before calibration adjusts weights.
 const MIN_TASKS_FOR_CALIBRATION: usize = 10;

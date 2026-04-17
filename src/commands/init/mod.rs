@@ -41,13 +41,13 @@ mod tests;
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::db::open_and_migrate as open_connection;
-use crate::error::validate_safe_path;
 use crate::TaskMgrError;
 use crate::TaskMgrResult;
+use crate::db::open_and_migrate as open_connection;
+use crate::error::validate_safe_path;
 
 // Re-export public types
-pub use output::{format_init_verbose, format_text, DryRunDeletePreview, InitResult};
+pub use output::{DryRunDeletePreview, InitResult, format_init_verbose, format_text};
 pub use parse::{PrdFile, PrdUserStory};
 
 /// Controls how task ID prefixing behaves during import.

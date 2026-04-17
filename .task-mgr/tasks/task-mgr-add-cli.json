@@ -1,0 +1,557 @@
+{
+  "branchName": "feat/task-mgr-add-cli",
+  "description": "Ship `task-mgr add` CLI (JSON input + auto-priority + PRD JSON sync), `<task-status>TASK-ID:status</task-status>` bracket tag detection, iteration-prompt hardening, and an Edit/Write permission guard on `tasks/*.json`. Together these stop the loop agent from burning context rewriting the PRD JSON on every status flip or dynamic task insert.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy --lib",
+      "Rust: All cargo test --lib cases pass",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to existing CLI subcommand surfaces unless explicitly called out",
+      "Test + build commands use the single-command `tee | tail && grep` pattern (CLAUDE.md section 3 — needed because split commands hit the sandbox approval flow twice)",
+      "All match arms on `Commands` enum in src/cli/tests.rs updated when adding a new variant — otherwise CLI-test compilation fails (learning [1069])"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "3. CORRECTNESS — Self-critique after code. Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Each task delivers working code + tests together",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Test boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code",
+      "Reuse existing helpers — do NOT reinvent INSERT SQL, tag parsing, or status transition logic"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "New INSERT SQL for tasks/task_files/task_relationships — reuse the helpers in src/commands/init/import.rs",
+    "New status-transition SQL — dispatch `<task-status>` through existing `complete`/`fail`/`skip`/`irrelevant`/`reset_tasks` command handlers",
+    "Rewriting the existing shipped commit 4eda061 (prompt-too-long + effort ladder) — it is already on main"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "069dd6f7",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `cargo build` succeeds on the feature branch after main.rs is wired",
+        "Positive: `cargo test --lib commands::add` runs at least 8 tests and all pass",
+        "Positive: `cargo clippy --lib -- -D warnings` clean",
+        "Positive: `cargo fmt --check` clean",
+        "Positive: `task-mgr add --help` (via `cargo run --bin task-mgr -- add --help`) prints the EXAMPLES and PRIORITY help blocks from the clap `after_help` attribute on the `Add` variant",
+        "Positive: git log shows exactly one new commit on the feature branch with a conventional-commits `feat:` prefix",
+        "Negative: No new INSERT/UPDATE/DELETE SQL added in this task — only reuse existing helpers from `src/commands/init/import.rs`",
+        "Negative: No changes to commit 4eda061 (prompt-too-long + effort ladder) — check with `git log main..HEAD`",
+        "Negative: No new files created besides the commit itself — this task only finalizes what's already in the working tree",
+        "Unit test (existing): `commands::add::tests::test_add_writes_task_into_database` passes",
+        "Unit test (existing): `commands::add::tests::test_auto_priority_one_less_than_top` passes — seeds one task at priority 10 and verifies new task gets priority 9",
+        "Known-bad: if main.rs routing is copied from another arm but stdin handling is skipped, `task-mgr add --stdin` would hang on stdin OR error unclearly. Verify manually: `echo '{...}' | cargo run -- add --stdin` must round-trip through the handler (failure case visible in integration tests in FEAT-002)",
+        "Failure mode: if `src/cli/tests.rs` has pattern-match code that doesn't compile because of the new variant, add the missing arm following the style of the `Commands::Reset` arm nearby — do not silence with `_ => {}` (that hides future regressions)"
+      ],
+      "dependsOn": [],
+      "description": "The working tree already contains partial scaffolding for `task-mgr add`:\n  - NEW: `src/commands/add.rs` (handler, `AddTaskInput`, `resolve_priority`, `locate_prd_json`, `append_task_to_prd_json`, `atomic_write`, unit tests)\n  - MODIFIED: `src/commands/init/parse.rs` — `#[derive(Serialize)]` + `skip_serializing_if` on `PrdUserStory`\n  - MODIFIED: `src/commands/mod.rs` — `pub mod add;` + re-exports\n  - MODIFIED: `src/cli/commands.rs` — `Commands::Add { json, stdin, priority }` variant with EXAMPLES/PRIORITY help block\n  - MODIFIED: `src/handlers.rs` — `impl_text_formattable!(AddResult, format_add_text)` at the top of the impl list\n\nYour job: verify this scaffolding compiles, wire the `Commands::Add` match arm in `src/main.rs` (this is NOT yet done), update any broken exhaustive matches in `src/cli/tests.rs`, run the tests, and make the initial feature commit. This task's deliverable is a commit; it does NOT add new PRD-JSON-sync behaviour beyond what's already in `add.rs`.\n\nDO: Read every modified file listed above BEFORE making changes. Add the main.rs routing arm next to `Commands::Reset` (around line 454). Run `cargo build`, `cargo test --lib commands::add`, `cargo clippy --lib -- -D warnings`, `cargo fmt --check`. If any exhaustive match over `Commands` in `src/cli/tests.rs` fails to compile because of the new variant, add the missing arm (learning [1069]).\nDO NOT: Refactor the scaffolding. Do not change the tag name `<task-status>` or the auto-priority formula. Do not touch commits earlier than HEAD.\n\nEdge cases:\n- `src/cli/tests.rs` has multiple exhaustive matches on `Commands` (learning [1069]) — audit all of them; adding one missing arm is not enough if several exist.\n- `src/handlers.rs` needs `pub use` of `format_add_text` for the macro invocation to resolve — verify already-done by reading the file.\n- If `cargo build` fails with 'unused import' for `commands::add::*` after wiring main.rs, the re-exports in `src/commands/mod.rs` are already there — do not add a second `use` line in main.rs.\n\nKnown-bad to guard against:\n- A stale or partial re-run that re-creates `src/commands/add.rs` from scratch — the file is already rich and tested; READ IT FIRST, do not overwrite.\n- Forgetting that `src/cli/tests.rs` needs ALL exhaustive match arms updated, not just the one you encounter first (learning [1069]).",
+      "edgeCases": [
+        "User passes neither --json nor --stdin → main.rs returns invalid_state error with a clear actionable message",
+        "User passes --json and --stdin together → clap rejects at parse time (conflicts_with) with its own diagnostic; no custom handling needed",
+        "stdin is empty → serde_json::from_str fails with a clear parse error; handler already surfaces it as invalid_state",
+        "Task id contains a single segment (e.g. 'FEAT-001') → task_prefix() returns None, auto-priority falls through to prefix=None branch of select_next_task (this is tested in add.rs)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Missing match arm in src/cli/tests.rs after adding Commands::Add variant",
+          "expectedBehavior": "cargo test fails with a clear `non-exhaustive patterns` error; fix is to add the arm using the Reset-arm shape"
+        },
+        {
+          "cause": "impl_text_formattable! macro invocation references a function that doesn't exist in the re-exports",
+          "expectedBehavior": "cargo build fails with `cannot find function format_add_text`; fix is to verify `pub use add::{..., format_text as format_add_text, ...}` in src/commands/mod.rs"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-6",
+      "notes": "Files to read BEFORE editing: src/commands/add.rs (full), src/cli/commands.rs:494 (the `Reset` variant — the Add variant is right above it), src/main.rs:454 (the Reset arm — your Add arm goes nearby), src/handlers.rs:74 (where impl_text_formattable! list starts), src/cli/tests.rs (grep for `Commands::Reset` to find exhaustive matches needing updates).\n\nKey reuse: `commands::add::add()` public entry is already defined in add.rs; you only need to call it from main.rs.\n\nLearnings:\n- [1069]: Adding a clap enum variant breaks ALL exhaustive matches in src/cli/tests.rs — audit every one, don't patch just the first.\n- [1479]: `impl_text_formattable!(AddResult, commands::format_add_text)` is already added in handlers.rs; verify it's still there after your edits.\n- [1480]: Flat match dispatch in main.rs is idiomatic — copy the `Reset` arm shape, don't over-abstract.\n- [1430]: Run tests via `cargo test --lib commands::add 2>&1 | tee /tmp/add-test.txt | tail -5 && grep FAILED /tmp/add-test.txt | head -10` — a single command (sandbox constraint).",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Match arm in main.rs must accept either --json or --stdin and error clearly when both or neither are supplied (the clap `conflicts_with` handles the 'both' case at parse time; the 'neither' case needs a runtime check)",
+          "stdin read must use `std::io::Read::read_to_string` on `io::stdin()` — do NOT spawn a subshell, do NOT re-open /dev/stdin",
+          "All `cargo test --lib commands::add` tests pass without modification"
+        ],
+        "performance": [
+          "No redundant DB connections — a single `open_connection` + `LockGuard` per invocation (already in add.rs)"
+        ],
+        "style": [
+          "Match arm in main.rs mirrors the style of adjacent arms (use `&cli.dir`, call `output_result(&result, cli.format)`)",
+          "Use `crate::TaskMgrError::invalid_state` for the 'neither --json nor --stdin' error — follow the signature of existing invalid_state calls"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Verify and commit the `task-mgr add` WIP scaffolding",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/handlers.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: new integration test file `tests/add_integration.rs` exists with at least 3 tests",
+        "Positive: `cargo test --test add_integration` runs and all tests pass",
+        "Positive: test_add_roundtrips_task_into_prd_json — assert DB state AND JSON file state after `add()`",
+        "Positive: test_auto_priority_derives_from_top — seeds priorities [50, 100], asserts new task gets 49",
+        "Positive: test_no_tmp_file_left_after_successful_add — verify no `.task-mgr-add.tmp` remains in the dir",
+        "Positive: test uses `tempfile::TempDir` and `task-mgr init --from-json` (via `commands::init::init()`) — no hardcoded paths",
+        "Negative: No modification to src/commands/add.rs beyond bug fixes surfaced by this test — if a test fails, fix the production code, don't weaken the assertion",
+        "Negative: No dependence on git state or the loop engine — this is a pure CLI-level integration test",
+        "Known-bad: a test that creates the DB via raw SQL instead of `task-mgr init` would pass even if prd_files is never populated, letting the PRD-sync path silently skip. Test MUST go through `init()`.",
+        "Edge-case test: PRD with `userStories: []` (empty array) — add() should succeed and produce an array with 1 element",
+        "Failure mode: if PRD JSON file is deleted after `init` but before `add`, `add()` logs a warning and the DB still gets the row (document this in the test assertion)"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "The unit tests in `src/commands/add.rs` cover each helper in isolation, but there's no test that runs `task-mgr add` against a real initialized PRD and verifies BOTH the DB row AND the PRD JSON file on disk pick up the new task. Write an integration test that:\n  1. Creates a tmp directory with a minimal PRD JSON (2 seed tasks)\n  2. Runs `task-mgr init --from-json <prd>` to populate the DB + prd_files table\n  3. Calls `task-mgr add` with a new task JSON (via `commands::add::add()` programmatically — don't spawn subprocesses, that's slow and fragile)\n  4. Asserts: DB row exists with correct priority (auto-computed as top_priority - 1), `task_files` + `task_relationships` rows correct, and the PRD JSON file now has 3 entries in userStories with the new task appended and byte-for-byte unchanged fields on the original 2\n\nDO: Put the test in `tests/add_integration.rs` (new file) so it compiles as a separate integration binary and has access to the public API. Use `tempfile::TempDir`.\nDO NOT: Rely on the local `.task-mgr/` directory or any global state — everything must be tmp-dir scoped.\n\nEdge cases to cover:\n- Priority auto-compute correctness: seed PRD has 2 tasks at priorities 50 and 100 → new task priority must be 49 (one less than top), NOT 99 (one less than the OTHER one)\n- `userStories` key ordering — serde_json preserves insertion order for the array, so the new task is LAST\n- Original task JSON fields unchanged (read the seed PRD, add, re-read, diff the first 2 tasks' JSON Values — should be equal)\n- Atomic write: after a successful add, there should be NO leftover `.add-cli-hardening.json.task-mgr-add.tmp` file in the tasks dir\n\nKnown-bad to guard against:\n- A naive test that just checks the DB ignores the file half (half the feature). Test must assert BOTH halves.\n- Testing with `serde_json::to_string` then a substring match on the new task ID: fragile; use `serde_json::from_str` and navigate the Value tree.",
+      "edgeCases": [
+        "PRD file deleted between init and add → add logs warning, DB row still inserted",
+        "PRD file read-only → append_task_to_prd_json returns a clear error; DB row was inserted (non-atomic, documented)",
+        "Seed PRD has `userStories: []` → after add, array has 1 element",
+        "Seed PRD has `userStories` key missing entirely → after add, key is created with 1 element"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Test uses raw SQL to seed tasks but doesn't populate prd_files — add() skips JSON sync path, test passes, real production would fail",
+          "expectedBehavior": "Test must go through `init()`; add-with-no-prd-file is a SEPARATE test case"
+        }
+      ],
+      "id": "FEAT-002",
+      "notes": "Files to read: src/commands/add.rs (full — already has unit tests as reference for shape), src/commands/init/mod.rs (for the `init()` entry point), tests/cli_tests.rs (for integration-test idioms — how it uses TempDir, how it invokes commands programmatically).\n\nKey types: `commands::init::init()` returns `InitResult`; `commands::add::add(db_dir, json_str, priority_override)` returns `AddResult`. Both take `&Path`. The `db_dir` is `<tmp>/.task-mgr`.\n\nLearning [1069]: TempDir pattern — see existing tests like `tests/cli_tests.rs` for how to set up a tmp DB + PRD.\n\nPRD JSON shape reference (from .task-mgr/tasks/batch-chain-worktrees.json): camelCase keys, `userStories` is the tasks array, `taskPrefix` optional.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "Test must verify BOTH the DB row AND the PRD JSON entry — either alone is insufficient",
+          "Test must run against a real initialized DB (via `init()`), not a raw-SQL synthetic one",
+          "Test must clean up tmp dir on both success and failure (TempDir's Drop handles this)"
+        ],
+        "performance": [
+          "Test runtime <200ms — no network, no shell subprocesses"
+        ],
+        "style": [
+          "Use helper functions like `setup_prd_with_tasks(dir, seed_tasks)` to keep individual tests focused",
+          "Each test makes ONE logical assertion — DB-state test separate from JSON-state test separate from priority-derivation test"
+        ]
+      },
+      "synergyWith": [],
+      "title": "End-to-end integration test for `task-mgr add` — DB + PRD JSON round-trip",
+      "touchesFiles": [
+        "tests/add_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `extract_status_updates(\"<task-status>FEAT-001:done</task-status>\")` returns `[TaskStatusUpdate { task_id: \"FEAT-001\", status: Done }]`",
+        "Positive: multiple tags in one output all parsed in order (test with 3 tags)",
+        "Positive: case-insensitive status parsing — `:DONE`, `:Done`, `:done` all map to `TaskStatusChange::Done`",
+        "Positive: engine dispatch calls `commands::complete::complete` for Done, `fail` for Failed, etc.",
+        "Positive: engine logs a warning and CONTINUES when a tag fails to dispatch (e.g., task not in_progress for Done)",
+        "Negative: No new SQL added — grep-verify that all INSERT/UPDATE/DELETE on `tasks` in the dispatcher go through existing command handlers",
+        "Negative: `<task-status>` is NOT a variant of `IterationOutcome` — verify by reading the enum",
+        "Negative: Status-tag extraction does NOT alter the outcome returned by `analyze_output` — verify with an explicit test",
+        "Unit test: detection::tests::test_extract_status_updates_single",
+        "Unit test: detection::tests::test_extract_status_updates_multiple",
+        "Unit test: detection::tests::test_extract_status_updates_case_insensitive_status",
+        "Unit test: detection::tests::test_extract_status_updates_malformed_skipped",
+        "Unit test: detection::tests::test_extract_status_updates_unknown_status_skipped",
+        "Unit test: detection::tests::test_extract_status_updates_empty_id_skipped",
+        "Unit test: detection::tests::test_extract_status_updates_whitespace_trimmed",
+        "Unit test: detection::tests::test_status_tag_does_not_change_iteration_outcome — output contains both `<task-status>` and `<promise>COMPLETE</promise>` — outcome is Completed, AND status-update list is non-empty",
+        "Engine test: engine::tests::test_apply_status_update_marks_task_done_after_claim — seeds task in `in_progress`, runs dispatcher, asserts DB status transitions to `done`",
+        "Engine test: engine::tests::test_apply_status_update_logs_warning_when_task_not_claimed — seeds task in `todo` (not claimed), runs dispatcher, asserts task is still `todo` AND a warning was logged (learning [1475]: state machine violation should not silently succeed)",
+        "Engine test: engine::tests::test_apply_status_update_done_flips_prd_json_passes — after a successful Done dispatch, the PRD JSON entry's `passes` flips to true; other tasks in the array unchanged",
+        "Engine test: engine::tests::test_apply_status_update_json_sync_failure_does_not_rollback_db — if PRD JSON is missing/read-only, warning is logged but DB transition stands (mirrors add.rs behaviour)",
+        "Engine test: engine::tests::test_apply_status_update_task_missing_from_prd_json — task exists in DB but not in PRD JSON → warning logged, DB transition stands, JSON unchanged",
+        "Known-bad: a `find(\"<task-status>\")` approach that greedy-matches through the CLOSING `</task-status>` of a later tag would corrupt all subsequent parses. Test: `<task-status>A:done</task-status> noise <task-status>B:done</task-status>` must yield TWO updates, not one with an oversized task_id.",
+        "Failure mode: if the existing `complete()` function returns an error (e.g., state machine violation), log the error with `eprintln!` including task_id and status, and proceed to the next tag"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Add a new side-band tag parser — parallel to `extract_key_decisions` and `extract_reorder_task_id` in `src/loop_engine/detection.rs` — that scans Claude's stdout for one or more `<task-status>TASK-ID:status</task-status>` tags and returns `Vec<TaskStatusUpdate>`. Hook it into `src/loop_engine/engine.rs` after `analyze_output` so each parsed update is dispatched through the EXISTING status command (`complete` / `fail` / `skip` / `irrelevant` / `unblock` or `reset_tasks`), THEN also flips the corresponding entry's `passes` field in the PRD JSON on disk (symmetric with `task-mgr add` — every task-mgr operation updates DB + JSON atomically, or neither).\n\nWhy side-band not outcome: like key-decisions, status updates don't change the iteration's IterationOutcome classification — they're metadata applied alongside whatever outcome detection returned.\n\nDO:\n- Add `pub struct TaskStatusUpdate { pub task_id: String, pub status: TaskStatusChange }` and `pub enum TaskStatusChange { Done, Failed, Skipped, Irrelevant, Blocked }` to detection.rs (or a new module if cleaner)\n- Add `pub fn extract_status_updates(output: &str) -> Vec<TaskStatusUpdate>`\n- In engine.rs, after the existing PromptTooLong handler block, iterate parsed updates and dispatch\n- For `Done`: the existing `complete()` in src/commands/complete.rs enforces the task state machine (learning [1475]: tasks must be `in_progress` before `complete`). If the tag fires for a task not yet claimed, `complete()` will error — catch this, log a clear warning, and continue. Do NOT silently auto-claim — that would mask bugs where Claude marks an unclaimed task done.\n- Status parsing must be case-insensitive (`done`, `DONE`, `Done` all valid); task ID parsing is case-sensitive (IDs are case-sensitive in the DB)\n- AFTER a successful DB status transition, ALSO update the PRD JSON on disk. Create a helper `fn sync_task_status_to_prd_json(conn, task_id, new_passes: bool, new_status: &str) -> TaskMgrResult<()>`. Reuse the `locate_prd_json` pattern from src/commands/add.rs (query prd_files for file_type='task_list'). Read the JSON, find the matching `userStories[i]` by id, set `passes = true` for Done, leave `passes = false` for the other statuses but record the status somehow (options: add a `status` field to that userStories entry, OR just flip `passes` for Done only and let export/doctor reconcile the rest — recommend the latter to keep the JSON schema tight). Use the same atomic-rename write pattern as add.rs — factor it out if duplication emerges.\n- If the PRD JSON sync fails AFTER the DB transition succeeded, log a clear warning (DB-and-JSON drift) but do NOT roll back the DB — the next `task-mgr export` / `doctor` can reconcile. This matches the existing failure mode in add.rs.\n\nDO NOT:\n- Introduce new SQL for status transitions — dispatch through existing command handlers\n- Add `<task-status>` to the `IterationOutcome` enum — it's side-band\n- Use `output.find(\"<task-status>\")` alone — a malformed tag with no close tag must not block parsing of a well-formed tag later in the output (learning [193] pattern: substring match is a common footgun)\n- Duplicate the atomic-write code from add.rs — factor it into a shared helper in a new module (`src/commands/prd_json.rs`) OR export the existing `atomic_write` from add.rs as `pub(crate)`.\n\nEdge cases (MUST handle, each gets an explicit test):\n- Multiple tags in one output → all applied in order; PRD JSON flipped ONCE per final status after all tags applied\n- Malformed tag (no close) → skipped; subsequent well-formed tags still parsed\n- Unknown status string (e.g., `:completed`) → logged and skipped; does not crash\n- Empty task ID (`<task-status>:done</task-status>`) → skipped; logged\n- Task ID with whitespace → trimmed before dispatch\n- Task not in DB → complete/fail/skip/irrelevant returns an error; log the warning, keep processing remaining tags, do NOT touch PRD JSON\n- Task not in PRD JSON (only in DB — e.g., added via raw SQL) → log warning, DB is still authoritative\n- PRD JSON file deleted after iteration started → log warning, DB is still authoritative\n- Two tags for the same task_id in one output (e.g., `:done` then `:failed`) → apply in order; last write wins for the JSON flip",
+      "edgeCases": [
+        "Multiple `<task-status>` tags in one output",
+        "Malformed tag with missing close (earlier in output) followed by well-formed tag (later)",
+        "Unknown status string like `:in_progress` or `:completed` — skipped with log",
+        "Empty task_id (`<task-status>:done</task-status>`) — skipped",
+        "Whitespace in/around task id — trimmed",
+        "Tag emitted for a task not in DB — dispatch error logged, loop continues",
+        "Tag emitted for a task not claimed (violates state machine per learning [1475]) — complete() errors, log warning, do not auto-claim",
+        "Output with NO tags — extract_status_updates returns empty Vec, no-op dispatcher"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Malformed `<task-status>` with no `</task-status>` close tag",
+          "expectedBehavior": "Skip the malformed tag; log once; continue parsing remaining tags"
+        },
+        {
+          "cause": "complete() / fail() / etc. returns error (task not found, state machine violation)",
+          "expectedBehavior": "Log eprintln! with task_id + status + error; proceed to the next update"
+        }
+      ],
+      "id": "FEAT-003",
+      "notes": "Files to read: src/loop_engine/detection.rs (existing tag parsers — especially `extract_reorder_task_id` and `extract_key_decisions`; copy their slicing style), src/loop_engine/engine.rs (around line 627 for the analyze_output call + PromptTooLong handler — your dispatch goes AFTER that block, BEFORE update_trackers), src/commands/complete.rs (existing `complete(conn, task_ids, run_id, commit, force)` signature), src/commands/fail.rs, src/commands/skip.rs, src/commands/irrelevant.rs, src/commands/add.rs (for the `locate_prd_json` + `append_task_to_prd_json` + `atomic_write` pattern you'll reuse for the JSON sync).\n\nPRD JSON sync for status tags: the user explicitly chose symmetry — every task-mgr operation updates DB + JSON atomically or neither. For Done, flip `passes=true` in the matching userStories entry. For Failed/Skipped/Irrelevant/Blocked, decide in implementation: either add a `status` field to the userStories entry OR leave those non-Done flips to `task-mgr export` / `doctor` reconciliation (recommend the latter to keep the JSON schema tight — only Done flips `passes`).\n\nFactor out the atomic-write helper: add.rs has `fn atomic_write(target: &Path, content: &str)` that should become a shared utility. Options: move to `src/commands/prd_json.rs` (new module), or `pub(crate)` it from add.rs. Decide in implementation, keep it clean.\n\nLearnings:\n- [1475]: Task state machine — tasks must be claimed (in_progress) before complete. The dispatcher must NOT auto-claim because that hides state-machine violations.\n- [193]: String find() is a common footgun for tag parsing. Use the extract-inner pattern from extract_reorder_task_id (two-stage slice between open+close tags), iterated until no more tags found.\n- [130] / [132]: For tests, use deterministic short strings — don't build giant outputs unless testing boundary behaviour.\n- [1361]: Wiring failure mode — when adding a new path that updates multiple stores (DB + JSON), every test must verify BOTH halves update. A test that only asserts DB state would let JSON-sync silently break.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": {
+        "correctness": [
+          "Tag parser handles malformed input without panic — every unwrap must be justified or replaced with `?` / match",
+          "Dispatcher must preserve iteration semantics: status updates happen AFTER analyze_output and BEFORE update_trackers so crash counters still reflect the real outcome",
+          "Unknown status variants are logged and skipped, never silently mapped to a nearby variant"
+        ],
+        "performance": [
+          "Single pass over the output for all tags — do NOT call extract_status_updates multiple times",
+          "Tag parsing is O(n) in output length"
+        ],
+        "style": [
+          "Follow the string-slicing idiom from `extract_reorder_task_id` — no regex dependency needed",
+          "TaskStatusChange enum derives Debug, Clone, Copy, PartialEq, Eq",
+          "TaskStatusUpdate struct derives Debug, Clone, PartialEq, Eq (for easy test assertions)"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-004"
+      ],
+      "title": "`<task-status>` tag parser + engine dispatch + PRD JSON sync",
+      "touchesFiles": [
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/engine.rs",
+        "src/commands/add.rs",
+        "src/commands/prd_json.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/loop_engine/prompt_sections/task_ops.rs` exists and exports `task_ops_section()`",
+        "Positive: the section is wired into prompt assembly (grep the prompt builder for `task_ops` and confirm it's called)",
+        "Positive: every loop iteration's built prompt contains the exact strings `You MUST NOT edit \\`tasks/*.json\\`` and `task-mgr add --stdin` and `<task-status>TASK-ID:done</task-status>`",
+        "Positive: section positioned ABOVE the learnings section in the assembled prompt (test by locating both substrings and asserting ordering)",
+        "Negative: section does NOT reference `.task-mgr/tasks/*.json` — the user corrected this path to `tasks/*.json`",
+        "Negative: section is NOT added to any trimmable-sections list — verify by grep",
+        "Negative: section is NOT behind a runtime flag or config option",
+        "Unit test: prompt_sections::task_ops::tests::test_section_contains_critical_phrases — checks for `MUST NOT edit`, `task-mgr add --stdin`, `<task-status>`, all 5 status keywords",
+        "Integration test (in prompt builder test file): test_iteration_prompt_includes_task_ops_section — builds a prompt for a dummy task, asserts the section is present and positioned correctly",
+        "Known-bad: a section that uses ``.task-mgr/tasks/*.json`` matches the codebase's internal path but NOT what Claude sees in the loop working directory. Claude's CWD is the project root where the PRD path is `tasks/*.json` — test must assert the literal `tasks/*.json` string, not the longer path",
+        "Failure mode: if the section is too long (>500 bytes), prompt budget may be exceeded — verify section.len() < 1024"
+      ],
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Create `src/loop_engine/prompt_sections/task_ops.rs` exporting a static markdown section that gets injected into every loop iteration's prompt. This is hard rules, not hints — sits near the top, above learnings/synergy.\n\nSection text (EXACTLY this — the user corrected the path string from `.task-mgr/tasks/*.json` to `tasks/*.json`):\n\n```markdown\n## Task lifecycle — CLI only, never edit the JSON\n\nYou MUST NOT edit `tasks/*.json` directly. Instead:\n\n- **Mark a task's status**: emit `<task-status>TASK-ID:done</task-status>`\n  (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop\n  engine parses these and applies them via `task-mgr`.\n- **Add a new task** (review fix / refactor / follow-up): pipe a single task\n  JSON to `task-mgr add --stdin`. Example:\n\n      echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race in X\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"],\"dependsOn\":[]}' \\\n        | task-mgr add --stdin\n\n  Priority is auto-computed to rank ahead of the current `next` pick. Omit it\n  unless you explicitly need a lower priority.\n- For anything else (dependencies, status queries, etc.), use the `task-mgr`\n  CLI — see `task-mgr --help`.\n```\n\nDO:\n- Create the new file with a `pub fn task_ops_section() -> &'static str` returning the text\n- Register in `src/loop_engine/prompt_sections/mod.rs` alongside the existing sections (escalation, learnings, etc.)\n- Wire into the iteration prompt builder so it's always included (NOT behind a feature flag, NOT conditional on task type)\n- Position: near the top of the prompt, above the learnings and synergy sections (this is hard rules — agent must see it before context-sensitive content)\n- Section budget: <200 tokens. Do not pad.\n\nDO NOT:\n- Add it to the trimmable-sections list — this is non-negotiable content\n- Reference `.task-mgr/tasks/*.json` — the user explicitly corrected this to `tasks/*.json`\n- Create a config option to disable it",
+      "edgeCases": [
+        "Iteration with no task selected (agent exploring) — section still included",
+        "Iteration with a reorder hint — section still included",
+        "Section must render correctly after `<reorder>` hint (no double-heading collision)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Section accidentally added to a trimmable list and dropped when prompt is large",
+          "expectedBehavior": "Test must fail immediately — section is non-negotiable content"
+        }
+      ],
+      "id": "FEAT-004",
+      "notes": "Files to read: src/loop_engine/prompt_sections/mod.rs (existing section registrations), src/loop_engine/prompt_sections/escalation.rs (shape template for your new file), src/loop_engine/prompt.rs (where sections are assembled — find the assembly point and add your call).\n\nThe user explicitly corrected `.task-mgr/tasks/*.json` → `tasks/*.json` during planning. Honor this.\n\nLearning [132]: For large-template inclusion tests, use start/end markers. For this small section, a few substring checks suffice.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": {
+        "correctness": [
+          "Section text matches the plan verbatim — no paraphrasing",
+          "Section is unconditionally included — no runtime flag gates it",
+          "Path string is `tasks/*.json` (per user correction), not `.task-mgr/tasks/*.json`"
+        ],
+        "performance": [
+          "Section is a `&'static str` — no allocations per iteration"
+        ],
+        "style": [
+          "Follow the shape of existing prompt_sections (mod organization, public function naming)",
+          "No markdown preprocessing — emit raw markdown"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "Iteration-prompt section `task_ops.rs` — instruct Claude to use `task-mgr add` and `<task-status>` tags",
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/task_ops.rs",
+        "src/loop_engine/prompt_sections/mod.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: researched and documented whether Claude CLI --allowedTools supports negative patterns (decision written in PR description or a commit note)",
+        "Positive: loop's allowed-tools policy prevents Edit/Write on any path matching `tasks/*.json` OR loop's post-iteration output includes a targeted hint when the agent attempts one",
+        "Positive: `Bash(task-mgr add:*)` and `Bash(task-mgr *)` remain allowed",
+        "Positive: `Read` on `tasks/*.json` remains allowed",
+        "Negative: No modifications to user's ~/.claude/settings.json",
+        "Negative: No blanket `Edit(!*)` — only scoped to `tasks/*.json`",
+        "Unit test: config::tests::test_coding_allowed_tools_denies_edit_on_tasks_json (if going the allowed-tools route) — grep the built tools string for the deny pattern",
+        "Unit test: config::tests::test_coding_allowed_tools_permits_task_mgr_bash — grep for `Bash(task-mgr:*)` or equivalent",
+        "End-to-end test (manual, documented in the commit): run one loop iteration and attempt Edit on tasks/foo.json; verify it's denied and the hint mentions task-mgr add / <task-status>",
+        "Known-bad: a policy that denies ALL Edit operations would block legitimate src/**.rs edits. Test MUST verify `Edit` is still allowed for paths NOT matching `tasks/*.json`",
+        "Failure mode: if Claude CLI doesn't support negative patterns at all, document this in the commit, fall back to post-iteration detection + hint"
+      ],
+      "dependsOn": [
+        "FEAT-004"
+      ],
+      "description": "Tighten the loop's allowed-tools policy so `Edit` and `Write` on `tasks/*.json` are denied. When the agent accidentally tries to edit the PRD JSON, it should surface as a denied-tool hint — the agent can then retry via `task-mgr add --stdin` or `<task-status>` tag.\n\nSTEP 1 — Research: Read `src/loop_engine/claude.rs` for how the `--allowedTools` string is built for subprocess invocation. Determine empirically whether Claude Code CLI supports NEGATIVE patterns like `Edit(!tasks/*.json)` or requires a separate deny list. Try it locally with `claude --allowedTools 'Edit(!tasks/*.json)' --print '...'` and verify.\n\nSTEP 2 — Implement:\n- If negative patterns ARE supported: add them to the CODING_ALLOWED_TOOLS string in src/loop_engine/config.rs, scoped to Edit and Write only (NOT Bash — we want `Bash(task-mgr *)` allowed)\n- If negative patterns are NOT supported: add post-iteration detection. Parse `permission_denials` from `claude_result` (already captured in engine.rs at line ~527 — see `extract_denied_commands`). If the denial is on `Edit`/`Write` against a `tasks/*.json` path, emit a tailored hint: `[hint] Tool denied: Edit on tasks/*.json — use 'task-mgr add --stdin' or <task-status> tag instead`\n\nDO NOT:\n- Block `Bash(task-mgr *)` — this is the intended replacement\n- Block `Read` on `tasks/*.json` — agents legitimately read the PRD for context\n- Touch the user's global `~/.claude/settings.json` — changes must be loop-local\n\nEdge cases:\n- Agent reads `tasks/foo.json` (allowed) then tries to edit it (denied) — hint should say `use 'task-mgr add --stdin' OR <task-status>`\n- Agent tries `Write` (create new file) at `tasks/new-thing.json` — also denied; agent must use `task-mgr init --from-json --append` for new PRDs",
+      "edgeCases": [
+        "Agent tries Write (new file creation) at `tasks/new.json` → denied, hint mentions `task-mgr init --append`",
+        "Agent tries Edit at `tasks/subdir/foo.json` → matches `tasks/*.json`? Pattern must be explicit about shallow vs recursive (pick one, document)",
+        "Agent uses `cd tasks && edit foo.json` — this is Bash, not Edit; the guard doesn't apply. Document as out-of-scope."
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Claude CLI silently ignores a malformed negative pattern",
+          "expectedBehavior": "Test must verify the guard actually triggers — don't trust that `--allowedTools` consumed the flag means it honored it"
+        }
+      ],
+      "id": "FEAT-005",
+      "notes": "Files to read: src/loop_engine/config.rs (CODING_ALLOWED_TOOLS constant), src/loop_engine/claude.rs (how --allowedTools is assembled + how `extract_denied_commands` works), src/loop_engine/engine.rs:527 (existing permission-denial hint code — extend this for the fallback path).\n\nImportant: verify negative-pattern support empirically before committing to a pattern. If the CLI silently ignores unknown pattern syntax, the guard becomes a no-op and nothing tests catch it.\n\nIf fallback needed: the detection path already exists in engine.rs:527 — you're just adding a more specific hint for Edit/Write on tasks/*.json paths.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": {
+        "correctness": [
+          "Denies Edit AND Write (creating a new file there is also blocked), scoped to `tasks/*.json`",
+          "Does NOT deny Read — agents legitimately read the PRD for task selection",
+          "Does NOT deny Bash(task-mgr:*) — this is the intended replacement",
+          "Works regardless of whether the agent uses relative or absolute paths (pattern matching must cover both)"
+        ],
+        "performance": [
+          "No per-tool-call overhead beyond what the existing permission flow already does"
+        ],
+        "style": [
+          "If using allowed-tools route: add to the existing CODING_ALLOWED_TOOLS string, don't create a parallel config",
+          "If using fallback-detection route: extend the existing denial-hint code, don't duplicate"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Permission guard — deny Edit/Write on `tasks/*.json` via loop's --allowedTools policy",
+      "touchesFiles": [
+        "src/loop_engine/config.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr add --stdin --depended-on-by MILESTONE-1` (with MILESTONE-1 existing in DB) inserts the new task AND a task_relationships row where task_id=MILESTONE-1, related_id=<new-id>, rel_type='dependsOn'",
+        "Positive: PRD JSON's MILESTONE-1 entry gains `<new-id>` in its dependsOn array after the call",
+        "Positive: flag accepts multiple targets: `--depended-on-by A --depended-on-by B` — BOTH existing tasks now depend on the new one",
+        "Positive: MILESTONE-1 in `task-mgr show MILESTONE-1` now lists the new task in its dependsOn",
+        "Negative: `--depended-on-by NONEXISTENT-ID` fails BEFORE any write — no new task in DB, no PRD JSON edit",
+        "Negative: the new task's OWN `dependsOn` is NOT populated from --depended-on-by (direction is reversed)",
+        "Negative: no new SQL tables — reuses task_relationships",
+        "Unit test: `commands::add::tests::test_depended_on_by_inserts_reverse_relationship` — seed MILESTONE-1, call add_with_conn with depended_on_by=['MILESTONE-1'], assert task_relationships has the row",
+        "Unit test: `commands::add::tests::test_depended_on_by_invalid_id_rejects_before_insert` — assert new task NOT in DB after the error",
+        "Unit test: `commands::add::tests::test_depended_on_by_multiple_targets_all_wired` — seed 2 targets, pass both, assert both relationships inserted",
+        "Integration test: `tests/add_integration.rs::test_depended_on_by_updates_prd_json_dependson` — real PRD file, assert the existing task's dependsOn array gains the new id",
+        "Integration test: `tests/add_integration.rs::test_depended_on_by_missing_target_in_prd_json_logs_but_dbstill_updated`",
+        "CLI test: `task-mgr add --help` documents the --depended-on-by flag",
+        "Known-bad: an implementation that mutates the new task's dependsOn (instead of the existing task's) would pass a test checking 'dependsOn contains MILESTONE-1' on the new task — test must assert the REVERSE direction (existing task now has new id in its dependsOn)",
+        "Failure mode: if PRD JSON sync fails for one of several targets, DB rows all commit, warning logged per missing target, overall command returns OK (DB-authoritative)"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "The existing review workflows (CODE-REVIEW, REFACTOR-REVIEW, MILESTONE gates) create FIX/REFACTOR tasks dynamically and need to add them to the MILESTONE's `dependsOn` so the gate waits. Without CLI support, the loop agent would have to edit `tasks/*.json` — exactly what we're avoiding.\n\nAdd a `--depended-on-by <existing-task-id>` flag to `task-mgr add` that, after the new task is inserted, ALSO inserts a `task_relationships` row `(task_id=<existing>, rel_type='dependsOn', related_id=<new>)` — meaning the existing task now depends on the new one — AND updates the existing task's userStories entry in the PRD JSON to include the new task's id in its `dependsOn` array.\n\nDO:\n- Add `#[arg(long)] depended_on_by: Vec<String>` to the `Commands::Add` variant (Vec so multiple existing tasks can depend on the new one in one call)\n- Thread it through `commands::add::add()` → `add_with_conn()` — extend the signature with `depended_on_by: &[String]`\n- Validate every `depended_on_by` id exists in the DB BEFORE inserting the new task (fail fast if any is invalid)\n- Inside the existing transaction (after insert_task_relationships for the new task's OWN dependsOn): for each `depended_on_by_id`, call `insert_relationship(&tx, depended_on_by_id, &new_task.id, \"dependsOn\")` — note the argument order: `(task_id=<existing>, related_id=<new>, rel_type=dependsOn)`\n- PRD JSON sync: in addition to appending the new task to userStories, for each `depended_on_by_id`, find its entry in userStories, push `new_task.id` into its `dependsOn` array (create the array if missing)\n- If PRD JSON sync partially succeeds (e.g., new task appended but one of the existing entries not found), the DB write has already committed — log a clear warning per missing entry; DB is authoritative\n\nDO NOT:\n- Mutate the new task's OWN dependsOn based on depended_on_by — the direction is reversed (the EXISTING task depends on the NEW task)\n- Silently skip invalid `depended_on_by` ids — fail the entire operation before any insert\n- Introduce new tables or columns — reuse `task_relationships` (already has rel_type='dependsOn') and `userStories[].dependsOn`\n\nEdge cases:\n- `--depended-on-by` passed with no new-task JSON via stdin/--json → clap's normal validation covers this\n- `--depended-on-by MILESTONE-1,MILESTONE-2` (comma-separated) vs repeated flag (`--depended-on-by MILESTONE-1 --depended-on-by MILESTONE-2`) → prefer repeated flag (clap's default for Vec<String> with `long`)\n- `--depended-on-by MISSING-TASK-ID` → fail with a clear error listing the missing id; no DB changes; new task NOT created\n- `--depended-on-by` references a task that's in DB but NOT in the PRD JSON (e.g., added via raw SQL) → DB insert succeeds, PRD JSON sync logs a warning for that specific entry, continues\n- Attempting to create a dependency cycle (`task A --depended-on-by B`, where B already depends on A transitively) → out of scope for this task; document in commit that cycle detection is a future enhancement\n- Duplicate insertion (calling add twice with same `--depended-on-by`) → task_relationships may or may not have a UNIQUE constraint on (task_id, related_id, rel_type); if it does, return a clear error; if not, the second row is harmless noise",
+      "edgeCases": [
+        "--depended-on-by with missing target → fail before any write",
+        "--depended-on-by with multiple targets → all inserted, all PRD JSON entries updated",
+        "Target exists in DB but not PRD JSON → DB write OK, PRD JSON logs warning for that one target",
+        "Empty --depended-on-by (flag not passed) → behaviour identical to current `task-mgr add`",
+        "PRD JSON's target entry has NO dependsOn key → create it as a new array with the one id",
+        "Dependency cycle creation → OUT OF SCOPE; document in commit for a future task"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "One of the --depended-on-by ids doesn't exist in the DB",
+          "expectedBehavior": "Fail with an error naming the missing id; no writes occur"
+        },
+        {
+          "cause": "PRD JSON write fails after DB commit",
+          "expectedBehavior": "Log warning; DB is authoritative; user can rerun or run task-mgr export to reconcile"
+        }
+      ],
+      "id": "FEAT-006",
+      "notes": "Files to touch: src/cli/commands.rs (add the flag to Commands::Add), src/main.rs (pass it through), src/commands/add.rs (thread through public API + add reverse-insert logic + PRD-JSON-mutation helper).\n\nFor the PRD JSON sync side: reuse the atomic-write helper factored out in FEAT-003 (if completed before this task, which depending on ordering may not be the case — if FEAT-003 hasn't factored it yet, this task can either factor it first or duplicate for now and let REFACTOR-001 deduplicate).\n\nReverse-insert SQL pattern: `insert_relationship(&tx, depended_on_by_id /* task_id */, &new_task.id /* related_id */, \"dependsOn\")` — argument 1 is the EXISTING task that now HAS a new dependency; argument 2 is the new task being depended upon.\n\nLearning [1475]: task_relationships may have a UNIQUE(task_id, related_id, rel_type) index — check src/db/schema for this; if present, duplicate calls surface as a clean DB error.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": {
+        "correctness": [
+          "Direction of dependency: EXISTING task's dependsOn gains the NEW task's id (not the other way around)",
+          "Validation happens before any writes — invalid ids cause a clean rejection",
+          "All writes (new task + reverse relationships + PRD JSON) share a transaction where possible",
+          "PRD JSON partial failure doesn't roll back the DB (DB is authoritative)"
+        ],
+        "performance": [
+          "Validation is a single IN-clause query for all depended_on_by ids, not N queries"
+        ],
+        "style": [
+          "Reuse the existing insert_relationship helper in src/commands/init/import.rs:356 — do not inline SQL",
+          "Error messages name the specific invalid id, not 'one of the --depended-on-by ids is invalid'"
+        ]
+      },
+      "synergyWith": [
+        "FEAT-003"
+      ],
+      "title": "`task-mgr add --depended-on-by <task-id>` — wire new task into an existing task's dependsOn",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/commands/add.rs",
+        "tests/add_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: CHANGELOG.md has a new entry under the top section naming all 4 additions (add subcommand, <task-status> tag, prompt hardening, permission guard)",
+        "Positive: `cargo run --bin gen-docs -- --check` exits 0 (docs are in sync)",
+        "Positive: `task-mgr man-pages` (or equivalent) runs without error if that command exists",
+        "Negative: No crate version bump in Cargo.toml",
+        "Negative: No modifications to pre-existing CHANGELOG sections",
+        "Known-bad: CHANGELOG entry that says only 'Added task-mgr add command' without mentioning auto-priority / PRD-sync / tag / hardening misses half the user-facing value"
+      ],
+      "dependsOn": [
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Document the new subcommand, tag, and prompt hardening in CHANGELOG.md and regenerate any auto-generated docs.\n\nDO:\n- Add a CHANGELOG entry under the current unreleased / top section describing:\n  - New `task-mgr add` subcommand (JSON stdin + auto-priority + PRD-sync)\n  - New `<task-status>TASK-ID:status</task-status>` tag for loop status updates\n  - Loop prompt now instructs agents to use the CLI + tag, never edit the PRD JSON\n  - Loop permission policy denies Edit/Write on `tasks/*.json`\n- Run `cargo run --bin gen-docs` if any doc generation is triggered by new CLI surfaces\n- If `task-mgr man-pages` generates man pages for subcommands, regenerate and ensure the `add` subcommand's man page builds without error\n\nDO NOT:\n- Bump the crate version — that's a separate release concern\n- Alter existing CHANGELOG entries",
+      "edgeCases": [],
+      "estimatedEffort": "low",
+      "failureModes": [],
+      "id": "FEAT-007",
+      "notes": "Files to read: CHANGELOG.md (existing style — previous 2-3 entries), src/bin/gen-docs.rs (for what gen-docs covers), Cargo.toml (to confirm the bin binary name for gen-docs).\n\nIf gen-docs regenerates .claude/commands/tasks.md and the regen changes content, commit that regeneration as part of this task. CHANGELOG should also mention the new --depended-on-by flag.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": {
+        "correctness": [
+          "CHANGELOG entry covers all four user-facing changes",
+          "gen-docs --check passes"
+        ],
+        "performance": [],
+        "style": [
+          "Match the existing CHANGELOG formatting (bullet style, section ordering)"
+        ]
+      },
+      "synergyWith": [],
+      "title": "CHANGELOG.md entry + regenerate docs/man pages",
+      "touchesFiles": [
+        "CHANGELOG.md",
+        ".claude/commands/tasks.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each modified file audited for: DRY violations, functions >30 lines, repeated error-construction, tight coupling to specific caller",
+        "Any new REFACTOR-FIX-xxx tasks added via `task-mgr add --stdin` (not by editing tasks/*.json — the whole point of this plan)",
+        "If no issues: passes:true with note summarising the audit"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007"
+      ],
+      "description": "Review all files modified in FEAT-001..FEAT-006 for DRY violations, functions over 30 lines, tight coupling, and opportunities to reuse existing helpers that were missed.\n\nDO:\n- Check for duplicated error-handling boilerplate between add.rs and the init/import.rs helpers\n- Check that detection.rs's new tag parser follows the same idiom as `extract_reorder_task_id` / `extract_key_decisions` (and isn't a one-off snowflake)\n- Check that the engine.rs dispatcher for status tags doesn't duplicate logic with the existing completion-tag handling\n- Check the prompt_sections new file fits the existing module's conventions\n- If issues found: add REFACTOR-FIX-xxx tasks (priority 50-97) via `task-mgr add --stdin` and commit the JSON change\n- If no issues: mark passes:true with note 'No refactoring needed'\n\nDO NOT: skip this gate. The review task catches issues before final verification.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-6",
+      "notes": "Use `task-mgr add --stdin` (the subcommand delivered in this PRD) to add any REFACTOR-FIX tasks. Do NOT hand-edit this JSON file — if you do, FEAT-005's permission guard should stop you.",
+      "passes": true,
+      "priority": 98,
+      "title": "Review for refactoring opportunities across the delivered change",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs",
+        "src/loop_engine/prompt_sections/mod.rs",
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: cargo test --lib clean",
+        "Positive: cargo test --test '*' — new add_integration.rs tests pass; existing tests still pass",
+        "Positive: cargo clippy --lib -- -D warnings clean",
+        "Positive: cargo fmt --check clean",
+        "Positive: manual smoke test documented in REVIEW-001 commit — all 6 steps pass",
+        "Positive: prompt_sections::task_ops is reachable (grep for `task_ops_section()` call in the assembled prompt path)",
+        "Positive: `<task-status>` dispatcher is reachable (grep in engine.rs for the dispatcher call site after analyze_output)",
+        "Positive: CLAUDE.md updated with a 5-line quick-reference for the new CLI + tag (this is user-visible tooling for anyone running the loop manually)",
+        "Negative: No unwrap() in production code paths added across the PRD",
+        "Negative: No dead-code warnings for new code",
+        "Negative: No new top-level files outside src/commands/add.rs + src/loop_engine/prompt_sections/task_ops.rs + tests/add_integration.rs",
+        "Task update: review progress.txt — if implementation diverged from task descriptions, note which tasks drifted and why (informs future PRDs)",
+        "If issues found: FIX-xxx tasks added via `task-mgr add --stdin` with priority 50-97"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "REFACTOR-001"
+      ],
+      "description": "Review all delivered code for quality, security, integration wiring, and documentation needs. Run the full test suite. Perform the end-to-end smoke test from the plan.\n\nDO:\n- Run: `cargo test --lib 2>&1 | tee /tmp/t.txt | tail -5 && grep FAILED /tmp/t.txt | head -10` (single command, sandbox-safe — learning [1430])\n- Run: `cargo test --test '*' 2>&1 | tee /tmp/it.txt | tail -5 && grep FAILED /tmp/it.txt | head -10`\n- Run: `cargo clippy --lib -- -D warnings 2>&1 | tee /tmp/c.txt | tail -5 && grep '^error' /tmp/c.txt | head -10`\n- Run: `cargo fmt --check 2>&1 | tee /tmp/f.txt | tail -5 && grep 'Diff' /tmp/f.txt | head -5`\n- Verify all new code reachable from production entry points (grep for public fn invocations)\n- Check documentation: CLAUDE.md updated with a quick-reference for `task-mgr add` + `<task-status>` tag? Architecture docs updated if new modules introduced? If so, update them.\n- Manual smoke test (document results in REVIEW-001's commit message):\n  1. `task-mgr init` a test PRD\n  2. Note `task-mgr next` pick's priority\n  3. Run `echo '{\"id\":\"<prefix>-SMOKE-001\",\"title\":\"smoke\",\"difficulty\":\"medium\",\"touchesFiles\":[]}' | task-mgr add --stdin`\n  4. Assert `task-mgr next` now returns SMOKE-001\n  5. Assert PRD JSON on disk has SMOKE-001 as last userStories entry\n  6. Produce a test output containing `<task-status>SMOKE-001:done</task-status>`, run through detection — assert extract_status_updates returns the update\n- If issues: add FIX-xxx tasks via `task-mgr add --stdin`\n\nDO NOT: Skip the integration-wiring check. Unconnected code is the #1 failure mode (per prompt template). Specifically verify the prompt_sections wiring (FEAT-004) — it's easy to create the module and forget to call it.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-6",
+      "notes": "Use the single-command test pattern with tee/tail/grep — learning [1430]: split commands hit the sandbox approval flow and fail.\n\nThe smoke test is best done in a scratch tempdir so you don't pollute the real `.task-mgr/`. Use `mktemp -d` and `cd` into it.\n\nIf CLAUDE.md doesn't already have a 'Loop CLI Cheat Sheet' section, add one. Anyone running `task-mgr loop` manually benefits from knowing the tag and add-cli syntax.",
+      "passes": true,
+      "priority": 99,
+      "title": "Final review: security, integration wiring, documentation, end-to-end smoke",
+      "touchesFiles": [
+        "src/commands/add.rs",
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs",
+        "src/loop_engine/prompt_sections/mod.rs",
+        "src/loop_engine/config.rs",
+        "src/loop_engine/claude.rs",
+        "tests/add_integration.rs",
+        "CHANGELOG.md",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

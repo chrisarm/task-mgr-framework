@@ -9,4 +9,4 @@ pub mod models;
 pub mod paths;
 
 // Re-export commonly used error types
-pub use error::{validate_safe_path, TaskMgrError, TaskMgrResult};
+pub use error::{TaskMgrError, TaskMgrResult, validate_safe_path};

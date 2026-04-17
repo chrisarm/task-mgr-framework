@@ -9,9 +9,9 @@
 /// from iteration outcomes rather than just showing learnings blindly.
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::learnings::bandit;
 use crate::loop_engine::config::IterationOutcome;
-use crate::TaskMgrResult;
 
 /// Record feedback for learnings shown during an iteration based on its outcome.
 ///

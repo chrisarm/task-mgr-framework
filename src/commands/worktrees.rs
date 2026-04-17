@@ -73,12 +73,13 @@ fn locked_worktree_paths(db_dir: &Path) -> Vec<String> {
             continue;
         }
         if let Some(info) = LockGuard::read_holder_info(&path)
-            && let Some(wt) = info.worktree {
-                // Verify the flock is actually held (not stale from SIGKILL)
-                if is_flock_held(&path) {
-                    locked.push(wt);
-                }
+            && let Some(wt) = info.worktree
+        {
+            // Verify the flock is actually held (not stale from SIGKILL)
+            if is_flock_held(&path) {
+                locked.push(wt);
             }
+        }
     }
     locked
 }

@@ -6,12 +6,12 @@
 
 use rusqlite::Connection;
 
+use crate::TaskMgrResult;
 use crate::learnings::crud::get_learning;
 use crate::learnings::embeddings::{
-    cosine_similarity, load_all_active_embeddings, OllamaEmbedder, DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_OLLAMA_URL,
+    DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL, OllamaEmbedder, cosine_similarity,
+    load_all_active_embeddings,
 };
-use crate::TaskMgrResult;
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
 
@@ -137,7 +137,7 @@ impl RetrievalBackend for VectorBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learnings::crud::{record_learning, RecordLearningParams};
+    use crate::learnings::crud::{RecordLearningParams, record_learning};
     use crate::learnings::embeddings::store_embedding;
     use crate::learnings::test_helpers::setup_db;
     use crate::models::{Confidence, LearningOutcome};
