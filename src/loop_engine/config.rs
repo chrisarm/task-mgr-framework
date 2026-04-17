@@ -439,6 +439,10 @@ pub enum CrashType {
     Segfault,
     /// Rate limit error detected in output
     RateLimit,
+    /// Claude CLI reported "Prompt is too long" — the running conversation
+    /// exceeded the model's context window. Handled by reducing the next
+    /// iteration's effort and resetting the task for retry.
+    PromptTooLong,
 }
 
 /// Outcome of a single loop iteration, determined by analyzing Claude's output.

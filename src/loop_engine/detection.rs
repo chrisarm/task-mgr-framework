@@ -68,6 +68,14 @@ pub fn analyze_output(output: &str, exit_code: i32, _dir: &Path) -> IterationOut
         return IterationOutcome::RateLimit;
     }
 
+    // Step 3.5: Detect "Prompt is too long" (Claude CLI context-window overflow)
+    // before generic crash classification. The CLI emits this on stdout when
+    // the running conversation exceeds the model context window; handled
+    // separately so the engine can downgrade effort and reset the task.
+    if is_prompt_too_long(output) {
+        return IterationOutcome::Crash(CrashType::PromptTooLong);
+    }
+
     // Step 4: Check exit code for crashes
     if exit_code != 0 {
         return IterationOutcome::Crash(categorize_crash(exit_code));
@@ -101,6 +109,15 @@ fn extract_reorder_task_id(output: &str) -> Option<String> {
     }
 
     Some(task_id.to_string())
+}
+
+/// Check if output contains the Claude CLI "Prompt is too long" error.
+///
+/// Claude emits this exact string on stdout when the assembled conversation
+/// exceeds the model's context window. Match case-insensitively so minor CLI
+/// wording variants still classify correctly.
+pub(crate) fn is_prompt_too_long(output: &str) -> bool {
+    output.to_lowercase().contains("prompt is too long")
 }
 
 /// Check if output contains rate-limit error patterns.
@@ -1249,6 +1266,90 @@ mod tests {
         // Label attribute is trimmed too
         assert_eq!(result[0].options[0].label, "A: x");
         assert_eq!(result[0].options[0].description, "trimmed desc");
+    }
+
+    // --- Prompt-too-long detection (context-window overflow) ---
+
+    #[test]
+    fn test_detects_prompt_too_long_exact_message() {
+        let output = "some tool output\nPrompt is too long\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::Crash(CrashType::PromptTooLong),
+        );
+    }
+
+    #[test]
+    fn test_detects_prompt_too_long_regardless_of_exit_code() {
+        // Fires on exit 0 too — Claude CLI may print the error and exit cleanly
+        let output = "Prompt is too long";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Crash(CrashType::PromptTooLong),
+        );
+    }
+
+    #[test]
+    fn test_prompt_too_long_case_insensitive() {
+        assert!(is_prompt_too_long("PROMPT IS TOO LONG"));
+        assert!(is_prompt_too_long("Prompt Is Too Long"));
+        assert!(is_prompt_too_long("the prompt is too long, aborting"));
+    }
+
+    #[test]
+    fn test_prompt_too_long_negative() {
+        assert!(!is_prompt_too_long(""));
+        assert!(!is_prompt_too_long("normal output"));
+        assert!(!is_prompt_too_long("prompt was long but fine"));
+    }
+
+    #[test]
+    fn test_complete_beats_prompt_too_long() {
+        let output =
+            "Prompt is too long earlier\nrecovered\n<promise>COMPLETE</promise>\n";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Completed,
+            "COMPLETE must win over PromptTooLong"
+        );
+    }
+
+    #[test]
+    fn test_blocked_beats_prompt_too_long() {
+        let output = "Prompt is too long\n<promise>BLOCKED</promise>";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Blocked,
+        );
+    }
+
+    #[test]
+    fn test_reorder_beats_prompt_too_long() {
+        let output = "Prompt is too long\n<reorder>FEAT-005</reorder>";
+        assert_eq!(
+            analyze_output(output, 0, &test_dir()),
+            IterationOutcome::Reorder("FEAT-005".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_beats_prompt_too_long() {
+        // Rate-limit check runs before prompt-too-long
+        let output = "rate_limit_error\nPrompt is too long\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::RateLimit,
+        );
+    }
+
+    #[test]
+    fn test_prompt_too_long_beats_generic_crash() {
+        // Non-zero exit + prompt-too-long → PromptTooLong (not RuntimeError)
+        let output = "Prompt is too long\n";
+        assert_eq!(
+            analyze_output(output, 1, &test_dir()),
+            IterationOutcome::Crash(CrashType::PromptTooLong),
+        );
     }
 
     #[test]

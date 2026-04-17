@@ -205,6 +205,10 @@ pub struct IterationContext {
     /// Whether the previous iteration crashed. Loop-thread-local — no concurrency concern.
     /// Used by crash escalation logic (FEAT-007) to trigger model escalation.
     pub last_was_crash: bool,
+    /// Per-task effort overrides set after `Crash(PromptTooLong)`. Keys are
+    /// task IDs, values are the effort level to use on the next attempt in
+    /// place of the difficulty-derived default.
+    pub effort_overrides: std::collections::HashMap<String, &'static str>,
 }
 
 impl IterationContext {
@@ -220,6 +224,7 @@ impl IterationContext {
             reorder_count: 0,
             last_task_id: None,
             last_was_crash: false,
+            effort_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -491,7 +496,20 @@ pub fn run_iteration(
     };
 
     // Derive effort from task difficulty so we can show it in the header.
-    let effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
+    // Apply any per-task override left by a prior PromptTooLong crash.
+    let base_effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
+    let effort = ctx
+        .effort_overrides
+        .get(&task_id)
+        .copied()
+        .or(base_effort);
+    if effort != base_effort {
+        eprintln!(
+            "Effort override (prior prompt overflow): {} → {}",
+            base_effort.unwrap_or("(default)"),
+            effort.unwrap_or("(default)"),
+        );
+    }
 
     // Step 5: Print iteration header (with post-escalation effective_model + effort)
     display::print_iteration_header(
@@ -700,6 +718,49 @@ pub fn run_iteration(
     if let Err(e) = feedback::record_iteration_feedback(params.conn, &shown_learning_ids, &outcome)
     {
         eprintln!("Warning: failed to record iteration feedback: {}", e);
+    }
+
+    // Step 8.5: Handle PromptTooLong — downgrade next-attempt effort and reset task.
+    // The Claude CLI exceeded the model context window; crash-tracker backoff still
+    // runs via update_trackers below, but we pre-seed a lower effort for the retry
+    // and reset the task so the next iteration picks it up fresh rather than leaving
+    // it wedged in_progress.
+    if matches!(
+        outcome,
+        IterationOutcome::Crash(config::CrashType::PromptTooLong)
+    ) {
+        match model::downgrade_effort(effort) {
+            Some(next) => {
+                eprintln!(
+                    "Prompt is too long for {} at effort {} — downgrading to {} and resetting task",
+                    task_id,
+                    effort.unwrap_or("(default)"),
+                    next,
+                );
+                ctx.effort_overrides.insert(task_id.clone(), next);
+            }
+            None => {
+                eprintln!(
+                    "Prompt is too long for {} at effort {} — no downgrade available (high is the floor); resetting task for retry at same effort",
+                    task_id,
+                    effort.unwrap_or("(default)"),
+                );
+            }
+        }
+
+        // Mirrors the run-end cleanup at lines ~2050–2058; same query, earlier trigger.
+        match params.conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL \
+             WHERE id = ? AND status = 'in_progress'",
+            [&task_id],
+        ) {
+            Ok(1) => eprintln!("Reset task {} to todo after prompt overflow", task_id),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "Warning: failed to reset task {} after prompt overflow: {}",
+                task_id, e,
+            ),
+        }
     }
 
     // Step 9: Update trackers based on outcome

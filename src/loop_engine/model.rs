@@ -21,10 +21,15 @@ pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Mapping from task difficulty to Claude CLI `--effort` level.
 ///
-/// Scaling: low difficulty → high effort, medium → xhigh, high → max.
+/// Scaling: low difficulty → medium effort, medium → high, high → xhigh.
 /// Unset / unknown difficulty → no `--effort` flag (CLI default applies).
+///
+/// The ladder intentionally stops below `max`: `max` consistently overshot the
+/// model context budget on long iterations (observed repeated
+/// `Prompt is too long` failures on Opus 4.7). On overflow, `downgrade_effort`
+/// steps `xhigh → high`; `high` is the floor.
 pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
-    &[("low", "high"), ("medium", "xhigh"), ("high", "max")];
+    &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
 
 /// Model tier ordering for comparison.
 ///
@@ -131,6 +136,19 @@ pub fn resolve_iteration_model(task_models: &[Option<String>]) -> Option<String>
         .filter_map(|m| m.as_deref())
         .max_by_key(|m| model_tier(Some(m)))
         .map(String::from)
+}
+
+/// Step one tier down on the effort ladder.
+///
+/// Currently only `xhigh → high` is defined — `high` is the floor for overflow
+/// recovery. All other inputs (including `high`, `medium`, `low`, `None`,
+/// unknown strings) return `None`, signalling "no downgrade available". New
+/// tiers can be added without touching callers.
+pub fn downgrade_effort(effort: Option<&str>) -> Option<&'static str> {
+    match effort {
+        Some("xhigh") => Some("high"),
+        _ => None,
+    }
 }
 
 /// Escalate a model to the next higher tier.
@@ -615,5 +633,65 @@ mod tests {
             Some(OPUS_MODEL.to_string()),
             "opus is the ceiling; further escalation stays at opus"
         );
+    }
+
+    // ============ downgrade_effort tests ============
+
+    #[test]
+    fn test_downgrade_effort_xhigh_to_high() {
+        assert_eq!(downgrade_effort(Some("xhigh")), Some("high"));
+    }
+
+    #[test]
+    fn test_downgrade_effort_high_is_floor() {
+        assert_eq!(
+            downgrade_effort(Some("high")),
+            None,
+            "high is the floor: must not downgrade to medium"
+        );
+    }
+
+    #[test]
+    fn test_downgrade_effort_medium_and_low_return_none() {
+        assert_eq!(downgrade_effort(Some("medium")), None);
+        assert_eq!(downgrade_effort(Some("low")), None);
+    }
+
+    #[test]
+    fn test_downgrade_effort_none_returns_none() {
+        assert_eq!(downgrade_effort(None), None);
+    }
+
+    #[test]
+    fn test_downgrade_effort_unknown_returns_none() {
+        assert_eq!(downgrade_effort(Some("")), None);
+        assert_eq!(downgrade_effort(Some("max")), None);
+        assert_eq!(downgrade_effort(Some("ultra")), None);
+        assert_eq!(downgrade_effort(Some("HIGH")), None, "case-sensitive");
+    }
+
+    // ============ EFFORT_FOR_DIFFICULTY invariants ============
+
+    #[test]
+    fn test_effort_for_difficulty_new_mapping() {
+        assert_eq!(
+            EFFORT_FOR_DIFFICULTY,
+            &[
+                ("low", "medium"),
+                ("medium", "high"),
+                ("high", "xhigh"),
+            ],
+            "difficulty→effort ladder must be medium/high/xhigh (max retired)"
+        );
+    }
+
+    #[test]
+    fn test_effort_for_difficulty_never_produces_max() {
+        for (_, effort) in EFFORT_FOR_DIFFICULTY {
+            assert_ne!(
+                *effort, "max",
+                "max effort is retired — no difficulty should map to it"
+            );
+        }
     }
 }

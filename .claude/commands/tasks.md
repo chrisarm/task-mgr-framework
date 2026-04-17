@@ -47,9 +47,9 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 
 **Difficulty → `--effort` mapping** (from `EFFORT_FOR_DIFFICULTY`):
 
-- `low` → `high`
-- `medium` → `xhigh`
-- `high` → `max`
+- `low` → `medium`
+- `medium` → `high`
+- `high` → `xhigh`
 <!-- MODELS:END -->
 
 **Model assignment rubric** (set `model` field on tasks that need a specific tier; omit for tasks that should use the PRD-level default):
