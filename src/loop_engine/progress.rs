@@ -9,7 +9,8 @@ use std::path::Path;
 
 use chrono::Utc;
 
-use crate::loop_engine::config::IterationOutcome;
+use crate::loop_engine::config::{IterationOutcome, PermissionMode};
+use crate::loop_engine::model::HAIKU_MODEL;
 
 /// Log an iteration result to the progress file.
 ///
@@ -234,6 +235,86 @@ fn crash_recommendation(task_id: &str, outcomes: &[String]) -> Option<String> {
     None
 }
 
+/// Build the Haiku prompt asking for a short narrative summary + crash
+/// recommendations. Kept private so the format is owned by this module.
+fn build_haiku_summary_prompt(milestone_task_id: &str, raw_entries: &str) -> String {
+    format!(
+        "You are summarizing the progress log of an autonomous coding loop at a \
+         milestone boundary. The milestone that just completed is `{}`.\n\n\
+         Below are the raw iteration entries since the last milestone (or the start \
+         of the run). Each entry records one loop iteration: the task it ran, model, \
+         effort, outcome, and files touched.\n\n\
+         Produce a SHORT human-readable summary (≤180 words) with two parts:\n\
+         1. **Narrative**: 2–3 sentences describing what the loop accomplished and \
+            any notable patterns (clusters of failures, repeated tasks, model \
+            changes).\n\
+         2. **Recommendations**: For any task that crashed or hit `PromptOverflow` \
+            ≥2 times, give ONE concrete actionable recommendation per task (e.g. \
+            \"split task\", \"route to Sonnet 4.6\", \"verify already complete\", \
+            \"increase timeout\"). Skip this section if the run was clean.\n\n\
+         Output PLAIN TEXT only — no markdown headers, no fenced code blocks, no \
+         `---` lines (those break our parser). Start directly with the narrative.\n\n\
+         Raw entries:\n{}",
+        milestone_task_id, raw_entries
+    )
+}
+
+/// Try to generate the narrative + recommendations section via Haiku.
+///
+/// Returns `None` on any failure (binary missing, non-zero exit, empty output) —
+/// callers fall back to the deterministic heuristic in that case.
+///
+/// Designed to be cheap: text-only permission mode (no tools), no timeout
+/// override (Haiku is fast — short prompts, ~5–15s typical), `db_dir` threaded
+/// through so any nested `task-mgr` invocation hits the canonical DB.
+fn try_haiku_summary(
+    milestone_task_id: &str,
+    raw_entries: &str,
+    db_dir: Option<&Path>,
+) -> Option<String> {
+    let prompt = build_haiku_summary_prompt(milestone_task_id, raw_entries);
+    let result = match crate::loop_engine::claude::spawn_claude(
+        &prompt,
+        None,
+        None,
+        Some(HAIKU_MODEL),
+        None,
+        false,
+        &PermissionMode::text_only(),
+        None,
+        None,
+        db_dir,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "Warning: milestone summary Haiku spawn failed: {} — falling back to heuristic",
+                e
+            );
+            return None;
+        }
+    };
+    if result.exit_code != 0 {
+        eprintln!(
+            "Warning: milestone summary Haiku exited with code {} — falling back to heuristic",
+            result.exit_code
+        );
+        return None;
+    }
+    let trimmed = result.output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Sanitize: strip any literal `---` separator lines so the LLM can't
+    // accidentally split the entry boundary our parser relies on.
+    let cleaned: String = trimmed
+        .lines()
+        .filter(|l| l.trim() != "---")
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(cleaned)
+}
+
 /// Compact the progress file by replacing every raw iteration entry since
 /// the last milestone summary (or file start) with a single summary block.
 ///
@@ -243,16 +324,21 @@ fn crash_recommendation(task_id: &str, outcomes: &[String]) -> Option<String> {
 /// long-running narrative survives.
 ///
 /// The summary records iterations covered, distinct tasks, completed tasks,
-/// files touched, and a crash-avoidance recommendation for any task with
-/// ≥2 crash or PromptOverflow entries in the window.
+/// files touched, and (when `db_dir` is `Some`) a Haiku-generated narrative +
+/// crash-avoidance recommendations. When `db_dir` is `None` or the Haiku call
+/// fails, falls back to the deterministic `crash_recommendation` heuristic.
 ///
 /// **Note on "Iterations covered":** the count reflects raw entries currently
 /// present in the file since the last milestone — NOT the true number of
 /// iterations elapsed. `rotate_progress` may have already trimmed older
 /// entries before the milestone fired, so the count is a lower bound.
 ///
-/// Best-effort: file I/O errors log to stderr and do not propagate.
-pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str) {
+/// Best-effort: file I/O and LLM failures log to stderr and do not propagate.
+pub fn summarize_milestone(
+    progress_path: &Path,
+    milestone_task_id: &str,
+    db_dir: Option<&Path>,
+) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -329,7 +415,24 @@ pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str) {
         },
     );
 
-    if recommendations.is_empty() {
+    // Optional Haiku-generated narrative + recommendations. Skipped when
+    // db_dir is None (test path) or when the spawn fails for any reason —
+    // either way the deterministic heuristic block always provides a baseline.
+    let llm_section = if db_dir.is_some() {
+        let raw_entries = entries[scope_start..].join("\n---\n");
+        try_haiku_summary(milestone_task_id, &raw_entries, db_dir)
+    } else {
+        None
+    };
+
+    if let Some(narrative) = llm_section {
+        summary.push_str("- Narrative + recommendations (haiku):\n");
+        for line in narrative.lines() {
+            summary.push_str("    ");
+            summary.push_str(line);
+            summary.push('\n');
+        }
+    } else if recommendations.is_empty() {
         summary.push_str("- Crash recommendations: (none — clean run)\n");
     } else {
         summary.push_str("- Crash recommendations:\n");
@@ -808,7 +911,7 @@ mod tests {
         write_iteration_entry(&mut content, 3, "MILESTONE-1", "Completed");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-1");
+        summarize_milestone(&progress_path, "MILESTONE-1", None);
 
         let after = fs::read_to_string(&progress_path).unwrap();
         // Raw FEAT-001 / FEAT-002 entries should be GONE — replaced by summary.
@@ -844,7 +947,7 @@ mod tests {
         write_iteration_entry(&mut content, 3, "FEAT-003", "Completed");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2");
+        summarize_milestone(&progress_path, "MILESTONE-2", None);
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -878,7 +981,7 @@ mod tests {
         write_iteration_entry(&mut content, 3, "REFACTOR-REVIEW-2", "PromptOverflow");
         fs::write(&progress_path, &content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2");
+        summarize_milestone(&progress_path, "MILESTONE-2", None);
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -907,7 +1010,7 @@ mod tests {
             "\n## 2026-01-01 - Milestone Summary: MILESTONE-1\n- Iterations covered: 0\n---\n";
         fs::write(&progress_path, content).unwrap();
 
-        summarize_milestone(&progress_path, "MILESTONE-2");
+        summarize_milestone(&progress_path, "MILESTONE-2", None);
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert_eq!(after, content, "no-op when nothing to summarize");
@@ -917,7 +1020,7 @@ mod tests {
     fn test_summarize_milestone_missing_file_is_noop() {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("missing.txt");
-        summarize_milestone(&progress_path, "MILESTONE-1");
+        summarize_milestone(&progress_path, "MILESTONE-1", None);
         assert!(
             !progress_path.exists(),
             "must not create a progress file from nothing"

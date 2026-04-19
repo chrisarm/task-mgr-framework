@@ -12,6 +12,7 @@ use crate::commands::curate::types::{EnrichCandidate, EnrichParams, EnrichPropos
 use crate::learnings::{EditLearningParams, edit_learning, get_learning, get_learning_tags};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::model::HAIKU_MODEL;
 
 use std::collections::HashSet;
 
@@ -232,11 +233,15 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         let batch_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
         let prompt = build_enrich_prompt(&batch_items);
 
+        // Pin to Haiku — enrich is a background metadata refinement pass; cheap
+        // and fast wins over peak quality. Override via CLI is not exposed; if
+        // a future caller needs heavier reasoning, route through DedupParams-
+        // style explicit model field rather than reverting to default-resolution.
         let claude_result = match claude::spawn_claude(
             &prompt,
             None,
             None,
-            None,
+            Some(HAIKU_MODEL),
             None,
             false,
             &PermissionMode::text_only(),

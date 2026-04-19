@@ -1811,6 +1811,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 Some(&paths.prd_file),
                 task_prefix.as_deref(),
                 Some(&paths.progress_file),
+                Some(&run_config.db_dir),
             )
         } else {
             0
@@ -2592,6 +2593,7 @@ pub fn apply_status_updates(
     prd_path: Option<&Path>,
     task_prefix: Option<&str>,
     progress_path: Option<&Path>,
+    db_dir: Option<&Path>,
 ) -> u32 {
     use detection::TaskStatusChange;
 
@@ -2655,7 +2657,7 @@ pub fn apply_status_updates(
                         || update.task_id == "MILESTONE"
                         || update.task_id.ends_with("-MILESTONE");
                     if is_milestone && let Some(pp) = progress_path {
-                        progress::summarize_milestone(pp, &update.task_id);
+                        progress::summarize_milestone(pp, &update.task_id, db_dir);
                     }
                 }
             }
@@ -4589,7 +4591,7 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4613,7 +4615,7 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(
             applied, 0,
             "unclaimed todo task must not transition on <task-status>:done",
@@ -4647,7 +4649,7 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let prd: serde_json::Value =
@@ -4687,7 +4689,7 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(
             applied, 1,
             "DB dispatch succeeded even though PRD sync failed",
@@ -4718,7 +4720,7 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4757,6 +4759,7 @@ mod tests {
             Some(&prd_path),
             None,
             Some(&progress_path),
+            None,
         );
         assert_eq!(applied, 1);
 
@@ -4798,6 +4801,7 @@ mod tests {
             Some(&prd_path),
             None,
             Some(&progress_path),
+            None,
         );
         assert_eq!(applied, 1);
 
@@ -4828,7 +4832,7 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1, "one dispatch failed, one succeeded");
 
         let status_b: String = conn
