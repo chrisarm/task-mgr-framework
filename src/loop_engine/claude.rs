@@ -87,6 +87,7 @@ pub(crate) fn spawn_claude(
     permission_mode: &PermissionMode,
     effort: Option<&str>,
     disallowed_tools: Option<&str>,
+    db_dir: Option<&Path>,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -156,6 +157,21 @@ pub(crate) fn spawn_claude(
     // engine already scopes permissions via --allowedTools, so the hook's
     // interactive-approval model is not applicable here.
     cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
+
+    // Pin every `task-mgr` invocation inside the spawned Claude (and any
+    // nested subprocesses that inherit env) to the canonical DB. Without
+    // this, when `working_dir` is a worktree, a `task-mgr add` from inside
+    // the subprocess would resolve `--dir=".task-mgr"` against the worktree
+    // cwd and silently create a stray `<worktree>/.task-mgr/tasks.db` —
+    // the original bug this whole feature exists to fix.
+    //
+    // Canonicalize defensively: the loop's `db_dir` may differ from the
+    // git-resolved path the subprocess would compute when reached via a
+    // symlinked worktree.
+    if let Some(dir) = db_dir {
+        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        cmd.env("TASK_MGR_DIR", canonical);
+    }
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -754,6 +770,7 @@ mod tests {
             permission_mode,
             None,
             None,
+            None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script);
@@ -1020,6 +1037,7 @@ mod tests {
             &PermissionMode::Dangerous,
             None,
             None,
+            None,
         );
         let elapsed = start.elapsed();
 
@@ -1092,6 +1110,7 @@ mod tests {
             None,
             false,
             &PermissionMode::Dangerous,
+            None,
             None,
             None,
         );
@@ -1496,6 +1515,7 @@ mod tests {
             None,
             true,
             &PermissionMode::Dangerous,
+            None,
             None,
             None,
         );
@@ -2093,6 +2113,7 @@ mod tests {
             &scoped_coding(),
             None,
             None,
+            None,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
@@ -2170,6 +2191,7 @@ mod tests {
                 &PermissionMode::Dangerous,
                 None,
                 None,
+                None,
             );
             unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script_path);
@@ -2187,6 +2209,7 @@ mod tests {
                 None,
                 stream_json,
                 &PermissionMode::Dangerous,
+                None,
                 None,
                 None,
             );
@@ -2301,6 +2324,7 @@ mod tests {
             None,
             stream_json,
             &PermissionMode::Dangerous,
+            None,
             None,
             None,
         );

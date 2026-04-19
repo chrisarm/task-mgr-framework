@@ -535,6 +535,7 @@ pub fn run_iteration(
         params.permission_mode,
         effort,
         Some(TASKS_JSON_DISALLOWED_TOOLS),
+        Some(params.db_dir),
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();

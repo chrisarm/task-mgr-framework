@@ -100,7 +100,7 @@ QUICK START:
 See 'task-mgr <command> --help' for detailed usage of each command.")]
 pub struct Cli {
     /// Directory for task-mgr database files
-    #[arg(long, default_value = ".task-mgr", global = true)]
+    #[arg(long, env = "TASK_MGR_DIR", default_value = ".task-mgr", global = true)]
     pub dir: PathBuf,
 
     /// Output format

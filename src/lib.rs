@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod git;
 pub mod handlers;
 pub mod learnings;
 pub mod loop_engine;

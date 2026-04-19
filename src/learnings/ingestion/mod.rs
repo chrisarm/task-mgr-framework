@@ -91,6 +91,7 @@ pub fn extract_learnings_from_output(
         &PermissionMode::text_only(),
         None,
         None,
+        db_dir,
     ) {
         Ok(result) => result,
         Err(e) => {

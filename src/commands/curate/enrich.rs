@@ -242,6 +242,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             &PermissionMode::text_only(),
             None,
             None,
+            None,
         ) {
             Ok(r) => r,
             Err(e) => {

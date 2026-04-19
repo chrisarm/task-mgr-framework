@@ -23,7 +23,7 @@ use task_mgr::commands::{
     resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
     worktrees_list, worktrees_prune, worktrees_remove,
 };
-use task_mgr::db::{LockGuard, open_connection};
+use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
     convert_run_end_status, generate_completions, generate_man_pages, output_migrate_result,
     output_result,
@@ -54,15 +54,53 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
-    if let Err(e) = run(cli) {
+    // Resolve --dir to a canonical absolute path *once*, so every subcommand
+    // inherits the same DB directory. See `src/db/path.rs` for the rules and
+    // the worktree bug this fixes (spawned subprocesses creating stray
+    // `<worktree>/.task-mgr/`).
+    //
+    // clap's derive macro doesn't surface `ValueSource` cleanly for global
+    // args, so detect provenance from the actual env / argv inputs.
+    let env_provided = std::env::var_os("TASK_MGR_DIR").is_some();
+    let cli_provided = std::env::args()
+        .skip(1)
+        .any(|a| a == "--dir" || a.starts_with("--dir="));
+    let was_explicit = env_provided || cli_provided;
+    let from_env = env_provided && !cli_provided;
+
+    let resolved = resolve_db_dir(&cli.dir, was_explicit, from_env);
+
+    // Stray-DB guard: if we just redirected the default away from the
+    // user's cwd-default location AND a tasks.db already exists at that
+    // cwd-default location, warn loudly. Prevents "where did my tasks go"
+    // confusion for users with pre-existing stray worktree DBs from before
+    // this fix shipped.
+    if resolved.source == DbDirSource::WorktreeAnchored
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let cwd_default = cwd.join(&cli.dir);
+        if cwd_default != resolved.path && cwd_default.join("tasks.db").exists() {
+            eprintln!(
+                "\x1b[33m[warn]\x1b[0m task-mgr: ignoring stray DB at {} \u{2014} \
+                 using main-repo DB at {} instead. Move or delete the stray DB \
+                 (or pass --dir / set TASK_MGR_DIR) to silence this warning.",
+                cwd_default.display(),
+                resolved.path.display(),
+            );
+        }
+    }
+
+    cli.dir = resolved.path.clone();
+
+    if let Err(e) = run(cli, resolved) {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<(), TaskMgrError> {
+fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
     match cli.command {
         Commands::Init {
             from_json,
@@ -740,17 +778,12 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
             config.use_worktrees = !no_worktree;
             config.cleanup_worktree = cleanup_worktree;
 
-            // Anchor db_dir to source_root so worktrees don't create a separate DB.
-            // If the user passed an absolute --dir, respect it; otherwise resolve
-            // the relative default (".task-mgr") against the project root.
-            let db_dir = if cli.dir.is_relative() {
-                project_root.join(&cli.dir)
-            } else {
-                cli.dir.clone()
-            };
-
+            // `cli.dir` is already absolute (resolved in `main()` via
+            // `resolve_db_dir`, which anchors a relative default against
+            // the main repo root when invoked from a worktree). No further
+            // per-arm massaging needed.
             let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
-                db_dir,
+                db_dir: cli.dir.clone(),
                 source_root: project_root.clone(),
                 working_root: project_root, // May be updated by run_loop if using worktrees
                 prd_file,
@@ -799,13 +832,8 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
         } => {
             let project_root = get_project_root()?;
 
-            // Anchor db_dir to source_root so worktrees don't create a separate DB.
-            // Same resolution as the `loop` command.
-            let db_dir = if cli.dir.is_relative() {
-                project_root.join(&cli.dir)
-            } else {
-                cli.dir.clone()
-            };
+            // `cli.dir` is already absolute (resolved in `main()`).
+            let db_dir = cli.dir.clone();
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -880,7 +908,7 @@ fn run(cli: Cli) -> Result<(), TaskMgrError> {
                     handle_unset_default(&cli.dir, UnsetDefaultOpts { project })?;
                 }
                 ModelsAction::Show => {
-                    handle_show(&cli.dir)?;
+                    handle_show(&cli.dir, resolved_db_dir.source)?;
                 }
             }
             Ok(())

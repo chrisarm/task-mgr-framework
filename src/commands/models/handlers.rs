@@ -158,7 +158,13 @@ pub fn handle_unset_default(db_dir: &Path, opts: UnsetDefaultOpts) -> io::Result
 }
 
 /// `task-mgr models show` entry point.
-pub fn handle_show(db_dir: &Path) -> io::Result<()> {
+///
+/// `db_dir_source` reports how `db_dir` was resolved (CLI flag, env var,
+/// worktree-anchored default, or plain cwd-default). Surfacing it here is
+/// cheap and pays for itself the next time someone wonders why their
+/// `task-mgr` invocation in a worktree shell is reading a different DB
+/// than they expected.
+pub fn handle_show(db_dir: &Path, db_dir_source: crate::db::DbDirSource) -> io::Result<()> {
     let project = read_project_config(db_dir).default_model;
     let user = read_user_config().default_model;
     let (model, source) = match (project.as_ref(), user.as_ref()) {
@@ -173,6 +179,11 @@ pub fn handle_show(db_dir: &Path) -> io::Result<()> {
              or rely on per-PRD / per-task overrides."
         ),
     }
+    println!(
+        "db_dir: {}  (source: {})",
+        db_dir.display(),
+        db_dir_source.label(),
+    );
     Ok(())
 }
 

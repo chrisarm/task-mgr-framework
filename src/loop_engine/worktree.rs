@@ -47,23 +47,9 @@ pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> P
 }
 
 fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
-    // In a worktree, `git rev-parse --git-dir` returns a path ending with `.git/worktrees/<name>`
-    // In the main repo, it returns `.git` (relative or absolute)
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(dir)
-        .output()
-        .map_err(|e| {
-            TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e)
-        })?;
-
-    if !output.status.success() {
-        return Ok(false);
-    }
-
-    let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // Worktree git-dir looks like: /path/to/main/.git/worktrees/branch-name
-    Ok(git_dir.contains("/worktrees/") || git_dir.contains("\\worktrees\\"))
+    crate::git::is_inside_worktree_at(dir).map_err(|e| {
+        TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e)
+    })
 }
 
 /// Return a list of (worktree_path, branch_name) tuples.
