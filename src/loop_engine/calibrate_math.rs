@@ -290,7 +290,7 @@ mod tests {
         ];
         let corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
         assert!(
-            corr >= -1.0 && corr <= 0.0,
+            (-1.0..=0.0).contains(&corr),
             "Extreme negative correlation should be clamped: {}",
             corr
         );
@@ -315,7 +315,7 @@ mod tests {
         ];
         let corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
         assert!(
-            corr >= 0.0 && corr <= 1.0,
+            (0.0..=1.0).contains(&corr),
             "Extreme positive correlation should be clamped: {}",
             corr
         );

@@ -63,7 +63,7 @@ fn create_benchmark_db() -> (TempDir, rusqlite::Connection) {
         for _ in 0..count {
             let id = format!("US-{:03}", task_count);
             let title = format!("Task {} - {} status", task_count, status);
-            let priority = (task_count % 100) as i32 + 1; // Priorities 1-100
+            let priority = (task_count % 100) + 1; // Priorities 1-100
             insert_task(&conn, &id, &title, status, priority);
             task_count += 1;
         }
@@ -390,7 +390,7 @@ fn test_benchmark_worst_case_all_todo() {
     for i in 0..200 {
         let id = format!("US-{:03}", i);
         let title = format!("Task {} - all todo", i);
-        let priority = (i % 100) as i32 + 1;
+        let priority = (i % 100) + 1;
         insert_task(&conn, &id, &title, "todo", priority);
 
         // Add some files
@@ -449,7 +449,7 @@ fn test_benchmark_many_files_overlap() {
     // Create 200 todo tasks with many files each
     for i in 0..200 {
         let id = format!("US-{:03}", i);
-        insert_task(&conn, &id, &format!("Task {}", i), "todo", (i + 1) as i32);
+        insert_task(&conn, &id, &format!("Task {}", i), "todo", i + 1);
 
         // Each task touches 10 files
         for f in 0..10 {

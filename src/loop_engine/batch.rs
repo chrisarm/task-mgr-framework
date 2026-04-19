@@ -701,7 +701,7 @@ mod tests {
         fs::write(&prd_path, "{}").expect("write prd");
         fs::write(&prompt_path, "# Prompt").expect("write prompt");
 
-        let result = validate_prompt_files(&[prd_path.clone()]);
+        let result = validate_prompt_files(std::slice::from_ref(&prd_path));
         assert!(result.is_ok());
         let pairs = result.unwrap();
         assert_eq!(pairs.len(), 1);
@@ -1077,7 +1077,7 @@ mod tests {
         // We test the PrdRunResult structure that would be produced, not the async runner.
         //
         // Simulate what run_batch would produce for 3 PRDs where PRD[1] fails:
-        let results = vec![
+        let results = [
             PrdRunResult {
                 prd_file: PathBuf::from("phase-1.json"),
                 exit_code: 0,

@@ -868,7 +868,7 @@ mod tests {
         let threshold: u8 = 92;
         let usage_pct: f64 = 92.0;
         assert!(
-            !(usage_pct < f64::from(threshold)),
+            usage_pct >= f64::from(threshold),
             "92.0 < 92.0 should be false (triggers wait)"
         );
     }
@@ -888,7 +888,7 @@ mod tests {
         let threshold: u8 = 92;
         let usage_pct: f64 = 92.001;
         assert!(
-            !(usage_pct < f64::from(threshold)),
+            usage_pct >= f64::from(threshold),
             "92.001 < 92.0 should be false (above threshold)"
         );
     }
@@ -898,7 +898,7 @@ mod tests {
         let threshold: u8 = 0;
         let usage_pct: f64 = 0.001;
         assert!(
-            !(usage_pct < f64::from(threshold)),
+            usage_pct >= f64::from(threshold),
             "Any positive usage should trigger when threshold is 0"
         );
     }

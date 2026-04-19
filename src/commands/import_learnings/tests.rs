@@ -767,14 +767,15 @@ fn test_import_learning_all_optional_fields_none() {
     assert_eq!(result.learnings_imported, 1);
 
     let conn = open_connection(dir.path()).unwrap();
-    let (root_cause, solution, applies_files, applies_tasks, applies_errors): (
+    type OptionalMetadataRow = (
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = conn
-        .query_row(
+    );
+    let (root_cause, solution, applies_files, applies_tasks, applies_errors): OptionalMetadataRow =
+        conn.query_row(
             "SELECT root_cause, solution, applies_to_files, applies_to_task_types, \
              applies_to_errors FROM learnings WHERE title = ?1",
             rusqlite::params!["Minimal"],
@@ -894,6 +895,21 @@ fn test_import_learning_all_optional_fields_populated() {
 
 /// Read a learning back from DB as a struct for round-trip comparison.
 /// Uses SQL directly to avoid dependency on export module.
+type FullLearningRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i32,
+    i32,
+    Option<String>,
+    Option<String>,
+);
+
 fn read_learning_from_db(conn: &rusqlite::Connection, title: &str) -> LearningExport {
     let (
         outcome_str,
@@ -908,20 +924,7 @@ fn read_learning_from_db(conn: &rusqlite::Connection, title: &str) -> LearningEx
         times_applied,
         last_shown,
         last_applied,
-    ): (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i32,
-        i32,
-        Option<String>,
-        Option<String>,
-    ) = conn
+    ): FullLearningRow = conn
         .query_row(
             "SELECT outcome, confidence, content, root_cause, solution, \
              applies_to_files, applies_to_task_types, applies_to_errors, \

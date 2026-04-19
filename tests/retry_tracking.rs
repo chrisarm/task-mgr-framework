@@ -401,6 +401,34 @@ fn test_model_escalation_haiku_to_sonnet_at_two_failures() {
     );
 }
 
+/// Empty / whitespace-only models in the DB must normalize to sonnet baseline
+/// and escalate to opus, matching `check_crash_escalation`. Falsifies a past
+/// state where the two paths disagreed on non-empty-but-whitespace inputs.
+#[test]
+fn test_model_escalation_empty_and_whitespace_normalize_to_opus() {
+    for (idx, bad) in ["", "   ", "\t"].iter().enumerate() {
+        let (_dir, conn) = setup_db();
+        let id = format!("WS-{idx}");
+        insert_retry_task(&conn, &id, Some(bad), 5, 0);
+
+        let result = escalate_task_model_if_needed(&conn, &id, 2).unwrap();
+        assert_eq!(
+            result,
+            Some(OPUS_MODEL.to_string()),
+            "bogus model {bad:?} must normalize to baseline and escalate to opus"
+        );
+
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM tasks WHERE id = ?", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some(OPUS_MODEL),
+            "DB model column must be rewritten to opus"
+        );
+    }
+}
+
 /// handle_task_failure with a haiku task: 2 failures → escalates to sonnet, not opus.
 #[test]
 fn test_handle_task_failure_haiku_escalates_to_sonnet_at_two() {

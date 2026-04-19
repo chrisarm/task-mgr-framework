@@ -1767,7 +1767,7 @@ mod tests {
             "error": null
         })
         .to_string();
-        let lines: Vec<String> = std::iter::repeat(block).take(10).collect();
+        let lines: Vec<String> = std::iter::repeat_n(block, 10).collect();
         let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
         let conv = conv.unwrap();
         assert!(
@@ -2043,7 +2043,7 @@ mod tests {
             "error": null
         })
         .to_string();
-        let lines: Vec<String> = std::iter::repeat(block).take(6).collect();
+        let lines: Vec<String> = std::iter::repeat_n(block, 6).collect();
         let (_, conv) = parse_stream_json_lines(lines.iter().map(|s| s.as_str()));
         let conv = conv.expect("should have conversation");
         assert!(
@@ -3156,10 +3156,7 @@ mod tests {
         // Should be a no-op, no panic.
         cleanup_title_artifact_sync(uuid::Uuid::new_v4(), None);
 
-        match previous {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => {}
-        }
+        if let Some(v) = previous { unsafe { std::env::set_var("HOME", v) } }
     }
 
     /// Target file never written (Claude crashed before writing ai-title):

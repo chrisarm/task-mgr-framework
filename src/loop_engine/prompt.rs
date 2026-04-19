@@ -27,9 +27,7 @@ use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
 };
 use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
-use crate::loop_engine::prompt_sections::synergy::{
-    build_synergy_section, resolve_synergy_cluster_model,
-};
+use crate::loop_engine::prompt_sections::synergy::{build_synergy_section, resolve_synergy_cluster};
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 
@@ -68,8 +66,17 @@ pub struct PromptResult {
     /// testing to distinguish "dropped due to budget" from "empty because no data".
     pub dropped_sections: Vec<String>,
     /// Difficulty level of the selected task (for per-iteration timeout calculation).
-    /// Propagated from `NextTaskOutput.difficulty`.
+    /// Propagated from `NextTaskOutput.difficulty`. Per-task, NOT cluster-wide — see
+    /// `cluster_effort` for the effort flag that mirrors cluster-wide model escalation.
     pub task_difficulty: Option<String>,
+    /// Resolved Claude CLI `--effort` level for this iteration (None → omit flag).
+    ///
+    /// Derived from the **cluster-wide max difficulty** (primary task + pending
+    /// `synergyWith` partners), then mapped through `model::effort_for_difficulty`.
+    /// This parallels `resolved_model`: both scale with the hardest task in the
+    /// cluster so (Opus, `xhigh`) is chosen when a cluster contains a `high`-difficulty
+    /// partner, even if the primary is only `medium`.
+    pub cluster_effort: Option<&'static str>,
 }
 
 /// Parameters for building a prompt.
@@ -144,13 +151,18 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         user_default: params.user_default_model,
         ..Default::default()
     };
-    let resolved_model = resolve_synergy_cluster_model(
+    // Derive cluster-wide model AND cluster-wide difficulty from a single
+    // synergy-partner SQL fetch, so both axes scale with the hardest task in
+    // the synergy cluster (not just the primary).
+    let (resolved_model, cluster_difficulty) = resolve_synergy_cluster(
         params.conn,
         &task_output.id,
         task_output.model.as_deref(),
         task_output.difficulty.as_deref(),
         &defaults,
     );
+    let cluster_effort =
+        crate::loop_engine::model::effort_for_difficulty(cluster_difficulty.as_deref());
 
     // ============================================================
     // Phase 1: Build critical sections into separate Strings
@@ -369,6 +381,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         resolved_model,
         dropped_sections,
         task_difficulty: task_output.difficulty.clone(),
+        cluster_effort,
     }))
 }
 
@@ -838,6 +851,7 @@ mod tests {
             resolved_model: None,
             dropped_sections: vec![],
             task_difficulty: None,
+            cluster_effort: None,
         };
 
         assert_eq!(result.task_id, "FEAT-001");
@@ -2372,6 +2386,85 @@ pub enum ApiError {
             "Synergy partner with opus MUST override selected task's haiku — \
              synergy cluster model = max tier across all members"
         );
+    }
+
+    // --- Cluster effort (parallels cluster model) ---
+
+    /// End-to-end: primary `medium` + pending synergy partner `high` must resolve
+    /// effort to `xhigh` (not `high`). Falsifies the previous primary-only behaviour
+    /// where model escalated cluster-wide but effort did not.
+    #[test]
+    fn test_cluster_effort_partner_higher_difficulty_wins() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CE-001", "Primary medium", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'medium' WHERE id = 'CE-001'",
+            [],
+        )
+        .unwrap();
+        insert_task(&conn, "SYN-CE-001", "Partner high", "todo", 10);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'SYN-CE-001'",
+            [],
+        )
+        .unwrap();
+        insert_relationship(&conn, "CE-001", "SYN-CE-001", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+
+        assert_eq!(
+            result.cluster_effort,
+            Some("xhigh"),
+            "synergy partner with high difficulty must pull cluster effort up to xhigh"
+        );
+        // Per-task difficulty stays the primary's — needed for watchdog timeout.
+        assert_eq!(result.task_difficulty.as_deref(), Some("medium"));
+    }
+
+    /// Done / archived partners must not influence cluster effort.
+    #[test]
+    fn test_cluster_effort_done_partner_excluded() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CE-002", "Primary medium", "todo", 5);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'medium' WHERE id = 'CE-002'",
+            [],
+        )
+        .unwrap();
+        insert_task(&conn, "SYN-CE-002", "Partner high but done", "done", 10);
+        conn.execute(
+            "UPDATE tasks SET difficulty = 'high' WHERE id = 'SYN-CE-002'",
+            [],
+        )
+        .unwrap();
+        insert_relationship(&conn, "CE-002", "SYN-CE-002", "synergyWith");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+
+        assert_eq!(
+            result.cluster_effort,
+            Some("high"),
+            "done partner must not influence cluster effort — stays at primary's medium→high"
+        );
+    }
+
+    /// Unset difficulty everywhere → no --effort flag.
+    #[test]
+    fn test_cluster_effort_unset_difficulty_returns_none() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_task(&conn, "CE-003", "No difficulty", "todo", 5);
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
+        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+
+        assert_eq!(result.cluster_effort, None);
     }
 
     // --- Edge case tests for model resolution ---

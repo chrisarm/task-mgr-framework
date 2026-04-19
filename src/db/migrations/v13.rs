@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn test_v13_current_schema_version_is_13() {
         let (_temp_dir, conn) = setup_migrated_db();
-        assert!(
+        const _: () = assert!(
             CURRENT_SCHEMA_VERSION >= 13,
             "CURRENT_SCHEMA_VERSION must be at least 13"
         );

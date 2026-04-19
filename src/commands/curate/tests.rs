@@ -1812,6 +1812,18 @@ fn test_enrich_batch_failure_previous_batches_committed_and_durable() {
 // All tests are #[ignore] until FEAT-004 (merge_cluster implementation).
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Optional fields for `insert_learning_full`. Callers use
+/// `InsertFullOpts { ..Default::default() }` to populate only what's relevant.
+#[derive(Default)]
+struct InsertFullOpts<'a> {
+    applies_to_files: Option<Vec<&'a str>>,
+    applies_to_task_types: Option<Vec<&'a str>>,
+    applies_to_errors: Option<Vec<&'a str>>,
+    tags: Option<Vec<&'a str>>,
+    times_shown: i32,
+    times_applied: i32,
+}
+
 /// Helper: insert a learning with full metadata and bandit stats for merge tests.
 ///
 /// Returns the new learning ID.
@@ -1819,12 +1831,7 @@ fn insert_learning_full(
     conn: &Connection,
     title: &str,
     confidence: Confidence,
-    applies_to_files: Option<Vec<&str>>,
-    applies_to_task_types: Option<Vec<&str>>,
-    applies_to_errors: Option<Vec<&str>>,
-    tags: Option<Vec<&str>>,
-    times_shown: i32,
-    times_applied: i32,
+    opts: InsertFullOpts<'_>,
 ) -> i64 {
     let params = RecordLearningParams {
         outcome: LearningOutcome::Pattern,
@@ -1834,11 +1841,16 @@ fn insert_learning_full(
         run_id: None,
         root_cause: None,
         solution: None,
-        applies_to_files: applies_to_files.map(|v| v.into_iter().map(str::to_string).collect()),
-        applies_to_task_types: applies_to_task_types
+        applies_to_files: opts
+            .applies_to_files
             .map(|v| v.into_iter().map(str::to_string).collect()),
-        applies_to_errors: applies_to_errors.map(|v| v.into_iter().map(str::to_string).collect()),
-        tags: tags.map(|v| v.into_iter().map(str::to_string).collect()),
+        applies_to_task_types: opts
+            .applies_to_task_types
+            .map(|v| v.into_iter().map(str::to_string).collect()),
+        applies_to_errors: opts
+            .applies_to_errors
+            .map(|v| v.into_iter().map(str::to_string).collect()),
+        tags: opts.tags.map(|v| v.into_iter().map(str::to_string).collect()),
         confidence,
     };
     let id = record_learning(conn, params)
@@ -1847,7 +1859,7 @@ fn insert_learning_full(
     // record_learning always initialises bandit stats to 0 — patch them now
     conn.execute(
         "UPDATE learnings SET times_shown = ?1, times_applied = ?2 WHERE id = ?3",
-        rusqlite::params![times_shown, times_applied, id],
+        rusqlite::params![opts.times_shown, opts.times_applied, id],
     )
     .expect("set bandit stats");
     id
@@ -1894,28 +1906,8 @@ fn test_merge_two_learnings_creates_one_merged() {
     // title and content come from the MergeClusterParams (not from the sources).
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(
-        &conn,
-        "Learning A",
-        Confidence::Medium,
-        None,
-        None,
-        None,
-        None,
-        0,
-        0,
-    );
-    let id2 = insert_learning_full(
-        &conn,
-        "Learning B",
-        Confidence::Medium,
-        None,
-        None,
-        None,
-        None,
-        0,
-        0,
-    );
+    let id1 = insert_learning_full(&conn, "Learning A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "Learning B", Confidence::Medium, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -1943,23 +1935,19 @@ fn test_merge_union_applies_to_files_no_duplicates() {
         &conn,
         "A",
         Confidence::Medium,
-        Some(vec!["src/lib.rs", "src/main.rs"]),
-        None,
-        None,
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/lib.rs", "src/main.rs"]),
+            ..Default::default()
+        },
     );
     let id2 = insert_learning_full(
         &conn,
         "B",
         Confidence::Medium,
-        Some(vec!["src/main.rs", "src/foo.rs"]), // "src/main.rs" is a duplicate
-        None,
-        None,
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/main.rs", "src/foo.rs"]), // "src/main.rs" is a duplicate
+            ..Default::default()
+        },
     );
 
     let params = MergeClusterParams {
@@ -1985,23 +1973,19 @@ fn test_merge_union_applies_to_task_types() {
         &conn,
         "A",
         Confidence::Medium,
-        None,
-        Some(vec!["FEAT-", "FIX-"]),
-        None,
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_task_types: Some(vec!["FEAT-", "FIX-"]),
+            ..Default::default()
+        },
     );
     let id2 = insert_learning_full(
         &conn,
         "B",
         Confidence::Medium,
-        None,
-        Some(vec!["FIX-", "TEST-"]), // "FIX-" is a duplicate
-        None,
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_task_types: Some(vec!["FIX-", "TEST-"]), // "FIX-" is a duplicate
+            ..Default::default()
+        },
     );
 
     let params = MergeClusterParams {
@@ -2024,23 +2008,19 @@ fn test_merge_union_applies_to_errors() {
         &conn,
         "A",
         Confidence::Medium,
-        None,
-        None,
-        Some(vec!["E0001", "E0002"]),
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_errors: Some(vec!["E0001", "E0002"]),
+            ..Default::default()
+        },
     );
     let id2 = insert_learning_full(
         &conn,
         "B",
         Confidence::Medium,
-        None,
-        None,
-        Some(vec!["E0002", "E0003"]), // "E0002" is a duplicate
-        None,
-        0,
-        0,
+        InsertFullOpts {
+            applies_to_errors: Some(vec!["E0002", "E0003"]), // "E0002" is a duplicate
+            ..Default::default()
+        },
     );
 
     let params = MergeClusterParams {
@@ -2062,23 +2042,19 @@ fn test_merge_union_tags_no_duplicates() {
         &conn,
         "A",
         Confidence::Medium,
-        None,
-        None,
-        None,
-        Some(vec!["alpha", "beta"]),
-        0,
-        0,
+        InsertFullOpts {
+            tags: Some(vec!["alpha", "beta"]),
+            ..Default::default()
+        },
     );
     let id2 = insert_learning_full(
         &conn,
         "B",
         Confidence::Medium,
-        None,
-        None,
-        None,
-        Some(vec!["beta", "gamma"]), // "beta" is a duplicate
-        0,
-        0,
+        InsertFullOpts {
+            tags: Some(vec!["beta", "gamma"]), // "beta" is a duplicate
+            ..Default::default()
+        },
     );
 
     let params = MergeClusterParams {
@@ -2099,8 +2075,8 @@ fn test_merge_times_shown_is_sum_of_sources() {
     // Known-bad discriminator: naive impl may forget to sum stats (leaves at 0).
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 5, 2);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 7, 3);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts { times_shown: 5, times_applied: 2, ..Default::default() });
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts { times_shown: 7, times_applied: 3, ..Default::default() });
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2121,8 +2097,8 @@ fn test_merge_times_applied_is_sum_of_sources() {
     // Known-bad discriminator: naive impl may forget to sum stats.
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 5, 2);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 7, 3);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts { times_shown: 5, times_applied: 2, ..Default::default() });
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts { times_shown: 7, times_applied: 3, ..Default::default() });
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2145,9 +2121,9 @@ fn test_merge_confidence_is_highest_from_sources() {
     // high > medium > low; merged learning takes the highest, not from LLM
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::High, None, None, None, None, 0, 0);
-    let id3 = insert_learning_full(&conn, "C", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::High, InsertFullOpts::default());
+    let id3 = insert_learning_full(&conn, "C", Confidence::Medium, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2, id3],
@@ -2168,8 +2144,8 @@ fn test_merge_confidence_not_from_llm_response() {
     // regardless of what the LLM-produced content might claim.
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
 
     // The merged_content deliberately embeds "confidence: high" to tempt a naive
     // implementation into parsing the LLM response for confidence.
@@ -2194,8 +2170,8 @@ fn test_merge_confidence_not_from_llm_response() {
 fn test_merge_sources_are_retired_after_merge() {
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2219,8 +2195,8 @@ fn test_merge_merged_learning_is_active() {
     // The merged learning itself must NOT be retired (retired_at IS NULL)
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2246,14 +2222,13 @@ fn test_merge_window_stats_reset_to_zero() {
         &conn,
         "A",
         Confidence::Medium,
-        None,
-        None,
-        None,
-        None,
-        10,
-        4,
+        InsertFullOpts {
+            times_shown: 10,
+            times_applied: 4,
+            ..Default::default()
+        },
     );
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 8, 3);
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts { times_shown: 8, times_applied: 3, ..Default::default() });
     // Manually set window_shown / window_applied on sources to non-zero values
     conn.execute(
         "UPDATE learnings SET window_shown = 6, window_applied = 2 WHERE id = ?1",
@@ -2294,9 +2269,9 @@ fn test_already_merged_learning_skipped_in_second_cluster() {
     // and still create a merged learning from the remaining active sources.
     let (_dir, conn) = setup_db();
 
-    let id_a = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 3, 1);
-    let id_b = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 4, 2);
-    let id_c = insert_learning_full(&conn, "C", Confidence::Medium, None, None, None, None, 5, 1);
+    let id_a = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts { times_shown: 3, times_applied: 1, ..Default::default() });
+    let id_b = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts { times_shown: 4, times_applied: 2, ..Default::default() });
+    let id_c = insert_learning_full(&conn, "C", Confidence::Medium, InsertFullOpts { times_shown: 5, times_applied: 1, ..Default::default() });
 
     // Cluster 1: merge A + B → M1
     let params1 = MergeClusterParams {
@@ -2348,56 +2323,66 @@ fn test_merge_large_cluster_5_sources_sums_all_stats_and_unions_metadata() {
         &conn,
         "A",
         Confidence::Low,
-        Some(vec!["src/a.rs"]),
-        Some(vec!["FEAT-"]),
-        Some(vec!["E001"]),
-        Some(vec!["tag-a"]),
-        3,
-        1,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/a.rs"]),
+            applies_to_task_types: Some(vec!["FEAT-"]),
+            applies_to_errors: Some(vec!["E001"]),
+            tags: Some(vec!["tag-a"]),
+            times_shown: 3,
+            times_applied: 1,
+        },
     );
     let id2 = insert_learning_full(
         &conn,
         "B",
         Confidence::Medium,
-        Some(vec!["src/b.rs"]),
-        Some(vec!["FIX-"]),
-        Some(vec!["E002"]),
-        Some(vec!["tag-b"]),
-        4,
-        2,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/b.rs"]),
+            applies_to_task_types: Some(vec!["FIX-"]),
+            applies_to_errors: Some(vec!["E002"]),
+            tags: Some(vec!["tag-b"]),
+            times_shown: 4,
+            times_applied: 2,
+        },
     );
     let id3 = insert_learning_full(
         &conn,
         "C",
         Confidence::High,
-        Some(vec!["src/c.rs"]),
-        Some(vec!["TEST-"]),
-        Some(vec!["E003"]),
-        Some(vec!["tag-c"]),
-        5,
-        3,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/c.rs"]),
+            applies_to_task_types: Some(vec!["TEST-"]),
+            applies_to_errors: Some(vec!["E003"]),
+            tags: Some(vec!["tag-c"]),
+            times_shown: 5,
+            times_applied: 3,
+        },
     );
     let id4 = insert_learning_full(
         &conn,
         "D",
         Confidence::Low,
-        Some(vec!["src/d.rs"]),
-        Some(vec!["REFACTOR-"]),
-        Some(vec!["E004"]),
-        None,
-        6,
-        4,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/d.rs"]),
+            applies_to_task_types: Some(vec!["REFACTOR-"]),
+            applies_to_errors: Some(vec!["E004"]),
+            tags: None,
+            times_shown: 6,
+            times_applied: 4,
+        },
     );
     let id5 = insert_learning_full(
         &conn,
         "E",
         Confidence::Medium,
-        Some(vec!["src/e.rs"]),
-        Some(vec!["FEAT-"]), // duplicate with id1
-        Some(vec!["E005"]),
-        Some(vec!["tag-a"]), // duplicate with id1
-        7,
-        5,
+        InsertFullOpts {
+            applies_to_files: Some(vec!["src/e.rs"]),
+            applies_to_task_types: Some(vec!["FEAT-"]), // duplicate with id1
+            applies_to_errors: Some(vec!["E005"]),
+            tags: Some(vec!["tag-a"]), // duplicate with id1
+            times_shown: 7,
+            times_applied: 5,
+        },
     );
 
     let params = MergeClusterParams {
@@ -2450,8 +2435,8 @@ fn test_merge_all_null_metadata_produces_null_fields() {
     // AC: when ALL sources have NULL metadata, merged learning has NULL fields (not empty arrays)
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 2, 1);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 3, 2);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts { times_shown: 2, times_applied: 1, ..Default::default() });
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts { times_shown: 3, times_applied: 2, ..Default::default() });
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2485,8 +2470,8 @@ fn test_merge_confidence_medium_plus_high_gives_high() {
     // AC: confidence ordering edge case — medium + high = high
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::High, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::High, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2505,8 +2490,8 @@ fn test_merge_confidence_low_plus_low_gives_low() {
     // AC: confidence ordering edge case — low + low = low
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Low, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Low, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Low, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Low, InsertFullOpts::default());
 
     let params = MergeClusterParams {
         source_ids: vec![id1, id2],
@@ -2527,8 +2512,8 @@ fn test_merge_outcome_is_pattern_not_computed_from_sources() {
     let (_dir, conn) = setup_db();
 
     // Insert with non-pattern outcomes via raw SQL after creation
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
     conn.execute(
         "UPDATE learnings SET outcome = 'failure' WHERE id = ?1",
         [id1],
@@ -2561,8 +2546,8 @@ fn test_merge_root_cause_and_solution_not_propagated() {
     // The merged content captures this information instead.
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
     // Set root_cause and solution on source learnings
     conn.execute(
         "UPDATE learnings SET root_cause = 'Source root cause A', solution = 'Source solution A' WHERE id = ?1",
@@ -2599,8 +2584,8 @@ fn test_merge_created_at_is_now_not_copied_from_sources() {
     // AC: merged learning has created_at set to now, not copied from oldest source
     let (_dir, conn) = setup_db();
 
-    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, None, None, None, None, 0, 0);
-    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, None, None, None, None, 0, 0);
+    let id1 = insert_learning_full(&conn, "A", Confidence::Medium, InsertFullOpts::default());
+    let id2 = insert_learning_full(&conn, "B", Confidence::Medium, InsertFullOpts::default());
 
     // Age both sources by 100 days
     set_age_days(&conn, id1, 100);
@@ -2762,7 +2747,7 @@ fn test_parse_dedup_response_filters_nonexistent_ids() {
 
     // Cluster with valid IDs [1,2] must be preserved
     let has_valid = clusters.iter().any(|c| {
-        let ids = c.source_ids.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let ids = c.source_ids.as_deref().unwrap_or(&[]);
         ids.contains(&1) && ids.contains(&2)
     });
     assert!(has_valid, "cluster with valid IDs [1, 2] must be preserved");
@@ -2792,7 +2777,7 @@ fn test_parse_dedup_response_first_cluster_wins_on_duplicate_id() {
 
     // First cluster [1,2] must be present
     let first_kept = clusters.iter().any(|c| {
-        let ids = c.source_ids.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let ids = c.source_ids.as_deref().unwrap_or(&[]);
         ids.contains(&1) && ids.contains(&2)
     });
     assert!(first_kept, "first cluster [1, 2] must be kept");
@@ -2885,7 +2870,7 @@ fn test_parse_dedup_response_single_id_cluster_rejected() {
 
     // Valid 2-ID cluster must be kept
     let has_valid_pair = clusters.iter().any(|c| {
-        let ids = c.source_ids.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+        let ids = c.source_ids.as_deref().unwrap_or(&[]);
         ids.contains(&1) && ids.contains(&2)
     });
     assert!(has_valid_pair, "valid 2-ID cluster must be preserved");

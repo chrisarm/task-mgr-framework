@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_detects_blocked_in_last_20_lines() {
         let output = "Missing dependency\n<promise>BLOCKED</promise>\n";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Blocked,
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_blocked_on_last_line() {
         let output = "Cannot proceed\n<promise>BLOCKED</promise>";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(result, IterationOutcome::Blocked);
     }
 
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn test_detects_reorder_with_task_id() {
         let output = "I think LOOP-005 would be better.\n<reorder>LOOP-005</reorder>\nDone.";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Reorder("LOOP-005".to_string()),
@@ -473,14 +473,14 @@ mod tests {
     #[test]
     fn test_detects_reorder_with_different_task_id_format() {
         let output = "Suggest switching to FEAT-024.\n<reorder>FEAT-024</reorder>";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(result, IterationOutcome::Reorder("FEAT-024".to_string()),);
     }
 
     #[test]
     fn test_reorder_with_whitespace_around_task_id() {
         let output = "<reorder>  LOOP-005  </reorder>";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Reorder("LOOP-005".to_string()),
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn test_reorder_empty_tag_not_detected() {
         let output = "Some output\n<reorder></reorder>\nMore output";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_ne!(
             result,
             IterationOutcome::Reorder(String::new()),
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn test_reorder_missing_closing_tag_not_detected() {
         let output = "Some output\n<reorder>LOOP-005\nMore output";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         // Should NOT be Reorder since no closing tag
         if let IterationOutcome::Reorder(_) = result {
             panic!("Should not detect reorder without closing tag");
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn test_detects_rate_limit_error_pattern() {
         let output = "Error: rate_limit_error - too many requests\n";
-        let result = analyze_output(&output, 1, &test_dir());
+        let result = analyze_output(output, 1, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::RateLimit,
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn test_detects_429_rate_pattern() {
         let output = "HTTP 429 rate limit exceeded\n";
-        let result = analyze_output(&output, 1, &test_dir());
+        let result = analyze_output(output, 1, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::RateLimit,
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn test_detects_usage_limit_reached_pattern() {
         let output = "Usage limit reached. Please wait.\n";
-        let result = analyze_output(&output, 1, &test_dir());
+        let result = analyze_output(output, 1, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::RateLimit,
@@ -629,7 +629,7 @@ mod tests {
     fn test_complete_takes_priority_over_blocked() {
         let output =
             "Working...\n<promise>BLOCKED</promise>\nFixed it!\n<promise>COMPLETE</promise>\n";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Completed,
@@ -642,7 +642,7 @@ mod tests {
         // Both in last 20 lines, BLOCKED after COMPLETE
         let output =
             "Start\n<promise>COMPLETE</promise>\nMore work\n<promise>BLOCKED</promise>\nEnd";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Completed,
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn test_complete_takes_priority_over_rate_limit() {
         let output = "rate_limit_error earlier\nRecovered\n<promise>COMPLETE</promise>\n";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Completed,
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn test_blocked_takes_priority_over_reorder() {
         let output = "<reorder>FEAT-005</reorder>\n<promise>BLOCKED</promise>\n";
-        let result = analyze_output(&output, 0, &test_dir());
+        let result = analyze_output(output, 0, &test_dir());
         assert_eq!(
             result,
             IterationOutcome::Blocked,

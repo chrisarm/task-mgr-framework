@@ -933,7 +933,7 @@ fn test_edit_learning_errors_null_field_remove_is_noop() {
             || learning
                 .applies_to_errors
                 .as_ref()
-                .map_or(true, |v| v.is_empty())
+                .is_none_or(|v| v.is_empty())
     );
 }
 
@@ -1191,7 +1191,7 @@ fn test_edit_learning_task_types_round_trip_add_read_remove_null() {
             || learning
                 .applies_to_task_types
                 .as_ref()
-                .map_or(true, |v| v.is_empty()),
+                .is_none_or(|v| v.is_empty()),
         "applies_to_task_types should be NULL/empty after removing all items"
     );
 }

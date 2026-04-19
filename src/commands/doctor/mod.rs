@@ -410,7 +410,7 @@ mod audit_setup_tests {
 
         let warn_count = result.warning_count();
         assert!(
-            warn_count >= EXPECTED_SKILLS.len() + 1,
+            warn_count > EXPECTED_SKILLS.len(),
             "expected ≥ {} warnings (skills + config.json), got {warn_count}",
             EXPECTED_SKILLS.len() + 1
         );

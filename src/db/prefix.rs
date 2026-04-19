@@ -341,7 +341,7 @@ mod tests {
     fn test_discriminator_underscore_escape_prevents_wildcard_match() {
         let escaped = escape_like("P_1");
         // Naive unescaped form
-        let naive_pattern = format!("P_1-%");
+        let naive_pattern = "P_1-%".to_string();
         // Correctly escaped form
         let safe_pattern = format!("{escaped}-%");
 

@@ -666,9 +666,8 @@ detached
             "remove_worktree on clean worktree should return Ok: {:?}",
             result.err()
         );
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "remove_worktree on clean worktree should return Ok(true)"
         );
         assert!(
@@ -694,9 +693,8 @@ detached
             "remove_worktree on dirty worktree should return Ok (skip with warning): {:?}",
             result.err()
         );
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "remove_worktree on dirty worktree should return Ok(false)"
         );
         assert!(
@@ -848,9 +846,8 @@ detached
             "remove_worktree with staged changes should return Ok (skip): {:?}",
             result.err()
         );
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "remove_worktree with staged changes should return Ok(false)"
         );
         assert!(

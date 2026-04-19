@@ -467,6 +467,49 @@ pub fn insert_prd_file(
     Ok(())
 }
 
+/// Register all files associated with a PRD in the prd_files table.
+///
+/// Records:
+/// 1. The task list JSON file as `task_list` type
+/// 2. The derived prompt file (`<stem>-prompt.md`) as `prompt` type if it exists
+/// 3. The PRD markdown file from `prd.prd_file` as `prd` type if set
+///
+/// All paths are stored relative to the tasks directory.
+pub fn register_prd_files(
+    conn: &Connection,
+    prd_id: i64,
+    json_path: &Path,
+    prd: &PrdFile,
+    tasks_dir: &Path,
+) -> TaskMgrResult<()> {
+    // Store the JSON task list path (relative to tasks dir)
+    let json_relative = json_path
+        .strip_prefix(tasks_dir)
+        .unwrap_or(json_path)
+        .to_string_lossy();
+    insert_prd_file(conn, prd_id, &json_relative, "task_list")?;
+
+    // Derive prompt file path: <stem>-prompt.md
+    if let Some(stem) = json_path.file_stem() {
+        let prompt_name = format!("{}-prompt.md", stem.to_string_lossy());
+        let prompt_path = json_path.with_file_name(&prompt_name);
+        if prompt_path.exists() {
+            let prompt_relative = prompt_path
+                .strip_prefix(tasks_dir)
+                .unwrap_or(&prompt_path)
+                .to_string_lossy();
+            insert_prd_file(conn, prd_id, &prompt_relative, "prompt")?;
+        }
+    }
+
+    // Store PRD markdown file if specified
+    if let Some(ref prd_file) = prd.prd_file {
+        insert_prd_file(conn, prd_id, prd_file, "prd")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,50 +658,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(task.requires_human, true);
+        assert!(task.requires_human);
         assert_eq!(task.human_review_timeout, None);
     }
-}
-
-/// Register all files associated with a PRD in the prd_files table.
-///
-/// Records:
-/// 1. The task list JSON file as `task_list` type
-/// 2. The derived prompt file (`<stem>-prompt.md`) as `prompt` type if it exists
-/// 3. The PRD markdown file from `prd.prd_file` as `prd` type if set
-///
-/// All paths are stored relative to the tasks directory.
-pub fn register_prd_files(
-    conn: &Connection,
-    prd_id: i64,
-    json_path: &Path,
-    prd: &PrdFile,
-    tasks_dir: &Path,
-) -> TaskMgrResult<()> {
-    // Store the JSON task list path (relative to tasks dir)
-    let json_relative = json_path
-        .strip_prefix(tasks_dir)
-        .unwrap_or(json_path)
-        .to_string_lossy();
-    insert_prd_file(conn, prd_id, &json_relative, "task_list")?;
-
-    // Derive prompt file path: <stem>-prompt.md
-    if let Some(stem) = json_path.file_stem() {
-        let prompt_name = format!("{}-prompt.md", stem.to_string_lossy());
-        let prompt_path = json_path.with_file_name(&prompt_name);
-        if prompt_path.exists() {
-            let prompt_relative = prompt_path
-                .strip_prefix(tasks_dir)
-                .unwrap_or(&prompt_path)
-                .to_string_lossy();
-            insert_prd_file(conn, prd_id, &prompt_relative, "prompt")?;
-        }
-    }
-
-    // Store PRD markdown file if specified
-    if let Some(ref prd_file) = prd.prd_file {
-        insert_prd_file(conn, prd_id, prd_file, "prd")?;
-    }
-
-    Ok(())
 }

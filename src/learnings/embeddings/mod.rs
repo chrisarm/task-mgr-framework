@@ -594,7 +594,7 @@ mod tests {
         let (_dir, conn) = setup_db();
         insert_learning(&conn, 1, "Test learning");
 
-        let embedding = vec![1.0_f32, -2.5, 3.14, 0.0];
+        let embedding = vec![1.0_f32, -2.5, 3.125, 0.0];
         store_embedding(&conn, 1, "test-model", &embedding).unwrap();
 
         let loaded = load_embedding(&conn, 1).unwrap();

@@ -266,7 +266,7 @@ mod tests {
                 3 => 4 * 60,
                 4 => 3 * 60,
                 5 => 2 * 60,
-                6 => 1 * 60,
+                6 => 60,
                 _ => 0,
             };
             assert_eq!(ext, expected, "Extension #{} should be {}s", i, expected);

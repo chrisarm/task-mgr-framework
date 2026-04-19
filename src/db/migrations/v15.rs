@@ -40,7 +40,7 @@ pub static MIGRATION: Migration = Migration {
 #[cfg(test)]
 mod tests {
     use crate::db::migrations::{
-        CURRENT_SCHEMA_VERSION, MIGRATIONS, get_schema_version, run_migrations,
+        MIGRATIONS, get_schema_version, run_migrations,
     };
     use crate::db::{create_schema, open_connection};
     use rusqlite::Connection;

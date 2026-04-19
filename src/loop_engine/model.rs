@@ -13,6 +13,18 @@
 //! When bumping a model ID or effort value, edit ONLY this file, then run
 //! `cargo run --bin gen-docs` to refresh the slash-command doc. Tests import
 //! these constants and pick up changes automatically.
+//!
+//! # Escalation vs. downgrade asymmetry
+//!
+//! Model escalation and effort downgrade are deliberately asymmetric.
+//! `escalate_model` moves the model up one tier on repeat crash / consecutive
+//! failure (called from `engine::check_crash_escalation` and
+//! `engine::escalate_task_model_if_needed`). `downgrade_effort` moves effort
+//! down one tier on `PromptTooLong` (called from the `PromptTooLong` branch
+//! in `engine.rs`). A task that starts at (Sonnet, `xhigh`) and keeps crashing
+//! can therefore land at (Opus, `high`); this is intentional — `max` effort
+//! was retired for overflowing context and the `xhigh → high` step is the
+//! same safety valve for `xhigh`.
 
 /// Well-known model identifiers.
 pub const OPUS_MODEL: &str = "claude-opus-4-7";
@@ -30,6 +42,36 @@ pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 /// steps `xhigh → high`; `high` is the floor.
 pub const EFFORT_FOR_DIFFICULTY: &[(&str, &str)] =
     &[("low", "medium"), ("medium", "high"), ("high", "xhigh")];
+
+/// Trim + lowercase a difficulty string for table lookup. Returns `None` when
+/// the input is absent or whitespace-only so callers can short-circuit.
+fn normalize_difficulty(difficulty: Option<&str>) -> Option<String> {
+    let d = difficulty?.trim().to_ascii_lowercase();
+    if d.is_empty() { None } else { Some(d) }
+}
+
+/// Map task difficulty to Claude CLI `--effort` level.
+///
+/// Looks the difficulty up in `EFFORT_FOR_DIFFICULTY` (case-insensitive,
+/// whitespace-trimmed). Returns `None` for `None` or unknown difficulty —
+/// the caller should then omit `--effort` and let Claude use its CLI default.
+pub fn effort_for_difficulty(difficulty: Option<&str>) -> Option<&'static str> {
+    let d = normalize_difficulty(difficulty)?;
+    EFFORT_FOR_DIFFICULTY
+        .iter()
+        .find(|(k, _)| *k == d)
+        .map(|(_, v)| *v)
+}
+
+/// Rank a difficulty by its position in `EFFORT_FOR_DIFFICULTY`.
+///
+/// Higher index = harder difficulty (ladder is ascending by construction).
+/// `None`, empty, or unknown strings return `None` — they don't participate
+/// in cluster-wide max comparisons.
+pub fn difficulty_rank(difficulty: Option<&str>) -> Option<usize> {
+    let d = normalize_difficulty(difficulty)?;
+    EFFORT_FOR_DIFFICULTY.iter().position(|(k, _)| *k == d)
+}
 
 /// Model tier ordering for comparison.
 ///
@@ -924,5 +966,86 @@ mod tests {
                 "max effort is retired — no difficulty should map to it"
             );
         }
+    }
+
+    // ============ effort_for_difficulty tests ============
+
+    #[test]
+    fn test_effort_for_difficulty_roundtrips_table() {
+        for (difficulty, expected) in EFFORT_FOR_DIFFICULTY {
+            assert_eq!(effort_for_difficulty(Some(difficulty)), Some(*expected));
+            assert_eq!(
+                effort_for_difficulty(Some(&difficulty.to_ascii_uppercase())),
+                Some(*expected),
+                "lookup must be case-insensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effort_for_difficulty_unknown_and_none() {
+        assert_eq!(effort_for_difficulty(None), None);
+        assert_eq!(effort_for_difficulty(Some("")), None);
+        assert_eq!(effort_for_difficulty(Some("   ")), None);
+        assert_eq!(effort_for_difficulty(Some("impossible")), None);
+    }
+
+    /// Pins the shared `normalize_difficulty` contract via its two public
+    /// callers: both must trim whitespace and lowercase before lookup so DB
+    /// values like `"  High  "` resolve identically to `"high"`.
+    #[test]
+    fn test_difficulty_normalization_trims_and_lowercases() {
+        for raw in [" low ", "LOW", "\tlow\n", "  Low  "] {
+            assert_eq!(
+                effort_for_difficulty(Some(raw)),
+                effort_for_difficulty(Some("low")),
+                "effort lookup must normalize {raw:?}"
+            );
+            assert_eq!(
+                difficulty_rank(Some(raw)),
+                difficulty_rank(Some("low")),
+                "rank lookup must normalize {raw:?}"
+            );
+        }
+    }
+
+    // ============ difficulty_rank tests ============
+
+    /// The rank order is derived from the table's index, so the assertion
+    /// walks the table rather than hardcoding 0/1/2.
+    #[test]
+    fn test_difficulty_rank_matches_table_index() {
+        for (i, (difficulty, _)) in EFFORT_FOR_DIFFICULTY.iter().enumerate() {
+            assert_eq!(difficulty_rank(Some(difficulty)), Some(i));
+        }
+    }
+
+    #[test]
+    fn test_difficulty_rank_case_insensitive() {
+        for mutation in ["HIGH", "High", "hIgH"] {
+            assert_eq!(
+                difficulty_rank(Some(mutation)),
+                difficulty_rank(Some("high")),
+                "{mutation} must rank the same as 'high'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_difficulty_rank_unknown_and_empty() {
+        assert_eq!(difficulty_rank(None), None);
+        assert_eq!(difficulty_rank(Some("")), None);
+        assert_eq!(difficulty_rank(Some("   ")), None);
+        assert_eq!(difficulty_rank(Some("trivial")), None);
+        assert_eq!(difficulty_rank(Some("impossible")), None);
+    }
+
+    #[test]
+    fn test_difficulty_rank_ascending() {
+        // Ladder must be strictly ascending so cluster max is well-defined.
+        let low = difficulty_rank(Some("low")).unwrap();
+        let medium = difficulty_rank(Some("medium")).unwrap();
+        let high = difficulty_rank(Some("high")).unwrap();
+        assert!(low < medium && medium < high);
     }
 }

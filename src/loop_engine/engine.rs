@@ -78,19 +78,6 @@ pub(crate) const AUTO_MODE_DEPRECATION_HINT: &str = concat!(
     "Your current settings continue to work in the meantime."
 );
 
-/// Map task difficulty to Claude CLI `--effort` level.
-///
-/// Mapping is defined by `model::EFFORT_FOR_DIFFICULTY`. Difficulty matching is
-/// case-insensitive. Returns `None` for unset / unknown difficulty, letting
-/// Claude use its default.
-fn effort_for_difficulty(difficulty: Option<&str>) -> Option<&'static str> {
-    let d = difficulty?.to_ascii_lowercase();
-    crate::loop_engine::model::EFFORT_FOR_DIFFICULTY
-        .iter()
-        .find(|(k, _)| *k == d)
-        .map(|(_, v)| *v)
-}
-
 /// Parameters for usage API monitoring within an iteration.
 #[derive(Debug, Clone)]
 pub struct UsageParams {
@@ -497,9 +484,11 @@ pub fn run_iteration(
         }
     };
 
-    // Derive effort from task difficulty so we can show it in the header.
-    // Apply any per-task override left by a prior PromptTooLong crash.
-    let base_effort = effort_for_difficulty(prompt_result.task_difficulty.as_deref());
+    // Use the cluster-wide effort computed by `build_prompt` — parallels the
+    // cluster-wide `resolved_model` so both axes scale with the hardest task
+    // in the synergy cluster. Apply any per-task override left by a prior
+    // `PromptTooLong` crash on top.
+    let base_effort = prompt_result.cluster_effort;
     let effort = ctx.effort_overrides.get(&task_id).copied().or(base_effort);
     if effort != base_effort {
         eprintln!(
@@ -519,7 +508,9 @@ pub fn run_iteration(
         effort,
     );
 
-    // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor
+    // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor.
+    // Timeout is intentionally derived from the primary task's difficulty, not
+    // the cluster — synergy partners don't lengthen wall-clock inactivity budgets.
     let monitor_handle = monitor::start_monitor(params.project_root);
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
         prompt_result.task_difficulty.as_deref(),
@@ -4542,34 +4533,6 @@ mod tests {
             Some(SONNET_MODEL.to_string()),
             "model in DB must be unchanged at 1 failure"
         );
-    }
-
-    #[test]
-    fn test_effort_for_difficulty_mapping() {
-        use crate::loop_engine::model::EFFORT_FOR_DIFFICULTY;
-
-        // Every row in the canonical table must round-trip through the fn.
-        assert!(
-            !EFFORT_FOR_DIFFICULTY.is_empty(),
-            "EFFORT_FOR_DIFFICULTY must not be empty"
-        );
-        for (difficulty, expected_effort) in EFFORT_FOR_DIFFICULTY {
-            assert_eq!(
-                effort_for_difficulty(Some(difficulty)),
-                Some(*expected_effort),
-                "table row {difficulty} → {expected_effort} must round-trip",
-            );
-            // Case-insensitive: uppercase must map the same way.
-            assert_eq!(
-                effort_for_difficulty(Some(&difficulty.to_ascii_uppercase())),
-                Some(*expected_effort),
-                "case-insensitive mapping failed for {difficulty}",
-            );
-        }
-        // Unknown / None → None (use CLI default).
-        assert_eq!(effort_for_difficulty(None), None);
-        assert_eq!(effort_for_difficulty(Some("unknown")), None);
-        assert_eq!(effort_for_difficulty(Some("")), None);
     }
 
     // --- apply_status_updates dispatcher tests (FEAT-003) ---

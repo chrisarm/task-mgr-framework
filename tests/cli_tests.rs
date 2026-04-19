@@ -1842,9 +1842,8 @@ fn test_list_without_flag_excludes_archived() {
 
     // None of the returned tasks should have archived = true
     for task in tasks {
-        assert_eq!(
-            task["archived"].as_bool().unwrap_or(false),
-            false,
+        assert!(
+            !task["archived"].as_bool().unwrap_or(false),
             "list without flag must not return archived tasks: {task}"
         );
     }
@@ -1990,9 +1989,8 @@ fn test_history_without_flag_excludes_archived_runs() {
         "the active run must be returned"
     );
     // archived field is omitted from JSON when false (skip_serializing_if)
-    assert_eq!(
-        runs[0]["archived"].as_bool().unwrap_or(false),
-        false,
+    assert!(
+        !runs[0]["archived"].as_bool().unwrap_or(false),
         "active run must not be archived"
     );
 
@@ -2053,9 +2051,8 @@ fn test_history_include_archived_returns_all_with_markers() {
         .find(|r| r["run_id"].as_str() == Some("run-active"))
         .expect("run-active must be in results");
     // archived field is omitted from JSON when false (skip_serializing_if)
-    assert_eq!(
-        active_run["archived"].as_bool().unwrap_or(false),
-        false,
+    assert!(
+        !active_run["archived"].as_bool().unwrap_or(false),
         "run-active must not be archived"
     );
 

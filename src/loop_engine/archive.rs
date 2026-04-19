@@ -2114,7 +2114,7 @@ mod tests {
         );
         // empty branch → archive_folder_name uses date only
         assert!(
-            strip_branch_prefix("") == "",
+            strip_branch_prefix("").is_empty(),
             "empty branch should return empty string"
         );
     }

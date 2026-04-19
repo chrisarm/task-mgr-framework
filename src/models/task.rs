@@ -734,8 +734,8 @@ mod tests {
     #[test]
     fn test_task_new_requires_human_defaults_to_false() {
         let task = Task::new("US-001", "Test Task");
-        assert_eq!(
-            task.requires_human, false,
+        assert!(
+            !task.requires_human,
             "Task::new() must default requires_human to false"
         );
     }
@@ -805,8 +805,8 @@ mod tests {
             "error_count": 0
         }"#;
         let task: Task = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            task.requires_human, false,
+        assert!(
+            !task.requires_human,
             "missing requires_human must deserialize to false"
         );
         assert_eq!(
@@ -829,7 +829,7 @@ mod tests {
             "human_review_timeout": 90
         }"#;
         let task: Task = serde_json::from_str(json).unwrap();
-        assert_eq!(task.requires_human, true);
+        assert!(task.requires_human);
         assert_eq!(task.human_review_timeout, Some(90));
     }
 }
