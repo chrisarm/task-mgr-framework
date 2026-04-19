@@ -4592,7 +4592,8 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4616,7 +4617,8 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(
             applied, 0,
             "unclaimed todo task must not transition on <task-status>:done",
@@ -4650,7 +4652,8 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let prd: serde_json::Value =
@@ -4690,7 +4693,8 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(
             applied, 1,
             "DB dispatch succeeded even though PRD sync failed",
@@ -4721,7 +4725,8 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4833,7 +4838,8 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let applied =
+            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(applied, 1, "one dispatch failed, one succeeded");
 
         let status_b: String = conn

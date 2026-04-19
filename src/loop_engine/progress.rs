@@ -184,10 +184,10 @@ fn parse_entry(entry: &str) -> ParsedEntry {
             }
         } else if let Some(rest) = line.strip_prefix("- Outcome: ") {
             parsed.outcome = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("- Files: ") {
-            if rest != "(none)" {
-                parsed.files = rest.split(", ").map(|s| s.to_string()).collect();
-            }
+        } else if let Some(rest) = line.strip_prefix("- Files: ")
+            && rest != "(none)"
+        {
+            parsed.files = rest.split(", ").map(|s| s.to_string()).collect();
         }
     }
     parsed
@@ -199,7 +199,10 @@ fn crash_recommendation(task_id: &str, outcomes: &[String]) -> Option<String> {
     if outcomes.len() < 2 {
         return None;
     }
-    let overflow_count = outcomes.iter().filter(|o| o.contains("PromptOverflow")).count();
+    let overflow_count = outcomes
+        .iter()
+        .filter(|o| o.contains("PromptOverflow"))
+        .count();
     let crash_count = outcomes.iter().filter(|o| o.starts_with("Crash")).count();
     let timeout_count = outcomes
         .iter()
@@ -284,6 +287,7 @@ fn try_haiku_summary(
         None,
         None,
         db_dir,
+        false,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -334,11 +338,7 @@ fn try_haiku_summary(
 /// entries before the milestone fired, so the count is a lower bound.
 ///
 /// Best-effort: file I/O and LLM failures log to stderr and do not propagate.
-pub fn summarize_milestone(
-    progress_path: &Path,
-    milestone_task_id: &str,
-    db_dir: Option<&Path>,
-) {
+pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str, db_dir: Option<&Path>) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
@@ -379,7 +379,10 @@ pub fn summarize_milestone(
         if let Some(tid) = &entry.task_id
             && let Some(outcome) = &entry.outcome
         {
-            by_task.entry(tid.clone()).or_default().push(outcome.clone());
+            by_task
+                .entry(tid.clone())
+                .or_default()
+                .push(outcome.clone());
             if outcome == "Completed" && !completed.contains(tid) {
                 completed.push(tid.clone());
             }
@@ -879,10 +882,7 @@ mod tests {
 
     #[test]
     fn test_crash_recommendation_repeated_timeout() {
-        let outcomes = vec![
-            "Crash (Timeout)".to_string(),
-            "Crash (Timeout)".to_string(),
-        ];
+        let outcomes = vec!["Crash (Timeout)".to_string(), "Crash (Timeout)".to_string()];
         let rec = crash_recommendation("FEAT-002", &outcomes).expect("must produce recommendation");
         assert!(
             rec.contains("timeout") || rec.contains("Timeout") || rec.contains("difficulty"),
@@ -993,7 +993,10 @@ mod tests {
             "summary must name the offending task"
         );
         assert!(
-            after.contains("PromptOverflow") && (after.contains("Sonnet") || after.contains("auto-skip") || after.contains("already complete")),
+            after.contains("PromptOverflow")
+                && (after.contains("Sonnet")
+                    || after.contains("auto-skip")
+                    || after.contains("already complete")),
             "summary must include both the symptom count and a remedy: {}",
             after
         );
