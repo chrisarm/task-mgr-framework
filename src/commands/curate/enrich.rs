@@ -243,7 +243,7 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
             None,
             None,
             None,
-            false,
+            true,
         ) {
             Ok(r) => r,
             Err(e) => {
