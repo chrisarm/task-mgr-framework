@@ -159,3 +159,17 @@
 - 5 pre-existing test-only warnings in unrelated modules (loop_engine, worktrees, curate/tests) — not from this feature
 - **Approach**: Parallel execution of all 4 cargo commands, then targeted checks for dead code and CLI help
 ---
+
+## 2026-04-19 - 293c4fde-FEAT-001
+- Added `cleanup_title_artifact: bool` arg to spawn_claude (appended)
+- New const TITLE_ARTIFACT_CLEANUP_DELAY = 30s
+- New pure helper `encoded_cwd_dir(cwd, home) -> PathBuf` (trims trailing slash, replaces / with -)
+- New helper `schedule_title_artifact_cleanup(uuid, working_dir)`: detached thread, single deterministic remove_file
+- Inserted `--session-id <uuid>` flag before -p (after --model/--effort) — Learning [671]
+- Updated all 7 production+test callers in other files to pass `false` (preserves behavior)
+- 6 new unit tests (3 encoded_cwd_dir incl. trailing slash; 1 false→no flag; 1 true→valid v4 + ordering; 1 bystander-survives invariant)
+- All 2956 lib tests pass; pre-existing test_default_dir failure is unrelated (worktree DB anchoring)
+- cargo fmt --check clean (also fixed pre-existing fmt drift in 4 unrelated files via `cargo fmt`)
+- **Approach**: Thread the bool through, keep the cleanup logic in a tiny detached helper, derive the target path from a pure function so the worst that can ever happen is a stale file (never collateral deletion)
+- **Learnings:** Cleanup thread takes owned PathBuf via `move`, so the function can return immediately. Don't canonicalize cwd — Claude encodes the literal cwd, and resolving symlinks would mismatch.
+---

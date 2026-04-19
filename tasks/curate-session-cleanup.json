@@ -1,0 +1,233 @@
+{
+  "branchName": "feat/curate-session-cleanup",
+  "description": "Curate dedup/enrich leave orphan 130-byte ai-title session files in ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl despite --no-session-persistence (Claude Code 2.1.110 bug). Fix: force a deterministic --session-id per curate spawn and detach a 30s-delayed cleanup thread that deletes that exact file. Loops are unchanged.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings from cargo check or cargo clippy",
+      "Rust: All tests pass with cargo test",
+      "Rust: cargo fmt --check passes",
+      "No breaking changes to callers that pass the existing 9-arg signature — callers must be explicitly updated to pass the new flag"
+    ],
+    "description": "Apply to ALL tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "The hierarchy of what matters most",
+    "hierarchy": [
+      "1. PLAN — Approach before code. Anticipate edge cases. Consider 2-3 approaches, pick the best",
+      "2. FUNCTIONING CODE — Pragmatic, reliable code, wired in according to the plan",
+      "3. CORRECTNESS — Self-critique after code. Compiles, type-checks, all tests pass",
+      "4. CODE QUALITY — Quality dimensions explicit. Clean code, good patterns, no warnings"
+    ],
+    "principles": [
+      "Quality dimensions explicit — read qualityDimensions on every task; know what 'good' looks like before coding",
+      "Approach before code — consider 2-3 approaches with tradeoffs, pick the best, then implement",
+      "Each task delivers working code + tests together",
+      "Self-critique after code — review your own implementation for correctness, style, and performance before moving on",
+      "Test boundaries and exceptions - edge cases are where bugs hide",
+      "Handle Option/Result explicitly; avoid unwrap() in production code"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "A cleanup mechanism that could delete unrelated session files (e.g., interactive sessions, other curate batches, loop iterations)",
+    "A cleanup thread that blocks or prolongs curate latency",
+    "CLI arg ordering that breaks --no-session-persistence (must stay before -p per learning 671)"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "293c4fde",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: spawn_claude signature gains a 10th positional arg `cleanup_title_artifact: bool` at the end",
+        "Positive: When cleanup_title_artifact=true, argv contains exactly one `--session-id <valid-uuid-v4>` pair positioned after --model/--effort and before `-p`",
+        "Positive: When cleanup_title_artifact=false, argv contains NO `--session-id` flag (unchanged from current behavior)",
+        "Positive: The cleanup thread is spawned AFTER cmd.spawn() succeeds (not before — we don't want dangling threads if spawn itself fails)",
+        "Positive: The cleanup thread is DETACHED (no join handle stored; the function returns immediately regardless of thread state)",
+        "Positive: Existing loop-engine and learnings-ingestion callers pass `false` and produce byte-identical argv to today",
+        "Negative: No code path forces --session-id when cleanup_title_artifact=false",
+        "Negative: The cleanup thread must NOT scan, glob, or enumerate the projects directory — it must `remove_file` a single, deterministic path",
+        "Negative: spawn_claude must not block on the cleanup thread (no join(), no channel.recv())",
+        "Unit test: `encoded_cwd_dir(Path::new('$HOME/foo'), Path::new('$HOME'))` returns `$HOME/.claude/projects/-home-chris-foo`",
+        "Unit test: `encoded_cwd_dir(Path::new('$HOME/projects/task-mgr'), Path::new('$HOME'))` returns `$HOME/.claude/projects/-home-chris-Documents-startat0-Projects-task-mgr`",
+        "Unit test (via mock CLAUDE_BINARY that echoes argv): passing cleanup_title_artifact=true inserts `--session-id <uuid>` between --model and -p; passing false produces argv with no --session-id",
+        "Unit test: uuid produced is a valid v4 (version nibble == 4) — parse it with Uuid::parse_str and assert get_version() == Some(Version::Random)",
+        "Unit test: filename encoding handles the trailing-slash cwd case — `$HOME/foo/` encodes identically to `$HOME/foo` (strip trailing slash before encoding)",
+        "Known-bad: if the implementation puts --session-id AFTER -p, the flag is ignored by Claude and the cleanup path has a mismatched UUID → file never gets deleted. Test: assert argv index of '--session-id' < argv index of '-p'.",
+        "Known-bad: if the implementation uses std::fs::read_dir + filter to find 'recent' files, test that creates an UNRELATED recent .jsonl in the target dir and verifies it SURVIVES the cleanup.",
+        "Failure mode: if HOME env var is unset, spawn_claude still returns Ok — cleanup is best-effort; the spawn itself must not fail because cleanup could not be scheduled",
+        "Failure mode: if the target file never appears (Claude crashed before writing title), remove_file returns NotFound and the thread exits silently"
+      ],
+      "dependsOn": [],
+      "description": "Extend spawn_claude in src/loop_engine/claude.rs with a new `cleanup_title_artifact: bool` argument (appended to the end of the positional args to match the existing pattern; the function is already under #[allow(clippy::too_many_arguments)]).\n\nWhen `cleanup_title_artifact` is true:\n1. Generate `uuid::Uuid::new_v4()` once per invocation.\n2. Insert `--session-id <uuid>` into the argv. Place it after `--model`/`--effort` but BEFORE `-p` (learning 671: flag ordering matters — flags before -p).\n3. After `cmd.spawn()` succeeds, compute the target jsonl path:\n   - effective_cwd = working_dir.map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default())\n   - Canonicalize it so symlinks (e.g. Dropbox → Documents/startat0 symlink in this repo) resolve to the same path Claude encodes\n   - encoded = effective_cwd.to_string_lossy().replace('/', '-')   // e.g. '$HOME/foo' → '-home-chris-foo'\n   - home = std::env::var('HOME')? ; projects_dir = home/.claude/projects/<encoded>\n   - target = projects_dir.join(format!('{}.jsonl', uuid))\n4. Spawn a DETACHED cleanup thread: `std::thread::spawn(move || { std::thread::sleep(Duration::from_secs(30)); let _ = std::fs::remove_file(&target); });`\n5. Do NOT join the thread. Do NOT block curate on it.\n\nWhen `cleanup_title_artifact` is false (default): behavior is identical to today — no UUID, no --session-id, no thread.\n\nDO:\n- Pull the cleanup delay into a named const (e.g. `const TITLE_ARTIFACT_CLEANUP_DELAY: Duration = Duration::from_secs(30);`) for later tuning.\n- Extract path-encoding into a small pure helper `fn encoded_cwd_dir(cwd: &Path, home: &Path) -> PathBuf` so it can be unit-tested without spawning.\n- Log nothing on success (silent cleanup is correct behavior); optionally log at debug/trace level only.\n- Pass `--session-id` only when the opt-in is true — do not set it unconditionally, as real loop sessions should still get auto-generated IDs.\n\nDO NOT:\n- Do not thread-join in the spawning function (defeats the purpose).\n- Do not use any snapshot/diff approach to find the file — the UUID makes the filename deterministic, which is the whole point.\n- Do not add a global cleanup that scans the projects directory — risks deleting real sessions.\n- Do not set --session-id when `cleanup_title_artifact=false` — loops should keep today's behavior exactly.\n- Do not reuse `cleanup_ghost_sessions()` at src/loop_engine/claude.rs:668 — that targets ~/.claude/sessions/, a DIFFERENT directory; the orphan title files land in ~/.claude/projects/<cwd>/ instead.\n\nEdge cases:\n- HOME unset: skip cleanup (return Ok, don't error the spawn).\n- current_dir() fails: skip cleanup (same).\n- File doesn't exist at 30s: remove_file returns NotFound — swallow.\n- Claude process still running at 30s: irrelevant, file is only ever a single-line ai-title; deleting during a future write would be a race, but Claude writes the title once during init, so the 30s delay means we delete after the write is done in practice.\n\nKnown-bad to guard against:\n- Inserting --session-id AFTER -p would pass compilation but Claude parses flags left-of-prompt only; the flag would be ignored and a fresh UUID chosen, making the cleanup path wrong.\n- Using thread::spawn without `move` and capturing a non-'static reference — won't compile.\n- Holding the `working_dir: Option<&Path>` borrow into the cleanup thread — must be converted to an owned PathBuf before the thread is spawned.",
+      "edgeCases": [
+        "HOME env var unset: skip scheduling cleanup, return Ok from spawn",
+        "working_dir=None and std::env::current_dir() errors: skip cleanup, return Ok",
+        "working_dir=Some(tmpdir) (used by loop in worktrees): encode using that dir, not process cwd",
+        "cwd with trailing slash: normalize by trimming trailing '/' before encoding",
+        "Claude process exits before 30s: cleanup thread still runs, file exists, gets deleted normally",
+        "Claude process takes >30s to write title: cleanup removes nothing that run, file remains; next curate run with same UUID is impossible (UUIDs are unique)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "HOME env var unset",
+          "expectedBehavior": "Skip cleanup scheduling; spawn still succeeds; no error surfaced to caller"
+        },
+        {
+          "cause": "remove_file returns NotFound",
+          "expectedBehavior": "Thread exits silently; no log noise"
+        },
+        {
+          "cause": "remove_file returns PermissionDenied",
+          "expectedBehavior": "Thread exits silently; orphan survives but is inert"
+        },
+        {
+          "cause": "Process panics mid-spawn before thread is spawned",
+          "expectedBehavior": "No thread was ever spawned (cleanup is scheduled AFTER child.spawn() succeeds), so no dangling work"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Key file: src/loop_engine/claude.rs (spawn_claude at line 80, args-building block at lines 92-144, Command spawn at line 149-187).\n\nLearning [671]: CLI arg ordering matters — flags before -p. Place --session-id in the flag group.\n\nExisting cleanup precedent (different dir): src/loop_engine/claude.rs:668 `cleanup_ghost_sessions()` targets ~/.claude/sessions/ but orphan title files are in ~/.claude/projects/<cwd>/ — a different path. Do not conflate.\n\nUUID dep already in Cargo.toml: `uuid = { version = '1', features = ['v4', 'serde'] }` — already used in src/commands/curate/dedup.rs and src/commands/curate/enrich.rs.\n\nExisting test mutex: src/loop_engine/test_utils.rs::CLAUDE_BINARY_MUTEX serializes tests that mutate CLAUDE_BINARY. Use it in new tests.\n\nPath encoding evidence (from `ls ~/.claude/projects/`): `$HOME/foo/bar` → `-home-chris-foo-bar`. No fancy escaping — just `/` → `-`. Leading slash becomes a leading dash.\n\nCanonicalization note: this repo's cwd can be reached as both `$HOME/projects/task-mgr` (symlink) and `$HOME/projects/task-mgr` (real). Claude encodes whichever path the process runs under, so just use the cwd as-is without resolving symlinks — resolution would break if Claude used the un-resolved form.\n\nMock pattern for argv tests: tests/fixtures/fake_claude.sh already exists and echoes argv. Set CLAUDE_BINARY=<script> via env in a test while holding CLAUDE_BINARY_MUTEX.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": {
+        "correctness": [
+          "Thread is detached — no join, no channel, no handle stored",
+          "--session-id flag position is strictly before -p",
+          "Cleanup targets exactly one deterministic path; no enumeration of the projects directory",
+          "When cleanup_title_artifact=false, zero behavior change for existing callers (loops + ingestion)"
+        ],
+        "performance": [
+          "spawn_claude return time must not increase — cleanup thread spawns in O(1) and does not wait",
+          "No allocations in the hot path of the flag check when cleanup_title_artifact=false"
+        ],
+        "style": [
+          "Extract the path-encoding into a named pure function for testability",
+          "Put the 30s delay behind a const for tunability",
+          "Match the existing clap-style arg-pushing pattern (args.push(flag.to_string()); args.push(value.to_string()))",
+          "Preserve the current `#[allow(clippy::too_many_arguments)]` since signature grows by one"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Add opt-in --session-id + deferred cleanup to spawn_claude",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: src/commands/curate/mod.rs:604 dedup call passes `true` as the 10th arg",
+        "Positive: src/commands/curate/enrich.rs:235 enrich call passes `true` as the 10th arg",
+        "Positive: All other callers (ingestion, prd_reconcile, engine, watchdog tests, claude.rs tests) pass `false`",
+        "Positive: cargo check passes with zero 'missing argument' errors",
+        "Negative: No caller passes `Some(true)`, `Default::default()`, or any indirection — the bool is a bare literal at each call site",
+        "Negative: learnings::ingestion::extract_learnings_from_output must still pass `false` (out of scope)",
+        "Unit/integration test: existing curate tests still pass (they use mock CLAUDE_BINARY, so the cleanup thread tries to delete a file that doesn't exist — remove_file returns NotFound, swallowed)",
+        "Manual verification (documented in progress.txt): running `CLAUDE_BINARY=/tmp/claude-log-argv.sh cargo run --release -- curate dedup --dry-run --concurrency 1` logs argv containing `--session-id <uuid>` before `-p`"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Update every caller of spawn_claude to pass the new 10th arg explicitly. The two curate call sites pass `true`; all other callers pass `false` to preserve current behavior.\n\nCall sites (from grep of `spawn_claude\\(`):\n- src/commands/curate/mod.rs:604 (dedup)                    → PASS TRUE\n- src/commands/curate/enrich.rs:235 (enrich)               → PASS TRUE\n- src/learnings/ingestion/mod.rs:84 (loop-side extraction) → PASS FALSE (scope says curate only; not touching ingestion here)\n- src/loop_engine/prd_reconcile.rs:659                     → PASS FALSE\n- src/loop_engine/engine.rs:528 (main loop)                → PASS FALSE\n- src/loop_engine/watchdog.rs:308, 364 (tests)             → PASS FALSE\n- src/loop_engine/claude.rs:747 + test sites 1013/1087/1491 → PASS FALSE\n\nDO:\n- Update exactly these 2 curate call sites to `true`.\n- Update every other call site to an explicit `false` — compile errors force you to visit all of them; do not bypass with a default.\n- Keep permission_mode, model, effort, allowed-tools arguments unchanged at the curate sites.\n\nDO NOT:\n- Do not ship a default value for the new arg (no `Option<bool>`, no Default trait) — the positional arg pattern used by spawn_claude requires every caller to be explicit.\n- Do not enable cleanup in learnings/ingestion, loop, or prd_reconcile in this task — user scope is curate only. (Follow-up task can consider ingestion separately.)\n\nKnown-bad to guard against:\n- Missing a caller → compile error. Good. Don't paper over with `_ = cleanup_title_artifact` shims.",
+      "edgeCases": [
+        "Test call sites in watchdog.rs and claude.rs — must be updated too or tests won't compile"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Missed call site",
+          "expectedBehavior": "Compile error identifies it immediately; fix and retry"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": true,
+      "notes": "This is mechanical once FEAT-001 lands. Use the grep pattern `spawn_claude\\(` to find every call site. Expect ~8 sites to touch in src/ and 4-5 in test code.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": {
+        "correctness": [
+          "Every caller is explicitly updated; compile errors drive completeness",
+          "Only curate sites flip to true"
+        ],
+        "performance": [],
+        "style": [
+          "Match existing trailing-comma-and-newline formatting at each call site",
+          "Do not reorder other args"
+        ]
+      },
+      "synergyWith": [],
+      "title": "Flip opt-in at curate call sites; keep all other callers on false",
+      "touchesFiles": [
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/enrich.rs",
+        "src/learnings/ingestion/mod.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/watchdog.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Path-encoding helper is a pure function, not a method on spawn_claude",
+        "30s delay lives in a named const",
+        "No code duplication between the flag-push block and the thread-spawn block",
+        "spawn_claude remains under a reasonable size after the change (flag the function if it grew beyond 300 lines)"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Review FEAT-001 and FEAT-002 changes for DRY, complexity, and coupling. Specifically check: is the path-encoding helper reusable for a future ingestion opt-in? Is the 30s constant easy to change? Is the cleanup-thread pattern small enough that a second opt-in site wouldn't duplicate code?\n\nDO: Check for duplicated logic, functions >30 lines, tight coupling.\nDO NOT: Expand scope to other callers; this is review-only.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: add REFACTOR-FIX-xxx tasks to JSON (priority 50-97), commit JSON. If clean, run `/simplify` plugin on the modified files and mark passes:true.",
+      "passes": false,
+      "priority": 98,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: cargo test / clippy / fmt --check all clean",
+        "Positive: Mock-argv verification logged in progress.txt shows --session-id before -p",
+        "Positive: Empirical test documented in progress.txt: ran curate dedup --dry-run, observed orphan files in ~/.claude/projects/<encoded-cwd>/ BEFORE 30s, none remaining AFTER 35s",
+        "Positive: spawn_claude doc comment updated to describe the new opt-in behavior",
+        "Negative: No unwrap() introduced in new code paths",
+        "Negative: No dead-code warnings for new code",
+        "Documentation: CLAUDE.md has a brief mention if non-obvious for future contributors",
+        "Task-mgr learn: record a learning for the `ai-title orphan workaround` pattern with `--outcome workaround` and tags `curate,claude-cli,session-persistence`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for correctness, security, integration wiring, and documentation.\n\nDO:\n- Verify argv order via a mock CLAUDE_BINARY wrapper that logs argv — confirm `--session-id <uuid>` appears before `-p`.\n- Run a real `task-mgr curate dedup --dry-run --concurrency 1` (quick, read-only) and confirm: (a) files appear briefly in ~/.claude/projects/<encoded-cwd>/, (b) within ~35s they are gone.\n- Check `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all clean.\n- Review spawn_claude doc comment: the description of base flags must mention --session-id opt-in.\n- Check CLAUDE.md — if a 'curate session cleanup' section is warranted for future contributors, add one (brief, under 10 lines).\n\nDO NOT:\n- Skip the empirical cleanup-verification step — this is the whole point of the feature; unit tests alone don't prove the file gets deleted in the real projects dir.",
+      "estimatedEffort": "low",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: add FIX-xxx tasks to JSON (priority 50-97), commit. Empirical test command: `CLAUDE_BINARY=/tmp/claude-log-argv.sh target/release/task-mgr curate dedup --dry-run --concurrency 1`. Argv-log wrapper already exists at /tmp/claude-log-argv.sh from earlier investigation.",
+      "passes": false,
+      "priority": 99,
+      "title": "Code review + empirical verification",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/enrich.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

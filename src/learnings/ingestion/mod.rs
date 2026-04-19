@@ -92,6 +92,7 @@ pub fn extract_learnings_from_output(
         None,
         None,
         db_dir,
+        false,
     ) {
         Ok(result) => result,
         Err(e) => {

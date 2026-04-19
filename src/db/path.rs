@@ -214,7 +214,10 @@ mod tests {
         // cwd join wins — explicit override is honored literally.
         assert_eq!(r.path, std::env::current_dir().unwrap().join("scratch"));
         // And specifically NOT the main-repo path.
-        assert_ne!(r.path, std::fs::canonicalize(repo.path()).unwrap().join("scratch"));
+        assert_ne!(
+            r.path,
+            std::fs::canonicalize(repo.path()).unwrap().join("scratch")
+        );
     }
 
     #[test]
@@ -227,7 +230,9 @@ mod tests {
         assert_eq!(r.source, DbDirSource::WorktreeAnchored);
         assert_eq!(
             r.path,
-            std::fs::canonicalize(repo.path()).unwrap().join(".task-mgr"),
+            std::fs::canonicalize(repo.path())
+                .unwrap()
+                .join(".task-mgr"),
         );
     }
 
@@ -251,7 +256,9 @@ mod tests {
         assert_eq!(r.source, DbDirSource::WorktreeAnchored);
         assert_eq!(
             r.path,
-            std::fs::canonicalize(repo.path()).unwrap().join(".task-mgr"),
+            std::fs::canonicalize(repo.path())
+                .unwrap()
+                .join(".task-mgr"),
         );
     }
 }
