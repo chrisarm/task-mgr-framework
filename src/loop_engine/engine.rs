@@ -1810,6 +1810,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
                 Some(&run_id),
                 Some(&paths.prd_file),
                 task_prefix.as_deref(),
+                Some(&paths.progress_file),
             )
         } else {
             0
@@ -2590,6 +2591,7 @@ pub fn apply_status_updates(
     run_id: Option<&str>,
     prd_path: Option<&Path>,
     task_prefix: Option<&str>,
+    progress_path: Option<&Path>,
 ) -> u32 {
     use detection::TaskStatusChange;
 
@@ -2629,16 +2631,32 @@ pub fn apply_status_updates(
                 applied += 1;
                 // Only Done flips PRD JSON `passes` — other transitions leave
                 // `passes: false` unchanged.
-                if matches!(update.status, TaskStatusChange::Done)
-                    && let Some(path) = prd_path
-                    && let Err(e) = update_prd_task_passes(path, &update.task_id, true, task_prefix)
-                {
-                    eprintln!(
-                        "Warning: <task-status> dispatched {} to done in DB but PRD JSON sync failed ({}): {}",
-                        update.task_id,
-                        path.display(),
-                        e,
-                    );
+                if matches!(update.status, TaskStatusChange::Done) {
+                    if let Some(path) = prd_path
+                        && let Err(e) =
+                            update_prd_task_passes(path, &update.task_id, true, task_prefix)
+                    {
+                        eprintln!(
+                            "Warning: <task-status> dispatched {} to done in DB but PRD JSON sync failed ({}): {}",
+                            update.task_id,
+                            path.display(),
+                            e,
+                        );
+                    }
+                    // Milestone hook: when a MILESTONE-* task flips to done,
+                    // append a summary block to progress-*.txt covering every
+                    // entry since the last milestone summary, with crash-
+                    // avoidance recommendations for any task that crashed/
+                    // overflowed ≥2 times in the window.
+                    // Hyphen-anchored to avoid false matches like
+                    // `PRE-MILESTONE-NOTES` or `MILESTONEISH-1`.
+                    let is_milestone = update.task_id.contains("-MILESTONE-")
+                        || update.task_id.starts_with("MILESTONE-")
+                        || update.task_id == "MILESTONE"
+                        || update.task_id.ends_with("-MILESTONE");
+                    if is_milestone && let Some(pp) = progress_path {
+                        progress::summarize_milestone(pp, &update.task_id);
+                    }
                 }
             }
             Err(e) => {
@@ -4571,7 +4589,7 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4595,7 +4613,7 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(
             applied, 0,
             "unclaimed todo task must not transition on <task-status>:done",
@@ -4629,7 +4647,7 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(applied, 1);
 
         let prd: serde_json::Value =
@@ -4669,7 +4687,7 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(
             applied, 1,
             "DB dispatch succeeded even though PRD sync failed",
@@ -4700,7 +4718,7 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(applied, 1);
 
         let status: String = conn
@@ -4713,6 +4731,81 @@ mod tests {
         // PRD JSON content unchanged.
         let after = std::fs::read_to_string(&prd_path).unwrap();
         assert_eq!(before, after, "PRD JSON must be unchanged when task absent");
+    }
+
+    #[test]
+    fn test_apply_status_update_milestone_done_writes_summary_to_progress_file() {
+        // Pre-seed progress.txt with two iteration entries, then dispatch
+        // <task-status>MILESTONE-1:done</task-status>. The hook must rewrite
+        // progress.txt so the raw entries are replaced by a summary block.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "MILESTONE-1", "in_progress");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["MILESTONE-1"]);
+
+        let progress_path = temp_dir.path().join("progress-test.txt");
+        let initial = "\n## 2026-01-01 - Iteration 1\n- Task: FEAT-001\n- Model: (default)\n- Effort: medium\n- Outcome: Completed\n- Files: (none)\n---\n\n## 2026-01-01 - Iteration 2\n- Task: FEAT-002\n- Model: (default)\n- Effort: medium\n- Outcome: Completed\n- Files: (none)\n---\n";
+        std::fs::write(&progress_path, initial).unwrap();
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "MILESTONE-1".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            Some(&progress_path),
+        );
+        assert_eq!(applied, 1);
+
+        let after = std::fs::read_to_string(&progress_path).unwrap();
+        assert!(
+            after.contains("Milestone Summary: MILESTONE-1"),
+            "milestone hook must append a summary block"
+        );
+        assert!(
+            !after.contains("Iteration 1") && !after.contains("Iteration 2"),
+            "raw iteration entries must be replaced by the summary"
+        );
+        assert!(
+            after.contains("FEAT-001") && after.contains("FEAT-002"),
+            "completed task IDs must survive in the summary's task list"
+        );
+    }
+
+    #[test]
+    fn test_apply_status_update_non_milestone_done_does_not_touch_progress_file() {
+        // A regular FEAT-* Done dispatch must NOT trigger the milestone hook,
+        // even when a progress_path is supplied.
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-100", "in_progress");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-100"]);
+
+        let progress_path = temp_dir.path().join("progress-test.txt");
+        let initial = "\n## 2026-01-01 - Iteration 1\n- Task: FEAT-100\n- Model: (default)\n- Effort: medium\n- Outcome: Completed\n- Files: (none)\n---\n";
+        std::fs::write(&progress_path, initial).unwrap();
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-100".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            Some(&progress_path),
+        );
+        assert_eq!(applied, 1);
+
+        let after = std::fs::read_to_string(&progress_path).unwrap();
+        assert_eq!(
+            after, initial,
+            "non-milestone Done dispatch must leave progress file untouched"
+        );
     }
 
     #[test]
@@ -4735,7 +4828,7 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None);
+        let applied = apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None);
         assert_eq!(applied, 1, "one dispatch failed, one succeeded");
 
         let status_b: String = conn

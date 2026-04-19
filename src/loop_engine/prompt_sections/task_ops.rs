@@ -8,13 +8,22 @@
 /// Tells the loop agent: never edit tasks/*.json directly; use <task-status> tags
 /// to update status and `task-mgr add --stdin` to create new tasks.
 pub(crate) fn task_ops_section() -> &'static str {
-    "## Task lifecycle — CLI only, never edit the JSON\n\
+    "## Task lifecycle — CLI only, never read or edit the JSON\n\
      \n\
-     You MUST NOT edit `tasks/*.json` directly. Instead:\n\
+     You MUST NOT read or edit `tasks/*.json` directly. The PRD task JSON is large;\n\
+     pulling one into context can push you past the model window mid-iteration and\n\
+     force a retry. Use the `task-mgr` CLI for every task operation instead:\n\
      \n\
      - **Mark a task's status**: emit `<task-status>TASK-ID:done</task-status>`\n\
        (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop\n\
        engine parses these and applies them via `task-mgr`.\n\
+     - **Look up another task**: ALWAYS prefer `task-mgr show <task-id>` (or\n\
+       `task-mgr list` / `task-mgr next`) — these cover almost every read. Only\n\
+       as a last resort, if the CLI can't give you what you need, use `jq` to pull\n\
+       just the field(s) — e.g.\n\
+       `jq '.tasks[]|select(.id==\"FEAT-007\")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.\n\
+       Never `cat`, `Read`, or `grep` the whole file.\n\
+     - **List tasks / check status**: `task-mgr list`, `task-mgr next`.\n\
      - **Add a new task** (review fix / refactor / follow-up): pipe a single task\n\
        JSON to `task-mgr add --stdin`. Example:\n\
      \n\
@@ -37,8 +46,20 @@ mod tests {
         let section = task_ops_section();
 
         assert!(
-            section.contains("MUST NOT edit"),
-            "section must contain 'MUST NOT edit'"
+            section.contains("MUST NOT read or edit"),
+            "section must warn against both reading and editing the JSON"
+        );
+        assert!(
+            section.contains("past the model window"),
+            "section must explain why (context-window risk) so the rule sticks"
+        );
+        assert!(
+            section.contains("task-mgr show"),
+            "section must offer the CLI alternative for looking up other tasks"
+        );
+        assert!(
+            section.contains("jq"),
+            "section must point at jq as the field-extraction fallback when JSON access is unavoidable"
         );
         assert!(
             section.contains("task-mgr add --stdin"),
@@ -77,8 +98,8 @@ mod tests {
     fn test_section_size_within_budget() {
         let section = task_ops_section();
         assert!(
-            section.len() < 1024,
-            "section is {} bytes, must be < 1024 to stay within prompt budget",
+            section.len() < 1536,
+            "section is {} bytes, must be < 1536 to stay within prompt budget",
             section.len()
         );
     }

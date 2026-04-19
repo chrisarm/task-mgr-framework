@@ -3261,8 +3261,8 @@ pub enum ApiError {
 
         // Section must be present
         assert!(
-            p.contains("MUST NOT edit"),
-            "task_ops section must contain 'MUST NOT edit'"
+            p.contains("MUST NOT read or edit"),
+            "task_ops section must warn against both reading and editing the JSON"
         );
         assert!(
             p.contains("task-mgr add --stdin"),
@@ -3285,7 +3285,7 @@ pub enum ApiError {
 
         // Section must be positioned ABOVE the learnings section
         let task_ops_pos = p
-            .find("MUST NOT edit")
+            .find("MUST NOT read or edit")
             .expect("task_ops content must be present");
 
         // task_ops is assembled after ## Current Task and before ## Relevant Learnings

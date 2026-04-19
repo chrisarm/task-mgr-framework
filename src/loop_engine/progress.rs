@@ -87,13 +87,26 @@ pub fn format_outcome(outcome: &IterationOutcome) -> String {
     }
 }
 
-/// Maximum number of progress entries to keep after rotation.
-const MAX_PROGRESS_ENTRIES: usize = 20;
+/// Maximum number of regular iteration entries to keep after rotation.
+/// Milestone summary entries are exempt and always preserved.
+const MAX_PROGRESS_ENTRIES: usize = 7;
 
-/// Rotate the progress file to keep only the last `MAX_PROGRESS_ENTRIES` entries.
+/// Marker substring identifying a milestone-summary entry. Used by both
+/// `rotate_progress` (to preserve summaries past rotation) and
+/// `summarize_milestone` (to find the cutoff for "since the last milestone").
+const MILESTONE_SUMMARY_MARKER: &str = "Milestone Summary:";
+
+fn is_milestone_summary(entry: &str) -> bool {
+    entry.contains(MILESTONE_SUMMARY_MARKER)
+}
+
+/// Rotate the progress file to keep only the last `MAX_PROGRESS_ENTRIES` regular
+/// iteration entries. **Milestone summary entries are always preserved** so that
+/// the long-running narrative of a PRD survives rotation.
 ///
-/// Reads the file, splits on `---` delimiters, keeps the last N entries, and writes back.
-/// Errors are logged to stderr but never crash the loop.
+/// Reads the file, splits on `---` delimiters, keeps every milestone summary plus
+/// the trailing N regular entries (in original order), and writes back. Errors are
+/// logged to stderr but never crash the loop.
 pub fn rotate_progress(progress_path: &Path) {
     let content = match fs::read_to_string(progress_path) {
         Ok(c) => c,
@@ -112,26 +125,235 @@ pub fn rotate_progress(progress_path: &Path) {
         return;
     }
 
-    // Split on "---" delimiter lines. Each entry ends with "---\n".
-    // We split on "\n---\n" to separate entries, filtering out empty trailing parts.
     let entries: Vec<&str> = content
         .split("\n---\n")
         .filter(|e| !e.trim().is_empty())
         .collect();
 
-    if entries.len() <= MAX_PROGRESS_ENTRIES {
+    let regular_count = entries.iter().filter(|e| !is_milestone_summary(e)).count();
+    if regular_count <= MAX_PROGRESS_ENTRIES {
         return;
     }
 
-    // Keep last MAX_PROGRESS_ENTRIES entries, rejoin with the delimiter
-    let start = entries.len() - MAX_PROGRESS_ENTRIES;
-    let kept: Vec<&str> = entries[start..].to_vec();
+    let drop_regular = regular_count - MAX_PROGRESS_ENTRIES;
+    let mut dropped = 0usize;
+    let kept: Vec<&str> = entries
+        .into_iter()
+        .filter(|e| {
+            if is_milestone_summary(e) {
+                true
+            } else if dropped < drop_regular {
+                dropped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     let mut rotated = kept.join("\n---\n");
     rotated.push_str("\n---\n");
 
     if let Err(e) = fs::write(progress_path, rotated) {
         eprintln!(
             "Warning: could not write rotated progress file {}: {}",
+            progress_path.display(),
+            e
+        );
+    }
+}
+
+/// Parsed view of a single progress entry — only the fields needed for
+/// milestone summarization. Unparseable lines are tolerated and produce
+/// `None` fields rather than failures.
+#[derive(Debug, Default, Clone)]
+struct ParsedEntry {
+    task_id: Option<String>,
+    outcome: Option<String>,
+    files: Vec<String>,
+}
+
+fn parse_entry(entry: &str) -> ParsedEntry {
+    let mut parsed = ParsedEntry::default();
+    for line in entry.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- Task: ") {
+            if rest != "(none)" {
+                parsed.task_id = Some(rest.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("- Outcome: ") {
+            parsed.outcome = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("- Files: ") {
+            if rest != "(none)" {
+                parsed.files = rest.split(", ").map(|s| s.to_string()).collect();
+            }
+        }
+    }
+    parsed
+}
+
+/// Heuristic recommendation for a cluster of crash/overflow entries on the
+/// same task. Pure function — easy to unit-test against real outcome strings.
+fn crash_recommendation(task_id: &str, outcomes: &[String]) -> Option<String> {
+    if outcomes.len() < 2 {
+        return None;
+    }
+    let overflow_count = outcomes.iter().filter(|o| o.contains("PromptOverflow")).count();
+    let crash_count = outcomes.iter().filter(|o| o.starts_with("Crash")).count();
+    let timeout_count = outcomes
+        .iter()
+        .filter(|o| o.contains("Timeout") || o.contains("OomOrKilled"))
+        .count();
+
+    let is_review = task_id.contains("-REVIEW");
+
+    if overflow_count >= 2 {
+        if is_review {
+            return Some(format!(
+                "{}× PromptOverflow on REVIEW-type task — verify the task isn't already complete (Opus 4.7 may be re-doing work); consider auto-skip or routing to Sonnet 4.6",
+                overflow_count
+            ));
+        }
+        return Some(format!(
+            "{}× PromptOverflow — split the task into smaller subtasks, or route to Sonnet 4.6 (lower per-tool-use token cost)",
+            overflow_count
+        ));
+    }
+    if timeout_count >= 2 {
+        return Some(format!(
+            "{}× Timeout/OOM — increase per-iteration timeout or lower task difficulty",
+            timeout_count
+        ));
+    }
+    if crash_count >= 2 {
+        return Some(format!(
+            "{}× Crash — investigate root cause; consider escalating model or marking task blocked for human review",
+            crash_count
+        ));
+    }
+    None
+}
+
+/// Compact the progress file by replacing every raw iteration entry since
+/// the last milestone summary (or file start) with a single summary block.
+///
+/// Milestones are the compaction mechanism — after this runs, all raw entries
+/// in the summarized window are dropped from the file and the summary takes
+/// their place. Prior milestone summaries are preserved verbatim, so the
+/// long-running narrative survives.
+///
+/// The summary records iterations covered, distinct tasks, completed tasks,
+/// files touched, and a crash-avoidance recommendation for any task with
+/// ≥2 crash or PromptOverflow entries in the window.
+///
+/// **Note on "Iterations covered":** the count reflects raw entries currently
+/// present in the file since the last milestone — NOT the true number of
+/// iterations elapsed. `rotate_progress` may have already trimmed older
+/// entries before the milestone fired, so the count is a lower bound.
+///
+/// Best-effort: file I/O errors log to stderr and do not propagate.
+pub fn summarize_milestone(progress_path: &Path, milestone_task_id: &str) {
+    let content = match fs::read_to_string(progress_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read progress file for milestone summary {}: {}",
+                progress_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    let entries: Vec<&str> = content
+        .split("\n---\n")
+        .filter(|e| !e.trim().is_empty())
+        .collect();
+
+    let last_milestone_idx = entries.iter().rposition(|e| is_milestone_summary(e));
+    let scope_start = last_milestone_idx.map(|i| i + 1).unwrap_or(0);
+    let scope: Vec<ParsedEntry> = entries[scope_start..]
+        .iter()
+        .map(|e| parse_entry(e))
+        .collect();
+
+    if scope.is_empty() {
+        // Nothing to summarize — last entry was already a milestone summary,
+        // or the file is empty. Skip silently.
+        return;
+    }
+
+    let mut by_task: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut completed: Vec<String> = Vec::new();
+    let mut files_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for entry in &scope {
+        if let Some(tid) = &entry.task_id
+            && let Some(outcome) = &entry.outcome
+        {
+            by_task.entry(tid.clone()).or_default().push(outcome.clone());
+            if outcome == "Completed" && !completed.contains(tid) {
+                completed.push(tid.clone());
+            }
+        }
+        for f in &entry.files {
+            files_set.insert(f.clone());
+        }
+    }
+
+    let mut recommendations: Vec<String> = Vec::new();
+    for (tid, outcomes) in &by_task {
+        if let Some(rec) = crash_recommendation(tid, outcomes) {
+            recommendations.push(format!("  - {}: {}", tid, rec));
+        }
+    }
+
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let mut summary = format!(
+        "\n## {} - Milestone Summary: {}\n- Iterations covered: {}\n- Distinct tasks: {}\n- Tasks completed: {}\n- Files touched: {}\n",
+        timestamp,
+        milestone_task_id,
+        scope.len(),
+        by_task.len(),
+        if completed.is_empty() {
+            "(none)".to_string()
+        } else {
+            completed.join(", ")
+        },
+        if files_set.is_empty() {
+            "(none)".to_string()
+        } else {
+            files_set.into_iter().collect::<Vec<_>>().join(", ")
+        },
+    );
+
+    if recommendations.is_empty() {
+        summary.push_str("- Crash recommendations: (none — clean run)\n");
+    } else {
+        summary.push_str("- Crash recommendations:\n");
+        for rec in &recommendations {
+            summary.push_str(rec);
+            summary.push('\n');
+        }
+    }
+    summary.push_str("---\n");
+
+    // Rebuild the file: keep every entry up to and including the last existing
+    // milestone summary, drop the raw iteration entries we just summarized,
+    // then append the new summary block.
+    let kept: Vec<&str> = entries[..scope_start].to_vec();
+    let mut rebuilt = String::with_capacity(content.len() + summary.len());
+    if !kept.is_empty() {
+        rebuilt.push_str(&kept.join("\n---\n"));
+        rebuilt.push_str("\n---\n");
+    }
+    rebuilt.push_str(&summary);
+
+    if let Err(e) = fs::write(progress_path, rebuilt) {
+        eprintln!(
+            "Warning: could not write milestone summary to {}: {}",
             progress_path.display(),
             e
         );
@@ -395,7 +617,7 @@ mod tests {
     fn test_rotate_progress_under_limit_no_change() {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
-        let content = build_progress_entries(10);
+        let content = build_progress_entries(MAX_PROGRESS_ENTRIES - 1);
         fs::write(&progress_path, &content).unwrap();
 
         rotate_progress(&progress_path);
@@ -408,29 +630,28 @@ mod tests {
     fn test_rotate_progress_over_limit_keeps_last_n() {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
-        let content = build_progress_entries(30);
+        let total = MAX_PROGRESS_ENTRIES * 3;
+        let content = build_progress_entries(total);
         fs::write(&progress_path, &content).unwrap();
 
         rotate_progress(&progress_path);
 
         let after = fs::read_to_string(&progress_path).unwrap();
 
-        // Should keep last 20 entries (iterations 11-30)
+        let first_kept = total - MAX_PROGRESS_ENTRIES + 1;
         assert!(
-            !after.contains("TASK-001"),
-            "Oldest entry should be rotated out"
+            !after.contains(&format!("TASK-{:03}", first_kept - 1)),
+            "Entry just before the kept window should be rotated out"
         );
         assert!(
-            !after.contains("TASK-010"),
-            "Entry 10 should be rotated out"
+            after.contains(&format!("TASK-{:03}", first_kept)),
+            "First entry inside the kept window should remain"
         );
         assert!(
-            after.contains("TASK-011") || after.contains("TASK-012"),
-            "Entries around the boundary should be kept"
+            after.contains(&format!("TASK-{:03}", total)),
+            "Latest entry should be kept"
         );
-        assert!(after.contains("TASK-030"), "Latest entry should be kept");
 
-        // Count entries by counting "---" delimiters
         let entry_count = after.matches("\n---\n").count();
         assert!(
             entry_count <= MAX_PROGRESS_ENTRIES,
@@ -444,7 +665,7 @@ mod tests {
     fn test_rotate_progress_exact_limit_no_change() {
         let temp_dir = TempDir::new().unwrap();
         let progress_path = temp_dir.path().join("progress.txt");
-        let content = build_progress_entries(20);
+        let content = build_progress_entries(MAX_PROGRESS_ENTRIES);
         fs::write(&progress_path, &content).unwrap();
 
         rotate_progress(&progress_path);
@@ -463,5 +684,243 @@ mod tests {
 
         let after = fs::read_to_string(&progress_path).unwrap();
         assert_eq!(after, "", "Empty file should remain empty");
+    }
+
+    #[test]
+    fn test_rotate_progress_preserves_milestone_summaries() {
+        // File layout: 1 milestone summary then MAX*2 regular entries.
+        // After rotation, the milestone block must survive even though the
+        // regular entries before/after it are well past the cap.
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        let mut content = String::new();
+        for i in 1..=MAX_PROGRESS_ENTRIES {
+            content.push_str(&format!(
+                "\n## 2026-01-01 - Iteration {}\n- Task: TASK-{:03}\n- Model: (default)\n- Outcome: Completed\n- Files: (none)\n---\n",
+                i, i
+            ));
+        }
+        content.push_str(
+            "\n## 2026-01-02 - Milestone Summary: MILESTONE-1\n- Iterations covered: 7\n---\n",
+        );
+        for i in (MAX_PROGRESS_ENTRIES + 1)..=(MAX_PROGRESS_ENTRIES * 2) {
+            content.push_str(&format!(
+                "\n## 2026-01-03 - Iteration {}\n- Task: TASK-{:03}\n- Model: (default)\n- Outcome: Completed\n- Files: (none)\n---\n",
+                i, i
+            ));
+        }
+        fs::write(&progress_path, &content).unwrap();
+
+        rotate_progress(&progress_path);
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert!(
+            after.contains("Milestone Summary: MILESTONE-1"),
+            "milestone summary must survive rotation"
+        );
+        // Pre-milestone regular entries should be the ones rotated out.
+        assert!(
+            !after.contains("TASK-001"),
+            "earliest pre-milestone regular entry should be dropped"
+        );
+        // Latest regular entry should be kept.
+        assert!(
+            after.contains(&format!("TASK-{:03}", MAX_PROGRESS_ENTRIES * 2)),
+            "newest regular entry should be kept"
+        );
+        // Total regular entries should not exceed the cap.
+        let regular = after
+            .split("\n---\n")
+            .filter(|e| !e.trim().is_empty() && !e.contains("Milestone Summary"))
+            .count();
+        assert!(
+            regular <= MAX_PROGRESS_ENTRIES,
+            "regular-entry count {} exceeded cap {}",
+            regular,
+            MAX_PROGRESS_ENTRIES
+        );
+    }
+
+    // --- crash_recommendation tests ---
+
+    #[test]
+    fn test_crash_recommendation_single_outcome_returns_none() {
+        let recs = crash_recommendation("FEAT-001", &["PromptOverflow".to_string()]);
+        assert!(recs.is_none(), "one entry isn't a pattern");
+    }
+
+    #[test]
+    fn test_crash_recommendation_repeated_overflow() {
+        let outcomes = vec!["PromptOverflow".to_string(), "PromptOverflow".to_string()];
+        let rec = crash_recommendation("FEAT-001", &outcomes).expect("must produce recommendation");
+        assert!(rec.contains("PromptOverflow"), "must name the symptom");
+        assert!(
+            rec.contains("Sonnet") || rec.contains("split"),
+            "must propose a concrete remedy: {}",
+            rec
+        );
+    }
+
+    #[test]
+    fn test_crash_recommendation_review_task_overflow_suggests_already_complete_check() {
+        let outcomes = vec!["PromptOverflow".to_string(), "PromptOverflow".to_string()];
+        let rec = crash_recommendation("REFACTOR-REVIEW-2", &outcomes)
+            .expect("must produce recommendation");
+        assert!(
+            rec.contains("already complete") || rec.contains("auto-skip"),
+            "REVIEW-type tasks should trigger the loop-on-completed-work warning: {}",
+            rec
+        );
+    }
+
+    #[test]
+    fn test_crash_recommendation_repeated_timeout() {
+        let outcomes = vec![
+            "Crash (Timeout)".to_string(),
+            "Crash (Timeout)".to_string(),
+        ];
+        let rec = crash_recommendation("FEAT-002", &outcomes).expect("must produce recommendation");
+        assert!(
+            rec.contains("timeout") || rec.contains("Timeout") || rec.contains("difficulty"),
+            "timeout cluster should suggest timeout/difficulty fix: {}",
+            rec
+        );
+    }
+
+    // --- summarize_milestone tests ---
+
+    fn write_iteration_entry(buf: &mut String, iteration: u32, task_id: &str, outcome: &str) {
+        buf.push_str(&format!(
+            "\n## 2026-01-01 - Iteration {}\n- Task: {}\n- Model: (default)\n- Effort: medium\n- Outcome: {}\n- Files: (none)\n---\n",
+            iteration, task_id, outcome
+        ));
+    }
+
+    #[test]
+    fn test_summarize_milestone_replaces_raw_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        let mut content = String::new();
+        write_iteration_entry(&mut content, 1, "FEAT-001", "Completed");
+        write_iteration_entry(&mut content, 2, "FEAT-002", "Completed");
+        write_iteration_entry(&mut content, 3, "MILESTONE-1", "Completed");
+        fs::write(&progress_path, &content).unwrap();
+
+        summarize_milestone(&progress_path, "MILESTONE-1");
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        // Raw FEAT-001 / FEAT-002 entries should be GONE — replaced by summary.
+        assert!(
+            !after.contains("Iteration 1"),
+            "raw iteration entries must be dropped after summarization"
+        );
+        assert!(
+            after.contains("Milestone Summary: MILESTONE-1"),
+            "summary block must be present"
+        );
+        assert!(
+            after.contains("Iterations covered: 3"),
+            "summary must count the entries it replaced"
+        );
+        assert!(
+            after.contains("FEAT-001") && after.contains("FEAT-002"),
+            "completed task list must be preserved in the summary"
+        );
+    }
+
+    #[test]
+    fn test_summarize_milestone_preserves_prior_summaries() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        let mut content = String::new();
+        write_iteration_entry(&mut content, 1, "FEAT-001", "Completed");
+        content.push_str(
+            "\n## 2026-01-01 - Milestone Summary: MILESTONE-1\n- Iterations covered: 1\n- Crash recommendations: (none — clean run)\n---\n",
+        );
+        write_iteration_entry(&mut content, 2, "FEAT-002", "Completed");
+        write_iteration_entry(&mut content, 3, "FEAT-003", "Completed");
+        fs::write(&progress_path, &content).unwrap();
+
+        summarize_milestone(&progress_path, "MILESTONE-2");
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert!(
+            after.contains("Milestone Summary: MILESTONE-1"),
+            "prior milestone summary must remain"
+        );
+        assert!(
+            after.contains("Milestone Summary: MILESTONE-2"),
+            "new milestone summary must be appended"
+        );
+        // Only entries since MILESTONE-1 should be summarized — count = 2.
+        assert!(
+            after.contains("Iterations covered: 2"),
+            "new summary must only count entries since the prior milestone, got: {}",
+            after
+        );
+        assert!(
+            !after.contains("Iteration 2") && !after.contains("Iteration 3"),
+            "raw entries since prior milestone must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_summarize_milestone_includes_crash_recommendation() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        let mut content = String::new();
+        write_iteration_entry(&mut content, 1, "REFACTOR-REVIEW-2", "PromptOverflow");
+        write_iteration_entry(&mut content, 2, "REFACTOR-REVIEW-2", "PromptOverflow");
+        write_iteration_entry(&mut content, 3, "REFACTOR-REVIEW-2", "PromptOverflow");
+        fs::write(&progress_path, &content).unwrap();
+
+        summarize_milestone(&progress_path, "MILESTONE-2");
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert!(
+            after.contains("Crash recommendations:"),
+            "summary must include recommendations section"
+        );
+        assert!(
+            after.contains("REFACTOR-REVIEW-2"),
+            "summary must name the offending task"
+        );
+        assert!(
+            after.contains("PromptOverflow") && (after.contains("Sonnet") || after.contains("auto-skip") || after.contains("already complete")),
+            "summary must include both the symptom count and a remedy: {}",
+            after
+        );
+    }
+
+    #[test]
+    fn test_summarize_milestone_no_entries_is_noop() {
+        // Already-summarized state: file ends with a milestone block. Calling
+        // summarize again with no new entries between should leave the file
+        // unchanged.
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+        let content =
+            "\n## 2026-01-01 - Milestone Summary: MILESTONE-1\n- Iterations covered: 0\n---\n";
+        fs::write(&progress_path, content).unwrap();
+
+        summarize_milestone(&progress_path, "MILESTONE-2");
+
+        let after = fs::read_to_string(&progress_path).unwrap();
+        assert_eq!(after, content, "no-op when nothing to summarize");
+    }
+
+    #[test]
+    fn test_summarize_milestone_missing_file_is_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("missing.txt");
+        summarize_milestone(&progress_path, "MILESTONE-1");
+        assert!(
+            !progress_path.exists(),
+            "must not create a progress file from nothing"
+        );
     }
 }
