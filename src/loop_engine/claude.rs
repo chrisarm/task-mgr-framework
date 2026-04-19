@@ -757,6 +757,11 @@ pub(crate) fn cleanup_ghost_sessions() {
 /// cannot be touched.
 ///
 /// Best-effort: if HOME is unset or cwd resolution fails, we skip.
+/// `NotFound` from `remove_file` is silently ignored (the artifact may
+/// never have been written, e.g. if a future Claude release finally
+/// honors `--no-session-persistence`). Any other error is logged to
+/// stderr so environmental misconfiguration (permissions, mount issues)
+/// surfaces instead of being silently dropped.
 fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
     let home = match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
@@ -770,7 +775,17 @@ fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
         },
     };
     let target = encoded_cwd_dir(&cwd, &home).join(format!("{}.jsonl", session_id));
-    let _ = std::fs::remove_file(&target);
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "[curate cleanup] failed to delete ai-title artifact {}: {}",
+                target.display(),
+                e
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3048,5 +3063,104 @@ mod tests {
             !target_path.exists(),
             "the UUID-matched target should be removed"
         );
+    }
+
+    /// Serializes env-var mutation across HOME-sensitive tests; HOME is process-
+    /// global and leaking it into concurrent tests would make them flaky.
+    static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores HOME (or unsets it) on drop, so a failed assertion doesn't
+    /// leak the fake HOME into subsequent tests.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", value) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    /// End-to-end: drive `cleanup_title_artifact_sync` directly against a
+    /// temp HOME. Proves the actual helper (not a reimplementation) deletes
+    /// the UUID-matched file and leaves an unrelated sibling alone. Future
+    /// changes to the path-encoding logic or the `remove_file` call will
+    /// break this test, which is the point.
+    #[test]
+    fn test_cleanup_title_artifact_sync_deletes_target_preserves_bystander() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let bystander_uuid = uuid::Uuid::new_v4();
+        let bystander = projects_dir.join(format!("{}.jsonl", bystander_uuid));
+        std::fs::write(&bystander, "untouched").unwrap();
+
+        let target_uuid = uuid::Uuid::new_v4();
+        let target_path = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target_path, "to-be-deleted").unwrap();
+
+        let _home = HomeGuard::set(&fake_home);
+        cleanup_title_artifact_sync(target_uuid, Some(&fake_cwd));
+
+        assert!(
+            !target_path.exists(),
+            "cleanup_title_artifact_sync should have removed the UUID-matched target"
+        );
+        assert!(
+            bystander.exists(),
+            "cleanup_title_artifact_sync must not touch a .jsonl with a different UUID"
+        );
+    }
+
+    /// HOME unset: helper must return silently without panicking or erroring.
+    #[test]
+    fn test_cleanup_title_artifact_sync_skips_when_home_unset() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        // Should be a no-op, no panic.
+        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), None);
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => {}
+        }
+    }
+
+    /// Target file never written (Claude crashed before writing ai-title):
+    /// `NotFound` must be swallowed, no panic, no stderr noise tested here
+    /// (we only assert the call returns normally).
+    #[test]
+    fn test_cleanup_title_artifact_sync_missing_target_is_silent() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+        // Deliberately do NOT create the projects dir or any target file.
+
+        let _home = HomeGuard::set(&fake_home);
+        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), Some(&fake_cwd));
+        // Test passes if we reach here without panic.
     }
 }
