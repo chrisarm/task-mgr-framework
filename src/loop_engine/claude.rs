@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -28,13 +27,6 @@ const MAX_CONVERSATION_BYTES: usize = 50_000;
 const MAX_TOOL_USE_BYTES: usize = 500;
 /// Maximum bytes for a single tool_result content block.
 const MAX_TOOL_RESULT_BYTES: usize = 1_000;
-
-/// Delay before a `cleanup_title_artifact=true` spawn deletes the orphan
-/// `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` ai-title metadata file
-/// that Claude Code 2.1.110 writes despite `--no-session-persistence`.
-/// 30s is comfortably longer than Claude's title-write window (observed
-/// sub-second) while still cleaning up before the user notices.
-const TITLE_ARTIFACT_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 /// Compute the directory Claude Code uses for a given working directory.
 ///
@@ -98,6 +90,12 @@ pub struct ClaudeResult {
 ///
 /// When `signal_flag` is `Some`, a watchdog thread polls the flag every 200ms.
 /// On signal detection: sends SIGTERM to child, waits up to 3s, then SIGKILL.
+///
+/// When `cleanup_title_artifact` is `true`, a known UUID is injected via
+/// `--session-id` (before `-p`) and the corresponding `ai-title` jsonl file
+/// is removed synchronously after the child process exits. The deletion is
+/// best-effort and only targets the exact UUID-derived path, so unrelated
+/// session files are never touched.
 ///
 /// # Errors
 ///
@@ -239,10 +237,6 @@ pub(crate) fn spawn_claude(
         }
     })?;
 
-    if let Some(uuid) = cleanup_session_id {
-        schedule_title_artifact_cleanup(uuid, working_dir);
-    }
-
     // Write the prompt to stdin and close it so the child can start processing.
     // This must happen before reading stdout to avoid deadlock.
     {
@@ -331,6 +325,13 @@ pub(crate) fn spawn_claude(
     stop_watchdog.store(true, Ordering::Release);
     if let Some(handle) = watchdog_handle {
         let _ = handle.join();
+    }
+
+    // Child has exited: the ai-title jsonl is guaranteed written (or never will
+    // be). Delete it synchronously so it's gone before this function returns,
+    // even if the caller (curate_dedup worker) immediately exits the process.
+    if let Some(uuid) = cleanup_session_id {
+        cleanup_title_artifact_sync(uuid, working_dir);
     }
 
     let exit_code = exit_code_from_status(status);
@@ -746,17 +747,17 @@ pub(crate) fn cleanup_ghost_sessions() {
     }
 }
 
-/// Detach a thread that, after `TITLE_ARTIFACT_CLEANUP_DELAY`, deletes the
-/// single jsonl file Claude wrote for the given session UUID.
+/// Delete the ai-title jsonl that Claude wrote for the given session UUID.
 ///
-/// The target path is computed deterministically from the cwd via
-/// `encoded_cwd_dir`; the thread does NOT enumerate the projects directory,
-/// so it cannot touch unrelated session files (interactive sessions,
-/// concurrent curate batches, loop iterations).
+/// Called synchronously after the child process exits, so the file is
+/// guaranteed to be present (or never written). The target path is
+/// computed deterministically from the cwd via `encoded_cwd_dir`; the
+/// projects directory is never enumerated, so unrelated session files
+/// (interactive sessions, concurrent curate batches, loop iterations)
+/// cannot be touched.
 ///
-/// Best-effort: if HOME is unset or cwd resolution fails, we skip
-/// scheduling. The thread is detached — no join handle is retained.
-fn schedule_title_artifact_cleanup(session_id: Uuid, working_dir: Option<&Path>) {
+/// Best-effort: if HOME is unset or cwd resolution fails, we skip.
+fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
     let home = match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
         _ => return,
@@ -769,10 +770,7 @@ fn schedule_title_artifact_cleanup(session_id: Uuid, working_dir: Option<&Path>)
         },
     };
     let target = encoded_cwd_dir(&cwd, &home).join(format!("{}.jsonl", session_id));
-    std::thread::spawn(move || {
-        std::thread::sleep(TITLE_ARTIFACT_CLEANUP_DELAY);
-        let _ = std::fs::remove_file(&target);
-    });
+    let _ = std::fs::remove_file(&target);
 }
 
 #[cfg(test)]
