@@ -121,7 +121,9 @@ public for tests and `curate enrich`, but new production creation paths should u
 Claude Code 2.1.110 writes an `ai-title` jsonl to `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
 even with `--no-session-persistence`. To avoid polluting the user's projects dir, `curate dedup`
 and `curate enrich` opt into `spawn_claude`'s `cleanup_title_artifact` arg: a fixed UUID is
-passed via `--session-id` (before `-p`) and a detached thread deletes that exact file ~30s
-later. Scope is intentionally narrow — loops and learning ingestion do NOT opt in; only the
-curate call sites do. See `spawn_claude` and `schedule_title_artifact_cleanup` in
-`src/loop_engine/claude.rs`.
+passed via `--session-id` (before `-p`, required — Claude parses flags only left of the prompt)
+and, after `child.wait()` returns, that exact file is removed synchronously. An earlier detached
+30s-delay thread design was replaced because threads die when the parent `task-mgr` process
+exits; synchronous post-wait cleanup is both simpler and guaranteed to run. Scope is narrow —
+loops and learning ingestion do NOT opt in; only the curate call sites do. See `spawn_claude`
+and `cleanup_title_artifact_sync` in `src/loop_engine/claude.rs`.
