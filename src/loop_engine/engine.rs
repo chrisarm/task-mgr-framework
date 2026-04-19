@@ -198,6 +198,11 @@ pub struct IterationContext {
     /// task IDs, values are the effort level to use on the next attempt in
     /// place of the difficulty-derived default.
     pub effort_overrides: std::collections::HashMap<String, &'static str>,
+    /// Per-task model overrides set after `Crash(PromptTooLong)` when effort
+    /// downgrade is exhausted. Escalates to the 1M-context model variant so
+    /// the task can fit in the larger context window. Uses `String` values
+    /// (not `&'static str`) to allow future dynamic model IDs.
+    pub model_overrides: std::collections::HashMap<String, String>,
 }
 
 impl IterationContext {
@@ -214,6 +219,7 @@ impl IterationContext {
             last_task_id: None,
             last_was_crash: false,
             effort_overrides: std::collections::HashMap::new(),
+            model_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -466,10 +472,10 @@ pub fn run_iteration(
     let task_files = prompt_result.task_files.clone();
     let shown_learning_ids = prompt_result.shown_learning_ids.clone();
 
-    // Step 4.5: Apply crash escalation (after model resolution, before spawn)
+    // Step 4.5: Apply crash escalation and PromptTooLong model overrides
     let effective_model = {
         let resolved = prompt_result.resolved_model.as_deref();
-        match check_crash_escalation(
+        let after_crash_escalation = match check_crash_escalation(
             ctx.last_task_id.as_deref(),
             &task_id,
             ctx.last_was_crash,
@@ -481,6 +487,17 @@ pub fn run_iteration(
                 Some(escalated)
             }
             None => prompt_result.resolved_model,
+        };
+        // Apply per-task 1M model override from prior PromptTooLong recovery
+        if let Some(override_model) = ctx.model_overrides.get(&task_id) {
+            let old = after_crash_escalation.as_deref().unwrap_or("(default)");
+            eprintln!(
+                "Model override (prior prompt overflow): {} → {}",
+                old, override_model,
+            );
+            Some(override_model.clone())
+        } else {
+            after_crash_escalation
         }
     };
 
@@ -742,7 +759,7 @@ pub fn run_iteration(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) {
-        match model::downgrade_effort(effort) {
+        let has_recovery = match model::downgrade_effort(effort) {
             Some(next) => {
                 eprintln!(
                     "Prompt is too long for {} at effort {} — downgrading to {} and resetting task",
@@ -751,28 +768,62 @@ pub fn run_iteration(
                     next,
                 );
                 ctx.effort_overrides.insert(task_id.clone(), next);
+                true
             }
             None => {
-                eprintln!(
-                    "Prompt is too long for {} at effort {} — no downgrade available (high is the floor); resetting task for retry at same effort",
-                    task_id,
-                    effort.unwrap_or("(default)"),
-                );
+                // Effort floor reached — try escalating to the 1M context model
+                match model::to_1m_model(effective_model.as_deref()) {
+                    Some(m1m) => {
+                        eprintln!(
+                            "Prompt is too long for {} at effort {} — effort floor reached, escalating to 1M context model ({}) and resetting task",
+                            task_id,
+                            effort.unwrap_or("(default)"),
+                            m1m,
+                        );
+                        ctx.model_overrides
+                            .insert(task_id.clone(), m1m.to_string());
+                        true
+                    }
+                    None => false,
+                }
             }
-        }
+        };
 
-        // Mirrors the run-end cleanup at lines ~2050–2058; same query, earlier trigger.
-        match params.conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL \
-             WHERE id = ? AND status = 'in_progress'",
-            [&task_id],
-        ) {
-            Ok(1) => eprintln!("Reset task {} to todo after prompt overflow", task_id),
-            Ok(_) => {}
-            Err(e) => eprintln!(
-                "Warning: failed to reset task {} after prompt overflow: {}",
-                task_id, e,
-            ),
+        if has_recovery {
+            // Reset to todo so the next iteration retries with the downgraded
+            // effort or escalated model.
+            match params.conn.execute(
+                "UPDATE tasks SET status = 'todo', started_at = NULL \
+                 WHERE id = ? AND status = 'in_progress'",
+                [&task_id],
+            ) {
+                Ok(1) => eprintln!("Reset task {} to todo after prompt overflow", task_id),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "Warning: failed to reset task {} after prompt overflow: {}",
+                    task_id, e,
+                ),
+            }
+        } else {
+            // All recovery options exhausted — block the task so it doesn't
+            // consume crash-tracker budget and abort the entire loop.
+            eprintln!(
+                "Prompt is too long for {} at effort {} — all recovery exhausted (effort floor + 1M model); blocking task",
+                task_id,
+                effort.unwrap_or("(default)"),
+            );
+            match params.conn.execute(
+                "UPDATE tasks SET status = 'blocked' \
+                 WHERE id = ? AND status = 'in_progress'",
+                [&task_id],
+            ) {
+                Ok(1) => eprintln!("Blocked task {} — prompt overflow unrecoverable", task_id),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "Warning: failed to block task {} after prompt overflow: {}",
+                    task_id, e,
+                ),
+            }
         }
     }
 

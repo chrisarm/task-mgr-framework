@@ -25,9 +25,15 @@
 //! can therefore land at (Opus, `high`); this is intentional — `max` effort
 //! was retired for overflowing context and the `xhigh → high` step is the
 //! same safety valve for `xhigh`.
+//!
+//! When effort downgrade is exhausted (already at `high`), `to_1m_model`
+//! provides a second escape hatch: escalate to the 1M-context variant of
+//! the current model (currently Opus only). This gives the task a larger
+//! context window without changing effort.
 
 /// Well-known model identifiers.
 pub const OPUS_MODEL: &str = "claude-opus-4-7";
+pub const OPUS_MODEL_1M: &str = "claude-opus-4-7[1m]";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
@@ -212,6 +218,23 @@ pub fn escalate_model(model: Option<&str>) -> Option<String> {
             ModelTier::Sonnet => Some(OPUS_MODEL.to_string()),
             ModelTier::Opus => Some(OPUS_MODEL.to_string()),
         },
+    }
+}
+
+/// Check whether a model string is already a 1M-context variant (contains `[1m]`).
+pub fn is_1m_model(model: Option<&str>) -> bool {
+    model.is_some_and(|m| m.to_lowercase().contains("[1m]"))
+}
+
+/// Return the 1M-context variant for a model, if one exists.
+///
+/// Currently only Opus has a 1M variant. Returns `None` if the model is
+/// already 1M, not Opus-tier, or `None`.
+pub fn to_1m_model(model: Option<&str>) -> Option<&'static str> {
+    match model {
+        Some(m) if is_1m_model(Some(m)) => None,
+        Some(m) if model_tier(Some(m)) == ModelTier::Opus => Some(OPUS_MODEL_1M),
+        _ => None,
     }
 }
 
@@ -1047,5 +1070,71 @@ mod tests {
         let medium = difficulty_rank(Some("medium")).unwrap();
         let high = difficulty_rank(Some("high")).unwrap();
         assert!(low < medium && medium < high);
+    }
+
+    // ============ is_1m_model tests ============
+
+    #[test]
+    fn test_is_1m_model_positive() {
+        assert!(is_1m_model(Some(OPUS_MODEL_1M)));
+        assert!(is_1m_model(Some("claude-opus-4-7[1m]")));
+        assert!(is_1m_model(Some("anything[1M]")));
+        assert!(is_1m_model(Some("model[1m]suffix")));
+    }
+
+    #[test]
+    fn test_is_1m_model_negative() {
+        assert!(!is_1m_model(None));
+        assert!(!is_1m_model(Some(OPUS_MODEL)));
+        assert!(!is_1m_model(Some(SONNET_MODEL)));
+        assert!(!is_1m_model(Some("")));
+        assert!(!is_1m_model(Some("opus")));
+    }
+
+    // ============ to_1m_model tests ============
+
+    #[test]
+    fn test_to_1m_model_opus_returns_1m() {
+        assert_eq!(to_1m_model(Some(OPUS_MODEL)), Some(OPUS_MODEL_1M));
+    }
+
+    #[test]
+    fn test_to_1m_model_already_1m_returns_none() {
+        assert_eq!(to_1m_model(Some(OPUS_MODEL_1M)), None);
+    }
+
+    #[test]
+    fn test_to_1m_model_non_opus_returns_none() {
+        assert_eq!(to_1m_model(Some(SONNET_MODEL)), None);
+        assert_eq!(to_1m_model(Some(HAIKU_MODEL)), None);
+    }
+
+    #[test]
+    fn test_to_1m_model_none_returns_none() {
+        assert_eq!(to_1m_model(None), None);
+    }
+
+    #[test]
+    fn test_to_1m_model_unknown_returns_none() {
+        assert_eq!(to_1m_model(Some("gpt-4")), None);
+        assert_eq!(to_1m_model(Some("")), None);
+    }
+
+    #[test]
+    fn test_to_1m_model_case_variant_opus() {
+        assert_eq!(
+            to_1m_model(Some("OPUS")),
+            Some(OPUS_MODEL_1M),
+            "case-insensitive opus detection should return 1M variant"
+        );
+    }
+
+    #[test]
+    fn test_1m_model_tier_is_opus() {
+        assert_eq!(
+            model_tier(Some(OPUS_MODEL_1M)),
+            ModelTier::Opus,
+            "1M model should still be classified as Opus tier"
+        );
     }
 }

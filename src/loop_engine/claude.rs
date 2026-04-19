@@ -849,7 +849,7 @@ fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
 mod tests {
     use super::*;
     use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
-    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
+    use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
     use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status};
     use rstest::rstest;
     use std::sync::atomic::AtomicU64;
@@ -1314,6 +1314,29 @@ mod tests {
         assert!(
             output.contains(&expected),
             "model=Some(OPUS_MODEL) should include --model flag, got: '{}'",
+            output
+        );
+    }
+
+    /// model=Some(OPUS_MODEL_1M) → --model flag present with the 1M context model ID.
+    #[test]
+    fn test_spawn_model_opus_1m_includes_model_flag() {
+        let result = spawn_claude_echo(
+            "test_prompt",
+            None,
+            Some(OPUS_MODEL_1M),
+            false,
+            &scoped_coding(),
+        );
+
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        let output = res.output.trim();
+
+        let expected = format!("--model {OPUS_MODEL_1M}");
+        assert!(
+            output.contains(&expected),
+            "model=Some(OPUS_MODEL_1M) should include --model flag with 1M variant, got: '{}'",
             output
         );
     }
