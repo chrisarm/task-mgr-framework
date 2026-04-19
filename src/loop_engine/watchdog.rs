@@ -316,6 +316,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let elapsed = start.elapsed();
 
@@ -373,6 +374,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let elapsed = start.elapsed();
 

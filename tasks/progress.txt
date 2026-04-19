@@ -159,3 +159,31 @@
 - 5 pre-existing test-only warnings in unrelated modules (loop_engine, worktrees, curate/tests) — not from this feature
 - **Approach**: Parallel execution of all 4 cargo commands, then targeted checks for dead code and CLI help
 ---
+
+## 2026-04-19 - 293c4fde-FEAT-001
+- Added `cleanup_title_artifact: bool` arg to spawn_claude (appended)
+- New const TITLE_ARTIFACT_CLEANUP_DELAY = 30s
+- New pure helper `encoded_cwd_dir(cwd, home) -> PathBuf` (trims trailing slash, replaces / with -)
+- New helper `schedule_title_artifact_cleanup(uuid, working_dir)`: detached thread, single deterministic remove_file
+- Inserted `--session-id <uuid>` flag before -p (after --model/--effort) — Learning [671]
+- Updated all 7 production+test callers in other files to pass `false` (preserves behavior)
+- 6 new unit tests (3 encoded_cwd_dir incl. trailing slash; 1 false→no flag; 1 true→valid v4 + ordering; 1 bystander-survives invariant)
+- All 2956 lib tests pass; pre-existing test_default_dir failure is unrelated (worktree DB anchoring)
+- cargo fmt --check clean (also fixed pre-existing fmt drift in 4 unrelated files via `cargo fmt`)
+- **Approach**: Thread the bool through, keep the cleanup logic in a tiny detached helper, derive the target path from a pure function so the worst that can ever happen is a stale file (never collateral deletion)
+- **Learnings:** Cleanup thread takes owned PathBuf via `move`, so the function can return immediately. Don't canonicalize cwd — Claude encodes the literal cwd, and resolving symlinks would mismatch.
+---
+
+## 2026-04-19 - 293c4fde-REVIEW-001
+- Code review: spawn_claude signature, schedule_title_artifact_cleanup, encoded_cwd_dir all look correct and idiomatic. Doc comments on spawn_claude describe the opt-in. Every caller passes false except curate dedup (mod.rs:615) and enrich (enrich.rs:246) which pass true.
+- Static checks: cargo fmt --check clean; cargo clippy -D warnings clean; cargo test 2950/2951 pass (the one failure `cli::tests::test_default_dir` is pre-existing, unrelated to this feature — reproduces on main, caused by bc9283d's canonicalization fix).
+- Empirical verification via CLAUDE_BINARY=/tmp/claude-log-argv.sh task-mgr curate dedup --dry-run --concurrency 1:
+  - Argv order CONFIRMED correct: `--print --no-session-persistence --permission-mode dontAsk --model haiku --session-id <uuid> -p` — session-id appears before -p in all 5 spawns observed.
+  - BEFORE: 9 jsonl files in projects dir; RIGHT AFTER: 11 (+2 from this run).
+  - AFTER 40s: 2 orphan files STILL PRESENT matching session UUIDs from the final two argv entries (5fdc1dd7..., fd01d06a...). 3 of 5 argv UUIDs never produced files (likely Claude didn't write for those spawns).
+  - Root cause: detached cleanup thread dies when task-mgr exits. Any jsonl created in the final 30s of execution survives because the 30s timer never fires.
+- Filed 293c4fde-FIX-001 (priority 90): flush pending cleanups before curate returns, or do cleanup synchronously after child.wait.
+- CLAUDE.md updated with a brief "Curate session cleanup workaround" section.
+- Learning recorded (tags: curate, claude-cli, session-persistence) with workaround outcome and the process-exit caveat flagged.
+- **Learnings:** detached std::thread cleanup timers do NOT survive parent exit — use join handles or synchronous cleanup for short-lived CLI subcommands.
+---

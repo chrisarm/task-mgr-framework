@@ -47,9 +47,8 @@ pub(crate) fn compute_worktree_path(project_root: &Path, branch_name: &str) -> P
 }
 
 fn is_inside_worktree(dir: &Path) -> TaskMgrResult<bool> {
-    crate::git::is_inside_worktree_at(dir).map_err(|e| {
-        TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e)
-    })
+    crate::git::is_inside_worktree_at(dir)
+        .map_err(|e| TaskMgrError::io_error(dir.display().to_string(), "running git rev-parse", e))
 }
 
 /// Return a list of (worktree_path, branch_name) tuples.

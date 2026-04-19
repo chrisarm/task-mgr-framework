@@ -612,6 +612,7 @@ fn process_batches_parallel(
                     None,
                     None,
                     None,
+                    true,
                 ) {
                     Err(e) => {
                         eprintln!(

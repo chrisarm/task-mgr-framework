@@ -137,21 +137,16 @@ fn run_add(
 
 /// Assert that `<dir>/tasks.db` contains a row with the given id.
 fn assert_task_in_db(db_dir: &Path, id: &str) {
-    let conn = rusqlite::Connection::open(db_dir.join("tasks.db")).unwrap_or_else(|e| {
-        panic!(
-            "expected DB at {}: {e}",
-            db_dir.join("tasks.db").display()
-        )
-    });
+    let conn = rusqlite::Connection::open(db_dir.join("tasks.db"))
+        .unwrap_or_else(|e| panic!("expected DB at {}: {e}", db_dir.join("tasks.db").display()));
     let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE id = ?1",
-            [id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(
-        count, 1,
+        count,
+        1,
         "expected 1 row with id={id} in {}",
         db_dir.join("tasks.db").display()
     );

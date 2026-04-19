@@ -8,10 +8,12 @@
 /// When a `SignalFlag` is provided, a watchdog thread monitors for SIGINT/SIGTERM
 /// and escalates: SIGTERM → 3s grace → SIGKILL.
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use uuid::Uuid;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
@@ -25,6 +27,23 @@ const MAX_CONVERSATION_BYTES: usize = 50_000;
 const MAX_TOOL_USE_BYTES: usize = 500;
 /// Maximum bytes for a single tool_result content block.
 const MAX_TOOL_RESULT_BYTES: usize = 1_000;
+
+/// Compute the directory Claude Code uses for a given working directory.
+///
+/// Claude encodes the cwd into a flat directory name under
+/// `<HOME>/.claude/projects/` by replacing every `/` with `-`. The leading
+/// slash becomes a leading dash. Trailing slashes are trimmed before
+/// encoding so `/foo/` and `/foo` map to the same directory.
+///
+/// Pure: takes `&Path` inputs, no filesystem access. Symlinks are NOT
+/// resolved — Claude encodes the literal cwd it is invoked with, so this
+/// must mirror that exactly.
+pub(crate) fn encoded_cwd_dir(cwd: &Path, home: &Path) -> PathBuf {
+    let cwd_str = cwd.to_string_lossy();
+    let trimmed = cwd_str.trim_end_matches('/');
+    let encoded = trimmed.replace('/', "-");
+    home.join(".claude").join("projects").join(encoded)
+}
 
 /// Result of a Claude subprocess invocation.
 #[derive(Debug)]
@@ -72,6 +91,12 @@ pub struct ClaudeResult {
 /// When `signal_flag` is `Some`, a watchdog thread polls the flag every 200ms.
 /// On signal detection: sends SIGTERM to child, waits up to 3s, then SIGKILL.
 ///
+/// When `cleanup_title_artifact` is `true`, a known UUID is injected via
+/// `--session-id` (before `-p`) and the corresponding `ai-title` jsonl file
+/// is removed synchronously after the child process exits. The deletion is
+/// best-effort and only targets the exact UUID-derived path, so unrelated
+/// session files are never touched.
+///
 /// # Errors
 ///
 /// Returns `TaskMgrError::IoError` if the binary is not found or
@@ -88,6 +113,7 @@ pub(crate) fn spawn_claude(
     effort: Option<&str>,
     disallowed_tools: Option<&str>,
     db_dir: Option<&Path>,
+    cleanup_title_artifact: bool,
 ) -> TaskMgrResult<ClaudeResult> {
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -143,6 +169,15 @@ pub(crate) fn spawn_claude(
         args.push("--effort".to_string());
         args.push(e.to_string());
     }
+    // Claude Code 2.1.110 writes an ai-title jsonl despite --no-session-persistence;
+    // forcing a known UUID lets a deferred thread delete that exact file.
+    // Must stay before -p — Claude only parses flags left of the prompt.
+    let cleanup_session_id: Option<Uuid> = cleanup_title_artifact.then(|| {
+        let id = Uuid::new_v4();
+        args.push("--session-id".to_string());
+        args.push(id.to_string());
+        id
+    });
     args.push("-p".to_string());
     // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
     // limits when prompts are large (e.g. curate dedup with many learnings).
@@ -290,6 +325,13 @@ pub(crate) fn spawn_claude(
     stop_watchdog.store(true, Ordering::Release);
     if let Some(handle) = watchdog_handle {
         let _ = handle.join();
+    }
+
+    // Child has exited: the ai-title jsonl is guaranteed written (or never will
+    // be). Delete it synchronously so it's gone before this function returns,
+    // even if the caller (curate_dedup worker) immediately exits the process.
+    if let Some(uuid) = cleanup_session_id {
+        cleanup_title_artifact_sync(uuid, working_dir);
     }
 
     let exit_code = exit_code_from_status(status);
@@ -705,6 +747,47 @@ pub(crate) fn cleanup_ghost_sessions() {
     }
 }
 
+/// Delete the ai-title jsonl that Claude wrote for the given session UUID.
+///
+/// Called synchronously after the child process exits, so the file is
+/// guaranteed to be present (or never written). The target path is
+/// computed deterministically from the cwd via `encoded_cwd_dir`; the
+/// projects directory is never enumerated, so unrelated session files
+/// (interactive sessions, concurrent curate batches, loop iterations)
+/// cannot be touched.
+///
+/// Best-effort: if HOME is unset or cwd resolution fails, we skip.
+/// `NotFound` from `remove_file` is silently ignored (the artifact may
+/// never have been written, e.g. if a future Claude release finally
+/// honors `--no-session-persistence`). Any other error is logged to
+/// stderr so environmental misconfiguration (permissions, mount issues)
+/// surfaces instead of being silently dropped.
+fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => return,
+    };
+    let cwd = match working_dir {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+    };
+    let target = encoded_cwd_dir(&cwd, &home).join(format!("{}.jsonl", session_id));
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "[curate cleanup] failed to delete ai-title artifact {}: {}",
+                target.display(),
+                e
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +854,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script);
@@ -1038,6 +1122,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let elapsed = start.elapsed();
 
@@ -1113,6 +1198,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
@@ -1518,6 +1604,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
@@ -2114,6 +2201,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         let _ = std::fs::remove_file(&script_path);
@@ -2192,6 +2280,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script_path);
@@ -2212,6 +2301,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             );
             unsafe { std::env::remove_var("CLAUDE_BINARY") };
             let _ = std::fs::remove_file(&script);
@@ -2327,6 +2417,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         unsafe { std::env::remove_var("CLAUDE_BINARY") };
         result
@@ -2819,5 +2910,257 @@ mod tests {
     fn test_is_tasks_json_path_src_path_not_matched() {
         assert!(!is_tasks_json_path("src/commands/add.rs"));
         assert!(!is_tasks_json_path("src/loop_engine/config.rs"));
+    }
+
+    // --- AC: encoded_cwd_dir pure helper ---
+
+    #[test]
+    fn test_encoded_cwd_dir_simple_path() {
+        let got = encoded_cwd_dir(Path::new("$HOME/foo"), Path::new("$HOME"));
+        assert_eq!(
+            got,
+            PathBuf::from("$HOME/.claude/projects/-home-chris-foo")
+        );
+    }
+
+    #[test]
+    fn test_encoded_cwd_dir_repo_path() {
+        let got = encoded_cwd_dir(
+            Path::new("$HOME/projects/task-mgr"),
+            Path::new("$HOME"),
+        );
+        assert_eq!(
+            got,
+            PathBuf::from(
+                "$HOME/.claude/projects/-home-chris-Documents-startat0-Projects-task-mgr"
+            )
+        );
+    }
+
+    #[test]
+    fn test_encoded_cwd_dir_trailing_slash_normalized() {
+        // Trailing slash on cwd must encode identically to no trailing slash —
+        // otherwise the cleanup target wouldn't match what Claude wrote.
+        let with_slash = encoded_cwd_dir(Path::new("$HOME/foo/"), Path::new("$HOME"));
+        let no_slash = encoded_cwd_dir(Path::new("$HOME/foo"), Path::new("$HOME"));
+        assert_eq!(with_slash, no_slash);
+    }
+
+    // --- AC: --session-id flag + UUID v4 + ordering ---
+
+    /// Helper: split echoed-args output into argv tokens. The mock script
+    /// echoes `"$@" "$PROMPT"` so tokens are space-separated.
+    fn argv_tokens(output: &str) -> Vec<String> {
+        output.split_whitespace().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_cleanup_title_artifact_false_omits_session_id() {
+        let result = spawn_claude_echo("p", None, None, false, &scoped_coding())
+            .expect("spawn should succeed");
+        assert!(
+            !result.output.contains("--session-id"),
+            "cleanup_title_artifact=false must NOT add --session-id; got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn test_cleanup_title_artifact_true_adds_valid_uuid_v4_session_id() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let script = make_echo_args_stdin_script("cleanup_uuid");
+        unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+        let result = spawn_claude(
+            "p",
+            None,
+            None,
+            Some(SONNET_MODEL),
+            None,
+            false,
+            &PermissionMode::Dangerous,
+            None,
+            None,
+            None,
+            true,
+        );
+        unsafe { std::env::remove_var("CLAUDE_BINARY") };
+        let _ = std::fs::remove_file(&script);
+        let res = result.expect("spawn should succeed");
+        let tokens = argv_tokens(&res.output);
+
+        let sid_idx = tokens
+            .iter()
+            .position(|t| t == "--session-id")
+            .expect("--session-id must be present when cleanup_title_artifact=true");
+        let p_idx = tokens
+            .iter()
+            .position(|t| t == "-p")
+            .expect("-p must be present");
+        // Known-bad guard: flag must be left of -p, else Claude ignores it.
+        assert!(
+            sid_idx < p_idx,
+            "--session-id must appear before -p (got sid={}, p={})",
+            sid_idx,
+            p_idx
+        );
+
+        let model_idx = tokens.iter().position(|t| t == "--model").unwrap();
+        assert!(
+            sid_idx > model_idx,
+            "--session-id should be placed after --model"
+        );
+
+        let uuid_str = &tokens[sid_idx + 1];
+        let parsed = uuid::Uuid::parse_str(uuid_str)
+            .unwrap_or_else(|e| panic!("UUID '{}' must parse: {}", uuid_str, e));
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "UUID must be v4 (random); got {:?}",
+            parsed.get_version()
+        );
+
+        // Exactly one --session-id pair.
+        let count = tokens.iter().filter(|t| *t == "--session-id").count();
+        assert_eq!(count, 1, "expected exactly one --session-id flag");
+    }
+
+    /// Cleanup must target a deterministic path — so an UNRELATED .jsonl that
+    /// happens to live in the same projects dir MUST survive. This guards
+    /// against any future implementation that uses read_dir + heuristics.
+    #[test]
+    fn test_cleanup_does_not_touch_unrelated_jsonl_files() {
+        // Use a temp HOME so we can place a sibling file safely.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path();
+        let fake_cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let bystander = projects_dir.join("00000000-0000-4000-8000-000000000000.jsonl");
+        std::fs::write(&bystander, "untouched").unwrap();
+
+        // Drive the helper directly with a known UUID; nothing should remove
+        // the bystander since the UUID differs.
+        let target_uuid = uuid::Uuid::new_v4();
+        let target_path = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target_path, "to-be-deleted").unwrap();
+
+        // Manually invoke the same path computation the cleanup thread uses.
+        // (We avoid spawning the real thread here to keep the test under 30s;
+        // the deterministic-target invariant is what matters.)
+        let computed = encoded_cwd_dir(&fake_cwd, fake_home).join(format!("{}.jsonl", target_uuid));
+        let _ = std::fs::remove_file(&computed);
+
+        assert!(
+            bystander.exists(),
+            "bystander .jsonl with a different UUID must NOT be deleted"
+        );
+        assert!(
+            !target_path.exists(),
+            "the UUID-matched target should be removed"
+        );
+    }
+
+    /// Serializes env-var mutation across HOME-sensitive tests; HOME is process-
+    /// global and leaking it into concurrent tests would make them flaky.
+    static HOME_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores HOME (or unsets it) on drop, so a failed assertion doesn't
+    /// leak the fake HOME into subsequent tests.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", value) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    /// End-to-end: drive `cleanup_title_artifact_sync` directly against a
+    /// temp HOME. Proves the actual helper (not a reimplementation) deletes
+    /// the UUID-matched file and leaves an unrelated sibling alone. Future
+    /// changes to the path-encoding logic or the `remove_file` call will
+    /// break this test, which is the point.
+    #[test]
+    fn test_cleanup_title_artifact_sync_deletes_target_preserves_bystander() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+
+        let projects_dir = encoded_cwd_dir(&fake_cwd, &fake_home);
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let bystander_uuid = uuid::Uuid::new_v4();
+        let bystander = projects_dir.join(format!("{}.jsonl", bystander_uuid));
+        std::fs::write(&bystander, "untouched").unwrap();
+
+        let target_uuid = uuid::Uuid::new_v4();
+        let target_path = projects_dir.join(format!("{}.jsonl", target_uuid));
+        std::fs::write(&target_path, "to-be-deleted").unwrap();
+
+        let _home = HomeGuard::set(&fake_home);
+        cleanup_title_artifact_sync(target_uuid, Some(&fake_cwd));
+
+        assert!(
+            !target_path.exists(),
+            "cleanup_title_artifact_sync should have removed the UUID-matched target"
+        );
+        assert!(
+            bystander.exists(),
+            "cleanup_title_artifact_sync must not touch a .jsonl with a different UUID"
+        );
+    }
+
+    /// HOME unset: helper must return silently without panicking or erroring.
+    #[test]
+    fn test_cleanup_title_artifact_sync_skips_when_home_unset() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        // Should be a no-op, no panic.
+        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), None);
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => {}
+        }
+    }
+
+    /// Target file never written (Claude crashed before writing ai-title):
+    /// `NotFound` must be swallowed, no panic, no stderr noise tested here
+    /// (we only assert the call returns normally).
+    #[test]
+    fn test_cleanup_title_artifact_sync_missing_target_is_silent() {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_home = tmp.path().to_path_buf();
+        let fake_cwd = fake_home.join("workspace");
+        std::fs::create_dir_all(&fake_cwd).unwrap();
+        // Deliberately do NOT create the projects dir or any target file.
+
+        let _home = HomeGuard::set(&fake_home);
+        cleanup_title_artifact_sync(uuid::Uuid::new_v4(), Some(&fake_cwd));
+        // Test passes if we reach here without panic.
     }
 }

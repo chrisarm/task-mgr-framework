@@ -1267,6 +1267,19 @@
       "timeoutSecs": 1800,
       "title": "Milestone Final: Ready for merge",
       "touchesFiles": []
+    },
+    {
+      "description": "Empirical verification of REVIEW-001 showed that the detached cleanup thread dies when the parent task-mgr process exits. For `task-mgr curate dedup`, batches spawned in the final 30s of execution leave orphan jsonl files behind because the 30s timer never fires before the process terminates. Observed: 2 of 5 argv-logged sessions left surviving ai-title files after dedup completed, even 1+ minute later. Fix options (pick one): (a) Track pending cleanup handles and .join() them at the end of curate_dedup/curate_enrich; (b) Replace the 30s delay with a synchronous post-wait cleanup in spawn_claude (1-2s sleep inline after child.wait()); (c) Register an atexit-like mechanism. Option (a) preserves non-blocking semantics while guaranteeing cleanup; option (b) is simplest. Acceptance: rerun the REVIEW-001 empirical test — 0 orphan files remain after dedup returns (or within a short bounded window after).",
+      "estimatedEffort": "medium",
+      "id": "293c4fde-FIX-001",
+      "passes": false,
+      "priority": 90,
+      "title": "Cleanup thread dies when task-mgr exits — flush pending cleanups before return",
+      "touchesFiles": [
+        "src/loop_engine/claude.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/enrich.rs"
+      ]
     }
   ],
   "version": "1.0"
