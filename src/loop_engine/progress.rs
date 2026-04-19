@@ -278,16 +278,15 @@ fn try_haiku_summary(
     let prompt = build_haiku_summary_prompt(milestone_task_id, raw_entries);
     let result = match crate::loop_engine::claude::spawn_claude(
         &prompt,
-        None,
-        None,
-        Some(HAIKU_MODEL),
-        None,
-        false,
         &PermissionMode::text_only(),
-        None,
-        None,
-        db_dir,
-        false,
+        crate::loop_engine::claude::SpawnOpts {
+            model: Some(HAIKU_MODEL),
+            db_dir,
+            // Text-only metadata pass — same leak profile as curate; clean up
+            // the ai-title jsonl after the child exits.
+            cleanup_title_artifact: true,
+            ..Default::default()
+        },
     ) {
         Ok(r) => r,
         Err(e) => {

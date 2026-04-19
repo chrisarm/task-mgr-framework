@@ -527,16 +527,18 @@ pub fn run_iteration(
     );
     let claude_result = claude::spawn_claude(
         &prompt_result.prompt,
-        Some(params.signal_flag),
-        Some(params.project_root),
-        effective_model.as_deref(),
-        Some(timeout_config),
-        true,
         params.permission_mode,
-        effort,
-        Some(TASKS_JSON_DISALLOWED_TOOLS),
-        Some(params.db_dir),
-        false,
+        claude::SpawnOpts {
+            signal_flag: Some(params.signal_flag),
+            working_dir: Some(params.project_root),
+            model: effective_model.as_deref(),
+            timeout: Some(timeout_config),
+            stream_json: true,
+            effort,
+            disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
+            db_dir: Some(params.db_dir),
+            ..Default::default()
+        },
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
@@ -2697,11 +2699,18 @@ pub fn check_crash_escalation(
     if last_task_id != Some(current_task_id) {
         return None;
     }
-    // None model: assume sonnet baseline, escalate to opus
-    match resolved_model {
+    // None / empty / whitespace model: assume sonnet baseline, escalate to opus
+    match normalize_baseline(resolved_model) {
         None => Some(model::OPUS_MODEL.to_string()),
         Some(m) => model::escalate_model(Some(m)),
     }
+}
+
+/// Treat `Some("")` and `Some("   ")` as "no model known" so both escalation
+/// paths (`check_crash_escalation` and `escalate_task_model_if_needed`) share
+/// the same baseline-fallback semantics.
+fn normalize_baseline(model: Option<&str>) -> Option<&str> {
+    model.filter(|s| !s.trim().is_empty())
 }
 
 /// Returns true if a task should be auto-blocked due to consecutive failures.
@@ -2740,8 +2749,8 @@ pub fn escalate_task_model_if_needed(
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
             r.get::<_, Option<String>>(0)
         })?;
-    // None/empty model: assume sonnet baseline → escalate to opus (matches check_crash_escalation).
-    let escalated = match current_model.as_deref().filter(|s| !s.is_empty()) {
+    // None / empty / whitespace model: assume sonnet baseline → escalate to opus.
+    let escalated = match normalize_baseline(current_model.as_deref()) {
         None => Some(model::OPUS_MODEL.to_string()),
         Some(m) => model::escalate_model(Some(m)),
     };
@@ -3518,6 +3527,21 @@ mod tests {
             Some(OPUS_MODEL.to_string()),
             "None model crash must assume sonnet baseline and escalate to opus"
         );
+    }
+
+    /// Empty / whitespace-only models must be normalized to baseline so they
+    /// escalate to opus rather than silently dropping the model on the floor.
+    /// Keeps `check_crash_escalation` and `escalate_task_model_if_needed` in sync.
+    #[test]
+    fn test_crash_escalation_empty_and_whitespace_normalize_to_opus() {
+        for bad in ["", "   ", "\t", " \n "] {
+            let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(bad));
+            assert_eq!(
+                result,
+                Some(OPUS_MODEL.to_string()),
+                "bogus model {bad:?} must normalize to sonnet baseline and escalate"
+            );
+        }
     }
 
     /// Known-bad discriminator: escalation requires BOTH same task AND crash.

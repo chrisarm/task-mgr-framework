@@ -83,16 +83,14 @@ pub fn extract_learnings_from_output(
     // Spawn Claude for extraction
     let claude_result = match claude::spawn_claude(
         &prompt,
-        None,
-        None,
-        None,
-        None,
-        false,
         &PermissionMode::text_only(),
-        None,
-        None,
-        db_dir,
-        false,
+        claude::SpawnOpts {
+            db_dir,
+            // Text-only metadata pass — same leak profile as curate; clean up
+            // the ai-title jsonl after the child exits.
+            cleanup_title_artifact: true,
+            ..Default::default()
+        },
     ) {
         Ok(result) => result,
         Err(e) => {

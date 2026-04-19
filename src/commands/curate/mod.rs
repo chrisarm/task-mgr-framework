@@ -28,7 +28,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::learnings::LearningWriter;
 use crate::learnings::crud::{RecordLearningParams, get_learning_tags, record_learning};
-use crate::loop_engine::claude::spawn_claude;
+use crate::loop_engine::claude::{SpawnOpts, spawn_claude};
 use crate::loop_engine::config::PermissionMode;
 
 /// Rank confidence levels for comparison: High=2, Medium=1, Low=0.
@@ -603,16 +603,12 @@ fn process_batches_parallel(
 
                 let raw_clusters = match spawn_claude(
                     &prompt,
-                    None,
-                    None,
-                    Some(&model),
-                    None,
-                    false,
                     &PermissionMode::text_only(),
-                    None,
-                    None,
-                    None,
-                    true,
+                    SpawnOpts {
+                        model: Some(&model),
+                        cleanup_title_artifact: true,
+                        ..Default::default()
+                    },
                 ) {
                     Err(e) => {
                         eprintln!(

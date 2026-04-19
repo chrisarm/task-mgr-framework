@@ -307,16 +307,11 @@ mod tests {
         let start = Instant::now();
         let result = crate::loop_engine::claude::spawn_claude(
             "ignored",
-            None,
-            None,
-            None,
-            Some(timeout),
-            false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
-            None,
-            None,
-            None,
-            false,
+            crate::loop_engine::claude::SpawnOpts {
+                timeout: Some(timeout),
+                ..Default::default()
+            },
         );
         let elapsed = start.elapsed();
 
@@ -365,16 +360,11 @@ mod tests {
         let start = Instant::now();
         let result = crate::loop_engine::claude::spawn_claude(
             "ignored",
-            None,
-            None,
-            None,
-            Some(timeout),
-            false,
             &crate::loop_engine::config::PermissionMode::Dangerous,
-            None,
-            None,
-            None,
-            false,
+            crate::loop_engine::claude::SpawnOpts {
+                timeout: Some(timeout),
+                ..Default::default()
+            },
         );
         let elapsed = start.elapsed();
 

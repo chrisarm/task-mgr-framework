@@ -239,16 +239,12 @@ pub fn curate_enrich(conn: &Connection, params: EnrichParams) -> TaskMgrResult<E
         // style explicit model field rather than reverting to default-resolution.
         let claude_result = match claude::spawn_claude(
             &prompt,
-            None,
-            None,
-            Some(HAIKU_MODEL),
-            None,
-            false,
             &PermissionMode::text_only(),
-            None,
-            None,
-            None,
-            true,
+            claude::SpawnOpts {
+                model: Some(HAIKU_MODEL),
+                cleanup_title_artifact: true,
+                ..Default::default()
+            },
         ) {
             Ok(r) => r,
             Err(e) => {

@@ -658,16 +658,11 @@ pub(crate) fn mutate_prd_from_feedback(
     let effective_model = model.unwrap_or(SONNET_MODEL);
     let result = match claude::spawn_claude(
         &prompt,
-        None,
-        None,
-        Some(effective_model),
-        None,
-        false,
         permission_mode,
-        None,
-        None,
-        None,
-        false,
+        claude::SpawnOpts {
+            model: Some(effective_model),
+            ..Default::default()
+        },
     ) {
         Ok(r) => r,
         Err(e) => {
