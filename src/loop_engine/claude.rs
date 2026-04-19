@@ -171,20 +171,15 @@ pub(crate) fn spawn_claude(
         args.push("--effort".to_string());
         args.push(e.to_string());
     }
-    // Workaround for Claude Code 2.1.110: even with --no-session-persistence,
-    // the CLI writes a 130-byte ai-title metadata file to
-    // ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl on every spawn.
-    // When opted-in, we force a known UUID so a deferred cleanup thread can
-    // delete that exact file (no enumeration / no collateral damage).
-    // Flag MUST appear before -p (Claude only parses flags left of the prompt).
-    let cleanup_session_id: Option<Uuid> = if cleanup_title_artifact {
+    // Claude Code 2.1.110 writes an ai-title jsonl despite --no-session-persistence;
+    // forcing a known UUID lets a deferred thread delete that exact file.
+    // Must stay before -p — Claude only parses flags left of the prompt.
+    let cleanup_session_id: Option<Uuid> = cleanup_title_artifact.then(|| {
         let id = Uuid::new_v4();
         args.push("--session-id".to_string());
         args.push(id.to_string());
-        Some(id)
-    } else {
-        None
-    };
+        id
+    });
     args.push("-p".to_string());
     // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
     // limits when prompts are large (e.g. curate dedup with many learnings).
@@ -244,9 +239,6 @@ pub(crate) fn spawn_claude(
         }
     })?;
 
-    // Schedule the deferred cleanup of the orphan ai-title metadata file.
-    // Best-effort: if HOME or cwd resolution fails, we silently skip — the
-    // spawn itself must not fail because cleanup could not be scheduled.
     if let Some(uuid) = cleanup_session_id {
         schedule_title_artifact_cleanup(uuid, working_dir);
     }
