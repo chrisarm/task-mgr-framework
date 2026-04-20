@@ -800,14 +800,26 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 
             let mut batches: Vec<Vec<DeduplicateLearningItem>> = Vec::new();
 
-            // Each embedding cluster → one LLM batch.
+            // Each embedding cluster → one or more LLM batches.
+            // Large clusters (from transitive chaining) are split to avoid
+            // exceeding the LLM context window.
+            let max_cluster_batch = params.batch_size.unwrap_or(7).max(2);
             for cluster_ids in clusters {
                 let batch: Vec<DeduplicateLearningItem> = cluster_ids
                     .iter()
                     .filter_map(|id| item_map.get(id).cloned())
                     .collect();
-                if batch.len() >= 2 {
+                if batch.len() < 2 {
+                    continue;
+                }
+                if batch.len() <= max_cluster_batch {
                     batches.push(batch);
+                } else {
+                    for chunk in batch.chunks(max_cluster_batch) {
+                        if chunk.len() >= 2 {
+                            batches.push(chunk.to_vec());
+                        }
+                    }
                 }
             }
 
