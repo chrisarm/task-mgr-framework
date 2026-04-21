@@ -66,7 +66,7 @@ pub enum PrefixMode {
 /// Apply a prefix to a single task ID.
 ///
 /// Idempotent: if the ID already starts with `{prefix}-`, returns it unchanged.
-fn prefix_id(prefix: &str, id: &str) -> String {
+pub(crate) fn prefix_id(prefix: &str, id: &str) -> String {
     let with_dash = format!("{}-", prefix);
     if id.starts_with(&with_dash) {
         id.to_string()

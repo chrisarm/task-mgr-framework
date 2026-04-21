@@ -95,6 +95,15 @@ impl AddTaskInput {
         }
     }
 
+    fn apply_prefix(&mut self, prefix: &str) {
+        let pfx = super::init::prefix_id;
+        self.id = pfx(prefix, &self.id);
+        self.depends_on = self.depends_on.iter().map(|d| pfx(prefix, d)).collect();
+        self.synergy_with = self.synergy_with.iter().map(|s| pfx(prefix, s)).collect();
+        self.batch_with = self.batch_with.iter().map(|b| pfx(prefix, b)).collect();
+        self.conflicts_with = self.conflicts_with.iter().map(|c| pfx(prefix, c)).collect();
+    }
+
     fn into_prd_user_story(self, priority: i32) -> PrdUserStory {
         PrdUserStory {
             id: self.id,
@@ -193,7 +202,7 @@ pub fn add(
 /// with in-memory DBs).
 pub fn add_with_conn(
     conn: &Connection,
-    input: AddTaskInput,
+    mut input: AddTaskInput,
     priority_override: Option<i32>,
     depended_on_by: &[String],
 ) -> TaskMgrResult<AddResult> {
@@ -216,6 +225,29 @@ pub fn add_with_conn(
         ));
     }
 
+    // Auto-prefix: when exactly one active PRD prefix exists, prepend it to the
+    // task ID and all cross-references. Idempotent — already-prefixed IDs are
+    // left unchanged.
+    let resolved_prefix = resolve_active_prefix(conn);
+    let prefixed_depended_on_by: Vec<String>;
+    let effective_depended_on_by: &[String] = if let Some(ref prefix) = resolved_prefix {
+        let original_id = input.id.clone();
+        input.apply_prefix(prefix);
+        if input.id != original_id {
+            eprintln!(
+                "Note: auto-prefixed task ID as {} (active prefix: {})",
+                input.id, prefix,
+            );
+        }
+        prefixed_depended_on_by = depended_on_by
+            .iter()
+            .map(|id| super::init::prefix_id(prefix, id))
+            .collect();
+        &prefixed_depended_on_by
+    } else {
+        depended_on_by
+    };
+
     // Pre-flight: reject duplicate IDs before any writes. Propagate DB errors
     // rather than swallowing them — an unexpected schema/I/O error must not
     // be reinterpreted as "no conflict" and fall through to insert_task.
@@ -236,7 +268,7 @@ pub fn add_with_conn(
     // Pre-flight: every --depended-on-by id must exist. Fail BEFORE any write
     // so a typo can't leave the DB with a new task whose reverse links are
     // missing.
-    for existing_id in depended_on_by {
+    for existing_id in effective_depended_on_by {
         let found: i64 = conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE id = ?",
             [existing_id],
@@ -267,7 +299,7 @@ pub fn add_with_conn(
     }
     // Reverse links: each `existing_id` now dependsOn the NEW task.
     // Argument order: (task_id=<existing>, related_id=<new>, rel_type="dependsOn").
-    for existing_id in depended_on_by {
+    for existing_id in effective_depended_on_by {
         insert_relationship(&tx, existing_id, &story.id, "dependsOn")?;
     }
     tx.commit()?;
@@ -276,7 +308,7 @@ pub fn add_with_conn(
     // the DB — the task is already in the database, and `task-mgr export`
     // can reconcile the JSON later.
     let prd_path = match locate_prd_json(conn, task_prefix.as_deref()) {
-        Ok(Some(path)) => match append_task_to_prd_json(&path, &story, depended_on_by) {
+        Ok(Some(path)) => match append_task_to_prd_json(&path, &story, effective_depended_on_by) {
             Ok(()) => Some(path),
             Err(e) => {
                 eprintln!(
@@ -339,14 +371,58 @@ fn resolve_priority(
     }
 }
 
+/// Query `prd_metadata` for the active effort prefix.
+///
+/// Returns `Some(prefix)` when exactly one non-NULL `task_prefix` exists.
+/// Returns `None` when zero or multiple prefixes exist (ambiguous).
+fn resolve_active_prefix(conn: &Connection) -> Option<String> {
+    let mut stmt = conn
+        .prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")
+        .ok()?;
+    let prefixes: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    if prefixes.len() == 1 {
+        Some(prefixes.into_iter().next().unwrap())
+    } else {
+        None
+    }
+}
+
 /// Look up the PRD JSON file path for the currently-active PRD.
+///
+/// When `task_prefix` is provided, finds the PRD JSON via `prd_metadata`.
+/// Falls back to the first registered `task_list` file when prefix is `None`
+/// or the prefix-scoped query finds nothing.
 ///
 /// Returns `Ok(None)` when no `task_list` file is registered (valid state:
 /// e.g. the DB was populated programmatically without a source JSON).
 fn locate_prd_json(
     conn: &Connection,
-    _task_prefix: Option<&str>,
+    task_prefix: Option<&str>,
 ) -> TaskMgrResult<Option<PathBuf>> {
+    if let Some(prefix) = task_prefix {
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT pf.file_path FROM prd_files pf \
+                 JOIN prd_metadata pm ON pf.prd_id = pm.id \
+                 WHERE pf.file_type = 'task_list' AND pm.task_prefix = ? \
+                 LIMIT 1",
+                [prefix],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if let Some(path) = result {
+            return Ok(Some(PathBuf::from(path)));
+        }
+    }
+    // Fallback: first registered task_list regardless of prefix.
     let mut stmt =
         conn.prepare("SELECT file_path FROM prd_files WHERE file_type = 'task_list' LIMIT 1")?;
     let path: Option<String> =
