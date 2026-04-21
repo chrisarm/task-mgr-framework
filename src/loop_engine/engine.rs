@@ -545,7 +545,16 @@ pub fn run_iteration(
             effort,
             disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
             db_dir: Some(params.db_dir),
-            use_pty: true,
+            // PTY disabled: when Claude sees isatty(1)==true it switches to
+            // "interactive" handling of rate limits (internal wait + retry)
+            // instead of failing fast with an error. That breaks task-mgr's
+            // own probe_rate_limit_lifted wait loop because Claude never
+            // exits; the watchdog eventually SIGKILLs it ~30 min later and
+            // we lose the whole iteration. Live streaming would be nice but
+            // not at the cost of rate-limit handling — revisit later with
+            // a mechanism that keeps Claude in non-interactive mode while
+            // still getting per-line flushing.
+            use_pty: false,
             target_task_id: Some(&task_id),
             ..Default::default()
         },
