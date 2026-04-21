@@ -2648,6 +2648,37 @@ pub fn apply_status_updates(
         let task_ids = [update.task_id.clone()];
         let dispatch: Result<(), TaskMgrError> = match update.status {
             TaskStatusChange::Done => {
+                // Auto-claim unclaimed tasks: todo -> in_progress -> done
+                let current: Result<String, _> = conn.query_row(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    [update.task_id.as_str()],
+                    |row| row.get(0),
+                );
+                if let Ok(ref s) = current
+                    && s == "todo"
+                {
+                    let _ = conn.execute(
+                        "UPDATE tasks SET status = 'in_progress', \
+                         started_at = datetime('now'), \
+                         updated_at = datetime('now') \
+                         WHERE id = ? AND status = 'todo'",
+                        [update.task_id.as_str()],
+                    );
+                    if let Some(rid) = run_id {
+                        let iter: i64 = conn
+                            .query_row(
+                                "SELECT COALESCE(MAX(iteration), 0) + 1 FROM run_tasks WHERE run_id = ?",
+                                [rid],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(1);
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO run_tasks (run_id, task_id, iteration, status) \
+                             VALUES (?, ?, ?, 'started')",
+                            rusqlite::params![rid, update.task_id, iter],
+                        );
+                    }
+                }
                 complete_cmd::complete(conn, &task_ids, run_id, None, false).map(|_| ())
             }
             TaskStatusChange::Failed => crate::commands::fail(
@@ -4644,10 +4675,9 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_status_update_logs_warning_when_task_not_claimed() {
-        // Seeds task as todo (NOT claimed). Dispatching Done via complete()
-        // must fail the state-machine check per learning [1475]: the engine
-        // logs and skips instead of auto-claiming.
+    fn test_apply_status_update_todo_task_auto_claimed_and_completed() {
+        // Seeds task as todo (NOT claimed). Dispatching Done should auto-claim
+        // (todo -> in_progress) then complete (in_progress -> done).
         let (temp_dir, mut conn) = setup_test_db();
         seed_task_with_status(&conn, "FEAT-002", "todo");
         let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-002"]);
@@ -4658,24 +4688,58 @@ mod tests {
         }];
         let applied =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(
-            applied, 0,
-            "unclaimed todo task must not transition on <task-status>:done",
-        );
+        assert_eq!(applied, 1, "todo task must be auto-claimed then completed");
 
-        let status: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 'FEAT-002'", [], |r| {
-                r.get(0)
-            })
+        let (status, started_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, started_at FROM tasks WHERE id = 'FEAT-002'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(status, "todo", "DB status must be unchanged");
-
-        // PRD JSON must be untouched too — no silent auto-pass.
-        let prd_text = std::fs::read_to_string(&prd_path).unwrap();
+        assert_eq!(status, "done");
         assert!(
-            prd_text.contains("\"passes\": false"),
-            "PRD JSON passes must remain false on failed dispatch",
+            started_at.is_some(),
+            "started_at must be set by auto-claim",
         );
+    }
+
+    #[test]
+    fn test_apply_status_update_todo_auto_claim_writes_run_tasks() {
+        let (temp_dir, mut conn) = setup_test_db();
+        seed_task_with_status(&conn, "FEAT-010", "todo");
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-010"]);
+
+        // Create a run so run_tasks linkage can be written.
+        conn.execute(
+            "INSERT INTO runs (run_id, status) VALUES ('run-1', 'active')",
+            [],
+        )
+        .unwrap();
+
+        let updates = vec![detection::TaskStatusUpdate {
+            task_id: "FEAT-010".to_string(),
+            status: detection::TaskStatusChange::Done,
+        }];
+        let applied = apply_status_updates(
+            &mut conn,
+            &updates,
+            Some("run-1"),
+            Some(&prd_path),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(applied, 1);
+
+        let linked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_tasks WHERE run_id = 'run-1' AND task_id = 'FEAT-010'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 1, "auto-claim must link task to run");
     }
 
     #[test]
@@ -4859,17 +4923,16 @@ mod tests {
 
     #[test]
     fn test_apply_status_update_continues_past_failed_dispatch() {
-        // Two updates: the first targets a todo task (dispatch fails), the
-        // second targets an in_progress task (dispatch succeeds). The engine
+        // Two updates: the first targets a nonexistent task (dispatch fails),
+        // the second targets an in_progress task (dispatch succeeds). The engine
         // must log + continue, not abort on the first failure.
         let (temp_dir, mut conn) = setup_test_db();
-        seed_task_with_status(&conn, "FEAT-A", "todo");
         seed_task_with_status(&conn, "FEAT-B", "in_progress");
-        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-A", "FEAT-B"]);
+        let prd_path = write_minimal_prd(temp_dir.path(), &["FEAT-B"]);
 
         let updates = vec![
             detection::TaskStatusUpdate {
-                task_id: "FEAT-A".to_string(),
+                task_id: "NONEXISTENT-999".to_string(),
                 status: detection::TaskStatusChange::Done,
             },
             detection::TaskStatusUpdate {
