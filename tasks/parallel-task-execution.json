@@ -1,0 +1,855 @@
+{
+  "branchName": "feat/parallel-task-execution",
+  "description": "Replace synergyWith/batchWith/conflictsWith relationships with runtime file-overlap detection from touchesFiles. Add parallel task execution where non-conflicting tasks run simultaneously in separate git worktrees using a wave-based model (max 3 slots).",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output",
+      "Rust: All tests pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required",
+      "--parallel 1 (default) produces identical behavior to current sequential execution",
+      "Old PRD JSON with synergyWith/batchWith/conflictsWith parses without error"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at milestones — milestones must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Two tasks with overlapping touchesFiles in the same parallel group",
+    "Sharing IterationContext across threads — each slot gets its own minimal state",
+    "Using git worktree add on a branch already checked out — git forbids this"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Test: select_parallel_group with 2 tasks sharing a file returns group of 1",
+        "Test: select_parallel_group with 2 disjoint-file tasks returns group of 2",
+        "Test: task with empty touchesFiles can always parallelize",
+        "Test: group size respects max_slots parameter",
+        "Test: group is ordered by score (highest first)",
+        "Test: single eligible task returns group of 1",
+        "Test: all eligible tasks sharing one file → sequential, group of 1",
+        "Known-bad discriminator: test that returns group>1 only when files are truly disjoint (would fail if conflict check skipped)",
+        "Test file compiles (tests may be #[ignore] until FEAT tasks implement)"
+      ],
+      "dependsOn": [],
+      "description": "Write TDD tests for select_parallel_group() function and simplified 2-dimension scoring (priority_score + file_score only). Tests define the contract before implementation.",
+      "edgeCases": [
+        "All eligible tasks share the same file: parallel group degenerates to 1 task",
+        "Task has empty touchesFiles: can always parallelize — empty set has no overlap with any set",
+        "Single eligible task: returns group of 1 regardless of max_slots",
+        "max_slots=1: always returns exactly 1 task (sequential fallback)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "select_parallel_group not yet implemented",
+          "expectedBehavior": "Compilation error or #[ignore] — tests define the contract"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "No two tasks in a parallel group share any file path in touchesFiles",
+        "Group size <= max_slots",
+        "Group ordered by total_score descending",
+        "Group contains only dependency-eligible tasks (all dependsOn satisfied)"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Learning [522]: Incremental field addition to IterationResult — follow same pattern for new structs. The existing get_all_task_files() (selection.rs:358) returns HashMap<String, Vec<String>> — use this to build the inverted file index for conflict detection.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "File conflict detection must be conservative: any shared file = conflict",
+        "Tasks with empty touchesFiles have no conflicts (empty set overlap is empty)",
+        "Group selection is greedy by score order — highest priority first",
+        "No additional DB queries beyond what select_next_task already does"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for parallel group selection and simplified scoring",
+      "touchesFiles": [
+        "src/commands/next/tests.rs",
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: ensure_slot_worktrees creates N worktrees on ephemeral branches",
+        "Test: slot 0 reuses existing branch worktree",
+        "Test: slots 1-2 get worktrees at {repo}-worktrees/{branch}-slot-{N}/",
+        "Test: ephemeral branches named {branch}-slot-{N}",
+        "Test: merge_slot_branches merges disjoint changes back to main branch",
+        "Test: cleanup removes slot worktrees and ephemeral branches",
+        "Test: git worktree add on same branch fails — ephemeral branches required",
+        "Test file compiles (tests may be #[ignore] until FEAT tasks implement)"
+      ],
+      "dependsOn": [],
+      "description": "Write TDD tests for per-slot worktree management with ephemeral branches. Tests verify that git's branch exclusivity constraint is respected.",
+      "edgeCases": [
+        "git worktree add on already-checked-out branch: must use ephemeral branch, not same branch",
+        "Merge with disjoint file changes: should always succeed (no conflicts)",
+        "Cleanup when worktree doesn't exist: should not error"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "git worktree add refuses same branch",
+          "expectedBehavior": "Uses ephemeral branch {branch}-slot-{N} instead"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Each slot worktree is on a unique branch",
+        "Slot 0 is always the main branch worktree",
+        "After merge_slot_branches, main branch contains all slots' commits"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Learning [791]: Integration test pattern for worktree chaining — setup_git_repo_with_file for temp repo. Learning [1329]: git merge --no-commit --no-ff safely tests merges. CRITICAL: git worktrees cannot share a branch — this is the core constraint these tests verify.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Tests must use real git repos (tempdir), not mocks",
+        "Verify git's branch exclusivity constraint is handled correctly",
+        "Merge tests must use disjoint files to prove conflict-free merge"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for per-slot worktree management",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Remove SYNERGY_BONUS and CONFLICT_PENALTY constants (or set to 0)",
+        "Remove synergy_score, conflict_score, synergy_from, conflict_from from ScoreBreakdown",
+        "Remove batch_with from ScoredTask",
+        "Remove batch_tasks from SelectionResult",
+        "Delete get_eligible_batch_tasks() function",
+        "Remove get_relationships_by_type calls for synergyWith, conflictsWith, batchWith (keep dependsOn)",
+        "Scoring formula is now: total = priority_score + file_score",
+        "Update selection_reason format string",
+        "All existing selection tests updated and passing"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Remove synergy/batch/conflict relationship scoring from the task selection algorithm. Simplify to 2-dimension scoring: priority + file overlap.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "modifiesBehavior": true,
+      "notes": "selection.rs lines 121-124: remove 3 get_relationships_by_type calls. Lines 175-191: remove synergy/conflict scoring. Lines 233-247: remove batch_with handling. Lines 387-431: delete get_eligible_batch_tasks(). Learning [273]: Decompose long functions into per-dimension helpers.",
+      "passes": false,
+      "priority": 5,
+      "qualityDimensions": [
+        "Scoring formula simplified to total = priority_score + file_score",
+        "dependsOn relationship handling unchanged",
+        "No regression in task ordering for PRDs without synergy/batch/conflict"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Simplify selection scoring to priority + file overlap only",
+      "touchesFiles": [
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New function: select_parallel_group(conn, after_files, recently_completed, task_prefix, max_slots) -> TaskMgrResult<Vec<ScoredTask>>",
+        "Builds inverted file index from get_all_task_files() result",
+        "Greedy selection: iterate candidates by score, add if no file overlap with already-selected tasks",
+        "Tasks with empty touchesFiles always included (no file conflicts possible)",
+        "Returns up to max_slots tasks",
+        "Group ordered by total_score descending",
+        "All TEST-INIT-001 tests pass"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add select_parallel_group() to selection.rs that selects up to N non-conflicting tasks by building an inverted file index and greedily selecting tasks in score order.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "get_all_task_files() (selection.rs:358) already returns HashMap<String, Vec<String>>. Build inverted index: HashMap<&str, HashSet<usize>> mapping file_path → indices of already-selected tasks. O(tasks * avg_files) complexity, sub-10ms for 200 tasks. Data contract: get_all_task_files returns task_id→Vec<file_path>; invert to file_path→Set<selected_indices>.",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "File conflict detection must be conservative: any shared file = conflict",
+        "Sub-10ms for 200 tasks — in-memory, no additional SQL",
+        "Empty touchesFiles = no conflicts",
+        "Reuses existing scoring/filtering internals, not duplicated"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add select_parallel_group() function",
+      "touchesFiles": [
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Remove batch_with from NextTaskOutput",
+        "Remove synergy, synergy_from, conflict, conflict_from from ScoreOutput",
+        "Remove batch_tasks from NextResult",
+        "Update from_selection_result() mapping to match simplified ScoreBreakdown",
+        "JSON output backward-compatible (removed fields simply absent)",
+        "All existing output tests pass"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Update next command output structs to match simplified scoring. Remove deprecated relationship-based fields from JSON output.",
+      "estimatedEffort": "low",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "output.rs lines 51-86: NextTaskOutput — remove batch_with. Lines 90-109: ScoreOutput — remove synergy, conflict, synergy_from, conflict_from. Lines 14-32: NextResult — remove batch_tasks. Learning [522]: Incremental field addition pattern — same in reverse for removal.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "JSON output removes only deprecated fields",
+        "No regression for consumers that ignore unknown fields"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Update next command output structs for simplified scoring",
+      "touchesFiles": [
+        "src/commands/next/output.rs",
+        "src/commands/next/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "In insert_task_relationships(): skip loops for synergy_with, batch_with, conflicts_with",
+        "Log one-time deprecation warning when deprecated fields are non-empty",
+        "dependsOn continues inserting normally",
+        "Keep synergy_with, batch_with, conflicts_with fields on PrdUserStory with #[serde(default)]",
+        "Old PRD JSON with all 4 relationship types: dependsOn imported, others silently ignored",
+        "In AddTaskInput: skip deprecated relationship insertion",
+        "AddTaskInput.apply_prefix() still processes deprecated fields for backward compat parsing"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Stop inserting deprecated relationships during PRD import and task addition. Keep serde fields for backward-compat JSON parsing.",
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "import.rs:370-393: insert_task_relationships() has 4 loops (depends_on, synergy_with, batch_with, conflicts_with) — remove the last 3. add.rs:98-105: apply_prefix() processes all relationship fields — keep for serde compat. parse.rs:36-42: PrdUserStory fields — keep with #[serde(default)].",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "Backward compat: old JSON parses without error",
+        "Only dependsOn relationships inserted to DB",
+        "Deprecation warning logged at most once per import"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Stop importing deprecated relationships",
+      "touchesFiles": [
+        "src/commands/init/import.rs",
+        "src/commands/init/parse.rs",
+        "src/commands/add.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "build_synergy_section() returns String::new() always",
+        "resolve_synergy_cluster() returns (primary_model, primary_difficulty) directly without querying partners",
+        "Function signatures unchanged (minimize blast radius on callers)",
+        "Remove SelectionWeights.synergy and .conflict fields (or set to 0)",
+        "Remove synergy_count and conflict_count from TaskOutcome",
+        "compute_calibrated_weights only computes file_overlap correlation",
+        "load_task_outcomes query simplified (no synergy/conflict counting)",
+        "Remove synergy_with, batch_with, conflicts_with from ExportedUserStory",
+        "Simplify RelationshipMaps type to single HashMap (dependsOn only)",
+        "load_all_relationships() only populates dependsOn map",
+        "Remove synergy_with, batch_with, conflicts_with from ShowResult",
+        "Remove their match arms and output sections in format_text()"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Gut synergy prompt section to no-ops, remove deprecated relationship scoring from calibration, remove deprecated fields from export and show commands.",
+      "estimatedEffort": "high",
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "synergy.rs: build_synergy_section (line 14) and resolve_synergy_cluster (line 82) — gut implementations, keep signatures. calibrate.rs: SelectionWeights (line 29) — remove synergy/conflict. TaskOutcome (line 148) — remove synergy_count/conflict_count. compute_calibrated_weights (line 165) — simplify. export/prd.rs: ExportedUserStory (line 30) and load_all_relationships (line 333). show.rs: ShowResult (line 15). Learning [1229]: Soft-delete filter missed on secondary synergy query. Learning [1147]: Cross-task dependencies in batch can pre-satisfy later tasks.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "Synergy section callers see no behavior change (empty string returned)",
+        "Calibration only tunes file_overlap and priority_base weights",
+        "Export/show cleanly omit deprecated fields",
+        "No orphaned code paths after removal"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Gut synergy/calibrate/export/show deprecated relationship code",
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/synergy.rs",
+        "src/loop_engine/calibrate.rs",
+        "src/loop_engine/calibrate_math.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/show.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Learning-extraction path uses prefix-aware progress file glob",
+        "With prefix P1: reads progress-P1.txt",
+        "Without prefix: reads progress.txt",
+        "Does NOT glob all progress-*.txt indiscriminately",
+        "Other prefix progress files untouched"
+      ],
+      "dependsOn": [],
+      "description": "Fix archive.rs:256 which hard-codes progress.txt for learning extraction. Should use the prefix-aware progress file path matching the archived PRD.",
+      "estimatedEffort": "low",
+      "id": "FIX-001",
+      "modifiesBehavior": false,
+      "notes": "archive.rs:256: `let progress_path = tasks_dir.join(\"progress.txt\");`. Lines 126-131 already correctly skip all progress files from archiving — only the learning-extraction path at line 256 is wrong. Learning [565]: clear_prd_data skipped when no files on disk. Learning [516]: prd_metadata uses task_prefix for multi-PRD.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "Only extracts learnings from the archived PRD's progress file",
+        "Existing archive file-skipping logic at lines 126-131 unchanged"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Fix archive progress.txt hard-coded path bug",
+      "touchesFiles": [
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New file src/db/migrations/v18.rs with up_sql and down_sql",
+        "Up: ALTER TABLE run_tasks ADD COLUMN slot INTEGER NOT NULL DEFAULT 0",
+        "Up: UPDATE global_state SET schema_version = 18",
+        "Down: UPDATE global_state SET schema_version = 17 (SQLite can't drop columns)",
+        "src/db/migrations/mod.rs: mod v18 added, MIGRATIONS includes &v18::MIGRATION",
+        "CURRENT_SCHEMA_VERSION bumped (to 17 or 18 depending on whether v17 exists at implementation time)",
+        "Existing run_tasks rows get slot=0 (backward compat)",
+        "All existing migration tests still pass"
+      ],
+      "dependsOn": [],
+      "description": "Add slot column to run_tasks for tracking which parallel slot executed a task. v17 is expected to be taken by the recall-scores-and-supersession PRD; verify at implementation time and use next available version.",
+      "estimatedEffort": "low",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Learning [1448]: Stub migration pattern with #[ignore] tests enables TDD. Learning [15]: Comprehensive test coverage for migrations: up, down, defaults, writes. Learning [1027]: Migration tests should use >= assertions for schema version. Learning [1251]: Multiple modules may have ignored tests gated on the same migration. Check CURRENT_SCHEMA_VERSION at implementation time — if v17 doesn't exist yet, use v17 instead of v18.",
+      "passes": false,
+      "priority": 9,
+      "qualityDimensions": [
+        "Migration follows established v1-v16 file pattern",
+        "Down migration only reverts version (can't drop columns in SQLite)",
+        "Existing rows backward-compat with default 0"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Migration: add slot column to run_tasks",
+      "touchesFiles": [
+        "src/db/migrations/v18.rs",
+        "src/db/migrations/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "Error propagation uses ? or explicit error types",
+        "All new functions reachable from production code paths",
+        "SQL parameterization used everywhere",
+        "qualityDimensions from each FEAT task verified",
+        "dependsOn relationship handling confirmed unchanged",
+        "Old PRD JSON backward compat confirmed",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added via task-mgr add --stdin"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FIX-001",
+        "FEAT-006"
+      ],
+      "description": "Review all Phase 1 implementations (scoring simplification, parallel group selection, import/export/show cleanup, archive bug fix, migration) for correctness, security, and code quality.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1` — atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line progress note.",
+      "passes": false,
+      "priority": 13,
+      "qualityDimensions": [
+        "No unwrap() in production paths",
+        "SQL parameterization everywhere",
+        "New code reachable from production",
+        "Backward compat for old PRD JSON verified"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: Phase 1 — scoring simplification + cleanup",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/commands/next/output.rs",
+        "src/commands/next/mod.rs",
+        "src/commands/init/import.rs",
+        "src/commands/export/prd.rs",
+        "src/commands/show.rs",
+        "src/loop_engine/prompt_sections/synergy.rs",
+        "src/loop_engine/calibrate.rs",
+        "src/loop_engine/archive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check has no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes (full workspace, unscoped)",
+        "All FEAT and FIX tasks have passes: true",
+        "CODE-REVIEW-1 has passes: true",
+        "Any pre-existing test failures fixed in this milestone"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full quality gate: scoring simplification complete, all deprecated relationships removed from active code paths, archive bug fixed, migration ready.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Run full workspace tests. If any fail (including pre-existing), fix them. Spawn FIX tasks for non-trivial failures.",
+      "passes": false,
+      "priority": 20,
+      "qualityDimensions": [
+        "Full test suite green — no pre-existing failures left",
+        "No warnings from check, clippy, or fmt"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 1 gate: scoring simplified, relationships deprecated",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "--parallel <N> option on Loop command (default 1, valid 1-3)",
+        "--parallel <N> option on Next command (default 1)",
+        "--parallel 0 rejected with error",
+        "--parallel 4 rejected with error (max 3)",
+        "LOOP_PARALLEL env var support in LoopConfig",
+        "parallel_slots: usize field on LoopConfig (default 1)",
+        "from_env() parses LOOP_PARALLEL"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Add --parallel N CLI flag to loop and next subcommands. Extend LoopConfig with parallel_slots field and LOOP_PARALLEL env var parsing.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-007",
+      "modifiesBehavior": false,
+      "notes": "cli/commands.rs: Loop struct (line 715) — add #[arg(long, default_value_t = 1)] parallel: usize. Next struct — add same. config.rs: LoopConfig (line 14) — add parallel_slots. from_env() (line 93) — add LOOP_PARALLEL parsing. Validate: 0 rejected, 1-3 accepted, >3 rejected.",
+      "passes": false,
+      "priority": 22,
+      "qualityDimensions": [
+        "Validation: 0 rejected, 1-3 accepted, >3 rejected with clear error",
+        "Env var fallback to CLI flag to default (1)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add --parallel N CLI flag and LoopConfig extension",
+      "touchesFiles": [
+        "src/cli/commands.rs",
+        "src/loop_engine/config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "compute_slot_worktree_path returns {repo}-worktrees/{branch}-slot-{N}/",
+        "ensure_slot_worktrees: slot 0 reuses existing branch worktree",
+        "ensure_slot_worktrees: slots 1+ create worktrees on ephemeral branches {branch}-slot-{N}",
+        "Ephemeral branches forked from main branch head",
+        "merge_slot_branches merges each ephemeral branch into main via git merge --no-edit",
+        "After merge: fast-forward each slot worktree to updated main branch",
+        "cleanup_slot_worktrees removes slot worktrees and deletes ephemeral branches",
+        "All TEST-INIT-002 tests pass"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-INIT-002"
+      ],
+      "description": "Implement per-slot worktree creation with ephemeral branches, post-wave merge-back, and cleanup. Git worktrees cannot share a branch, so slots 1+ use ephemeral branches that merge back after each wave.",
+      "estimatedEffort": "high",
+      "id": "FEAT-008",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "CRITICAL: git worktree add refuses to check out a branch already checked out elsewhere. Slots 1+ must use ephemeral branches. Existing ensure_worktree (worktree.rs:103) already returns the existing worktree for slot 0. Learning [791]: Integration test pattern for worktree. Learning [1329]: git merge --no-commit --no-ff safely tests merges. Learning [311]: Worktree branch points can trail behind main.",
+      "passes": false,
+      "priority": 24,
+      "qualityDimensions": [
+        "Git's branch exclusivity constraint respected",
+        "Merge guaranteed conflict-free due to disjoint touchesFiles",
+        "Cleanup removes both worktrees and ephemeral branches",
+        "Error handling: merge failure logged and recovered, not fatal"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Per-slot worktree management with ephemeral branches",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "SlotContext struct: slot_index, working_root, task, last_activity_epoch",
+        "SlotResult struct: slot_index, iteration_result",
+        "WaveResult struct: outcomes Vec<SlotResult>, wave_duration",
+        "run_slot_iteration() does NOT take &mut IterationContext",
+        "run_slot_iteration() opens its own rusqlite::Connection via open_connection()",
+        "run_slot_iteration() creates its own last_activity_epoch for per-slot watchdog",
+        "run_slot_iteration() builds prompt, spawns Claude in slot worktree, parses output",
+        "run_slot_iteration() checks signal_flag.is_signaled()",
+        "run_parallel_wave() claims all tasks sequentially before spawning threads",
+        "run_parallel_wave() spawns std::thread::spawn per slot",
+        "run_parallel_wave() waits via JoinHandle::join() (wave model)",
+        "run_parallel_wave() handles thread panics gracefully (no unwrap on join)"
+      ],
+      "dependsOn": [
+        "FEAT-007",
+        "FEAT-008"
+      ],
+      "description": "Create the parallel wave execution engine: SlotContext, run_slot_iteration (simplified run_iteration without shared IterationContext), and run_parallel_wave (thread spawning + join).",
+      "estimatedEffort": "high",
+      "id": "FEAT-009",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "IterationContext (engine.rs:176) is NOT thread-safe — do NOT share across threads. Each slot gets its own minimal state. spawn_claude already accepts working_dir (claude.rs SpawnOpts). Each spawn_claude creates its own watchdog thread — timeouts are per-subprocess. SignalFlag is Arc<AtomicBool> — thread-safe sharing. run_loop is async fn but blocking thread::join is fine (existing path already blocks on child.wait). Learning [1601]: Update all spawn_claude callers when adding new arg. Learning [135]: Use multi-iteration sequences to test state machine transitions.",
+      "passes": false,
+      "priority": 26,
+      "qualityDimensions": [
+        "IterationContext never shared across threads",
+        "Each slot opens its own DB connection (WAL supports concurrent access)",
+        "Thread panics caught via JoinHandle::join().is_err()",
+        "Per-slot independent watchdog timeouts"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Wave-based parallel execution engine",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "When parallel_slots <= 1: existing sequential path unchanged",
+        "When parallel_slots > 1: calls select_parallel_group, creates slot worktrees, runs wave",
+        "After wave: merge slot branches, log progress for each slot, update IterationContext",
+        "CrashTracker policy: all slots crash → increment; any succeeds → reset",
+        "Progress logging happens sequentially on main thread after wave completes",
+        "log_iteration gains slot: Option<usize> parameter",
+        "One wave = one iteration toward max_iterations budget",
+        "Reorder hints from parallel slots queued for next wave"
+      ],
+      "dependsOn": [
+        "FEAT-009"
+      ],
+      "description": "Wire parallel wave execution into run_loop()'s main iteration loop. Add branching: sequential path for parallel=1, wave path for parallel>1. Add slot-aware progress logging.",
+      "estimatedEffort": "high",
+      "id": "FEAT-010",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "engine.rs: main loop at line 1713. Insert branching on config.parallel_slots. After wave: merge results from WaveResult into IterationContext (extend last_files, update crash_tracker). Progress logging (progress.rs:38): add slot parameter, log sequentially after wave (not during). Learning [1005]: 9 consecutive retries on same blocked task wastes iterations — crash policy prevents this in parallel mode too.",
+      "passes": false,
+      "priority": 28,
+      "qualityDimensions": [
+        "Sequential path (parallel=1) completely unchanged",
+        "Progress logged sequentially after wave, not during",
+        "CrashTracker: all-crash → increment, any-success → reset",
+        "Main thread handles all post-wave state merging"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Wire parallel wave into run_loop main iteration loop",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/progress.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap() in production code paths",
+        "Thread safety verified: no shared mutable state between slot threads",
+        "Git operations correctly use ephemeral branches, not same-branch worktrees",
+        "CrashTracker policy consistent across all code paths",
+        "Signal handling propagates to all slot threads via shared SignalFlag",
+        "Progress logging sequential (no concurrent file appends)",
+        "Any issues found have corresponding CODE-FIX-xxx tasks added via task-mgr add --stdin"
+      ],
+      "dependsOn": [
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009",
+        "FEAT-010"
+      ],
+      "description": "Review Phase 2 parallel execution implementation for thread safety, correctness, error handling, and git edge cases.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-2",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Critical checks: (1) IterationContext never crosses thread boundaries, (2) each slot opens its own Connection, (3) git merge uses ephemeral branches not same-branch, (4) JoinHandle panics handled, (5) progress logged sequentially post-wave.",
+      "passes": false,
+      "priority": 30,
+      "qualityDimensions": [
+        "Thread safety: no shared mutable state between slots",
+        "Git correctness: ephemeral branches, conflict-free merges",
+        "Error recovery: one slot failure doesn't block others"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: Phase 2 — parallel execution engine",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/config.rs",
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check has no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes (full workspace, unscoped)",
+        "All Phase 2 FEAT tasks have passes: true",
+        "CODE-REVIEW-2 has passes: true"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-2"
+      ],
+      "description": "Full quality gate: parallel execution engine implemented and reviewed.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Run full workspace tests. Phase 2 is the critical parallel infrastructure.",
+      "passes": false,
+      "priority": 35,
+      "qualityDimensions": [
+        "Full test suite green",
+        "No warnings from check, clippy, or fmt"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 2 gate: parallel execution engine complete",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: two non-conflicting tasks complete in one wave with --parallel 2",
+        "Test: signal during wave terminates all slots",
+        "Test: crash in one slot doesn't affect other slots",
+        "Test: --parallel 1 produces identical results to sequential execution",
+        "Test: parallel group with all-overlapping tasks degenerates to sequential",
+        "Test: git merge after wave succeeds with disjoint changes",
+        "Test: CrashTracker: all crash → increment, any success → reset",
+        "Test: progress file entries include slot numbers",
+        "80%+ coverage on new functions in engine.rs, worktree.rs, selection.rs"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Comprehensive integration tests for parallel execution: wave completion, signal handling, crash recovery, git reconciliation, progress logging.",
+      "estimatedEffort": "high",
+      "id": "TEST-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Build on TEST-INIT stubs. Remove #[ignore] attributes. Learning [135]: Use multi-iteration sequences to test state machine transitions. Learning [681]: Archive CLI tests fail in non-git temp dirs. Tests need real git repos (tempdir-based).",
+      "passes": false,
+      "priority": 38,
+      "qualityDimensions": [
+        "Tests verify content, not just 'no crash'",
+        "Real git repos (tempdir), not mocks",
+        "80%+ coverage on new code"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Comprehensive tests for parallel execution",
+      "touchesFiles": [
+        "src/commands/next/tests.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check has no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes (full workspace, unscoped)",
+        "All TEST tasks have passes: true"
+      ],
+      "dependsOn": [
+        "MILESTONE-2",
+        "TEST-001"
+      ],
+      "description": "Full quality gate after comprehensive testing phase.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-3",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "If tests reveal implementation gaps, spawn IMPL-FIX tasks.",
+      "passes": false,
+      "priority": 50,
+      "qualityDimensions": [
+        "Full test suite green",
+        "No warnings"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 3 gate: comprehensive tests pass",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated logic between run_slot_iteration and run_iteration beyond necessary fork",
+        "select_parallel_group reuses scoring internals cleanly",
+        "Worktree functions follow existing patterns in worktree.rs",
+        "All new structs have appropriate derives (Debug, Clone, Serialize where needed)",
+        "Any issues found have corresponding REFACTOR-xxx tasks added"
+      ],
+      "dependsOn": [
+        "MILESTONE-3"
+      ],
+      "description": "Full-context final review of all code + tests: DRY, complexity, coupling, clarity, pattern adherence.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Focus on code quality, not behavior.",
+      "passes": false,
+      "priority": 70,
+      "qualityDimensions": [
+        "DRY: no unnecessary duplication",
+        "Consistent patterns with existing codebase",
+        "Clean separation between sequential and parallel paths"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactoring review",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/calibrate.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Smoke test: task-mgr next --parallel 3 returns up to 3 non-conflicting tasks",
+        "Smoke test: task-mgr loop --parallel 2 runs two tasks in one wave",
+        "Smoke test: task-mgr loop (no --parallel) behaves identically to current",
+        "Smoke test: old PRD JSON with synergyWith/batchWith/conflictsWith imports without error",
+        "CLAUDE.md updated with --parallel flag, slot worktree paths, v18 migration",
+        "task-mgr loop --help shows --parallel flag",
+        "No .unwrap() in new production code (grep verified)",
+        "cargo test passes (full workspace)"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "End-to-end verification of parallel execution and relationship simplification. Update CLAUDE.md documentation.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "CLAUDE.md updates: Loop CLI Cheat Sheet (add --parallel), Worktrees section (add slot worktree paths), Database section (note v18 migration). Keep concise.",
+      "passes": false,
+      "priority": 90,
+      "qualityDimensions": [
+        "End-to-end smoke tests with real CLI",
+        "Documentation accurate and complete",
+        "No unwrap() in production code"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final verification and documentation",
+      "touchesFiles": [
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo fmt --check passes",
+        "cargo check has no warnings",
+        "cargo clippy -- -D warnings passes",
+        "cargo test passes (full workspace)",
+        "All tasks have passes: true",
+        "VERIFY-001 has passes: true",
+        "REFACTOR-REVIEW-FINAL has passes: true"
+      ],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "Final milestone: everything green, documented, and verified.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Final gate. If green, the branch is ready for merge.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full suite green",
+        "All prior tasks complete"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final gate: parallel execution verified and documented",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}
