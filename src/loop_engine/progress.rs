@@ -6,11 +6,21 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use chrono::Utc;
 
 use crate::loop_engine::config::{IterationOutcome, PermissionMode};
 use crate::loop_engine::model::HAIKU_MODEL;
+use crate::loop_engine::watchdog::TimeoutConfig;
+
+/// Hard timeout for the milestone-summary Haiku spawn. Summaries are a
+/// ~1KB text prompt; anything over 5 min means the child is stuck. We
+/// fall back to the heuristic summary on timeout, so the loop never
+/// hangs on milestone rollups.
+const MILESTONE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Log an iteration result to the progress file.
 ///
@@ -276,6 +286,14 @@ fn try_haiku_summary(
     db_dir: Option<&Path>,
 ) -> Option<String> {
     let prompt = build_haiku_summary_prompt(milestone_task_id, raw_entries);
+    // No activity extensions — this is a fixed-size summary pass, not an
+    // open-ended coding iteration.
+    let no_activity = Arc::new(AtomicU64::new(0));
+    let timeout = TimeoutConfig {
+        base_timeout: MILESTONE_SUMMARY_TIMEOUT,
+        initial_extension: Duration::from_secs(0),
+        last_activity_epoch: no_activity,
+    };
     let result = match crate::loop_engine::claude::spawn_claude(
         &prompt,
         &PermissionMode::text_only(),
@@ -285,6 +303,9 @@ fn try_haiku_summary(
             // Text-only metadata pass — same leak profile as curate; clean up
             // the ai-title jsonl after the child exits.
             cleanup_title_artifact: true,
+            // Bounded so a rate-limited or stalled summary can't hang the
+            // loop. On timeout we fall through to the heuristic fallback.
+            timeout: Some(timeout),
             ..Default::default()
         },
     ) {
@@ -297,6 +318,13 @@ fn try_haiku_summary(
             return None;
         }
     };
+    if result.timed_out {
+        eprintln!(
+            "Warning: milestone summary Haiku timed out after {}s — falling back to heuristic",
+            MILESTONE_SUMMARY_TIMEOUT.as_secs()
+        );
+        return None;
+    }
     if result.exit_code != 0 {
         eprintln!(
             "Warning: milestone summary Haiku exited with code {} — falling back to heuristic",

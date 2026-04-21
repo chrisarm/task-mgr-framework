@@ -1057,6 +1057,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 task_id.as_deref(),
                 run_id.as_deref(),
                 Some(&cli.dir),
+                None, // CLI invocation — no shared signal flag; Ctrl-C kills this process directly
             )?;
 
             if result.learnings_extracted > 0 {

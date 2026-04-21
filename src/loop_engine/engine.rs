@@ -743,6 +743,7 @@ pub fn run_iteration(
             Some(&task_id),
             Some(params.run_id),
             Some(params.db_dir),
+            Some(params.signal_flag),
         ) {
             Ok(r) if r.learnings_extracted > 0 => {
                 eprintln!(

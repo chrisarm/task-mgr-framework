@@ -13,6 +13,9 @@
 pub mod extraction;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -21,7 +24,16 @@ use crate::learnings::crud::{LearningWriter, RecordLearningParams};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::loop_engine::claude;
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::model::HAIKU_MODEL;
+use crate::loop_engine::signals::SignalFlag;
+use crate::loop_engine::watchdog::TimeoutConfig;
 use crate::models::LearningOutcome;
+
+/// Hard timeout for the extraction subprocess. Extraction is a one-shot
+/// classification pass on ≤50KB of text; anything over ~5 min means the
+/// spawned Claude is stuck (rate limit, network stall, runaway internal
+/// retry). Better to bail and move on than hang the whole loop.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub use extraction::{build_extraction_prompt, parse_extraction_response};
 
@@ -72,6 +84,7 @@ pub fn extract_learnings_from_output(
     task_id: Option<&str>,
     run_id: Option<&str>,
     db_dir: Option<&Path>,
+    signal_flag: Option<&SignalFlag>,
 ) -> TaskMgrResult<ExtractionResult> {
     if output.trim().is_empty() {
         return Ok(ExtractionResult::empty());
@@ -79,6 +92,17 @@ pub fn extract_learnings_from_output(
 
     // Build extraction prompt
     let prompt = build_extraction_prompt(output, task_id);
+
+    // Extraction runs with a fixed hard timeout — no monitor thread, no
+    // activity-based extensions. A 0-valued activity epoch means the
+    // watchdog's activity branch is inert (no extension can trigger),
+    // so only the base deadline and the signal flag can terminate it.
+    let no_activity = Arc::new(AtomicU64::new(0));
+    let timeout = TimeoutConfig {
+        base_timeout: EXTRACTION_TIMEOUT,
+        initial_extension: Duration::from_secs(0),
+        last_activity_epoch: no_activity,
+    };
 
     // Spawn Claude for extraction
     let claude_result = match claude::spawn_claude(
@@ -89,6 +113,14 @@ pub fn extract_learnings_from_output(
             // Text-only metadata pass — same leak profile as curate; clean up
             // the ai-title jsonl after the child exits.
             cleanup_title_artifact: true,
+            // Cheap, fast classification — Haiku is the right tool here.
+            model: Some(HAIKU_MODEL),
+            // Bounded so a rate-limited or stalled extraction can't hang the
+            // whole loop. 5 min is generous for ≤50KB of input to Haiku.
+            timeout: Some(timeout),
+            // Honor Ctrl-C during extraction so the user isn't stuck waiting
+            // on the full hard timeout after hitting the signal.
+            signal_flag,
             ..Default::default()
         },
     ) {
@@ -99,6 +131,13 @@ pub fn extract_learnings_from_output(
         }
     };
 
+    if claude_result.timed_out {
+        eprintln!(
+            "Warning: learning extraction timed out after {}s — skipping",
+            EXTRACTION_TIMEOUT.as_secs()
+        );
+        return Ok(ExtractionResult::empty());
+    }
     if claude_result.exit_code != 0 {
         eprintln!(
             "Warning: learning extraction Claude exited with code {}",
