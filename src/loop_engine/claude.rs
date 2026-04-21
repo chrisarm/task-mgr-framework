@@ -7,7 +7,7 @@
 ///
 /// When a `SignalFlag` is provided, a watchdog thread monitors for SIGINT/SIGTERM
 /// and escalates: SIGTERM → 3s grace → SIGKILL.
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -105,6 +105,88 @@ pub(crate) struct SpawnOpts<'a> {
     /// child process exits. Workaround for Claude Code 2.1.110 leaking
     /// ai-title metadata despite `--no-session-persistence`.
     pub cleanup_title_artifact: bool,
+    /// When `true` (Unix only), wire the child's stdout+stderr to a
+    /// pseudo-TTY slave instead of a regular pipe. Node.js (and therefore
+    /// Claude Code) line-buffers stdout only when `isatty(1)` is true, so
+    /// a pipe causes block-buffered bursts while a PTY streams per line.
+    /// stdin remains a pipe (unchanged prompt delivery + no echo).
+    /// Ignored on non-Unix — falls back to piped stdout / inherited stderr.
+    pub use_pty: bool,
+}
+
+/// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
+///
+/// Returns `(master, slave_stdout, slave_stderr)`. The two slave fds are
+/// duplicates of the same PTY endpoint so both of the child's output streams
+/// share it (mirrors a terminal). Termios is configured with `OPOST` cleared
+/// so the PTY doesn't map `\n` to `\r\n`, and echo bits cleared for safety
+/// (we don't write to master, but keeps state deterministic).
+///
+/// # Why a PTY
+/// Node.js — the Claude Code runtime — line-buffers stdout only when
+/// `isatty(1)` returns true. A plain pipe triggers block-buffering (~8KB),
+/// which makes stream-json lines arrive in bursts instead of live.
+#[cfg(unix)]
+fn open_pty_for_child_output() -> std::io::Result<(
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    // SAFETY: openpty writes the two out params; null termios/winsize/name use defaults.
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openpty just gave us fresh fds; wrap them as owned so they close on drop.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+
+    // Disable OPOST so `\n` isn't remapped to `\r\n` on output; clear echo
+    // bits defensively (slave never reads from us, but state stays predictable).
+    // Best-effort: termios failure doesn't abort — we'd just see `\r\n` which
+    // serde_json tolerates as JSON whitespace.
+    // SAFETY: tcgetattr/tcsetattr take a valid fd and a valid termios pointer.
+    unsafe {
+        let mut tio: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave.as_raw_fd(), &mut tio) == 0 {
+            tio.c_oflag &= !libc::OPOST;
+            tio.c_lflag &= !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL);
+            let _ = libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &tio);
+        }
+    }
+
+    let slave_err = slave.try_clone()?;
+    Ok((master, slave, slave_err))
+}
+
+/// Treat EIO from a PTY master read as a clean EOF.
+///
+/// Linux returns `EIO` (input/output error) from a master-side read once every
+/// slave fd has been closed — i.e. once the child exits and its stdout/stderr
+/// descriptors are released. Non-PTY readers never produce EIO, so this check
+/// is safe to apply unconditionally in the read loops.
+fn is_pty_read_eof(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
 }
 
 /// Spawn Claude with the given prompt and collect its output.
@@ -159,6 +241,7 @@ pub(crate) fn spawn_claude(
         disallowed_tools,
         db_dir,
         cleanup_title_artifact,
+        use_pty,
     } = opts;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -228,10 +311,40 @@ pub(crate) fn spawn_claude(
     // limits when prompts are large (e.g. curate dedup with many learnings).
 
     let mut cmd = Command::new(&binary);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+    cmd.args(&args).stdin(Stdio::piped());
+
+    // PTY mode (Unix): wire stdout+stderr to a pseudo-TTY slave so Node.js
+    // line-buffers its writes. Pipe mode (default): piped stdout for our
+    // reader, inherited stderr for direct terminal passthrough.
+    //
+    // `pty_master` stays in scope through the end of the read loop — dropping
+    // it early would close our end of the PTY and cause reads to EIO mid-run.
+    #[cfg(unix)]
+    let pty_master: Option<std::os::fd::OwnedFd> = if use_pty {
+        match open_pty_for_child_output() {
+            Ok((master, slave_out, slave_err)) => {
+                cmd.stdout(Stdio::from(slave_out));
+                cmd.stderr(Stdio::from(slave_err));
+                Some(master)
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to allocate PTY for streaming (falling back to pipe): {}",
+                    e
+                );
+                cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+                None
+            }
+        }
+    } else {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+        None
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = use_pty;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    }
 
     // Tell the guard-destructive hook to allow all commands.  The loop
     // engine already scopes permissions via --allowedTools, so the hook's
@@ -331,13 +444,32 @@ pub(crate) fn spawn_claude(
         None
     };
 
-    // Take ownership of stdout for line-by-line reading
-    let stdout = child
-        .stdout
-        .take()
-        .expect("stdout should be piped (Stdio::piped() was set on spawn)");
-
-    let reader = BufReader::new(stdout);
+    // In PTY mode, reads come from our master fd (child wrote via the slave end);
+    // otherwise they come from the piped stdout. Both implement `Read`; we box to
+    // a single type so the downstream tee logic stays generic over the source.
+    let reader_source: Box<dyn Read + Send> = {
+        #[cfg(unix)]
+        {
+            if let Some(master) = pty_master {
+                Box::new(std::fs::File::from(master))
+            } else {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .expect("stdout should be piped (Stdio::piped() was set on spawn)");
+                Box::new(stdout)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let stdout = child
+                .stdout
+                .take()
+                .expect("stdout should be piped (Stdio::piped() was set on spawn)");
+            Box::new(stdout)
+        }
+    };
+    let reader = BufReader::new(reader_source);
 
     let (output, conversation, permission_denials) = if stream_json {
         tee_stream_json(reader)
@@ -351,6 +483,7 @@ pub(crate) fn spawn_claude(
                     buf.push_str(&line);
                     buf.push('\n');
                 }
+                Err(e) if is_pty_read_eof(&e) => break,
                 Err(e) => {
                     eprintln!("Warning: error reading Claude stdout: {}", e);
                     break;
@@ -420,6 +553,7 @@ fn tee_stream_json(
                     }
                 }
             }
+            Err(e) if is_pty_read_eof(&e) => break,
             Err(e) => {
                 eprintln!("Warning: error reading Claude stdout: {}", e);
                 break;

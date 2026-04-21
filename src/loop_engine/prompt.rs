@@ -186,7 +186,13 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
              When all acceptance criteria pass:\n\
              1. Commit with message: `feat: {task_id}-completed - [Title]`\n\
                 If completing multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`\n\
-             2. Output `<completed>{task_id}</completed>` (using the full task ID shown above).\n\n\
+             2. Output `<completed>{task_id}</completed>` (using the full task ID shown above).\n\
+             3. Stop immediately. Do NOT wait on background tasks, `Monitor` streams, \
+                polling loops, or `run_in_background` commands after emitting `<completed>`. \
+                If any background process is still running, kill it (`KillShell`, SIGTERM) \
+                and exit this turn. The loop treats `<completed>` as terminal — anything \
+                you wait for afterward is wasted wall-clock until the base timeout kills \
+                the subprocess.\n\n\
              The loop will automatically mark the task done and update the PRD.\n\
              Do NOT run `task-mgr done` manually.\n\n",
             task_id = task_output.id,

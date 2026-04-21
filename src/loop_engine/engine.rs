@@ -545,6 +545,7 @@ pub fn run_iteration(
             effort,
             disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
             db_dir: Some(params.db_dir),
+            use_pty: true,
             ..Default::default()
         },
     );
