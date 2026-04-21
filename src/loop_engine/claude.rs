@@ -11,7 +11,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
@@ -112,6 +113,15 @@ pub(crate) struct SpawnOpts<'a> {
     /// stdin remains a pipe (unchanged prompt delivery + no echo).
     /// Ignored on non-Unix — falls back to piped stdout / inherited stderr.
     pub use_pty: bool,
+    /// The task ID this spawn is working on. When `Some`, the stream-json
+    /// tee scans assistant text for `<completed>TARGET</completed>` and,
+    /// on first match, starts a bounded post-completion grace window
+    /// (see `watchdog::POST_COMPLETION_GRACE_SECS`). After the grace
+    /// elapses, the watchdog terminates the process even if the agent is
+    /// still waiting on background tasks. Only the *current* target's
+    /// completion triggers the grace — other `<completed>` tags (e.g.
+    /// tasks finished en route) are collected normally but do not arm it.
+    pub target_task_id: Option<&'a str>,
 }
 
 /// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
@@ -242,6 +252,7 @@ pub(crate) fn spawn_claude(
         db_dir,
         cleanup_title_artifact,
         use_pty,
+        target_task_id,
     } = opts;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -423,26 +434,39 @@ pub(crate) fn spawn_claude(
     // Extract PID before starting watchdog — no race condition
     let child_pid = child.id();
 
-    // Start watchdog thread if signal handling or timeout is requested
+    // Shared epoch seconds of when the current task's `<completed>` tag was
+    // first observed in the stream. 0 = not yet seen. Written by the reader
+    // thread (tee_stream_json), read by the watchdog thread; the watchdog
+    // force-exits POST_COMPLETION_GRACE_SECS after the value goes non-zero.
+    let completion_epoch = Arc::new(AtomicU64::new(0));
+
+    // Start watchdog thread if signal handling, timeout, or completion-grace
+    // is requested. target_task_id alone justifies a watchdog because it's
+    // what triggers the post-completion kill.
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let timed_out_flag = Arc::new(AtomicBool::new(false));
-    let watchdog_handle = if signal_flag.is_some() || timeout.is_some() {
-        let stop = Arc::clone(&stop_watchdog);
-        let flag = signal_flag.cloned();
-        let timeout_cfg = timeout;
-        let timed_out = Arc::clone(&timed_out_flag);
-        Some(std::thread::spawn(move || {
-            watchdog_loop(
-                child_pid,
-                flag.as_ref(),
-                &stop,
-                timeout_cfg.as_ref(),
-                &timed_out,
-            );
-        }))
-    } else {
-        None
-    };
+    let watchdog_handle =
+        if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some() {
+            let stop = Arc::clone(&stop_watchdog);
+            let flag = signal_flag.cloned();
+            let timeout_cfg = timeout;
+            let timed_out = Arc::clone(&timed_out_flag);
+            let epoch = Arc::clone(&completion_epoch);
+            let target = target_task_id.map(str::to_owned);
+            Some(std::thread::spawn(move || {
+                watchdog_loop(
+                    child_pid,
+                    flag.as_ref(),
+                    &stop,
+                    timeout_cfg.as_ref(),
+                    &timed_out,
+                    Some(&epoch),
+                    target.as_deref(),
+                );
+            }))
+        } else {
+            None
+        };
 
     // In PTY mode, reads come from our master fd (child wrote via the slave end);
     // otherwise they come from the piped stdout. Both implement `Read`; we box to
@@ -472,7 +496,7 @@ pub(crate) fn spawn_claude(
     let reader = BufReader::new(reader_source);
 
     let (output, conversation, permission_denials) = if stream_json {
-        tee_stream_json(reader)
+        tee_stream_json(reader, target_task_id, &completion_epoch)
     } else {
         let mut buf = String::new();
         for line_result in reader.lines() {
@@ -536,6 +560,8 @@ pub(crate) fn spawn_claude(
 /// conversation building).
 fn tee_stream_json(
     reader: BufReader<impl std::io::Read>,
+    target_task_id: Option<&str>,
+    completion_epoch: &AtomicU64,
 ) -> (String, Option<String>, Vec<serde_json::Value>) {
     let mut parsed: Vec<serde_json::Value> = Vec::new();
 
@@ -546,6 +572,13 @@ fn tee_stream_json(
                     Ok(val) => {
                         // Tee assistant text live before collecting for conversation building
                         tee_assistant_text(&val);
+                        // Arm the post-completion grace once we see the current
+                        // task's `<completed>` in the stream. Other task IDs are
+                        // ignored here and captured normally via the post-process
+                        // parse_completed_tasks pass.
+                        if let Some(target) = target_task_id {
+                            scan_for_target_completion(&val, target, completion_epoch);
+                        }
                         parsed.push(val);
                     }
                     Err(_) => {
@@ -600,6 +633,64 @@ fn tee_assistant_text(val: &serde_json::Value) {
                 eprintln!("{}", text);
             }
         }
+    }
+}
+
+/// Scan an assistant message for `<completed>TARGET</completed>` and arm the
+/// post-completion grace if the current target task's tag is present.
+///
+/// Writes `completion_epoch` at most once (first observation wins) so that
+/// repeated completions don't reset the grace timer. Uses
+/// `parse_completed_tasks` for tolerance against surrounding whitespace and
+/// to match the detection path the engine uses post-process.
+fn scan_for_target_completion(
+    val: &serde_json::Value,
+    target_task_id: &str,
+    completion_epoch: &AtomicU64,
+) {
+    if completion_epoch.load(Ordering::Acquire) != 0 {
+        return; // already armed — first observation wins
+    }
+    if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return;
+    }
+    let Some(content) = assistant_content(val) else {
+        return;
+    };
+    let mut found = false;
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(text) = block.get("text").and_then(|t| t.as_str())
+            && crate::loop_engine::output_parsing::parse_completed_tasks(text)
+                .iter()
+                .any(|id| id == target_task_id)
+        {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return;
+    }
+    // Saturate to 1 so the sentinel `0 == not armed` stays unambiguous even on
+    // a system whose clock reads pre-epoch (unsynced VM / container init); a
+    // 0-valued store would silently fail the "already armed" short-circuit and
+    // the grace kill would never fire.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .max(1);
+    // CAS so a second thread (shouldn't exist, but defensive) can't double-set.
+    if completion_epoch
+        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        eprintln!(
+            "[completion] saw <completed>{}</completed> in stream — {}s grace window begins",
+            target_task_id,
+            crate::loop_engine::watchdog::POST_COMPLETION_GRACE_SECS,
+        );
     }
 }
 

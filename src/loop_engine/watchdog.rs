@@ -7,7 +7,7 @@
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::loop_engine::signals::SignalFlag;
 
@@ -17,6 +17,15 @@ const TIMEOUT_MEDIUM_SECS: u64 = 30 * 60;
 const TIMEOUT_HIGH_SECS: u64 = 40 * 60;
 pub(crate) const INITIAL_EXTENSION_SECS: u64 = 7 * 60;
 pub(crate) const EXTENSION_DECREMENT_SECS: u64 = 60;
+
+/// Seconds to keep the child alive after the current task's `<completed>` tag
+/// is seen in the stream, before force-terminating.
+///
+/// Gives the agent a bounded window to flush straggling text, commit/push a
+/// final change, and emit any additional `<completed>` tags for other tasks
+/// it finished en route. Any output in this window is captured in the stream
+/// buffer and processed by the engine's post-process path like normal.
+pub(crate) const POST_COMPLETION_GRACE_SECS: u64 = 180;
 
 /// Configuration for per-iteration timeout with activity-based extensions.
 #[derive(Clone)]
@@ -121,6 +130,8 @@ pub(crate) fn watchdog_loop(
     stop: &AtomicBool,
     timeout: Option<&TimeoutConfig>,
     timed_out: &AtomicBool,
+    completion_epoch: Option<&AtomicU64>,
+    target_task_id: Option<&str>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -136,6 +147,29 @@ pub(crate) fn watchdog_loop(
         {
             kill_process_group(child_pid, stop, "Signal received");
             return;
+        }
+
+        // Check post-completion grace: the tee loop sets completion_epoch
+        // when it sees `<completed>CURRENT_TASK</completed>` in the stream.
+        // After POST_COMPLETION_GRACE_SECS elapse, force-exit — this is a
+        // successful completion, not a timeout, so timed_out stays false.
+        if let Some(epoch) = completion_epoch {
+            let set_at = epoch.load(Ordering::Acquire);
+            if set_at > 0 {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(set_at) >= POST_COMPLETION_GRACE_SECS {
+                    eprintln!(
+                        "[completion] grace window ({}s) elapsed after <completed>{}</completed> — terminating Claude process group",
+                        POST_COMPLETION_GRACE_SECS,
+                        target_task_id.unwrap_or("?"),
+                    );
+                    kill_process_group(child_pid, stop, "Post-completion grace expired");
+                    return;
+                }
+            }
         }
 
         // Check timeout
@@ -185,6 +219,8 @@ pub(crate) fn watchdog_loop(
     stop: &AtomicBool,
     _timeout: Option<&TimeoutConfig>,
     _timed_out: &AtomicBool,
+    _completion_epoch: Option<&AtomicU64>,
+    _target_task_id: Option<&str>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -378,6 +414,129 @@ mod tests {
             elapsed.as_secs() >= 4,
             "Activity should have extended lifetime past 3s, took {:?}",
             elapsed
+        );
+    }
+
+    /// Pre-arm `completion_epoch` to a time already past the grace window and
+    /// verify the watchdog kills the child promptly without setting
+    /// `timed_out` (grace kill = success, not timeout).
+    #[cfg(unix)]
+    #[test]
+    fn test_watchdog_grace_kills_after_completion_armed() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut child = Command::new("sleep")
+            .arg("120")
+            .process_group(0) // own pgroup so kill_process_group's -pid targets it
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        let epoch = Arc::new(AtomicU64::new(0));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Store grace-already-expired: watchdog should fire on its first poll.
+        epoch.store(
+            now.saturating_sub(POST_COMPLETION_GRACE_SECS + 1),
+            Ordering::Release,
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let timed_out_clone = Arc::clone(&timed_out);
+        let epoch_clone = Arc::clone(&epoch);
+        let handle = std::thread::spawn(move || {
+            watchdog_loop(
+                pid,
+                None,
+                &stop_clone,
+                None, // no base timeout — we're isolating the grace branch
+                &timed_out_clone,
+                Some(&epoch_clone),
+                Some("T-GRACE-TEST"),
+            );
+        });
+
+        let wait_start = Instant::now();
+        let status = child.wait().expect("child wait");
+        let wait_elapsed = wait_start.elapsed();
+
+        stop.store(true, Ordering::Release);
+        handle.join().expect("watchdog thread join");
+
+        assert!(!status.success(), "grace kill must terminate the child");
+        assert!(
+            wait_elapsed < Duration::from_secs(5),
+            "grace kill should fire promptly after the grace window elapses, took {:?}",
+            wait_elapsed
+        );
+        assert!(
+            !timed_out.load(Ordering::Acquire),
+            "grace kill is a successful completion — timed_out must stay false",
+        );
+    }
+
+    /// When `completion_epoch` is never armed, the grace branch must be inert
+    /// — nothing should be killed on that basis, only via timeout/signal.
+    #[cfg(unix)]
+    #[test]
+    fn test_watchdog_grace_not_armed_does_not_kill() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        let epoch = Arc::new(AtomicU64::new(0)); // unarmed
+        let stop = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let timed_out_clone = Arc::clone(&timed_out);
+        let epoch_clone = Arc::clone(&epoch);
+        let handle = std::thread::spawn(move || {
+            watchdog_loop(
+                pid,
+                None,
+                &stop_clone,
+                None,
+                &timed_out_clone,
+                Some(&epoch_clone),
+                Some("T-UNARMED"),
+            );
+        });
+
+        // Let the watchdog poll a few times, confirm child still alive.
+        std::thread::sleep(Duration::from_millis(800));
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+
+        // Clean up: stop watchdog, kill child ourselves.
+        stop.store(true, Ordering::Release);
+        handle.join().expect("watchdog thread join");
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = child.wait();
+
+        assert!(
+            alive,
+            "unarmed grace must not kill the child; kill(0) on pid should succeed"
+        );
+        assert!(
+            !timed_out.load(Ordering::Acquire),
+            "no timeout configured, no grace armed — timed_out must stay false"
         );
     }
 }
