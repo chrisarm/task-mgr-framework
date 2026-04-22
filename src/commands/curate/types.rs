@@ -234,6 +234,9 @@ pub struct DedupParams {
     /// Directory that holds `.task-mgr/` (needed for Ollama embedding after merge).
     /// `None` disables post-merge embedding (used in tests).
     pub db_dir: Option<std::path::PathBuf>,
+    /// If true, delete all rows from `dedup_dismissals` before running. Applies
+    /// even when `dry_run` is true (a reset is a deliberate administrative action).
+    pub reset_dismissals: bool,
 }
 
 /// Default Claude model for `curate dedup` LLM calls.
@@ -251,6 +254,7 @@ impl Default for DedupParams {
             embed_model: DEFAULT_EMBEDDING_MODEL.to_string(),
             model: DEFAULT_DEDUP_MODEL.to_string(),
             db_dir: None,
+            reset_dismissals: false,
         }
     }
 }
@@ -340,6 +344,9 @@ pub struct DedupResult {
     pub dry_run: bool,
     /// Number of duplicate clusters identified by the LLM.
     pub clusters_found: usize,
+    /// Number of batches skipped because every pair was previously dismissed.
+    #[serde(default)]
+    pub clusters_skipped: usize,
     /// Number of source learnings retired (0 when dry_run=true).
     pub learnings_merged: usize,
     /// Number of merged learnings created (0 when dry_run=true).

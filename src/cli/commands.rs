@@ -1163,6 +1163,11 @@ THRESHOLD:
         /// Number of LLM batches to process in parallel (default: 2)
         #[arg(long, default_value_t = 2)]
         concurrency: usize,
+
+        /// Clear the dedup_dismissals table before running (forces re-examination
+        /// of every cluster). Applies even with --dry-run.
+        #[arg(long = "reset-dismissals", default_value_t = false)]
+        reset_dismissals: bool,
     },
 
     /// Enrich learning metadata using LLM analysis

@@ -171,6 +171,43 @@ existing CLI formatters.
 - `curate embed --status` only queries the DB (no Ollama connection needed)
 - `curate embed` returns a clear error if Ollama is unreachable or the model is missing
 
+## Dedup Dismissal Memory
+
+`curate dedup` persists pairs the LLM has already examined and found distinct in the
+`dedup_dismissals` table (migration v18: composite PK `(id_lo, id_hi)` **plus
+`CHECK (id_lo < id_hi)`** for defense-in-depth, plus `idx_dedup_dismissals_hi`).
+Subsequent runs skip batches whose every C(N,2) pair is already dismissed, so
+users don't re-pay LLM calls for the same "no duplicates" output.
+
+- **Pair normalization**: `normalize_pair()` canonicalizes `(a, b)` to `(min, max)`;
+  all writes go through `record_dismissals()`. The v18 CHECK constraint backstops
+  this at the schema level — a self-pair or reversed pair that slipped past Rust
+  normalization fails at INSERT time rather than silently corrupting the table.
+- **Narrow conflict suppression**: `record_dismissals` uses
+  `ON CONFLICT (id_lo, id_hi) DO NOTHING`, **not** `INSERT OR IGNORE`. This keeps
+  duplicates idempotent while letting CHECK (or any future NOT NULL / FK) failures
+  propagate as real errors instead of being swallowed.
+- **Multi-row INSERT**: `record_dismissals` emits a single
+  `INSERT ... VALUES (?,?),(?,?),...` per chunk of 256 pairs (512 params,
+  well under `SQLITE_MAX_VARIABLE_NUMBER`). One round-trip per chunk, not per pair.
+- **When dismissals are recorded**: after a successful LLM batch, every C(N,2) pair
+  from the batch minus (a) pairs the LLM grouped as duplicates and (b) pairs whose
+  IDs were retired by a strictly earlier batch.
+- **When they are NOT recorded**: `dry_run=true` (read-only convention) OR the batch
+  raised an LLM error (can't trust a batch whose result we never got). The
+  `continue` in the LLM error arm short-circuits before any dismissal accounting.
+- **Forcing re-examination**: `task-mgr curate dedup --reset-dismissals` clears the
+  table (`clear_dismissals()`) before the run; applies even with `--dry-run` because
+  a reset is an administrative action, not an LLM pass.
+- **`DedupResult.clusters_skipped`**: serde `default = 0` so JSON consumers parsing
+  older output still work; new runs populate it with the count of batches skipped.
+- Table has no foreign keys to `learnings` — rows for retired learnings are inert
+  and harmless (they just never match an active cluster).
+
+Helpers live in `src/commands/curate/mod.rs` as `pub(crate)` (not exported outside
+the crate): `load_dismissals`, `record_dismissals`, `clear_dismissals`,
+`is_fully_dismissed`, plus the private `normalize_pair` / `unordered_pairs`.
+
 ## Curate session cleanup workaround
 
 Claude Code 2.1.110 writes an `ai-title` jsonl to `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`

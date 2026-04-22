@@ -88,6 +88,13 @@ pub fn format_dedup_text(result: &DedupResult) -> String {
         result.clusters_found, result.learnings_merged, result.learnings_created, dry_run_marker
     );
 
+    if result.clusters_skipped > 0 {
+        out.push_str(&format!(
+            "{} cluster(s) skipped (all pairs previously dismissed)\n",
+            result.clusters_skipped
+        ));
+    }
+
     if result.llm_errors > 0 {
         out.push_str(&format!("{} LLM error(s) encountered\n", result.llm_errors));
     }

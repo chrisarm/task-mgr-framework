@@ -671,6 +671,15 @@ fn process_batches_parallel(
 /// - When there are 0 active learnings, returns an empty `DedupResult` without
 ///   invoking the LLM.
 pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<DedupResult> {
+    // Reset dismissals before anything else. Applies even with `dry_run=true`
+    // because a reset is an explicit administrative action, not an LLM pass.
+    if params.reset_dismissals {
+        let removed = clear_dismissals(conn)?;
+        if removed > 0 {
+            eprintln!("Cleared {removed} dismissal(s) from dedup_dismissals");
+        }
+    }
+
     // Load all active learnings (id, title, content, confidence).
     struct LearningRow {
         id: i64,
@@ -701,12 +710,16 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         return Ok(DedupResult {
             dry_run: params.dry_run,
             clusters_found: 0,
+            clusters_skipped: 0,
             learnings_merged: 0,
             learnings_created: 0,
             llm_errors: 0,
             clusters: Vec::new(),
         });
     }
+
+    // Load dismissed pairs once; used to skip fully-dismissed batches below.
+    let dismissals = load_dismissals(conn)?;
 
     // Build a map from id -> (title, confidence) for cluster assembly.
     let id_info: HashMap<i64, (String, String)> = rows
@@ -861,6 +874,35 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         items.chunks(batch_size).map(|s| s.to_vec()).collect()
     };
 
+    // Skip batches whose entire C(N,2) pair set is already recorded as dismissed.
+    // Every skipped batch is one we would otherwise send to the LLM with
+    // identical input and get an identical "no duplicates" response.
+    let mut clusters_skipped: usize = 0;
+    let batches: Vec<Vec<DeduplicateLearningItem>> = batches
+        .into_iter()
+        .filter_map(|batch| {
+            let ids: Vec<i64> = batch.iter().map(|i| i.id).collect();
+            if is_fully_dismissed(&ids, &dismissals) {
+                clusters_skipped += 1;
+                None
+            } else {
+                Some(batch)
+            }
+        })
+        .collect();
+
+    if clusters_skipped > 0 {
+        eprintln!("Skipped {clusters_skipped} cluster(s) (all pairs previously dismissed)");
+    }
+
+    // Capture the IDs per batch BEFORE `process_batches_parallel` consumes `batches`.
+    // The post-processing loop needs these to compute which pairs to record as
+    // dismissed (batch pairs minus merged-cluster internal pairs minus prior-retired IDs).
+    let batch_item_ids: Vec<Vec<i64>> = batches
+        .iter()
+        .map(|b| b.iter().map(|i| i.id).collect())
+        .collect();
+
     let total_batches = batches.len();
     if total_batches > 1 {
         eprintln!(
@@ -883,19 +925,38 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     let mut learnings_created: usize = 0;
 
     for output in batch_outputs {
+        let batch_idx = output.batch_idx;
         let raw_clusters = match output.raw_clusters {
             Ok(clusters) => clusters,
             Err(()) => {
+                // LLM error: counts toward llm_errors but we do NOT record dismissals
+                // for this batch — we cannot trust a batch whose result we never got.
                 llm_errors += 1;
                 continue;
             }
         };
+
+        // Snapshot merged_ids BEFORE this batch so dismissed-pair filtering only
+        // excludes IDs retired by strictly earlier batches. Pairs that include an
+        // ID merged *in this batch* still get recorded as dismissed — the LLM did
+        // examine them alongside the surviving items.
+        let prior_merged_ids: HashSet<i64> = merged_ids.clone();
+
+        // Pairs the LLM grouped as duplicates in this batch. Collected regardless
+        // of merge outcome so a cluster skipped due to prior-batch ID overlap
+        // still counts as "LLM said duplicates" (not to be dismissed).
+        let mut cluster_internal_pairs: HashSet<(i64, i64)> = HashSet::new();
 
         for raw in raw_clusters {
             let source_ids = match raw.source_ids {
                 Some(ids) if ids.len() >= 2 => ids,
                 _ => continue,
             };
+
+            // Skip self-pairs in case the LLM hallucinates a duplicate ID in source_ids.
+            for pair in unordered_pairs(&source_ids).filter(|(a, b)| a != b) {
+                cluster_internal_pairs.insert(pair);
+            }
 
             // Skip if any source ID was already merged by a prior batch.
             if source_ids.iter().any(|id| merged_ids.contains(id)) {
@@ -961,6 +1022,27 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 merged_learning_id,
             });
         }
+
+        // Record dismissals for this batch: every C(N,2) pair from the batch,
+        // minus pairs the LLM flagged as duplicates, minus any pair whose IDs
+        // were retired by a strictly earlier batch (those IDs are gone).
+        //
+        // Suppressed when dry_run is set (read-only convention) or when the
+        // batch errored out (already handled via the `continue` above).
+        if !params.dry_run {
+            let ids = &batch_item_ids[batch_idx];
+            if ids.len() >= 2 {
+                let to_dismiss: Vec<(i64, i64)> = unordered_pairs(ids)
+                    .filter(|pair| !cluster_internal_pairs.contains(pair))
+                    .filter(|(lo, hi)| {
+                        !prior_merged_ids.contains(lo) && !prior_merged_ids.contains(hi)
+                    })
+                    .collect();
+                if !to_dismiss.is_empty() {
+                    record_dismissals(conn, &to_dismiss)?;
+                }
+            }
+        }
     }
 
     let clusters_found = all_clusters.len();
@@ -969,6 +1051,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     Ok(DedupResult {
         dry_run: params.dry_run,
         clusters_found,
+        clusters_skipped,
         learnings_merged,
         learnings_created,
         llm_errors,
@@ -1169,6 +1252,90 @@ pub fn curate_embed(conn: &Connection, params: EmbedParams) -> TaskMgrResult<Emb
         errors,
         model: params.model,
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dedup dismissal helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Returns `(id_lo, id_hi)` with `id_lo <= id_hi`. Canonical key for the
+/// `dedup_dismissals` composite PK and any in-memory pair set.
+fn normalize_pair(a: i64, b: i64) -> (i64, i64) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Yields each C(N,2) pair from `ids` exactly once, normalized via [`normalize_pair`].
+fn unordered_pairs(ids: &[i64]) -> impl Iterator<Item = (i64, i64)> + '_ {
+    (0..ids.len())
+        .flat_map(move |i| ((i + 1)..ids.len()).map(move |j| normalize_pair(ids[i], ids[j])))
+}
+
+/// Loads all dismissed pairs from the database as a HashSet.
+///
+/// All stored pairs satisfy id_lo < id_hi (enforced by the v18 CHECK constraint
+/// and by `normalize_pair` on the write path).
+pub(crate) fn load_dismissals(conn: &Connection) -> TaskMgrResult<HashSet<(i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT id_lo, id_hi FROM dedup_dismissals")?;
+    let pairs = stmt
+        .query_map([], |row| {
+            let lo: i64 = row.get(0)?;
+            let hi: i64 = row.get(1)?;
+            Ok((lo, hi))
+        })?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(pairs)
+}
+
+/// Persists pairs the LLM found distinct, normalizing each to (id_lo < id_hi).
+///
+/// Emits one multi-row `INSERT ... VALUES (?,?),(?,?),...` per chunk
+/// (`CHUNK_PAIRS=256`, i.e. 512 params — well under SQLite's default
+/// `SQLITE_MAX_VARIABLE_NUMBER`). `ON CONFLICT (id_lo, id_hi) DO NOTHING`
+/// narrowly suppresses primary-key conflicts so repeat runs are idempotent;
+/// CHECK violations (e.g. a self-pair that slipped past `normalize_pair`)
+/// still surface as errors instead of being silently dropped.
+///
+/// No-op when `pairs` is empty.
+pub(crate) fn record_dismissals(conn: &Connection, pairs: &[(i64, i64)]) -> TaskMgrResult<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    const CHUNK_PAIRS: usize = 256;
+    let tx = conn.unchecked_transaction()?;
+    for chunk in pairs.chunks(CHUNK_PAIRS) {
+        let mut sql = String::with_capacity(64 + chunk.len() * 8);
+        sql.push_str("INSERT INTO dedup_dismissals (id_lo, id_hi) VALUES ");
+        let mut params: Vec<i64> = Vec::with_capacity(chunk.len() * 2);
+        for (i, &(a, b)) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?)");
+            let (lo, hi) = normalize_pair(a, b);
+            params.push(lo);
+            params.push(hi);
+        }
+        sql.push_str(" ON CONFLICT (id_lo, id_hi) DO NOTHING");
+        tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes all rows from dedup_dismissals. Returns the number of rows removed.
+pub(crate) fn clear_dismissals(conn: &Connection) -> TaskMgrResult<usize> {
+    let rows = conn.execute("DELETE FROM dedup_dismissals", [])?;
+    Ok(rows)
+}
+
+/// Returns true iff every C(N,2) pair from `cluster_ids` appears in `dismissals`.
+///
+/// A cluster with fewer than 2 members can never be fully dismissed.
+pub(crate) fn is_fully_dismissed(cluster_ids: &[i64], dismissals: &HashSet<(i64, i64)>) -> bool {
+    if cluster_ids.len() < 2 {
+        return false;
+    }
+    unordered_pairs(cluster_ids).all(|p| dismissals.contains(&p))
 }
 
 #[cfg(test)]

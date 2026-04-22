@@ -19,8 +19,9 @@ use crate::models::{Confidence, LearningOutcome};
 
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
-    DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt, curate_count,
-    curate_retire, curate_unretire, merge_cluster, parse_dedup_response,
+    DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt,
+    clear_dismissals, curate_count, curate_retire, curate_unretire, is_fully_dismissed,
+    load_dismissals, merge_cluster, parse_dedup_response, record_dismissals,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3558,6 +3559,7 @@ fn test_dedup_result_json_serialization_all_fields() {
     let result = DedupResult {
         dry_run: false,
         clusters_found: 1,
+        clusters_skipped: 0,
         learnings_merged: 2,
         learnings_created: 1,
         llm_errors: 0,
@@ -4004,6 +4006,7 @@ fn test_e2e_text_output_format_for_dedup_result() {
     let result = DedupResult {
         dry_run: true,
         clusters_found: 2,
+        clusters_skipped: 0,
         learnings_merged: 0,
         learnings_created: 0,
         llm_errors: 0,
@@ -4069,6 +4072,7 @@ fn test_e2e_json_output_format_for_dedup_result() {
     let result = DedupResult {
         dry_run: false,
         clusters_found: 1,
+        clusters_skipped: 0,
         learnings_merged: 3,
         learnings_created: 1,
         llm_errors: 0,
@@ -4416,4 +4420,421 @@ fn test_count_returns_zeros_on_empty_db() {
     assert_eq!(result.active, 0);
     assert_eq!(result.retired, 0);
     assert_eq!(result.embedded, 0);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dedup dismissal CRUD tests (v18 migration)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// AC: load_dismissals on an empty table returns an empty HashSet.
+#[test]
+fn test_load_dismissals_empty() {
+    let (_tmp, conn) = setup_db();
+    let result = load_dismissals(&conn).expect("load_dismissals");
+    assert!(result.is_empty(), "empty table must yield empty HashSet");
+}
+
+/// AC: record_dismissals normalizes pairs — (5,3) is stored as (3,5) and (10,7) as (7,10).
+#[test]
+fn test_record_dismissals_normalizes_pairs() {
+    let (_tmp, conn) = setup_db();
+    record_dismissals(&conn, &[(5, 3), (10, 7)]).expect("record_dismissals");
+    let stored = load_dismissals(&conn).expect("load_dismissals");
+    assert!(
+        stored.contains(&(3, 5)),
+        "(3,5) must be stored after inserting (5,3)"
+    );
+    assert!(
+        stored.contains(&(7, 10)),
+        "(7,10) must be stored after inserting (10,7)"
+    );
+    assert_eq!(stored.len(), 2, "exactly 2 pairs must be stored");
+}
+
+/// AC: record_dismissals called twice with the same pairs does not error (ON CONFLICT DO NOTHING).
+#[test]
+fn test_record_dismissals_idempotent() {
+    let (_tmp, conn) = setup_db();
+    record_dismissals(&conn, &[(1, 2), (3, 4)]).expect("first insert");
+    record_dismissals(&conn, &[(1, 2), (3, 4)]).expect("second insert must not error");
+    let stored = load_dismissals(&conn).expect("load_dismissals");
+    assert_eq!(
+        stored.len(),
+        2,
+        "duplicate inserts must not create extra rows"
+    );
+}
+
+/// AC: record_dismissals propagates CHECK (id_lo < id_hi) errors — a self-pair is a bug
+/// signal (e.g. caller passed duplicate IDs), not a silently-ignored PK conflict.
+#[test]
+fn test_record_dismissals_rejects_self_pair() {
+    let (_tmp, conn) = setup_db();
+    let err = record_dismissals(&conn, &[(5, 5)])
+        .expect_err("self-pair must propagate CHECK constraint violation");
+    assert!(
+        err.to_string().to_ascii_uppercase().contains("CHECK"),
+        "error should name CHECK constraint, got: {err}"
+    );
+    let stored = load_dismissals(&conn).expect("load_dismissals");
+    assert!(
+        stored.is_empty(),
+        "no rows should be committed when a chunk fails CHECK"
+    );
+}
+
+/// AC: record_dismissals batches well past a single chunk (256 pairs) in one call.
+/// Exercises the multi-chunk path of the dynamic-VALUES-list INSERT.
+#[test]
+fn test_record_dismissals_multi_chunk() {
+    let (_tmp, conn) = setup_db();
+    // 300 pairs → spans two chunks (256 + 44). IDs are distinct and pre-normalized.
+    let pairs: Vec<(i64, i64)> = (0..300).map(|i| (i, i + 1_000_000)).collect();
+    record_dismissals(&conn, &pairs).expect("multi-chunk insert must succeed");
+    let stored = load_dismissals(&conn).expect("load_dismissals");
+    assert_eq!(
+        stored.len(),
+        300,
+        "all 300 pairs across two chunks must be stored"
+    );
+}
+
+/// AC: record_dismissals with an empty slice executes no SQL and returns Ok.
+#[test]
+fn test_record_dismissals_empty_slice_is_noop() {
+    let (_tmp, conn) = setup_db();
+    record_dismissals(&conn, &[]).expect("empty slice must be a no-op");
+    let stored = load_dismissals(&conn).expect("load_dismissals");
+    assert!(
+        stored.is_empty(),
+        "no rows should be inserted for an empty slice"
+    );
+}
+
+/// AC: is_fully_dismissed([1,2,3], all 3 pairs) returns true.
+#[test]
+fn test_is_fully_dismissed_three_ids_all_pairs_present() {
+    let dismissals = [(1, 2), (1, 3), (2, 3)].into_iter().collect();
+    assert!(
+        is_fully_dismissed(&[1, 2, 3], &dismissals),
+        "all C(3,2) pairs present — must return true"
+    );
+}
+
+/// AC: is_fully_dismissed([1,2,3], only 2 of 3 pairs) returns false.
+#[test]
+fn test_is_fully_dismissed_missing_one_pair() {
+    let dismissals = [(1, 2), (1, 3)].into_iter().collect();
+    assert!(
+        !is_fully_dismissed(&[1, 2, 3], &dismissals),
+        "missing (2,3) — must return false"
+    );
+}
+
+/// AC: is_fully_dismissed with a single-item cluster returns false.
+#[test]
+fn test_is_fully_dismissed_single_item() {
+    let dismissals = [(1, 2)].into_iter().collect();
+    assert!(
+        !is_fully_dismissed(&[1], &dismissals),
+        "cluster of 1 can never be fully dismissed"
+    );
+}
+
+/// AC: is_fully_dismissed with an empty cluster returns false.
+#[test]
+fn test_is_fully_dismissed_empty_cluster() {
+    let dismissals = std::collections::HashSet::new();
+    assert!(
+        !is_fully_dismissed(&[], &dismissals),
+        "empty cluster must return false"
+    );
+}
+
+/// Known-bad guard: is_fully_dismissed checks ALL C(N,2) pairs, not just adjacent.
+/// 4 IDs require C(4,2)=6 pairs; supplying only 4 "diagonal" pairs must return false.
+#[test]
+fn test_is_fully_dismissed_non_adjacent_missing_pairs() {
+    // Pairs present: (1,2),(2,3),(3,4),(1,4) — missing (1,3) and (2,4)
+    let dismissals = [(1, 2), (2, 3), (3, 4), (1, 4)].into_iter().collect();
+    assert!(
+        !is_fully_dismissed(&[1, 2, 3, 4], &dismissals),
+        "only 4 of 6 pairs present — must return false"
+    );
+}
+
+/// AC: is_fully_dismissed with a two-item cluster checks exactly 1 pair.
+#[test]
+fn test_is_fully_dismissed_two_item_cluster() {
+    let mut dismissals = std::collections::HashSet::new();
+    assert!(
+        !is_fully_dismissed(&[5, 7], &dismissals),
+        "pair (5,7) not yet dismissed — must return false"
+    );
+    dismissals.insert((5, 7));
+    assert!(
+        is_fully_dismissed(&[5, 7], &dismissals),
+        "pair (5,7) dismissed — must return true"
+    );
+}
+
+/// AC: clear_dismissals removes all rows; subsequent load returns empty HashSet.
+#[test]
+fn test_clear_dismissals_empties_table() {
+    let (_tmp, conn) = setup_db();
+    record_dismissals(&conn, &[(1, 2), (3, 4), (5, 6)]).expect("record");
+    let removed = clear_dismissals(&conn).expect("clear_dismissals");
+    assert_eq!(removed, 3, "clear must report 3 rows deleted");
+    let stored = load_dismissals(&conn).expect("load after clear");
+    assert!(stored.is_empty(), "table must be empty after clear");
+}
+
+/// AC: clear_dismissals on an empty table returns 0.
+#[test]
+fn test_clear_dismissals_empty_table_returns_zero() {
+    let (_tmp, conn) = setup_db();
+    let removed = clear_dismissals(&conn).expect("clear on empty table");
+    assert_eq!(removed, 0);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dedup dismissal INTEGRATION tests: skip+record pairs through curate_dedup.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Count rows in the dedup_dismissals table.
+fn dismissal_row_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM dedup_dismissals", [], |r| r.get(0))
+        .expect("count dedup_dismissals")
+}
+
+/// AC (text output): format_dedup_text shows 'N cluster(s) skipped' when clusters_skipped > 0.
+#[test]
+fn test_format_dedup_text_shows_clusters_skipped_when_positive() {
+    let result = DedupResult {
+        dry_run: false,
+        clusters_found: 0,
+        clusters_skipped: 3,
+        learnings_merged: 0,
+        learnings_created: 0,
+        llm_errors: 0,
+        clusters: vec![],
+    };
+    let text = format_dedup_text(&result);
+    assert!(
+        text.contains("3 cluster(s) skipped"),
+        "text must mention skipped clusters: {text}"
+    );
+    assert!(
+        text.contains("previously dismissed"),
+        "text must explain why clusters were skipped: {text}"
+    );
+}
+
+/// AC (text output): format_dedup_text omits skipped line when clusters_skipped == 0.
+#[test]
+fn test_format_dedup_text_omits_skipped_line_when_zero() {
+    let result = DedupResult {
+        dry_run: false,
+        clusters_found: 1,
+        clusters_skipped: 0,
+        learnings_merged: 2,
+        learnings_created: 1,
+        llm_errors: 0,
+        clusters: vec![],
+    };
+    let text = format_dedup_text(&result);
+    assert!(
+        !text.contains("skipped"),
+        "text must NOT mention skipped when 0: {text}"
+    );
+}
+
+/// AC (positive): batch of N items with LLM returning [] records all C(N,2) pairs as dismissed.
+/// Uses 3 learnings in a single batch → 3 dismissed pairs expected.
+#[test]
+#[cfg(unix)]
+fn test_dedup_records_dismissals_when_llm_returns_empty() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning(&conn, "D1", Confidence::High, LearningOutcome::Pattern);
+    let id2 = insert_learning(&conn, "D2", Confidence::High, LearningOutcome::Pattern);
+    let id3 = insert_learning(&conn, "D3", Confidence::High, LearningOutcome::Pattern);
+
+    let (_mock_dir, script) = setup_claude_mock("[]");
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+    let result =
+        curate_dedup(&conn, DedupParams::default()).expect("curate_dedup with empty LLM response");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(result.clusters_found, 0, "LLM returned [] → 0 clusters");
+    assert_eq!(result.llm_errors, 0, "no LLM errors");
+    assert_eq!(result.clusters_skipped, 0, "no prior dismissals → no skips");
+
+    // 3 learnings → C(3,2) = 3 pairs recorded as dismissed.
+    let dismissals = load_dismissals(&conn).expect("load dismissals");
+    assert_eq!(dismissals.len(), 3, "3 dismissed pairs expected");
+    let expect_pair = |a: i64, b: i64| if a < b { (a, b) } else { (b, a) };
+    assert!(dismissals.contains(&expect_pair(id1, id2)));
+    assert!(dismissals.contains(&expect_pair(id1, id3)));
+    assert!(dismissals.contains(&expect_pair(id2, id3)));
+}
+
+/// AC (positive): cluster {A,B} from batch {A,B,C,D} dismisses
+/// (A,C),(A,D),(B,C),(B,D),(C,D) — 5 pairs — but NOT (A,B).
+#[test]
+#[cfg(unix)]
+fn test_dedup_dismissals_exclude_merged_internal_pairs() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    let a = insert_learning(&conn, "A", Confidence::High, LearningOutcome::Pattern);
+    let b = insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
+    let c = insert_learning(&conn, "C", Confidence::High, LearningOutcome::Pattern);
+    let d = insert_learning(&conn, "D", Confidence::High, LearningOutcome::Pattern);
+
+    let mock_json = format!(
+        r#"[{{"source_ids": [{a},{b}], "merged_title": "AB", "merged_content": "c", "merged_outcome": "pattern", "reason": "dup"}}]"#
+    );
+    let (_mock_dir, script) = setup_claude_mock(&mock_json);
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(result.clusters_found, 1, "1 cluster {{A,B}} merged");
+
+    let dismissals = load_dismissals(&conn).expect("load dismissals");
+    let pair = |x: i64, y: i64| if x < y { (x, y) } else { (y, x) };
+
+    assert!(
+        !dismissals.contains(&pair(a, b)),
+        "(A,B) is a merged cluster pair — must NOT be dismissed"
+    );
+    assert!(dismissals.contains(&pair(a, c)), "(A,C) must be dismissed");
+    assert!(dismissals.contains(&pair(a, d)), "(A,D) must be dismissed");
+    assert!(dismissals.contains(&pair(b, c)), "(B,C) must be dismissed");
+    assert!(dismissals.contains(&pair(b, d)), "(B,D) must be dismissed");
+    assert!(dismissals.contains(&pair(c, d)), "(C,D) must be dismissed");
+    assert_eq!(dismissals.len(), 5, "exactly 5 dismissed pairs expected");
+}
+
+/// AC (positive): when all batches are fully dismissed, curate_dedup skips the LLM entirely.
+/// Pre-records all C(2,2)=1 pair for a 2-learning batch; CLAUDE_BINARY set to a
+/// sentinel so an LLM call would fail — absence of llm_errors proves no call happened.
+#[test]
+fn test_dedup_fully_dismissed_batch_makes_zero_llm_calls() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    let id1 = insert_learning(&conn, "E1", Confidence::High, LearningOutcome::Pattern);
+    let id2 = insert_learning(&conn, "E2", Confidence::High, LearningOutcome::Pattern);
+
+    record_dismissals(&conn, &[(id1, id2)]).expect("pre-record dismissal");
+
+    // If the LLM were invoked with CLAUDE_BINARY=false we would observe
+    // llm_errors > 0. Proving llm_errors == 0 shows the batch was skipped.
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(
+        result.llm_errors, 0,
+        "fully-dismissed batch must not invoke the LLM"
+    );
+    assert_eq!(
+        result.clusters_skipped, 1,
+        "one batch skipped due to full dismissal"
+    );
+    assert_eq!(result.clusters_found, 0);
+}
+
+/// Negative AC: dry_run=true must NOT record any dismissals.
+#[test]
+#[cfg(unix)]
+fn test_dedup_dry_run_does_not_record_dismissals() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    insert_learning(&conn, "N1", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(&conn, "N2", Confidence::High, LearningOutcome::Pattern);
+
+    let (_mock_dir, script) = setup_claude_mock("[]");
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            dry_run: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup dry_run");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert!(result.dry_run);
+    assert_eq!(
+        dismissal_row_count(&conn),
+        0,
+        "dry_run must not write dedup_dismissals rows"
+    );
+}
+
+/// Negative AC: batches whose LLM call errored must NOT record dismissals.
+#[test]
+fn test_dedup_llm_error_batch_does_not_record_dismissals() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    insert_learning(&conn, "F1", Confidence::High, LearningOutcome::Pattern);
+    insert_learning(&conn, "F2", Confidence::High, LearningOutcome::Pattern);
+
+    // CLAUDE_BINARY=false → every batch returns a non-zero exit → LLM error.
+    unsafe { std::env::set_var("CLAUDE_BINARY", "false") };
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(result.llm_errors, 1, "one batch errored");
+    assert_eq!(
+        dismissal_row_count(&conn),
+        0,
+        "error batches must not write dedup_dismissals rows"
+    );
+}
+
+/// AC: --reset-dismissals clears existing rows before running (even with dry_run).
+#[test]
+#[cfg(unix)]
+fn test_dedup_reset_dismissals_clears_table_before_run() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    // Pre-existing dismissals that would otherwise skip everything.
+    let id1 = insert_learning(&conn, "R1", Confidence::High, LearningOutcome::Pattern);
+    let id2 = insert_learning(&conn, "R2", Confidence::High, LearningOutcome::Pattern);
+    record_dismissals(&conn, &[(id1, id2)]).expect("pre-record");
+    assert_eq!(dismissal_row_count(&conn), 1, "precondition: 1 dismissal");
+
+    // With reset_dismissals + dry_run: table cleared at start; dry_run blocks
+    // recording new dismissals → table ends empty.
+    let (_mock_dir, script) = setup_claude_mock("[]");
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+    let result = curate_dedup(
+        &conn,
+        DedupParams {
+            dry_run: true,
+            reset_dismissals: true,
+            ..DedupParams::default()
+        },
+    )
+    .expect("curate_dedup reset+dry_run");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(
+        result.clusters_skipped, 0,
+        "reset cleared dismissals before skip check"
+    );
+    assert_eq!(
+        dismissal_row_count(&conn),
+        0,
+        "reset cleared the table; dry_run prevented re-populating it"
+    );
 }
