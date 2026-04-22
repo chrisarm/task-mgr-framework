@@ -85,15 +85,20 @@ pub fn edit_learning(
     learning_id: i64,
     params: EditLearningParams,
 ) -> TaskMgrResult<EditLearningResult> {
+    // Wrap the entire edit in one transaction so a late failure (e.g. typo'd
+    // --supersedes old-id) rolls back all sibling field edits. Uses
+    // unchecked_transaction to keep the &Connection signature stable for callers.
+    let tx = conn.unchecked_transaction()?;
+
     // First get the learning to verify it exists and get current values
-    let learning = get_learning(conn, learning_id)?
+    let learning = get_learning(&tx, learning_id)?
         .ok_or_else(|| crate::TaskMgrError::learning_not_found(learning_id.to_string()))?;
 
     let mut updated_fields: Vec<String> = Vec::new();
 
     // Update title if provided
     if let Some(ref new_title) = params.title {
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET title = ?1 WHERE id = ?2",
             rusqlite::params![new_title, learning_id],
         )?;
@@ -102,7 +107,7 @@ pub fn edit_learning(
 
     // Update content if provided
     if let Some(ref new_content) = params.content {
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET content = ?1 WHERE id = ?2",
             rusqlite::params![new_content, learning_id],
         )?;
@@ -111,7 +116,7 @@ pub fn edit_learning(
 
     // Update solution if provided
     if let Some(ref new_solution) = params.solution {
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET solution = ?1 WHERE id = ?2",
             rusqlite::params![new_solution, learning_id],
         )?;
@@ -120,7 +125,7 @@ pub fn edit_learning(
 
     // Update root_cause if provided
     if let Some(ref new_root_cause) = params.root_cause {
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET root_cause = ?1 WHERE id = ?2",
             rusqlite::params![new_root_cause, learning_id],
         )?;
@@ -129,7 +134,7 @@ pub fn edit_learning(
 
     // Update confidence if provided
     if let Some(new_confidence) = params.confidence {
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET confidence = ?1 WHERE id = ?2",
             rusqlite::params![new_confidence.as_db_str(), learning_id],
         )?;
@@ -163,7 +168,7 @@ pub fn edit_learning(
             Some(serde_json::to_string(&current_files).unwrap_or_default())
         };
 
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET applies_to_files = ?1 WHERE id = ?2",
             rusqlite::params![files_json, learning_id],
         )?;
@@ -193,7 +198,7 @@ pub fn edit_learning(
             Some(serde_json::to_string(&current).unwrap_or_default())
         };
 
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET applies_to_task_types = ?1 WHERE id = ?2",
             rusqlite::params![json, learning_id],
         )?;
@@ -223,7 +228,7 @@ pub fn edit_learning(
             Some(serde_json::to_string(&current).unwrap_or_default())
         };
 
-        conn.execute(
+        tx.execute(
             "UPDATE learnings SET applies_to_errors = ?1 WHERE id = ?2",
             rusqlite::params![json, learning_id],
         )?;
@@ -237,7 +242,7 @@ pub fn edit_learning(
     // Remove tags first
     if let Some(ref remove_tags) = params.remove_tags {
         for tag in remove_tags {
-            let rows = conn.execute(
+            let rows = tx.execute(
                 "DELETE FROM learning_tags WHERE learning_id = ?1 AND tag = ?2",
                 rusqlite::params![learning_id, tag],
             )?;
@@ -249,7 +254,7 @@ pub fn edit_learning(
     if let Some(ref add_tags) = params.add_tags {
         for tag in add_tags {
             // Use INSERT OR IGNORE to handle duplicates gracefully
-            let rows = conn.execute(
+            let rows = tx.execute(
                 "INSERT OR IGNORE INTO learning_tags (learning_id, tag) VALUES (?1, ?2)",
                 rusqlite::params![learning_id, tag],
             )?;
@@ -263,16 +268,19 @@ pub fn edit_learning(
         updated_fields.push("tags".to_string());
     }
 
-    // Apply supersession last: if it fails, the other edits above are already
-    // committed (each executes its own auto-commit), and the caller can retry
-    // just the `--supersedes` flag without re-doing the field edits.
+    // Apply supersession last within the same transaction: if it fails (e.g.
+    // typo'd --supersedes old-id), the transaction is rolled back on drop and
+    // all sibling edits above are reverted, so the user sees a clean error and
+    // the row is untouched.
     if let Some(old_id) = params.supersedes {
-        apply_supersession(conn, old_id, learning_id)?;
+        apply_supersession(&tx, old_id, learning_id)?;
         updated_fields.push("supersedes".to_string());
     }
 
     // Get final title (may have been updated)
     let final_title = params.title.unwrap_or(learning.title);
+
+    tx.commit()?;
 
     Ok(EditLearningResult {
         learning_id,
