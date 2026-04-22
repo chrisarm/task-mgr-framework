@@ -1427,6 +1427,7 @@ detached
     /// AC4: ephemeral branches named {branch}-slot-{N}
     #[test]
     #[ignore = "FEAT-008: implements ensure_slot_worktrees"]
+    #[allow(clippy::needless_range_loop)]
     fn test_ensure_slot_worktrees_creates_ephemeral_branches_named_by_slot() {
         let tmp = setup_git_repo_with_file();
         let branch = "feat/ephemeral";
@@ -1449,6 +1450,7 @@ detached
     /// AC5: merge_slot_branches merges disjoint changes back into main branch
     #[test]
     #[ignore = "FEAT-008: implements ensure_slot_worktrees + merge_slot_branches"]
+    #[allow(clippy::needless_range_loop)]
     fn test_merge_slot_branches_merges_disjoint_changes() {
         let tmp = setup_git_repo_with_file();
         let branch = "feat/merge-back";
@@ -1493,6 +1495,7 @@ detached
     /// Slot 0 (the user's main branch worktree) MUST be preserved.
     #[test]
     #[ignore = "FEAT-008: implements cleanup_slot_worktrees"]
+    #[allow(clippy::needless_range_loop)]
     fn test_cleanup_slot_worktrees_removes_worktrees_and_branches() {
         let tmp = setup_git_repo_with_file();
         let branch = "feat/cleanup";
