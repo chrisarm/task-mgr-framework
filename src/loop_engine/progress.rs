@@ -26,15 +26,21 @@ const MILESTONE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 ///
 /// Appends a structured entry in the format:
 /// ```text
-/// ## [timestamp] - Iteration N
+/// ## [timestamp] - Iteration N [Slot M]
 /// - Task: TASK-ID
 /// - Outcome: Completed|Blocked|Crash|etc.
 /// - Files: file1.rs, file2.rs
 /// ---
 /// ```
 ///
+/// `slot` is `None` for sequential iterations and `Some(index)` for parallel
+/// wave slots (FEAT-010). Slot lines are written sequentially on the main
+/// thread after the wave completes — log_iteration is not called from worker
+/// threads.
+///
 /// Errors are logged to stderr but don't propagate — progress logging
 /// should never crash the loop.
+#[allow(clippy::too_many_arguments)]
 pub fn log_iteration(
     progress_path: &Path,
     iteration: u32,
@@ -43,6 +49,7 @@ pub fn log_iteration(
     files: &[String],
     model: Option<&str>,
     effort: Option<&str>,
+    slot: Option<usize>,
 ) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let task = task_id.unwrap_or("(none)");
@@ -54,10 +61,26 @@ pub fn log_iteration(
     };
     let model_display = model.unwrap_or("(default)");
     let effort_display = effort.unwrap_or("(default)");
+    let header_suffix = match slot {
+        Some(idx) => format!(" Slot {}", idx),
+        None => String::new(),
+    };
+    let slot_line = match slot {
+        Some(idx) => format!("- Slot: {}\n", idx),
+        None => String::new(),
+    };
 
     let entry = format!(
-        "\n## {} - Iteration {}\n- Task: {}\n- Model: {}\n- Effort: {}\n- Outcome: {}\n- Files: {}\n---\n",
-        timestamp, iteration, task, model_display, effort_display, outcome_str, files_str
+        "\n## {} - Iteration {}{}\n{}- Task: {}\n- Model: {}\n- Effort: {}\n- Outcome: {}\n- Files: {}\n---\n",
+        timestamp,
+        iteration,
+        header_suffix,
+        slot_line,
+        task,
+        model_display,
+        effort_display,
+        outcome_str,
+        files_str
     );
 
     match OpenOptions::new()
@@ -515,6 +538,7 @@ mod tests {
             &["src/lib.rs".to_string()],
             None,
             None,
+            None,
         );
 
         assert!(progress_path.exists());
@@ -542,6 +566,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
         log_iteration(
             &progress_path,
@@ -549,6 +574,7 @@ mod tests {
             Some("FEAT-002"),
             &IterationOutcome::Blocked,
             &[],
+            None,
             None,
             None,
         );
@@ -572,6 +598,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -589,6 +616,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
             None,
             None,
         );
@@ -610,6 +638,7 @@ mod tests {
             &["src/a.rs".to_string(), "src/b.rs".to_string()],
             None,
             None,
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
@@ -627,6 +656,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         );
     }
 
@@ -641,6 +671,7 @@ mod tests {
             Some("FEAT-001"),
             &IterationOutcome::Completed,
             &[],
+            None,
             None,
             None,
         );
@@ -663,11 +694,65 @@ mod tests {
             &[],
             Some(SONNET_MODEL),
             Some("xhigh"),
+            None,
         );
 
         let content = fs::read_to_string(&progress_path).unwrap();
         assert!(content.contains(&format!("- Model: {SONNET_MODEL}")));
         assert!(content.contains("- Effort: xhigh"));
+    }
+
+    #[test]
+    fn test_log_iteration_with_slot_renders_slot_header_and_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        log_iteration(
+            &progress_path,
+            7,
+            Some("FEAT-042"),
+            &IterationOutcome::Completed,
+            &["src/a.rs".to_string()],
+            None,
+            None,
+            Some(2),
+        );
+
+        let content = fs::read_to_string(&progress_path).unwrap();
+        // Header gets " Slot N" suffix; a body "- Slot: N" line is also added
+        // so consumers can grep on either field.
+        assert!(
+            content.contains("Iteration 7 Slot 2"),
+            "expected slot suffix in header, got: {content}"
+        );
+        assert!(
+            content.contains("- Slot: 2"),
+            "expected slot body line, got: {content}"
+        );
+        assert!(content.contains("FEAT-042"));
+    }
+
+    #[test]
+    fn test_log_iteration_without_slot_omits_slot_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let progress_path = temp_dir.path().join("progress.txt");
+
+        log_iteration(
+            &progress_path,
+            7,
+            Some("FEAT-042"),
+            &IterationOutcome::Completed,
+            &[],
+            None,
+            None,
+            None,
+        );
+
+        let content = fs::read_to_string(&progress_path).unwrap();
+        assert!(
+            !content.contains("Slot"),
+            "sequential iterations must not emit any Slot field, got: {content}"
+        );
     }
 
     // --- format_outcome tests ---
