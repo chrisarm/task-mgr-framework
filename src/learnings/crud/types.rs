@@ -89,6 +89,10 @@ pub struct EditLearningParams {
     pub add_errors: Option<Vec<String>>,
     /// Error patterns to remove
     pub remove_errors: Option<Vec<String>>,
+    /// ID of an existing learning that this edit makes this learning supersede.
+    /// When set, a supersession row is inserted and the old learning's confidence
+    /// is downgraded to `low`.
+    pub supersedes: Option<i64>,
 }
 
 impl EditLearningParams {
@@ -107,6 +111,7 @@ impl EditLearningParams {
             || self.remove_task_types.is_some()
             || self.add_errors.is_some()
             || self.remove_errors.is_some()
+            || self.supersedes.is_some()
     }
 }
 

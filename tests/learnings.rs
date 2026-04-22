@@ -1041,6 +1041,7 @@ fn test_e2e_learn_auto_populate_then_recall_for_task() {
             errors: None,
             tags: None,
             confidence: CliConfidence::High,
+            supersedes: None,
         },
     )
     .unwrap();

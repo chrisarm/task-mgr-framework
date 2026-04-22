@@ -1264,3 +1264,272 @@ fn test_edit_learning_only_new_fields_no_existing_fields() {
         Some(vec!["compile error".to_string()])
     );
 }
+
+// ============ TEST-INIT-002: Supersession CRUD tests ============
+//
+// Tests define the contract for FEAT-004 (`--supersedes <old-id>` flag on
+// Learn and EditLearning CLI variants). The CRUD-layer behaviors tested here:
+//
+//   - AC5: self-supersession (old_id == new_id) rejected with clear error
+//   - AC6: superseding a non-existent learning ID is rejected
+//   - AC10: superseding a retired learning IS allowed (retirement ≠ deletion)
+//
+// Structural / DB-level invariants (FK rejection of missing IDs; cascade delete;
+// UNIQUE pair) live in `src/db/migrations/v17.rs` tests. The tests below sit at
+// the CRUD layer where FEAT-004's `RecordLearningParams.supersedes` /
+// `EditLearningParams.supersedes` will plug in.
+//
+// Tests requiring the not-yet-added field are `#[ignore]`d with a note on the
+// exact change FEAT-004 must make to re-enable each one.
+
+use crate::db::migrations::run_migrations;
+
+/// Setup that runs migrations so the v17 `learning_supersessions` table exists.
+/// The existing `setup_db()` above applies only `create_schema()`.
+fn setup_db_with_migrations() -> (TempDir, Connection) {
+    let temp_dir = TempDir::new().unwrap();
+    let mut conn = open_connection(temp_dir.path()).unwrap();
+    create_schema(&conn).unwrap();
+    run_migrations(&mut conn).unwrap();
+    (temp_dir, conn)
+}
+
+fn record_minimal(conn: &Connection, title: &str) -> i64 {
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: title.to_string(),
+        content: "content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: None,
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::Medium,
+    };
+    record_learning(conn, params).unwrap().learning_id
+}
+
+/// AC6 (DB-level): FK constraint rejects supersession pointing at a non-existent
+/// `old_learning_id`. This guard holds regardless of FEAT-004 — it is the DB's
+/// last line of defense. Active (not ignored) so any schema regression surfaces.
+#[test]
+fn test_supersede_nonexistent_old_learning_rejected_by_fk() {
+    let (_temp_dir, conn) = setup_db_with_migrations();
+    conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+    let new_id = record_minimal(&conn, "New learning");
+
+    let result = conn.execute(
+        "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+        [9999, new_id],
+    );
+    assert!(
+        result.is_err(),
+        "FK on old_learning_id must reject insert referencing nonexistent learning id=9999"
+    );
+}
+
+/// AC6 (symmetric): FK constraint rejects supersession pointing at a non-existent
+/// `new_learning_id`. Both sides are CASCADE-typed FKs, so both must reject.
+#[test]
+fn test_supersede_nonexistent_new_learning_rejected_by_fk() {
+    let (_temp_dir, conn) = setup_db_with_migrations();
+    conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+    let old_id = record_minimal(&conn, "Old learning");
+
+    let result = conn.execute(
+        "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+        [old_id, 9999],
+    );
+    assert!(
+        result.is_err(),
+        "FK on new_learning_id must reject insert referencing nonexistent learning id=9999"
+    );
+}
+
+/// AC10: Superseding a retired learning IS allowed. Retirement hides a learning
+/// from recall but does NOT delete it — supersession rows must still be creatable
+/// with a retired learning as the `old_learning_id`. This invariant is DB-level
+/// (no WHERE retired_at IS NULL anywhere on the FK), so it holds today and must
+/// continue to hold after FEAT-004 adds an app-level validation layer — FEAT-004
+/// MUST NOT add a `retired_at IS NULL` guard to the supersedes check.
+#[test]
+fn test_supersede_retired_learning_is_allowed() {
+    use crate::learnings::test_helpers::retire_learning;
+
+    let (_temp_dir, conn) = setup_db_with_migrations();
+    let old_id = record_minimal(&conn, "Old retired");
+    let new_id = record_minimal(&conn, "New replacement");
+
+    retire_learning(&conn, old_id);
+
+    let result = conn.execute(
+        "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+        [old_id, new_id],
+    );
+    assert!(
+        result.is_ok(),
+        "superseding a retired learning must be allowed at the DB layer; got {:?}",
+        result.err()
+    );
+
+    // And the row persists — retirement did not cascade-delete it.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learning_supersessions WHERE old_learning_id = ?1 AND new_learning_id = ?2",
+            [old_id, new_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "supersession row must persist after retiring the old learning"
+    );
+}
+
+/// AC5: Self-supersession (old_id == new_id) MUST be rejected with a clear error.
+///
+/// This is an APP-LEVEL check — the DB schema intentionally omits a CHECK
+/// constraint so the CLI can return a human-readable `TaskMgrError` message.
+/// `edit_learning()` enforces this when `params.supersedes == Some(learning_id)`.
+#[test]
+fn test_self_supersession_rejected_with_clear_error() {
+    let (_temp_dir, conn) = setup_db_with_migrations();
+    let id = record_minimal(&conn, "Target");
+
+    let params = EditLearningParams {
+        supersedes: Some(id),
+        ..Default::default()
+    };
+    let err = edit_learning(&conn, id, params).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("supersede"),
+        "error message must mention supersede, got: {msg}"
+    );
+    assert!(
+        msg.contains(&id.to_string()),
+        "error message must name the offending id {id}, got: {msg}"
+    );
+
+    // And no supersession row was inserted.
+    let row_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learning_supersessions WHERE old_learning_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        row_count, 0,
+        "self-supersession must NOT insert a supersession row"
+    );
+}
+
+/// AC6 (app-level mirror): superseding a non-existent learning ID surfaces a
+/// clear `Learning not found` error BEFORE the FK constraint fires — so the
+/// user sees a friendly message that names the missing id instead of a raw
+/// SQLite constraint failure.
+#[test]
+fn test_supersede_nonexistent_id_surfaces_clear_app_error() {
+    let (_temp_dir, conn) = setup_db_with_migrations();
+    conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+    let new_id = record_minimal(&conn, "New learning");
+
+    let params = EditLearningParams {
+        supersedes: Some(9999),
+        ..Default::default()
+    };
+    let err = edit_learning(&conn, new_id, params).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("9999"),
+        "error must name the missing id, got: {msg}"
+    );
+    assert!(
+        msg.contains("not found") || msg.contains("does not exist"),
+        "error must indicate the learning is missing, got: {msg}"
+    );
+}
+
+// ============ FEAT-004 app-layer supersession tests ============
+
+/// Happy path: `edit_learning(..., supersedes: Some(old_id))` inserts a
+/// supersession row AND downgrades the old learning's confidence to `low`.
+#[test]
+fn test_edit_learning_supersedes_inserts_row_and_downgrades_confidence() {
+    let (_temp_dir, conn) = setup_db_with_migrations();
+
+    // Old learning starts at `high` confidence — must end at `low`.
+    let old_id = {
+        let params = RecordLearningParams {
+            outcome: LearningOutcome::Pattern,
+            title: "Old learning".to_string(),
+            content: "old content".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files: None,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::High,
+        };
+        record_learning(&conn, params).unwrap().learning_id
+    };
+    let new_id = record_minimal(&conn, "New learning");
+
+    let params = EditLearningParams {
+        supersedes: Some(old_id),
+        ..Default::default()
+    };
+    let result = edit_learning(&conn, new_id, params).unwrap();
+    assert!(
+        result.updated_fields.iter().any(|f| f == "supersedes"),
+        "updated_fields must include 'supersedes', got: {:?}",
+        result.updated_fields
+    );
+
+    // Supersession row inserted.
+    let row_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learning_supersessions \
+             WHERE old_learning_id = ?1 AND new_learning_id = ?2",
+            rusqlite::params![old_id, new_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "exactly one supersession row must be inserted"
+    );
+
+    // Old learning's confidence downgraded to 'low'.
+    let old_confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM learnings WHERE id = ?1",
+            [old_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_confidence, "low",
+        "old learning confidence must be downgraded to 'low'"
+    );
+
+    // New learning's confidence untouched.
+    let new_confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM learnings WHERE id = ?1",
+            [new_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        new_confidence, "medium",
+        "new learning confidence must NOT be altered by supersession"
+    );
+}

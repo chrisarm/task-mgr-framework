@@ -445,28 +445,28 @@ pub(crate) fn spawn_claude(
     // what triggers the post-completion kill.
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let timed_out_flag = Arc::new(AtomicBool::new(false));
-    let watchdog_handle =
-        if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some() {
-            let stop = Arc::clone(&stop_watchdog);
-            let flag = signal_flag.cloned();
-            let timeout_cfg = timeout;
-            let timed_out = Arc::clone(&timed_out_flag);
-            let epoch = Arc::clone(&completion_epoch);
-            let target = target_task_id.map(str::to_owned);
-            Some(std::thread::spawn(move || {
-                watchdog_loop(
-                    child_pid,
-                    flag.as_ref(),
-                    &stop,
-                    timeout_cfg.as_ref(),
-                    &timed_out,
-                    Some(&epoch),
-                    target.as_deref(),
-                );
-            }))
-        } else {
-            None
-        };
+    let watchdog_handle = if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some()
+    {
+        let stop = Arc::clone(&stop_watchdog);
+        let flag = signal_flag.cloned();
+        let timeout_cfg = timeout;
+        let timed_out = Arc::clone(&timed_out_flag);
+        let epoch = Arc::clone(&completion_epoch);
+        let target = target_task_id.map(str::to_owned);
+        Some(std::thread::spawn(move || {
+            watchdog_loop(
+                child_pid,
+                flag.as_ref(),
+                &stop,
+                timeout_cfg.as_ref(),
+                &timed_out,
+                Some(&epoch),
+                target.as_deref(),
+            );
+        }))
+    } else {
+        None
+    };
 
     // In PTY mode, reads come from our master fd (child wrote via the slave end);
     // otherwise they come from the piped stdout. Both implement `Read`; we box to
@@ -3404,7 +3404,9 @@ mod tests {
         // Should be a no-op, no panic.
         cleanup_title_artifact_sync(uuid::Uuid::new_v4(), None);
 
-        if let Some(v) = previous { unsafe { std::env::set_var("HOME", v) } }
+        if let Some(v) = previous {
+            unsafe { std::env::set_var("HOME", v) }
+        }
     }
 
     /// Target file never written (Claude crashed before writing ai-title):

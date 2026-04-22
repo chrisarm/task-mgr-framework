@@ -1481,3 +1481,242 @@ fn test_fts5_backend_tag_search_no_false_positives() {
         "FTS5 must not return a learning tagged 'database-sql' when searching 'chrono'"
     );
 }
+
+// ========== TEST-INIT-002: Supersession filter tests ==========
+//
+// Tests the contract that recall (via backends) must exclude superseded learnings
+// by default, and include them only when `include_superseded: true`.
+//
+// Structural tests (supersession row insertable, table accessible) run now against
+// the v17 schema. Behavioral tests are `#[ignore]`d until FEAT-005 adds the
+// `include_superseded: bool` field to `RetrievalQuery` and wires the NOT IN filter
+// into FTS5 / Patterns / Vector backends.
+//
+// The behavioral tests deliberately use only currently-available API surfaces so
+// the file compiles today; when FEAT-005 lands, each test's body will need the
+// one-line change documented in its comment (set `include_superseded: true` where
+// noted) and the `#[ignore]` removed.
+
+/// Inserts a supersession row linking `old_id` → `new_id` via direct SQL. Used by
+/// the supersession filter tests; FEAT-004 will add a higher-level CRUD helper.
+fn insert_supersession(conn: &Connection, old_id: i64, new_id: i64) {
+    conn.execute(
+        "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+        [old_id, new_id],
+    )
+    .unwrap();
+}
+
+/// Structural test that the v17 table is reachable from retrieval tests.
+/// Always-active guard — fails loudly if the migration is rolled back or renamed.
+#[test]
+fn test_supersession_row_is_insertable_after_migrations() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    let old_id = create_test_learning(&conn, "Old", "content", LearningOutcome::Pattern);
+    let new_id = create_test_learning(&conn, "New", "content", LearningOutcome::Pattern);
+
+    insert_supersession(&conn, old_id, new_id);
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM learning_supersessions WHERE old_learning_id = ?1 AND new_learning_id = ?2",
+            [old_id, new_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// AC: superseded learning excluded from recall results (default behavior).
+///
+/// Uses FTS5 backend with a text query that matches the old title. With the
+/// default `include_superseded: false`, `execute_fts5_query` filters out the
+/// superseded learning via the `NOT IN (SELECT old_learning_id ...)` clause.
+#[test]
+fn test_supersession_excluded_from_fts5_recall_by_default() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    let old_id = create_test_learning(
+        &conn,
+        "Old pattern",
+        "unique-supersede-marker content",
+        LearningOutcome::Pattern,
+    );
+    let new_id = create_test_learning(
+        &conn,
+        "New pattern",
+        "unique-supersede-marker content",
+        LearningOutcome::Pattern,
+    );
+    insert_supersession(&conn, old_id, new_id);
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("unique-supersede-marker".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    let ids: Vec<Option<i64>> = results.iter().map(|r| r.learning.id).collect();
+    assert!(
+        !ids.contains(&Some(old_id)),
+        "superseded learning (id={old_id}) must NOT appear in default recall results; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&Some(new_id)),
+        "superseding learning (id={new_id}) MUST appear in recall results; got {ids:?}"
+    );
+}
+
+/// AC: superseded learning excluded from patterns backend recall (file match path).
+#[test]
+fn test_supersession_excluded_from_patterns_recall_by_default() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    let old_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "Old DB pattern".to_string(),
+        content: "Use transactions".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    let old_id = record_learning(&conn, old_params).unwrap().learning_id;
+
+    let new_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "New DB pattern".to_string(),
+        content: "Use savepoints".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    let new_id = record_learning(&conn, new_params).unwrap().learning_id;
+    insert_supersession(&conn, old_id, new_id);
+
+    let backend = PatternsBackend;
+    let query = RetrievalQuery {
+        task_files: vec!["src/db/schema.rs".to_string()],
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    let ids: Vec<Option<i64>> = results.iter().map(|r| r.learning.id).collect();
+    assert!(
+        !ids.contains(&Some(old_id)),
+        "superseded learning (id={old_id}) must NOT appear in patterns recall; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&Some(new_id)),
+        "superseding learning (id={new_id}) MUST appear in patterns recall; got {ids:?}"
+    );
+}
+
+/// AC: `--include-superseded` flag includes superseded learning in results.
+///
+/// With `include_superseded: true`, backends skip the NOT IN (supersessions)
+/// filter and return all learnings regardless of supersession status.
+#[test]
+fn test_include_superseded_flag_returns_superseded_learning() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    let old_id = create_test_learning(
+        &conn,
+        "Old pattern",
+        "include-flag-marker content",
+        LearningOutcome::Pattern,
+    );
+    let new_id = create_test_learning(
+        &conn,
+        "New pattern",
+        "include-flag-marker content",
+        LearningOutcome::Pattern,
+    );
+    insert_supersession(&conn, old_id, new_id);
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("include-flag-marker".to_string()),
+        limit: 10,
+        include_superseded: true,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    let ids: Vec<Option<i64>> = results.iter().map(|r| r.learning.id).collect();
+    assert!(
+        ids.contains(&Some(old_id)),
+        "with include_superseded=true, superseded learning (id={old_id}) MUST appear; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&Some(new_id)),
+        "with include_superseded=true, superseding learning (id={new_id}) MUST appear; got {ids:?}"
+    );
+}
+
+/// AC: transitive supersession (A->B->C) correctly filters both A and B.
+///
+/// A chain A→B→C means B supersedes A, and C supersedes B. Default recall
+/// must exclude BOTH A and B, returning only C. This guards against a naive
+/// single-hop filter that only hides the most-recently-superseded learning.
+#[test]
+fn test_supersession_filter_is_transitive_over_chain() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    let a_id = create_test_learning(
+        &conn,
+        "A",
+        "transitive-chain body",
+        LearningOutcome::Pattern,
+    );
+    let b_id = create_test_learning(
+        &conn,
+        "B",
+        "transitive-chain body",
+        LearningOutcome::Pattern,
+    );
+    let c_id = create_test_learning(
+        &conn,
+        "C",
+        "transitive-chain body",
+        LearningOutcome::Pattern,
+    );
+    insert_supersession(&conn, a_id, b_id); // B supersedes A
+    insert_supersession(&conn, b_id, c_id); // C supersedes B
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("transitive-chain".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    let ids: Vec<Option<i64>> = results.iter().map(|r| r.learning.id).collect();
+    assert!(
+        !ids.contains(&Some(a_id)),
+        "A (id={a_id}) is superseded by B — must be excluded; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&Some(b_id)),
+        "B (id={b_id}) is superseded by C — must be excluded; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&Some(c_id)),
+        "C (id={c_id}) is the terminal supersession — must appear; got {ids:?}"
+    );
+}

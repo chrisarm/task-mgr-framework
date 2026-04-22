@@ -410,6 +410,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             errors,
             tags,
             confidence,
+            supersedes,
         } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -427,6 +428,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 errors,
                 tags,
                 confidence,
+                supersedes,
             };
 
             let result = learn(&conn, Some(&cli.dir), params)?;
@@ -441,6 +443,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             tags,
             outcome,
             limit,
+            include_superseded,
         } => {
             use task_mgr::loop_engine::project_config::read_project_config;
 
@@ -455,6 +458,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 limit,
                 ollama_url: proj_config.ollama_url,
                 embedding_model: proj_config.embedding_model,
+                include_superseded,
             };
 
             let result = recall(&conn, params)?;
@@ -643,6 +647,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             remove_task_types,
             add_errors,
             remove_errors,
+            supersedes,
         } => {
             let _lock = LockGuard::acquire(&cli.dir)?;
             let conn = open_connection(&cli.dir)?;
@@ -667,6 +672,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 remove_task_types,
                 add_errors,
                 remove_errors,
+                supersedes,
             };
 
             let result = edit_learning(&conn, learning_id, params)?;

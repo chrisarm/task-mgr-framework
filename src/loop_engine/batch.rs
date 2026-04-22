@@ -80,6 +80,36 @@ fn expand_glob(pattern: &str) -> TaskMgrResult<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn has_glob_chars(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[')
+}
+
+/// Resolve a pattern relative to `base`, returning matched file paths.
+///
+/// For literal paths (no glob metacharacters), checks existence directly.
+/// For glob patterns, uses `globwalk` with the absolute path.
+fn expand_glob_from(base: &Path, pattern: &str) -> TaskMgrResult<Vec<PathBuf>> {
+    if !has_glob_chars(pattern) {
+        let candidate = base.join(pattern);
+        if candidate.exists() {
+            return Ok(vec![candidate]);
+        }
+        return Err(TaskMgrError::invalid_state(
+            "batch",
+            "glob pattern",
+            "at least one matching file",
+            format!(
+                "no files matched pattern '{}' in {}",
+                pattern,
+                base.display()
+            ),
+        ));
+    }
+
+    let absolute = format!("{}/{}", base.display(), pattern);
+    expand_glob(&absolute)
+}
+
 /// Derive prompt file path from PRD file path.
 ///
 /// Strips `.json` extension and appends `-prompt.md`.
@@ -275,17 +305,62 @@ fn push_remaining_skipped(
 ///
 /// Processes all patterns in order, canonicalises each path to deduplicate
 /// across overlapping globs, then returns a sorted list.
-fn collect_prd_files(patterns: &[String]) -> TaskMgrResult<Vec<PathBuf>> {
+///
+/// When a relative pattern finds no local matches, falls back to searching
+/// sibling git worktrees for the same relative path.
+fn collect_prd_files(patterns: &[String], project_root: &Path) -> TaskMgrResult<Vec<PathBuf>> {
     let mut prd_files: Vec<PathBuf> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut other_roots: Option<Vec<PathBuf>> = None;
 
     for pattern in patterns {
-        let files = expand_glob(pattern)?;
-        for file in files {
-            let canonical = std::fs::canonicalize(&file).unwrap_or(file);
-            if seen.insert(canonical.clone()) {
-                prd_files.push(canonical);
+        match expand_glob(pattern) {
+            Ok(files) => {
+                for file in files {
+                    let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+                    if seen.insert(canonical.clone()) {
+                        prd_files.push(canonical);
+                    }
+                }
             }
+            Err(_) if !Path::new(pattern).is_absolute() => {
+                let roots =
+                    other_roots.get_or_insert_with(|| worktree::list_other_roots(project_root));
+
+                let mut found_any = false;
+                for root in roots.iter() {
+                    if let Ok(files) = expand_glob_from(root, pattern) {
+                        if !found_any {
+                            eprintln!(
+                                "Note: '{}' not found locally; using files from worktree {}",
+                                pattern,
+                                root.display()
+                            );
+                        }
+                        found_any = true;
+                        for file in files {
+                            let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+                            if seen.insert(canonical.clone()) {
+                                prd_files.push(canonical);
+                            }
+                        }
+                    }
+                }
+
+                if !found_any {
+                    return Err(TaskMgrError::invalid_state(
+                        "batch",
+                        "glob pattern",
+                        "at least one matching file",
+                        format!(
+                            "no files matched pattern '{}' (also checked {} worktree(s))",
+                            pattern,
+                            roots.len()
+                        ),
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 
@@ -380,7 +455,7 @@ pub async fn run_batch(
     chain: bool,
 ) -> BatchResult {
     // Step 1: Expand all patterns, deduplicate, and sort
-    let prd_files = match collect_prd_files(patterns) {
+    let prd_files = match collect_prd_files(patterns, project_root) {
         Ok(files) => files,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -1125,6 +1200,83 @@ mod tests {
             results[1].chain_base.as_deref(),
             results[0].branch_name.as_deref(),
             "chain_base must equal previous PRD's branch_name"
+        );
+    }
+
+    // --- worktree fallback tests ---
+
+    static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_collect_prd_files_finds_files_in_worktree() {
+        use crate::loop_engine::test_utils::setup_git_repo_with_file;
+
+        let _lock = CWD_MUTEX.lock().unwrap();
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path();
+
+        // Create a worktree with a tasks/ dir containing a PRD
+        let wt_path = worktree::ensure_worktree(project_root, "feat/wt-test", true, None)
+            .expect("create worktree");
+        let wt_tasks = wt_path.join("tasks");
+        fs::create_dir_all(&wt_tasks).expect("create tasks dir");
+        fs::write(wt_tasks.join("my-prd.json"), "{}").expect("write prd");
+
+        // From main worktree, tasks/my-prd.json doesn't exist locally
+        let patterns = vec!["tasks/my-prd.json".to_string()];
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let result = collect_prd_files(&patterns, project_root);
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "should find file in worktree: {:?}",
+            result.err()
+        );
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].to_string_lossy().contains("my-prd.json"),
+            "found file should be my-prd.json, got: {}",
+            files[0].display()
+        );
+    }
+
+    #[test]
+    fn test_collect_prd_files_prefers_local_over_worktree() {
+        use crate::loop_engine::test_utils::setup_git_repo_with_file;
+
+        let _lock = CWD_MUTEX.lock().unwrap();
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path();
+
+        // Create the file locally
+        let local_tasks = project_root.join("tasks");
+        fs::create_dir_all(&local_tasks).expect("create local tasks");
+        fs::write(local_tasks.join("local.json"), r#"{"local":true}"#).expect("write local");
+
+        // Also create it in a worktree
+        let wt_path = worktree::ensure_worktree(project_root, "feat/pref-test", true, None)
+            .expect("create worktree");
+        let wt_tasks = wt_path.join("tasks");
+        fs::create_dir_all(&wt_tasks).expect("create wt tasks");
+        fs::write(wt_tasks.join("local.json"), r#"{"wt":true}"#).expect("write wt");
+
+        let patterns = vec!["tasks/local.json".to_string()];
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let result = collect_prd_files(&patterns, project_root);
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        let files = result.expect("should succeed");
+        assert_eq!(files.len(), 1);
+        // Should be the local file, not the worktree one
+        let content = fs::read_to_string(&files[0]).unwrap();
+        assert!(
+            content.contains("local"),
+            "should use local file, got: {}",
+            content
         );
     }
 }

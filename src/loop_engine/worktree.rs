@@ -78,6 +78,36 @@ pub(crate) fn parse_worktree_list(output: &str) -> Vec<(PathBuf, Option<String>)
     worktrees
 }
 
+/// Return root directories of all git worktrees except `exclude_root`.
+///
+/// Returns an empty vec if git is unavailable or `git worktree list` fails.
+/// Comparison is done on canonicalized paths to handle symlinks and trailing slashes.
+pub(crate) fn list_other_roots(exclude_root: &Path) -> Vec<PathBuf> {
+    let output = match Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(exclude_root)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return vec![],
+    };
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let canonical_exclude = exclude_root.canonicalize().ok();
+
+    parse_worktree_list(&raw)
+        .into_iter()
+        .filter_map(|(path, _branch)| {
+            let canonical = path.canonicalize().ok()?;
+            if canonical_exclude.as_ref() == Some(&canonical) {
+                None
+            } else {
+                Some(path)
+            }
+        })
+        .collect()
+}
+
 /// Create a worktree at `{repo-parent}/{repo-name}-worktrees/{sanitized-branch}/`
 /// if one doesn't already exist for this branch.
 ///
@@ -1224,6 +1254,29 @@ detached
             branch, "feat/phase-2",
             "phase-2 worktree must be on branch 'feat/phase-2', not '{}'",
             branch
+        );
+    }
+
+    #[test]
+    fn test_list_other_roots_excludes_self() {
+        let tmp = setup_git_repo_with_file();
+
+        let wt =
+            ensure_worktree(tmp.path(), "feature/other-root", true, None).expect("create worktree");
+
+        let others = list_other_roots(tmp.path());
+        assert_eq!(others.len(), 1, "should find exactly one other root");
+        assert_eq!(
+            others[0].canonicalize().unwrap(),
+            wt.canonicalize().unwrap(),
+        );
+
+        // From the worktree's perspective, main repo is the "other"
+        let others_from_wt = list_other_roots(&wt);
+        assert_eq!(others_from_wt.len(), 1);
+        assert_eq!(
+            others_from_wt[0].canonicalize().unwrap(),
+            tmp.path().canonicalize().unwrap(),
         );
     }
 }

@@ -6,7 +6,60 @@ use rusqlite::Connection;
 
 use super::read::get_learning;
 use super::types::{EditLearningParams, EditLearningResult};
-use crate::TaskMgrResult;
+use crate::models::Confidence;
+use crate::{TaskMgrError, TaskMgrResult};
+
+/// Applies a supersession: records that `new_learning_id` replaces `old_learning_id`
+/// and downgrades the old learning's confidence to `low`.
+///
+/// Validates that the two IDs differ and that the old learning exists. Returns a
+/// friendly [`TaskMgrError`] on either failure — the caller surfaces it as-is.
+///
+/// # Errors
+///
+/// - `TaskMgrError::InvalidState` when `old_learning_id == new_learning_id`.
+/// - `TaskMgrError::NotFound` when `old_learning_id` does not reference an
+///   existing learning (pre-empting the raw FK constraint failure).
+/// - Any other `rusqlite::Error` surfaced from the INSERT or UPDATE.
+pub fn apply_supersession(
+    conn: &Connection,
+    old_learning_id: i64,
+    new_learning_id: i64,
+) -> TaskMgrResult<()> {
+    if old_learning_id == new_learning_id {
+        return Err(TaskMgrError::invalid_state(
+            "Learning",
+            new_learning_id.to_string(),
+            "supersedes a different learning id",
+            format!("self-supersession (old_id == new_id == {new_learning_id})"),
+        ));
+    }
+
+    // App-level existence check so users see a clean `Learning not found: <id>`
+    // instead of a raw SQLite FK constraint message.
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM learnings WHERE id = ?1",
+        [old_learning_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(TaskMgrError::learning_not_found(
+            old_learning_id.to_string(),
+        ));
+    }
+
+    conn.execute(
+        "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+        rusqlite::params![old_learning_id, new_learning_id],
+    )?;
+
+    conn.execute(
+        "UPDATE learnings SET confidence = ?1 WHERE id = ?2",
+        rusqlite::params![Confidence::Low.as_db_str(), old_learning_id],
+    )?;
+
+    Ok(())
+}
 
 /// Edits an existing learning in the database.
 ///
@@ -208,6 +261,14 @@ pub fn edit_learning(
 
     if tags_added > 0 || tags_removed > 0 {
         updated_fields.push("tags".to_string());
+    }
+
+    // Apply supersession last: if it fails, the other edits above are already
+    // committed (each executes its own auto-commit), and the caller can retry
+    // just the `--supersedes` flag without re-doing the field edits.
+    if let Some(old_id) = params.supersedes {
+        apply_supersession(conn, old_id, learning_id)?;
+        updated_fields.push("supersedes".to_string());
     }
 
     // Get final title (may have been updated)

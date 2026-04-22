@@ -306,11 +306,30 @@ pub fn resolve_paths(
     project_dir: &Path,
     prefix: Option<&str>,
 ) -> TaskMgrResult<ResolvedPaths> {
-    // Resolve PRD file to absolute path
+    // Resolve PRD file to absolute path, falling back to sibling worktrees
     let prd_absolute = if prd_file.is_absolute() {
         prd_file.to_path_buf()
     } else {
-        project_dir.join(prd_file)
+        let local = project_dir.join(prd_file);
+        if local.exists() {
+            local
+        } else {
+            // Try sibling worktrees
+            let mut found = None;
+            for root in super::worktree::list_other_roots(project_dir) {
+                let candidate = root.join(prd_file);
+                if candidate.exists() {
+                    eprintln!(
+                        "Note: '{}' not found locally; using file from worktree {}",
+                        prd_file.display(),
+                        root.display()
+                    );
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.unwrap_or(local)
+        }
     };
 
     if !prd_absolute.exists() {

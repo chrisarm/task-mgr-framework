@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::TaskMgrResult;
 use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
-use crate::learnings::{LearningWriter, RecordLearningParams, RecordLearningResult};
+use crate::learnings::{
+    LearningWriter, RecordLearningParams, RecordLearningResult, apply_supersession,
+};
 use crate::models::{Confidence, LearningOutcome};
 
 /// Parameters for the learn command.
@@ -40,6 +42,10 @@ pub struct LearnParams {
     pub tags: Option<Vec<String>>,
     /// Confidence level for this learning
     pub confidence: CliConfidence,
+    /// ID of an existing learning that this new learning supersedes.
+    /// On record: the old learning's confidence is downgraded to `low` and a row
+    /// is inserted into `learning_supersessions` so recall can filter it out.
+    pub supersedes: Option<i64>,
 }
 
 /// Result of the learn command.
@@ -161,6 +167,13 @@ pub fn learn(
     let mut writer = LearningWriter::new(db_dir);
     let result = writer.record(conn, record_params)?;
     writer.flush(conn);
+
+    // Supersession happens after record+flush (per the LearningWriter chokepoint
+    // rule): the new learning must exist before we can link it as the `new_id`.
+    if let Some(old_id) = params.supersedes {
+        apply_supersession(conn, old_id, result.learning_id)?;
+    }
+
     Ok(LearnResult::from(result))
 }
 
@@ -218,6 +231,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -254,6 +268,7 @@ mod tests {
             errors: Some(vec!["E0001".to_string()]),
             tags: Some(vec!["rust".to_string(), "database".to_string()]),
             confidence: CliConfidence::High,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -289,6 +304,7 @@ mod tests {
                 errors: None,
                 tags: None,
                 confidence: CliConfidence::Medium,
+                supersedes: None,
             };
 
             let result = learn(&conn, None, params).unwrap();
@@ -313,6 +329,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params);
@@ -404,6 +421,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -438,6 +456,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -478,6 +497,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -515,6 +535,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -550,6 +571,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -595,6 +617,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -634,6 +657,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -678,6 +702,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         // FK constraint: learnings.task_id must reference tasks.id
@@ -714,6 +739,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -752,6 +778,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         // No panic — clean error from FK constraint
@@ -795,6 +822,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         // Even though resolve_task_context errors (missing table),
@@ -838,6 +866,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -876,6 +905,7 @@ mod tests {
             errors: None,
             tags: None,
             confidence: CliConfidence::Medium,
+            supersedes: None,
         };
 
         let result = learn(&conn, None, params).unwrap();
@@ -889,6 +919,99 @@ mod tests {
         assert!(
             !files_json.contains("src/main.rs"),
             "Should NOT contain hardcoded 'src/main.rs'; implementation must query the DB, got: {files_json}"
+        );
+    }
+
+    // ─── FEAT-004: --supersedes flag on learn() ──────────────────────────────
+
+    fn minimal_learn_params(title: &str) -> LearnParams {
+        LearnParams {
+            outcome: CliOutcome::Pattern,
+            title: title.to_string(),
+            content: "content".to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            files: None,
+            task_types: None,
+            errors: None,
+            tags: None,
+            confidence: CliConfidence::Medium,
+            supersedes: None,
+        }
+    }
+
+    /// Happy path: `learn(..., supersedes: Some(old_id))` records the new
+    /// learning, inserts the supersession row, and downgrades the OLD learning's
+    /// confidence to `low`. The new learning keeps its own confidence.
+    #[test]
+    fn test_learn_supersedes_records_new_and_downgrades_old() {
+        let (_dir, conn) = setup_db();
+
+        // Record the "old" learning at high confidence so the downgrade is observable.
+        let mut old_params = minimal_learn_params("Old learning");
+        old_params.confidence = CliConfidence::High;
+        let old_id = learn(&conn, None, old_params).unwrap().learning_id;
+
+        // Record the "new" learning that supersedes the old one.
+        let mut new_params = minimal_learn_params("New learning");
+        new_params.supersedes = Some(old_id);
+        let new_id = learn(&conn, None, new_params).unwrap().learning_id;
+
+        // Supersession row inserted.
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM learning_supersessions \
+                 WHERE old_learning_id = ?1 AND new_learning_id = ?2",
+                rusqlite::params![old_id, new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "one supersession row must be inserted");
+
+        // Old learning downgraded to 'low'.
+        let old_conf: String = conn
+            .query_row(
+                "SELECT confidence FROM learnings WHERE id = ?1",
+                [old_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_conf, "low", "old learning confidence must be 'low'");
+
+        // New learning confidence preserved.
+        let new_conf: String = conn
+            .query_row(
+                "SELECT confidence FROM learnings WHERE id = ?1",
+                [new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_conf, "medium",
+            "new learning confidence must NOT be altered by supersession"
+        );
+    }
+
+    /// Supersession pointing at a non-existent learning id returns a clean
+    /// `Learning not found` error that names the missing id — NOT a raw SQLite
+    /// FK constraint failure.
+    #[test]
+    fn test_learn_supersedes_nonexistent_returns_clear_error() {
+        let (_dir, conn) = setup_db();
+
+        let mut params = minimal_learn_params("New learning");
+        params.supersedes = Some(9999);
+        let err = learn(&conn, None, params).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("9999"),
+            "error must name the missing id, got: {msg}"
+        );
+        assert!(
+            msg.contains("not found") || msg.contains("does not exist"),
+            "error must indicate the learning is missing, got: {msg}"
         );
     }
 }

@@ -41,6 +41,8 @@ pub struct RecallParams {
     pub outcome: Option<LearningOutcome>,
     /// Maximum number of results to return
     pub limit: usize,
+    /// When `false` (default), superseded learnings are excluded from results.
+    pub include_superseded: bool,
 }
 
 /// Result of recalling learnings.
@@ -74,6 +76,34 @@ pub fn recall_learnings_with_backend(
     params: RecallParams,
     backend: &dyn RetrievalBackend,
 ) -> TaskMgrResult<RecallResult> {
+    let scored = retrieve_and_rank(conn, &params, backend)?;
+
+    // Extract learnings
+    let learnings: Vec<Learning> = scored.into_iter().map(|s| s.learning).collect();
+
+    // Note: times_shown is updated by bandit::record_learning_shown() in
+    // loop_engine/prompt.rs — not here. The recall module is retrieval-only.
+
+    Ok(RecallResult {
+        count: learnings.len(),
+        learnings,
+        query: params.query.clone(),
+        for_task: params.for_task.clone(),
+        outcome_filter: params.outcome.map(|o| o.to_string()),
+        tags_filter: params.tags.clone(),
+    })
+}
+
+/// Shared retrieval pipeline: backend lookup + UCB fallback + re-ranking.
+///
+/// Returns `ScoredLearning` rows in final ranked order. Used by both
+/// [`recall_learnings_with_backend`] (which strips scores) and
+/// [`recall_learnings_scored`] (which preserves them).
+fn retrieve_and_rank(
+    conn: &Connection,
+    params: &RecallParams,
+    backend: &dyn RetrievalBackend,
+) -> TaskMgrResult<Vec<ScoredLearning>> {
     let limit = if params.limit == 0 { 5 } else { params.limit };
 
     // Build RetrievalQuery from RecallParams
@@ -82,6 +112,7 @@ pub fn recall_learnings_with_backend(
         limit,
         tags: params.tags.clone(),
         outcome: params.outcome,
+        include_superseded: params.include_superseded,
         ..Default::default()
     };
 
@@ -103,7 +134,8 @@ pub fn recall_learnings_with_backend(
         if scored.len() < limit {
             let exclude_ids: Vec<i64> = scored.iter().filter_map(|s| s.learning.id).collect();
             let remaining = limit - scored.len();
-            let fallback = load_ucb_fallback(conn, &exclude_ids, remaining)?;
+            let fallback =
+                load_ucb_fallback(conn, &exclude_ids, remaining, params.include_superseded)?;
             scored.extend(fallback);
         }
 
@@ -111,20 +143,7 @@ pub fn recall_learnings_with_backend(
         rerank_with_ucb(conn, &mut scored)?;
     }
 
-    // Extract learnings
-    let learnings: Vec<Learning> = scored.into_iter().map(|s| s.learning).collect();
-
-    // Note: times_shown is updated by bandit::record_learning_shown() in
-    // loop_engine/prompt.rs — not here. The recall module is retrieval-only.
-
-    Ok(RecallResult {
-        count: learnings.len(),
-        learnings,
-        query: params.query.clone(),
-        for_task: params.for_task.clone(),
-        outcome_filter: params.outcome.map(|o| o.to_string()),
-        tags_filter: params.tags.clone(),
-    })
+    Ok(scored)
 }
 
 /// Recalls learnings using the default composite backend.
@@ -134,6 +153,97 @@ pub fn recall_learnings_with_backend(
 pub fn recall_learnings(conn: &Connection, params: RecallParams) -> TaskMgrResult<RecallResult> {
     let backend = CompositeBackend::default_backends();
     recall_learnings_with_backend(conn, params, &backend)
+}
+
+/// A scored learning output, preserving numeric retrieval signals.
+///
+/// Output type for [`recall_learnings_scored`]. Unlike [`RecallResult`], this
+/// retains the relevance, UCB, and combined scores alongside the match reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredLearningOutput {
+    /// The retrieved learning
+    pub learning: Learning,
+    /// Backend relevance score (FTS5 BM25, pattern points, or vector cosine)
+    pub relevance_score: f64,
+    /// UCB bandit score (Some for `--for-task` recall, None for free-text recall)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ucb_score: Option<f64>,
+    /// Final ranking score: `relevance_score * 100.0 + ucb_score` for task recall;
+    /// equal to `relevance_score` when no UCB applies.
+    pub combined_score: f64,
+    /// Human-readable explanation of why this matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_reason: Option<String>,
+}
+
+/// Result of [`recall_learnings_scored`] — mirrors [`RecallResult`] but preserves scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredRecallResult {
+    /// The scored learnings that matched the query, ordered by combined_score desc
+    pub scored_learnings: Vec<ScoredLearningOutput>,
+    /// Number of learnings returned
+    pub count: usize,
+    /// The query parameters used (for debugging)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub for_task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_filter: Option<Vec<String>>,
+}
+
+/// Recalls learnings preserving numeric retrieval scores.
+///
+/// Mirrors [`recall_learnings_with_backend`] but keeps the per-row relevance,
+/// UCB, and combined scores produced by the ranking pipeline. For task-based
+/// recall (`params.for_task.is_some()`) every row has `ucb_score = Some(..)`
+/// and `combined_score = relevance_score * 100.0 + ucb_score`. For free-text
+/// recall UCB is skipped entirely: `ucb_score = None` and `combined_score`
+/// equals `relevance_score`.
+pub fn recall_learnings_scored(
+    conn: &Connection,
+    params: RecallParams,
+    backend: &dyn RetrievalBackend,
+) -> TaskMgrResult<ScoredRecallResult> {
+    let scored = retrieve_and_rank(conn, &params, backend)?;
+
+    // Only compute UCB when we actually applied it in ranking — preserves the
+    // invariant that ucb_score is Some iff --for-task recall.
+    let total_window_shows = if params.for_task.is_some() && !scored.is_empty() {
+        Some(bandit::get_total_window_shows(conn)?)
+    } else {
+        None
+    };
+
+    let scored_learnings: Vec<ScoredLearningOutput> = scored
+        .into_iter()
+        .map(|s| {
+            let ucb_score =
+                total_window_shows.map(|total| ucb_for_learning(conn, &s.learning, total));
+            let combined_score = match ucb_score {
+                Some(ucb) => combine_scores(s.relevance_score, ucb),
+                None => s.relevance_score,
+            };
+            ScoredLearningOutput {
+                learning: s.learning,
+                relevance_score: s.relevance_score,
+                ucb_score,
+                combined_score,
+                match_reason: s.match_reason,
+            }
+        })
+        .collect();
+
+    Ok(ScoredRecallResult {
+        count: scored_learnings.len(),
+        scored_learnings,
+        query: params.query.clone(),
+        for_task: params.for_task.clone(),
+        outcome_filter: params.outcome.map(|o| o.to_string()),
+        tags_filter: params.tags.clone(),
+    })
 }
 
 /// Updates times_shown and last_shown_at for the given learnings.
@@ -173,56 +283,51 @@ fn load_ucb_fallback(
     conn: &Connection,
     exclude_ids: &[i64],
     remaining_slots: usize,
+    include_superseded: bool,
 ) -> TaskMgrResult<Vec<ScoredLearning>> {
     if remaining_slots == 0 {
         return Ok(Vec::new());
     }
 
-    // Load all learnings, optionally excluding already-matched IDs
-    let learnings: Vec<Learning> = if exclude_ids.is_empty() {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT id, created_at, task_id, run_id, outcome, title, content,
-                   root_cause, solution,
-                   applies_to_files, applies_to_task_types, applies_to_errors,
-                   confidence, times_shown, times_applied, last_shown_at, last_applied_at
-            FROM learnings
-            WHERE retired_at IS NULL
-            "#,
-        )?;
+    let mut conditions = vec!["retired_at IS NULL".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        stmt.query_map([], |row| {
-            Learning::try_from(row)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    } else {
+    if !include_superseded {
+        conditions.push(format!(
+            "id {}",
+            crate::learnings::retrieval::SUPERSESSION_SUBQUERY
+        ));
+    }
+
+    if !exclude_ids.is_empty() {
         let placeholders: Vec<String> =
             (1..=exclude_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            r#"
-            SELECT id, created_at, task_id, run_id, outcome, title, content,
-                   root_cause, solution,
-                   applies_to_files, applies_to_task_types, applies_to_errors,
-                   confidence, times_shown, times_applied, last_shown_at, last_applied_at
-            FROM learnings
-            WHERE retired_at IS NULL
-            AND id NOT IN ({})
-            "#,
-            placeholders.join(", ")
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = exclude_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        let mut stmt = conn.prepare(&sql)?;
+        conditions.push(format!("id NOT IN ({})", placeholders.join(", ")));
+        for id in exclude_ids {
+            params.push(Box::new(*id));
+        }
+    }
 
-        stmt.query_map(params.as_slice(), |row| {
+    let sql = format!(
+        r#"
+        SELECT id, created_at, task_id, run_id, outcome, title, content,
+               root_cause, solution,
+               applies_to_files, applies_to_task_types, applies_to_errors,
+               confidence, times_shown, times_applied, last_shown_at, last_applied_at
+        FROM learnings
+        WHERE {}
+        "#,
+        conditions.join(" AND ")
+    );
+
+    let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let learnings: Vec<Learning> = stmt
+        .query_map(params_ref.as_slice(), |row| {
             Learning::try_from(row)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Rank by UCB
     let ranked = bandit::rank_learnings_by_ucb(conn, learnings)?;
@@ -239,6 +344,26 @@ fn load_ucb_fallback(
         .collect())
 }
 
+/// Computes the UCB score for a single learning, or 0.0 if stats are unavailable.
+///
+/// Factored out of [`rerank_with_ucb`]'s sort closure so scored output variants
+/// can capture the same values used for ranking.
+fn ucb_for_learning(conn: &Connection, learning: &Learning, total_window_shows: i64) -> f64 {
+    learning
+        .id
+        .and_then(|id| bandit::get_window_stats(conn, id).ok())
+        .map(|stats| bandit::calculate_ucb_score(&stats, learning.confidence, total_window_shows))
+        .unwrap_or(0.0)
+}
+
+/// Combines relevance and UCB into the final ranking score.
+///
+/// Pattern-matched learnings (relevance 2/5/10) always outrank fallback (0.1)
+/// because the `* 100.0` scale separates tiers cleanly.
+fn combine_scores(relevance_score: f64, ucb_score: f64) -> f64 {
+    relevance_score * 100.0 + ucb_score
+}
+
 /// Re-ranks scored learnings so relevance tier dominates and UCB breaks ties.
 ///
 /// Sort key: `relevance_score * 100.0 + ucb_score`. Pattern-matched learnings
@@ -252,26 +377,14 @@ fn rerank_with_ucb(conn: &Connection, scored: &mut [ScoredLearning]) -> TaskMgrR
     let total_window_shows = bandit::get_total_window_shows(conn)?;
 
     scored.sort_by(|a, b| {
-        let ucb_a = a
-            .learning
-            .id
-            .and_then(|id| bandit::get_window_stats(conn, id).ok())
-            .map(|stats| {
-                bandit::calculate_ucb_score(&stats, a.learning.confidence, total_window_shows)
-            })
-            .unwrap_or(0.0);
-
-        let ucb_b = b
-            .learning
-            .id
-            .and_then(|id| bandit::get_window_stats(conn, id).ok())
-            .map(|stats| {
-                bandit::calculate_ucb_score(&stats, b.learning.confidence, total_window_shows)
-            })
-            .unwrap_or(0.0);
-
-        let score_a = a.relevance_score * 100.0 + ucb_a;
-        let score_b = b.relevance_score * 100.0 + ucb_b;
+        let score_a = combine_scores(
+            a.relevance_score,
+            ucb_for_learning(conn, &a.learning, total_window_shows),
+        );
+        let score_b = combine_scores(
+            b.relevance_score,
+            ucb_for_learning(conn, &b.learning, total_window_shows),
+        );
 
         score_b
             .partial_cmp(&score_a)

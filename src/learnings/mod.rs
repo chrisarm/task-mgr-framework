@@ -24,11 +24,12 @@ pub use bandit::{
 };
 pub use crud::{
     DeleteLearningResult, EditLearningParams, EditLearningResult, LearningWriter,
-    RecordLearningParams, RecordLearningResult, delete_learning, edit_learning, format_delete_text,
-    format_edit_text, get_learning, get_learning_tags, record_learning,
+    RecordLearningParams, RecordLearningResult, apply_supersession, delete_learning, edit_learning,
+    format_delete_text, format_edit_text, get_learning, get_learning_tags, record_learning,
 };
 pub use recall::{
-    RecallParams, RecallResult, format_text as format_recall_text, recall_learnings,
+    RecallParams, RecallResult, ScoredLearningOutput, ScoredRecallResult,
+    format_text as format_recall_text, recall_learnings, recall_learnings_scored,
     recall_learnings_with_backend,
 };
 pub use retrieval::{

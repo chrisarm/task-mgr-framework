@@ -136,6 +136,12 @@ fn execute_fts5_query(
         format!("AND {}", conditions.join(" AND "))
     };
 
+    let supersession_clause = if query.include_superseded {
+        String::new()
+    } else {
+        format!("AND l.id {}", super::SUPERSESSION_SUBQUERY)
+    };
+
     // FTS5 query with BM25 scoring
     // bm25() returns a negative score (lower = better match), so we negate it
     let sql = format!(
@@ -151,10 +157,11 @@ fn execute_fts5_query(
         WHERE learnings_fts MATCH ?1
         AND l.retired_at IS NULL
         {}
+        {}
         ORDER BY relevance DESC
         LIMIT ?
         "#,
-        additional_where
+        supersession_clause, additional_where
     );
 
     sql_params.push(Box::new(query.limit as i64));
@@ -194,6 +201,10 @@ fn execute_like_query(
     conditions.push("(title LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\')".to_string());
     let pattern = escape_like_pattern(text);
     sql_params.push(Box::new(pattern));
+
+    if !query.include_superseded {
+        conditions.push(format!("id {}", super::SUPERSESSION_SUBQUERY));
+    }
 
     append_common_filters(query, &mut conditions, &mut sql_params, "id", "outcome");
 
@@ -249,6 +260,10 @@ fn execute_unfiltered_query(
 ) -> TaskMgrResult<Vec<ScoredLearning>> {
     let mut conditions = vec!["retired_at IS NULL".to_string()];
     let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if !query.include_superseded {
+        conditions.push(format!("id {}", super::SUPERSESSION_SUBQUERY));
+    }
 
     append_common_filters(query, &mut conditions, &mut sql_params, "id", "outcome");
 

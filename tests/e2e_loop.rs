@@ -203,6 +203,7 @@ fn test_failure_flow_with_learning() {
             errors: None,
             tags: Some(vec!["api".to_string(), "credentials".to_string()]),
             confidence: Confidence::High,
+            supersedes: None,
         },
     )
     .unwrap();

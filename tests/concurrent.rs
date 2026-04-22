@@ -653,13 +653,14 @@ fn test_doctor_detects_stale_in_progress_task() {
 
     // Check if there are any issues detected
     if let Some(summary) = parsed.get("summary")
-        && let Some(issues) = summary.get("issue_count") {
-            // Should detect the stale in_progress task as an issue
-            assert!(
-                issues.as_i64().unwrap_or(0) >= 0,
-                "Doctor should report issues or healthy state"
-            );
-        }
+        && let Some(issues) = summary.get("issue_count")
+    {
+        // Should detect the stale in_progress task as an issue
+        assert!(
+            issues.as_i64().unwrap_or(0) >= 0,
+            "Doctor should report issues or healthy state"
+        );
+    }
 }
 
 // ============================================================================

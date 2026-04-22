@@ -27,7 +27,9 @@ use crate::loop_engine::prompt_sections::learnings::{
     build_learnings_section, record_shown_learnings,
 };
 use crate::loop_engine::prompt_sections::siblings::build_sibling_prd_section;
-use crate::loop_engine::prompt_sections::synergy::{build_synergy_section, resolve_synergy_cluster};
+use crate::loop_engine::prompt_sections::synergy::{
+    build_synergy_section, resolve_synergy_cluster,
+};
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 
@@ -2419,7 +2421,9 @@ pub enum ApiError {
 
         let base_prompt_path = create_base_prompt(temp_dir.path());
         let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
-        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
 
         assert_eq!(
             result.cluster_effort,
@@ -2451,7 +2455,9 @@ pub enum ApiError {
 
         let base_prompt_path = create_base_prompt(temp_dir.path());
         let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
-        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
 
         assert_eq!(
             result.cluster_effort,
@@ -2468,7 +2474,9 @@ pub enum ApiError {
         insert_task(&conn, "CE-003", "No difficulty", "todo", 5);
         let base_prompt_path = create_base_prompt(temp_dir.path());
         let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
-        let result = build_prompt(&params).unwrap().expect("Should return a prompt");
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
 
         assert_eq!(result.cluster_effort, None);
     }

@@ -54,7 +54,7 @@ impl RetrievalBackend for PatternsBackend {
             return Ok(Vec::new());
         }
 
-        let candidates = load_learnings_with_applicability(conn)?;
+        let candidates = load_learnings_with_applicability(conn, query.include_superseded)?;
         let needs_tags =
             query.tags.as_ref().is_some_and(|t| !t.is_empty()) || !query.task_files.is_empty();
         let tags_map = if needs_tags {
@@ -287,8 +287,19 @@ pub(crate) fn type_prefix_from(task_prefix: &str) -> String {
 }
 
 /// Loads learnings that have applicability metadata.
-fn load_learnings_with_applicability(conn: &Connection) -> TaskMgrResult<Vec<Learning>> {
-    let mut stmt = conn.prepare(
+///
+/// When `include_superseded` is false, filters out learnings whose IDs appear in
+/// `learning_supersessions.old_learning_id`.
+fn load_learnings_with_applicability(
+    conn: &Connection,
+    include_superseded: bool,
+) -> TaskMgrResult<Vec<Learning>> {
+    let supersession_clause = if include_superseded {
+        String::new()
+    } else {
+        format!("AND l.id {}", super::SUPERSESSION_SUBQUERY)
+    };
+    let sql = format!(
         r#"
         SELECT
             l.id, l.created_at, l.task_id, l.run_id, l.outcome, l.title, l.content,
@@ -297,12 +308,15 @@ fn load_learnings_with_applicability(conn: &Connection) -> TaskMgrResult<Vec<Lea
             l.confidence, l.times_shown, l.times_applied, l.last_shown_at, l.last_applied_at
         FROM learnings l
         WHERE l.retired_at IS NULL
+          {}
           AND (l.applies_to_files IS NOT NULL
            OR l.applies_to_task_types IS NOT NULL
            OR l.applies_to_errors IS NOT NULL
            OR EXISTS (SELECT 1 FROM learning_tags lt WHERE lt.learning_id = l.id))
         "#,
-    )?;
+        supersession_clause
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let learnings: Vec<Learning> = stmt
         .query_map([], |row| {

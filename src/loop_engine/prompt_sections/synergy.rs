@@ -360,15 +360,13 @@ mod tests {
         set_difficulty(&conn, "COMB-002", "low");
 
         let defaults = model::ModelResolutionContext::default();
-        let (m, d) = resolve_synergy_cluster(
-            &conn,
-            "COMB-002",
-            None,
-            Some("low"),
-            &defaults,
-        );
+        let (m, d) = resolve_synergy_cluster(&conn, "COMB-002", None, Some("low"), &defaults);
 
-        assert_eq!(d.as_deref(), Some("low"), "no partners → primary difficulty");
+        assert_eq!(
+            d.as_deref(),
+            Some("low"),
+            "no partners → primary difficulty"
+        );
         // Model falls back to None (no defaults supplied, no task_model set).
         assert!(m.is_none(), "no model sources → None");
     }
@@ -391,13 +389,7 @@ mod tests {
         // `difficulty=high` forces Opus regardless of task_model — see
         // `resolve_task_model` semantics.
         let defaults = model::ModelResolutionContext::default();
-        let (m, d) = resolve_synergy_cluster(
-            &conn,
-            "COMB-003",
-            None,
-            Some("medium"),
-            &defaults,
-        );
+        let (m, d) = resolve_synergy_cluster(&conn, "COMB-003", None, Some("medium"), &defaults);
 
         assert_eq!(d.as_deref(), Some("high"), "partner pulls difficulty up");
         assert_eq!(
@@ -418,13 +410,7 @@ mod tests {
         insert_relationship(&conn, "COMB-004", "SYN-COMB-004", "synergyWith");
 
         let defaults = model::ModelResolutionContext::default();
-        let (_m, d) = resolve_synergy_cluster(
-            &conn,
-            "COMB-004",
-            None,
-            Some("medium"),
-            &defaults,
-        );
+        let (_m, d) = resolve_synergy_cluster(&conn, "COMB-004", None, Some("medium"), &defaults);
         assert_eq!(
             d.as_deref(),
             Some("medium"),

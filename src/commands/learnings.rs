@@ -2,6 +2,8 @@
 //!
 //! Provides CLI entry point for listing all learnings from the institutional memory system.
 
+use std::collections::HashMap;
+
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,12 @@ pub struct LearningSummary {
     pub times_shown: i32,
     /// Times marked as applied
     pub times_applied: i32,
+    /// ID of the learning that supersedes this one, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
+    /// IDs of learnings this one supersedes, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<i64>>,
 }
 
 /// Result of the learnings list command.
@@ -115,8 +123,8 @@ pub fn list_learnings(
         .filter_map(|r| r.ok())
         .collect();
 
-    // Convert to summaries
-    let summaries: Vec<LearningSummary> = learnings
+    // Convert to summaries (supersession fields filled below)
+    let mut summaries: Vec<LearningSummary> = learnings
         .into_iter()
         .filter_map(|l| {
             l.id.map(|id| LearningSummary {
@@ -127,9 +135,49 @@ pub fn list_learnings(
                 created_at: l.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                 times_shown: l.times_shown,
                 times_applied: l.times_applied,
+                superseded_by: None,
+                supersedes: None,
             })
         })
         .collect();
+
+    // Batch-query supersessions for all displayed IDs (single query, not N+1).
+    if !summaries.is_empty() {
+        let id_list: Vec<i64> = summaries.iter().map(|s| s.id).collect();
+        // Build an IN clause from integer IDs — safe since these are database-internal i64 values.
+        let id_csv: String = id_list
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sup_sql = format!(
+            "SELECT old_learning_id, new_learning_id FROM learning_supersessions \
+             WHERE old_learning_id IN ({0}) OR new_learning_id IN ({0})",
+            id_csv
+        );
+        let mut sup_stmt = conn.prepare(&sup_sql)?;
+        let id_set: std::collections::HashSet<i64> = id_list.into_iter().collect();
+        let mut superseded_by_map: HashMap<i64, i64> = HashMap::new();
+        let mut supersedes_map: HashMap<i64, Vec<i64>> = HashMap::new();
+        let rows =
+            sup_stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (old_id, new_id) = row?;
+            if id_set.contains(&old_id) {
+                superseded_by_map.insert(old_id, new_id);
+            }
+            if id_set.contains(&new_id) {
+                supersedes_map.entry(new_id).or_default().push(old_id);
+            }
+        }
+        for summary in &mut summaries {
+            summary.superseded_by = superseded_by_map.get(&summary.id).copied();
+            let sups = supersedes_map.remove(&summary.id);
+            if sups.is_some() {
+                summary.supersedes = sups;
+            }
+        }
+    }
 
     let count = summaries.len();
 
@@ -184,13 +232,35 @@ pub fn format_text(result: &LearningsListResult) -> String {
 
     // Table rows
     for learning in &result.learnings {
-        // Truncate title if too long
-        let title = super::truncate_str(&learning.title, 37);
+        let annotation = if let Some(sup_by) = learning.superseded_by {
+            format!(" (superseded by #{})", sup_by)
+        } else if let Some(sups) = &learning.supersedes {
+            if !sups.is_empty() {
+                let ids: Vec<String> = sups.iter().map(|id| format!("#{}", id)).collect();
+                format!(" (supersedes {})", ids.join(", "))
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        // truncate_str(s, N) produces at most N+3 chars when truncated ("..." appended).
+        // We need title + annotation ≤ 40 chars, so max_trunc = 40 - annotation_len - 3.
+        let max_trunc = if annotation.is_empty() {
+            37
+        } else {
+            (40usize.saturating_sub(annotation.len()))
+                .saturating_sub(3)
+                .max(5)
+        };
+        let title = super::truncate_str(&learning.title, max_trunc);
+        let title_col = format!("{}{}", title, annotation);
 
         output.push_str(&format!(
             "{:>4}  {:<40}  {:<10}  {:<8}  {:>5}  {:>7}\n",
             learning.id,
-            title,
+            title_col,
             learning.outcome,
             learning.confidence,
             learning.times_shown,
@@ -381,6 +451,20 @@ mod tests {
         assert_eq!(result.limited_to, Some(100));
     }
 
+    fn make_summary(id: i64, title: &str, outcome: &str) -> LearningSummary {
+        LearningSummary {
+            id,
+            title: title.to_string(),
+            outcome: outcome.to_string(),
+            confidence: "medium".to_string(),
+            created_at: "2026-01-18 12:00:00".to_string(),
+            times_shown: 0,
+            times_applied: 0,
+            superseded_by: None,
+            supersedes: None,
+        }
+    }
+
     #[test]
     fn test_format_text_empty() {
         let result = LearningsListResult {
@@ -403,22 +487,17 @@ mod tests {
             total_including_retired: 2,
             learnings: vec![
                 LearningSummary {
-                    id: 1,
-                    title: "Test failure".to_string(),
-                    outcome: "failure".to_string(),
-                    confidence: "medium".to_string(),
-                    created_at: "2026-01-18 12:00:00".to_string(),
                     times_shown: 5,
                     times_applied: 2,
+                    confidence: "medium".to_string(),
+                    ..make_summary(1, "Test failure", "failure")
                 },
                 LearningSummary {
-                    id: 2,
-                    title: "Test success".to_string(),
-                    outcome: "success".to_string(),
-                    confidence: "high".to_string(),
-                    created_at: "2026-01-18 13:00:00".to_string(),
                     times_shown: 3,
                     times_applied: 1,
+                    confidence: "high".to_string(),
+                    created_at: "2026-01-18 13:00:00".to_string(),
+                    ..make_summary(2, "Test success", "success")
                 },
             ],
             limited_to: None,
@@ -438,15 +517,7 @@ mod tests {
             count: 5,
             total: 20,
             total_including_retired: 20,
-            learnings: vec![LearningSummary {
-                id: 1,
-                title: "Test".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "medium".to_string(),
-                created_at: "2026-01-18 12:00:00".to_string(),
-                times_shown: 0,
-                times_applied: 0,
-            }],
+            learnings: vec![make_summary(1, "Test", "pattern")],
             limited_to: Some(5),
         };
 
@@ -461,22 +532,16 @@ mod tests {
             count: 1,
             total: 1,
             total_including_retired: 1,
-            learnings: vec![LearningSummary {
-                id: 1,
-                title: "This is a very long title that should definitely be truncated to fit in the table".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "medium".to_string(),
-                created_at: "2026-01-18 12:00:00".to_string(),
-                times_shown: 0,
-                times_applied: 0,
-            }],
+            learnings: vec![make_summary(
+                1,
+                "This is a very long title that should definitely be truncated to fit in the table",
+                "pattern",
+            )],
             limited_to: None,
         };
 
         let text = format_text(&result);
-        // Should contain truncated title with "..."
         assert!(text.contains("..."));
-        // Should not contain full title
         assert!(!text.contains("should definitely be truncated to fit in the table"));
     }
 
@@ -490,6 +555,8 @@ mod tests {
             created_at: "2026-01-18 12:00:00".to_string(),
             times_shown: 10,
             times_applied: 5,
+            superseded_by: None,
+            supersedes: None,
         };
 
         let json = serde_json::to_string(&summary).unwrap();
@@ -507,15 +574,7 @@ mod tests {
             count: 1,
             total: 5,
             total_including_retired: 5,
-            learnings: vec![LearningSummary {
-                id: 1,
-                title: "Test".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "medium".to_string(),
-                created_at: "2026-01-18 12:00:00".to_string(),
-                times_shown: 0,
-                times_applied: 0,
-            }],
+            learnings: vec![make_summary(1, "Test", "pattern")],
             limited_to: Some(1),
         };
 
@@ -634,13 +693,8 @@ mod tests {
             total: 1,
             total_including_retired: 3,
             learnings: vec![LearningSummary {
-                id: 1,
-                title: "Active".to_string(),
-                outcome: "pattern".to_string(),
                 confidence: "high".to_string(),
-                created_at: "2026-01-18 12:00:00".to_string(),
-                times_shown: 0,
-                times_applied: 0,
+                ..make_summary(1, "Active", "pattern")
             }],
             limited_to: None,
         };
@@ -661,23 +715,10 @@ mod tests {
             total_including_retired: 2,
             learnings: vec![
                 LearningSummary {
-                    id: 1,
-                    title: "Test".to_string(),
-                    outcome: "pattern".to_string(),
                     confidence: "high".to_string(),
-                    created_at: "2026-01-18 12:00:00".to_string(),
-                    times_shown: 0,
-                    times_applied: 0,
+                    ..make_summary(1, "Test", "pattern")
                 },
-                LearningSummary {
-                    id: 2,
-                    title: "Test 2".to_string(),
-                    outcome: "failure".to_string(),
-                    confidence: "medium".to_string(),
-                    created_at: "2026-01-18 12:00:00".to_string(),
-                    times_shown: 0,
-                    times_applied: 0,
-                },
+                make_summary(2, "Test 2", "failure"),
             ],
             limited_to: None,
         };
@@ -699,15 +740,7 @@ mod tests {
             count: 1,
             total: 1,
             total_including_retired: 3,
-            learnings: vec![LearningSummary {
-                id: 1,
-                title: "Test".to_string(),
-                outcome: "pattern".to_string(),
-                confidence: "medium".to_string(),
-                created_at: "2026-01-18 12:00:00".to_string(),
-                times_shown: 0,
-                times_applied: 0,
-            }],
+            learnings: vec![make_summary(1, "Test", "pattern")],
             limited_to: None,
         };
 
@@ -727,5 +760,194 @@ mod tests {
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("limited_to"));
+    }
+
+    // ========== FEAT-006: Supersession annotation tests ==========
+
+    fn insert_supersession(conn: &Connection, old_id: i64, new_id: i64) {
+        conn.execute(
+            "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
+            rusqlite::params![old_id, new_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_superseded_learning_shows_superseded_by_field() {
+        // AC: learnings list JSON output includes superseded_by when a learning is superseded.
+        let (_temp_dir, conn) = setup_db();
+        let old_id = create_test_learning(&conn, "Old learning", LearningOutcome::Pattern);
+        let new_id = create_test_learning(&conn, "New learning", LearningOutcome::Pattern);
+        insert_supersession(&conn, old_id, new_id);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+
+        let old_summary = result.learnings.iter().find(|s| s.id == old_id).unwrap();
+        assert_eq!(
+            old_summary.superseded_by,
+            Some(new_id),
+            "superseded learning must report superseded_by = new_id"
+        );
+        assert!(
+            old_summary.supersedes.is_none(),
+            "superseded learning must not claim to supersede anything"
+        );
+    }
+
+    #[test]
+    fn test_list_superseding_learning_shows_supersedes_field() {
+        // AC: learnings list JSON output includes supersedes when a learning supersedes another.
+        let (_temp_dir, conn) = setup_db();
+        let old_id = create_test_learning(&conn, "Old learning", LearningOutcome::Pattern);
+        let new_id = create_test_learning(&conn, "New learning", LearningOutcome::Pattern);
+        insert_supersession(&conn, old_id, new_id);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+
+        let new_summary = result.learnings.iter().find(|s| s.id == new_id).unwrap();
+        assert_eq!(
+            new_summary.supersedes,
+            Some(vec![old_id]),
+            "superseding learning must list the old learning ID in supersedes"
+        );
+        assert!(
+            new_summary.superseded_by.is_none(),
+            "superseding learning must not itself be marked as superseded"
+        );
+    }
+
+    #[test]
+    fn test_list_no_annotation_for_unrelated_learning() {
+        // AC: No annotation when learning has no supersession relationship.
+        let (_temp_dir, conn) = setup_db();
+        let id_a = create_test_learning(&conn, "Unrelated A", LearningOutcome::Pattern);
+        let id_b = create_test_learning(&conn, "Linked old", LearningOutcome::Pattern);
+        let id_c = create_test_learning(&conn, "Linked new", LearningOutcome::Pattern);
+        insert_supersession(&conn, id_b, id_c);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+
+        let unrelated = result.learnings.iter().find(|s| s.id == id_a).unwrap();
+        assert!(unrelated.superseded_by.is_none());
+        assert!(unrelated.supersedes.is_none());
+    }
+
+    #[test]
+    fn test_format_text_shows_superseded_by_annotation() {
+        // AC: text output shows '(superseded by #N)' after title when superseded.
+        let result = LearningsListResult {
+            count: 1,
+            total: 1,
+            total_including_retired: 1,
+            learnings: vec![LearningSummary {
+                superseded_by: Some(42),
+                ..make_summary(1, "Old learning", "pattern")
+            }],
+            limited_to: None,
+        };
+
+        let text = format_text(&result);
+        assert!(
+            text.contains("(superseded by #42)"),
+            "text output must contain '(superseded by #42)'"
+        );
+    }
+
+    #[test]
+    fn test_format_text_shows_supersedes_annotation() {
+        // AC: text output shows '(supersedes #N)' after title when superseding another.
+        let result = LearningsListResult {
+            count: 1,
+            total: 1,
+            total_including_retired: 1,
+            learnings: vec![LearningSummary {
+                supersedes: Some(vec![7]),
+                ..make_summary(2, "New learning", "pattern")
+            }],
+            limited_to: None,
+        };
+
+        let text = format_text(&result);
+        assert!(
+            text.contains("(supersedes #7)"),
+            "text output must contain '(supersedes #7)'"
+        );
+    }
+
+    #[test]
+    fn test_format_text_no_annotation_for_plain_learning() {
+        // AC: no annotation when learning has no supersession relationship.
+        let result = LearningsListResult {
+            count: 1,
+            total: 1,
+            total_including_retired: 1,
+            learnings: vec![make_summary(1, "Plain learning", "pattern")],
+            limited_to: None,
+        };
+
+        let text = format_text(&result);
+        assert!(
+            !text.contains("superseded"),
+            "no supersession annotation expected"
+        );
+        assert!(
+            !text.contains("supersedes"),
+            "no supersession annotation expected"
+        );
+    }
+
+    #[test]
+    fn test_json_superseded_by_omitted_when_none() {
+        // AC: JSON output omits superseded_by when not present.
+        let summary = make_summary(1, "Plain", "pattern");
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(
+            !json.contains("superseded_by"),
+            "superseded_by must be absent from JSON when None"
+        );
+        assert!(
+            !json.contains("supersedes"),
+            "supersedes must be absent from JSON when None"
+        );
+    }
+
+    #[test]
+    fn test_json_superseded_by_present_when_set() {
+        // AC: JSON output includes superseded_by and supersedes when applicable.
+        let summary = LearningSummary {
+            superseded_by: Some(99),
+            supersedes: Some(vec![5, 6]),
+            ..make_summary(1, "Linked", "pattern")
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"superseded_by\":99"));
+        assert!(json.contains("\"supersedes\":[5,6]"));
+    }
+
+    #[test]
+    fn test_list_learnings_supersession_batch_query() {
+        // AC: single batch query for all displayed learning IDs (structural — confirmed by
+        // the implementation using a single SQL statement, but we verify correct results
+        // across multiple learnings with mixed supersession states in one call).
+        let (_temp_dir, conn) = setup_db();
+        let id_a = create_test_learning(&conn, "A: superseded", LearningOutcome::Pattern);
+        let id_b = create_test_learning(&conn, "B: superseding", LearningOutcome::Pattern);
+        let id_c = create_test_learning(&conn, "C: plain", LearningOutcome::Success);
+        insert_supersession(&conn, id_a, id_b);
+
+        let result = list_learnings(&conn, LearningsListParams::default()).unwrap();
+        assert_eq!(result.count, 3);
+
+        let a = result.learnings.iter().find(|s| s.id == id_a).unwrap();
+        assert_eq!(a.superseded_by, Some(id_b));
+        assert!(a.supersedes.is_none());
+
+        let b = result.learnings.iter().find(|s| s.id == id_b).unwrap();
+        assert_eq!(b.supersedes, Some(vec![id_a]));
+        assert!(b.superseded_by.is_none());
+
+        let c = result.learnings.iter().find(|s| s.id == id_c).unwrap();
+        assert!(c.superseded_by.is_none());
+        assert!(c.supersedes.is_none());
     }
 }

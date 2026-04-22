@@ -6,9 +6,13 @@
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use super::{RecallParams, RecallResult, format_text, recall_learnings};
+use super::{
+    RecallParams, RecallResult, ScoredLearningOutput, ScoredRecallResult, format_text,
+    recall_learnings, recall_learnings_scored,
+};
 use crate::db::{create_schema, migrations::run_migrations, open_connection};
 use crate::learnings::crud::{RecordLearningParams, record_learning};
+use crate::learnings::retrieval::CompositeBackend;
 use crate::models::{Confidence, Learning, LearningOutcome};
 
 fn setup_db() -> (TempDir, Connection) {
@@ -850,4 +854,422 @@ fn test_apply_learning_works_for_retired() {
         result.is_ok(),
         "apply_learning() must succeed for retired learning by ID (single-record lookup is exempt)"
     );
+}
+
+// ========== TEST-INIT-001: recall_learnings_scored contract ==========
+//
+// Tests define the contract for FEAT-001 (ScoredLearningOutput + scored function)
+// and FEAT-002 (CLI wiring). FEAT-001 has landed — recall_learnings_scored now
+// preserves real backend scores, so the score-contract tests run alongside the
+// structural ones.
+
+/// Creates a task with one touches-file path (used to exercise pattern matching).
+fn insert_task_with_file(conn: &Connection, task_id: &str, file_path: &str) {
+    conn.execute(
+        "INSERT INTO tasks (id, title) VALUES (?1, 'Test Task')",
+        [task_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
+        [task_id, file_path],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_scored_output_has_score_fields() {
+    // AC1: ScoredLearningOutput exposes relevance_score, combined_score, match_reason.
+    // Structural check — compiles iff the fields exist with the declared types.
+    let mut learning = Learning::new(LearningOutcome::Pattern, "t", "c");
+    learning.id = Some(1);
+    let output = ScoredLearningOutput {
+        learning,
+        relevance_score: 1.5,
+        ucb_score: Some(0.25),
+        combined_score: 150.25,
+        match_reason: Some("file match".to_string()),
+    };
+    // Explicit field reads — guards against accidental rename to dummy fields.
+    assert_eq!(output.relevance_score, 1.5);
+    assert_eq!(output.combined_score, 150.25);
+    assert_eq!(output.match_reason.as_deref(), Some("file match"));
+    assert_eq!(output.ucb_score, Some(0.25));
+}
+
+#[test]
+fn test_scored_recall_result_mirrors_recall_result() {
+    // AC1/AC2 structural: ScoredRecallResult has scored_learnings + filter fields.
+    let result = ScoredRecallResult {
+        scored_learnings: vec![],
+        count: 0,
+        query: Some("x".to_string()),
+        for_task: None,
+        outcome_filter: None,
+        tags_filter: Some(vec!["a".into()]),
+    };
+    assert_eq!(result.count, 0);
+    assert!(result.scored_learnings.is_empty());
+    assert_eq!(result.query.as_deref(), Some("x"));
+    assert_eq!(result.tags_filter.as_ref().map(|t| t.len()), Some(1));
+}
+
+#[test]
+fn test_scored_recall_ucb_some_for_task_recall() {
+    // AC2: ucb_score is Some for --for-task recall
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "DB pattern".to_string(),
+        content: "Use transactions".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    assert!(
+        !result.scored_learnings.is_empty(),
+        "expected at least one scored result"
+    );
+    assert!(
+        result
+            .scored_learnings
+            .iter()
+            .any(|s| s.ucb_score.is_some()),
+        "at least one scored result must carry a UCB score for --for-task recall"
+    );
+}
+
+#[test]
+fn test_scored_recall_ucb_none_for_free_text() {
+    // AC2: ucb_score is None for free-text recall (no --for-task)
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    create_test_learning(
+        &conn,
+        "Database error",
+        "SQLite crashed",
+        LearningOutcome::Failure,
+    );
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        query: Some("database".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    assert!(
+        !result.scored_learnings.is_empty(),
+        "text query should match"
+    );
+    assert!(
+        result
+            .scored_learnings
+            .iter()
+            .all(|s| s.ucb_score.is_none()),
+        "free-text recall must NOT compute UCB (ucb_score must be None on every row)"
+    );
+}
+
+#[test]
+fn test_scored_recall_combined_equals_relevance_for_non_task() {
+    // AC3: combined_score == relevance_score when no UCB applies
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    create_test_learning(
+        &conn,
+        "Alpha database",
+        "alpha body",
+        LearningOutcome::Failure,
+    );
+    create_test_learning(
+        &conn,
+        "Beta database",
+        "beta body",
+        LearningOutcome::Success,
+    );
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        query: Some("database".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    assert!(!result.scored_learnings.is_empty());
+    for s in &result.scored_learnings {
+        assert!(
+            (s.combined_score - s.relevance_score).abs() < f64::EPSILON,
+            "non-task recall: combined_score ({}) must equal relevance_score ({}) for learning {:?}",
+            s.combined_score,
+            s.relevance_score,
+            s.learning.id,
+        );
+    }
+}
+
+#[test]
+fn test_scored_recall_monotonicity_combined_score_desc() {
+    // AC4: output order matches combined_score descending
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+
+    // High-relevance learning (file pattern match, score=10)
+    let high_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "High relevance".to_string(),
+        content: "Pattern content".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, high_params).unwrap();
+
+    // Low-relevance learning (no file match, will arrive via UCB fallback)
+    create_test_learning(
+        &conn,
+        "Low relevance",
+        "unrelated content",
+        LearningOutcome::Pattern,
+    );
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    assert!(result.scored_learnings.len() >= 2);
+    for pair in result.scored_learnings.windows(2) {
+        assert!(
+            pair[0].combined_score >= pair[1].combined_score,
+            "combined_score must be non-increasing: {} -> {}",
+            pair[0].combined_score,
+            pair[1].combined_score,
+        );
+    }
+}
+
+#[test]
+fn test_scored_recall_json_round_trip_preserves_all_fields() {
+    // AC5: JSON round-trip serialization preserves all score fields, including None ucb_score.
+    let mut learning_a = Learning::new(LearningOutcome::Pattern, "A", "content-a");
+    learning_a.id = Some(1);
+    let mut learning_b = Learning::new(LearningOutcome::Success, "B", "content-b");
+    learning_b.id = Some(2);
+
+    let original = ScoredRecallResult {
+        scored_learnings: vec![
+            ScoredLearningOutput {
+                learning: learning_a,
+                relevance_score: 10.0,
+                ucb_score: Some(0.7),
+                combined_score: 1000.7,
+                match_reason: Some("file match: src/db/*.rs".to_string()),
+            },
+            ScoredLearningOutput {
+                learning: learning_b,
+                relevance_score: 0.5,
+                ucb_score: None, // Must survive round trip despite skip_serializing_if
+                combined_score: 0.5,
+                match_reason: None,
+            },
+        ],
+        count: 2,
+        query: Some("content".to_string()),
+        for_task: None,
+        outcome_filter: None,
+        tags_filter: None,
+    };
+
+    let json = serde_json::to_string(&original).unwrap();
+    // skip_serializing_if: None ucb_score / match_reason absent from second entry's JSON
+    assert!(
+        json.contains("\"relevance_score\":10.0") || json.contains("\"relevance_score\":10"),
+        "json missing relevance_score=10.0: {}",
+        json
+    );
+    assert!(
+        json.contains("\"combined_score\":1000.7"),
+        "json missing combined_score"
+    );
+    assert!(
+        json.contains("\"ucb_score\":0.7"),
+        "json missing ucb_score=0.7"
+    );
+
+    let parsed: ScoredRecallResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.count, 2);
+    assert_eq!(parsed.scored_learnings.len(), 2);
+
+    let first = &parsed.scored_learnings[0];
+    assert_eq!(first.relevance_score, 10.0);
+    assert_eq!(first.ucb_score, Some(0.7));
+    assert_eq!(first.combined_score, 1000.7);
+    assert_eq!(
+        first.match_reason.as_deref(),
+        Some("file match: src/db/*.rs")
+    );
+
+    let second = &parsed.scored_learnings[1];
+    assert_eq!(second.relevance_score, 0.5);
+    assert_eq!(second.ucb_score, None);
+    assert_eq!(second.combined_score, 0.5);
+    assert_eq!(second.match_reason, None);
+}
+
+#[test]
+fn test_scored_recall_unfiltered_fts5_fallback_score() {
+    // AC6: unfiltered recall (no query, no task) returns relevance_score ~0.5 from FTS5 fallback
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    create_test_learning(&conn, "One", "alpha", LearningOutcome::Pattern);
+    create_test_learning(&conn, "Two", "beta", LearningOutcome::Pattern);
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    assert!(!result.scored_learnings.is_empty());
+    for s in &result.scored_learnings {
+        assert!(
+            (s.relevance_score - 0.5).abs() < 0.05,
+            "unfiltered recall expected relevance_score ~0.5 from FTS5 fallback, got {} for learning {:?}",
+            s.relevance_score,
+            s.learning.id,
+        );
+    }
+}
+
+#[test]
+fn test_scored_recall_real_scores_not_hardcoded_zero() {
+    // AC7: discriminator — would PASS if scores were hardcoded 0.0 but FAIL with real scoring.
+    //
+    // This test is inverted: it asserts that at least one non-zero score appears, so it
+    // FAILS against the current stub (0.0 everywhere) and PASSES once FEAT-001 preserves
+    // real backend scores. A pattern-match (file prefix) has relevance=10, so the stub's
+    // 0.0 is impossible under real scoring.
+    let (_temp_dir, conn) = setup_db_with_fts5();
+    insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "DB pattern".to_string(),
+        content: "Use transactions".to_string(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/db/*.rs".to_string()]),
+        applies_to_task_types: None,
+        applies_to_errors: None,
+        tags: None,
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).unwrap();
+
+    let backend = CompositeBackend::default_backends();
+    let recall_params = RecallParams {
+        for_task: Some("US-001".to_string()),
+        limit: 5,
+        ..Default::default()
+    };
+    let result = recall_learnings_scored(&conn, recall_params, &backend).unwrap();
+
+    let pattern_match = result
+        .scored_learnings
+        .iter()
+        .find(|s| s.learning.title == "DB pattern")
+        .expect("file-matched learning must be in results");
+
+    // With real scoring, a file-match yields relevance=10 (see patterns.rs FILE_MATCH points).
+    // With the stub, both are 0.0 → assertion fails → test fails until FEAT-001 ships.
+    assert!(
+        pattern_match.relevance_score > 1.0,
+        "file-pattern match expected relevance > 1.0, got {} (stub hardcoded 0.0?)",
+        pattern_match.relevance_score,
+    );
+    assert!(
+        pattern_match.combined_score > 1.0,
+        "file-pattern match expected combined > 1.0, got {}",
+        pattern_match.combined_score,
+    );
+    assert!(
+        pattern_match.match_reason.is_some(),
+        "file-pattern match must carry a human-readable reason"
+    );
+}
+
+#[test]
+fn test_learning_summary_deserializes_with_all_score_fields() {
+    // AC8: structural — serde_json::from_value::<LearningSummary> succeeds with all new fields.
+    // Also validates that Option<f64> ucb_score correctly round-trips both Some and None.
+    use crate::commands::recall::LearningSummary;
+
+    let with_ucb = serde_json::json!({
+        "id": 42,
+        "title": "Scored learning",
+        "outcome": "pattern",
+        "confidence": "high",
+        "content": "body",
+        "times_shown": 3,
+        "times_applied": 1,
+        "relevance_score": 12.5,
+        "ucb_score": 0.42,
+        "combined_score": 1250.42,
+        "match_reason": "file match: src/db/*.rs"
+    });
+    let parsed: LearningSummary = serde_json::from_value(with_ucb).unwrap();
+    assert_eq!(parsed.relevance_score, 12.5);
+    assert_eq!(parsed.ucb_score, Some(0.42));
+    assert_eq!(parsed.combined_score, 1250.42);
+    assert_eq!(
+        parsed.match_reason.as_deref(),
+        Some("file match: src/db/*.rs")
+    );
+
+    // Missing ucb_score (free-text recall) must default to None.
+    let without_ucb = serde_json::json!({
+        "id": 43,
+        "title": "Scored learning no UCB",
+        "outcome": "pattern",
+        "confidence": "medium",
+        "content": "body",
+        "times_shown": 0,
+        "times_applied": 0,
+        "relevance_score": 0.5,
+        "combined_score": 0.5
+    });
+    let parsed_no_ucb: LearningSummary = serde_json::from_value(without_ucb).unwrap();
+    assert_eq!(parsed_no_ucb.ucb_score, None);
+    assert_eq!(parsed_no_ucb.match_reason, None);
+    assert_eq!(parsed_no_ucb.relevance_score, 0.5);
 }

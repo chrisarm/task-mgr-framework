@@ -4,6 +4,8 @@
 //! all stored embeddings, and returns the top-N results. Degrades gracefully if
 //! Ollama is unavailable or no embeddings exist.
 
+use std::collections::HashSet;
+
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
@@ -14,6 +16,15 @@ use crate::learnings::embeddings::{
 };
 
 use super::{RetrievalBackend, RetrievalQuery, ScoredLearning};
+
+/// Loads the set of learning IDs that have been superseded (appear as `old_learning_id`).
+fn load_superseded_ids(conn: &Connection) -> TaskMgrResult<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT old_learning_id FROM learning_supersessions")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<HashSet<i64>, _>>()?;
+    Ok(ids)
+}
 
 /// Score multiplier to normalize vector similarity scores into a range
 /// comparable with FTS5 and pattern backend scores (which top out around 15).
@@ -80,9 +91,18 @@ impl RetrievalBackend for VectorBackend {
             return Ok(Vec::new());
         }
 
+        // Filter out superseded learnings unless caller explicitly opts in.
+        // Graceful degradation: if the table is unreachable, assume nothing is superseded.
+        let superseded: HashSet<i64> = if query.include_superseded {
+            HashSet::new()
+        } else {
+            load_superseded_ids(conn).unwrap_or_default()
+        };
+
         // Score each stored embedding and collect (learning_id, score) pairs.
         let mut scored: Vec<(i64, f64)> = stored
             .into_iter()
+            .filter(|le| !superseded.contains(&le.learning_id))
             .map(|le| {
                 let sim = cosine_similarity(&query_embedding, &le.embedding) as f64;
                 let score = sim * SCORE_SCALE;

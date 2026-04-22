@@ -31,5 +31,5 @@ pub use types::{
     DeleteLearningResult, EditLearningParams, EditLearningResult, RecordLearningParams,
     RecordLearningResult,
 };
-pub use update::edit_learning;
+pub use update::{apply_supersession, edit_learning};
 pub use writer::LearningWriter;

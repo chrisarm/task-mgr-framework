@@ -95,6 +95,41 @@ The low-level `record_learning()` primitive in `src/learnings/crud/create.rs` is
 public for tests and `curate enrich`, but new production creation paths should use
 `LearningWriter` to get automatic embedding scheduling.
 
+## Learning Supersession
+
+When a newer learning replaces an older one, the link is tracked in the
+`learning_supersessions` join table (migration v17). The old row is retained (for
+audit / history) but auto-filtered from recall by default.
+
+- **Create a supersession**: `task-mgr learn --supersedes <old-id> ...` or
+  `task-mgr edit-learning <new-id> --supersedes <old-id>`. The old learning's
+  confidence is downgraded to `low` and a row is inserted into
+  `learning_supersessions(old_id, new_id, superseded_at)`.
+- **Recall behavior**: `task-mgr recall` excludes superseded learnings by default.
+  Pass `--include-superseded` to see them. Filtering happens in
+  `retrieval/mod.rs::passes_query_filters()` via a shared SQL helper — all three
+  backends (fts5, patterns, vector) honor the flag.
+- **Listing**: `task-mgr learnings` annotates rows with `(superseded by #N)` and
+  `(supersedes #M)`.
+- See `task-mgr learn --help`, `task-mgr edit-learning --help`,
+  `task-mgr recall --help` for flag details.
+
+## Recall Score Output
+
+`task-mgr --format json recall` returns numeric scores alongside the categorical
+`confidence` field so consumers can parse signal strength:
+
+- `relevance_score` — raw retrieval score (FTS5 BM25, pattern-match points, or
+  vector cosine similarity, depending on backend)
+- `ucb_score` — UCB1 bandit score (present on `--for-task` queries)
+- `combined_score` — aggregated ranking score used for ordering
+- `match_reason` — human-readable explanation (e.g. `"FTS5 text match"`,
+  `"file pattern match, task type match"`)
+
+The underlying `recall_learnings()` / `recall_learnings_with_backend()` signatures
+are unchanged; scored output flows through `recall_learnings_scored()` and the
+existing CLI formatters.
+
 ## Embedding / Ollama Configuration
 
 `curate embed` generates local embeddings via Ollama for the dedup pre-filter. Configure in `.task-mgr/config.json`:

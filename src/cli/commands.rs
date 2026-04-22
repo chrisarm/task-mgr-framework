@@ -428,6 +428,12 @@ OUTCOME TYPES:
         /// Confidence level for this learning
         #[arg(long, value_enum, default_value_t = Confidence::Medium)]
         confidence: Confidence,
+
+        /// ID of an existing learning that this new learning supersedes.
+        /// The old learning's confidence is downgraded to `low` and a row is
+        /// inserted into `learning_supersessions` so recall can filter it out.
+        #[arg(long)]
+        supersedes: Option<i64>,
     },
 
     /// Find relevant learnings for a task or query
@@ -479,6 +485,10 @@ MATCHING BEHAVIOR:
         /// Maximum number of results to return
         #[arg(long, default_value_t = 5)]
         limit: usize,
+
+        /// Include superseded learnings in the results (default: exclude them)
+        #[arg(long = "include-superseded", default_value_t = false)]
+        include_superseded: bool,
     },
 
     /// List all learnings
@@ -663,6 +673,12 @@ PRIORITY:
         /// Error patterns to remove (comma-separated)
         #[arg(long = "remove-errors", value_delimiter = ',')]
         remove_errors: Option<Vec<String>>,
+
+        /// ID of an existing learning that this learning supersedes.
+        /// The old learning's confidence is downgraded to `low` and a row is
+        /// inserted into `learning_supersessions` so recall can filter it out.
+        #[arg(long)]
+        supersedes: Option<i64>,
     },
 
     /// Review blocked and skipped tasks

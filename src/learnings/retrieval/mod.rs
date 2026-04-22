@@ -42,6 +42,8 @@ pub struct RetrievalQuery {
     pub outcome: Option<LearningOutcome>,
     /// Maximum results to return
     pub limit: usize,
+    /// When `false` (default), exclude learnings present in `learning_supersessions.old_learning_id`.
+    pub include_superseded: bool,
 }
 
 /// A retrieval result with backend-specific relevance score.
@@ -87,3 +89,8 @@ pub use composite::CompositeBackend;
 pub use fts5::Fts5Backend;
 pub use patterns::PatternsBackend;
 pub use vector::VectorBackend;
+
+/// Core SQL predicate that excludes superseded learnings.
+/// Used by every backend that needs to filter `learning_supersessions`.
+pub(crate) const SUPERSESSION_SUBQUERY: &str =
+    "NOT IN (SELECT old_learning_id FROM learning_supersessions)";

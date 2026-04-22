@@ -792,8 +792,7 @@ pub fn run_iteration(
                             effort.unwrap_or("(default)"),
                             m1m,
                         );
-                        ctx.model_overrides
-                            .insert(task_id.clone(), m1m.to_string());
+                        ctx.model_overrides.insert(task_id.clone(), m1m.to_string());
                         true
                     }
                     None => false,
@@ -1035,7 +1034,7 @@ fn check_global_skills(source_root: &Path) {
 /// - 2: blocked
 /// - 130: SIGINT
 /// - 143: SIGTERM
-pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
+pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // Step 1: Load environment
     env::load_env();
 
@@ -1055,7 +1054,7 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     }
 
     // Step 3: Resolve paths (PRD, prompt, progress live in source_root)
-    let paths = match env::resolve_paths(
+    let mut paths = match env::resolve_paths(
         &run_config.prd_file,
         run_config.prompt_file.as_deref(),
         &run_config.source_root,
@@ -1075,6 +1074,11 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
             };
         }
     };
+
+    // Propagate resolved absolute path so all downstream code (init, prefix
+    // generation, hash, etc.) uses the actual file location — which may be in
+    // a sibling worktree rather than the local source_root.
+    run_config.prd_file = paths.prd_file.clone();
 
     // Step 4: Ensure directories exist (in db_dir)
     if let Err(e) = env::ensure_directories(&run_config.db_dir) {
@@ -1325,7 +1329,6 @@ pub async fn run_loop(run_config: LoopRunConfig) -> LoopResult {
     let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
 
     // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
-    let mut paths = paths;
     if let Some(ref pfx) = task_prefix {
         paths.progress_file = paths.tasks_dir.join(format!("progress-{}.txt", pfx));
     }
@@ -4709,10 +4712,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "done");
-        assert!(
-            started_at.is_some(),
-            "started_at must be set by auto-claim",
-        );
+        assert!(started_at.is_some(), "started_at must be set by auto-claim",);
     }
 
     #[test]

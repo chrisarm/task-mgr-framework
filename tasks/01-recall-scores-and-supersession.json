@@ -88,7 +88,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning [1467]: Uniform (score, reason) tuples for multi-dimension scoring. Learning [1402]: VectorBackend score scale = cosine * 15.0. Learning [238]: Pattern scoring FILE_MATCH=10, TAG_CONTEXT=3.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Score fields must reflect actual internal scores that determined ranking order",
@@ -143,7 +143,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning [833]: Don't add migration columns to base schema. Learning [835]: Base schema frozen at v0. Learning [1397]: Migration file structure pattern. Learning [348]: Down migrations for new tables use DROP TABLE (not column-level). Learning [1448]: Stub migration + #[ignore] enables TDD.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Supersession must be validated: both old and new learning IDs must exist",
@@ -181,7 +181,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Key change: line 115 in recall/mod.rs currently does `scored.into_iter().map(|s| s.learning).collect()` discarding all scores. The new function preserves them. rerank_with_ucb (line 247) computes UCB inside a sort closure — extract to a separate function so scored variant can capture the values. Learning [1467]: Uniform (score, reason) tuples. Learning [273]: Decompose long scoring functions into per-dimension helpers.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Score fields must reflect actual internal scores that determined ranking order",
@@ -216,7 +216,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "Learning [710]: format_text naming convention in task-mgr. The existing format_verbose() at lines 204-283 reconstructs match reasons by re-checking title/content against query — replace with actual match_reason from backend. Data contract: ScoredRecallResult.scored_learnings[i] → LearningSummary { relevance_score, ucb_score, combined_score, match_reason }.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Score fields must reflect actual ranking order",
@@ -251,7 +251,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Learning [833]: Don't add migration columns to base schema. Learning [835]: Base schema frozen at v0. Learning [1397]: Migration file structure pattern. Learning [348]: SQLite down migrations for new tables use DROP TABLE. Learning [324]: Check existing migration versions before creating new ones — current highest is v16.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Base schema files frozen — new table in migration only",
@@ -289,7 +289,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning [767]: Wiring new CLI commands requires edits in 3 locations. Learning [705]: Four integration points for new CLI commands. Learning [799]: Thread new CLI flag through clap+main+engine in one pass. Learning [706]: Learning struct lacks retired_at; use direct SQL for retired_at operations. Learning [728]: Confidence enum stored as lowercase strings in SQLite. The learn() function in src/commands/learn.rs uses LearningWriter (per CLAUDE.md chokepoint rule). Supersession INSERT + confidence downgrade happen AFTER the LearningWriter.record() call and AFTER LearningWriter.flush().",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Supersession validated: both old and new IDs must exist",
@@ -350,7 +350,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Learning [1444]: Soft-archive queries need filters on all listing operations. Learning [282]: Separate filtering from scoring in retrieval logic. Learning [1465]: Tag-only learnings retrieval with EXISTS subquery. The supersession filter pattern is identical to existing retired_at IS NULL: add WHERE condition to every retrieval SQL. For vector backend, load superseded IDs first via simple SELECT, then filter in Rust after cosine computation.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": [
         "Supersession filter added to ALL retrieval SQL locations (fts5: 3 functions, patterns: 1, vector: post-filter)",
@@ -388,7 +388,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "The learnings list command is in src/commands/learnings.rs. LearningSummary struct (different from recall's LearningSummary) has id, title, outcome, confidence, created_at, times_shown, times_applied. Add optional superseded_by: Option<i64> and supersedes: Option<Vec<i64>> fields.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "Batch query for supersession annotations — no N+1",
@@ -426,7 +426,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1` — atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line progress note.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "No unwrap() in production paths",
@@ -469,7 +469,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Run full workspace tests. If any fail (including pre-existing), fix them. Spawn FIX tasks for non-trivial failures.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Full test suite green — no pre-existing failures left",
@@ -501,7 +501,7 @@
       "id": "TEST-001",
       "modifiesBehavior": false,
       "notes": "Build on TEST-INIT stubs. Remove #[ignore] attributes. Add integration tests that exercise full CLI paths.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": [
         "Tests verify content, not just 'no crash'",
@@ -566,7 +566,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Focus on code quality, not behavior.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "DRY: no unnecessary duplication",
@@ -608,7 +608,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "CLAUDE.md update: add section about learning_supersessions table, --supersedes flag, and auto-filtering. Keep it concise — reference the CLI help for details.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "qualityDimensions": [
         "End-to-end smoke tests with real CLI",
@@ -653,6 +653,43 @@
       "timeoutSecs": 1800,
       "title": "Final gate: all features verified and documented",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Single helper exists and is called from all 5 production call sites",
+        "Behavior unchanged: existing tests still pass",
+        "grep for the literal 'NOT IN (SELECT old_learning_id FROM learning_supersessions)' returns only the helper and test/doc sites",
+        "No new clippy or check warnings"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: the string literal for the supersession NOT IN filter is duplicated across 5 production call sites. Extract a single helper in src/learnings/retrieval/mod.rs (or a new filters.rs) and have every call site use it. Covers: src/learnings/recall/mod.rs:295, src/learnings/retrieval/patterns.rs:300, src/learnings/retrieval/fts5.rs:142/207/267. Keep the vector backend (HashSet-based filter in Rust) as-is since it filters post-scoring.",
+      "estimatedEffort": "low",
+      "id": "358c54f0-REFACTOR-001",
+      "passes": true,
+      "priority": 71,
+      "title": "Centralize supersession SQL filter into a helper",
+      "touchesFiles": [
+        "src/learnings/retrieval/mod.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/retrieval/patterns.rs",
+        "src/learnings/retrieval/fts5.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Single SELECT path in load_ucb_fallback (no if/else duplicating the statement)",
+        "All recall tests still pass, including test_ucb_fallback_excludes_already_matched",
+        "File line count drops materially (target: ~40 lines net reduction)",
+        "No new clippy or check warnings"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: src/learnings/recall/mod.rs:282-362 (load_ucb_fallback) has two near-identical 20+ line SELECT statements that diverge only by whether the 'AND id NOT IN (exclude_ids...)' clause is present. Collapse into a single SQL build path using the Vec<String> conditions pattern already used in src/learnings/retrieval/fts5.rs::execute_like_query and execute_unfiltered_query.",
+      "estimatedEffort": "low",
+      "id": "358c54f0-REFACTOR-002",
+      "passes": true,
+      "priority": 72,
+      "title": "Collapse duplicate SELECT branches in load_ucb_fallback",
+      "touchesFiles": [
+        "src/learnings/recall/mod.rs"
+      ]
     }
   ],
   "version": "1.0"

@@ -21,6 +21,10 @@ fn verify_cli() {
 
 #[test]
 fn test_default_dir() {
+    // Clap's `env = "TASK_MGR_DIR"` attribute means an ambient env var (e.g.
+    // set by an outer `task-mgr loop` shell) will shadow the default. Remove
+    // it for this test to assert the compile-time default specifically.
+    unsafe { std::env::remove_var("TASK_MGR_DIR") };
     let cli = Cli::parse_from(["task-mgr", "list"]);
     assert_eq!(cli.dir, PathBuf::from(".task-mgr"));
 }
@@ -875,6 +879,7 @@ fn test_learn_minimal() {
             errors,
             tags,
             confidence,
+            supersedes,
         } => {
             assert_eq!(outcome, LearningOutcome::Failure);
             assert_eq!(title, "Test learning");
@@ -888,6 +893,7 @@ fn test_learn_minimal() {
             assert!(errors.is_none());
             assert!(tags.is_none());
             assert_eq!(confidence, Confidence::Medium); // default
+            assert!(supersedes.is_none());
         }
         _ => panic!("Expected Learn command"),
     }
@@ -937,6 +943,7 @@ fn test_learn_with_all_options() {
             errors,
             tags,
             confidence,
+            supersedes,
         } => {
             assert_eq!(outcome, LearningOutcome::Success);
             assert_eq!(title, "Learned pattern");
@@ -956,6 +963,7 @@ fn test_learn_with_all_options() {
             assert_eq!(errors, Some(vec!["E0001".to_string(), "E0002".to_string()]));
             assert_eq!(tags, Some(vec!["rust".to_string(), "cli".to_string()]));
             assert_eq!(confidence, Confidence::High);
+            assert!(supersedes.is_none());
         }
         _ => panic!("Expected Learn command"),
     }
@@ -1016,6 +1024,28 @@ fn test_learn_confidence_variants() {
     }
 }
 
+#[test]
+fn test_learn_with_supersedes() {
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "learn",
+        "--outcome",
+        "pattern",
+        "--title",
+        "Replacement",
+        "--content",
+        "Content",
+        "--supersedes",
+        "42",
+    ]);
+    match cli.command {
+        Commands::Learn { supersedes, .. } => {
+            assert_eq!(supersedes, Some(42));
+        }
+        _ => panic!("Expected Learn command"),
+    }
+}
+
 // Recall command tests
 #[test]
 fn test_recall_minimal() {
@@ -1027,12 +1057,14 @@ fn test_recall_minimal() {
             tags,
             outcome,
             limit,
+            include_superseded,
         } => {
             assert!(query.is_none());
             assert!(for_task.is_none());
             assert!(tags.is_none());
             assert!(outcome.is_none());
             assert_eq!(limit, 5); // default
+            assert!(!include_superseded, "default must exclude superseded");
         }
         _ => panic!("Expected Recall command"),
     }
@@ -1123,6 +1155,7 @@ fn test_recall_with_all_options() {
             tags,
             outcome,
             limit,
+            include_superseded,
         } => {
             assert_eq!(query, Some("SQL error".to_string()));
             assert_eq!(for_task, Some("US-010".to_string()));
@@ -1132,6 +1165,23 @@ fn test_recall_with_all_options() {
             );
             assert_eq!(outcome, Some(LearningOutcome::Workaround));
             assert_eq!(limit, 3);
+            assert!(!include_superseded);
+        }
+        _ => panic!("Expected Recall command"),
+    }
+}
+
+#[test]
+fn test_recall_include_superseded_flag() {
+    let cli = Cli::parse_from(["task-mgr", "recall", "--include-superseded"]);
+    match cli.command {
+        Commands::Recall {
+            include_superseded, ..
+        } => {
+            assert!(
+                include_superseded,
+                "--include-superseded must set the flag to true"
+            );
         }
         _ => panic!("Expected Recall command"),
     }
@@ -1809,6 +1859,22 @@ fn test_edit_learning_with_json_format() {
         _ => panic!("Expected EditLearning command"),
     }
     assert_eq!(cli.format, OutputFormat::Json);
+}
+
+#[test]
+fn test_edit_learning_with_supersedes() {
+    let cli = Cli::parse_from(["task-mgr", "edit-learning", "7", "--supersedes", "3"]);
+    match cli.command {
+        Commands::EditLearning {
+            learning_id,
+            supersedes,
+            ..
+        } => {
+            assert_eq!(learning_id, 7);
+            assert_eq!(supersedes, Some(3));
+        }
+        _ => panic!("Expected EditLearning command"),
+    }
 }
 
 // Review command tests

@@ -399,10 +399,7 @@ fn resolve_active_prefix(conn: &Connection) -> Option<String> {
 ///
 /// Returns `Ok(None)` when no `task_list` file is registered (valid state:
 /// e.g. the DB was populated programmatically without a source JSON).
-fn locate_prd_json(
-    conn: &Connection,
-    task_prefix: Option<&str>,
-) -> TaskMgrResult<Option<PathBuf>> {
+fn locate_prd_json(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<Option<PathBuf>> {
     if let Some(prefix) = task_prefix {
         let result: Option<String> = conn
             .query_row(
