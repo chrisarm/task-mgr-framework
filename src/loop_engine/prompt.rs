@@ -557,7 +557,7 @@ fn append_synergy_context(
 /// Build a JSON representation of the task for inclusion in the prompt.
 fn build_task_json(
     task: &crate::commands::next::output::NextTaskOutput,
-    next_result: &NextResult,
+    _next_result: &NextResult,
 ) -> String {
     // Build a simplified JSON that includes what Claude needs
     let mut json = serde_json::json!({
@@ -583,12 +583,6 @@ fn build_task_json(
     }
     if let Some(ref escalation_note) = task.escalation_note {
         json["escalationNote"] = serde_json::Value::String(escalation_note.clone());
-    }
-    if !task.batch_with.is_empty() {
-        json["batchWith"] = serde_json::json!(task.batch_with);
-    }
-    if !next_result.batch_tasks.is_empty() {
-        json["eligibleBatchTasks"] = serde_json::json!(next_result.batch_tasks);
     }
 
     serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
@@ -814,7 +808,6 @@ mod tests {
             acceptance_criteria: vec!["AC1".to_string()],
             notes: None,
             files: vec!["src/lib.rs".to_string()],
-            batch_with: vec![],
             model: None,
             difficulty: None,
             escalation_note: None,
@@ -823,17 +816,12 @@ mod tests {
                 total: 995,
                 priority: 995,
                 file_overlap: 0,
-                synergy: 0,
-                conflict: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         };
 
         let next_result = NextResult {
             task: Some(task.clone()),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "test".to_string(),
@@ -1565,68 +1553,31 @@ pub enum ApiError {
     }
 
     // --- Synergy context tests (unit-level) ---
+    //
+    // The synergy section is now a permanent no-op (synergy relationships were
+    // dropped in favour of runtime file-overlap detection). `build_synergy_section`
+    // always returns `String::new()`, so `append_synergy_context` is guaranteed
+    // to leave the prompt buffer empty regardless of DB state.
 
     #[test]
-    fn test_synergy_context_with_run_id() {
+    fn test_synergy_context_always_empty() {
         let (_temp_dir, conn) = setup_test_db();
 
+        // Even with a fully populated synergy relationship + run/commit, the
+        // section must be empty.
         insert_task(&conn, "SYN-001", "Synergy task done", "done", 5);
         insert_task(&conn, "TASK-001", "Current task", "todo", 10);
         insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
-
-        // Create run with a run_task entry linking SYN-001 to the run
         insert_run(&conn, "run-001");
         insert_run_task(&conn, "run-001", "SYN-001", 1);
 
-        // Set a last_commit on the run
-        conn.execute(
-            "UPDATE runs SET last_commit = 'abc123' WHERE run_id = 'run-001'",
-            [],
-        )
-        .unwrap();
-
         let mut prompt = String::new();
         append_synergy_context(&mut prompt, &conn, "TASK-001", Some("run-001"));
+        assert!(prompt.is_empty(), "synergy section must always be empty");
 
-        assert!(
-            prompt.contains("## Synergy Tasks"),
-            "Should have synergy section"
-        );
-        assert!(prompt.contains("SYN-001"), "Should reference synergy task");
-        assert!(
-            prompt.contains("Synergy task done"),
-            "Should include synergy task title"
-        );
-        assert!(prompt.contains("abc123"), "Should include commit hash");
-    }
-
-    #[test]
-    fn test_synergy_context_without_run_id_omits_section() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "SYN-001", "Synergy task", "done", 5);
-        insert_task(&conn, "TASK-001", "Current task", "todo", 10);
-        insert_relationship(&conn, "TASK-001", "SYN-001", "synergyWith");
-
-        let mut prompt = String::new();
+        // And for the no-run_id / no-partner cases.
         append_synergy_context(&mut prompt, &conn, "TASK-001", None);
-
-        assert!(prompt.is_empty(), "No run_id should omit synergy section");
-    }
-
-    #[test]
-    fn test_synergy_context_no_synergy_tasks_omits_section() {
-        let (_temp_dir, conn) = setup_test_db();
-
-        insert_task(&conn, "TASK-001", "Task without synergy", "todo", 10);
-
-        let mut prompt = String::new();
-        append_synergy_context(&mut prompt, &conn, "TASK-001", Some("run-001"));
-
-        assert!(
-            prompt.is_empty(),
-            "No synergy tasks should omit the section"
-        );
+        assert!(prompt.is_empty());
     }
 
     // --- build_task_json comprehensive tests ---
@@ -1642,26 +1593,20 @@ pub enum ApiError {
             acceptance_criteria: vec!["Criterion one".to_string(), "Criterion two".to_string()],
             notes: Some("Important: check edge cases".to_string()),
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
-            batch_with: vec!["FEAT-043".to_string()],
             model: Some(OPUS_MODEL.to_string()),
             difficulty: Some("high".to_string()),
             escalation_note: Some("Complex architectural task".to_string()),
             requires_human: false,
             score: ScoreOutput {
-                total: 1003,
+                total: 1007,
                 priority: 997,
                 file_overlap: 10,
-                synergy: 3,
-                conflict: -7,
                 file_overlap_count: 1,
-                synergy_from: vec!["FEAT-040".to_string()],
-                conflict_from: vec!["FEAT-099".to_string()],
             },
         };
 
         let next_result = NextResult {
             task: Some(task.clone()),
-            batch_tasks: vec!["FEAT-043".to_string()],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "highest score".to_string(),
@@ -1692,11 +1637,6 @@ pub enum ApiError {
             "Should contain second criterion"
         );
         assert!(json.contains("src/a.rs"), "Should contain first file");
-        assert!(json.contains("FEAT-043"), "Should contain batchWith");
-        assert!(
-            json.contains("eligibleBatchTasks"),
-            "Should contain eligible batch tasks when non-empty"
-        );
         assert!(
             json.contains(OPUS_MODEL),
             "Should contain model when present"
@@ -1730,7 +1670,6 @@ pub enum ApiError {
             acceptance_criteria: vec![],
             notes: None,
             files: vec![],
-            batch_with: vec![],
             model: None,
             difficulty: None,
             escalation_note: None,
@@ -1739,17 +1678,12 @@ pub enum ApiError {
                 total: 999,
                 priority: 999,
                 file_overlap: 0,
-                synergy: 0,
-                conflict: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         };
 
         let next_result = NextResult {
             task: Some(task.clone()),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "only task".to_string(),
@@ -1775,10 +1709,6 @@ pub enum ApiError {
         assert!(
             !json.contains("batchWith"),
             "Should not contain batchWith when empty"
-        );
-        assert!(
-            !json.contains("eligibleBatchTasks"),
-            "Should not contain eligibleBatchTasks when empty"
         );
         assert!(
             !json.contains("model"),
@@ -1811,7 +1741,6 @@ pub enum ApiError {
             acceptance_criteria: vec![],
             notes: None,
             files: vec![],
-            batch_with: vec![],
             model: model.map(String::from),
             difficulty: difficulty.map(String::from),
             escalation_note: escalation_note.map(String::from),
@@ -1820,11 +1749,7 @@ pub enum ApiError {
                 total: 990,
                 priority: 990,
                 file_overlap: 0,
-                synergy: 0,
-                conflict: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         }
     }
@@ -1832,7 +1757,6 @@ pub enum ApiError {
     fn empty_next_result(task: &NextTaskOutput) -> NextResult {
         NextResult {
             task: Some(task.clone()),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "test".to_string(),
@@ -2292,13 +2216,13 @@ pub enum ApiError {
         );
     }
 
-    /// AC4: Task with synergyWith partner that has higher-tier model → resolved_model is higher.
+    /// Partner model is ignored: selected task's own model wins even when a
+    /// synergy-linked partner has a higher tier. Synergy escalation was removed
+    /// in favour of runtime file-overlap detection.
     #[test]
-
-    fn test_resolved_model_synergy_partner_higher_tier() {
+    fn test_resolved_model_synergy_partner_ignored() {
         let (temp_dir, conn) = setup_test_db();
 
-        // Selected task has haiku model
         insert_task(&conn, "MOD-004", "Selected task", "todo", 5);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'MOD-004'",
@@ -2306,7 +2230,6 @@ pub enum ApiError {
         )
         .unwrap();
 
-        // Synergy partner has sonnet model and is pending (todo)
         insert_task(&conn, "SYN-004", "Synergy partner", "todo", 10);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'SYN-004'",
@@ -2314,7 +2237,7 @@ pub enum ApiError {
         )
         .unwrap();
 
-        // Establish synergyWith relationship
+        // Legacy synergy row in DB — must have no effect on resolution.
         insert_relationship(&conn, "MOD-004", "SYN-004", "synergyWith");
 
         let base_prompt_path = create_base_prompt(temp_dir.path());
@@ -2326,8 +2249,8 @@ pub enum ApiError {
 
         assert_eq!(
             result.resolved_model,
-            Some(SONNET_MODEL.to_string()),
-            "Synergy partner with higher-tier model should elevate resolved_model"
+            Some(HAIKU_MODEL.to_string()),
+            "partner model must be ignored — selected task's model is authoritative"
         );
     }
 
@@ -2355,54 +2278,13 @@ pub enum ApiError {
         );
     }
 
-    /// AC6 (known-bad discriminator): Synergy partner with opus model overrides
-    /// selected task's haiku. Rejects implementations that ignore synergy.
-    #[test]
-
-    fn test_resolved_model_synergy_opus_overrides_task_haiku() {
-        let (temp_dir, conn) = setup_test_db();
-
-        // Selected task explicitly set to haiku
-        insert_task(&conn, "MOD-006", "Haiku task", "todo", 5);
-        conn.execute(
-            "UPDATE tasks SET model = ?1 WHERE id = 'MOD-006'",
-            params![HAIKU_MODEL],
-        )
-        .unwrap();
-
-        // Synergy partner set to opus and is in_progress (active)
-        insert_task(&conn, "SYN-006", "Opus partner", "in_progress", 10);
-        conn.execute(
-            "UPDATE tasks SET model = ?1 WHERE id = 'SYN-006'",
-            params![OPUS_MODEL],
-        )
-        .unwrap();
-
-        // Establish synergyWith relationship
-        insert_relationship(&conn, "MOD-006", "SYN-006", "synergyWith");
-
-        let base_prompt_path = create_base_prompt(temp_dir.path());
-        let params = build_params(temp_dir.path(), &conn, &base_prompt_path);
-
-        let result = build_prompt(&params)
-            .unwrap()
-            .expect("Should return a prompt");
-
-        assert_eq!(
-            result.resolved_model,
-            Some(OPUS_MODEL.to_string()),
-            "Synergy partner with opus MUST override selected task's haiku — \
-             synergy cluster model = max tier across all members"
-        );
-    }
-
     // --- Cluster effort (parallels cluster model) ---
 
-    /// End-to-end: primary `medium` + pending synergy partner `high` must resolve
-    /// effort to `xhigh` (not `high`). Falsifies the previous primary-only behaviour
-    /// where model escalated cluster-wide but effort did not.
+    /// Partner difficulty is ignored: cluster effort maps from the primary's
+    /// own difficulty, even if a synergy-linked partner is harder. Synergy
+    /// escalation was removed.
     #[test]
-    fn test_cluster_effort_partner_higher_difficulty_wins() {
+    fn test_cluster_effort_partner_ignored() {
         let (temp_dir, conn) = setup_test_db();
 
         insert_task(&conn, "CE-001", "Primary medium", "todo", 5);
@@ -2417,6 +2299,7 @@ pub enum ApiError {
             [],
         )
         .unwrap();
+        // Legacy synergy row in DB — must have no effect.
         insert_relationship(&conn, "CE-001", "SYN-CE-001", "synergyWith");
 
         let base_prompt_path = create_base_prompt(temp_dir.path());
@@ -2425,12 +2308,9 @@ pub enum ApiError {
             .unwrap()
             .expect("Should return a prompt");
 
-        assert_eq!(
-            result.cluster_effort,
-            Some("xhigh"),
-            "synergy partner with high difficulty must pull cluster effort up to xhigh"
-        );
-        // Per-task difficulty stays the primary's — needed for watchdog timeout.
+        // medium → "high" per effort_for_difficulty mapping; partner's "high"
+        // difficulty is ignored.
+        assert_eq!(result.cluster_effort, Some("high"));
         assert_eq!(result.task_difficulty.as_deref(), Some("medium"));
     }
 
@@ -2507,16 +2387,15 @@ pub enum ApiError {
         );
     }
 
-    /// Edge case: Multiple synergy partners with different tiers → highest tier wins.
+    /// Edge case: Multiple legacy synergy partners in the DB must not influence
+    /// the resolved model — synergy escalation was removed. Primary has no
+    /// model and no defaults are supplied, so result is `None`.
     #[test]
-
-    fn test_resolved_model_multi_partner_highest_wins() {
+    fn test_resolved_model_ignores_multiple_synergy_partners() {
         let (temp_dir, conn) = setup_test_db();
 
-        // Selected task has no model
         insert_task(&conn, "MOD-008", "No-model task", "todo", 5);
 
-        // Synergy partners: haiku, opus, sonnet
         insert_task(&conn, "SYN-008A", "Haiku partner", "todo", 10);
         conn.execute(
             "UPDATE tasks SET model = ?1 WHERE id = 'SYN-008A'",
@@ -2550,9 +2429,8 @@ pub enum ApiError {
             .expect("Should return a prompt");
 
         assert_eq!(
-            result.resolved_model,
-            Some(OPUS_MODEL.to_string()),
-            "Among multiple synergy partners, opus (highest tier) must win"
+            result.resolved_model, None,
+            "legacy synergy partners must not influence resolved_model"
         );
     }
 

@@ -2563,8 +2563,8 @@ pub fn on_run_completed(conn: &Connection, task_prefix: Option<&str>) {
             let defaults = calibrate::SelectionWeights::default();
             if weights != defaults {
                 eprintln!(
-                    "Calibrated selection weights: file_overlap={}, synergy={}, conflict={}, priority_base={}",
-                    weights.file_overlap, weights.synergy, weights.conflict, weights.priority_base
+                    "Calibrated selection weights: file_overlap={}, priority_base={}",
+                    weights.file_overlap, weights.priority_base
                 );
             }
         }

@@ -21,15 +21,6 @@ pub struct ShowResult {
     /// Tasks that this task depends on (hard dependencies)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
-    /// Tasks that have synergy with this task
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub synergy_with: Vec<String>,
-    /// Tasks to batch with this task
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub batch_with: Vec<String>,
-    /// Tasks that conflict with this task
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub conflicts_with: Vec<String>,
     /// Tasks that depend on this task (reverse dependency)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub depended_on_by: Vec<String>,
@@ -67,18 +58,12 @@ pub fn show(dir: &std::path::Path, task_id: &str) -> TaskMgrResult<ShowResult> {
     // Query reverse dependencies (tasks that depend on this one)
     let depended_on_by = query_reverse_dependencies(&conn, task_id)?;
 
-    // Group relationships by type
+    // Group relationships by type. Deprecated synergy/batch/conflicts variants
+    // are skipped so stale rows in older DBs don't surface.
     let mut depends_on = Vec::new();
-    let mut synergy_with = Vec::new();
-    let mut batch_with = Vec::new();
-    let mut conflicts_with = Vec::new();
-
     for rel in relationships {
-        match rel.rel_type {
-            RelationshipType::DependsOn => depends_on.push(rel.related_id),
-            RelationshipType::SynergyWith => synergy_with.push(rel.related_id),
-            RelationshipType::BatchWith => batch_with.push(rel.related_id),
-            RelationshipType::ConflictsWith => conflicts_with.push(rel.related_id),
+        if matches!(rel.rel_type, RelationshipType::DependsOn) {
+            depends_on.push(rel.related_id);
         }
     }
 
@@ -86,9 +71,6 @@ pub fn show(dir: &std::path::Path, task_id: &str) -> TaskMgrResult<ShowResult> {
         task,
         files,
         depends_on,
-        synergy_with,
-        batch_with,
-        conflicts_with,
         depended_on_by,
     })
 }
@@ -218,30 +200,6 @@ pub fn format_text(result: &ShowResult) -> String {
         output.push_str("\nDepends On:\n");
         for dep in &result.depends_on {
             output.push_str(&format!("  - {}\n", dep));
-        }
-    }
-
-    // Synergy
-    if !result.synergy_with.is_empty() {
-        output.push_str("\nSynergy With:\n");
-        for syn in &result.synergy_with {
-            output.push_str(&format!("  - {}\n", syn));
-        }
-    }
-
-    // Batch with
-    if !result.batch_with.is_empty() {
-        output.push_str("\nBatch With:\n");
-        for batch in &result.batch_with {
-            output.push_str(&format!("  - {}\n", batch));
-        }
-    }
-
-    // Conflicts
-    if !result.conflicts_with.is_empty() {
-        output.push_str("\nConflicts With:\n");
-        for conflict in &result.conflicts_with {
-            output.push_str(&format!("  - {}\n", conflict));
         }
     }
 
@@ -379,42 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_show_includes_synergy_with() {
-        let (temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "First Task", "todo", 1);
-        insert_test_task(&conn, "US-002", "Second Task", "todo", 2);
-        insert_test_relationship(&conn, "US-001", "US-002", "synergyWith");
-        drop(conn);
-
-        let result = show(temp_dir.path(), "US-001").unwrap();
-        assert_eq!(result.synergy_with, vec!["US-002"]);
-    }
-
-    #[test]
-    fn test_show_includes_batch_with() {
-        let (temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "First Task", "todo", 1);
-        insert_test_task(&conn, "FIX-001", "Fix Task", "todo", 2);
-        insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
-        drop(conn);
-
-        let result = show(temp_dir.path(), "US-001").unwrap();
-        assert_eq!(result.batch_with, vec!["FIX-001"]);
-    }
-
-    #[test]
-    fn test_show_includes_conflicts_with() {
-        let (temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "First Task", "todo", 1);
-        insert_test_task(&conn, "TECH-001", "Tech Task", "todo", 2);
-        insert_test_relationship(&conn, "US-001", "TECH-001", "conflictsWith");
-        drop(conn);
-
-        let result = show(temp_dir.path(), "US-001").unwrap();
-        assert_eq!(result.conflicts_with, vec!["TECH-001"]);
-    }
-
-    #[test]
     fn test_show_includes_reverse_dependencies() {
         let (temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "First Task", "done", 1);
@@ -431,7 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn test_show_all_relationship_types() {
+    fn test_show_ignores_deprecated_relationship_rows() {
+        // Older databases may still contain synergyWith/batchWith/conflictsWith
+        // rows. Ensure `show` silently drops them instead of surfacing them on
+        // fields that no longer exist.
         let (temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-000", "Prereq", "done", 0);
         insert_test_task(&conn, "US-001", "Main Task", "todo", 1);
@@ -449,9 +374,6 @@ mod tests {
 
         let result = show(temp_dir.path(), "US-001").unwrap();
         assert_eq!(result.depends_on, vec!["US-000"]);
-        assert_eq!(result.synergy_with, vec!["US-002"]);
-        assert_eq!(result.batch_with, vec!["FIX-001"]);
-        assert_eq!(result.conflicts_with, vec!["TECH-001"]);
         assert_eq!(result.depended_on_by, vec!["US-005"]);
     }
 
@@ -464,9 +386,6 @@ mod tests {
         let result = show(temp_dir.path(), "US-001").unwrap();
         assert!(result.files.is_empty());
         assert!(result.depends_on.is_empty());
-        assert!(result.synergy_with.is_empty());
-        assert!(result.batch_with.is_empty());
-        assert!(result.conflicts_with.is_empty());
         assert!(result.depended_on_by.is_empty());
     }
 
@@ -555,9 +474,6 @@ mod tests {
         // Empty vecs should be omitted
         assert!(!json.contains(r#""files""#));
         assert!(!json.contains(r#""depends_on""#));
-        assert!(!json.contains(r#""synergy_with""#));
-        assert!(!json.contains(r#""batch_with""#));
-        assert!(!json.contains(r#""conflicts_with""#));
         assert!(!json.contains(r#""depended_on_by""#));
     }
 
@@ -587,9 +503,6 @@ mod tests {
             task,
             files: vec![],
             depends_on: vec![],
-            synergy_with: vec![],
-            batch_with: vec![],
-            conflicts_with: vec![],
             depended_on_by: vec![],
         }
     }

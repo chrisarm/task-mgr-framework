@@ -308,14 +308,7 @@ fn test_export_preserves_relationships() {
     let exported_json = fs::read_to_string(&export_path).unwrap();
     let exported: ExportedPrd = serde_json::from_str(&exported_json).unwrap();
 
-    // synergyWith is deprecated and not stored in the DB; export returns empty.
-    let us001 = exported
-        .user_stories
-        .iter()
-        .find(|s| s.id == "US-001")
-        .unwrap();
-    assert!(us001.synergy_with.is_empty());
-
+    // Only dependsOn survives export; synergy/batch/conflicts were removed.
     let us002 = exported
         .user_stories
         .iter()
@@ -771,9 +764,6 @@ fn test_exported_story_requires_human_absent_when_none() {
         source_review: None,
         touches_files: vec![],
         depends_on: vec![],
-        synergy_with: vec![],
-        batch_with: vec![],
-        conflicts_with: vec![],
         model: None,
         difficulty: None,
         escalation_note: None,
@@ -808,9 +798,6 @@ fn test_exported_story_requires_human_true_in_json() {
         source_review: None,
         touches_files: vec![],
         depends_on: vec![],
-        synergy_with: vec![],
-        batch_with: vec![],
-        conflicts_with: vec![],
         model: None,
         difficulty: None,
         escalation_note: None,
@@ -841,9 +828,6 @@ fn test_exported_story_human_review_timeout_in_json() {
         source_review: None,
         touches_files: vec![],
         depends_on: vec![],
-        synergy_with: vec![],
-        batch_with: vec![],
-        conflicts_with: vec![],
         model: None,
         difficulty: None,
         escalation_note: None,
@@ -874,9 +858,6 @@ fn test_exported_story_requires_human_round_trip() {
         source_review: None,
         touches_files: vec![],
         depends_on: vec![],
-        synergy_with: vec![],
-        batch_with: vec![],
-        conflicts_with: vec![],
         model: None,
         difficulty: None,
         escalation_note: None,
