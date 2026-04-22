@@ -1,7 +1,7 @@
 //! Smart task selection for the next command.
 //!
 //! This module implements the `next` command's task selection algorithm that
-//! considers file locality, dependencies, synergies, conflicts, and batch grouping.
+//! considers file locality, dependencies, and priority scoring.
 //! It also provides the main `next()` entry point that integrates task selection,
 //! claiming, and learnings retrieval.
 //!
@@ -130,7 +130,7 @@ pub use selection::{
 ///
 /// # Returns
 ///
-/// Returns a `NextResult` with the selected task, batch tasks, learnings, and metadata.
+/// Returns a `NextResult` with the selected task, learnings, and metadata.
 pub fn next(
     dir: &Path,
     after_files: &[String],

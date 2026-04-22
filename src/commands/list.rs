@@ -411,7 +411,15 @@ mod tests {
         drop(conn);
 
         // Match all .rs files in src/commands/
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None, None).unwrap();
+        let result = list(
+            temp_dir.path(),
+            None,
+            Some("src/commands/*.rs"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().any(|t| t.id == "US-001"));
         assert!(result.tasks.iter().any(|t| t.id == "US-002"));
@@ -424,7 +432,15 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/main.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("nonexistent/*.rs"), None, None, None).unwrap();
+        let result = list(
+            temp_dir.path(),
+            None,
+            Some("nonexistent/*.rs"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.count, 0);
     }
 
@@ -484,7 +500,15 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/commands/show.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None, None).unwrap();
+        let result = list(
+            temp_dir.path(),
+            None,
+            Some("src/commands/*.rs"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Should only return the task once, not three times
         assert_eq!(result.count, 1);
         assert_eq!(result.tasks[0].id, "US-001");
