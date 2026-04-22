@@ -2562,7 +2562,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // pre-condition is missing, we warn and silently fall back to the
     // sequential path so the loop still makes progress instead of failing.
     let parallel_requested = run_config.config.parallel_slots > 1;
-    let (parallel_active, slot_worktree_paths) = if parallel_requested {
+    let (mut parallel_active, slot_worktree_paths) = if parallel_requested {
         match (branch_name.as_ref(), run_config.config.use_worktrees) {
             (Some(branch), true) => match worktree::ensure_slot_worktrees(
                 &run_config.source_root,
@@ -2828,11 +2828,18 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // terminal-condition checks. The outer loop only needs to track the
         // counters and decide when to break.
         if parallel_active {
-            // `branch_name` is guaranteed Some here because parallel_active
-            // is gated on it during step 9.5 setup.
-            let branch = branch_name
-                .as_deref()
-                .expect("parallel_active implies branch");
+            let Some(branch) = branch_name.as_deref() else {
+                // Should never happen: parallel_active is only set when
+                // branch_name is Some (step 9.5). Degrade to sequential
+                // rather than panic on an invariant violation.
+                eprintln!(
+                    "Warning: parallel_active=true but branch_name is None; \
+                     falling through to sequential iteration"
+                );
+                parallel_active = false;
+                // fall through to sequential path below
+                continue;
+            };
             let wave_params = WaveIterationParams {
                 conn: &mut conn,
                 db_dir: &run_config.db_dir,
