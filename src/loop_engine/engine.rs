@@ -6719,5 +6719,630 @@ mod tests {
             assert_eq!(cloned.verbose, params.verbose);
             assert_eq!(cloned.default_model.as_deref(), Some(OPUS_MODEL));
         }
+
+        // --- TEST-001: Comprehensive parallel execution tests -------------
+        //
+        // End-to-end behavior of `run_parallel_wave` and `run_wave_iteration`
+        // using a mock Claude binary. Every test here mutates the process-wide
+        // `CLAUDE_BINARY` env var, so each one takes the shared mutex to
+        // serialize with other tests that touch the same variable.
+        mod comprehensive {
+            use super::*;
+            use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard, insert_run};
+            use std::io::Write as _;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            /// Create a mock `claude` script for wave tests.
+            ///
+            /// Behavior:
+            /// - Reads prompt from stdin (how `spawn_claude` delivers it).
+            /// - Extracts `TASK_ID` from the task JSON `"id": "TASK-ID"` line.
+            /// - Emits one stream-json `result` line so the claude wrapper's
+            ///   stream-json parser yields `<completed>TASK-ID</completed>`
+            ///   as the slot's output text.
+            /// - When the `MOCK_CRASH_TASKS` env var lists the extracted id
+            ///   (comma-delimited), exit 1 with no output so the slot outcome
+            ///   becomes `Crash(RuntimeError)`.
+            ///
+            /// The caller removes the script with `std::fs::remove_file` after
+            /// the wave completes.
+            fn make_mock_script(name: &str) -> PathBuf {
+                let path = std::env::temp_dir().join(format!("task_mgr_test_wave_{name}.sh"));
+                {
+                    let mut f = std::fs::File::create(&path).unwrap();
+                    writeln!(f, "#!/bin/sh").unwrap();
+                    writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+                    writeln!(
+                        f,
+                        r#"TASK_ID=$(printf '%s' "$PROMPT" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -n 1)"#
+                    )
+                    .unwrap();
+                    writeln!(
+                        f,
+                        r#"case ",${{MOCK_CRASH_TASKS:-}}," in *",${{TASK_ID}},"*) exit 1 ;; esac"#
+                    )
+                    .unwrap();
+                    writeln!(
+                        f,
+                        r#"printf '{{"type":"result","result":"<completed>%s</completed>"}}\n' "$TASK_ID""#
+                    )
+                    .unwrap();
+                }
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            }
+
+            /// Fetch a task's status, panicking if the row is missing.
+            fn task_status(conn: &Connection, id: &str) -> String {
+                conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
+                    .unwrap()
+            }
+
+            /// Minimal PRD with the given ids so `update_prd_task_passes`
+            /// finds matching `userStories` entries to flip `passes=true` on.
+            fn write_prd(dir: &Path, ids: &[&str]) -> PathBuf {
+                use serde_json::json;
+                let stories: Vec<_> = ids
+                    .iter()
+                    .map(|id| json!({"id": id, "title": "t", "priority": 10, "passes": false}))
+                    .collect();
+                let path = dir.join("prd.json");
+                std::fs::write(
+                    &path,
+                    serde_json::to_string(&json!({"userStories": stories})).unwrap(),
+                )
+                .unwrap();
+                path
+            }
+
+            /// Assemble a WaveIterationParams for the common test wiring.
+            #[allow(clippy::too_many_arguments)]
+            fn build_wave_params<'a>(
+                conn: &'a mut Connection,
+                db_dir: &'a Path,
+                source_root: &'a Path,
+                slot_paths: &'a [PathBuf],
+                base_prompt: &'a Path,
+                permission_mode: &'a PermissionMode,
+                signal_flag: &'a SignalFlag,
+                prd_path: &'a Path,
+                progress_path: &'a Path,
+                parallel_slots: usize,
+                run_id: &'a str,
+            ) -> WaveIterationParams<'a> {
+                WaveIterationParams {
+                    conn,
+                    db_dir,
+                    source_root,
+                    branch: "main",
+                    parallel_slots,
+                    slot_worktree_paths: slot_paths,
+                    iteration: 1,
+                    run_id,
+                    base_prompt_path: base_prompt,
+                    permission_mode,
+                    signal_flag,
+                    default_model: None,
+                    verbose: false,
+                    task_prefix: None,
+                    prd_path,
+                    progress_path,
+                    tasks_dir: source_root,
+                    external_repo_path: None,
+                    external_git_scan_depth: 50,
+                    inter_iteration_delay: Duration::ZERO,
+                }
+            }
+
+            /// AC1: two non-conflicting tasks complete in one wave (--parallel 2).
+            ///
+            /// Two eligible tasks with disjoint `touchesFiles` fill both slots;
+            /// the mock emits `<completed>` for each, so both rows flip to
+            /// `done` and `tasks_completed == 2` after the wave.
+            #[test]
+            fn test_wave_two_disjoint_tasks_both_complete() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("two_complete");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-complete";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-A", "Task A", "todo", 10);
+                insert_task(&conn, "FEAT-B", "Task B", "todo", 20);
+                insert_task_file(&conn, "FEAT-A", "src/a.rs");
+                insert_task_file(&conn, "FEAT-B", "src/b.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-A", "FEAT-B"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 2,
+                    "both slots should complete their tasks"
+                );
+                assert!(outcome.iteration_consumed);
+                assert_eq!(task_status(&conn, "FEAT-A"), "done");
+                assert_eq!(task_status(&conn, "FEAT-B"), "done");
+            }
+
+            /// AC2: signal during wave terminates all slots.
+            ///
+            /// Pre-set the shared signal before the wave starts. Steps 0/13 of
+            /// `run_wave_iteration` short-circuit on signal, so the direct
+            /// wave-iteration path is covered by
+            /// `test_run_wave_iteration_pre_set_signal_returns_terminal_signal`.
+            /// This test exercises `run_parallel_wave` itself: every spawned
+            /// slot thread must observe the signal and bail out of its iteration
+            /// without ever reaching the mock Claude process.
+            #[test]
+            fn test_wave_pre_signal_terminates_every_slot() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // Point the binary at a path that would crash if spawned, so a
+                // regression that skips the signal check would surface as a
+                // non-Empty outcome instead of a silent pass.
+                let _guard = EnvGuard::set("CLAUDE_BINARY", "/nonexistent_binary_for_signal_test");
+
+                let (temp, conn) = setup_test_db();
+                insert_task(&conn, "FEAT-A", "a", "todo", 10);
+                insert_task(&conn, "FEAT-B", "b", "todo", 20);
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+
+                let signal = SignalFlag::new();
+                signal.set();
+                let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal.clone()));
+
+                let slots = vec![
+                    make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
+                    make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
+                ];
+                let wave = run_parallel_wave(&conn, slots, params);
+
+                assert_eq!(wave.outcomes.len(), 2, "every slot must report an outcome");
+                for outcome in &wave.outcomes {
+                    assert!(
+                        outcome.iteration_result.should_stop,
+                        "slot {} must stop on signal",
+                        outcome.slot_index
+                    );
+                    assert!(
+                        matches!(outcome.iteration_result.outcome, IterationOutcome::Empty),
+                        "slot {} outcome must be Empty on pre-set signal, got {:?}",
+                        outcome.slot_index,
+                        outcome.iteration_result.outcome
+                    );
+                }
+            }
+
+            /// AC3: crash in one slot doesn't affect other slots.
+            ///
+            /// Mock crashes slot 0 (`FEAT-CRASH`) by setting `MOCK_CRASH_TASKS`
+            /// to that id; slot 1 (`FEAT-OK`) completes normally. We expect
+            /// one `Crash(RuntimeError)` outcome plus one completion mark; the
+            /// completion must not be lost because its peer crashed.
+            #[test]
+            fn test_wave_crash_in_one_slot_does_not_affect_others() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("mixed_crash");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-mixed";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-CRASH", "crash slot", "todo", 10);
+                insert_task(&conn, "FEAT-OK", "passing slot", "todo", 20);
+                insert_task_file(&conn, "FEAT-CRASH", "src/crash.rs");
+                insert_task_file(&conn, "FEAT-OK", "src/ok.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-CRASH", "FEAT-OK"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 1,
+                    "the non-crashing slot must still mark its task done"
+                );
+                assert_eq!(task_status(&conn, "FEAT-OK"), "done");
+                assert_ne!(
+                    task_status(&conn, "FEAT-CRASH"),
+                    "done",
+                    "the crashed slot must not mark its task done"
+                );
+            }
+
+            /// AC4: `--parallel 1` produces identical behavior to sequential.
+            ///
+            /// With `parallel_slots=1` and three eligible disjoint-file tasks,
+            /// `select_parallel_group` caps at one task — the same pick
+            /// sequential `select_next_task` would make. After the wave, the
+            /// winning task is `done` and the other two are still `todo`.
+            #[test]
+            fn test_wave_parallel_slots_one_runs_a_single_task() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("parallel_one");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-parallel-one";
+                insert_run(&conn, run_id);
+                // Priorities: 10 wins, 20 and 30 must not be touched.
+                insert_task(&conn, "FEAT-WIN", "winner", "todo", 10);
+                insert_task(&conn, "FEAT-SKIP1", "skip 1", "todo", 20);
+                insert_task(&conn, "FEAT-SKIP2", "skip 2", "todo", 30);
+                insert_task_file(&conn, "FEAT-WIN", "src/win.rs");
+                insert_task_file(&conn, "FEAT-SKIP1", "src/skip1.rs");
+                insert_task_file(&conn, "FEAT-SKIP2", "src/skip2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-WIN", "FEAT-SKIP1", "FEAT-SKIP2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        1,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(outcome.tasks_completed, 1, "exactly one slot runs");
+                assert_eq!(task_status(&conn, "FEAT-WIN"), "done");
+                assert_eq!(
+                    task_status(&conn, "FEAT-SKIP1"),
+                    "todo",
+                    "lower-priority task must be untouched by --parallel 1"
+                );
+                assert_eq!(task_status(&conn, "FEAT-SKIP2"), "todo");
+
+                // Only one progress entry was emitted — matches sequential cadence.
+                let log = std::fs::read_to_string(&progress).unwrap();
+                assert_eq!(
+                    log.matches("- Task: FEAT-").count(),
+                    1,
+                    "exactly one task entry in progress, got: {log}"
+                );
+            }
+
+            /// AC5: parallel group with all-overlapping tasks degenerates to
+            /// sequential.
+            ///
+            /// Three tasks all touch `src/shared.rs`. Even with
+            /// `parallel_slots=3`, `select_parallel_group` returns a group of
+            /// one; the wave runs a single slot and only the highest-priority
+            /// task advances.
+            #[test]
+            fn test_wave_all_overlapping_tasks_run_sequentially() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("all_overlap");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-overlap";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-HOT1", "hot 1", "todo", 10);
+                insert_task(&conn, "FEAT-HOT2", "hot 2", "todo", 20);
+                insert_task(&conn, "FEAT-HOT3", "hot 3", "todo", 30);
+                for id in ["FEAT-HOT1", "FEAT-HOT2", "FEAT-HOT3"] {
+                    insert_task_file(&conn, id, "src/shared.rs");
+                }
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-HOT1", "FEAT-HOT2", "FEAT-HOT3"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![
+                    tmp.path().to_path_buf(),
+                    tmp.path().to_path_buf(),
+                    tmp.path().to_path_buf(),
+                ];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        3,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 1,
+                    "file-conflict collapse must leave only one slot running"
+                );
+                assert_eq!(task_status(&conn, "FEAT-HOT1"), "done");
+                assert_eq!(task_status(&conn, "FEAT-HOT2"), "todo");
+                assert_eq!(task_status(&conn, "FEAT-HOT3"), "todo");
+            }
+
+            /// AC7 — CrashTracker wave policy: all-slot crash increments the
+            /// tracker, any-slot success resets it.
+            ///
+            /// Two tasks → both crash → `record_crash()` called so
+            /// `ctx.crash_tracker.count() == 1` after the wave.
+            #[test]
+            fn test_wave_crash_tracker_all_crashed_increments() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("all_crash");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                // Both tasks crash.
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-X,FEAT-Y");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-all-crash";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-X", "x", "todo", 10);
+                insert_task(&conn, "FEAT-Y", "y", "todo", 20);
+                insert_task_file(&conn, "FEAT-X", "src/x.rs");
+                insert_task_file(&conn, "FEAT-Y", "src/y.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-X", "FEAT-Y"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(10);
+                assert_eq!(ctx.crash_tracker.count(), 0);
+
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(outcome.tasks_completed, 0, "no slot should complete");
+                assert_eq!(
+                    ctx.crash_tracker.count(),
+                    1,
+                    "all-slots-crashed must bump the crash tracker exactly once per wave"
+                );
+            }
+
+            /// AC7 — mirror: at least one slot completes, so the crash tracker
+            /// resets even if a sibling crashed. Seeds `count = 2` first so the
+            /// reset-to-zero assertion is meaningful.
+            #[test]
+            fn test_wave_crash_tracker_any_completed_resets() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("mixed_reset");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-mixed-reset";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-CRASH", "c", "todo", 10);
+                insert_task(&conn, "FEAT-OK2", "ok", "todo", 20);
+                insert_task_file(&conn, "FEAT-CRASH", "src/crash2.rs");
+                insert_task_file(&conn, "FEAT-OK2", "src/ok2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-CRASH", "FEAT-OK2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(10);
+                ctx.crash_tracker.record_crash();
+                ctx.crash_tracker.record_crash();
+                assert_eq!(ctx.crash_tracker.count(), 2);
+
+                run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    ctx.crash_tracker.count(),
+                    0,
+                    "any-slot success must reset the crash tracker to zero"
+                );
+            }
+
+            /// AC8: progress file entries include slot numbers.
+            ///
+            /// After a 2-slot wave, the progress log must carry per-slot
+            /// headers (`Iteration N Slot M`) and body lines (`- Slot: M`)
+            /// so operators can correlate entries with wave slots.
+            #[test]
+            fn test_wave_progress_entries_include_slot_numbers() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("progress_slots");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-progress";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-P1", "p1", "todo", 10);
+                insert_task(&conn, "FEAT-P2", "p2", "todo", 20);
+                insert_task_file(&conn, "FEAT-P1", "src/p1.rs");
+                insert_task_file(&conn, "FEAT-P2", "src/p2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-P1", "FEAT-P2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                let log = std::fs::read_to_string(&progress).expect("progress file exists");
+                assert!(
+                    log.contains("Iteration 1 Slot 0"),
+                    "progress must tag slot 0 in iteration 1 header, got: {log}"
+                );
+                assert!(
+                    log.contains("Iteration 1 Slot 1"),
+                    "progress must tag slot 1 in iteration 1 header, got: {log}"
+                );
+                assert!(
+                    log.contains("- Slot: 0"),
+                    "progress body must contain '- Slot: 0', got: {log}"
+                );
+                assert!(
+                    log.contains("- Slot: 1"),
+                    "progress body must contain '- Slot: 1', got: {log}"
+                );
+            }
+        }
     }
 }
