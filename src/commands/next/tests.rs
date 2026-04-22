@@ -349,7 +349,6 @@ mod selection_tests {
     use crate::commands::next::selection::select_parallel_group;
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_two_tasks_sharing_file_returns_one() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Task A", "todo", 10);
@@ -368,7 +367,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_two_disjoint_tasks_returns_two() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Task A", "todo", 10);
@@ -384,7 +382,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_empty_touches_files_always_parallelize() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "With file", "todo", 10);
@@ -406,7 +403,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_respects_max_slots() {
         let (_temp_dir, conn) = setup_test_db();
         // 5 tasks with fully-disjoint files; max_slots=3 → group truncated to 3.
@@ -423,7 +419,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_ordered_by_score_descending() {
         let (_temp_dir, conn) = setup_test_db();
         // Disjoint files so all three can parallelize; priorities out of order.
@@ -451,7 +446,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_single_eligible_task_returns_one() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Only Task", "todo", 10);
@@ -463,7 +457,6 @@ mod selection_tests {
     }
 
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_all_sharing_one_file_forces_sequential() {
         let (_temp_dir, conn) = setup_test_db();
         // 4 eligible tasks all touching the same hot-spot file.
@@ -491,7 +484,6 @@ mod selection_tests {
     /// no conflict check would return all three (wrong: US-001 and US-002
     /// collide on src/shared.rs).
     #[test]
-    #[ignore = "select_parallel_group is a stub until FEAT-002"]
     fn test_parallel_group_known_bad_requires_conflict_check() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "High A", "todo", 10);

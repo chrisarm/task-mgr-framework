@@ -314,16 +314,108 @@ fn get_all_task_files(
 
 /// Select up to `max_slots` non-conflicting tasks for parallel execution.
 ///
-/// STUB — implemented in FEAT-002. Returns an empty vector so the test file
-/// compiles; FEAT-002 tests covering this function are `#[ignore]`d until then.
+/// # Algorithm
+///
+/// 1. Score all eligible tasks identically to `select_next_task`.
+/// 2. Sort by total_score DESC, priority ASC.
+/// 3. Greedy pass: accept each candidate unless any of its files appear in the
+///    set of files already claimed by an accepted task.
+/// 4. Tasks with zero `touchesFiles` entries have no conflicts and are always
+///    eligible.
+/// 5. Stop once `max_slots` tasks are accepted.
+///
+/// The returned group is ordered by total_score descending.
 pub fn select_parallel_group(
-    _conn: &Connection,
-    _after_files: &[String],
+    conn: &Connection,
+    after_files: &[String],
     _recently_completed: &[String],
-    _task_prefix: Option<&str>,
-    _max_slots: usize,
+    task_prefix: Option<&str>,
+    max_slots: usize,
 ) -> TaskMgrResult<Vec<ScoredTask>> {
-    Ok(Vec::new())
+    if max_slots == 0 {
+        return Ok(Vec::new());
+    }
+
+    let completed_ids = get_completed_task_ids(conn, task_prefix)?;
+    let todo_tasks = get_todo_tasks(conn, task_prefix)?;
+    let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
+    let task_files = get_all_task_files(conn, task_prefix)?;
+
+    let eligible_tasks: Vec<Task> = todo_tasks
+        .into_iter()
+        .filter(|task| {
+            let task_deps = dependencies
+                .get(&task.id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            task_deps
+                .iter()
+                .all(|dep_id| completed_ids.contains(dep_id))
+        })
+        .collect();
+
+    if eligible_tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let weights = calibrate::load_dynamic_weights(conn);
+    let after_files_set: HashSet<&str> = after_files.iter().map(String::as_str).collect();
+
+    let mut scored_tasks: Vec<ScoredTask> = eligible_tasks
+        .into_iter()
+        .map(|task| {
+            let files = task_files.get(&task.id).cloned().unwrap_or_default();
+
+            let file_overlap_count = files
+                .iter()
+                .filter(|f| after_files_set.contains(f.as_str()))
+                .count() as i32;
+            let file_score = file_overlap_count * weights.file_overlap;
+            let priority_score = weights.priority_base - task.priority;
+            let total_score = priority_score + file_score;
+
+            ScoredTask {
+                task,
+                files,
+                total_score,
+                score_breakdown: ScoreBreakdown {
+                    priority_score,
+                    file_score,
+                    file_overlap_count,
+                },
+            }
+        })
+        .collect();
+
+    scored_tasks.sort_by(|a, b| {
+        b.total_score
+            .cmp(&a.total_score)
+            .then_with(|| a.task.priority.cmp(&b.task.priority))
+    });
+
+    // Greedy selection: borrow file slices from task_files (not candidate) so
+    // candidate can be moved into group while used_files retains its borrows.
+    let mut group: Vec<ScoredTask> = Vec::new();
+    let mut used_files: HashSet<&str> = HashSet::new();
+
+    for candidate in scored_tasks {
+        if group.len() >= max_slots {
+            break;
+        }
+        let files = task_files
+            .get(&candidate.task.id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if !files.is_empty() && files.iter().any(|f| used_files.contains(f.as_str())) {
+            continue;
+        }
+        for f in files {
+            used_files.insert(f.as_str());
+        }
+        group.push(candidate);
+    }
+
+    Ok(group)
 }
 
 /// Format selection result as human-readable text.
