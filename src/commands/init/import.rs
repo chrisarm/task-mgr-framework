@@ -367,23 +367,22 @@ pub fn insert_relationship(
 }
 
 /// Insert all relationships for a task. Returns the number of relationships inserted.
-///
-/// `synergyWith`, `batchWith`, and `conflictsWith` are deprecated; file-overlap
-/// detection at runtime replaces them. They are silently ignored here.
 pub fn insert_task_relationships(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<usize> {
-    let has_deprecated = !story.synergy_with.is_empty()
-        || !story.batch_with.is_empty()
-        || !story.conflicts_with.is_empty();
-    if has_deprecated {
-        eprintln!(
-            "warning: task {} uses deprecated relationship fields (synergyWith/batchWith/conflictsWith); \
-             these are ignored — use touchesFiles for conflict detection",
-            story.id
-        );
-    }
     let mut count = 0;
     for dep in &story.depends_on {
         insert_relationship(conn, &story.id, dep, "dependsOn")?;
+        count += 1;
+    }
+    for syn in &story.synergy_with {
+        insert_relationship(conn, &story.id, syn, "synergyWith")?;
+        count += 1;
+    }
+    for batch in &story.batch_with {
+        insert_relationship(conn, &story.id, batch, "batchWith")?;
+        count += 1;
+    }
+    for conflict in &story.conflicts_with {
+        insert_relationship(conn, &story.id, conflict, "conflictsWith")?;
         count += 1;
     }
     Ok(count)

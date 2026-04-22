@@ -182,7 +182,6 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             run_id,
             decay_threshold,
             prefix,
-            parallel: _,
         } => {
             let _lock = if claim || decay_threshold > 0 {
                 Some(LockGuard::acquire(&cli.dir)?)
@@ -792,7 +791,6 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_worktree,
             external_repo,
             cleanup_worktree,
-            parallel,
         } => {
             let project_root = get_project_root()?;
 
@@ -802,7 +800,6 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             config.verbose = verbose || cli.verbose;
             config.use_worktrees = !no_worktree;
             config.cleanup_worktree = cleanup_worktree;
-            config.parallel_slots = parallel;
 
             // `cli.dir` is already absolute (resolved in `main()` via
             // `resolve_db_dir`, which anchors a relative default against

@@ -20,7 +20,6 @@ pub(crate) fn clamp_weight(value: i32, default: i32) -> i32 {
 }
 
 /// Clamp a negative weight to [2.0x, 0.5x] of its default (inverted bounds).
-#[allow(dead_code)]
 pub(crate) fn clamp_negative_weight(value: i32, default: i32) -> i32 {
     // For negative weights like CONFLICT_PENALTY=-5:
     // lower bound (more negative) = default * 2.0 = -10
@@ -192,18 +191,26 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 5.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 4.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 1.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
 
@@ -218,10 +225,14 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 5.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
 
@@ -236,10 +247,14 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 3.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 5.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
 
@@ -263,10 +278,14 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 1000.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
         let corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
@@ -284,10 +303,14 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 1000.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
         let corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
@@ -304,14 +327,79 @@ mod tests {
             TaskOutcome {
                 first_try_success: true,
                 file_overlap_count: 3.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
             TaskOutcome {
                 first_try_success: false,
                 file_overlap_count: 3.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
             },
         ];
         let corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
         assert_eq!(corr, 0.0, "Equal means should produce zero correlation");
+    }
+
+    #[test]
+    fn test_correlation_synergy_dimension() {
+        let outcomes = vec![
+            TaskOutcome {
+                first_try_success: true,
+                file_overlap_count: 0.0,
+                synergy_count: 10.0,
+                conflict_count: 0.0,
+            },
+            TaskOutcome {
+                first_try_success: true,
+                file_overlap_count: 0.0,
+                synergy_count: 8.0,
+                conflict_count: 0.0,
+            },
+            TaskOutcome {
+                first_try_success: false,
+                file_overlap_count: 0.0,
+                synergy_count: 1.0,
+                conflict_count: 0.0,
+            },
+            TaskOutcome {
+                first_try_success: false,
+                file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
+            },
+        ];
+        let corr = compute_correlation(&outcomes, |o| o.synergy_count);
+        assert!(
+            corr > 0.0,
+            "High synergy success should give positive correlation: {}",
+            corr
+        );
+    }
+
+    #[test]
+    fn test_correlation_conflict_dimension() {
+        // Successful tasks have low conflict, failed have high → negative correlation for conflict
+        let outcomes = vec![
+            TaskOutcome {
+                first_try_success: true,
+                file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 0.0,
+            },
+            TaskOutcome {
+                first_try_success: false,
+                file_overlap_count: 0.0,
+                synergy_count: 0.0,
+                conflict_count: 5.0,
+            },
+        ];
+        let corr = compute_correlation(&outcomes, |o| o.conflict_count);
+        assert!(
+            corr < 0.0,
+            "High conflict in failures should give negative correlation: {}",
+            corr
+        );
     }
 
     // --- adjust_weight tests ---

@@ -327,7 +327,6 @@ fn test_e2e_progress_log_records_model() {
         &["src/core.rs".to_string()],
         Some(OPUS_MODEL),
         Some("max"),
-        None,
     );
 
     let content = fs::read_to_string(&progress_path).unwrap();
@@ -343,7 +342,6 @@ fn test_e2e_progress_log_records_model() {
         Some("MR-003"),
         &task_mgr::loop_engine::config::IterationOutcome::Completed,
         &[],
-        None,
         None,
         None,
     );

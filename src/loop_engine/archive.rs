@@ -251,23 +251,21 @@ pub fn run_archive(
         }
     }
 
-    // Extract learnings from each archived PRD's prefix-specific progress file.
-    let mut learnings_count = 0usize;
-    for prd_summary in &prds_archived {
-        let progress_filename = if prd_summary.task_prefix.is_empty() {
-            "progress.txt".to_string()
-        } else {
-            format!("progress-{}.txt", prd_summary.task_prefix)
-        };
-        let progress_path = tasks_dir.join(&progress_filename);
+    // Extract learnings once, only when at least one PRD was archived
+    let learnings_count = if !prds_archived.is_empty() {
+        let progress_path = tasks_dir.join("progress.txt");
         if progress_path.exists() {
             let learnings = extract_learnings_from_progress(&progress_path)?;
             if !learnings.is_empty() && !dry_run {
                 append_learnings_to_file(&tasks_dir.join("learnings.md"), &learnings)?;
             }
-            learnings_count += learnings.len();
+            learnings.len()
+        } else {
+            0
         }
-    }
+    } else {
+        0
+    };
 
     let message = if prds_archived.is_empty() {
         // Keep "not fully completed" wording for backward-compatible messaging
@@ -977,9 +975,8 @@ mod tests {
         let tasks_dir = dir.path().join("tasks");
         fs::create_dir_all(&tasks_dir).unwrap();
         fs::write(tasks_dir.join("test-project.json"), "{}").unwrap();
-        // Prefix "FEAT" → progress-FEAT.txt
         fs::write(
-            tasks_dir.join("progress-FEAT.txt"),
+            tasks_dir.join("progress.txt"),
             "## FEAT-001\n- **Learnings:** Important discovery.\n---\n",
         )
         .unwrap();
@@ -993,85 +990,6 @@ mod tests {
         let content = fs::read_to_string(&learnings_path).unwrap();
         assert!(content.contains("Important discovery."));
         assert!(content.contains("## Archived Learnings"));
-    }
-
-    /// Prefix-aware learning extraction: progress-P1.txt is read; progress.txt is ignored.
-    #[test]
-    fn test_run_archive_learnings_prefix_aware() {
-        let dir = TempDir::new().unwrap();
-
-        let conn = setup_db(dir.path());
-        insert_prd(&conn, 1, "proj-p1", "main", Some("P1"));
-        insert_task(&conn, "P1-001", "Done", 1, "done");
-        drop(conn);
-
-        let tasks_dir = dir.path().join("tasks");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(tasks_dir.join("proj-p1.json"), "{}").unwrap();
-        // Wrong file (no prefix): must NOT be read
-        fs::write(
-            tasks_dir.join("progress.txt"),
-            "## P1-001\n- **Learnings:** Should be ignored.\n---\n",
-        )
-        .unwrap();
-        // Correct file (prefix P1)
-        fs::write(
-            tasks_dir.join("progress-P1.txt"),
-            "## P1-001\n- **Learnings:** Prefix discovery.\n---\n",
-        )
-        .unwrap();
-
-        let result = run_archive(dir.path(), false, None).unwrap();
-        assert_eq!(
-            result.learnings_extracted, 1,
-            "Exactly one learning from progress-P1.txt"
-        );
-
-        let content = fs::read_to_string(tasks_dir.join("learnings.md")).unwrap();
-        assert!(
-            content.contains("Prefix discovery."),
-            "learning from progress-P1.txt extracted"
-        );
-        assert!(
-            !content.contains("Should be ignored."),
-            "progress.txt must not be read"
-        );
-    }
-
-    /// Prefix-aware: a second PRD with a different prefix reads its own progress file.
-    /// Verifies both files are read independently and learnings from each are combined.
-    #[test]
-    fn test_run_archive_learnings_two_prds_separate_progress_files() {
-        let dir = TempDir::new().unwrap();
-
-        let conn = setup_db(dir.path());
-        insert_prd(&conn, 1, "proj-pa", "main", Some("PA"));
-        insert_task(&conn, "PA-001", "Done", 1, "done");
-        insert_prd(&conn, 2, "proj-pb", "main", Some("PB"));
-        insert_task(&conn, "PB-001", "Done", 2, "done");
-        drop(conn);
-
-        let tasks_dir = dir.path().join("tasks");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(tasks_dir.join("proj-pa.json"), "{}").unwrap();
-        fs::write(tasks_dir.join("proj-pb.json"), "{}").unwrap();
-        fs::write(
-            tasks_dir.join("progress-PA.txt"),
-            "## PA-001\n- **Learnings:** Alpha discovery.\n---\n",
-        )
-        .unwrap();
-        fs::write(
-            tasks_dir.join("progress-PB.txt"),
-            "## PB-001\n- **Learnings:** Beta discovery.\n---\n",
-        )
-        .unwrap();
-
-        let result = run_archive(dir.path(), false, None).unwrap();
-        assert_eq!(result.learnings_extracted, 2, "One learning per PRD");
-
-        let content = fs::read_to_string(tasks_dir.join("learnings.md")).unwrap();
-        assert!(content.contains("Alpha discovery."));
-        assert!(content.contains("Beta discovery."));
     }
 
     #[test]

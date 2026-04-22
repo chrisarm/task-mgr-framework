@@ -11,20 +11,6 @@ use super::enums::{
     Confidence, FailStatus, LearningOutcome, RunEndStatus, Shell, TaskStatusFilter,
 };
 
-/// Validate --parallel N (must be 1-3).
-pub(crate) fn parse_parallel_slots(s: &str) -> Result<usize, String> {
-    let n: usize = s
-        .parse()
-        .map_err(|_| format!("'{s}' is not a valid integer"))?;
-    if (1..=3).contains(&n) {
-        Ok(n)
-    } else {
-        Err(format!(
-            "--parallel must be between 1 and 3, got {n} (1 = sequential, 2-3 = parallel waves)"
-        ))
-    }
-}
-
 /// Available commands for task-mgr
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -195,13 +181,6 @@ EXAMPLES:
         /// Scope task selection to a specific PRD prefix (e.g., "P1" returns only P1-* tasks)
         #[arg(long)]
         prefix: Option<String>,
-
-        /// Number of tasks to select in parallel (1-3, default 1)
-        ///
-        /// When greater than 1, selects up to N non-conflicting tasks
-        /// (tasks with no overlapping touchesFiles) for concurrent execution.
-        #[arg(long, default_value_t = 1, value_parser = parse_parallel_slots)]
-        parallel: usize,
     },
 
     /// Mark one or more tasks as completed
@@ -823,14 +802,6 @@ EXAMPLES:
         /// In interactive mode (no --yes), the user is prompted instead.
         #[arg(long = "cleanup-worktree", default_value_t = false)]
         cleanup_worktree: bool,
-
-        /// Number of tasks to run in parallel per wave (1-3, default 1 = sequential)
-        ///
-        /// When greater than 1, each wave selects N non-conflicting tasks
-        /// (tasks with no overlapping touchesFiles) and runs them concurrently.
-        /// Tasks that share files are never placed in the same wave.
-        #[arg(long, default_value_t = 1, value_parser = parse_parallel_slots)]
-        parallel: usize,
     },
 
     /// Show status dashboard for PRD projects

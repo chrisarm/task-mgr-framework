@@ -1,7 +1,7 @@
 /// Adaptive selection weight calibration.
 ///
 /// After each completed run, analyzes historical task outcomes against scoring
-/// dimensions (file_overlap, priority). Stores updated weights in the
+/// dimensions (file_overlap, synergy, priority). Stores updated weights in the
 /// `global_state` table. Weights are bounded at 0.5x-2.0x of default constants
 /// to prevent runaway calibration from noisy data.
 ///
@@ -10,9 +10,13 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::TaskMgrResult;
-use crate::commands::next::selection::{FILE_OVERLAP_SCORE, PRIORITY_BASE};
+use crate::commands::next::selection::{
+    CONFLICT_PENALTY, FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS,
+};
 use crate::db::prefix::prefix_and;
-use crate::loop_engine::calibrate_math::{adjust_weight, clamp_weight, compute_correlation};
+use crate::loop_engine::calibrate_math::{
+    adjust_weight, clamp_negative_weight, clamp_weight, compute_correlation,
+};
 
 /// Minimum number of completed tasks before calibration adjusts weights.
 const MIN_TASKS_FOR_CALIBRATION: usize = 10;
@@ -24,6 +28,8 @@ const MIN_TASKS_FOR_CALIBRATION: usize = 10;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SelectionWeights {
     pub file_overlap: i32,
+    pub synergy: i32,
+    pub conflict: i32,
     pub priority_base: i32,
 }
 
@@ -31,6 +37,8 @@ impl Default for SelectionWeights {
     fn default() -> Self {
         Self {
             file_overlap: FILE_OVERLAP_SCORE,
+            synergy: SYNERGY_BONUS,
+            conflict: CONFLICT_PENALTY,
             priority_base: PRIORITY_BASE,
         }
     }
@@ -42,6 +50,8 @@ impl SelectionWeights {
         let defaults = SelectionWeights::default();
 
         self.file_overlap = clamp_weight(self.file_overlap, defaults.file_overlap);
+        self.synergy = clamp_weight(self.synergy, defaults.synergy);
+        self.conflict = clamp_negative_weight(self.conflict, defaults.conflict);
         self.priority_base = clamp_weight(self.priority_base, defaults.priority_base);
     }
 }
@@ -138,8 +148,12 @@ fn count_completed_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMg
 pub(crate) struct TaskOutcome {
     /// true if the task completed on its first attempt in any run
     pub(crate) first_try_success: bool,
-    /// Number of files this task touches
+    /// Number of files this task touches that overlapped with prior iteration files
     pub(crate) file_overlap_count: f64,
+    /// Number of synergy relationships to completed tasks
+    pub(crate) synergy_count: f64,
+    /// Number of conflict relationships to completed tasks
+    pub(crate) conflict_count: f64,
 }
 
 /// Compute calibrated weights from historical data.
@@ -160,8 +174,10 @@ fn compute_calibrated_weights(
 
     let defaults = SelectionWeights::default();
 
-    // Compute correlation between file count and first-try success
+    // Compute mean dimension values for success vs failure groups
     let file_corr = compute_correlation(&outcomes, |o| o.file_overlap_count);
+    let synergy_corr = compute_correlation(&outcomes, |o| o.synergy_count);
+    let conflict_corr = compute_correlation(&outcomes, |o| o.conflict_count);
 
     // Adjust weights: scale default by (1 + correlation * ADJUSTMENT_FACTOR)
     // Positive correlation → increase weight; negative → decrease
@@ -169,6 +185,8 @@ fn compute_calibrated_weights(
 
     let mut weights = SelectionWeights {
         file_overlap: adjust_weight(defaults.file_overlap, file_corr, ADJUSTMENT_FACTOR),
+        synergy: adjust_weight(defaults.synergy, synergy_corr, ADJUSTMENT_FACTOR),
+        conflict: adjust_weight(defaults.conflict, conflict_corr, ADJUSTMENT_FACTOR),
         priority_base: defaults.priority_base, // Priority base is not calibrated
     };
 
@@ -180,7 +198,7 @@ fn compute_calibrated_weights(
 ///
 /// For each unique task that appears in run_tasks, determines:
 /// - Whether it completed on its first attempt (first_try_success)
-/// - Its scoring dimension values (file overlap count)
+/// - Its scoring dimension values (file overlap, synergy, conflict counts)
 fn load_task_outcomes(
     conn: &Connection,
     task_prefix: Option<&str>,
@@ -243,12 +261,18 @@ fn load_task_outcomes(
     // Load file counts per task
     let file_counts = get_task_file_counts(conn, task_prefix)?;
 
+    // Load synergy/conflict counts per task
+    let synergy_counts = get_relationship_counts(conn, "synergyWith", task_prefix)?;
+    let conflict_counts = get_relationship_counts(conn, "conflictsWith", task_prefix)?;
+
     // Build outcome records
     let outcomes: Vec<TaskOutcome> = task_first_try
         .into_iter()
         .map(|(task_id, first_try_success)| TaskOutcome {
             first_try_success,
             file_overlap_count: *file_counts.get(&task_id).unwrap_or(&0) as f64,
+            synergy_count: *synergy_counts.get(&task_id).unwrap_or(&0) as f64,
+            conflict_count: *conflict_counts.get(&task_id).unwrap_or(&0) as f64,
         })
         .collect();
 
@@ -279,6 +303,36 @@ fn get_task_file_counts(
             .collect(),
         None => stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect(),
+    };
+    Ok(rows?.into_iter().collect())
+}
+
+/// Get the count of relationships of a given type per task, optionally filtered by prefix.
+fn get_relationship_counts(
+    conn: &Connection,
+    rel_type: &str,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<std::collections::HashMap<String, i32>> {
+    let (prefix_clause, prefix_param) = match task_prefix {
+        Some(p) => {
+            let pattern = format!("{}-%", crate::db::prefix::escape_like(p));
+            ("AND task_id LIKE ? ESCAPE '\\'".to_string(), Some(pattern))
+        }
+        None => (String::new(), None),
+    };
+    let sql = format!(
+        "SELECT task_id, COUNT(*) FROM task_relationships WHERE rel_type = ? {prefix_clause} GROUP BY task_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Result<Vec<(String, i32)>, rusqlite::Error> = match prefix_param {
+        Some(ref p) => stmt
+            .query_map(rusqlite::params![rel_type, p], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect(),
+        None => stmt
+            .query_map([rel_type], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect(),
     };
     Ok(rows?.into_iter().collect())
@@ -318,6 +372,8 @@ mod tests {
     fn test_default_weights_match_constants() {
         let defaults = SelectionWeights::default();
         assert_eq!(defaults.file_overlap, FILE_OVERLAP_SCORE);
+        assert_eq!(defaults.synergy, SYNERGY_BONUS);
+        assert_eq!(defaults.conflict, CONFLICT_PENALTY);
         assert_eq!(defaults.priority_base, PRIORITY_BASE);
     }
 
@@ -328,11 +384,21 @@ mod tests {
     fn test_selection_weights_clamp_to_bounds() {
         let mut weights = SelectionWeights {
             file_overlap: 100,  // Way above 2.0x of 10
+            synergy: 0,         // Below 0.5x of 3
+            conflict: -100,     // Way below 2.0x of -5
             priority_base: 500, // Below 0.5x of 1000
         };
         weights.clamp_to_bounds();
 
         assert_eq!(weights.file_overlap, 20, "file_overlap clamped to upper");
+        assert_eq!(
+            weights.synergy, 1,
+            "synergy clamped to lower (0.5 * 3 = 1.5 -> 1)"
+        );
+        assert_eq!(
+            weights.conflict, -10,
+            "conflict clamped to lower (more neg)"
+        );
         assert_eq!(weights.priority_base, 500, "priority_base within bounds");
     }
 
@@ -391,12 +457,16 @@ mod tests {
         // Store valid weights JSON
         let weights = SelectionWeights {
             file_overlap: 15,
+            synergy: 4,
+            conflict: -7,
             priority_base: 1200,
         };
         store_weights(&conn, &weights).unwrap();
 
         let loaded = load_dynamic_weights(&conn);
         assert_eq!(loaded.file_overlap, 15);
+        assert_eq!(loaded.synergy, 4);
+        assert_eq!(loaded.conflict, -7);
         assert_eq!(loaded.priority_base, 1200);
     }
 
@@ -442,8 +512,8 @@ mod tests {
     fn test_load_dynamic_weights_clamps_out_of_bounds() {
         let (_temp_dir, conn) = setup_test_db();
 
-        // Store weights that exceed bounds (extra fields are ignored by serde)
-        let json = r#"{"file_overlap":100,"priority_base":5000}"#;
+        // Store weights that exceed bounds
+        let json = r#"{"file_overlap":100,"synergy":100,"conflict":-100,"priority_base":5000}"#;
         conn.execute(
             "UPDATE global_state SET last_task_id = ?1 WHERE id = 1",
             [json],
@@ -454,6 +524,11 @@ mod tests {
         assert_eq!(
             weights.file_overlap, 20,
             "Should clamp file_overlap to 2.0x"
+        );
+        assert_eq!(weights.synergy, 6, "Should clamp synergy to 2.0x");
+        assert_eq!(
+            weights.conflict, -10,
+            "Should clamp conflict to 2.0x (more negative)"
         );
         assert_eq!(
             weights.priority_base, 2000,
@@ -469,6 +544,8 @@ mod tests {
 
         let original = SelectionWeights {
             file_overlap: 12,
+            synergy: 5,
+            conflict: -8,
             priority_base: 1100,
         };
         store_weights(&conn, &original).unwrap();
@@ -624,10 +701,10 @@ mod tests {
 
     // === Comprehensive tests (TEST-005) ===
 
-    // --- AC: Calibration with file count signal ---
+    // --- AC: Calibration with conflicting signals ---
 
     #[test]
-    fn test_calibration_file_count_signal() {
+    fn test_calibration_conflicting_signals() {
         let (_temp_dir, conn) = setup_test_db();
 
         for i in 0..12 {
@@ -640,7 +717,7 @@ mod tests {
         )
         .unwrap();
 
-        // Tasks 0-5: succeed, high file count
+        // Tasks 0-5: succeed, high file count, LOW synergy
         for i in 0..6 {
             let id = format!("TASK-{:03}", i);
             conn.execute(
@@ -648,6 +725,7 @@ mod tests {
                 params![id, i],
             )
             .unwrap();
+            // Many files
             for f in 0..4 {
                 conn.execute(
                     "INSERT OR IGNORE INTO task_files (task_id, file_path) VALUES (?, ?)",
@@ -655,9 +733,10 @@ mod tests {
                 )
                 .unwrap();
             }
+            // No synergy relationships (low synergy)
         }
 
-        // Tasks 6-11: fail, low file count
+        // Tasks 6-11: fail, LOW file count, HIGH synergy
         for i in 6..12 {
             let id = format!("TASK-{:03}", i);
             conn.execute(
@@ -665,11 +744,22 @@ mod tests {
                 params![id, i],
             )
             .unwrap();
+            // 1 file only
             conn.execute(
                 "INSERT OR IGNORE INTO task_files (task_id, file_path) VALUES (?, ?)",
                 params![id, "src/single.rs"],
             )
             .unwrap();
+            // Many synergy relationships
+            for j in 6..12 {
+                if j != i {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_relationships (task_id, related_id, rel_type) VALUES (?, ?, 'synergyWith')",
+                        params![id, format!("TASK-{:03}", j)],
+                    )
+                    .unwrap();
+                }
+            }
         }
 
         let weights = recalibrate_weights(&conn, None).unwrap();
@@ -679,6 +769,12 @@ mod tests {
             weights.file_overlap >= FILE_OVERLAP_SCORE,
             "file_overlap should increase or stay: got {}",
             weights.file_overlap
+        );
+        // synergy should DECREASE (failing tasks had more synergy)
+        assert!(
+            weights.synergy <= SYNERGY_BONUS,
+            "synergy should decrease or stay: got {}",
+            weights.synergy
         );
     }
 
@@ -856,6 +952,8 @@ mod tests {
         // Store initial weights
         let initial = SelectionWeights {
             file_overlap: 15,
+            synergy: 5,
+            conflict: -8,
             priority_base: 1100,
         };
         store_weights(&conn, &initial).unwrap();
@@ -867,6 +965,8 @@ mod tests {
         // Store different weights
         let updated = SelectionWeights {
             file_overlap: 8,
+            synergy: 2,
+            conflict: -3,
             priority_base: 900,
         };
         store_weights(&conn, &updated).unwrap();
@@ -905,7 +1005,7 @@ mod tests {
     fn test_load_json_with_extra_fields() {
         let (_temp_dir, conn) = setup_test_db();
 
-        // serde(deny_unknown_fields) is not set, so legacy synergy/conflict fields are ignored
+        // serde(deny_unknown_fields) is not set, so extra fields should be ignored
         let json_with_extras = r#"{"file_overlap":12,"synergy":4,"conflict":-6,"priority_base":1050,"extra_field":"ignored"}"#;
         conn.execute(
             "UPDATE global_state SET last_task_id = ?1 WHERE id = 1",
@@ -915,6 +1015,8 @@ mod tests {
 
         let weights = load_dynamic_weights(&conn);
         assert_eq!(weights.file_overlap, 12);
+        assert_eq!(weights.synergy, 4);
+        assert_eq!(weights.conflict, -6);
         assert_eq!(weights.priority_base, 1050);
     }
 

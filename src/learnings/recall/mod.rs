@@ -18,8 +18,6 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
-
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +76,7 @@ pub fn recall_learnings_with_backend(
     params: RecallParams,
     backend: &dyn RetrievalBackend,
 ) -> TaskMgrResult<RecallResult> {
-    let (scored, _ucb_cache) = retrieve_and_rank(conn, &params, backend)?;
+    let scored = retrieve_and_rank(conn, &params, backend)?;
 
     // Extract learnings
     let learnings: Vec<Learning> = scored.into_iter().map(|s| s.learning).collect();
@@ -96,24 +94,16 @@ pub fn recall_learnings_with_backend(
     })
 }
 
-/// Output of [`retrieve_and_rank`]: scored rows and an optional UCB-score cache.
-///
-/// The cache is `Some` iff UCB re-ranking ran ([`RecallParams::for_task`] was
-/// set and `scored` was non-empty).
-type RankedWithUcb = (Vec<ScoredLearning>, Option<HashMap<i64, f64>>);
-
 /// Shared retrieval pipeline: backend lookup + UCB fallback + re-ranking.
 ///
-/// Returns `ScoredLearning` rows in final ranked order plus an optional cache
-/// of per-learning UCB scores computed during re-ranking.
-/// [`recall_learnings_scored`] uses the cache to avoid redundant
-/// `bandit::get_window_stats` calls; [`recall_learnings_with_backend`] ignores
-/// it.
+/// Returns `ScoredLearning` rows in final ranked order. Used by both
+/// [`recall_learnings_with_backend`] (which strips scores) and
+/// [`recall_learnings_scored`] (which preserves them).
 fn retrieve_and_rank(
     conn: &Connection,
     params: &RecallParams,
     backend: &dyn RetrievalBackend,
-) -> TaskMgrResult<RankedWithUcb> {
+) -> TaskMgrResult<Vec<ScoredLearning>> {
     let limit = if params.limit == 0 { 5 } else { params.limit };
 
     // Build RetrievalQuery from RecallParams
@@ -139,7 +129,7 @@ fn retrieve_and_rank(
     let mut scored = backend.retrieve(conn, &query)?;
 
     // UCB fallback + re-ranking only for task-based recall (not CLI free-text queries)
-    let ucb_cache = if params.for_task.is_some() {
+    if params.for_task.is_some() {
         // Fill empty slots with exploration candidates
         if scored.len() < limit {
             let exclude_ids: Vec<i64> = scored.iter().filter_map(|s| s.learning.id).collect();
@@ -149,15 +139,11 @@ fn retrieve_and_rank(
             scored.extend(fallback);
         }
 
-        // Re-rank: relevance tier dominates, UCB breaks ties within tiers.
-        // The returned cache is reused by recall_learnings_scored so we don't
-        // re-query bandit stats per row.
-        Some(rerank_with_ucb(conn, &mut scored)?)
-    } else {
-        None
-    };
+        // Re-rank: relevance tier dominates, UCB breaks ties within tiers
+        rerank_with_ucb(conn, &mut scored)?;
+    }
 
-    Ok((scored, ucb_cache))
+    Ok(scored)
 }
 
 /// Recalls learnings using the default composite backend.
@@ -221,16 +207,21 @@ pub fn recall_learnings_scored(
     params: RecallParams,
     backend: &dyn RetrievalBackend,
 ) -> TaskMgrResult<ScoredRecallResult> {
-    let (scored, ucb_cache) = retrieve_and_rank(conn, &params, backend)?;
+    let scored = retrieve_and_rank(conn, &params, backend)?;
+
+    // Only compute UCB when we actually applied it in ranking — preserves the
+    // invariant that ucb_score is Some iff --for-task recall.
+    let total_window_shows = if params.for_task.is_some() && !scored.is_empty() {
+        Some(bandit::get_total_window_shows(conn)?)
+    } else {
+        None
+    };
 
     let scored_learnings: Vec<ScoredLearningOutput> = scored
         .into_iter()
         .map(|s| {
-            // UCB was computed during rerank_with_ucb and cached; looking it up
-            // avoids a second round-trip to bandit::get_window_stats per row.
-            let ucb_score = ucb_cache
-                .as_ref()
-                .and_then(|cache| s.learning.id.and_then(|id| cache.get(&id).copied()));
+            let ucb_score =
+                total_window_shows.map(|total| ucb_for_learning(conn, &s.learning, total));
             let combined_score = match ucb_score {
                 Some(ucb) => combine_scores(s.relevance_score, ucb),
                 None => s.relevance_score,
@@ -244,14 +235,6 @@ pub fn recall_learnings_scored(
             }
         })
         .collect();
-
-    // Invariant lock: ucb_score is Some iff --for-task recall produced results.
-    // Catches future refactors that change when rerank_with_ucb runs.
-    debug_assert!(
-        scored_learnings.is_empty()
-            || params.for_task.is_some() == scored_learnings.iter().any(|s| s.ucb_score.is_some()),
-        "ucb_score presence must match for_task presence"
-    );
 
     Ok(ScoredRecallResult {
         count: scored_learnings.len(),
@@ -386,50 +369,29 @@ fn combine_scores(relevance_score: f64, ucb_score: f64) -> f64 {
 /// Sort key: `relevance_score * 100.0 + ucb_score`. Pattern-matched learnings
 /// (relevance 2/5/10) always outrank fallback learnings (0.1). Within the same
 /// relevance tier, UCB balances exploitation and exploration.
-///
-/// Returns a cache of per-learning UCB scores computed during this pass. The
-/// cache lets [`recall_learnings_scored`] surface the same values that drove
-/// ranking without re-querying `bandit::get_window_stats` per row — a sort of
-/// O(N log N) stat lookups becomes O(N).
-fn rerank_with_ucb(
-    conn: &Connection,
-    scored: &mut [ScoredLearning],
-) -> TaskMgrResult<HashMap<i64, f64>> {
-    let mut ucb_cache: HashMap<i64, f64> = HashMap::new();
+fn rerank_with_ucb(conn: &Connection, scored: &mut [ScoredLearning]) -> TaskMgrResult<()> {
     if scored.is_empty() {
-        return Ok(ucb_cache);
+        return Ok(());
     }
 
     let total_window_shows = bandit::get_total_window_shows(conn)?;
 
-    // Compute UCB once per learning, then sort against cached values.
-    for s in scored.iter() {
-        if let Some(id) = s.learning.id {
-            let ucb = ucb_for_learning(conn, &s.learning, total_window_shows);
-            ucb_cache.insert(id, ucb);
-        }
-    }
-
     scored.sort_by(|a, b| {
-        let ucb_a = a
-            .learning
-            .id
-            .and_then(|id| ucb_cache.get(&id).copied())
-            .unwrap_or(0.0);
-        let ucb_b = b
-            .learning
-            .id
-            .and_then(|id| ucb_cache.get(&id).copied())
-            .unwrap_or(0.0);
-        let score_a = combine_scores(a.relevance_score, ucb_a);
-        let score_b = combine_scores(b.relevance_score, ucb_b);
+        let score_a = combine_scores(
+            a.relevance_score,
+            ucb_for_learning(conn, &a.learning, total_window_shows),
+        );
+        let score_b = combine_scores(
+            b.relevance_score,
+            ucb_for_learning(conn, &b.learning, total_window_shows),
+        );
 
         score_b
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    Ok(ucb_cache)
+    Ok(())
 }
 
 /// Formats the recall result as human-readable text.

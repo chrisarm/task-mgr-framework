@@ -11,11 +11,13 @@ use serde_json::Value;
 use crate::TaskMgrResult;
 use crate::models::TaskStatus;
 
-/// Task-relationship map loaded from the database.
-///
-/// After synergy/batch/conflicts relationship types were dropped, only
-/// `dependsOn` is stored — a single `task_id -> [related_id]` map suffices.
-pub(crate) type RelationshipMaps = HashMap<String, Vec<String>>;
+/// Type alias for relationship maps loaded from database.
+pub(crate) type RelationshipMaps = (
+    HashMap<String, Vec<String>>, // depends_on
+    HashMap<String, Vec<String>>, // synergy_with
+    HashMap<String, Vec<String>>, // batch_with
+    HashMap<String, Vec<String>>, // conflicts_with
+);
 
 /// Default value for max_retries deserialization (used when field absent in old JSON).
 fn default_max_retries_value() -> i32 {
@@ -46,6 +48,12 @@ pub struct ExportedUserStory {
     pub touches_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synergy_with: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_with: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,7 +227,8 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
     let files_map = load_all_task_files(conn)?;
 
     // Load all relationships into maps
-    let depends_on_map = load_all_relationships(conn)?;
+    let (depends_on_map, synergy_with_map, batch_with_map, conflicts_with_map) =
+        load_all_relationships(conn)?;
 
     let mut tasks = Vec::new();
     for row in task_rows {
@@ -262,6 +271,15 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
         let mut depends_on = depends_on_map.get(&id).cloned().unwrap_or_default();
         depends_on.sort();
 
+        let mut synergy_with = synergy_with_map.get(&id).cloned().unwrap_or_default();
+        synergy_with.sort();
+
+        let mut batch_with = batch_with_map.get(&id).cloned().unwrap_or_default();
+        batch_with.sort();
+
+        let mut conflicts_with = conflicts_with_map.get(&id).cloned().unwrap_or_default();
+        conflicts_with.sort();
+
         tasks.push(ExportedUserStory {
             id,
             title,
@@ -275,6 +293,9 @@ pub(crate) fn load_tasks(conn: &Connection) -> TaskMgrResult<Vec<ExportedUserSto
             source_review,
             touches_files,
             depends_on,
+            synergy_with,
+            batch_with,
+            conflicts_with,
             model,
             difficulty,
             escalation_note,
@@ -308,29 +329,35 @@ pub(crate) fn load_all_task_files(
     Ok(map)
 }
 
-/// Load all `dependsOn` task relationships into a map.
-///
-/// Deprecated `synergyWith` / `batchWith` / `conflictsWith` rows that may still
-/// exist in older databases are ignored.
+/// Load all task relationships into maps by type.
 pub(crate) fn load_all_relationships(conn: &Connection) -> TaskMgrResult<RelationshipMaps> {
     let mut stmt = conn.prepare(
-        "SELECT task_id, related_id FROM task_relationships \
-         WHERE rel_type = 'dependsOn' \
-         ORDER BY task_id, related_id",
+        "SELECT task_id, related_id, rel_type FROM task_relationships ORDER BY task_id, related_id",
     )?;
     let rows = stmt.query_map([], |row| {
         let task_id: String = row.get(0)?;
         let related_id: String = row.get(1)?;
-        Ok((task_id, related_id))
+        let rel_type: String = row.get(2)?;
+        Ok((task_id, related_id, rel_type))
     })?;
 
     let mut depends_on: HashMap<String, Vec<String>> = HashMap::new();
+    let mut synergy_with: HashMap<String, Vec<String>> = HashMap::new();
+    let mut batch_with: HashMap<String, Vec<String>> = HashMap::new();
+    let mut conflicts_with: HashMap<String, Vec<String>> = HashMap::new();
+
     for row in rows {
-        let (task_id, related_id) = row?;
-        depends_on.entry(task_id).or_default().push(related_id);
+        let (task_id, related_id, rel_type) = row?;
+        match rel_type.as_str() {
+            "dependsOn" => depends_on.entry(task_id).or_default().push(related_id),
+            "synergyWith" => synergy_with.entry(task_id).or_default().push(related_id),
+            "batchWith" => batch_with.entry(task_id).or_default().push(related_id),
+            "conflictsWith" => conflicts_with.entry(task_id).or_default().push(related_id),
+            _ => {}
+        }
     }
 
-    Ok(depends_on)
+    Ok((depends_on, synergy_with, batch_with, conflicts_with))
 }
 
 // Import FromStr implementations from models
