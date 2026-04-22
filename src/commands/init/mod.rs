@@ -416,19 +416,13 @@ pub fn init(
     for story in &all_stories {
         tasks_imported += 1;
         files_imported += story.touches_files.len();
-        relationships_imported += story.depends_on.len()
-            + story.synergy_with.len()
-            + story.batch_with.len()
-            + story.conflicts_with.len();
+        relationships_imported += story.depends_on.len();
     }
 
     for story in &stories_to_update {
         tasks_updated += 1;
         files_imported += story.touches_files.len();
-        relationships_imported += story.depends_on.len()
-            + story.synergy_with.len()
-            + story.batch_with.len()
-            + story.conflicts_with.len();
+        relationships_imported += story.depends_on.len();
     }
 
     // In dry-run mode, skip the actual database modifications
