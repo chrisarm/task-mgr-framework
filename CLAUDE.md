@@ -114,26 +114,6 @@ audit / history) but auto-filtered from recall by default.
 - See `task-mgr learn --help`, `task-mgr edit-learning --help`,
   `task-mgr recall --help` for flag details.
 
-**Invariants for future maintainers:**
-
-- **`apply_supersession` runs AFTER `LearningWriter::flush`** in `learn()` — the
-  new learning's `id` is only known post-insert. In `edit_learning()` the id is
-  known upfront so `apply_supersession` can run before/after other field edits;
-  it runs after so typo'd `--supersedes` values don't roll back unrelated edits.
-- **Single source for the filter SQL**: `pub(crate) const SUPERSESSION_SUBQUERY`
-  in `src/learnings/retrieval/mod.rs` is the canonical `NOT IN (SELECT
-  old_learning_id FROM learning_supersessions)` fragment. All retrieval call
-  sites (`fts5::execute_fts5_query`, `fts5::execute_like_query`,
-  `fts5::execute_unfiltered_query`, `patterns::load_learnings_with_applicability`,
-  `recall::load_ucb_fallback`) must format this const into their WHERE clauses
-  alongside — never replacing — the existing `retired_at IS NULL` filter.
-- **Vector backend filters in Rust, not SQL**: `vector.rs` loads embeddings
-  directly, so supersession is enforced via `load_superseded_ids()` +
-  `HashSet::contains` after the retrieval. Keep the two paths in sync when
-  changing filter semantics.
-- **Tests that touch `learning_supersessions` need `setup_db_with_migrations()`**
-  — the plain `setup_db()` calls `create_schema()` only, which stops at v0.
-
 ## Recall Score Output
 
 `task-mgr --format json recall` returns numeric scores alongside the categorical

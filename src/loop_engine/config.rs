@@ -52,6 +52,11 @@ pub struct LoopConfig {
     /// the loop finishes. Only applies when `use_worktrees` is true and the
     /// loop is running in a worktree. Dirty worktrees are warned but not forced.
     pub cleanup_worktree: bool,
+    /// Number of tasks to execute in parallel per wave (1-3, default 1 = sequential).
+    ///
+    /// Set via `--parallel N` CLI flag or `LOOP_PARALLEL` env var.
+    /// Values outside 1-3 are rejected; 0 and >3 are invalid.
+    pub parallel_slots: usize,
 }
 
 impl Default for LoopConfig {
@@ -70,6 +75,7 @@ impl Default for LoopConfig {
             git_scan_depth: 7,
             external_git_scan_depth: 50,
             cleanup_worktree: false,
+            parallel_slots: 1,
         }
     }
 }
@@ -88,6 +94,7 @@ impl LoopConfig {
     /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes")
     /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
     /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
+    /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 1)
     ///
     /// Invalid values are silently ignored (defaults used).
     pub fn from_env() -> Self {
@@ -113,6 +120,9 @@ impl LoopConfig {
             external_git_scan_depth: parse_env("LOOP_EXTERNAL_GIT_SCAN_DEPTH")
                 .unwrap_or(defaults.external_git_scan_depth),
             cleanup_worktree: defaults.cleanup_worktree,
+            parallel_slots: parse_env::<usize>("LOOP_PARALLEL")
+                .filter(|&n| (1..=3).contains(&n))
+                .unwrap_or(defaults.parallel_slots),
         }
     }
 }
@@ -872,6 +882,15 @@ mod tests {
     }
 
     #[test]
+    fn test_loop_config_default_parallel_slots() {
+        let config = LoopConfig::default();
+        assert_eq!(
+            config.parallel_slots, 1,
+            "parallel_slots should default to 1"
+        );
+    }
+
+    #[test]
     fn test_parse_env_missing_var_returns_none() {
         // Use a unique name that no test sets
         let result: Option<u32> = parse_env("TASKMGR_NONEXISTENT_VAR_49817");
@@ -881,6 +900,61 @@ mod tests {
     #[test]
     fn test_parse_env_bool_missing_var_returns_none() {
         assert!(parse_env_bool("TASKMGR_NONEXISTENT_BOOL_49817").is_none());
+    }
+
+    // --- LOOP_PARALLEL env var parsing ---
+    // These tests mutate environment variables and must be serialised.
+
+    static PARALLEL_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_loop_parallel_env_valid_values() {
+        for n in 1usize..=3 {
+            let _guard = PARALLEL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::set_var("LOOP_PARALLEL", n.to_string()) };
+            let config = LoopConfig::from_env();
+            unsafe { std::env::remove_var("LOOP_PARALLEL") };
+            assert_eq!(
+                config.parallel_slots, n,
+                "LOOP_PARALLEL={n} should set parallel_slots={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_loop_parallel_env_zero_rejected() {
+        let _guard = PARALLEL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("LOOP_PARALLEL", "0") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_PARALLEL") };
+        assert_eq!(
+            config.parallel_slots, 1,
+            "LOOP_PARALLEL=0 should fall back to default 1"
+        );
+    }
+
+    #[test]
+    fn test_loop_parallel_env_above_max_rejected() {
+        let _guard = PARALLEL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("LOOP_PARALLEL", "4") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_PARALLEL") };
+        assert_eq!(
+            config.parallel_slots, 1,
+            "LOOP_PARALLEL=4 should fall back to default 1"
+        );
+    }
+
+    #[test]
+    fn test_loop_parallel_env_invalid_string_rejected() {
+        let _guard = PARALLEL_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("LOOP_PARALLEL", "abc") };
+        let config = LoopConfig::from_env();
+        unsafe { std::env::remove_var("LOOP_PARALLEL") };
+        assert_eq!(
+            config.parallel_slots, 1,
+            "LOOP_PARALLEL=abc should fall back to default 1"
+        );
     }
 
     // --- PermissionMode enum ---
@@ -1306,6 +1380,7 @@ mod tests {
             git_scan_depth: _,
             external_git_scan_depth: _,
             cleanup_worktree: _,
+            parallel_slots: _,
         } = config;
         // Exhaustive destructure compiles only if LoopConfig has exactly these fields.
     }

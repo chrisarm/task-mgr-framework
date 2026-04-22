@@ -69,7 +69,7 @@ fn test_init_fresh_database() {
     assert_eq!(result.tasks_updated, 0);
     assert_eq!(result.tasks_skipped, 0);
     assert_eq!(result.files_imported, 3); // main.rs, lib.rs x2
-    assert_eq!(result.relationships_imported, 2); // 1 synergy + 1 dependency
+    assert_eq!(result.relationships_imported, 1); // 1 dependency (synergyWith ignored)
     assert!(result.prefix_applied.is_none());
 }
 
@@ -509,7 +509,8 @@ fn test_init_stores_relationships() {
         PrefixMode::Disabled,
     )
     .unwrap();
-    assert_eq!(result.relationships_imported, 4);
+    // Only dependsOn is imported; synergyWith/batchWith/conflictsWith are deprecated and ignored.
+    assert_eq!(result.relationships_imported, 1);
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let count: i32 = conn
@@ -519,7 +520,7 @@ fn test_init_stores_relationships() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -814,7 +815,7 @@ fn test_init_dry_run_does_not_modify_database() {
     assert!(result.dry_run);
     assert_eq!(result.tasks_imported, 2);
     assert_eq!(result.files_imported, 3);
-    assert_eq!(result.relationships_imported, 2);
+    assert_eq!(result.relationships_imported, 1); // synergyWith ignored
     assert!(result.would_delete.is_none());
 
     let conn = open_connection(temp_dir.path()).unwrap();
@@ -863,7 +864,7 @@ fn test_init_dry_run_with_force_shows_delete_preview() {
     let preview = result.would_delete.unwrap();
     assert_eq!(preview.tasks, 2);
     assert_eq!(preview.files, 3);
-    assert_eq!(preview.relationships, 2);
+    assert_eq!(preview.relationships, 1); // synergyWith ignored
 
     let count_after: i32 = conn
         .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
@@ -1143,15 +1144,15 @@ fn test_init_explicit_prefix_applied_to_relationships() {
         .unwrap();
     assert_eq!(dep, "P3-US-001");
 
-    // US-001 has synergy with US-002 -> P3-US-001 synergy with P3-US-002
-    let syn: String = conn
+    // synergyWith is deprecated and must NOT be stored in the DB
+    let syn_count: i32 = conn
         .query_row(
-            "SELECT related_id FROM task_relationships WHERE task_id = 'P3-US-001' AND rel_type = 'synergyWith'",
+            "SELECT COUNT(*) FROM task_relationships WHERE rel_type = 'synergyWith'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(syn, "P3-US-002");
+    assert_eq!(syn_count, 0, "synergyWith rows should not be inserted");
 }
 
 #[test]

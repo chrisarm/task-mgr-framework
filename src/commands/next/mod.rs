@@ -1,7 +1,7 @@
 //! Smart task selection for the next command.
 //!
 //! This module implements the `next` command's task selection algorithm that
-//! considers file locality, dependencies, synergies, conflicts, and batch grouping.
+//! considers file locality, dependencies, and priority scoring.
 //! It also provides the main `next()` entry point that integrates task selection,
 //! claiming, and learnings retrieval.
 //!
@@ -109,8 +109,8 @@ pub use output::{
     ScoreOutput, SelectionMetadata, build_task_output, format_next_text, format_next_verbose,
 };
 pub use selection::{
-    CONFLICT_PENALTY, FILE_OVERLAP_SCORE, PRIORITY_BASE, SYNERGY_BONUS, ScoreBreakdown, ScoredTask,
-    SelectionResult, format_text, select_next_task,
+    FILE_OVERLAP_SCORE, PRIORITY_BASE, ScoreBreakdown, ScoredTask, SelectionResult, format_text,
+    select_next_task,
 };
 
 /// Main entry point for the next command.
@@ -130,7 +130,7 @@ pub use selection::{
 ///
 /// # Returns
 ///
-/// Returns a `NextResult` with the selected task, batch tasks, learnings, and metadata.
+/// Returns a `NextResult` with the selected task, learnings, and metadata.
 pub fn next(
     dir: &Path,
     after_files: &[String],
@@ -159,11 +159,7 @@ pub fn next(
                     total: st.total_score,
                     priority: st.score_breakdown.priority_score,
                     file_overlap: st.score_breakdown.file_score,
-                    synergy: st.score_breakdown.synergy_score,
-                    conflict: st.score_breakdown.conflict_score,
                     file_overlap_count: st.score_breakdown.file_overlap_count,
-                    synergy_from: st.score_breakdown.synergy_from.clone(),
-                    conflict_from: st.score_breakdown.conflict_from.clone(),
                 },
             })
             .collect()
@@ -175,7 +171,6 @@ pub fn next(
     let Some(ref scored_task) = selection.task else {
         return Ok(NextResult {
             task: None,
-            batch_tasks: Vec::new(),
             learnings: Vec::new(),
             selection: SelectionMetadata {
                 reason: selection.selection_reason.clone(),
@@ -201,7 +196,6 @@ pub fn next(
 
     Ok(NextResult {
         task: Some(task_output),
-        batch_tasks: selection.batch_tasks.clone(),
         learnings,
         selection: SelectionMetadata {
             reason: selection.selection_reason.clone(),

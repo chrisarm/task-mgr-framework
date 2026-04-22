@@ -332,59 +332,20 @@ fn test_relationships_preserved_in_round_trip() {
             task_id
         );
 
-        // Check synergyWith
-        let orig_syn = orig
-            .get("synergyWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let exp_syn = exp
-            .get("synergyWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(
-            orig_syn.len(),
-            exp_syn.len(),
-            "synergyWith count should match for task {}",
-            task_id
-        );
-
-        // Check batchWith
-        let orig_batch = orig
-            .get("batchWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let exp_batch = exp
-            .get("batchWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(
-            orig_batch.len(),
-            exp_batch.len(),
-            "batchWith count should match for task {}",
-            task_id
-        );
-
-        // Check conflictsWith
-        let orig_conflicts = orig
-            .get("conflictsWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let exp_conflicts = exp
-            .get("conflictsWith")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(
-            orig_conflicts.len(),
-            exp_conflicts.len(),
-            "conflictsWith count should match for task {}",
-            task_id
-        );
+        // Deprecated relationship fields (synergyWith, batchWith, conflictsWith) are
+        // intentionally dropped on import/export — they are not stored or emitted.
+        for deprecated_field in &["synergyWith", "batchWith", "conflictsWith"] {
+            let exp_len = exp
+                .get(deprecated_field)
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            assert_eq!(
+                exp_len, 0,
+                "{} should be absent or empty in export for task {} (deprecated field)",
+                deprecated_field, task_id
+            );
+        }
     }
 }
 

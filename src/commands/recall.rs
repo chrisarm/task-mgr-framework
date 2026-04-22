@@ -190,12 +190,19 @@ pub fn format_text(result: &RecallCmdResult) -> String {
             learning.outcome
         ));
 
-        // Show confidence and scores
+        // Show confidence and (when non-zero) scores. A pure recency recall
+        // with no query / no for_task produces zero scores across the board;
+        // printing "Score: 0.00 | 0.00" there is noise, so we skip it.
         output.push_str(&format!("   Confidence: {}\n", learning.confidence));
-        output.push_str(&format!(
-            "   Score: {:.2} (relevance) | {:.2} (combined)\n",
-            learning.relevance_score, learning.combined_score
-        ));
+        let has_score = learning.relevance_score != 0.0
+            || learning.combined_score != 0.0
+            || learning.ucb_score.is_some();
+        if has_score {
+            output.push_str(&format!(
+                "   Score: {:.2} (relevance) | {:.2} (combined)\n",
+                learning.relevance_score, learning.combined_score
+            ));
+        }
 
         // Show content (truncated)
         let content_preview = super::truncate_str(&learning.content, 100);
@@ -819,7 +826,10 @@ mod tests {
     }
 
     #[test]
-    fn test_format_text_score_line_zero_scores() {
+    fn test_format_text_score_line_omitted_when_all_zero() {
+        // A recall with no query and no for_task (pure recency) yields zero
+        // relevance/combined scores and no ucb_score. Suppressing the Score:
+        // line in that case keeps the output focused on the learning content.
         let result = RecallCmdResult {
             count: 1,
             learnings: vec![LearningSummary {
@@ -840,8 +850,8 @@ mod tests {
 
         let text = format_text(&result);
         assert!(
-            text.contains("Score: 0.00 (relevance) | 0.00 (combined)"),
-            "zero scores should display as 0.00: {text}"
+            !text.contains("Score:"),
+            "all-zero scores should be omitted from text output: {text}"
         );
     }
 

@@ -474,43 +474,21 @@ fn test_conflict_penalty_from_recently_completed_tasks() {
     )
     .unwrap();
 
-    // Note: The current next() implementation doesn't pass recently_completed from
-    // the select_next_task call. The conflict scoring only works with explicit
-    // recently_completed parameter. For now, we'll test with direct select_next_task.
-
-    // Let's verify the conflict penalty logic at the integration level by using
-    // the internal select_next_task with recently_completed
+    // conflictsWith relationships are no longer scored; selection is by priority only.
     let conn = open_connection(temp_dir.path()).unwrap();
     let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
 
-    // Without conflict penalty:
+    // Without conflict scoring, TASK-002 wins purely on priority:
     // TASK-002: 990 (priority) = 990
     // TASK-003: 980 (priority) = 980
-    // TASK-002 would win
-
-    // With conflict penalty (TASK-001 recently completed):
-    // TASK-002: 990 (priority) + (-5 conflict) = 985
-    // TASK-003: 980 (priority) = 980
-    // TASK-002 still wins slightly
-
-    // Let's adjust the test to make it clearer
-    // Actually, even with -5 penalty, 990-5=985 > 980, so TASK-002 still wins
-    // But we can verify the penalty was applied
-
-    if task.task.id == "TASK-002" {
-        assert_eq!(
-            task.score_breakdown.conflict_score, -5,
-            "TASK-002 should have conflict penalty"
-        );
-        assert_eq!(
-            task.score_breakdown.conflict_from,
-            vec!["TASK-001"],
-            "Conflict should be from TASK-001"
-        );
-    }
+    assert_eq!(
+        task.task.id, "TASK-002",
+        "TASK-002 should win on priority (conflict scoring removed)"
+    );
+    assert_eq!(result.eligible_count, 2);
 }
 
 #[test]
@@ -569,10 +547,9 @@ fn test_conflict_penalty_changes_selection() {
     )
     .unwrap();
 
-    // With recently_completed = ["TASK-001"]:
-    // TASK-002: 986 - 5 = 981
-    // TASK-003: 983
-    // TASK-003 should win
+    // conflictsWith relationships are no longer scored; TASK-002 wins on priority:
+    // TASK-002: 986 (priority, no penalty)
+    // TASK-003: 983 (priority)
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
@@ -581,8 +558,8 @@ fn test_conflict_penalty_changes_selection() {
     let task = result.task.unwrap();
 
     assert_eq!(
-        task.task.id, "TASK-003",
-        "TASK-003 should be selected due to conflict penalty on TASK-002"
+        task.task.id, "TASK-002",
+        "TASK-002 should win on priority (conflict scoring removed)"
     );
 }
 
@@ -606,25 +583,15 @@ fn test_batch_tasks_included_in_output() {
     .unwrap();
 
     // TASK-003 depends on TASK-002 which is done (passes: true)
-    // TASK-003 has batchWith: ["TASK-004"]
+    // batchWith relationships are no longer tracked in selection output
 
     let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
 
-    // TASK-003 should be selected and include TASK-004 in batch_tasks
+    // TASK-003 should be selected (higher priority among eligible)
     assert_eq!(task.id, "TASK-003");
-    assert!(
-        task.batch_with.contains(&"TASK-004".to_string()),
-        "TASK-003 should have TASK-004 in batch_with"
-    );
-
-    // batch_tasks should include eligible batchWith targets
-    assert!(
-        result.batch_tasks.contains(&"TASK-004".to_string()),
-        "TASK-004 should be in batch_tasks since it's todo"
-    );
 }
 
 #[test]
@@ -683,26 +650,12 @@ fn test_batch_tasks_excludes_completed_tasks() {
     )
     .unwrap();
 
+    // batchWith relationships are no longer tracked in selection output
     let result = next::next(temp_dir.path(), &[], false, None, false, None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
     assert_eq!(task.id, "TASK-001");
-
-    // batch_with should list all (from the relationship)
-    assert_eq!(task.batch_with.len(), 2);
-    assert!(task.batch_with.contains(&"TASK-002".to_string()));
-    assert!(task.batch_with.contains(&"TASK-003".to_string()));
-
-    // batch_tasks should only include todo tasks
-    assert!(
-        !result.batch_tasks.contains(&"TASK-002".to_string()),
-        "TASK-002 is done and should not be in batch_tasks"
-    );
-    assert!(
-        result.batch_tasks.contains(&"TASK-003".to_string()),
-        "TASK-003 is todo and should be in batch_tasks"
-    );
 }
 
 #[test]
@@ -861,9 +814,9 @@ fn test_combined_scoring_factors() {
     )
     .unwrap();
 
-    // With after_files and recently_completed:
-    // TASK-002: 990 + 0 + 0 = 990
-    // TASK-003: 980 + 20 (files) + 3 (synergy) = 1003
+    // Synergy scoring removed; with after_files only:
+    // TASK-002: 990 (priority) + 0 (files) = 990
+    // TASK-003: 980 (priority) + 20 (2 file overlaps * 10) = 1000
 
     let conn = open_connection(temp_dir.path()).unwrap();
     let result = next::select_next_task(
@@ -879,12 +832,11 @@ fn test_combined_scoring_factors() {
 
     assert_eq!(
         task.task.id, "TASK-003",
-        "TASK-003 should win with combined bonuses"
+        "TASK-003 should win with file overlap bonus"
     );
     assert_eq!(task.score_breakdown.priority_score, 980);
     assert_eq!(task.score_breakdown.file_score, 20);
-    assert_eq!(task.score_breakdown.synergy_score, 3);
-    assert_eq!(task.total_score, 1003);
+    assert_eq!(task.total_score, 1000);
 }
 
 #[test]
