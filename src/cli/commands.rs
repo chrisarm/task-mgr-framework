@@ -83,6 +83,29 @@ TASK ID PREFIXING:
     },
 
     /// List tasks with optional filtering
+    #[command(after_help = "\
+EXAMPLES:
+    # List all tasks
+    task-mgr list
+
+    # Filter by status
+    task-mgr list --status todo
+
+    # Filter by PRD prefix (e.g., all tasks from a specific PRD)
+    task-mgr list --prefix abc123
+
+    # Filter by PRD file (reads taskPrefix from the JSON)
+    task-mgr list --prd tasks/my-prd.json
+
+    # Filter by task type (e.g., only FEAT- tasks)
+    task-mgr list --task-type FEAT-
+
+    # Combine prefix and task type
+    task-mgr list --prefix abc123 --task-type FEAT-
+
+    # Include archived tasks
+    task-mgr list --include-archived
+")]
     List {
         /// Filter by task status
         #[arg(long, value_enum)]
@@ -99,6 +122,14 @@ TASK ID PREFIXING:
         /// Include archived tasks; optionally limit number of archived records returned
         #[arg(long = "include-archived", num_args = 0..=1)]
         include_archived: Option<Option<usize>>,
+
+        /// Filter by PRD prefix (e.g., "abc123" matches all abc123-* tasks)
+        #[arg(long, conflicts_with = "prd")]
+        prefix: Option<String>,
+
+        /// Filter by PRD file (reads taskPrefix from the JSON file)
+        #[arg(long, conflicts_with = "prefix")]
+        prd: Option<PathBuf>,
     },
 
     /// Show detailed information about a single task

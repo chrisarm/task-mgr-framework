@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::TaskMgrResult;
 use crate::cli::TaskStatusFilter;
 use crate::db::open_and_migrate as open_connection;
+use crate::db::prefix::make_like_pattern;
 use crate::models::Task;
 
 /// Result of the list command.
@@ -63,6 +64,8 @@ impl From<&Task> for TaskSummary {
 /// * `status` - Optional status filter
 /// * `file` - Optional file pattern filter (glob matching against touchesFiles)
 /// * `task_type` - Optional task type prefix filter (e.g., "US-", "FIX-")
+/// * `include_archived` - Optional archived task inclusion with optional limit
+/// * `prefix` - Optional PRD prefix filter (e.g., "abc123" matches abc123-* tasks)
 ///
 /// # Returns
 ///
@@ -77,10 +80,11 @@ pub fn list(
     file: Option<&str>,
     task_type: Option<&str>,
     include_archived: Option<Option<usize>>,
+    prefix: Option<&str>,
 ) -> TaskMgrResult<ListResult> {
     let conn = open_connection(dir)?;
 
-    let summaries = query_tasks(&conn, status, file, task_type, include_archived)?;
+    let summaries = query_tasks(&conn, status, file, task_type, include_archived, prefix)?;
     let count = summaries.len();
 
     Ok(ListResult {
@@ -104,6 +108,7 @@ fn query_tasks(
     file: Option<&str>,
     task_type: Option<&str>,
     include_archived: Option<Option<usize>>,
+    prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<TaskSummary>> {
     // Build the query based on filters
     let mut conditions = Vec::new();
@@ -122,6 +127,11 @@ fn query_tasks(
     if let Some(task_type_filter) = task_type {
         conditions.push("t.id LIKE ?");
         params.push(Box::new(format!("{}%", task_type_filter)));
+    }
+
+    if let Some(pfx) = prefix {
+        conditions.push("t.id LIKE ? ESCAPE '\\'");
+        params.push(Box::new(make_like_pattern(pfx)));
     }
 
     // Build the base query — select only columns needed for TaskSummary plus archived_at
@@ -294,7 +304,7 @@ mod tests {
         insert_test_task(&conn, "FIX-001", "Fix 1", "in_progress", 5);
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, None, None).unwrap();
+        let result = list(temp_dir.path(), None, None, None, None, None).unwrap();
         assert_eq!(result.count, 3);
         // Should be ordered by priority
         assert_eq!(result.tasks[0].id, "FIX-001");
@@ -307,7 +317,7 @@ mod tests {
         let (temp_dir, conn) = setup_test_db();
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, None, None).unwrap();
+        let result = list(temp_dir.path(), None, None, None, None, None).unwrap();
         assert_eq!(result.count, 0);
         assert!(result.tasks.is_empty());
     }
@@ -323,6 +333,7 @@ mod tests {
         let result = list(
             temp_dir.path(),
             Some(TaskStatusFilter::Todo),
+            None,
             None,
             None,
             None,
@@ -342,6 +353,7 @@ mod tests {
         let result = list(
             temp_dir.path(),
             Some(TaskStatusFilter::InProgress),
+            None,
             None,
             None,
             None,
@@ -365,6 +377,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.count, 2);
@@ -380,7 +393,7 @@ mod tests {
         insert_test_task(&conn, "TECH-001", "Tech Debt 1", "todo", 15);
         drop(conn);
 
-        let result = list(temp_dir.path(), None, None, Some("US-"), None).unwrap();
+        let result = list(temp_dir.path(), None, None, Some("US-"), None, None).unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().all(|t| t.id.starts_with("US-")));
     }
@@ -398,7 +411,7 @@ mod tests {
         drop(conn);
 
         // Match all .rs files in src/commands/
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None).unwrap();
+        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None, None).unwrap();
         assert_eq!(result.count, 2);
         assert!(result.tasks.iter().any(|t| t.id == "US-001"));
         assert!(result.tasks.iter().any(|t| t.id == "US-002"));
@@ -411,7 +424,7 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/main.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("nonexistent/*.rs"), None, None).unwrap();
+        let result = list(temp_dir.path(), None, Some("nonexistent/*.rs"), None, None, None).unwrap();
         assert_eq!(result.count, 0);
     }
 
@@ -433,6 +446,7 @@ mod tests {
             Some("src/commands/*"),
             Some("US-"),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.count, 1);
@@ -450,6 +464,7 @@ mod tests {
             Some(TaskStatusFilter::Todo),
             Some("*.rs"),
             Some("US-"),
+            None,
             None,
         )
         .unwrap();
@@ -469,7 +484,7 @@ mod tests {
         insert_test_task_file(&conn, "US-001", "src/commands/show.rs");
         drop(conn);
 
-        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None).unwrap();
+        let result = list(temp_dir.path(), None, Some("src/commands/*.rs"), None, None, None).unwrap();
         // Should only return the task once, not three times
         assert_eq!(result.count, 1);
         assert_eq!(result.tasks[0].id, "US-001");
@@ -667,7 +682,7 @@ mod tests {
         drop(conn);
 
         // Default (no include_archived) should exclude archived
-        let result = list(temp_dir.path(), None, None, None, None).unwrap();
+        let result = list(temp_dir.path(), None, None, None, None, None).unwrap();
         assert_eq!(result.count, 1);
         assert_eq!(result.tasks[0].id, "US-001");
         assert!(!result.tasks[0].archived);
@@ -686,7 +701,7 @@ mod tests {
         drop(conn);
 
         // include_archived = Some(None) → show all (no limit)
-        let result = list(temp_dir.path(), None, None, None, Some(None)).unwrap();
+        let result = list(temp_dir.path(), None, None, None, Some(None), None).unwrap();
         assert_eq!(result.count, 2);
 
         // Active task comes first
@@ -713,7 +728,7 @@ mod tests {
         drop(conn);
 
         // include_archived = Some(Some(2)) → show active + max 2 archived
-        let result = list(temp_dir.path(), None, None, None, Some(Some(2))).unwrap();
+        let result = list(temp_dir.path(), None, None, None, Some(Some(2)), None).unwrap();
         let active: Vec<_> = result.tasks.iter().filter(|t| !t.archived).collect();
         let archived: Vec<_> = result.tasks.iter().filter(|t| t.archived).collect();
         assert_eq!(active.len(), 1);
@@ -755,5 +770,61 @@ mod tests {
             .find(|l| l.contains("US-002"))
             .expect("US-002 line not found");
         assert!(archived_line.contains("[archived]"));
+    }
+
+    #[test]
+    fn test_list_filter_by_prefix() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "abc123-FEAT-001", "Feature 1", "todo", 10);
+        insert_test_task(&conn, "abc123-FIX-001", "Fix 1", "todo", 20);
+        insert_test_task(&conn, "def456-FEAT-001", "Other Feature", "todo", 5);
+        drop(conn);
+
+        let result = list(temp_dir.path(), None, None, None, None, Some("abc123")).unwrap();
+        assert_eq!(result.count, 2);
+        assert!(result.tasks.iter().all(|t| t.id.starts_with("abc123-")));
+    }
+
+    #[test]
+    fn test_list_prefix_does_not_match_longer_prefix() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "P1-FEAT-001", "P1 task", "todo", 10);
+        insert_test_task(&conn, "P10-FEAT-001", "P10 task", "todo", 20);
+        drop(conn);
+
+        let result = list(temp_dir.path(), None, None, None, None, Some("P1")).unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.tasks[0].id, "P1-FEAT-001");
+    }
+
+    #[test]
+    fn test_list_prefix_combined_with_task_type() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "abc123-FEAT-001", "Feature", "todo", 10);
+        insert_test_task(&conn, "abc123-FIX-001", "Fix", "todo", 20);
+        insert_test_task(&conn, "def456-FEAT-001", "Other", "todo", 5);
+        drop(conn);
+
+        let result = list(
+            temp_dir.path(),
+            None,
+            None,
+            Some("abc123-FEAT-"),
+            None,
+            Some("abc123"),
+        )
+        .unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.tasks[0].id, "abc123-FEAT-001");
+    }
+
+    #[test]
+    fn test_list_prefix_no_match() {
+        let (temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "abc123-FEAT-001", "Feature", "todo", 10);
+        drop(conn);
+
+        let result = list(temp_dir.path(), None, None, None, None, Some("nonexistent")).unwrap();
+        assert_eq!(result.count, 0);
     }
 }

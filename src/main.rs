@@ -141,13 +141,30 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             file,
             task_type,
             include_archived,
+            prefix,
+            prd,
         } => {
+            let resolved_prefix = match (prefix, prd) {
+                (Some(p), _) => Some(p),
+                (_, Some(prd_path)) => {
+                    task_mgr::loop_engine::status_queries::read_task_prefix_from_prd(&prd_path)
+                        .ok_or_else(|| TaskMgrError::InvalidState {
+                            resource_type: "PRD file".to_string(),
+                            id: prd_path.display().to_string(),
+                            expected: "a JSON file with a \"taskPrefix\" field".to_string(),
+                            actual: "missing or unreadable taskPrefix".to_string(),
+                        })?
+                        .into()
+                }
+                _ => None,
+            };
             let result = list(
                 &cli.dir,
                 status,
                 file.as_deref(),
                 task_type.as_deref(),
                 include_archived,
+                resolved_prefix.as_deref(),
             )?;
             output_result(&result, cli.format);
             Ok(())
