@@ -1,31 +1,46 @@
-//! Migration 18: Add slot column to run_tasks for parallel execution tracking.
+//! Migration 18: Create dedup_dismissals table for persisting curate dedup pair judgements.
 //!
 //! ## Changes
-//! - ALTER TABLE run_tasks ADD COLUMN slot INTEGER NOT NULL DEFAULT 0
+//! - Creates `dedup_dismissals` table with composite PK (id_lo, id_hi):
+//!   - `id_lo INTEGER NOT NULL` — lower of the two learning IDs
+//!   - `id_hi INTEGER NOT NULL` — higher of the two learning IDs
+//!   - `CHECK (id_lo < id_hi)` — schema-level enforcement of the ordering invariant
+//!     (defense-in-depth; `normalize_pair` enforces it on the Rust side too).
+//! - `idx_dedup_dismissals_hi` index speeds up lookups by the high-side ID.
 //!
 //! ## Semantics
-//! - slot=0 is the main (sequential) slot; slot>0 identifies a parallel worker slot.
-//! - Existing rows get slot=0 via the DEFAULT, preserving backward compatibility.
-//! - SQLite cannot drop columns, so the down migration only reverts schema_version.
+//! - A row (id_lo, id_hi) means the LLM examined this pair and found them distinct.
+//! - `curate dedup` skips clusters where all C(N,2) pairs are already dismissed.
+//! - No foreign keys to learnings — dismissed pairs for retired learnings are inert.
 
 use super::Migration;
 
-/// Migration 18: Add slot column to run_tasks.
+/// Migration 18: Create dedup_dismissals table.
 pub static MIGRATION: Migration = Migration {
     version: 18,
-    description: "Add slot column to run_tasks for parallel execution tracking",
+    description: "Create dedup_dismissals table for persisting curate dedup pair judgements",
     up_sql: r#"
-        ALTER TABLE run_tasks ADD COLUMN slot INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE dedup_dismissals (
+            id_lo INTEGER NOT NULL,
+            id_hi INTEGER NOT NULL,
+            PRIMARY KEY (id_lo, id_hi),
+            CHECK (id_lo < id_hi)
+        );
+        CREATE INDEX idx_dedup_dismissals_hi ON dedup_dismissals(id_hi);
         UPDATE global_state SET schema_version = 18 WHERE id = 1;
     "#,
     down_sql: r#"
+        DROP INDEX IF EXISTS idx_dedup_dismissals_hi;
+        DROP TABLE IF EXISTS dedup_dismissals;
         UPDATE global_state SET schema_version = 17 WHERE id = 1;
     "#,
 };
 
 #[cfg(test)]
 mod tests {
-    use crate::db::migrations::{MIGRATIONS, get_schema_version, migrate_down, run_migrations};
+    use crate::db::migrations::{
+        CURRENT_SCHEMA_VERSION, MIGRATIONS, get_schema_version, run_migrations,
+    };
     use crate::db::{create_schema, open_connection};
     use tempfile::TempDir;
 
@@ -37,95 +52,95 @@ mod tests {
         (temp_dir, conn)
     }
 
-    /// AC: schema_version is >= 18 after running all migrations.
+    /// AC: CURRENT_SCHEMA_VERSION >= 18 after full migration run.
     #[test]
-    fn test_v18_schema_version() {
-        let (_temp_dir, conn) = setup_migrated_db();
-
+    fn test_v18_current_schema_version() {
+        const _: () = assert!(
+            CURRENT_SCHEMA_VERSION >= 18,
+            "CURRENT_SCHEMA_VERSION must be at least 18"
+        );
+        let (_tmp, conn) = setup_migrated_db();
         let version = get_schema_version(&conn).unwrap();
         assert!(
             version >= 18,
-            "schema_version must be >= 18 after running migrations, got {version}"
+            "DB schema_version must be >= 18 after running migrations, got {version}"
         );
     }
 
-    /// AC: slot column exists on run_tasks with correct default.
+    /// AC: dedup_dismissals table and its columns exist after v18 migration.
     #[test]
-    fn test_v18_slot_column_exists_with_default() {
-        let (_temp_dir, conn) = setup_migrated_db();
+    fn test_v18_dedup_dismissals_table_exists() {
+        let (_tmp, conn) = setup_migrated_db();
+        for col in ["id_lo", "id_hi"] {
+            let exists: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('dedup_dismissals') WHERE name = '{col}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                exists,
+                "dedup_dismissals.{col} column must exist after v18 migration"
+            );
+        }
+    }
 
-        // Column must exist
+    /// AC: idx_dedup_dismissals_hi index exists after v18 migration.
+    #[test]
+    fn test_v18_index_exists() {
+        let (_tmp, conn) = setup_migrated_db();
         let exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('run_tasks') WHERE name = 'slot'",
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_dedup_dismissals_hi'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
             exists,
-            "run_tasks.slot column must exist after v18 migration"
+            "idx_dedup_dismissals_hi must exist after v18 migration"
+        );
+    }
+
+    /// AC: CHECK (id_lo < id_hi) rejects equal and reversed tuples.
+    #[test]
+    fn test_v18_check_constraint_rejects_bad_tuples() {
+        let (_tmp, conn) = setup_migrated_db();
+
+        let self_pair = conn
+            .execute(
+                "INSERT INTO dedup_dismissals (id_lo, id_hi) VALUES (5, 5)",
+                [],
+            )
+            .expect_err("(5, 5) must violate CHECK (id_lo < id_hi)");
+        assert!(
+            self_pair.to_string().to_ascii_uppercase().contains("CHECK"),
+            "error for (5, 5) should name CHECK constraint, got: {self_pair}"
         );
 
-        // Insert a run_tasks row without specifying slot — must default to 0
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('r1', 'active')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, status) VALUES ('T-001', 'Test', 'todo')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, iteration) VALUES ('r1', 'T-001', 1)",
-            [],
-        )
-        .unwrap();
-
-        let slot: i64 = conn
-            .query_row(
-                "SELECT slot FROM run_tasks WHERE run_id = 'r1' AND task_id = 'T-001'",
+        let reversed = conn
+            .execute(
+                "INSERT INTO dedup_dismissals (id_lo, id_hi) VALUES (10, 5)",
                 [],
-                |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(slot, 0, "slot must default to 0 when not specified");
+            .expect_err("(10, 5) must violate CHECK (id_lo < id_hi)");
+        assert!(
+            reversed.to_string().to_ascii_uppercase().contains("CHECK"),
+            "error for (10, 5) should name CHECK constraint, got: {reversed}"
+        );
+
+        // Well-ordered tuple still inserts.
+        conn.execute(
+            "INSERT INTO dedup_dismissals (id_lo, id_hi) VALUES (3, 7)",
+            [],
+        )
+        .expect("(3, 7) must satisfy CHECK and insert");
     }
 
-    /// AC: slot column is writable with non-zero values.
-    #[test]
-    fn test_v18_slot_column_writable() {
-        let (_temp_dir, conn) = setup_migrated_db();
-
-        conn.execute(
-            "INSERT INTO runs (run_id, status) VALUES ('r2', 'active')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO tasks (id, title, status) VALUES ('T-002', 'Test2', 'todo')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO run_tasks (run_id, task_id, iteration, slot) VALUES ('r2', 'T-002', 1, 3)",
-            [],
-        )
-        .unwrap();
-
-        let slot: i64 = conn
-            .query_row(
-                "SELECT slot FROM run_tasks WHERE run_id = 'r2'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(slot, 3, "slot must store the provided value");
-    }
-
-    /// AC: down migration reverts schema_version to 17.
+    /// AC: v18 down migration drops the table and index, reverts schema_version to 17.
     #[test]
     fn test_v18_migration_down() {
         let temp_dir = TempDir::new().unwrap();
@@ -133,12 +148,10 @@ mod tests {
         create_schema(&conn).unwrap();
         run_migrations(&mut conn).unwrap();
 
-        assert!(
-            MIGRATIONS.iter().any(|m| m.version == 18),
-            "v18 must be registered in MIGRATIONS"
-        );
-
-        migrate_down(&mut conn).unwrap();
+        let v18 = MIGRATIONS.iter().find(|m| m.version == 18).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(v18.down_sql).unwrap();
+        tx.commit().unwrap();
 
         let version = get_schema_version(&conn).unwrap();
         assert_eq!(
@@ -146,17 +159,28 @@ mod tests {
             "schema_version must revert to 17 after v18 down migration"
         );
 
-        // Column still exists (SQLite cannot drop columns), which is expected
-        let col_exists: bool = conn
+        let table_exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('run_tasks') WHERE name = 'slot'",
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='dedup_dismissals'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(
-            col_exists,
-            "slot column remains after down migration (SQLite cannot drop columns)"
+            !table_exists,
+            "dedup_dismissals table must be removed after v18 down migration"
+        );
+
+        let idx_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_dedup_dismissals_hi'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !idx_exists,
+            "idx_dedup_dismissals_hi must be removed after v18 down migration"
         );
     }
 }

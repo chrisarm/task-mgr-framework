@@ -1020,6 +1020,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     threshold,
                     batch_size,
                     concurrency,
+                    reset_dismissals,
                 } => {
                     let proj_config = read_project_config(&cli.dir);
                     let embed_model = proj_config
@@ -1036,6 +1037,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                         embed_model,
                         model: dedup_model,
                         db_dir: Some(cli.dir.clone()),
+                        reset_dismissals,
                     };
                     let result = curate_dedup(&conn, params)?;
                     output_result(&result, cli.format);
