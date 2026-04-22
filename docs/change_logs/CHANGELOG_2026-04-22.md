@@ -36,3 +36,35 @@ New CLI flags are additive (`--supersedes`, `--include-superseded`). New
 fields on `LearningSummary` are additive with `#[serde(default)]`.
 
 ---
+
+## Dedup Dismissal Memory
+
+**Branch**: `feat/dedup-dismissals`
+**PRD**: `tasks/dedup-dismissals-prompt.md`
+
+### What shipped
+
+`curate dedup` now persists pairs the LLM has examined and found distinct in a
+new `dedup_dismissals` table (migration v18, composite PK `(id_lo, id_hi)` with
+normalization enforced at write time). Subsequent runs skip clusters whose
+every C(N,2) pair is already dismissed — no LLM call, no wasted review time on
+identical "no duplicates" output. Dismissals are recorded only on successful
+LLM batches (skipped on `dry_run` and on LLM-error batches), and merged-pair
+internal cluster relationships are excluded from dismissal accounting. A new
+`--reset-dismissals` flag clears the table before the run (applies even with
+`--dry-run` since it is an administrative action, not an LLM pass).
+
+### Why it matters
+
+- Second and subsequent `curate dedup` runs now short-circuit stable clusters,
+  cutting both LLM cost and the user's review time on repeat output.
+- Dismissal memory is idempotent (`INSERT OR IGNORE` on a normalized PK) and
+  has no foreign-key coupling to `learnings` — retired-learning rows become
+  inert rather than requiring a cascading cleanup.
+
+### Breaking changes
+
+None. `DedupResult.clusters_skipped` is additive with `#[serde(default = 0)]`
+so older JSON consumers still parse. `--reset-dismissals` is additive.
+
+---
