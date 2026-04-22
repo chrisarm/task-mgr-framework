@@ -1229,7 +1229,11 @@ pub fn run_wave_iteration(
         tasks_completed,
         iteration_consumed: true,
         terminal: if wave_should_stop {
-            Some((0, "stop signal".to_string(), None))
+            if params.signal_flag.is_signaled() {
+                Some((130, "signal received".to_string(), None))
+            } else {
+                Some((0, "stop signal".to_string(), None))
+            }
         } else {
             None
         },
@@ -6612,6 +6616,83 @@ mod tests {
             let (code, reason, _) = outcome.terminal.expect("terminal expected");
             assert_eq!(code, 1);
             assert!(reason.contains("too many crashes"), "got: {reason}");
+        }
+
+        #[test]
+        fn test_run_wave_iteration_signal_during_inter_wave_delay_returns_130() {
+            // Regression: signal fired during inter-wave delay must return exit
+            // code 130 ("signal received"), not 0 ("stop signal"), so operators
+            // can distinguish SIGINT/SIGTERM from a clean .stop-file termination.
+            //
+            // Setup: point CLAUDE_BINARY at a nonexistent path so each slot
+            // thread fails instantly (no real Claude spawn), letting run_parallel_wave
+            // complete in microseconds.  Then the 500 ms delay starts, and the
+            // background thread fires the signal at 100 ms — well inside the
+            // delay window and well after steps 0-13 have already passed without
+            // seeing the signal.
+            let _env_lock = crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX
+                .lock()
+                .unwrap();
+            let _env_guard = crate::loop_engine::test_utils::EnvGuard::set(
+                "CLAUDE_BINARY",
+                "/nonexistent_binary_for_test",
+            );
+
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+
+            // Insert an eligible task so select_parallel_group returns it and
+            // run_parallel_wave actually spawns a slot thread (which fails fast
+            // because CLAUDE_BINARY is invalid, so should_stop stays false and
+            // step 13 sees no signal yet).
+            insert_task(&conn, "FEAT-DELAY-SIGNAL", "delay signal test", "todo", 1);
+
+            let signal = SignalFlag::new();
+            let signal_clone = signal.clone();
+            // Fire at 100 ms: steps 0-13 complete in < 10 ms (slot fails at process
+            // spawn with ENOENT), so the signal always lands inside the 500 ms delay.
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                signal_clone.set();
+            });
+
+            let mut ctx = IterationContext::new(5);
+            let outcome = run_wave_iteration(
+                WaveIterationParams {
+                    conn: &mut conn,
+                    db_dir: temp.path(),
+                    source_root: tmp.path(),
+                    branch: "main",
+                    parallel_slots: 1,
+                    slot_worktree_paths: &[tmp.path().to_path_buf()],
+                    iteration: 1,
+                    run_id: "test-run",
+                    base_prompt_path: &base_prompt,
+                    permission_mode: &mode,
+                    signal_flag: &signal,
+                    default_model: None,
+                    verbose: false,
+                    task_prefix: None,
+                    prd_path: &prd,
+                    progress_path: &progress,
+                    tasks_dir: tmp.path(),
+                    external_repo_path: None,
+                    external_git_scan_depth: 50,
+                    inter_iteration_delay: Duration::from_millis(500),
+                },
+                &mut ctx,
+            );
+            let (code, reason, _) = outcome.terminal.expect("terminal expected");
+            assert_eq!(
+                code, 130,
+                "expected 130 for SIGINT during delay, got {code}"
+            );
+            assert_eq!(reason, "signal received", "got: {reason}");
         }
 
         #[test]
