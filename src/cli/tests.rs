@@ -279,12 +279,14 @@ fn test_next_no_flags() {
             run_id,
             decay_threshold,
             prefix,
+            parallel,
         } => {
             assert!(after_files.is_none());
             assert!(!claim);
             assert!(run_id.is_none());
             assert_eq!(decay_threshold, 32);
             assert!(prefix.is_none());
+            assert_eq!(parallel, 1);
         }
         _ => panic!("Expected Next command"),
     }
@@ -2161,6 +2163,7 @@ fn test_loop_with_prd_file_and_yes() {
             no_worktree,
             external_repo,
             cleanup_worktree,
+            parallel,
         } => {
             assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
             assert!(prompt_file.is_none());
@@ -2170,6 +2173,7 @@ fn test_loop_with_prd_file_and_yes() {
             assert!(!no_worktree);
             assert!(external_repo.is_none());
             assert!(!cleanup_worktree);
+            assert_eq!(parallel, 1);
         }
         _ => panic!("Expected Loop command"),
     }
