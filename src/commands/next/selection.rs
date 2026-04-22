@@ -430,6 +430,20 @@ fn get_eligible_batch_tasks(
     Ok(eligible)
 }
 
+/// Select up to `max_slots` non-conflicting tasks for parallel execution.
+///
+/// STUB — implemented in FEAT-002. Returns an empty vector so the test file
+/// compiles; FEAT-002 tests covering this function are `#[ignore]`d until then.
+pub fn select_parallel_group(
+    _conn: &Connection,
+    _after_files: &[String],
+    _recently_completed: &[String],
+    _task_prefix: Option<&str>,
+    _max_slots: usize,
+) -> TaskMgrResult<Vec<ScoredTask>> {
+    Ok(Vec::new())
+}
+
 /// Format selection result as human-readable text.
 pub fn format_text(result: &SelectionResult) -> String {
     let mut output = String::new();

@@ -411,6 +411,199 @@ mod selection_tests {
         assert!(text.contains("No tasks available"));
         assert!(text.contains("All tasks completed"));
     }
+
+    // -------------------------------------------------------------------------
+    // Parallel group selection (FEAT-002)
+    //
+    // These tests define the contract for `select_parallel_group()`. They are
+    // `#[ignore]`d until FEAT-002 replaces the stub in selection.rs. The test
+    // file still compiles because the stub exists.
+    //
+    // Contract:
+    //   select_parallel_group(conn, after_files, recently_completed,
+    //                         task_prefix, max_slots) -> Vec<ScoredTask>
+    //   - Greedy selection by descending score
+    //   - Two tasks never appear together if their touchesFiles overlap
+    //   - Tasks with NO touchesFiles entries have no conflicts → always eligible
+    //   - Length capped by max_slots
+    // -------------------------------------------------------------------------
+
+    use crate::commands::next::selection::select_parallel_group;
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_two_tasks_sharing_file_returns_one() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Task A", "todo", 10);
+        insert_test_task(&conn, "US-002", "Task B", "todo", 20);
+        insert_test_task_file(&conn, "US-001", "src/shared.rs");
+        insert_test_task_file(&conn, "US-002", "src/shared.rs");
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            1,
+            "two tasks sharing a file must not parallelize"
+        );
+        // Higher priority (lower number) wins the slot
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_two_disjoint_tasks_returns_two() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Task A", "todo", 10);
+        insert_test_task(&conn, "US-002", "Task B", "todo", 20);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        insert_test_task_file(&conn, "US-002", "src/b.rs");
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        assert_eq!(group.len(), 2, "disjoint files must parallelize");
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&"US-001"));
+        assert!(ids.contains(&"US-002"));
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_empty_touches_files_always_parallelize() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "With file", "todo", 10);
+        insert_test_task(&conn, "US-002", "No files A", "todo", 20);
+        insert_test_task(&conn, "US-003", "No files B", "todo", 30);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        // US-002 and US-003 have zero task_files rows — no conflicts possible.
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            3,
+            "tasks with empty touchesFiles can always parallelize"
+        );
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&"US-001"));
+        assert!(ids.contains(&"US-002"));
+        assert!(ids.contains(&"US-003"));
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_respects_max_slots() {
+        let (_temp_dir, conn) = setup_test_db();
+        // 5 tasks with fully-disjoint files; max_slots=3 → group truncated to 3.
+        for i in 1..=5i32 {
+            let id = format!("US-00{i}");
+            let title = format!("Task {i}");
+            let file = format!("src/file_{i}.rs");
+            insert_test_task(&conn, &id, &title, "todo", 10 + i);
+            insert_test_task_file(&conn, &id, &file);
+        }
+
+        let group = select_parallel_group(&conn, &[], &[], None, 3).unwrap();
+        assert_eq!(group.len(), 3, "group size is capped by max_slots");
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_ordered_by_score_descending() {
+        let (_temp_dir, conn) = setup_test_db();
+        // Disjoint files so all three can parallelize; priorities out of order.
+        insert_test_task(&conn, "US-001", "Low prio", "todo", 50);
+        insert_test_task(&conn, "US-002", "High prio", "todo", 10);
+        insert_test_task(&conn, "US-003", "Mid prio", "todo", 30);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        insert_test_task_file(&conn, "US-002", "src/b.rs");
+        insert_test_task_file(&conn, "US-003", "src/c.rs");
+
+        let group = select_parallel_group(&conn, &[], &[], None, 3).unwrap();
+        assert_eq!(group.len(), 3);
+        // Descending total_score (highest first)
+        assert!(
+            group[0].total_score >= group[1].total_score,
+            "group must be sorted by score desc"
+        );
+        assert!(
+            group[1].total_score >= group[2].total_score,
+            "group must be sorted by score desc"
+        );
+        assert_eq!(group[0].task.id, "US-002", "highest priority first");
+        assert_eq!(group[1].task.id, "US-003");
+        assert_eq!(group[2].task.id, "US-001");
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_single_eligible_task_returns_one() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Only Task", "todo", 10);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_all_sharing_one_file_forces_sequential() {
+        let (_temp_dir, conn) = setup_test_db();
+        // 4 eligible tasks all touching the same hot-spot file.
+        for i in 1..=4i32 {
+            let id = format!("US-00{i}");
+            let title = format!("Task {i}");
+            insert_test_task(&conn, &id, &title, "todo", 10 + i);
+            insert_test_task_file(&conn, &id, "src/hot_spot.rs");
+        }
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            1,
+            "all tasks sharing one file → group of 1 (sequential)"
+        );
+        // Highest priority (lowest priority number) wins the slot
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    /// Known-bad discriminator (AC #8): this test fails if the implementation
+    /// skips the file-conflict check. Two high-priority tasks share a file;
+    /// a lower-priority task has a disjoint file. Correct behavior returns
+    /// exactly {US-001, US-003}. A naive "top-N by score" implementation with
+    /// no conflict check would return all three (wrong: US-001 and US-002
+    /// collide on src/shared.rs).
+    #[test]
+    #[ignore = "select_parallel_group is a stub until FEAT-002"]
+    fn test_parallel_group_known_bad_requires_conflict_check() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "High A", "todo", 10);
+        insert_test_task(&conn, "US-002", "High B (conflicts)", "todo", 11);
+        insert_test_task(&conn, "US-003", "Low disjoint", "todo", 99);
+        insert_test_task_file(&conn, "US-001", "src/shared.rs");
+        insert_test_task_file(&conn, "US-002", "src/shared.rs");
+        insert_test_task_file(&conn, "US-003", "src/other.rs");
+
+        let group = select_parallel_group(&conn, &[], &[], None, 4).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+
+        assert_eq!(
+            group.len(),
+            2,
+            "conflict check must drop US-002 even though score > US-003"
+        );
+        assert!(
+            ids.contains(&"US-001"),
+            "US-001 selected first (highest priority)"
+        );
+        assert!(
+            ids.contains(&"US-003"),
+            "US-003 selected (disjoint file, no conflict)"
+        );
+        assert!(
+            !ids.contains(&"US-002"),
+            "US-002 must be excluded (shares src/shared.rs with US-001)"
+        );
+    }
 }
 
 /// Tests for prefix-scoped task selection (TDD: written before implementation).
