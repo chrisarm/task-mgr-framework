@@ -132,6 +132,7 @@ pub(crate) fn watchdog_loop(
     timed_out: &AtomicBool,
     completion_epoch: Option<&AtomicU64>,
     target_task_id: Option<&str>,
+    completion_killed: Option<&AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -166,6 +167,13 @@ pub(crate) fn watchdog_loop(
                         POST_COMPLETION_GRACE_SECS,
                         target_task_id.unwrap_or("?"),
                     );
+                    // Set BEFORE kill so the SIGTERM-induced wait() in
+                    // spawn_claude observes the flag. This distinguishes
+                    // an internal grace kill from an external Ctrl+C that
+                    // hit the child via the terminal foreground group.
+                    if let Some(flag) = completion_killed {
+                        flag.store(true, Ordering::Release);
+                    }
                     kill_process_group(child_pid, stop, "Post-completion grace expired");
                     return;
                 }
@@ -221,6 +229,7 @@ pub(crate) fn watchdog_loop(
     _timed_out: &AtomicBool,
     _completion_epoch: Option<&AtomicU64>,
     _target_task_id: Option<&str>,
+    _completion_killed: Option<&AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -450,9 +459,11 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
+        let completion_killed = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let timed_out_clone = Arc::clone(&timed_out);
         let epoch_clone = Arc::clone(&epoch);
+        let completion_killed_clone = Arc::clone(&completion_killed);
         let handle = std::thread::spawn(move || {
             watchdog_loop(
                 pid,
@@ -462,6 +473,7 @@ mod tests {
                 &timed_out_clone,
                 Some(&epoch_clone),
                 Some("T-GRACE-TEST"),
+                Some(&completion_killed_clone),
             );
         });
 
@@ -481,6 +493,10 @@ mod tests {
         assert!(
             !timed_out.load(Ordering::Acquire),
             "grace kill is a successful completion — timed_out must stay false",
+        );
+        assert!(
+            completion_killed.load(Ordering::Acquire),
+            "grace kill must set completion_killed so the engine can skip signal propagation",
         );
     }
 
@@ -505,9 +521,11 @@ mod tests {
         let epoch = Arc::new(AtomicU64::new(0)); // unarmed
         let stop = Arc::new(AtomicBool::new(false));
         let timed_out = Arc::new(AtomicBool::new(false));
+        let completion_killed = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let timed_out_clone = Arc::clone(&timed_out);
         let epoch_clone = Arc::clone(&epoch);
+        let completion_killed_clone = Arc::clone(&completion_killed);
         let handle = std::thread::spawn(move || {
             watchdog_loop(
                 pid,
@@ -517,6 +535,7 @@ mod tests {
                 &timed_out_clone,
                 Some(&epoch_clone),
                 Some("T-UNARMED"),
+                Some(&completion_killed_clone),
             );
         });
 
@@ -537,6 +556,10 @@ mod tests {
         assert!(
             !timed_out.load(Ordering::Acquire),
             "no timeout configured, no grace armed — timed_out must stay false"
+        );
+        assert!(
+            !completion_killed.load(Ordering::Acquire),
+            "no grace armed — completion_killed must stay false"
         );
     }
 }

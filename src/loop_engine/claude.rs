@@ -60,6 +60,12 @@ pub struct ClaudeResult {
     pub conversation: Option<String>,
     /// Whether the process was killed due to iteration timeout.
     pub timed_out: bool,
+    /// Whether the process was killed by the post-completion grace window
+    /// elapsing (watchdog saw `<completed>TARGET</completed>` and the
+    /// POST_COMPLETION_GRACE_SECS window ran out). This produces a SIGTERM
+    /// (exit code 143) that is NOT an external Ctrl+C and must not
+    /// propagate to the parent's signal flag.
+    pub completion_killed: bool,
     /// Tool calls denied by the permission system during this invocation.
     /// Each entry is a raw JSON value from the stream-json `permission_denials` array.
     pub permission_denials: Vec<serde_json::Value>,
@@ -445,6 +451,7 @@ pub(crate) fn spawn_claude(
     // what triggers the post-completion kill.
     let stop_watchdog = Arc::new(AtomicBool::new(false));
     let timed_out_flag = Arc::new(AtomicBool::new(false));
+    let completion_killed_flag = Arc::new(AtomicBool::new(false));
     let watchdog_handle = if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some()
     {
         let stop = Arc::clone(&stop_watchdog);
@@ -453,6 +460,7 @@ pub(crate) fn spawn_claude(
         let timed_out = Arc::clone(&timed_out_flag);
         let epoch = Arc::clone(&completion_epoch);
         let target = target_task_id.map(str::to_owned);
+        let completion_killed = Arc::clone(&completion_killed_flag);
         Some(std::thread::spawn(move || {
             watchdog_loop(
                 child_pid,
@@ -462,6 +470,7 @@ pub(crate) fn spawn_claude(
                 &timed_out,
                 Some(&epoch),
                 target.as_deref(),
+                Some(&completion_killed),
             );
         }))
     } else {
@@ -538,12 +547,14 @@ pub(crate) fn spawn_claude(
 
     let exit_code = exit_code_from_status(status);
     let timed_out = timed_out_flag.load(Ordering::Acquire);
+    let completion_killed = completion_killed_flag.load(Ordering::Acquire);
 
     Ok(ClaudeResult {
         exit_code,
         output,
         conversation,
         timed_out,
+        completion_killed,
         permission_denials,
     })
 }
@@ -1149,12 +1160,14 @@ mod tests {
             output: "Hello world\n".to_string(),
             conversation: None,
             timed_out: false,
+            completion_killed: false,
             permission_denials: vec![],
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.output, "Hello world\n");
         assert!(result.conversation.is_none());
         assert!(!result.timed_out);
+        assert!(!result.completion_killed);
         assert!(result.permission_denials.is_empty());
     }
 
@@ -1165,6 +1178,7 @@ mod tests {
             output: String::new(),
             conversation: None,
             timed_out: false,
+            completion_killed: false,
             permission_denials: vec![],
         };
         assert_eq!(result.exit_code, 137);
@@ -1212,6 +1226,7 @@ mod tests {
             output: String::new(),
             conversation: None,
             timed_out: false,
+            completion_killed: false,
             permission_denials: vec![],
         })
     }
@@ -1351,6 +1366,7 @@ mod tests {
             output,
             conversation: None,
             timed_out: false,
+            completion_killed: false,
             permission_denials: vec![],
         })
     }

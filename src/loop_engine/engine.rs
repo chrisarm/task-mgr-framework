@@ -641,7 +641,12 @@ pub fn run_iteration(
     // Step 6.5: Detect if Claude was killed by SIGINT/SIGTERM (exit 130/143).
     // Claude may be the terminal foreground group, so Ctrl+C goes to it instead
     // of us. Propagate the signal to our flag so the loop stops cleanly.
-    if matches!(claude_result.exit_code, 130 | 143) {
+    //
+    // Exception: if the watchdog fired the post-completion grace kill, the
+    // SIGTERM (143) was issued internally as a successful-completion finalizer
+    // — not an external Ctrl+C. Propagating it would end the whole loop (and
+    // any chained PRDs) despite the task completing normally.
+    if matches!(claude_result.exit_code, 130 | 143) && !claude_result.completion_killed {
         params.signal_flag.set();
     }
 
@@ -3885,7 +3890,8 @@ mod tests {
 
         // Simulate what run_iteration does when Claude exits with 130 (SIGINT)
         let exit_code = 130;
-        if matches!(exit_code, 130 | 143) {
+        let completion_killed = false;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
             flag.set();
         }
         assert!(flag.is_signaled(), "Exit code 130 should set signal flag");
@@ -3897,7 +3903,8 @@ mod tests {
         assert!(!flag.is_signaled());
 
         let exit_code = 143;
-        if matches!(exit_code, 130 | 143) {
+        let completion_killed = false;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
             flag.set();
         }
         assert!(flag.is_signaled(), "Exit code 143 should set signal flag");
@@ -3907,7 +3914,8 @@ mod tests {
     fn test_signal_flag_not_set_on_normal_exit_codes() {
         for exit_code in [0, 1, 127, 137, 139] {
             let flag = SignalFlag::new();
-            if matches!(exit_code, 130 | 143) {
+            let completion_killed = false;
+            if matches!(exit_code, 130 | 143) && !completion_killed {
                 flag.set();
             }
             assert!(
@@ -3916,6 +3924,24 @@ mod tests {
                 exit_code
             );
         }
+    }
+
+    /// Regression: post-completion grace kill sends SIGTERM (exit 143), but
+    /// that's an internal finalizer — it must NOT propagate to the parent's
+    /// signal flag, or the batch runner ends the whole loop + chained PRDs
+    /// after every `<completed>` tag.
+    #[test]
+    fn test_signal_flag_not_set_on_completion_killed_143() {
+        let flag = SignalFlag::new();
+        let exit_code = 143;
+        let completion_killed = true;
+        if matches!(exit_code, 130 | 143) && !completion_killed {
+            flag.set();
+        }
+        assert!(
+            !flag.is_signaled(),
+            "exit 143 from post-completion grace kill must not set signal flag"
+        );
     }
 
     // --- Auto-mode hint condition tests ---
