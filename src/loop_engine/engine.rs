@@ -214,6 +214,13 @@ pub struct IterationContext {
     /// influence on the next selection — hints surface in operator logs and
     /// remain available for future selection-side wiring.
     pub pending_reorder_hints: Vec<String>,
+    /// Task IDs that `claim_slot_task` set to `in_progress` in a parallel wave
+    /// but whose slot did not mark them `done` (e.g. crash, no `<completed>`
+    /// tag emitted, output-scan miss). Tracks across waves so the post-loop
+    /// cleanup can reset still-`in_progress` rows when the loop exits via
+    /// deadline / max-iterations rather than waiting for the next process's
+    /// step 6.6 recovery.
+    pub pending_slot_tasks: Vec<String>,
 }
 
 impl IterationContext {
@@ -232,6 +239,7 @@ impl IterationContext {
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
             pending_reorder_hints: Vec::new(),
+            pending_slot_tasks: Vec::new(),
         }
     }
 }
@@ -265,6 +273,11 @@ pub struct SlotResult {
     pub slot_index: usize,
     /// Outcome of the slot's iteration (mirrors the sequential `IterationResult`).
     pub iteration_result: IterationResult,
+    /// Whether `claim_slot_task` successfully transitioned this slot's task to
+    /// `in_progress`. `false` only for `slot_failure_result` entries where the
+    /// task was already `done` / `blocked` and the slot thread never spawned.
+    /// Drives the post-loop orphan reset (see `IterationContext::pending_slot_tasks`).
+    pub claim_succeeded: bool,
 }
 
 /// Aggregate result of a parallel wave.
@@ -432,6 +445,10 @@ fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
             effective_effort: exit.effective_effort,
             key_decisions_count: 0,
         },
+        // Early exit always runs after a successful claim (the slot thread
+        // started); the orphan reset must consider this task pending until
+        // process_slot_result clears it.
+        claim_succeeded: true,
     }
 }
 
@@ -542,7 +559,12 @@ pub fn run_slot_iteration(
 
     // If Claude was killed by SIGINT/SIGTERM (exit 130/143), propagate to
     // our shared signal flag so peer slots and the outer loop observe the stop.
-    if matches!(claude_result.exit_code, 130 | 143) {
+    //
+    // Exception: if the watchdog fired the post-completion grace kill, the
+    // SIGTERM (143) was issued internally as a successful-completion finalizer
+    // — not an external Ctrl+C. Propagating it would end the whole loop (and
+    // any chained PRDs) despite the task completing normally.
+    if matches!(claude_result.exit_code, 130 | 143) && !claude_result.completion_killed {
         params.signal_flag.set();
     }
 
@@ -579,6 +601,7 @@ pub fn run_slot_iteration(
             effective_effort: effort,
             key_decisions_count: 0,
         },
+        claim_succeeded: true,
     })
 }
 
@@ -608,7 +631,18 @@ fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
 }
 
 /// Build a SlotResult representing a slot thread that panicked or errored.
-fn slot_failure_result(slot_index: usize, task_id: Option<String>, reason: String) -> SlotResult {
+///
+/// `claim_succeeded` distinguishes two cases:
+///   - `true`: claim went through, but the slot thread later panicked / crashed
+///     while its task was already `in_progress` — the orphan reset must run.
+///   - `false`: claim itself failed (task already `done`/`blocked`) and no row
+///     was ever moved to `in_progress` — orphan reset must skip this entry.
+fn slot_failure_result(
+    slot_index: usize,
+    task_id: Option<String>,
+    reason: String,
+    claim_succeeded: bool,
+) -> SlotResult {
     SlotResult {
         slot_index,
         iteration_result: IterationResult {
@@ -621,6 +655,7 @@ fn slot_failure_result(slot_index: usize, task_id: Option<String>, reason: Strin
             effective_effort: None,
             key_decisions_count: 0,
         },
+        claim_succeeded,
     }
 }
 
@@ -665,6 +700,7 @@ pub fn run_parallel_wave(
                 slot_index,
                 Some(task_id.clone()),
                 format!("claim failed for task {}", task_id),
+                false,
             ));
             handles.push((slot_index, task_id, None));
             continue;
@@ -692,6 +728,7 @@ pub fn run_parallel_wave(
                     slot_index,
                     Some(task_id),
                     format!("iteration error: {}", e),
+                    true,
                 ));
             }
             Err(panic_payload) => {
@@ -709,6 +746,7 @@ pub fn run_parallel_wave(
                     slot_index,
                     Some(task_id),
                     format!("thread panic: {}", msg),
+                    true,
                 ));
             }
         }
@@ -960,6 +998,17 @@ fn process_slot_result(
     let result = &slot_result.iteration_result;
     let task_id = result.task_id.clone();
 
+    // Track every claimed slot task as pending until we observe a "done"
+    // signal in this slot's output. The post-loop cleanup uses this to reset
+    // any rows still in `in_progress` when the loop exits via deadline /
+    // max-iterations rather than waiting for the next process's step 6.6.
+    if slot_result.claim_succeeded
+        && let Some(ref tid) = task_id
+        && !ctx.pending_slot_tasks.contains(tid)
+    {
+        ctx.pending_slot_tasks.push(tid.clone());
+    }
+
     progress::log_iteration(
         params.progress_path,
         params.iteration,
@@ -1007,14 +1056,25 @@ fn process_slot_result(
     let mut slot_marked_done = false;
 
     if let Some(ref tid) = task_id {
+        // Slot output may emit `<task-status>X:done</task-status>` AND
+        // `<completed>X</completed>` for the same task ID — count each
+        // task at most once per wave per slot, otherwise the wave summary
+        // overstates progress (telemetry skew, not correctness).
+        let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut count_once = |cid: &str, agg: &mut WaveAggregator| {
+            if counted.insert(cid.to_string()) {
+                agg.tasks_completed += 1;
+            }
+            agg.any_completed = true;
+        };
+
         if status_updates_applied > 0
             && status_updates
                 .iter()
                 .any(|u| matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid)
         {
             slot_marked_done = true;
-            agg.tasks_completed += 1;
-            agg.any_completed = true;
+            count_once(tid, agg);
         }
 
         // Primary completion path: <completed>TASK-ID</completed>.
@@ -1032,8 +1092,7 @@ fn process_slot_result(
                     if cid == tid {
                         slot_marked_done = true;
                     }
-                    agg.tasks_completed += 1;
-                    agg.any_completed = true;
+                    count_once(cid, agg);
                     eprintln!(
                         "[slot {}] Task {} completed (<completed> tag)",
                         slot_idx, cid
@@ -1061,8 +1120,7 @@ fn process_slot_result(
                         if cid == tid {
                             slot_marked_done = true;
                         }
-                        agg.tasks_completed += 1;
-                        agg.any_completed = true;
+                        count_once(cid, agg);
                         if let Err(e) =
                             update_prd_task_passes(params.prd_path, cid, true, params.task_prefix)
                         {
@@ -1087,6 +1145,13 @@ fn process_slot_result(
 
     if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
         agg.all_crashed = false;
+    }
+
+    // Slot's task transitioned to terminal state — drop from the pending set
+    // so the post-loop orphan reset doesn't bounce a `done` row back to
+    // `todo` on shutdown.
+    if slot_marked_done && let Some(ref tid) = task_id {
+        ctx.pending_slot_tasks.retain(|t| t != tid);
     }
 
     // FEAT-010 AC: queue reorder hints for the next wave. `select_parallel_group`
@@ -1227,14 +1292,31 @@ pub fn run_wave_iteration(
 
     // Merge ephemeral slot branches back into the main loop branch so the
     // next wave starts from a unified base. No-op when parallel_slots <= 1.
-    if params.parallel_slots > 1
-        && let Err(e) =
-            worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots)
-    {
-        eprintln!(
-            "Warning: merge_slot_branches failed: {} (next wave may diverge)",
-            e
-        );
+    // Per-slot failures are logged but never fatal — slot 0 is restored to
+    // its pre-merge HEAD via `git merge --abort`, and the next wave still
+    // benefits from any slots that did merge.
+    if params.parallel_slots > 1 {
+        match worktree::merge_slot_branches(
+            params.source_root,
+            params.branch,
+            params.parallel_slots,
+        ) {
+            Ok(outcomes) if outcomes.any_failed() => {
+                for (slot, stderr) in &outcomes.failed_slots {
+                    eprintln!(
+                        "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
+                        slot, stderr
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "Warning: merge_slot_branches errored before any per-slot work: {} (next wave may diverge)",
+                    e
+                );
+            }
+        }
     }
 
     if let Err(e) = run_cmd::update(
@@ -2932,16 +3014,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         // terminal-condition checks. The outer loop only needs to track the
         // counters and decide when to break.
         if parallel_active {
+            // Invariant: `parallel_active` is only set when `branch_name` is
+            // Some (see step 9.5). `debug_assert!` traps in tests if a future
+            // change breaks the invariant; release builds keep the graceful
+            // sequential fallthrough rather than panicking on an inconsistency.
+            debug_assert!(
+                branch_name.is_some(),
+                "parallel_active=true must imply branch_name is Some"
+            );
             let Some(branch) = branch_name.as_deref() else {
-                // Should never happen: parallel_active is only set when
-                // branch_name is Some (step 9.5). Degrade to sequential
-                // rather than panic on an invariant violation.
                 eprintln!(
                     "Warning: parallel_active=true but branch_name is None; \
                      falling through to sequential iteration"
                 );
                 parallel_active = false;
-                // fall through to sequential path below
                 continue;
             };
             let wave_params = WaveIterationParams {
@@ -3112,6 +3198,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             && !matches!(result.outcome, IterationOutcome::Empty)
         {
             let mut task_marked_done_this_iteration = false;
+            // Iteration output may emit `<task-status>:done`, `<completed>`,
+            // commit-detection, output-scan, and "already complete" for the
+            // same task ID — count each task at most once per iteration to
+            // keep the wave summary honest.
+            let mut counted_this_iteration: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             // If a <task-status>...:done</task-status> referenced the claimed
             // task, treat it identically to a <completed> tag: mark the task
@@ -3124,7 +3216,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             {
                 task_marked_done_this_iteration = true;
                 last_claimed_task = None;
-                tasks_completed += 1;
+                if counted_this_iteration.insert(task_id.clone()) {
+                    tasks_completed += 1;
+                }
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
                 eprintln!(
@@ -3149,7 +3243,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                             last_claimed_task = None;
                             task_marked_done_this_iteration = true;
                         }
-                        tasks_completed += 1;
+                        if counted_this_iteration.insert(completed_id.clone()) {
+                            tasks_completed += 1;
+                        }
                         result.outcome = IterationOutcome::Completed;
                         ctx.crash_tracker.record_success();
                         eprintln!(
@@ -3178,7 +3274,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     ) {
                         Ok(_) => {
                             last_claimed_task = None;
-                            tasks_completed += 1;
+                            if counted_this_iteration.insert(task_id.clone()) {
+                                tasks_completed += 1;
+                            }
                             task_marked_done_this_iteration = true;
 
                             // Override outcome so stale/crash trackers reset — task was actually completed
@@ -3236,7 +3334,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                                     task_marked_done_this_iteration = true;
                                 }
 
-                                tasks_completed += 1;
+                                if counted_this_iteration.insert(completed_id.clone()) {
+                                    tasks_completed += 1;
+                                }
 
                                 // Override outcome so stale/crash trackers reset — task was actually completed
                                 result.outcome = IterationOutcome::Completed;
@@ -3290,7 +3390,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 )
             {
                 last_claimed_task = None;
-                tasks_completed += 1;
+                if counted_this_iteration.insert(task_id.clone()) {
+                    tasks_completed += 1;
+                }
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
                 eprintln!("Task {} completed (reported as already done)", task_id);
@@ -3467,6 +3569,28 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             Ok(1) => eprintln!("Reset uncompleted task {} to todo", task_id),
             Ok(_) => {} // Already completed by reconciliation or status changed
             Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
+        }
+    }
+
+    // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
+    // mode is fully covered by step 17.5 above; the wave path tracks every
+    // claimed task in `ctx.pending_slot_tasks` and removes it on `done`, so
+    // anything remaining was claimed but never closed (deadline / max-iter
+    // exit, slot crash, or output without a `<completed>` tag).
+    for task_id in &ctx.pending_slot_tasks {
+        if Some(task_id) == last_claimed_task.as_ref() {
+            continue; // already handled by step 17.5
+        }
+        match conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
+            [task_id],
+        ) {
+            Ok(1) => eprintln!("Reset uncompleted slot task {} to todo", task_id),
+            Ok(_) => {} // already terminal
+            Err(e) => eprintln!(
+                "Warning: failed to reset slot task {}: {}",
+                task_id, e
+            ),
         }
     }
 
@@ -6293,6 +6417,7 @@ mod tests {
                     effective_effort: None,
                     key_decisions_count: 0,
                 },
+                claim_succeeded: true,
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(

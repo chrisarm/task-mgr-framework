@@ -124,6 +124,7 @@ pub(crate) fn kill_process_group(child_pid: u32, stop: &AtomicBool, reason: &str
 /// Runs on a dedicated OS thread (not tokio) so it works even when the
 /// main thread is blocked in synchronous I/O.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // distinct atomic flags, packing into a struct just relocates the noise
 pub(crate) fn watchdog_loop(
     child_pid: u32,
     signal_flag: Option<&SignalFlag>,
@@ -221,6 +222,7 @@ pub(crate) fn watchdog_loop(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn watchdog_loop(
     _child_pid: u32,
     signal_flag: Option<&SignalFlag>,

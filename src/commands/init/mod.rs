@@ -150,9 +150,10 @@ pub fn generate_prefix(branch_name: Option<&str>, filename: &str) -> String {
 }
 
 use import::{
-    delete_task_files, delete_task_relationships, drop_existing_data, get_delete_preview,
-    get_existing_task_ids, insert_prd_metadata, insert_task, insert_task_file,
-    insert_task_relationships, is_fresh_database, register_prd_files, update_task,
+    DEPRECATED_RELATIONSHIPS_WARNING, delete_task_files, delete_task_relationships,
+    drop_existing_data, get_delete_preview, get_existing_task_ids, insert_prd_metadata,
+    insert_task, insert_task_file, insert_task_relationships, is_fresh_database,
+    register_prd_files, update_task,
 };
 
 /// Initialize the database from JSON PRD file(s).
@@ -460,6 +461,11 @@ pub fn init(
         register_prd_files(&tx, prd_id, json_path, prd_for_reg, &tasks_dir)?;
     }
 
+    // Track whether any task in this import session carried deprecated
+    // relationship fields, so we can emit a single warning after the loops
+    // instead of flooding stderr on large PRD upgrades.
+    let mut saw_deprecated_relationships = false;
+
     // Import new tasks
     for story in &all_stories {
         insert_task(&tx, story, prd_default_max_retries)?;
@@ -468,7 +474,8 @@ pub fn init(
             insert_task_file(&tx, &story.id, file_path)?;
         }
 
-        insert_task_relationships(&tx, story)?;
+        let outcome = insert_task_relationships(&tx, story)?;
+        saw_deprecated_relationships |= outcome.had_deprecated;
     }
 
     // Update existing tasks if --update-existing
@@ -498,10 +505,15 @@ pub fn init(
             insert_task_file(&tx, &story.id, file_path)?;
         }
 
-        insert_task_relationships(&tx, story)?;
+        let outcome = insert_task_relationships(&tx, story)?;
+        saw_deprecated_relationships |= outcome.had_deprecated;
     }
 
     tx.commit()?;
+
+    if saw_deprecated_relationships {
+        eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
+    }
 
     // Offer an interactive default-model picker on fresh (non-dry-run) imports.
     // No-ops when a default already resolves, in auto-mode, or when stdin/stderr

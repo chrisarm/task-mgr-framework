@@ -4,8 +4,8 @@
 
 use rusqlite::Connection;
 
-use crate::{TaskMgrError, TaskMgrResult};
 use crate::models::Learning;
+use crate::{TaskMgrError, TaskMgrResult};
 
 /// Confirms that a learning row exists, surfacing a friendly `NotFound`
 /// error when it doesn't (instead of leaving the caller to interpret an

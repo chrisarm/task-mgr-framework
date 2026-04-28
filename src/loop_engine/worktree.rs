@@ -256,6 +256,19 @@ pub fn ensure_worktree(
         false
     };
 
+    // git worktree commands take the path as a positional argument; non-UTF-8
+    // paths cannot round-trip through Command's &str API. Reject up front
+    // with a clear error rather than silently passing the empty string and
+    // letting git emit a confusing message.
+    let worktree_path_str = worktree_path
+        .to_str()
+        .ok_or_else(|| TaskMgrError::InvalidState {
+            resource_type: "worktree path".to_string(),
+            id: worktree_path.display().to_string(),
+            expected: "UTF-8 path".to_string(),
+            actual: "non-UTF-8 bytes".to_string(),
+        })?;
+
     // Check if branch exists
     let branch_exists = Command::new("git")
         .args([
@@ -280,12 +293,7 @@ pub fn ensure_worktree(
     let create_result = if branch_exists {
         // Branch exists, create worktree for existing branch
         Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                worktree_path.to_str().unwrap_or_default(),
-                branch_name,
-            ])
+            .args(["worktree", "add", worktree_path_str, branch_name])
             .current_dir(project_root)
             .output()
             .map_err(|e| {
@@ -299,13 +307,7 @@ pub fn ensure_worktree(
         // Branch doesn't exist, create new branch in worktree.
         // The `--` separator before start_point prevents flag injection from
         // malicious ref values (e.g. "--exec=...").
-        let mut args = vec![
-            "worktree",
-            "add",
-            "-b",
-            branch_name,
-            worktree_path.to_str().unwrap_or_default(),
-        ];
+        let mut args = vec!["worktree", "add", "-b", branch_name, worktree_path_str];
         if let Some(sp) = start_point {
             args.push("--");
             args.push(sp);
@@ -483,12 +485,34 @@ pub(crate) fn ensure_slot_worktrees(
     Ok(paths)
 }
 
+/// Per-slot outcome returned by `merge_slot_branches`.
+///
+/// Slots that merged cleanly into the main branch land in `merged_slots`
+/// (and get fast-forwarded). Slots whose merge or fast-forward failed land
+/// in `failed_slots` along with the captured stderr, while `slot0_path` is
+/// restored to its pre-merge HEAD via `git merge --abort`.
+#[derive(Debug, Default)]
+pub(crate) struct MergeOutcomes {
+    pub merged_slots: Vec<usize>,
+    pub failed_slots: Vec<(usize, String)>,
+}
+
+impl MergeOutcomes {
+    pub fn any_failed(&self) -> bool {
+        !self.failed_slots.is_empty()
+    }
+}
+
 /// Merge ephemeral slot branches back into the loop's main branch.
 ///
 /// Runs `git merge --no-edit {branch}-slot-{N}` from slot 0 (the main branch
-/// worktree) for each slot in `1..num_slots`. After all merges complete,
-/// fast-forwards each slot worktree to the updated main branch head so the
-/// next wave starts from a consistent base.
+/// worktree) for each slot in `1..num_slots`. On a merge failure the function
+/// runs `git merge --abort` to restore slot 0 to its pre-merge HEAD, records
+/// the failure in `failed_slots`, and continues to the next slot — one bad
+/// slot does not poison the others. After the merge loop completes,
+/// successfully-merged slots are fast-forwarded; failed slots keep their
+/// ephemeral branches diverged so the wave orchestrator can decide what to
+/// do (next wave's group selection still respects file-disjointness).
 ///
 /// Assumes all slot worktrees have their work committed to the ephemeral
 /// branch. Uncommitted changes on a slot branch cause the merge to succeed
@@ -498,14 +522,14 @@ pub(crate) fn merge_slot_branches(
     project_root: &Path,
     branch_name: &str,
     num_slots: usize,
-) -> TaskMgrResult<()> {
+) -> TaskMgrResult<MergeOutcomes> {
+    let mut outcomes = MergeOutcomes::default();
     if num_slots <= 1 {
-        return Ok(());
+        return Ok(outcomes);
     }
 
     let slot0_path = compute_slot_worktree_path(project_root, branch_name, 0);
 
-    // Merge each ephemeral branch back into the main branch.
     for slot in 1..num_slots {
         let ephemeral = ephemeral_slot_branch(branch_name, slot);
         let output = Command::new("git")
@@ -516,21 +540,30 @@ pub(crate) fn merge_slot_branches(
                 TaskMgrError::io_error(slot0_path.display().to_string(), "running git merge", e)
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TaskMgrError::InvalidState {
-                resource_type: "Git merge".to_string(),
-                id: ephemeral.clone(),
-                expected: format!("clean merge of {} into {}", ephemeral, branch_name),
-                actual: format!("git merge error: {}", stderr.trim()),
-            });
+        if output.status.success() {
+            outcomes.merged_slots.push(slot);
+        } else {
+            // git writes conflict details to stdout (e.g. "CONFLICT (content):
+            // ...") and short error context to stderr; capture whichever is
+            // non-empty so the warning logged by the caller is informative.
+            let detail = format_git_failure(&output.stdout, &output.stderr);
+            // Best-effort: restore slot 0 to its pre-merge HEAD so the next
+            // slot's merge starts from a clean state. We ignore the abort's
+            // exit code — if there's no in-progress merge (e.g., the failure
+            // was during merge-driver setup), abort is a no-op.
+            let _ = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(&slot0_path)
+                .output();
+            outcomes.failed_slots.push((slot, detail));
         }
     }
 
-    // Fast-forward each slot worktree to the updated main branch head. After
-    // the merge-back loop, every ephemeral slot branch is an ancestor of the
-    // main branch, so --ff-only is always safe.
-    for slot in 1..num_slots {
+    // Fast-forward each successfully-merged slot worktree to the updated main
+    // branch head. After the merge-back loop, every merged ephemeral branch
+    // is an ancestor of the main branch, so --ff-only is always safe.
+    let merged = outcomes.merged_slots.clone();
+    for slot in merged {
         let slot_path = compute_slot_worktree_path(project_root, branch_name, slot);
         let output = Command::new("git")
             .args(["merge", "--ff-only", branch_name])
@@ -545,17 +578,27 @@ pub(crate) fn merge_slot_branches(
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TaskMgrError::InvalidState {
-                resource_type: "Git fast-forward".to_string(),
-                id: format!("slot-{}", slot),
-                expected: format!("fast-forward of slot-{} worktree to {}", slot, branch_name),
-                actual: format!("git error: {}", stderr.trim()),
-            });
+            let detail = format_git_failure(&output.stdout, &output.stderr);
+            outcomes.merged_slots.retain(|s| *s != slot);
+            outcomes.failed_slots.push((slot, detail));
         }
     }
 
-    Ok(())
+    Ok(outcomes)
+}
+
+/// Pick the most informative non-empty git output for a failure summary.
+/// `git merge` writes conflict details to stdout and short context to stderr;
+/// either may be empty depending on the failure mode.
+fn format_git_failure(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout_str = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr_str = String::from_utf8_lossy(stderr).trim().to_string();
+    match (stdout_str.is_empty(), stderr_str.is_empty()) {
+        (false, false) => format!("{} | {}", stderr_str, stdout_str),
+        (false, true) => stdout_str,
+        (true, false) => stderr_str,
+        (true, true) => "git failed without output".to_string(),
+    }
 }
 
 /// Remove slot worktrees (slots 1+) and delete their ephemeral branches.
@@ -1621,7 +1664,17 @@ detached
                 .expect("git commit in slot");
         }
 
-        merge_slot_branches(tmp.path(), branch, 3).expect("merge_slot_branches");
+        let outcomes = merge_slot_branches(tmp.path(), branch, 3).expect("merge_slot_branches");
+        assert!(
+            !outcomes.any_failed(),
+            "disjoint changes must merge cleanly: {:?}",
+            outcomes.failed_slots
+        );
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1, 2],
+            "slots 1 and 2 should both report merged"
+        );
 
         // After merge, slot 0 (main branch worktree) must contain every
         // slot's file.
@@ -1634,6 +1687,119 @@ detached
                 merged.display()
             );
         }
+    }
+
+    /// AC5b: merge_slot_branches recovers from partial failure.
+    ///
+    /// If slot 1 merges cleanly but slot 2's merge conflicts (e.g., out-of-band
+    /// commit on the same path), `merge_slot_branches` must:
+    ///   (a) abort the active merge so slot 0 returns to a clean working tree,
+    ///   (b) record slot 2 in `failed_slots` with stderr captured,
+    ///   (c) leave slot 0's HEAD pointing at the (already-merged) slot 1 commit,
+    ///   (d) NOT propagate the failure as `Err` — the caller decides what to do.
+    #[test]
+    fn test_merge_slot_branches_recovers_from_partial_failure() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/partial-failure";
+        let slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 3).expect("ensure_slot_worktrees");
+
+        // Slot 1: clean disjoint commit (will merge fine)
+        fs::write(paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add slot 1");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint change"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit slot 1");
+
+        // Slot 2 + main both touch the SAME path with conflicting content,
+        // forcing a merge conflict when slot-2's branch comes back.
+        fs::write(paths[2].join("contended.txt"), "slot-2 version").expect("write slot 2");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[2])
+            .output()
+            .expect("git add slot 2");
+        Command::new("git")
+            .args(["commit", "-m", "slot-2 contended change"])
+            .current_dir(&paths[2])
+            .output()
+            .expect("git commit slot 2");
+
+        // Out-of-band commit on the main branch via slot 0 worktree, touching
+        // the same file with different content.
+        fs::write(slot0.join("contended.txt"), "main version").expect("write main");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot0)
+            .output()
+            .expect("git add main");
+        Command::new("git")
+            .args(["commit", "-m", "main out-of-band change"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git commit main");
+
+        let pre_merge_head = rev_parse(&slot0, "HEAD");
+
+        let outcomes =
+            merge_slot_branches(tmp.path(), branch, 3).expect("merge_slot_branches must not Err");
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot 1 should merge cleanly; slot 2 should not"
+        );
+        assert_eq!(
+            outcomes.failed_slots.len(),
+            1,
+            "exactly one slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+        assert_eq!(outcomes.failed_slots[0].0, 2, "failed slot must be slot 2");
+        assert!(
+            !outcomes.failed_slots[0].1.is_empty(),
+            "failure should capture stderr context"
+        );
+
+        // Slot 0 must NOT be in a half-merged state — `git merge --abort`
+        // restored it to its pre-merge HEAD plus slot 1's clean merge.
+        assert!(
+            !slot0.join(".git/MERGE_HEAD").exists()
+                && !slot0
+                    .join(".git/worktrees")
+                    .join("..")
+                    .join("MERGE_HEAD")
+                    .exists(),
+            "no in-progress merge artifact should remain in slot 0"
+        );
+
+        // Slot 1 was already merged before slot 2 was attempted, so HEAD
+        // should be one commit ahead of the pre-merge state.
+        let post_merge_head = rev_parse(&slot0, "HEAD");
+        assert_ne!(
+            post_merge_head, pre_merge_head,
+            "slot 1's clean merge should still be present"
+        );
+
+        // Slot 1's file is in slot 0; slot 2's contended file remains the
+        // out-of-band content (not slot 2's version).
+        assert!(
+            slot0.join("slot-1-file.txt").exists(),
+            "slot 1 file should be present after merge"
+        );
+        let contended = fs::read_to_string(slot0.join("contended.txt")).expect("read contended");
+        assert_eq!(
+            contended.trim(),
+            "main version",
+            "slot 2's failed merge must not have leaked into slot 0"
+        );
     }
 
     /// AC6: cleanup removes slot worktrees and deletes ephemeral branches.

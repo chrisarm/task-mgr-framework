@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::commands::init::import::{
-    insert_relationship, insert_task, insert_task_file, insert_task_relationships,
+    DEPRECATED_RELATIONSHIPS_WARNING, insert_relationship, insert_task, insert_task_file,
+    insert_task_relationships,
 };
 use crate::commands::init::parse::PrdUserStory;
 use crate::commands::next;
@@ -293,7 +294,7 @@ pub fn add_with_conn(
     // Insert task + relationships + files in a single transaction.
     let tx = conn.unchecked_transaction()?;
     insert_task(&tx, &story, None)?;
-    insert_task_relationships(&tx, &story)?;
+    let rel_outcome = insert_task_relationships(&tx, &story)?;
     for file_path in &story.touches_files {
         insert_task_file(&tx, &story.id, file_path)?;
     }
@@ -303,6 +304,10 @@ pub fn add_with_conn(
         insert_relationship(&tx, existing_id, &story.id, "dependsOn")?;
     }
     tx.commit()?;
+
+    if rel_outcome.had_deprecated {
+        eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
+    }
 
     // Best-effort PRD JSON sync. Failure here logs but does not roll back
     // the DB — the task is already in the database, and `task-mgr export`
