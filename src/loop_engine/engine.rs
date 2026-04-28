@@ -314,6 +314,12 @@ pub struct SlotIterationParams {
     pub default_model: Option<String>,
     /// Verbose logging toggle.
     pub verbose: bool,
+    /// Wave's iteration index (1-based, shared across slots in the wave).
+    pub iteration: u32,
+    /// Total iteration budget (for the per-slot iteration banner).
+    pub max_iterations: u32,
+    /// Wall-clock seconds since loop start (snapshot at wave dispatch time).
+    pub elapsed_secs: u64,
 }
 
 /// Build a minimal slot prompt from a pre-claimed task and base prompt template.
@@ -513,16 +519,31 @@ pub fn run_slot_iteration(
         );
     }
 
+    // Prefix every line of this slot's tee output with its slot index so
+    // concurrent slots stay attributable on a shared stderr.
+    let slot_label_buf = format!("[slot {}]", slot.slot_index);
+
+    // Iteration banner — same shape as the sequential `print_iteration_header`
+    // but routed through `emit_prefixed_lines` so each line carries the slot
+    // label. `format_iteration_header` emits a leading newline for visual
+    // separation; we strip it here because a blank line would land as
+    // `[slot N] ` in the output, which adds noise without adding signal.
+    let banner = display::format_iteration_header(
+        params.iteration,
+        params.max_iterations,
+        &slot.task.id,
+        params.elapsed_secs,
+        effective_model.as_deref(),
+        effort,
+    );
+    claude::emit_prefixed_lines(Some(&slot_label_buf), banner.trim_start_matches('\n'));
+
     // Per-slot timeout wired to the slot's own activity epoch. Each
     // spawn_claude creates its own watchdog thread, so timeouts are per-slot.
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
         slot.task.difficulty.as_deref(),
         Arc::clone(&slot.last_activity_epoch),
     );
-
-    // Prefix every line of this slot's tee output with its slot index so
-    // concurrent slots stay attributable on a shared stderr.
-    let slot_label_buf = format!("[slot {}]", slot.slot_index);
 
     let claude_result = claude::spawn_claude(
         &prompt,
@@ -787,6 +808,13 @@ pub struct WaveIterationParams<'a> {
     pub parallel_slots: usize,
     pub slot_worktree_paths: &'a [PathBuf],
     pub iteration: u32,
+    /// Total iteration budget (used for the iteration banner so each slot's
+    /// header reads "Iteration N/M" matching sequential mode).
+    pub max_iterations: u32,
+    /// Wall-clock seconds since the loop's start_time. Captured once per wave
+    /// (immediately before dispatch) and shared across slots so all slot
+    /// banners in the same wave display the same elapsed value.
+    pub elapsed_secs: u64,
     pub run_id: &'a str,
     pub base_prompt_path: &'a Path,
     pub permission_mode: &'a PermissionMode,
@@ -990,6 +1018,9 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         signal_flag: params.signal_flag.clone(),
         default_model: params.default_model.map(|s| s.to_string()),
         verbose: params.verbose,
+        iteration: params.iteration,
+        max_iterations: params.max_iterations,
+        elapsed_secs: params.elapsed_secs,
     })
 }
 
@@ -3048,6 +3079,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 parallel_slots: run_config.config.parallel_slots,
                 slot_worktree_paths: &slot_worktree_paths,
                 iteration,
+                max_iterations,
+                elapsed_secs: elapsed,
                 run_id: &run_id,
                 base_prompt_path: &paths.prompt_file,
                 permission_mode: &permission_mode,
@@ -6388,6 +6421,9 @@ mod tests {
                 signal_flag,
                 default_model: None,
                 verbose: false,
+                iteration: 1,
+                max_iterations: 1,
+                elapsed_secs: 0,
             }
         }
 
@@ -6714,6 +6750,8 @@ mod tests {
                 parallel_slots,
                 slot_worktree_paths: slot_paths,
                 iteration: 1,
+                max_iterations: 1,
+                elapsed_secs: 0,
                 run_id: "test-run",
                 base_prompt_path: base_prompt,
                 permission_mode,
@@ -6930,6 +6968,8 @@ mod tests {
                     parallel_slots: 1,
                     slot_worktree_paths: &[tmp.path().to_path_buf()],
                     iteration: 1,
+                    max_iterations: 1,
+                    elapsed_secs: 0,
                     run_id: "test-run",
                     base_prompt_path: &base_prompt,
                     permission_mode: &mode,
@@ -6973,6 +7013,9 @@ mod tests {
                 signal_flag: SignalFlag::new(),
                 default_model: Some(OPUS_MODEL.to_string()),
                 verbose: true,
+                iteration: 7,
+                max_iterations: 100,
+                elapsed_secs: 42,
             };
             let cloned = params.clone();
             assert_eq!(cloned.db_dir, params.db_dir);
@@ -7078,6 +7121,8 @@ mod tests {
                     parallel_slots,
                     slot_worktree_paths: slot_paths,
                     iteration: 1,
+                    max_iterations: 1,
+                    elapsed_secs: 0,
                     run_id,
                     base_prompt_path: base_prompt,
                     permission_mode,
