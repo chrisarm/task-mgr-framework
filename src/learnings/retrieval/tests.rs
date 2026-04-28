@@ -149,6 +149,72 @@ fn test_fts5_backend_with_outcome_filter() {
     assert_eq!(results[0].learning.title, "Database failure");
 }
 
+/// Regression for /review-loop finding #4: every placeholder kind in the same
+/// FTS5 query (FTS MATCH `?1`, outcome `?N`, multiple tags `?N..?N+M`, LIMIT
+/// `?N+M+1`) must bind the right value. Bare `?` for LIMIT used to work by
+/// accident; this exercise the full numbered chain end-to-end.
+#[test]
+fn test_fts5_backend_combines_text_outcome_tags_and_limit() {
+    let (_temp_dir, conn) = setup_db_with_fts5();
+
+    let id_match = create_test_learning(
+        &conn,
+        "Database connection bug",
+        "connection pool exhausted",
+        LearningOutcome::Failure,
+    );
+    let id_wrong_outcome = create_test_learning(
+        &conn,
+        "Database connection success story",
+        "connection pool tuned",
+        LearningOutcome::Success,
+    );
+    let id_no_tag_intersect = create_test_learning(
+        &conn,
+        "Database other failure",
+        "schema migration broke",
+        LearningOutcome::Failure,
+    );
+
+    // Tag id_match with both `network` and `prod`; the other two with mismatched
+    // tag combinations so only id_match survives the AND of all filters.
+    for (id, tag) in [
+        (id_match, "network"),
+        (id_match, "prod"),
+        (id_wrong_outcome, "network"),
+        (id_wrong_outcome, "prod"),
+        (id_no_tag_intersect, "schema"),
+    ] {
+        conn.execute(
+            "INSERT INTO learning_tags (learning_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![id, tag],
+        )
+        .unwrap();
+    }
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("database".to_string()),
+        outcome: Some(LearningOutcome::Failure),
+        tags: Some(vec!["network".to_string(), "prod".to_string()]),
+        limit: 5,
+        ..Default::default()
+    };
+    let results = backend.retrieve(&conn, &query).unwrap();
+
+    // Only id_match satisfies: text matches "database", outcome=Failure,
+    // and at least one of {network, prod} tags. id_wrong_outcome is Success;
+    // id_no_tag_intersect has only the `schema` tag.
+    assert_eq!(
+        results.len(),
+        1,
+        "expected exactly the row with matching text + outcome + tag, \
+         got {} results",
+        results.len()
+    );
+    assert_eq!(results[0].learning.id, Some(id_match));
+}
+
 #[test]
 fn test_fts5_backend_like_fallback() {
     let (_temp_dir, conn) = setup_db(); // No migrations = no FTS5

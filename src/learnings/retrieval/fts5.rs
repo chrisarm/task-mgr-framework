@@ -143,7 +143,11 @@ fn execute_fts5_query(
     };
 
     // FTS5 query with BM25 scoring
-    // bm25() returns a negative score (lower = better match), so we negate it
+    // bm25() returns a negative score (lower = better match), so we negate it.
+    // The LIMIT placeholder is given an explicit number (sql_params.len() + 1)
+    // rather than a bare `?`, so the binding can't silently drift if param
+    // push order changes upstream.
+    let limit_idx = sql_params.len() + 1;
     let sql = format!(
         r#"
         SELECT
@@ -156,12 +160,11 @@ fn execute_fts5_query(
         INNER JOIN learnings_fts fts ON l.id = fts.rowid
         WHERE learnings_fts MATCH ?1
         AND l.retired_at IS NULL
-        {}
-        {}
+        {supersession_clause}
+        {additional_where}
         ORDER BY relevance DESC
-        LIMIT ?
+        LIMIT ?{limit_idx}
         "#,
-        supersession_clause, additional_where
     );
 
     sql_params.push(Box::new(query.limit as i64));
@@ -214,6 +217,7 @@ fn execute_like_query(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
+    let limit_idx = sql_params.len() + 1;
     let sql = format!(
         r#"
         SELECT
@@ -222,14 +226,13 @@ fn execute_like_query(
             applies_to_files, applies_to_task_types, applies_to_errors,
             confidence, times_shown, times_applied, last_shown_at, last_applied_at
         FROM learnings
-        {}
+        {where_clause}
         ORDER BY
             CASE WHEN last_applied_at IS NULL THEN 1 ELSE 0 END,
             last_applied_at DESC,
             created_at DESC
-        LIMIT ?
+        LIMIT ?{limit_idx}
         "#,
-        where_clause
     );
 
     sql_params.push(Box::new(query.limit as i64));
@@ -269,6 +272,7 @@ fn execute_unfiltered_query(
 
     let where_clause = format!("WHERE {}", conditions.join(" AND "));
 
+    let limit_idx = sql_params.len() + 1;
     let sql = format!(
         r#"
         SELECT
@@ -277,14 +281,13 @@ fn execute_unfiltered_query(
             applies_to_files, applies_to_task_types, applies_to_errors,
             confidence, times_shown, times_applied, last_shown_at, last_applied_at
         FROM learnings
-        {}
+        {where_clause}
         ORDER BY
             CASE WHEN last_applied_at IS NULL THEN 1 ELSE 0 END,
             last_applied_at DESC,
             created_at DESC
-        LIMIT ?
+        LIMIT ?{limit_idx}
         "#,
-        where_clause
     );
 
     sql_params.push(Box::new(query.limit as i64));
