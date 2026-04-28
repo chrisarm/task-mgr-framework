@@ -613,6 +613,14 @@ pub fn run_slot_iteration(
 ///
 /// Done as a single UPDATE with an optimistic-locking WHERE clause so a
 /// concurrent external writer cannot clobber a `done` row back to `in_progress`.
+///
+/// `'in_progress'` is intentionally included in the WHERE clause: re-claiming
+/// an already-claimed task is idempotent (covered by the test
+/// `test_claim_slot_task_idempotent_on_already_in_progress`) and supports
+/// retry-after-recovery scenarios where step 6.6 left a row in `in_progress`
+/// that the loop wants to take over. The selection layer is responsible for
+/// not surfacing in-flight rows to other slots in the same wave; this guard
+/// only protects against `done`/`blocked` transitions, not duplicate claims.
 fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
     match conn.execute(
         "UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), \
@@ -1150,6 +1158,15 @@ fn process_slot_result(
     // Slot's task transitioned to terminal state — drop from the pending set
     // so the post-loop orphan reset doesn't bounce a `done` row back to
     // `todo` on shutdown.
+    //
+    // Cross-task case: if this slot was assigned X but emitted
+    // `<completed>Y</completed>`, `mark_task_done(Y)` ran above and Y is now
+    // `done`. `slot_marked_done` is gated on `cid == tid`, so X stays in
+    // `pending_slot_tasks` and Y was never added (it was a peer slot's task
+    // or was already terminal). Both behaviors are correct: step 17.6's
+    // UPDATE is guarded by `AND status='in_progress'`, so the orphan reset
+    // is a no-op for Y (now `done`) and correctly resets X (genuinely still
+    // `in_progress` — the slot's actual task was never completed by any path).
     if slot_marked_done && let Some(ref tid) = task_id {
         ctx.pending_slot_tasks.retain(|t| t != tid);
     }
@@ -1292,30 +1309,18 @@ pub fn run_wave_iteration(
 
     // Merge ephemeral slot branches back into the main loop branch so the
     // next wave starts from a unified base. No-op when parallel_slots <= 1.
-    // Per-slot failures are logged but never fatal — slot 0 is restored to
-    // its pre-merge HEAD via `git merge --abort`, and the next wave still
-    // benefits from any slots that did merge.
+    // Per-slot failures (merge conflicts, spawn errors, ff failures) are
+    // logged but never fatal — slot 0 is restored to its captured pre-merge
+    // HEAD via `git reset --hard`, and the next wave still benefits from any
+    // slots that did merge.
     if params.parallel_slots > 1 {
-        match worktree::merge_slot_branches(
-            params.source_root,
-            params.branch,
-            params.parallel_slots,
-        ) {
-            Ok(outcomes) if outcomes.any_failed() => {
-                for (slot, stderr) in &outcomes.failed_slots {
-                    eprintln!(
-                        "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
-                        slot, stderr
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: merge_slot_branches errored before any per-slot work: {} (next wave may diverge)",
-                    e
-                );
-            }
+        let outcomes =
+            worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots);
+        for (slot, detail) in &outcomes.failed_slots {
+            eprintln!(
+                "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
+                slot, detail
+            );
         }
     }
 
