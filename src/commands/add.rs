@@ -359,7 +359,7 @@ fn resolve_priority(
     if let Some(p) = input.priority {
         return (p, PrioritySource::Input);
     }
-    match next::select_next_task(conn, &[], &[], input.task_prefix()) {
+    match next::select_next_task(conn, &[], input.task_prefix()) {
         Ok(res) => match res.task {
             Some(top) => (
                 top.task.priority.saturating_sub(1),

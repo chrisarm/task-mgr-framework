@@ -830,7 +830,6 @@ pub fn run_wave_iteration(
     let group = match select_parallel_group(
         params.conn,
         &ctx.last_files,
-        &[],
         params.task_prefix,
         params.parallel_slots,
     ) {

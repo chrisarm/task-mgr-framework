@@ -68,7 +68,6 @@ pub struct SelectionResult {
 ///
 /// * `conn` - Database connection
 /// * `after_files` - Files modified in the previous iteration (for locality scoring)
-/// * `recently_completed` - Unused; kept for API compatibility
 /// * `task_prefix` - Optional prefix to scope selection to a single PRD
 ///
 /// # Returns
@@ -86,7 +85,6 @@ pub struct SelectionResult {
 pub fn select_next_task(
     conn: &Connection,
     after_files: &[String],
-    _recently_completed: &[String],
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<SelectionResult> {
     // Get IDs of tasks that are done or irrelevant (satisfy dependencies)
@@ -328,7 +326,6 @@ fn get_all_task_files(
 pub fn select_parallel_group(
     conn: &Connection,
     after_files: &[String],
-    _recently_completed: &[String],
     task_prefix: Option<&str>,
     max_slots: usize,
 ) -> TaskMgrResult<Vec<ScoredTask>> {

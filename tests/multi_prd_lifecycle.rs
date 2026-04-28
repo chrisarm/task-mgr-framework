@@ -133,7 +133,7 @@ fn test_select_next_task_scoped_to_prefix() {
     let (_temp_dir, conn) = setup_dual_prd_db();
 
     // P1: TASK-001 has no deps (eligible), TASK-002 depends on TASK-001 (not yet)
-    let p1_result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+    let p1_result = select_next_task(&conn, &[], Some("P1")).unwrap();
     let p1_task = p1_result.task.expect("P1 should have an eligible task");
     assert!(
         p1_task.task.id.starts_with("P1-"),
@@ -143,7 +143,7 @@ fn test_select_next_task_scoped_to_prefix() {
     assert_eq!(p1_task.task.id, "P1-TASK-001");
 
     // P2: TASK-001 is todo with no deps; TASK-002 is done
-    let p2_result = select_next_task(&conn, &[], &[], Some("P2")).unwrap();
+    let p2_result = select_next_task(&conn, &[], Some("P2")).unwrap();
     let p2_task = p2_result.task.expect("P2 should have an eligible task");
     assert!(
         p2_task.task.id.starts_with("P2-"),
@@ -334,7 +334,7 @@ fn test_single_prd_no_prefix_backwards_compat() {
     // select_next_task(None) works correctly — no prefix filtering is applied.
 
     // select_next_task with None prefix works (no filter applied)
-    let sel = select_next_task(&conn, &[], &[], None).unwrap();
+    let sel = select_next_task(&conn, &[], None).unwrap();
     assert!(
         sel.task.is_some(),
         "select_next_task(None) should work without prefix"

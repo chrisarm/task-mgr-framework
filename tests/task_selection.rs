@@ -476,7 +476,7 @@ fn test_conflict_penalty_from_recently_completed_tasks() {
 
     // conflictsWith relationships are no longer scored; selection is by priority only.
     let conn = open_connection(temp_dir.path()).unwrap();
-    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
+    let result = next::select_next_task(&conn, &[], None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -552,7 +552,7 @@ fn test_conflict_penalty_changes_selection() {
     // TASK-003: 983 (priority)
 
     let conn = open_connection(temp_dir.path()).unwrap();
-    let result = next::select_next_task(&conn, &[], &["TASK-001".to_string()], None).unwrap();
+    let result = next::select_next_task(&conn, &[], None).unwrap();
 
     assert!(result.task.is_some());
     let task = result.task.unwrap();
@@ -822,7 +822,6 @@ fn test_combined_scoring_factors() {
     let result = next::select_next_task(
         &conn,
         &["src/main.rs".to_string(), "src/lib.rs".to_string()],
-        &["TASK-001".to_string()],
         None,
     )
     .unwrap();
