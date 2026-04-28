@@ -180,8 +180,15 @@ pub fn learn(
 
     // Supersession happens after record+flush (per the LearningWriter chokepoint
     // rule): the new learning must exist before we can link it as the `new_id`.
+    // Wrap the INSERT + UPDATE inside a transaction so they commit together —
+    // `apply_supersession` itself takes `&Connection`, but `&Transaction` derefs
+    // to `&Connection`, so the existing signature works unmodified. The
+    // `edit_learning` caller already opens its own outer transaction and is
+    // unaffected by this wrap.
     if let Some(old_id) = params.supersedes {
-        apply_supersession(conn, old_id, result.learning_id)?;
+        let tx = conn.unchecked_transaction()?;
+        apply_supersession(&tx, old_id, result.learning_id)?;
+        tx.commit()?;
     }
 
     Ok(LearnResult::from(result))
