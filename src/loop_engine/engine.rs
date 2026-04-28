@@ -753,6 +753,14 @@ pub struct WaveIterationParams<'a> {
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
 ///
+/// Named exit descriptor carried by `WaveOutcome.terminal`.
+#[derive(Debug)]
+pub struct WaveTerminal {
+    pub exit_code: i32,
+    pub reason: String,
+    pub run_status: Option<RunStatus>,
+}
+
 /// `terminal` is `Some(_)` when the wave determined the loop should stop —
 /// the outer loop applies the exit code and breaks. `iteration_consumed`
 /// matches the AC: every wave (eligible or NoEligibleTasks) burns one
@@ -761,7 +769,7 @@ pub struct WaveIterationParams<'a> {
 pub struct WaveOutcome {
     pub tasks_completed: u32,
     pub iteration_consumed: bool,
-    pub terminal: Option<(i32, String, Option<RunStatus>)>,
+    pub terminal: Option<WaveTerminal>,
     /// True only when a `.stop` file caused the wave to halt — propagates to
     /// `LoopResult.was_stopped` so batch runners can react to a clean stop.
     pub was_stopped: bool,
@@ -806,7 +814,11 @@ fn wave_preflight_check(
         return Some(WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: false,
-            terminal: Some((130, "signal received".to_string(), None)),
+            terminal: Some(WaveTerminal {
+                exit_code: 130,
+                reason: "signal received".to_string(),
+                run_status: None,
+            }),
             was_stopped: false,
         });
     }
@@ -815,7 +827,11 @@ fn wave_preflight_check(
         return Some(WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: false,
-            terminal: Some((0, "stop signal".to_string(), None)),
+            terminal: Some(WaveTerminal {
+                exit_code: 0,
+                reason: "stop signal".to_string(),
+                run_status: None,
+            }),
             was_stopped: true,
         });
     }
@@ -836,7 +852,11 @@ fn wave_preflight_check(
         return Some(WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
-            terminal: Some((1, "too many crashes".to_string(), None)),
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: "too many crashes".to_string(),
+                run_status: None,
+            }),
             was_stopped: false,
         });
     }
@@ -869,14 +889,14 @@ fn handle_no_eligible_tasks(
         return WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
-            terminal: Some((
-                1,
-                format!(
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: format!(
                     "no eligible tasks after {} consecutive stale iterations",
                     ctx.stale_tracker.count()
                 ),
-                None,
-            )),
+                run_status: None,
+            }),
             was_stopped: false,
         };
     }
@@ -1252,7 +1272,11 @@ pub fn run_wave_iteration(
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
-            terminal: Some((130, "signal received".to_string(), None)),
+            terminal: Some(WaveTerminal {
+                exit_code: 130,
+                reason: "signal received".to_string(),
+                run_status: None,
+            }),
             was_stopped: false,
         };
     }
@@ -1260,7 +1284,11 @@ pub fn run_wave_iteration(
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
-            terminal: Some((1, "too many crashes".to_string(), None)),
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: "too many crashes".to_string(),
+                run_status: None,
+            }),
             was_stopped: false,
         };
     }
@@ -1269,11 +1297,11 @@ pub fn run_wave_iteration(
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
-            terminal: Some((
-                0,
-                "all tasks complete".to_string(),
-                Some(RunStatus::Completed),
-            )),
+            terminal: Some(WaveTerminal {
+                exit_code: 0,
+                reason: "all tasks complete".to_string(),
+                run_status: Some(RunStatus::Completed),
+            }),
             was_stopped: false,
         };
     }
@@ -1289,9 +1317,17 @@ pub fn run_wave_iteration(
         iteration_consumed: true,
         terminal: if wave_should_stop {
             if params.signal_flag.is_signaled() {
-                Some((130, "signal received".to_string(), None))
+                Some(WaveTerminal {
+                    exit_code: 130,
+                    reason: "signal received".to_string(),
+                    run_status: None,
+                })
             } else {
-                Some((0, "stop signal".to_string(), None))
+                Some(WaveTerminal {
+                    exit_code: 0,
+                    reason: "stop signal".to_string(),
+                    run_status: None,
+                })
             }
         } else {
             None
@@ -2933,10 +2969,10 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             if outcome.was_stopped {
                 was_stopped = true;
             }
-            if let Some((code, reason, status)) = outcome.terminal {
-                exit_code = code;
-                exit_reason = reason;
-                if let Some(s) = status {
+            if let Some(t) = outcome.terminal {
+                exit_code = t.exit_code;
+                exit_reason = t.reason;
+                if let Some(s) = t.run_status {
                     final_run_status = s;
                 }
                 break;
@@ -6562,7 +6598,10 @@ mod tests {
                 ),
                 &mut ctx,
             );
-            assert!(matches!(outcome.terminal, Some((130, _, _))));
+            assert!(matches!(
+                outcome.terminal,
+                Some(WaveTerminal { exit_code: 130, .. })
+            ));
             assert!(!outcome.iteration_consumed);
             assert_eq!(outcome.tasks_completed, 0);
         }
@@ -6636,10 +6675,10 @@ mod tests {
                 ),
                 &mut ctx,
             );
-            let (code, reason, status) = outcome.terminal.expect("terminal expected");
-            assert_eq!(code, 1);
-            assert!(reason.contains("no eligible tasks"), "got: {reason}");
-            assert!(status.is_none());
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 1);
+            assert!(t.reason.contains("no eligible tasks"), "got: {}", t.reason);
+            assert!(t.run_status.is_none());
         }
 
         #[test]
@@ -6672,9 +6711,9 @@ mod tests {
                 ),
                 &mut ctx,
             );
-            let (code, reason, _) = outcome.terminal.expect("terminal expected");
-            assert_eq!(code, 1);
-            assert!(reason.contains("too many crashes"), "got: {reason}");
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 1);
+            assert!(t.reason.contains("too many crashes"), "got: {}", t.reason);
         }
 
         #[test]
@@ -6746,12 +6785,13 @@ mod tests {
                 },
                 &mut ctx,
             );
-            let (code, reason, _) = outcome.terminal.expect("terminal expected");
+            let t = outcome.terminal.expect("terminal expected");
             assert_eq!(
-                code, 130,
-                "expected 130 for SIGINT during delay, got {code}"
+                t.exit_code, 130,
+                "expected 130 for SIGINT during delay, got {}",
+                t.exit_code
             );
-            assert_eq!(reason, "signal received", "got: {reason}");
+            assert_eq!(t.reason, "signal received", "got: {}", t.reason);
         }
 
         #[test]
