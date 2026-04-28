@@ -824,12 +824,13 @@ EXAMPLES:
         #[arg(long = "cleanup-worktree", default_value_t = false)]
         cleanup_worktree: bool,
 
-        /// Number of tasks to run in parallel per wave (1-3, default 1 = sequential)
+        /// Number of tasks to run in parallel per wave (1-3, default 2)
         ///
         /// When greater than 1, each wave selects N non-conflicting tasks
         /// (tasks with no overlapping touchesFiles) and runs them concurrently.
-        /// Tasks that share files are never placed in the same wave.
-        #[arg(long, default_value_t = 1, value_parser = parse_parallel_slots)]
+        /// Tasks that share files are never placed in the same wave. Set to 1
+        /// to force sequential execution.
+        #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
         parallel: usize,
     },
 
@@ -896,6 +897,16 @@ EXAMPLES:
         /// Requires each PRD to have a `branchName` field.
         #[arg(long, default_value_t = false)]
         chain: bool,
+
+        /// Number of tasks to run in parallel per wave (1-3, default 2)
+        ///
+        /// Applies to every PRD in the batch. Mirrors the loop subcommand's
+        /// flag — each wave selects N non-conflicting tasks (tasks with no
+        /// overlapping touchesFiles) and runs them concurrently. Use 1 to
+        /// force sequential execution per PRD. The CLI value overrides the
+        /// `LOOP_PARALLEL` env var (matching loop's behavior).
+        #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
+        parallel: usize,
     },
 
     /// Import learnings from a progress.json or learnings JSON file

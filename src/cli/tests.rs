@@ -2173,7 +2173,7 @@ fn test_loop_with_prd_file_and_yes() {
             assert!(!no_worktree);
             assert!(external_repo.is_none());
             assert!(!cleanup_worktree);
-            assert_eq!(parallel, 1);
+            assert_eq!(parallel, 2, "loop --parallel should default to 2");
         }
         _ => panic!("Expected Loop command"),
     }
@@ -2666,6 +2666,40 @@ fn test_batch_chain_defaults_false() {
         }
         _ => panic!("Expected Batch command"),
     }
+}
+
+#[test]
+fn test_batch_parallel_default_is_two() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json"]);
+    match cli.command {
+        Commands::Batch { parallel, .. } => {
+            assert_eq!(parallel, 2, "batch --parallel should default to 2");
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_parallel_explicit_value() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "tasks/*.json", "--parallel", "3"]);
+    match cli.command {
+        Commands::Batch { parallel, .. } => {
+            assert_eq!(parallel, 3);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_parallel_rejects_zero() {
+    let result = Cli::try_parse_from(["task-mgr", "batch", "tasks/*.json", "--parallel", "0"]);
+    assert!(result.is_err(), "--parallel 0 should be rejected");
+}
+
+#[test]
+fn test_batch_parallel_rejects_four() {
+    let result = Cli::try_parse_from(["task-mgr", "batch", "tasks/*.json", "--parallel", "4"]);
+    assert!(result.is_err(), "--parallel 4 should be rejected");
 }
 
 #[test]

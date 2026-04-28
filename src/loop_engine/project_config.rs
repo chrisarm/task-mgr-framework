@@ -21,7 +21,9 @@ pub struct ProjectConfig {
 
     /// Permission mode override for this project.
     /// Values: `"dangerous"`, `"scoped"`, `"auto"`.
-    /// When set, overrides the default scoped mode (but env vars still win).
+    /// When set, overrides the default `Dangerous` mode (env vars still win).
+    /// Set to `"scoped"` or `"auto"` to opt this project back into permission
+    /// prompts / allowlist enforcement.
     #[serde(default)]
     pub permission_mode: Option<String>,
 

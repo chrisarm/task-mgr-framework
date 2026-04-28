@@ -866,6 +866,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             yes,
             keep_worktrees,
             chain,
+            parallel,
         } => {
             let project_root = get_project_root()?;
 
@@ -889,6 +890,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     cli.verbose,
                     keep_worktrees,
                     chain,
+                    parallel,
                 )
                 .await
             });

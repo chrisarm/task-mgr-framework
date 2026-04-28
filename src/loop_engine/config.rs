@@ -52,10 +52,10 @@ pub struct LoopConfig {
     /// the loop finishes. Only applies when `use_worktrees` is true and the
     /// loop is running in a worktree. Dirty worktrees are warned but not forced.
     pub cleanup_worktree: bool,
-    /// Number of tasks to execute in parallel per wave (1-3, default 1 = sequential).
+    /// Number of tasks to execute in parallel per wave (1-3, default 2).
     ///
-    /// Set via `--parallel N` CLI flag or `LOOP_PARALLEL` env var.
-    /// Values outside 1-3 are rejected; 0 and >3 are invalid.
+    /// Set via `--parallel N` CLI flag or `LOOP_PARALLEL` env var. Set to 1
+    /// to force sequential execution. Values outside 1-3 are rejected.
     pub parallel_slots: usize,
 }
 
@@ -75,7 +75,7 @@ impl Default for LoopConfig {
             git_scan_depth: 7,
             external_git_scan_depth: 50,
             cleanup_worktree: false,
-            parallel_slots: 1,
+            parallel_slots: 2,
         }
     }
 }
@@ -94,7 +94,7 @@ impl LoopConfig {
     /// - `LOOP_USAGE_CHECK_ENABLED` → `usage_check_enabled` (bool: "true"/"1"/"yes")
     /// - `LOOP_GIT_SCAN_DEPTH` → `git_scan_depth` (usize, default 7)
     /// - `LOOP_EXTERNAL_GIT_SCAN_DEPTH` → `external_git_scan_depth` (usize, default 50)
-    /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 1)
+    /// - `LOOP_PARALLEL` → `parallel_slots` (usize, 1-3, default 2)
     ///
     /// Invalid values are silently ignored (defaults used).
     pub fn from_env() -> Self {
@@ -263,9 +263,11 @@ impl std::fmt::Display for PermissionMode {
 /// 4. `LOOP_ENABLE_AUTO_MODE=true` → `Auto` (legacy env var)
 /// 5. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped` with those tools (NO project config merge)
 /// 6. `.task-mgr/config.json` `permissionMode` field → corresponding variant
-/// 7. Default → `Scoped` with `CODING_ALLOWED_TOOLS` + project config
+/// 7. Default → `Dangerous` (no permission prompts, all tools allowed)
 ///
-/// Both `scoped` (default) and `auto` modes merge `CODING_ALLOWED_TOOLS` with
+/// Note: `Dangerous` is the default — opt back into `Scoped`/`Auto` via the
+/// project config or `LOOP_PERMISSION_MODE` to enforce tool restrictions.
+/// Both `scoped` and `auto` modes merge `CODING_ALLOWED_TOOLS` with
 /// project-specific tools from `.task-mgr/config.json`. The difference is the
 /// Claude CLI flag: `auto` passes `--permission-mode auto` (auto-approves
 /// unlisted tools interactively), while `scoped` passes `--permission-mode
@@ -301,7 +303,7 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
             _ => {
                 eprintln!(
                     "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
-                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                     ignoring; using next-priority resolution. Valid values: 'dangerous', 'scoped', 'auto'.",
                     mode
                 );
             }
@@ -349,19 +351,17 @@ pub fn resolve_permission_mode(db_dir: &std::path::Path) -> PermissionMode {
             _ => {
                 eprintln!(
                     "\x1b[33m[warn]\x1b[0m Unrecognized permissionMode='{}' in config.json, \
-                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                     ignoring; using next-priority resolution. Valid values: 'dangerous', 'scoped', 'auto'.",
                     mode
                 );
             }
         }
     }
 
-    // 5. Default → Scoped mode with full coding allowlist + project config.
-    let tools = merge_allowed_tools(&project_config.additional_allowed_tools);
-    log_project_config_additions(&project_config.additional_allowed_tools);
-    PermissionMode::Scoped {
-        allowed_tools: Some(tools),
-    }
+    // 5. Default → Dangerous mode (no permission prompts, all tools allowed).
+    // The user explicitly opted into this default for the loop engine; project
+    // config or LOOP_PERMISSION_MODE can still tighten it back to scoped/auto.
+    PermissionMode::Dangerous
 }
 
 /// Log project config tool additions to stderr.
@@ -405,7 +405,7 @@ fn merge_allowed_tools(additional: &[String]) -> String {
 /// 1. `LOOP_PERMISSION_MODE=dangerous|scoped|auto` → corresponding variant
 /// 2. `LOOP_ENABLE_AUTO_MODE=true` → `Auto` (legacy)
 /// 3. `LOOP_ALLOWED_TOOLS=<tools>` → `Scoped { allowed_tools: Some(tools) }`
-/// 4. Default → `Scoped` with `CODING_ALLOWED_TOOLS`
+/// 4. Default → `Dangerous`
 ///
 /// Prefer `resolve_permission_mode(db_dir)` for loop engine use.
 /// This function is kept for non-loop callers and tests.
@@ -429,7 +429,7 @@ pub fn permission_mode_from_env() -> PermissionMode {
             _ => {
                 eprintln!(
                     "\x1b[33m[warn]\x1b[0m Unrecognized LOOP_PERMISSION_MODE='{}', \
-                     falling back to scoped mode. Valid values: 'dangerous', 'scoped', 'auto'.",
+                     ignoring; using next-priority resolution. Valid values: 'dangerous', 'scoped', 'auto'.",
                     mode
                 );
             }
@@ -452,10 +452,8 @@ pub fn permission_mode_from_env() -> PermissionMode {
         };
     }
 
-    // 4. Default → Scoped with coding allowlist.
-    PermissionMode::Scoped {
-        allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string()),
-    }
+    // 4. Default → Dangerous (mirrors `resolve_permission_mode`'s default).
+    PermissionMode::Dangerous
 }
 
 /// Types of crashes detected from Claude subprocess exit codes.
@@ -885,8 +883,8 @@ mod tests {
     fn test_loop_config_default_parallel_slots() {
         let config = LoopConfig::default();
         assert_eq!(
-            config.parallel_slots, 1,
-            "parallel_slots should default to 1"
+            config.parallel_slots, 2,
+            "parallel_slots should default to 2"
         );
     }
 
@@ -928,8 +926,8 @@ mod tests {
         let config = LoopConfig::from_env();
         unsafe { std::env::remove_var("LOOP_PARALLEL") };
         assert_eq!(
-            config.parallel_slots, 1,
-            "LOOP_PARALLEL=0 should fall back to default 1"
+            config.parallel_slots, 2,
+            "LOOP_PARALLEL=0 should fall back to default 2"
         );
     }
 
@@ -940,8 +938,8 @@ mod tests {
         let config = LoopConfig::from_env();
         unsafe { std::env::remove_var("LOOP_PARALLEL") };
         assert_eq!(
-            config.parallel_slots, 1,
-            "LOOP_PARALLEL=4 should fall back to default 1"
+            config.parallel_slots, 2,
+            "LOOP_PARALLEL=4 should fall back to default 2"
         );
     }
 
@@ -952,8 +950,8 @@ mod tests {
         let config = LoopConfig::from_env();
         unsafe { std::env::remove_var("LOOP_PARALLEL") };
         assert_eq!(
-            config.parallel_slots, 1,
-            "LOOP_PARALLEL=abc should fall back to default 1"
+            config.parallel_slots, 2,
+            "LOOP_PARALLEL=abc should fall back to default 2"
         );
     }
 
@@ -1221,21 +1219,17 @@ mod tests {
     static PERM_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_permission_mode_from_env_default_is_scoped() {
+    fn test_permission_mode_from_env_default_is_dangerous() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
         unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
         let mode = permission_mode_from_env();
-        assert!(
-            matches!(
-                mode,
-                PermissionMode::Scoped {
-                    allowed_tools: Some(_)
-                }
-            ),
-            "Default should be Scoped with tools, got {:?}",
+        assert_eq!(
+            mode,
+            PermissionMode::Dangerous,
+            "Default should be Dangerous (no permission prompts), got {:?}",
             mode
         );
     }
@@ -1306,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_mode_from_env_unknown_mode_falls_through_to_scoped() {
+    fn test_permission_mode_from_env_unknown_mode_falls_through_to_dangerous() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("LOOP_PERMISSION_MODE", "unknown") };
         unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
@@ -1314,15 +1308,16 @@ mod tests {
 
         let mode = permission_mode_from_env();
         unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
-        assert!(
-            matches!(mode, PermissionMode::Scoped { .. }),
-            "Unknown mode should fall back to Scoped, got {:?}",
+        assert_eq!(
+            mode,
+            PermissionMode::Dangerous,
+            "Unknown mode should warn and fall through to the default (Dangerous), got {:?}",
             mode
         );
     }
 
     #[test]
-    fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_scoped() {
+    fn test_permission_mode_from_env_empty_allowed_tools_falls_back_to_dangerous() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
@@ -1330,14 +1325,10 @@ mod tests {
 
         let mode = permission_mode_from_env();
         unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
-        assert!(
-            matches!(
-                mode,
-                PermissionMode::Scoped {
-                    allowed_tools: Some(_)
-                }
-            ),
-            "Empty LOOP_ALLOWED_TOOLS should fall back to Scoped with tools, got {:?}",
+        assert_eq!(
+            mode,
+            PermissionMode::Dangerous,
+            "Empty LOOP_ALLOWED_TOOLS should fall through to the default (Dangerous), got {:?}",
             mode
         );
     }
@@ -1544,7 +1535,7 @@ mod tests {
     // --- resolve_permission_mode ---
 
     #[test]
-    fn test_resolve_permission_mode_default_is_scoped_with_tools() {
+    fn test_resolve_permission_mode_default_is_dangerous() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
@@ -1553,15 +1544,12 @@ mod tests {
         // Use a temp dir with no config.json
         let dir = tempfile::tempdir().unwrap();
         let mode = resolve_permission_mode(dir.path());
-        if let PermissionMode::Scoped {
-            allowed_tools: Some(tools),
-        } = &mode
-        {
-            assert!(tools.contains("Bash(cargo:*)"), "Should include cargo");
-            assert!(tools.contains("Bash(git:*)"), "Should include git");
-        } else {
-            panic!("Expected Scoped with tools, got {:?}", mode);
-        }
+        assert_eq!(
+            mode,
+            PermissionMode::Dangerous,
+            "Default should be Dangerous (no permission prompts), got {:?}",
+            mode
+        );
     }
 
     #[test]
@@ -1631,12 +1619,15 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_permission_mode_default_merges_project_config() {
+    fn test_resolve_permission_mode_default_ignores_additional_allowed_tools() {
         let _guard = PERM_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("LOOP_PERMISSION_MODE") };
         unsafe { std::env::remove_var("LOOP_ENABLE_AUTO_MODE") };
         unsafe { std::env::remove_var("LOOP_ALLOWED_TOOLS") };
 
+        // additionalAllowedTools is meaningful only when permissionMode is
+        // explicitly scoped/auto. With the Dangerous default, it's ignored
+        // because Dangerous doesn't use an allowlist at all.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.json"),
@@ -1645,22 +1636,12 @@ mod tests {
         .unwrap();
 
         let mode = resolve_permission_mode(dir.path());
-        // Default (Scoped) mode merges project config
-        if let PermissionMode::Scoped {
-            allowed_tools: Some(tools),
-        } = &mode
-        {
-            assert!(
-                tools.contains("Bash(docker:*)"),
-                "Default should merge project config tools"
-            );
-            assert!(
-                tools.contains("Bash(cargo:*)"),
-                "Core tools should still be present"
-            );
-        } else {
-            panic!("Expected Scoped with tools, got {:?}", mode);
-        }
+        assert_eq!(
+            mode,
+            PermissionMode::Dangerous,
+            "Default should be Dangerous regardless of additionalAllowedTools, got {:?}",
+            mode
+        );
     }
 
     #[test]

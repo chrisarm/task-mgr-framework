@@ -443,6 +443,8 @@ fn print_batch_summary(
 /// * `project_root` - Git repository root for git operations and path resolution
 /// * `verbose` - Verbose output
 /// * `keep_worktrees` - Never remove worktrees after PRD completion
+/// * `chain` - Chain PRDs so each builds on the previous PRD's branch
+/// * `parallel_slots` - Number of slots per wave (1-3). Overrides `LOOP_PARALLEL`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_batch(
     patterns: &[String],
@@ -453,6 +455,7 @@ pub async fn run_batch(
     verbose: bool,
     keep_worktrees: bool,
     chain: bool,
+    parallel_slots: usize,
 ) -> BatchResult {
     // Step 1: Expand all patterns, deduplicate, and sort
     let prd_files = match collect_prd_files(patterns, project_root) {
@@ -560,6 +563,9 @@ pub async fn run_batch(
         let mut config = LoopConfig::from_env();
         config.yes_mode = yes;
         config.verbose = verbose;
+        // CLI parallel value overrides whatever LoopConfig::from_env resolved
+        // (mirrors loop's behavior: explicit flag > env var > default).
+        config.parallel_slots = parallel_slots;
         if let Some(max_iter) = max_iterations {
             config.max_iterations = max_iter;
         }
