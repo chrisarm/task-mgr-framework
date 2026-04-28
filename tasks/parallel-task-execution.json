@@ -738,7 +738,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "If tests reveal implementation gaps, spawn IMPL-FIX tasks.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "qualityDimensions": [
         "Full test suite green",
@@ -850,6 +850,86 @@
       "timeoutSecs": 1800,
       "title": "Final gate: parallel execution verified and documented",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --all-targets passes with no failures",
+        "dependsOn round-trip assertion is preserved",
+        "Deprecated relationship fields no longer asserted to round-trip"
+      ],
+      "description": "tests/import_export.rs::test_relationships_preserved_in_round_trip fails because it asserts synergyWith/batchWith/conflictsWith lengths round-trip, but FEAT-004 stopped importing these and FEAT-005 removed them from export. The test must be updated: assert that deprecated fields are intentionally dropped (length becomes 0 on export regardless of input) or remove the deprecated-field assertions entirely and keep only the dependsOn check.",
+      "id": "ab55fca5-CODE-FIX-001",
+      "passes": true,
+      "priority": 14,
+      "title": "Update import/export round-trip test for deprecated relationship fields",
+      "touchesFiles": [
+        "tests/import_export.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No references to synergies/conflicts/batch_tasks in src/commands/next/mod.rs doc comments",
+        "cargo doc builds without warnings"
+      ],
+      "description": "FEAT-003 simplified ScoreBreakdown to priority_score + file_score only, but module-level doc comments in src/commands/next/mod.rs still reference removed concepts: \"synergies, conflicts, and batch grouping\" (line 4) and \"batch tasks\" (line 133 in the next() docstring).",
+      "id": "ab55fca5-CODE-FIX-002",
+      "passes": true,
+      "priority": 15,
+      "title": "Update stale doc comments in next/mod.rs for simplified scoring",
+      "touchesFiles": [
+        "src/commands/next/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap()/expect() on branch_name in the parallel dispatch arm",
+        "Behavior preserved when branch_name is Some (the only real case)",
+        "cargo clippy --lib -- -D warnings still passes",
+        "cargo test loop_engine::engine still passes"
+      ],
+      "description": "From CODE-REVIEW-2: src/loop_engine/engine.rs:2835 uses `branch_name.as_deref().expect(\"parallel_active implies branch\")`. The invariant holds (Step 9.5 only sets parallel_active=true when branch is Some) but the global AC says 'No unwrap() in production code paths'. expect() panics on invariant violation, defeating the spirit of the rule. Refactor to a `let Some(branch) = branch_name.as_deref() else { /* warn + skip wave dispatch */ }` pattern so a programming error degrades to sequential rather than crashing.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-031",
+      "passes": true,
+      "priority": 31,
+      "title": "Replace expect() in parallel run_loop branch with graceful pattern",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Inter-wave signal returns exit code 130, matching step 0/step 13",
+        "Inter-wave .stop file path (if reachable here) still returns 0",
+        "Existing wave tests still pass",
+        "Add a regression test asserting 130 is returned when signal_flag is set during inter-wave delay"
+      ],
+      "description": "From CODE-REVIEW-2: in src/loop_engine/engine.rs:1217-1236, when the signal flag is set during the inter-wave sleep poll, the wave returns terminal Some((0, \"stop signal\", None)). All other signal paths in run_wave_iteration return (130, \"signal received\", None) — see step 0 (line 793) and step 13 (line 1174). The mismatched exit code muddies operator triage of why the loop stopped (clean stop file vs. SIGINT) and is inconsistent with sequential run_iteration semantics. Branch on `signal_flag.is_signaled()` after the loop exits and return 130 in that case.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-032",
+      "passes": true,
+      "priority": 32,
+      "title": "Use exit code 130 (not 0) when SIGINT/SIGTERM hits during inter-wave delay",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All three curate_enrich integration tests pass",
+        "cargo fmt --check passes",
+        "cargo clippy -- -D warnings passes",
+        "No other tests regress"
+      ],
+      "description": "Pre-existing bug surfaced by MILESTONE-3 gate: commit 456834f wrapped edit_learning in an unchecked_transaction. apply_proposals_in_transaction in src/commands/curate/enrich.rs also opens an unchecked_transaction and calls edit_learning inside, causing SQLite error: cannot start a transaction within a transaction. Three integration tests fail: test_curate_enrich_populates_metadata, test_curate_enrich_skips_retired_learnings, test_curate_enrich_idempotent_second_run_zero_candidates.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-040",
+      "passes": true,
+      "priority": 49,
+      "title": "Fix nested-transaction bug in curate enrich",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs"
+      ]
     }
   ],
   "version": "1.0"
