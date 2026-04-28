@@ -12,6 +12,7 @@ use crate::cli::{Confidence as CliConfidence, LearningOutcome as CliOutcome};
 use crate::learnings::retrieval::patterns::{resolve_task_context, type_prefix_from};
 use crate::learnings::{
     LearningWriter, RecordLearningParams, RecordLearningResult, apply_supersession,
+    ensure_learning_exists,
 };
 use crate::models::{Confidence, LearningOutcome};
 
@@ -114,6 +115,15 @@ pub fn learn(
     db_dir: Option<&Path>,
     params: LearnParams,
 ) -> TaskMgrResult<LearnResult> {
+    // Pre-validate `--supersedes <old_id>` BEFORE any persistence: if the id
+    // is bogus, return early so we don't leave behind an orphan learning row
+    // and a queued embedding the user never asked for. The same check is
+    // repeated inside `apply_supersession` (defense-in-depth for callers that
+    // skip this entry point, e.g. `edit_learning`).
+    if let Some(old_id) = params.supersedes {
+        ensure_learning_exists(conn, old_id)?;
+    }
+
     // Auto-populate applies_to_files and applies_to_task_types from task context
     // when task_id is provided and --files/--task-types are not explicitly set.
     let (effective_files, effective_task_types) = if let Some(ref task_id) = params.task_id {
@@ -1012,6 +1022,31 @@ mod tests {
         assert!(
             msg.contains("not found") || msg.contains("does not exist"),
             "error must indicate the learning is missing, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_learn_supersedes_nonexistent_does_not_create_orphan() {
+        // Regression for /review-loop finding #2: a typo'd `--supersedes <id>`
+        // must reject the command BEFORE persisting the new learning, so the
+        // DB doesn't accumulate orphan rows + queued embeddings.
+        let (_dir, conn) = setup_db();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0, "preconditions: empty learnings table");
+
+        let mut params = minimal_learn_params("Orphan-free learning");
+        params.supersedes = Some(9999);
+        let _ = learn(&conn, None, params).unwrap_err();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM learnings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "learn() must not insert anything when --supersedes target is missing"
         );
     }
 }

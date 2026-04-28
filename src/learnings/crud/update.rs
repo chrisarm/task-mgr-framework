@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-use super::read::get_learning;
+use super::read::{ensure_learning_exists, get_learning};
 use super::types::{EditLearningParams, EditLearningResult};
 use crate::models::Confidence;
 use crate::{TaskMgrError, TaskMgrResult};
@@ -36,17 +36,10 @@ pub fn apply_supersession(
     }
 
     // App-level existence check so users see a clean `Learning not found: <id>`
-    // instead of a raw SQLite FK constraint message.
-    let exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM learnings WHERE id = ?1",
-        [old_learning_id],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        return Err(TaskMgrError::learning_not_found(
-            old_learning_id.to_string(),
-        ));
-    }
+    // instead of a raw SQLite FK constraint message. Shared with the
+    // `learn(--supersedes)` pre-validation so both paths surface the same
+    // error shape.
+    ensure_learning_exists(conn, old_learning_id)?;
 
     conn.execute(
         "INSERT INTO learning_supersessions (old_learning_id, new_learning_id) VALUES (?1, ?2)",
