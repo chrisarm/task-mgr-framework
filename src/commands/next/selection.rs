@@ -62,44 +62,21 @@ pub struct SelectionResult {
     pub top_candidates: Vec<ScoredTask>,
 }
 
-/// Select the next task to work on using the smart selection algorithm.
+/// Score, filter, and sort all eligible todo tasks.
 ///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `after_files` - Files modified in the previous iteration (for locality scoring)
-/// * `task_prefix` - Optional prefix to scope selection to a single PRD
-///
-/// # Returns
-///
-/// Returns a `SelectionResult` with the best task to work on, or None if no tasks are eligible.
-///
-/// # Algorithm
-///
-/// 1. Filter to eligible tasks: status='todo' and all dependsOn tasks are done/irrelevant
-/// 2. Score each task:
-///    - priority_score = 1000 - priority (higher priority = higher score)
-///    - file_score = 10 * count of files overlapping with after_files
-///    - total_score = priority_score + file_score
-/// 3. Order by total_score DESC, priority ASC
-pub fn select_next_task(
+/// Shared by `select_next_task` and `select_parallel_group`. Returns tasks
+/// sorted by total_score DESC, priority ASC — the callers diverge only in how
+/// they pick from this ordered list.
+fn build_scored_candidates(
     conn: &Connection,
     after_files: &[String],
     task_prefix: Option<&str>,
-) -> TaskMgrResult<SelectionResult> {
-    // Get IDs of tasks that are done or irrelevant (satisfy dependencies)
+) -> TaskMgrResult<Vec<ScoredTask>> {
     let completed_ids = get_completed_task_ids(conn, task_prefix)?;
-
-    // Get all todo tasks
     let todo_tasks = get_todo_tasks(conn, task_prefix)?;
-
-    // Get all relationships
     let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
-
-    // Get task files
     let task_files = get_all_task_files(conn, task_prefix)?;
 
-    // Filter to eligible tasks (all dependencies satisfied)
     let eligible_tasks: Vec<Task> = todo_tasks
         .into_iter()
         .filter(|task| {
@@ -114,37 +91,23 @@ pub fn select_next_task(
         .collect();
 
     if eligible_tasks.is_empty() {
-        return Ok(SelectionResult {
-            task: None,
-            selection_reason: "No eligible tasks found - all tasks are either complete, blocked by dependencies, or in a non-todo state".to_string(),
-            eligible_count: 0,
-            top_candidates: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
-    // Load dynamic weights (falls back to defaults if not calibrated)
     let weights = calibrate::load_dynamic_weights(conn);
-
-    // Convert after_files to a set for O(1) lookup
     let after_files_set: HashSet<&str> = after_files.iter().map(String::as_str).collect();
 
-    // Score each eligible task
     let mut scored_tasks: Vec<ScoredTask> = eligible_tasks
         .into_iter()
         .map(|task| {
             let files = task_files.get(&task.id).cloned().unwrap_or_default();
 
-            // Calculate file overlap score
             let file_overlap_count = files
                 .iter()
                 .filter(|f| after_files_set.contains(f.as_str()))
                 .count() as i32;
             let file_score = file_overlap_count * weights.file_overlap;
-
-            // Calculate priority score (higher priority = lower number = higher score)
             let priority_score = weights.priority_base - task.priority;
-
-            // Total score: priority + file overlap only
             let total_score = priority_score + file_score;
 
             ScoredTask {
@@ -160,19 +123,40 @@ pub fn select_next_task(
         })
         .collect();
 
-    // Sort by total_score DESC, then by priority ASC (as tiebreaker)
     scored_tasks.sort_by(|a, b| {
         b.total_score
             .cmp(&a.total_score)
             .then_with(|| a.task.priority.cmp(&b.task.priority))
     });
 
+    Ok(scored_tasks)
+}
+
+/// Select the next task to work on using the smart selection algorithm.
+///
+/// # Algorithm
+///
+/// 1. Filter to eligible tasks: status='todo' and all dependsOn tasks are done/irrelevant
+/// 2. Score each task: priority_score + file_overlap_score
+/// 3. Return the highest-scored task
+pub fn select_next_task(
+    conn: &Connection,
+    after_files: &[String],
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<SelectionResult> {
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
+
+    if scored_tasks.is_empty() {
+        return Ok(SelectionResult {
+            task: None,
+            selection_reason: "No eligible tasks found - all tasks are either complete, blocked by dependencies, or in a non-todo state".to_string(),
+            eligible_count: 0,
+            top_candidates: Vec::new(),
+        });
+    }
+
     let eligible_count = scored_tasks.len();
-
-    // Keep top 5 candidates for verbose output
     let top_candidates: Vec<ScoredTask> = scored_tasks.iter().take(5).cloned().collect();
-
-    // Get the top task
     let top_task = scored_tasks.into_iter().next();
 
     match top_task {
@@ -184,7 +168,6 @@ pub fn select_next_task(
                 task.score_breakdown.priority_score,
                 task.score_breakdown.file_score,
             );
-
             Ok(SelectionResult {
                 task: Some(task),
                 selection_reason,
@@ -333,82 +316,28 @@ pub fn select_parallel_group(
         return Ok(Vec::new());
     }
 
-    let completed_ids = get_completed_task_ids(conn, task_prefix)?;
-    let todo_tasks = get_todo_tasks(conn, task_prefix)?;
-    let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
-    let task_files = get_all_task_files(conn, task_prefix)?;
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
 
-    let eligible_tasks: Vec<Task> = todo_tasks
-        .into_iter()
-        .filter(|task| {
-            let task_deps = dependencies
-                .get(&task.id)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            task_deps
-                .iter()
-                .all(|dep_id| completed_ids.contains(dep_id))
-        })
-        .collect();
-
-    if eligible_tasks.is_empty() {
+    if scored_tasks.is_empty() {
         return Ok(Vec::new());
     }
 
-    let weights = calibrate::load_dynamic_weights(conn);
-    let after_files_set: HashSet<&str> = after_files.iter().map(String::as_str).collect();
-
-    let mut scored_tasks: Vec<ScoredTask> = eligible_tasks
-        .into_iter()
-        .map(|task| {
-            let files = task_files.get(&task.id).cloned().unwrap_or_default();
-
-            let file_overlap_count = files
-                .iter()
-                .filter(|f| after_files_set.contains(f.as_str()))
-                .count() as i32;
-            let file_score = file_overlap_count * weights.file_overlap;
-            let priority_score = weights.priority_base - task.priority;
-            let total_score = priority_score + file_score;
-
-            ScoredTask {
-                task,
-                files,
-                total_score,
-                score_breakdown: ScoreBreakdown {
-                    priority_score,
-                    file_score,
-                    file_overlap_count,
-                },
-            }
-        })
-        .collect();
-
-    scored_tasks.sort_by(|a, b| {
-        b.total_score
-            .cmp(&a.total_score)
-            .then_with(|| a.task.priority.cmp(&b.task.priority))
-    });
-
-    // Greedy selection: borrow file slices from task_files (not candidate) so
-    // candidate can be moved into group while used_files retains its borrows.
     let mut group: Vec<ScoredTask> = Vec::new();
-    let mut used_files: HashSet<&str> = HashSet::new();
+    let mut used_files: HashSet<String> = HashSet::new();
 
     for candidate in scored_tasks {
         if group.len() >= max_slots {
             break;
         }
-        let files = task_files
-            .get(&candidate.task.id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        if !files.is_empty() && files.iter().any(|f| used_files.contains(f.as_str())) {
+        if !candidate.files.is_empty()
+            && candidate
+                .files
+                .iter()
+                .any(|f| used_files.contains(f.as_str()))
+        {
             continue;
         }
-        for f in files {
-            used_files.insert(f.as_str());
-        }
+        used_files.extend(candidate.files.iter().cloned());
         group.push(candidate);
     }
 
