@@ -144,23 +144,39 @@ pub fn list_learnings(
     // Batch-query supersessions for all displayed IDs (single query, not N+1).
     if !summaries.is_empty() {
         let id_list: Vec<i64> = summaries.iter().map(|s| s.id).collect();
-        // Build an IN clause from integer IDs — safe since these are database-internal i64 values.
-        let id_csv: String = id_list
-            .iter()
-            .map(|id| id.to_string())
+        // Parameterised IN clauses for both columns (chained in params below).
+        // Numbered placeholders let the first IN list reuse bindings 1..=N and
+        // the second use N+1..=2N without re-binding the same values.
+        let first_placeholders: String = (1..=id_list.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let second_placeholders: String = (id_list.len() + 1..=id_list.len() * 2)
+            .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         let sup_sql = format!(
             "SELECT old_learning_id, new_learning_id FROM learning_supersessions \
-             WHERE old_learning_id IN ({0}) OR new_learning_id IN ({0})",
-            id_csv
+             WHERE old_learning_id IN ({first_placeholders}) \
+             OR new_learning_id IN ({second_placeholders})"
         );
         let mut sup_stmt = conn.prepare(&sup_sql)?;
-        let id_set: std::collections::HashSet<i64> = id_list.into_iter().collect();
+        let id_set: std::collections::HashSet<i64> = id_list.iter().copied().collect();
+        // Asymmetric representations are intentional:
+        // - `superseded_by_map: HashMap<i64, i64>` — a learning can be superseded
+        //   by several rows simultaneously (see SUPERSESSION_SUBQUERY doc), but
+        //   recall already filters such learnings out, so list output only needs
+        //   one successor for the annotation. Last-wins by SQL row order.
+        // - `supersedes_map: HashMap<i64, Vec<i64>>` — one new learning may
+        //   legitimately consolidate many olds, and we want to show all of them
+        //   in the `(supersedes #A, #B, #C)` annotation.
         let mut superseded_by_map: HashMap<i64, i64> = HashMap::new();
         let mut supersedes_map: HashMap<i64, Vec<i64>> = HashMap::new();
-        let rows =
-            sup_stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        let chained_params: Vec<i64> = id_list.iter().chain(id_list.iter()).copied().collect();
+        let rows = sup_stmt
+            .query_map(rusqlite::params_from_iter(chained_params.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
         for row in rows {
             let (old_id, new_id) = row?;
             if id_set.contains(&old_id) {

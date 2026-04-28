@@ -92,5 +92,15 @@ pub use vector::VectorBackend;
 
 /// Core SQL predicate that excludes superseded learnings.
 /// Used by every backend that needs to filter `learning_supersessions`.
+///
+/// Semantics: a single learning may appear as `old_learning_id` in multiple rows
+/// (the `UNIQUE(old_learning_id, new_learning_id)` constraint is on the *pair*,
+/// not on `old_learning_id` alone), so a learning can be "superseded by" several
+/// successors simultaneously. The `NOT IN (SELECT old_learning_id ...)` form
+/// hides the learning from recall regardless of how many successors exist —
+/// any-supersession-hides. List output picks one successor for the annotation
+/// (see `superseded_by_map` in `commands/learnings.rs`); the choice is
+/// last-wins by SQL row order, which is acceptable because the row is filtered
+/// from recall anyway and any one successor ID is informative enough.
 pub(crate) const SUPERSESSION_SUBQUERY: &str =
     "NOT IN (SELECT old_learning_id FROM learning_supersessions)";

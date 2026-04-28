@@ -4,8 +4,28 @@
 
 use rusqlite::Connection;
 
-use crate::TaskMgrResult;
 use crate::models::Learning;
+use crate::{TaskMgrError, TaskMgrResult};
+
+/// Confirms that a learning row exists, surfacing a friendly `NotFound`
+/// error when it doesn't (instead of leaving the caller to interpret an
+/// FK constraint violation later).
+///
+/// Used by paths that need to validate a referenced learning ID *before*
+/// committing other state — notably `learn(--supersedes <id>)`, which
+/// must reject a typo'd id before persisting the new learning, otherwise
+/// it would leave an orphan row + queued embedding behind.
+pub fn ensure_learning_exists(conn: &Connection, learning_id: i64) -> TaskMgrResult<()> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM learnings WHERE id = ?1",
+        [learning_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(TaskMgrError::learning_not_found(learning_id.to_string()));
+    }
+    Ok(())
+}
 
 /// Gets a learning by ID.
 ///

@@ -100,11 +100,10 @@ pub use migrate::{
     format_migrate_text, format_status_text, status as migrate_status, up as migrate_up_cmd,
 };
 pub use next::{
-    CONFLICT_PENALTY, CandidateSummary, ClaimMetadata, DecayWarning, FILE_OVERLAP_SCORE,
-    LearningSummaryOutput, NextResult, NextTaskOutput, PRIORITY_BASE, SYNERGY_BONUS,
-    ScoreBreakdown, ScoreOutput, ScoredTask, SelectionMetadata, SelectionResult, apply_decay,
-    find_decay_warnings, format_next_text, format_next_verbose,
-    format_text as format_selection_text, next, select_next_task,
+    CandidateSummary, ClaimMetadata, DecayWarning, FILE_OVERLAP_SCORE, LearningSummaryOutput,
+    NextResult, NextTaskOutput, PRIORITY_BASE, ScoreBreakdown, ScoreOutput, ScoredTask,
+    SelectionMetadata, SelectionResult, apply_decay, find_decay_warnings, format_next_text,
+    format_next_verbose, format_text as format_selection_text, next, select_next_task,
 };
 pub use recall::{
     LearningSummary as RecallLearningSummary, RecallCmdParams, RecallCmdResult,

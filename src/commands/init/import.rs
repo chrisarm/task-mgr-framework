@@ -366,27 +366,46 @@ pub fn insert_relationship(
     Ok(())
 }
 
-/// Insert all relationships for a task. Returns the number of relationships inserted.
-pub fn insert_task_relationships(conn: &Connection, story: &PrdUserStory) -> TaskMgrResult<usize> {
+/// Outcome of inserting a single task's relationships.
+///
+/// `had_deprecated` is set when the task carried any of the dropped relationship
+/// types (`synergyWith` / `batchWith` / `conflictsWith`). Callers aggregate it
+/// across an import and emit a single deprecation warning at the end, instead
+/// of one per task, to keep stderr from flooding on large PRD upgrades.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RelationshipInsertResult {
+    pub count: usize,
+    pub had_deprecated: bool,
+}
+
+/// Insert all relationships for a task.
+///
+/// `synergyWith`, `batchWith`, and `conflictsWith` are deprecated; file-overlap
+/// detection at runtime replaces them. They are silently ignored here, and the
+/// returned `had_deprecated` flag tells the caller to emit a single
+/// deprecation warning per import session.
+pub fn insert_task_relationships(
+    conn: &Connection,
+    story: &PrdUserStory,
+) -> TaskMgrResult<RelationshipInsertResult> {
+    let had_deprecated = !story.synergy_with.is_empty()
+        || !story.batch_with.is_empty()
+        || !story.conflicts_with.is_empty();
     let mut count = 0;
     for dep in &story.depends_on {
         insert_relationship(conn, &story.id, dep, "dependsOn")?;
         count += 1;
     }
-    for syn in &story.synergy_with {
-        insert_relationship(conn, &story.id, syn, "synergyWith")?;
-        count += 1;
-    }
-    for batch in &story.batch_with {
-        insert_relationship(conn, &story.id, batch, "batchWith")?;
-        count += 1;
-    }
-    for conflict in &story.conflicts_with {
-        insert_relationship(conn, &story.id, conflict, "conflictsWith")?;
-        count += 1;
-    }
-    Ok(count)
+    Ok(RelationshipInsertResult {
+        count,
+        had_deprecated,
+    })
 }
+
+/// Format the standardized deprecation warning emitted at most once per
+/// import when any task in the batch carried deprecated relationship fields.
+pub const DEPRECATED_RELATIONSHIPS_WARNING: &str = "warning: PRD contains deprecated relationship fields (synergyWith/batchWith/conflictsWith); \
+     these are ignored — use touchesFiles for conflict detection";
 
 /// Update an existing task in the database.
 ///

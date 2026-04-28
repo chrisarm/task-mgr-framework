@@ -3,9 +3,6 @@
 //! This module implements the smart task selection algorithm that considers:
 //! - Task priority
 //! - File locality (overlap with --after-files)
-//! - Synergy relationships with recently completed tasks
-//! - Conflict relationships (penalty for conflicting tasks)
-//! - Batch grouping (batchWith relationships)
 //!
 //! # Performance
 //!
@@ -24,8 +21,6 @@ use crate::models::Task;
 
 /// Scoring weights for task selection
 pub const FILE_OVERLAP_SCORE: i32 = 10;
-pub const SYNERGY_BONUS: i32 = 3;
-pub const CONFLICT_PENALTY: i32 = -5;
 pub const PRIORITY_BASE: i32 = 1000;
 
 /// A scored task candidate for selection.
@@ -35,8 +30,6 @@ pub struct ScoredTask {
     pub task: Task,
     /// Files this task touches
     pub files: Vec<String>,
-    /// Tasks this task should be batched with (from batchWith relationship)
-    pub batch_with: Vec<String>,
     /// Total calculated score
     pub total_score: i32,
     /// Breakdown of how the score was calculated
@@ -50,18 +43,8 @@ pub struct ScoreBreakdown {
     pub priority_score: i32,
     /// Score from file overlap with --after-files
     pub file_score: i32,
-    /// Score adjustment from synergy relationships
-    pub synergy_score: i32,
-    /// Score adjustment from conflict relationships
-    pub conflict_score: i32,
     /// Number of files that overlapped
     pub file_overlap_count: i32,
-    /// Tasks that provided synergy bonus
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub synergy_from: Vec<String>,
-    /// Tasks that caused conflict penalty
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub conflict_from: Vec<String>,
 }
 
 /// Result of the task selection algorithm.
@@ -70,9 +53,6 @@ pub struct SelectionResult {
     /// The selected task (if any eligible tasks exist)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<ScoredTask>,
-    /// Tasks that could be batched with the selected task (eligible batchWith targets)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub batch_tasks: Vec<String>,
     /// Reason for selection (or why no task was selected)
     pub selection_reason: String,
     /// Total number of eligible tasks considered
@@ -82,51 +62,21 @@ pub struct SelectionResult {
     pub top_candidates: Vec<ScoredTask>,
 }
 
-/// Select the next task to work on using the smart selection algorithm.
+/// Score, filter, and sort all eligible todo tasks.
 ///
-/// # Arguments
-///
-/// * `dir` - Directory containing the database
-/// * `after_files` - Files modified in the previous iteration (for locality scoring)
-/// * `recently_completed` - Task IDs recently completed (for synergy/conflict scoring)
-///
-/// # Returns
-///
-/// Returns a `SelectionResult` with the best task to work on, or None if no tasks are eligible.
-///
-/// # Algorithm
-///
-/// 1. Filter to eligible tasks: status='todo' and all dependsOn tasks are done/irrelevant
-/// 2. Score each task:
-///    - priority_score = 1000 - priority (higher priority = higher score)
-///    - file_score = 10 * count of files overlapping with after_files
-///    - synergy_score = 3 * count of synergy relationships to recently_completed
-///    - conflict_score = -5 * count of conflict relationships to recently_completed
-///    - total_score = priority_score + file_score + synergy_score + conflict_score
-/// 3. Order by total_score DESC, priority ASC
-/// 4. Return the top task with its batch group
-pub fn select_next_task(
+/// Shared by `select_next_task` and `select_parallel_group`. Returns tasks
+/// sorted by total_score DESC, priority ASC — the callers diverge only in how
+/// they pick from this ordered list.
+fn build_scored_candidates(
     conn: &Connection,
     after_files: &[String],
-    recently_completed: &[String],
     task_prefix: Option<&str>,
-) -> TaskMgrResult<SelectionResult> {
-    // Get IDs of tasks that are done or irrelevant (satisfy dependencies)
+) -> TaskMgrResult<Vec<ScoredTask>> {
     let completed_ids = get_completed_task_ids(conn, task_prefix)?;
-
-    // Get all todo tasks
     let todo_tasks = get_todo_tasks(conn, task_prefix)?;
-
-    // Get all relationships
     let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
-    let synergies = get_relationships_by_type(conn, "synergyWith", task_prefix)?;
-    let conflicts = get_relationships_by_type(conn, "conflictsWith", task_prefix)?;
-    let batches = get_relationships_by_type(conn, "batchWith", task_prefix)?;
-
-    // Get task files
     let task_files = get_all_task_files(conn, task_prefix)?;
 
-    // Filter to eligible tasks (all dependencies satisfied)
     let eligible_tasks: Vec<Task> = todo_tasks
         .into_iter()
         .filter(|task| {
@@ -141,124 +91,85 @@ pub fn select_next_task(
         .collect();
 
     if eligible_tasks.is_empty() {
-        return Ok(SelectionResult {
-            task: None,
-            batch_tasks: Vec::new(),
-            selection_reason: "No eligible tasks found - all tasks are either complete, blocked by dependencies, or in a non-todo state".to_string(),
-            eligible_count: 0,
-            top_candidates: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
-    // Load dynamic weights (falls back to defaults if not calibrated)
     let weights = calibrate::load_dynamic_weights(conn);
-
-    // Convert after_files to a set for O(1) lookup
     let after_files_set: HashSet<&str> = after_files.iter().map(String::as_str).collect();
-    let recently_completed_set: HashSet<&str> =
-        recently_completed.iter().map(String::as_str).collect();
 
-    // Score each eligible task
     let mut scored_tasks: Vec<ScoredTask> = eligible_tasks
         .into_iter()
         .map(|task| {
             let files = task_files.get(&task.id).cloned().unwrap_or_default();
-            let batch_with = batches.get(&task.id).cloned().unwrap_or_default();
 
-            // Calculate file overlap score
             let file_overlap_count = files
                 .iter()
                 .filter(|f| after_files_set.contains(f.as_str()))
                 .count() as i32;
             let file_score = file_overlap_count * weights.file_overlap;
-
-            // Calculate synergy score
-            let task_synergies = synergies.get(&task.id).map(|v| v.as_slice()).unwrap_or(&[]);
-            let synergy_from: Vec<String> = task_synergies
-                .iter()
-                .filter(|s| recently_completed_set.contains(s.as_str()))
-                .cloned()
-                .collect();
-            let synergy_score = synergy_from.len() as i32 * weights.synergy;
-
-            // Calculate conflict score
-            let task_conflicts = conflicts.get(&task.id).map(|v| v.as_slice()).unwrap_or(&[]);
-            let conflict_from: Vec<String> = task_conflicts
-                .iter()
-                .filter(|c| recently_completed_set.contains(c.as_str()))
-                .cloned()
-                .collect();
-            let conflict_score = conflict_from.len() as i32 * weights.conflict;
-
-            // Calculate priority score (higher priority = lower number = higher score)
             let priority_score = weights.priority_base - task.priority;
-
-            // Total score
-            let total_score = priority_score + file_score + synergy_score + conflict_score;
+            let total_score = priority_score + file_score;
 
             ScoredTask {
                 task,
                 files,
-                batch_with,
                 total_score,
                 score_breakdown: ScoreBreakdown {
                     priority_score,
                     file_score,
-                    synergy_score,
-                    conflict_score,
                     file_overlap_count,
-                    synergy_from,
-                    conflict_from,
                 },
             }
         })
         .collect();
 
-    // Sort by total_score DESC, then by priority ASC (as tiebreaker)
     scored_tasks.sort_by(|a, b| {
         b.total_score
             .cmp(&a.total_score)
             .then_with(|| a.task.priority.cmp(&b.task.priority))
     });
 
+    Ok(scored_tasks)
+}
+
+/// Select the next task to work on using the smart selection algorithm.
+///
+/// # Algorithm
+///
+/// 1. Filter to eligible tasks: status='todo' and all dependsOn tasks are done/irrelevant
+/// 2. Score each task: priority_score + file_overlap_score
+/// 3. Return the highest-scored task
+pub fn select_next_task(
+    conn: &Connection,
+    after_files: &[String],
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<SelectionResult> {
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
+
+    if scored_tasks.is_empty() {
+        return Ok(SelectionResult {
+            task: None,
+            selection_reason: "No eligible tasks found - all tasks are either complete, blocked by dependencies, or in a non-todo state".to_string(),
+            eligible_count: 0,
+            top_candidates: Vec::new(),
+        });
+    }
+
     let eligible_count = scored_tasks.len();
-
-    // Keep top 5 candidates for verbose output
     let top_candidates: Vec<ScoredTask> = scored_tasks.iter().take(5).cloned().collect();
-
-    // Get the top task
     let top_task = scored_tasks.into_iter().next();
 
     match top_task {
         Some(task) => {
-            // Find eligible batch tasks (batchWith targets that are also todo).
-            // When a prefix is set, only consider batch targets within the same PRD.
-            let scoped_batch_with: Vec<String> = match task_prefix {
-                Some(p) => {
-                    let required_prefix = format!("{p}-");
-                    task.batch_with
-                        .iter()
-                        .filter(|id| id.starts_with(&required_prefix))
-                        .cloned()
-                        .collect()
-                }
-                None => task.batch_with.clone(),
-            };
-            let batch_tasks = get_eligible_batch_tasks(conn, &scoped_batch_with)?;
-
             let selection_reason = format!(
-                "Selected task {} with score {} (priority: {}, file_overlap: {}, synergy: {}, conflict: {})",
+                "Selected task {} with score {} (priority: {}, file_overlap: {})",
                 task.task.id,
                 task.total_score,
                 task.score_breakdown.priority_score,
                 task.score_breakdown.file_score,
-                task.score_breakdown.synergy_score,
-                task.score_breakdown.conflict_score
             );
-
             Ok(SelectionResult {
                 task: Some(task),
-                batch_tasks,
                 selection_reason,
                 eligible_count,
                 top_candidates,
@@ -266,7 +177,6 @@ pub fn select_next_task(
         }
         None => Ok(SelectionResult {
             task: None,
-            batch_tasks: Vec::new(),
             selection_reason: "No eligible tasks found".to_string(),
             eligible_count: 0,
             top_candidates: Vec::new(),
@@ -383,51 +293,55 @@ fn get_all_task_files(
     Ok(map)
 }
 
-/// Get eligible batch tasks (tasks that can be batched and are still todo).
-fn get_eligible_batch_tasks(
+/// Select up to `max_slots` non-conflicting tasks for parallel execution.
+///
+/// # Algorithm
+///
+/// 1. Score all eligible tasks identically to `select_next_task`.
+/// 2. Sort by total_score DESC, priority ASC.
+/// 3. Greedy pass: accept each candidate unless any of its files appear in the
+///    set of files already claimed by an accepted task.
+/// 4. Tasks with zero `touchesFiles` entries have no conflicts and are always
+///    eligible.
+/// 5. Stop once `max_slots` tasks are accepted.
+///
+/// The returned group is ordered by total_score descending.
+pub fn select_parallel_group(
     conn: &Connection,
-    batch_with_ids: &[String],
-) -> TaskMgrResult<Vec<String>> {
-    if batch_with_ids.is_empty() {
+    after_files: &[String],
+    task_prefix: Option<&str>,
+    max_slots: usize,
+) -> TaskMgrResult<Vec<ScoredTask>> {
+    if max_slots == 0 {
         return Ok(Vec::new());
     }
 
-    // Query status of batch_with candidates
-    let placeholders: String = batch_with_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let query = format!(
-        "SELECT id, status FROM tasks WHERE id IN ({}) AND archived_at IS NULL",
-        placeholders
-    );
+    let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
 
-    let mut stmt = conn.prepare(&query)?;
+    if scored_tasks.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // Convert to rusqlite params
-    let params: Vec<&dyn rusqlite::ToSql> = batch_with_ids
-        .iter()
-        .map(|s| s as &dyn rusqlite::ToSql)
-        .collect();
+    let mut group: Vec<ScoredTask> = Vec::new();
+    let mut used_files: HashSet<String> = HashSet::new();
 
-    let rows: Result<Vec<(String, String)>, rusqlite::Error> = stmt
-        .query_map(params.as_slice(), |row| {
-            let id: String = row.get(0)?;
-            let status: String = row.get(1)?;
-            Ok((id, status))
-        })?
-        .collect();
+    for candidate in scored_tasks {
+        if group.len() >= max_slots {
+            break;
+        }
+        if !candidate.files.is_empty()
+            && candidate
+                .files
+                .iter()
+                .any(|f| used_files.contains(f.as_str()))
+        {
+            continue;
+        }
+        used_files.extend(candidate.files.iter().cloned());
+        group.push(candidate);
+    }
 
-    let eligible = rows?
-        .into_iter()
-        .filter_map(|(id, status)| {
-            // Task is eligible if it's todo and not blocked by dependencies
-            if status == "todo" { Some(id) } else { None }
-        })
-        .collect();
-
-    Ok(eligible)
+    Ok(group)
 }
 
 /// Format selection result as human-readable text.
@@ -454,26 +368,11 @@ pub fn format_text(result: &SelectionResult) -> String {
                 "  File Overlap: {:+} ({} file(s))\n",
                 task.score_breakdown.file_score, task.score_breakdown.file_overlap_count
             ));
-            output.push_str(&format!(
-                "  Synergy:     {:+}\n",
-                task.score_breakdown.synergy_score
-            ));
-            output.push_str(&format!(
-                "  Conflict:    {:+}\n",
-                task.score_breakdown.conflict_score
-            ));
 
             if !task.files.is_empty() {
                 output.push_str("\nTouches Files:\n");
                 for file in &task.files {
                     output.push_str(&format!("  - {}\n", file));
-                }
-            }
-
-            if !result.batch_tasks.is_empty() {
-                output.push_str("\nBatch With:\n");
-                for batch_id in &result.batch_tasks {
-                    output.push_str(&format!("  - {}\n", batch_id));
                 }
             }
 

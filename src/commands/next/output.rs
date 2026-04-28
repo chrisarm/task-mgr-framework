@@ -15,9 +15,6 @@ pub struct NextResult {
     /// The selected task with full details and score
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<NextTaskOutput>,
-    /// Eligible batch tasks (batchWith targets that are still todo)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub batch_tasks: Vec<String>,
     /// Relevant learnings for this task
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub learnings: Vec<LearningSummaryOutput>,
@@ -67,8 +64,6 @@ pub struct NextTaskOutput {
     pub notes: Option<String>,
     /// Files this task touches
     pub files: Vec<String>,
-    /// Task IDs in batchWith relationship
-    pub batch_with: Vec<String>,
     /// Preferred model for this task (e.g., the value of `loop_engine::model::OPUS_MODEL`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -94,18 +89,8 @@ pub struct ScoreOutput {
     pub priority: i32,
     /// Score from file overlap with --after-files
     pub file_overlap: i32,
-    /// Score from synergy relationships
-    pub synergy: i32,
-    /// Score from conflict relationships (negative)
-    pub conflict: i32,
     /// Number of files that overlapped
     pub file_overlap_count: i32,
-    /// Tasks that provided synergy bonus
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub synergy_from: Vec<String>,
-    /// Tasks that caused conflict penalty
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub conflict_from: Vec<String>,
 }
 
 /// Learning summary for the next command output.
@@ -169,17 +154,10 @@ pub struct ClaimMetadata {
 impl From<&ScoreBreakdown> for ScoreOutput {
     fn from(breakdown: &ScoreBreakdown) -> Self {
         ScoreOutput {
-            total: breakdown.priority_score
-                + breakdown.file_score
-                + breakdown.synergy_score
-                + breakdown.conflict_score,
+            total: breakdown.priority_score + breakdown.file_score,
             priority: breakdown.priority_score,
             file_overlap: breakdown.file_score,
-            synergy: breakdown.synergy_score,
-            conflict: breakdown.conflict_score,
             file_overlap_count: breakdown.file_overlap_count,
-            synergy_from: breakdown.synergy_from.clone(),
-            conflict_from: breakdown.conflict_from.clone(),
         }
     }
 }
@@ -201,7 +179,6 @@ pub fn build_task_output(scored_task: &ScoredTask, claimed: bool) -> NextTaskOut
         acceptance_criteria: scored_task.task.acceptance_criteria.clone(),
         notes: scored_task.task.notes.clone(),
         files: scored_task.files.clone(),
-        batch_with: scored_task.batch_with.clone(),
         model: scored_task.task.model.clone(),
         difficulty: scored_task.task.difficulty.clone(),
         escalation_note: scored_task.task.escalation_note.clone(),
@@ -222,12 +199,8 @@ pub fn format_next_text(result: &NextResult) -> String {
             output.push_str(&format!("Priority: {}\n", task.priority));
             output.push_str(&format!("Status:   {}\n", task.status));
             output.push_str(&format!(
-                "Score:    {} (priority: {}, file_overlap: {}, synergy: {}, conflict: {})\n",
-                task.score.total,
-                task.score.priority,
-                task.score.file_overlap,
-                task.score.synergy,
-                task.score.conflict
+                "Score:    {} (priority: {}, file_overlap: {})\n",
+                task.score.total, task.score.priority, task.score.file_overlap,
             ));
 
             if let Some(ref desc) = task.description {
@@ -259,14 +232,6 @@ pub fn format_next_text(result: &NextResult) -> String {
                     output.push_str(&format!(", run: {}", rid));
                 }
                 output.push_str(")\n");
-            }
-
-            // Show batch tasks if any
-            if !result.batch_tasks.is_empty() {
-                output.push_str("\nBatch Tasks (consider doing together):\n");
-                for batch_id in &result.batch_tasks {
-                    output.push_str(&format!("  - {}\n", batch_id));
-                }
             }
 
             // Show learnings if any
@@ -327,29 +292,13 @@ pub fn format_next_verbose(result: &NextResult) -> String {
             selected
         ));
         output.push_str(&format!(
-            "     Total Score: {} (priority: {:+}, file: {:+}, synergy: {:+}, conflict: {:+})\n",
-            candidate.total_score,
-            candidate.score.priority,
-            candidate.score.file_overlap,
-            candidate.score.synergy,
-            candidate.score.conflict
+            "     Total Score: {} (priority: {:+}, file: {:+})\n",
+            candidate.total_score, candidate.score.priority, candidate.score.file_overlap,
         ));
         if candidate.score.file_overlap_count > 0 {
             output.push_str(&format!(
                 "     File overlap: {} file(s)\n",
                 candidate.score.file_overlap_count
-            ));
-        }
-        if !candidate.score.synergy_from.is_empty() {
-            output.push_str(&format!(
-                "     Synergy from: {}\n",
-                candidate.score.synergy_from.join(", ")
-            ));
-        }
-        if !candidate.score.conflict_from.is_empty() {
-            output.push_str(&format!(
-                "     Conflicts with: {}\n",
-                candidate.score.conflict_from.join(", ")
             ));
         }
     }

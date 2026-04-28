@@ -16,6 +16,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,7 @@ use crate::commands::decisions::find_option;
 use crate::commands::doctor::setup_checks::pre_check_loop_setup;
 use crate::commands::doctor::setup_output::SetupSeverity;
 use crate::commands::init::{PrefixMode, generate_prefix};
+use crate::commands::next::selection::select_parallel_group;
 use crate::commands::run as run_cmd;
 use crate::db::LockGuard;
 use crate::db::prefix::{prefix_and, validate_prefix};
@@ -203,6 +205,22 @@ pub struct IterationContext {
     /// the task can fit in the larger context window. Uses `String` values
     /// (not `&'static str`) to allow future dynamic model IDs.
     pub model_overrides: std::collections::HashMap<String, String>,
+    /// Reorder hints emitted from parallel slots that haven't been consumed yet.
+    /// Sequential mode consumes from `reorder_hint`; in wave mode we collect
+    /// every `<reorder>` request a slot emits and append here so they survive
+    /// the wave (FEAT-010 AC: "Reorder hints from parallel slots queued for
+    /// next wave"). `select_parallel_group` is score-driven and does not yet
+    /// honor hints, so this acts as a preservation queue rather than a direct
+    /// influence on the next selection — hints surface in operator logs and
+    /// remain available for future selection-side wiring.
+    pub pending_reorder_hints: Vec<String>,
+    /// Task IDs that `claim_slot_task` set to `in_progress` in a parallel wave
+    /// but whose slot did not mark them `done` (e.g. crash, no `<completed>`
+    /// tag emitted, output-scan miss). Tracks across waves so the post-loop
+    /// cleanup can reset still-`in_progress` rows when the loop exits via
+    /// deadline / max-iterations rather than waiting for the next process's
+    /// step 6.6 recovery.
+    pub pending_slot_tasks: Vec<String>,
 }
 
 impl IterationContext {
@@ -220,7 +238,1188 @@ impl IterationContext {
             last_was_crash: false,
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
+            pending_reorder_hints: Vec::new(),
+            pending_slot_tasks: Vec::new(),
         }
+    }
+}
+
+/// Per-slot execution context for parallel wave iterations.
+///
+/// Each slot carries its own pre-claimed task, worktree path, and watchdog
+/// activity epoch. The struct is `Send` so run_parallel_wave can move it
+/// into a dedicated worker thread. It is intentionally not `Sync`:
+/// `run_slot_iteration` never shares a `&SlotContext` across threads.
+pub struct SlotContext {
+    /// Slot index within the wave (0..parallel_slots).
+    pub slot_index: usize,
+    /// Working directory for Claude — slot 0 uses the main branch worktree,
+    /// slots 1+ each get an ephemeral worktree (see `worktree::ensure_slot_worktrees`).
+    pub working_root: PathBuf,
+    /// Pre-claimed task assigned to this slot. Claimed by `run_parallel_wave`
+    /// on the main thread before any slot thread is spawned so that rusqlite
+    /// writes stay single-threaded for claim bookkeeping.
+    pub task: crate::models::Task,
+    /// Shared activity epoch for the slot's spawn_claude watchdog. Each slot
+    /// owns its own `Arc<AtomicU64>` — watchdogs must not share an epoch or
+    /// activity in one slot would silently extend another slot's deadline.
+    pub last_activity_epoch: Arc<AtomicU64>,
+}
+
+/// Result of running one slot during a wave.
+#[derive(Debug)]
+pub struct SlotResult {
+    /// Slot index the result came from (matches `SlotContext::slot_index`).
+    pub slot_index: usize,
+    /// Outcome of the slot's iteration (mirrors the sequential `IterationResult`).
+    pub iteration_result: IterationResult,
+    /// Whether `claim_slot_task` successfully transitioned this slot's task to
+    /// `in_progress`. `false` only for `slot_failure_result` entries where the
+    /// task was already `done` / `blocked` and the slot thread never spawned.
+    /// Drives the post-loop orphan reset (see `IterationContext::pending_slot_tasks`).
+    pub claim_succeeded: bool,
+}
+
+/// Aggregate result of a parallel wave.
+#[derive(Debug)]
+pub struct WaveResult {
+    /// Per-slot outcomes — one entry per slot spawned, preserving slot ordering.
+    /// Panicked slots are converted into a `Crash(RuntimeError)` entry with no task_id.
+    pub outcomes: Vec<SlotResult>,
+    /// Wall-clock duration from thread spawn to all-slots-joined.
+    pub wave_duration: Duration,
+}
+
+/// Parameters shared across all slot threads in a wave.
+///
+/// Each field must be safe to clone cheaply (Arc-backed or `Clone` with small
+/// owned data) because every spawned thread gets its own copy. The `SignalFlag`
+/// is internally `Arc<AtomicBool>` so all threads observe the same signal.
+///
+/// Per-thread mutable state (DB connection, watchdog epoch) is NOT stored
+/// here — it is created inside `run_slot_iteration` so it never crosses thread
+/// boundaries.
+#[derive(Clone)]
+pub struct SlotIterationParams {
+    /// Database directory (each slot opens its own connection here).
+    pub db_dir: PathBuf,
+    /// Path to base prompt.md file used when assembling per-slot prompts.
+    pub base_prompt_path: PathBuf,
+    /// Permission mode for Claude subprocess invocation.
+    pub permission_mode: PermissionMode,
+    /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
+    pub signal_flag: SignalFlag,
+    /// Default model from PRD metadata (falls through when the task has no
+    /// explicit model and no higher-tier escalation is active).
+    pub default_model: Option<String>,
+    /// Verbose logging toggle.
+    pub verbose: bool,
+}
+
+/// Build a minimal slot prompt from a pre-claimed task and base prompt template.
+///
+/// The sequential `run_iteration` pulls in learnings, source context, synergy
+/// context, sibling PRDs, etc. via `prompt::build_prompt`. For parallel slot
+/// execution we start with a lean prompt covering only the non-negotiable
+/// sections:
+/// - Task JSON (what to work on)
+/// - Task lifecycle rules (how status updates are communicated)
+/// - Completion instruction (how to signal done)
+/// - Base prompt template (project conventions)
+///
+/// Enriching the slot prompt with the full sequential pipeline is tracked by
+/// follow-up wiring tasks; this keeps the wave engine small and thread-safe
+/// today while leaving the obvious extension point clearly marked.
+fn build_slot_prompt(task: &crate::models::Task, base_prompt_path: &Path) -> String {
+    let mut prompt = String::new();
+
+    let mut task_json = serde_json::json!({
+        "id": task.id,
+        "title": task.title,
+        "priority": task.priority,
+        "status": "in_progress",
+        "acceptanceCriteria": task.acceptance_criteria,
+    });
+    if let Some(ref desc) = task.description {
+        task_json["description"] = serde_json::Value::String(desc.clone());
+    }
+    if let Some(ref notes) = task.notes {
+        task_json["notes"] = serde_json::Value::String(notes.clone());
+    }
+    if let Some(ref m) = task.model {
+        task_json["model"] = serde_json::Value::String(m.clone());
+    }
+    if let Some(ref d) = task.difficulty {
+        task_json["difficulty"] = serde_json::Value::String(d.clone());
+    }
+
+    let task_json_str = serde_json::to_string_pretty(&task_json)
+        .unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id));
+    prompt.push_str(&format!(
+        "## Current Task\n\n```json\n{}\n```\n\n",
+        task_json_str,
+    ));
+
+    prompt.push_str(crate::loop_engine::prompt_sections::task_ops::task_ops_section());
+
+    prompt.push_str(&format!(
+        "## Completing This Task\n\n\
+         When all acceptance criteria pass:\n\
+         1. Commit with message: `feat: {task_id}-completed - [{title}]`\n\
+         2. Output `<completed>{task_id}</completed>`.\n\
+         3. Stop immediately.\n\n\
+         The loop will automatically mark the task done and update the PRD.\n\n",
+        task_id = task.id,
+        title = task.title,
+    ));
+
+    match std::fs::read_to_string(base_prompt_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            prompt.push_str(&content);
+            if !content.ends_with('\n') {
+                prompt.push('\n');
+            }
+        }
+        Ok(_) => {
+            eprintln!(
+                "Warning: base prompt file is empty: {}",
+                base_prompt_path.display(),
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: could not read base prompt file {}: {}",
+                base_prompt_path.display(),
+                e,
+            );
+        }
+    }
+
+    prompt
+}
+
+/// Load the files a task touches from the `task_files` join table.
+///
+/// Returns an empty Vec if the task has no entries or on query error; the
+/// slot iteration remains runnable even without file metadata, and logging
+/// the error keeps silent failures visible.
+fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
+    match conn.prepare("SELECT file_path FROM task_files WHERE task_id = ? ORDER BY file_path") {
+        Ok(mut stmt) => stmt
+            .query_map([task_id], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!("Warning: failed to query task_files for {}: {}", task_id, e,);
+            Vec::new()
+        }
+    }
+}
+
+/// Fields that vary between early-exit paths in `run_slot_iteration`.
+struct SlotEarlyExit {
+    outcome: IterationOutcome,
+    task_id: String,
+    files_modified: Vec<String>,
+    should_stop: bool,
+    output: String,
+    effective_model: Option<String>,
+    effective_effort: Option<&'static str>,
+}
+
+/// Build a slot-scoped early-exit `SlotResult`.
+///
+/// Centralizes the `IterationResult` construction for the handful of early
+/// returns in `run_slot_iteration` so the 9-field struct literal isn't
+/// duplicated.
+fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
+    SlotResult {
+        slot_index,
+        iteration_result: IterationResult {
+            outcome: exit.outcome,
+            task_id: Some(exit.task_id),
+            files_modified: exit.files_modified,
+            should_stop: exit.should_stop,
+            output: exit.output,
+            effective_model: exit.effective_model,
+            effective_effort: exit.effective_effort,
+            key_decisions_count: 0,
+        },
+        // Early exit always runs after a successful claim (the slot thread
+        // started); the orphan reset must consider this task pending until
+        // process_slot_result clears it.
+        claim_succeeded: true,
+    }
+}
+
+/// Run one slot's iteration: build prompt, spawn Claude in the slot worktree,
+/// analyze output. Opens its own DB connection and creates its own watchdog
+/// activity epoch so nothing is shared across slot threads.
+///
+/// This is a deliberately simpler counterpart to `run_iteration`:
+/// - No `&mut IterationContext` — slot threads must not touch shared state.
+/// - No crash-escalation, reorder, stale, or rate-limit-wait logic — those
+///   are orchestrated by the outer loop after the wave returns.
+/// - No prompt-overflow recovery path — the slot prompt is minimal so the
+///   overflow branch is unreachable in practice.
+pub fn run_slot_iteration(
+    slot: &SlotContext,
+    params: &SlotIterationParams,
+) -> TaskMgrResult<SlotResult> {
+    // Early exit on signal — no work should start if the loop is stopping.
+    if params.signal_flag.is_signaled() {
+        return Ok(slot_early_exit(
+            slot.slot_index,
+            SlotEarlyExit {
+                outcome: IterationOutcome::Empty,
+                task_id: slot.task.id.clone(),
+                files_modified: vec![],
+                should_stop: true,
+                output: String::new(),
+                effective_model: None,
+                effective_effort: None,
+            },
+        ));
+    }
+
+    // Open a per-slot DB connection. rusqlite `Connection` is not `Send`, so
+    // each thread MUST open its own; sharing a connection across threads
+    // corrupts the WAL state.
+    let conn = crate::db::open_connection(&params.db_dir)?;
+
+    let task_files = load_task_files(&conn, &slot.task.id);
+
+    // Effective model: per-task override > default. Cluster-wide escalation
+    // (sequential path) is intentionally not applied in parallel; the wave
+    // engine targets tasks that are already scored as disjoint, not clusters.
+    let effective_model: Option<String> = slot
+        .task
+        .model
+        .clone()
+        .or_else(|| params.default_model.clone());
+
+    let effort = model::effort_for_difficulty(slot.task.difficulty.as_deref());
+
+    let prompt = build_slot_prompt(&slot.task, &params.base_prompt_path);
+
+    if params.verbose {
+        eprintln!(
+            "[slot {}] task={} model={} effort={} cwd={}",
+            slot.slot_index,
+            slot.task.id,
+            effective_model.as_deref().unwrap_or("(default)"),
+            effort.unwrap_or("(default)"),
+            slot.working_root.display(),
+        );
+    }
+
+    // Per-slot timeout wired to the slot's own activity epoch. Each
+    // spawn_claude creates its own watchdog thread, so timeouts are per-slot.
+    let timeout_config = watchdog::TimeoutConfig::from_difficulty(
+        slot.task.difficulty.as_deref(),
+        Arc::clone(&slot.last_activity_epoch),
+    );
+
+    let claude_result = claude::spawn_claude(
+        &prompt,
+        &params.permission_mode,
+        claude::SpawnOpts {
+            signal_flag: Some(&params.signal_flag),
+            working_dir: Some(&slot.working_root),
+            model: effective_model.as_deref(),
+            timeout: Some(timeout_config),
+            stream_json: true,
+            effort,
+            disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
+            db_dir: Some(&params.db_dir),
+            use_pty: false,
+            target_task_id: Some(&slot.task.id),
+            ..Default::default()
+        },
+    )?;
+
+    if claude_result.timed_out {
+        eprintln!(
+            "[slot {}] iteration timed out for task {}",
+            slot.slot_index, slot.task.id,
+        );
+        return Ok(slot_early_exit(
+            slot.slot_index,
+            SlotEarlyExit {
+                outcome: IterationOutcome::Crash(config::CrashType::RuntimeError),
+                task_id: slot.task.id.clone(),
+                files_modified: task_files,
+                should_stop: false,
+                output: claude_result.output,
+                effective_model,
+                effective_effort: effort,
+            },
+        ));
+    }
+
+    // If Claude was killed by SIGINT/SIGTERM (exit 130/143), propagate to
+    // our shared signal flag so peer slots and the outer loop observe the stop.
+    //
+    // Exception: if the watchdog fired the post-completion grace kill, the
+    // SIGTERM (143) was issued internally as a successful-completion finalizer
+    // — not an external Ctrl+C. Propagating it would end the whole loop (and
+    // any chained PRDs) despite the task completing normally.
+    if matches!(claude_result.exit_code, 130 | 143) && !claude_result.completion_killed {
+        params.signal_flag.set();
+    }
+
+    if params.signal_flag.is_signaled() {
+        return Ok(slot_early_exit(
+            slot.slot_index,
+            SlotEarlyExit {
+                outcome: IterationOutcome::Empty,
+                task_id: slot.task.id.clone(),
+                files_modified: task_files,
+                should_stop: true,
+                output: claude_result.output,
+                effective_model: None,
+                effective_effort: None,
+            },
+        ));
+    }
+
+    let outcome = detection::analyze_output(
+        &claude_result.output,
+        claude_result.exit_code,
+        &slot.working_root,
+    );
+
+    Ok(SlotResult {
+        slot_index: slot.slot_index,
+        iteration_result: IterationResult {
+            outcome,
+            task_id: Some(slot.task.id.clone()),
+            files_modified: task_files,
+            should_stop: false,
+            output: claude_result.output,
+            effective_model,
+            effective_effort: effort,
+            key_decisions_count: 0,
+        },
+        claim_succeeded: true,
+    })
+}
+
+/// Claim a slot's task on the main thread by updating status to `in_progress`.
+///
+/// Returns `true` when the claim succeeded (the row was in `todo` or already
+/// `in_progress` for this task), `false` when the task was in an unexpected
+/// state (e.g. `done`, `blocked`) — the caller should skip spawning that slot.
+///
+/// Done as a single UPDATE with an optimistic-locking WHERE clause so a
+/// concurrent external writer cannot clobber a `done` row back to `in_progress`.
+///
+/// `'in_progress'` is intentionally included in the WHERE clause: re-claiming
+/// an already-claimed task is idempotent (covered by the test
+/// `test_claim_slot_task_idempotent_on_already_in_progress`) and supports
+/// retry-after-recovery scenarios where step 6.6 left a row in `in_progress`
+/// that the loop wants to take over. The selection layer is responsible for
+/// not surfacing in-flight rows to other slots in the same wave; this guard
+/// only protects against `done`/`blocked` transitions, not duplicate claims.
+fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
+    match conn.execute(
+        "UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), \
+         updated_at = datetime('now') WHERE id = ? AND status IN ('todo', 'in_progress')",
+        [task_id],
+    ) {
+        Ok(rows) => rows > 0,
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to claim slot task {}: {} — skipping slot",
+                task_id, e,
+            );
+            false
+        }
+    }
+}
+
+/// Build a SlotResult representing a slot thread that panicked or errored.
+///
+/// `claim_succeeded` distinguishes two cases:
+///   - `true`: claim went through, but the slot thread later panicked / crashed
+///     while its task was already `in_progress` — the orphan reset must run.
+///   - `false`: claim itself failed (task already `done`/`blocked`) and no row
+///     was ever moved to `in_progress` — orphan reset must skip this entry.
+fn slot_failure_result(
+    slot_index: usize,
+    task_id: Option<String>,
+    reason: String,
+    claim_succeeded: bool,
+) -> SlotResult {
+    SlotResult {
+        slot_index,
+        iteration_result: IterationResult {
+            outcome: IterationOutcome::Crash(config::CrashType::RuntimeError),
+            task_id,
+            files_modified: vec![],
+            should_stop: false,
+            output: reason,
+            effective_model: None,
+            effective_effort: None,
+            key_decisions_count: 0,
+        },
+        claim_succeeded,
+    }
+}
+
+/// Run one parallel wave: claim all tasks sequentially (main thread), then
+/// spawn one OS thread per slot and wait for every thread to join.
+///
+/// The claim loop is intentionally serial on the main thread:
+/// - rusqlite `Connection` is not `Send`, so there's one DB writer.
+/// - Serial claims prevent two slots from racing to claim the same row
+///   (the UPDATE WHERE `status IN ('todo', 'in_progress')` guard would also
+///   catch this, but we prefer the stronger invariant that every spawned
+///   thread has an already-claimed task).
+///
+/// Slots whose claim fails (task already `done`/`blocked`) are reported as
+/// a `Crash(RuntimeError)` entry so the outer loop's tracking logic sees
+/// them; they are not silently dropped.
+///
+/// Thread panics are captured from `JoinHandle::join`'s `Err` branch and
+/// converted into `Crash(RuntimeError)` entries — we never unwrap on join.
+pub fn run_parallel_wave(
+    conn: &Connection,
+    slots: Vec<SlotContext>,
+    params: Arc<SlotIterationParams>,
+) -> WaveResult {
+    let start_time = Instant::now();
+
+    let mut claimed: Vec<(SlotContext, bool)> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let ok = claim_slot_task(conn, &slot.task.id);
+        claimed.push((slot, ok));
+    }
+
+    type SlotHandle = Option<thread::JoinHandle<TaskMgrResult<SlotResult>>>;
+    let mut handles: Vec<(usize, String, SlotHandle)> = Vec::with_capacity(claimed.len());
+    let mut failures: Vec<SlotResult> = Vec::new();
+
+    for (slot, ok) in claimed {
+        let slot_index = slot.slot_index;
+        let task_id = slot.task.id.clone();
+        if !ok {
+            failures.push(slot_failure_result(
+                slot_index,
+                Some(task_id.clone()),
+                format!("claim failed for task {}", task_id),
+                false,
+            ));
+            handles.push((slot_index, task_id, None));
+            continue;
+        }
+
+        let params_for_thread = Arc::clone(&params);
+        let handle = thread::spawn(move || run_slot_iteration(&slot, &params_for_thread));
+        handles.push((slot_index, task_id, Some(handle)));
+    }
+
+    let mut outcomes: Vec<SlotResult> = Vec::with_capacity(handles.len());
+    for (slot_index, task_id, maybe_handle) in handles {
+        let Some(handle) = maybe_handle else {
+            // Already recorded in `failures` above — skip re-emitting.
+            continue;
+        };
+        match handle.join() {
+            Ok(Ok(result)) => outcomes.push(result),
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[slot {}] iteration error for {}: {}",
+                    slot_index, task_id, e,
+                );
+                outcomes.push(slot_failure_result(
+                    slot_index,
+                    Some(task_id),
+                    format!("iteration error: {}", e),
+                    true,
+                ));
+            }
+            Err(panic_payload) => {
+                let msg = panic_payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        panic_payload
+                            .downcast_ref::<&'static str>()
+                            .map(|s| (*s).to_string())
+                    })
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("[slot {}] thread panicked: {}", slot_index, msg);
+                outcomes.push(slot_failure_result(
+                    slot_index,
+                    Some(task_id),
+                    format!("thread panic: {}", msg),
+                    true,
+                ));
+            }
+        }
+    }
+
+    // Merge claim failures into outcomes so callers see every slot represented.
+    outcomes.extend(failures);
+    outcomes.sort_by_key(|r| r.slot_index);
+
+    WaveResult {
+        outcomes,
+        wave_duration: start_time.elapsed(),
+    }
+}
+
+/// Borrowed parameters for one parallel wave iteration (FEAT-010).
+///
+/// The struct is named so the call site at `run_loop` reads as a single
+/// argument; it is constructed once per wave inside the outer loop.
+pub struct WaveIterationParams<'a> {
+    pub conn: &'a mut Connection,
+    pub db_dir: &'a Path,
+    pub source_root: &'a Path,
+    pub branch: &'a str,
+    pub parallel_slots: usize,
+    pub slot_worktree_paths: &'a [PathBuf],
+    pub iteration: u32,
+    pub run_id: &'a str,
+    pub base_prompt_path: &'a Path,
+    pub permission_mode: &'a PermissionMode,
+    pub signal_flag: &'a SignalFlag,
+    pub default_model: Option<&'a str>,
+    pub verbose: bool,
+    pub task_prefix: Option<&'a str>,
+    pub prd_path: &'a Path,
+    pub progress_path: &'a Path,
+    pub tasks_dir: &'a Path,
+    pub external_repo_path: Option<&'a Path>,
+    pub external_git_scan_depth: usize,
+    pub inter_iteration_delay: Duration,
+}
+
+/// Aggregated outcome of one parallel wave returned to `run_loop`.
+///
+/// Named exit descriptor carried by `WaveOutcome.terminal`.
+#[derive(Debug)]
+pub struct WaveTerminal {
+    pub exit_code: i32,
+    pub reason: String,
+    pub run_status: Option<RunStatus>,
+}
+
+/// `terminal` is `Some(_)` when the wave determined the loop should stop —
+/// the outer loop applies the exit code and breaks. `iteration_consumed`
+/// matches the AC: every wave (eligible or NoEligibleTasks) burns one
+/// iteration of the budget so the loop can't spin forever.
+#[derive(Debug)]
+pub struct WaveOutcome {
+    pub tasks_completed: u32,
+    pub iteration_consumed: bool,
+    pub terminal: Option<WaveTerminal>,
+    /// True only when a `.stop` file caused the wave to halt — propagates to
+    /// `LoopResult.was_stopped` so batch runners can react to a clean stop.
+    pub was_stopped: bool,
+}
+
+/// Wave-mode aggregator collected during per-slot post-processing.
+///
+/// `all_crashed` starts true only if the wave produced at least one slot
+/// outcome — an empty `outcomes` list cannot be "all crashed" — and gets
+/// flipped to false the first time a slot doesn't crash (or its claimed
+/// task gets marked done despite a crash outcome flag).
+struct WaveAggregator {
+    tasks_completed: u32,
+    any_completed: bool,
+    all_crashed: bool,
+    aggregated_files: Vec<String>,
+    wave_should_stop: bool,
+}
+
+impl WaveAggregator {
+    fn new(num_outcomes: usize) -> Self {
+        Self {
+            tasks_completed: 0,
+            any_completed: false,
+            all_crashed: num_outcomes > 0,
+            aggregated_files: Vec::new(),
+            wave_should_stop: false,
+        }
+    }
+}
+
+/// Pre-wave preflight: signal/stop-file checks and crash backoff/abort.
+/// Returns `Some(WaveOutcome)` when the wave should bail out before doing
+/// any work, `None` when execution should proceed.
+fn wave_preflight_check(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+) -> Option<WaveOutcome> {
+    // Match sequential semantics so Ctrl+C and `.stop` files exit the loop
+    // the same way in both paths.
+    if params.signal_flag.is_signaled() {
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: false,
+            terminal: Some(WaveTerminal {
+                exit_code: 130,
+                reason: "signal received".to_string(),
+                run_status: None,
+            }),
+            was_stopped: false,
+        });
+    }
+    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
+        eprintln!("Stop signal detected (.stop file found)");
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: false,
+            terminal: Some(WaveTerminal {
+                exit_code: 0,
+                reason: "stop signal".to_string(),
+                run_status: None,
+            }),
+            was_stopped: true,
+        });
+    }
+
+    // Crash backoff + abort. Identical contract to the sequential path so
+    // learning [1005] (don't burn iterations on a wedged task) holds even
+    // when every slot of the previous wave crashed.
+    let backoff = ctx.crash_tracker.backoff_duration();
+    if !backoff.is_zero() {
+        eprintln!(
+            "Crash backoff: waiting {} before retry...",
+            display::format_duration(backoff.as_secs())
+        );
+        thread::sleep(backoff);
+    }
+    if ctx.crash_tracker.should_abort() {
+        eprintln!("Too many consecutive crashes, aborting loop");
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: "too many crashes".to_string(),
+                run_status: None,
+            }),
+            was_stopped: false,
+        });
+    }
+    None
+}
+
+/// No eligible tasks were selected for this wave. Drives the stale tracker
+/// exactly like sequential does on `IterationOutcome::NoEligibleTasks`,
+/// returning a terminal outcome when the tracker tripped its abort threshold.
+fn handle_no_eligible_tasks(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+) -> WaveOutcome {
+    ctx.stale_tracker.check("stale", "stale");
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        None,
+        &IterationOutcome::NoEligibleTasks,
+        &[],
+        None,
+        None,
+        None,
+    );
+    if ctx.stale_tracker.should_abort() {
+        eprintln!(
+            "Aborting: no eligible tasks after {} consecutive stale iterations",
+            ctx.stale_tracker.count()
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: format!(
+                    "no eligible tasks after {} consecutive stale iterations",
+                    ctx.stale_tracker.count()
+                ),
+                run_status: None,
+            }),
+            was_stopped: false,
+        };
+    }
+    WaveOutcome {
+        tasks_completed: 0,
+        iteration_consumed: true,
+        terminal: None,
+        was_stopped: false,
+    }
+}
+
+/// Build per-slot `SlotContext` entries, pairing each scored task with its
+/// pre-allocated worktree path. Each slot gets its own activity epoch —
+/// sharing one would let activity in one slot silently extend another
+/// slot's watchdog deadline.
+fn build_slot_contexts(
+    group: Vec<crate::commands::next::selection::ScoredTask>,
+    slot_paths: &[PathBuf],
+) -> Vec<SlotContext> {
+    group
+        .into_iter()
+        .zip(slot_paths.iter())
+        .enumerate()
+        .map(|(idx, (scored, path))| SlotContext {
+            slot_index: idx,
+            working_root: path.clone(),
+            task: scored.task,
+            last_activity_epoch: Arc::new(AtomicU64::new(0)),
+        })
+        .collect()
+}
+
+/// Build the shared per-slot `SlotIterationParams`. `SignalFlag` clones the
+/// inner `Arc` so all threads observe the same SIGINT/SIGTERM signal.
+fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterationParams> {
+    Arc::new(SlotIterationParams {
+        db_dir: params.db_dir.to_path_buf(),
+        base_prompt_path: params.base_prompt_path.to_path_buf(),
+        permission_mode: params.permission_mode.clone(),
+        signal_flag: params.signal_flag.clone(),
+        default_model: params.default_model.map(|s| s.to_string()),
+        verbose: params.verbose,
+    })
+}
+
+/// Per-slot post-processing on the main thread: progress logging, key
+/// decision storage, `<task-status>` dispatch, `<completed>` tag handling
+/// (with a scan-output fallback when no tags are present), reorder-hint
+/// queueing, and file/stop-flag aggregation.
+///
+/// Updates `agg.all_crashed` only when the slot crashed AND its claimed
+/// task did not finish — any non-crash slot (or a crashed slot whose task
+/// was nonetheless marked done) breaks the all-crashed invariant.
+fn process_slot_result(
+    slot_result: &SlotResult,
+    params: &mut WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+    agg: &mut WaveAggregator,
+) {
+    let slot_idx = slot_result.slot_index;
+    let result = &slot_result.iteration_result;
+    let task_id = result.task_id.clone();
+
+    // Track every claimed slot task as pending until we observe a "done"
+    // signal in this slot's output. The post-loop cleanup uses this to reset
+    // any rows still in `in_progress` when the loop exits via deadline /
+    // max-iterations rather than waiting for the next process's step 6.6.
+    if slot_result.claim_succeeded
+        && let Some(ref tid) = task_id
+        && !ctx.pending_slot_tasks.contains(tid)
+    {
+        ctx.pending_slot_tasks.push(tid.clone());
+    }
+
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        task_id.as_deref(),
+        &result.outcome,
+        &result.files_modified,
+        result.effective_model.as_deref(),
+        result.effective_effort,
+        Some(slot_idx),
+    );
+
+    // Best-effort key decisions extraction so wave slots match sequential
+    // behavior. Failures only print a warning; we do not derail the wave.
+    let key_decisions = detection::extract_key_decisions(&result.output);
+    for decision in &key_decisions {
+        if let Err(e) = key_decisions_db::insert_key_decision(
+            params.conn,
+            params.run_id,
+            task_id.as_deref(),
+            i64::from(params.iteration),
+            decision,
+        ) {
+            eprintln!(
+                "Warning: [slot {}] failed to store key decision '{}': {}",
+                slot_idx, decision.title, e
+            );
+        }
+    }
+
+    let status_updates = detection::extract_status_updates(&result.output);
+    let status_updates_applied = if !status_updates.is_empty() {
+        apply_status_updates(
+            params.conn,
+            &status_updates,
+            Some(params.run_id),
+            Some(params.prd_path),
+            params.task_prefix,
+            Some(params.progress_path),
+            Some(params.db_dir),
+        )
+    } else {
+        0
+    };
+
+    let mut slot_marked_done = false;
+
+    if let Some(ref tid) = task_id {
+        // Slot output may emit `<task-status>X:done</task-status>` AND
+        // `<completed>X</completed>` for the same task ID — count each
+        // task at most once per wave per slot, otherwise the wave summary
+        // overstates progress (telemetry skew, not correctness).
+        let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut count_once = |cid: &str, agg: &mut WaveAggregator| {
+            if counted.insert(cid.to_string()) {
+                agg.tasks_completed += 1;
+            }
+            agg.any_completed = true;
+        };
+
+        if status_updates_applied > 0
+            && status_updates
+                .iter()
+                .any(|u| matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid)
+        {
+            slot_marked_done = true;
+            count_once(tid, agg);
+        }
+
+        // Primary completion path: <completed>TASK-ID</completed>.
+        let completed_tags = parse_completed_tasks(&result.output);
+        for cid in &completed_tags {
+            match mark_task_done(
+                params.conn,
+                cid,
+                params.run_id,
+                None,
+                params.prd_path,
+                params.task_prefix,
+            ) {
+                Ok(()) => {
+                    if cid == tid {
+                        slot_marked_done = true;
+                    }
+                    count_once(cid, agg);
+                    eprintln!(
+                        "[slot {}] Task {} completed (<completed> tag)",
+                        slot_idx, cid
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[slot {}] Warning: mark_task_done({}) failed: {}",
+                        slot_idx, cid, e
+                    );
+                }
+            }
+        }
+
+        // Fallback: scan output for completed task IDs. Slot execution
+        // intentionally skips git-commit detection because the commit lives
+        // on an ephemeral branch we have not yet merged.
+        if completed_tags.is_empty() {
+            let scanned =
+                scan_output_for_completed_tasks(&result.output, params.conn, params.task_prefix);
+            for cid in &scanned {
+                let ids = [cid.clone()];
+                match complete_cmd::complete(params.conn, &ids, Some(params.run_id), None, false) {
+                    Ok(_) => {
+                        if cid == tid {
+                            slot_marked_done = true;
+                        }
+                        count_once(cid, agg);
+                        if let Err(e) =
+                            update_prd_task_passes(params.prd_path, cid, true, params.task_prefix)
+                        {
+                            eprintln!(
+                                "[slot {}] Warning: PRD update for {} failed: {}",
+                                slot_idx, cid, e
+                            );
+                        } else {
+                            eprintln!("[slot {}] Task {} completed (output scan)", slot_idx, cid);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[slot {}] Warning: complete({}) failed: {}",
+                            slot_idx, cid, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
+        agg.all_crashed = false;
+    }
+
+    // Slot's task transitioned to terminal state — drop from the pending set
+    // so the post-loop orphan reset doesn't bounce a `done` row back to
+    // `todo` on shutdown.
+    //
+    // Cross-task case: if this slot was assigned X but emitted
+    // `<completed>Y</completed>`, `mark_task_done(Y)` ran above and Y is now
+    // `done`. `slot_marked_done` is gated on `cid == tid`, so X stays in
+    // `pending_slot_tasks` and Y was never added (it was a peer slot's task
+    // or was already terminal). Both behaviors are correct: step 17.6's
+    // UPDATE is guarded by `AND status='in_progress'`, so the orphan reset
+    // is a no-op for Y (now `done`) and correctly resets X (genuinely still
+    // `in_progress` — the slot's actual task was never completed by any path).
+    if slot_marked_done && let Some(ref tid) = task_id {
+        ctx.pending_slot_tasks.retain(|t| t != tid);
+    }
+
+    // FEAT-010 AC: queue reorder hints for the next wave. `select_parallel_group`
+    // does not yet honor hints (it ranks by score), so this acts as a
+    // preservation queue — operators see them in logs and a future selection
+    // pass can drain them.
+    if let IterationOutcome::Reorder(ref rid) = result.outcome {
+        ctx.pending_reorder_hints.push(rid.clone());
+        eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
+    }
+
+    for f in &result.files_modified {
+        if !agg.aggregated_files.contains(f) {
+            agg.aggregated_files.push(f.clone());
+        }
+    }
+
+    if result.should_stop {
+        agg.wave_should_stop = true;
+    }
+}
+
+/// Count tasks still in flight for the current PRD prefix. "Done",
+/// "skipped", "irrelevant" and "blocked" are terminal — anything else is
+/// still work to do.
+fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+    let (clause, param) = prefix_and(task_prefix);
+    let sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
+         ('done','irrelevant','skipped','blocked') {clause}"
+    );
+    let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Sleep between waves so the loop respects `--iteration-delay` the same
+/// way it does between sequential iterations. Polls the signal flag every
+/// 200ms so SIGINT/SIGTERM short-circuits the delay; returns true if the
+/// signal fired during the wait so the caller can treat it as a stop.
+fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
+    if delay.is_zero() {
+        return false;
+    }
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if signal_flag.is_signaled() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Wave-mode equivalent of `run_iteration` for the parallel execution path.
+///
+/// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
+/// stale-tracker bookkeeping. Wave: spawn slots via `run_parallel_wave`,
+/// merge slot branches back to the loop branch. Post-wave: per-slot progress
+/// logging, status update dispatch, completion detection, crash policy
+/// (all-crashed → record_crash; any-completed → record_success), reorder
+/// hint queueing, external-git reconciliation, terminal-condition checks.
+///
+/// The function only mutates `IterationContext` from the main thread — slot
+/// threads inside `run_parallel_wave` never touch shared state. All file
+/// aggregation and PRD updates happen here so the per-thread invariants
+/// established by FEAT-009 stay intact.
+pub fn run_wave_iteration(
+    mut params: WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+) -> WaveOutcome {
+    if let Some(outcome) = wave_preflight_check(&params, ctx) {
+        return outcome;
+    }
+
+    // Parallel group selection. Reuses the same scoring + greedy
+    // file-overlap walk as `task-mgr next`, capped at `parallel_slots`.
+    let group = match select_parallel_group(
+        params.conn,
+        &ctx.last_files,
+        params.task_prefix,
+        params.parallel_slots,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!(
+                "Warning: select_parallel_group failed: {} (treating wave as stale)",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    if group.is_empty() {
+        return handle_no_eligible_tasks(&params, ctx);
+    }
+
+    // Selected at least one eligible task → reset stale tracker (mirrors
+    // the sequential `else` branch that calls `check("a", "b")`).
+    ctx.stale_tracker.check("a", "b");
+
+    let n_slots = group.len();
+    let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
+    let slot_contexts = build_slot_contexts(group, slot_paths);
+    let slot_params = build_shared_slot_params(&params);
+
+    // Snapshot epoch for `trigger_human_reviews`-style timestamp gating
+    // (kept here for symmetry with sequential even though human reviews
+    // are deferred per design).
+    let _completion_epoch_start: i64 = params
+        .conn
+        .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+
+    // Run wave (blocks until every spawned slot thread joins).
+    let wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
+
+    // Per-slot post-processing on the main thread.
+    let mut agg = WaveAggregator::new(wave_result.outcomes.len());
+    for slot_result in &wave_result.outcomes {
+        process_slot_result(slot_result, &mut params, ctx, &mut agg);
+    }
+
+    // CrashTracker policy per FEAT-010 AC.
+    if agg.any_completed {
+        ctx.crash_tracker.record_success();
+    } else if agg.all_crashed {
+        ctx.crash_tracker.record_crash();
+    }
+
+    // Feed the next wave's locality scoring.
+    ctx.last_files = agg.aggregated_files.clone();
+
+    // Merge ephemeral slot branches back into the main loop branch so the
+    // next wave starts from a unified base. No-op when parallel_slots <= 1.
+    // Per-slot failures (merge conflicts, spawn errors, ff failures) are
+    // logged but never fatal — slot 0 is restored to its captured pre-merge
+    // HEAD via `git reset --hard`, and the next wave still benefits from any
+    // slots that did merge.
+    if params.parallel_slots > 1 {
+        let outcomes =
+            worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots);
+        for (slot, detail) in &outcomes.failed_slots {
+            eprintln!(
+                "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
+                slot, detail
+            );
+        }
+    }
+
+    if let Err(e) = run_cmd::update(
+        params.conn,
+        params.run_id,
+        ctx.last_commit.as_deref(),
+        Some(&agg.aggregated_files),
+    ) {
+        eprintln!("Warning: failed to update run: {}", e);
+    }
+
+    // Per-wave external-git reconciliation. Mirrors the sequential
+    // "Post-iteration: reconcile external git completions" step.
+    let mut tasks_completed = agg.tasks_completed;
+    if let Some(ext_repo) = params.external_repo_path {
+        let count = reconcile_external_git_completions(
+            ext_repo,
+            params.conn,
+            params.run_id,
+            params.prd_path,
+            params.task_prefix,
+            params.external_git_scan_depth,
+        );
+        if count > 0 {
+            tasks_completed += count as u32;
+            agg.any_completed = true;
+            ctx.crash_tracker.record_success();
+            eprintln!("Post-wave reconciliation: marked {} task(s) done", count);
+        }
+    }
+
+    // Terminal conditions: signal precedes everything; crash abort wins
+    // over completion-of-all-tasks because the abort is a hard stop.
+    if params.signal_flag.is_signaled() {
+        return WaveOutcome {
+            tasks_completed,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 130,
+                reason: "signal received".to_string(),
+                run_status: None,
+            }),
+            was_stopped: false,
+        };
+    }
+    if ctx.crash_tracker.should_abort() {
+        return WaveOutcome {
+            tasks_completed,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 1,
+                reason: "too many crashes".to_string(),
+                run_status: None,
+            }),
+            was_stopped: false,
+        };
+    }
+
+    if agg.any_completed && count_remaining_active_tasks(params.conn, params.task_prefix) == 0 {
+        return WaveOutcome {
+            tasks_completed,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: 0,
+                reason: "all tasks complete".to_string(),
+                run_status: Some(RunStatus::Completed),
+            }),
+            was_stopped: false,
+        };
+    }
+
+    let mut wave_should_stop = agg.wave_should_stop;
+    if !wave_should_stop && wait_inter_wave_delay(params.inter_iteration_delay, params.signal_flag)
+    {
+        wave_should_stop = true;
+    }
+
+    WaveOutcome {
+        tasks_completed,
+        iteration_consumed: true,
+        terminal: if wave_should_stop {
+            if params.signal_flag.is_signaled() {
+                Some(WaveTerminal {
+                    exit_code: 130,
+                    reason: "signal received".to_string(),
+                    run_status: None,
+                })
+            } else {
+                Some(WaveTerminal {
+                    exit_code: 0,
+                    reason: "stop signal".to_string(),
+                    run_status: None,
+                })
+            }
+        } else {
+            None
+        },
+        was_stopped: false,
     }
 }
 
@@ -1548,6 +2747,54 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         };
     }
 
+    // Step 9.5: Parallel wave setup (FEAT-010).
+    // Wave execution requires a branch (for ephemeral slot branches) AND
+    // worktrees enabled. If the user asked for --parallel > 1 but either
+    // pre-condition is missing, we warn and silently fall back to the
+    // sequential path so the loop still makes progress instead of failing.
+    let parallel_requested = run_config.config.parallel_slots > 1;
+    let (mut parallel_active, slot_worktree_paths) = if parallel_requested {
+        match (branch_name.as_ref(), run_config.config.use_worktrees) {
+            (Some(branch), true) => match worktree::ensure_slot_worktrees(
+                &run_config.source_root,
+                branch,
+                run_config.config.parallel_slots,
+            ) {
+                Ok(paths) => {
+                    eprintln!(
+                        "Parallel mode active: {} slots ({} ephemeral branches)",
+                        run_config.config.parallel_slots,
+                        run_config.config.parallel_slots.saturating_sub(1)
+                    );
+                    (true, paths)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to set up slot worktrees: {} — falling back to sequential",
+                        e
+                    );
+                    (false, Vec::new())
+                }
+            },
+            (None, _) => {
+                eprintln!(
+                    "Warning: --parallel {} requires a branchName in the PRD; falling back to sequential",
+                    run_config.config.parallel_slots
+                );
+                (false, Vec::new())
+            }
+            (Some(_), false) => {
+                eprintln!(
+                    "Warning: --parallel {} requires use_worktrees=true; falling back to sequential",
+                    run_config.config.parallel_slots
+                );
+                (false, Vec::new())
+            }
+        }
+    } else {
+        (false, Vec::new())
+    };
+
     // Step 10: Calculate max iterations
     let max_iterations = if run_config.config.max_iterations > 0 {
         run_config.config.max_iterations as u32
@@ -1765,6 +3012,73 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         let elapsed = start_time.elapsed().as_secs();
 
+        // Parallel wave dispatch (FEAT-010). When `parallel_active` we run
+        // a wave of slot iterations and skip the rest of the sequential
+        // post-processing — `run_wave_iteration` performs its own per-slot
+        // logging, status dispatch, completion detection, crash policy, and
+        // terminal-condition checks. The outer loop only needs to track the
+        // counters and decide when to break.
+        if parallel_active {
+            // Invariant: `parallel_active` is only set when `branch_name` is
+            // Some (see step 9.5). `debug_assert!` traps in tests if a future
+            // change breaks the invariant; release builds keep the graceful
+            // sequential fallthrough rather than panicking on an inconsistency.
+            debug_assert!(
+                branch_name.is_some(),
+                "parallel_active=true must imply branch_name is Some"
+            );
+            let Some(branch) = branch_name.as_deref() else {
+                eprintln!(
+                    "Warning: parallel_active=true but branch_name is None; \
+                     falling through to sequential iteration"
+                );
+                parallel_active = false;
+                continue;
+            };
+            let wave_params = WaveIterationParams {
+                conn: &mut conn,
+                db_dir: &run_config.db_dir,
+                source_root: &run_config.source_root,
+                branch,
+                parallel_slots: run_config.config.parallel_slots,
+                slot_worktree_paths: &slot_worktree_paths,
+                iteration,
+                run_id: &run_id,
+                base_prompt_path: &paths.prompt_file,
+                permission_mode: &permission_mode,
+                signal_flag: &signal_flag,
+                default_model: default_model.as_deref(),
+                verbose: run_config.config.verbose,
+                task_prefix: task_prefix.as_deref(),
+                prd_path: paths.prd_file.as_path(),
+                progress_path: paths.progress_file.as_path(),
+                tasks_dir: paths.tasks_dir.as_path(),
+                external_repo_path: external_repo_path.as_deref(),
+                external_git_scan_depth: run_config.config.external_git_scan_depth,
+                inter_iteration_delay,
+            };
+            let outcome = run_wave_iteration(wave_params, &mut ctx);
+            tasks_completed += outcome.tasks_completed;
+            if outcome.iteration_consumed {
+                iterations_completed += 1;
+            }
+            if outcome.was_stopped {
+                was_stopped = true;
+            }
+            if let Some(t) = outcome.terminal {
+                exit_code = t.exit_code;
+                exit_reason = t.reason;
+                if let Some(s) = t.run_status {
+                    final_run_status = s;
+                }
+                break;
+            }
+            // Suppress unused-elapsed warning when the sequential branch is
+            // skipped — the value is recomputed next iteration anyway.
+            let _ = elapsed;
+            continue;
+        }
+
         let iteration_params = IterationParams {
             conn: &conn,
             db_dir: &run_config.db_dir,
@@ -1807,7 +3121,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             break;
         }
 
-        // Log progress
+        // Log progress (sequential path: slot=None)
         progress::log_iteration(
             &paths.progress_file,
             iteration,
@@ -1816,6 +3130,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             &result.files_modified,
             result.effective_model.as_deref(),
             result.effective_effort,
+            None,
         );
 
         // Extract and store key decisions (non-fatal: DB errors are warnings only)
@@ -1888,6 +3203,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             && !matches!(result.outcome, IterationOutcome::Empty)
         {
             let mut task_marked_done_this_iteration = false;
+            // Iteration output may emit `<task-status>:done`, `<completed>`,
+            // commit-detection, output-scan, and "already complete" for the
+            // same task ID — count each task at most once per iteration to
+            // keep the wave summary honest.
+            let mut counted_this_iteration: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             // If a <task-status>...:done</task-status> referenced the claimed
             // task, treat it identically to a <completed> tag: mark the task
@@ -1900,7 +3221,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             {
                 task_marked_done_this_iteration = true;
                 last_claimed_task = None;
-                tasks_completed += 1;
+                if counted_this_iteration.insert(task_id.clone()) {
+                    tasks_completed += 1;
+                }
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
                 eprintln!(
@@ -1925,7 +3248,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                             last_claimed_task = None;
                             task_marked_done_this_iteration = true;
                         }
-                        tasks_completed += 1;
+                        if counted_this_iteration.insert(completed_id.clone()) {
+                            tasks_completed += 1;
+                        }
                         result.outcome = IterationOutcome::Completed;
                         ctx.crash_tracker.record_success();
                         eprintln!(
@@ -1954,7 +3279,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     ) {
                         Ok(_) => {
                             last_claimed_task = None;
-                            tasks_completed += 1;
+                            if counted_this_iteration.insert(task_id.clone()) {
+                                tasks_completed += 1;
+                            }
                             task_marked_done_this_iteration = true;
 
                             // Override outcome so stale/crash trackers reset — task was actually completed
@@ -2012,7 +3339,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                                     task_marked_done_this_iteration = true;
                                 }
 
-                                tasks_completed += 1;
+                                if counted_this_iteration.insert(completed_id.clone()) {
+                                    tasks_completed += 1;
+                                }
 
                                 // Override outcome so stale/crash trackers reset — task was actually completed
                                 result.outcome = IterationOutcome::Completed;
@@ -2066,7 +3395,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 )
             {
                 last_claimed_task = None;
-                tasks_completed += 1;
+                if counted_this_iteration.insert(task_id.clone()) {
+                    tasks_completed += 1;
+                }
                 result.outcome = IterationOutcome::Completed;
                 ctx.crash_tracker.record_success();
                 eprintln!("Task {} completed (reported as already done)", task_id);
@@ -2246,6 +3577,28 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         }
     }
 
+    // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
+    // mode is fully covered by step 17.5 above; the wave path tracks every
+    // claimed task in `ctx.pending_slot_tasks` and removes it on `done`, so
+    // anything remaining was claimed but never closed (deadline / max-iter
+    // exit, slot crash, or output without a `<completed>` tag).
+    for task_id in &ctx.pending_slot_tasks {
+        if Some(task_id) == last_claimed_task.as_ref() {
+            continue; // already handled by step 17.5
+        }
+        match conn.execute(
+            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
+            [task_id],
+        ) {
+            Ok(1) => eprintln!("Reset uncompleted slot task {} to todo", task_id),
+            Ok(_) => {} // already terminal
+            Err(e) => eprintln!(
+                "Warning: failed to reset slot task {}: {}",
+                task_id, e
+            ),
+        }
+    }
+
     // Step 18: Record session guidance if any
     record_session_guidance(
         &ctx.session_guidance,
@@ -2266,6 +3619,24 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // Step 21: Cleanup
     deadline::cleanup_deadline(&paths.tasks_dir, &prd_basename);
     signals::cleanup_signal_files_for_prefix(&paths.tasks_dir, task_prefix.as_deref());
+
+    // Step 21.4: Slot worktree cleanup (parallel mode only).
+    // Removes ephemeral slot worktrees (slots 1+) and their branches. Slot 0
+    // is the loop's main branch worktree and is handled by step 21.5 below.
+    // Always runs on shutdown so a crash does not leak stray worktrees.
+    if parallel_active
+        && let Some(ref branch) = branch_name
+        && let Err(e) = worktree::cleanup_slot_worktrees(
+            &run_config.source_root,
+            branch,
+            run_config.config.parallel_slots,
+        )
+    {
+        eprintln!(
+            "Warning: cleanup_slot_worktrees failed: {} — leaving slot worktrees intact",
+            e
+        );
+    }
 
     // Step 21.5: Worktree cleanup (if a worktree was used)
     if let Some(ref wt_path) = actual_worktree_path {
@@ -2568,8 +3939,8 @@ pub fn on_run_completed(conn: &Connection, task_prefix: Option<&str>) {
             let defaults = calibrate::SelectionWeights::default();
             if weights != defaults {
                 eprintln!(
-                    "Calibrated selection weights: file_overlap={}, synergy={}, conflict={}, priority_base={}",
-                    weights.file_overlap, weights.synergy, weights.conflict, weights.priority_base
+                    "Calibrated selection weights: file_overlap={}, priority_base={}",
+                    weights.file_overlap, weights.priority_base
                 );
             }
         }
@@ -4987,5 +6358,1246 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status_b, "done");
+    }
+
+    // --- Parallel wave execution engine tests (FEAT-009) ---
+
+    mod wave {
+        use super::*;
+        use crate::loop_engine::config::PermissionMode;
+        use crate::loop_engine::test_utils::{insert_task, insert_task_file};
+        use crate::models::Task;
+        use std::sync::atomic::Ordering;
+
+        /// Build a minimal SlotIterationParams wired to a test DB.
+        /// `signal_flag` is shared so tests can observe/trip it across slots.
+        fn make_slot_params(
+            db_dir: &Path,
+            base_prompt_path: PathBuf,
+            signal_flag: SignalFlag,
+        ) -> SlotIterationParams {
+            SlotIterationParams {
+                db_dir: db_dir.to_path_buf(),
+                base_prompt_path,
+                permission_mode: PermissionMode::Dangerous,
+                signal_flag,
+                default_model: None,
+                verbose: false,
+            }
+        }
+
+        fn make_slot(slot_index: usize, working_root: PathBuf, task: Task) -> SlotContext {
+            SlotContext {
+                slot_index,
+                working_root,
+                task,
+                last_activity_epoch: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        // --- Struct field contracts (AC 1-3) ---
+
+        #[test]
+        fn test_slot_context_fields() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let task = Task::new("FEAT-1", "t");
+            let ctx = make_slot(2, tmp.path().to_path_buf(), task);
+            assert_eq!(ctx.slot_index, 2);
+            assert_eq!(ctx.working_root, tmp.path());
+            assert_eq!(ctx.task.id, "FEAT-1");
+            assert_eq!(ctx.last_activity_epoch.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn test_slot_result_fields() {
+            let sr = SlotResult {
+                slot_index: 1,
+                iteration_result: IterationResult {
+                    outcome: IterationOutcome::Completed,
+                    task_id: Some("FEAT-1".to_string()),
+                    files_modified: vec!["a.rs".to_string()],
+                    should_stop: false,
+                    output: String::new(),
+                    effective_model: None,
+                    effective_effort: None,
+                    key_decisions_count: 0,
+                },
+                claim_succeeded: true,
+            };
+            assert_eq!(sr.slot_index, 1);
+            assert!(matches!(
+                sr.iteration_result.outcome,
+                IterationOutcome::Completed
+            ));
+        }
+
+        #[test]
+        fn test_wave_result_fields() {
+            let wr = WaveResult {
+                outcomes: vec![],
+                wave_duration: Duration::from_millis(10),
+            };
+            assert!(wr.outcomes.is_empty());
+            assert!(wr.wave_duration >= Duration::from_millis(10));
+        }
+
+        // --- run_slot_iteration: early exit on pre-signaled flag (AC 8) ---
+
+        #[test]
+        fn test_run_slot_iteration_honors_pre_set_signal_flag() {
+            let (temp, _conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            let signal = SignalFlag::new();
+            signal.set(); // pre-signal — slot must bail before spawning Claude
+            let params = make_slot_params(temp.path(), base_prompt, signal);
+
+            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-1", "t"));
+            let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
+            assert_eq!(result.slot_index, 0);
+            assert!(matches!(
+                result.iteration_result.outcome,
+                IterationOutcome::Empty
+            ));
+            assert!(result.iteration_result.should_stop);
+            assert_eq!(result.iteration_result.task_id.as_deref(), Some("FEAT-1"),);
+        }
+
+        // --- build_slot_prompt: includes task JSON + completion instruction ---
+
+        #[test]
+        fn test_build_slot_prompt_contains_task_and_completion_sections() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base = tmp.path().join("base.md");
+            std::fs::write(&base, "BASE_PROMPT_CONTENT").unwrap();
+
+            let mut task = Task::new("FEAT-42", "Do the thing");
+            task.description = Some("Detailed desc".to_string());
+            task.difficulty = Some("high".to_string());
+
+            let prompt = build_slot_prompt(&task, &base);
+            assert!(prompt.contains("FEAT-42"), "missing task id");
+            assert!(prompt.contains("Do the thing"), "missing title");
+            assert!(prompt.contains("Detailed desc"), "missing description");
+            assert!(prompt.contains("\"difficulty\""), "missing difficulty");
+            assert!(
+                prompt.contains("<completed>FEAT-42</completed>"),
+                "missing completion tag instruction",
+            );
+            assert!(
+                prompt.contains("BASE_PROMPT_CONTENT"),
+                "missing base prompt content",
+            );
+        }
+
+        #[test]
+        fn test_build_slot_prompt_tolerates_missing_base_prompt() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let task = Task::new("FEAT-1", "t");
+            // base_prompt_path does not exist — must not panic
+            let prompt = build_slot_prompt(&task, &tmp.path().join("does-not-exist.md"));
+            assert!(prompt.contains("FEAT-1"));
+        }
+
+        // --- load_task_files ---
+
+        #[test]
+        fn test_load_task_files_returns_sorted_paths() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "todo", 10);
+            insert_task_file(&conn, "FEAT-1", "src/z.rs");
+            insert_task_file(&conn, "FEAT-1", "src/a.rs");
+            let files = load_task_files(&conn, "FEAT-1");
+            assert_eq!(files, vec!["src/a.rs", "src/z.rs"]);
+        }
+
+        #[test]
+        fn test_load_task_files_empty_for_unknown_task() {
+            let (_tmp, conn) = setup_test_db();
+            let files = load_task_files(&conn, "FEAT-MISSING");
+            assert!(files.is_empty());
+        }
+
+        // --- claim_slot_task ---
+
+        #[test]
+        fn test_claim_slot_task_updates_todo_to_in_progress() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "todo", 10);
+            assert!(claim_slot_task(&conn, "FEAT-1"));
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-1'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "in_progress");
+        }
+
+        #[test]
+        fn test_claim_slot_task_idempotent_on_already_in_progress() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "in_progress", 10);
+            // UPDATE matches because WHERE clause accepts in_progress too
+            assert!(claim_slot_task(&conn, "FEAT-1"));
+        }
+
+        #[test]
+        fn test_claim_slot_task_rejects_done_task() {
+            let (_tmp, conn) = setup_test_db();
+            insert_task(&conn, "FEAT-1", "t", "done", 10);
+            assert!(!claim_slot_task(&conn, "FEAT-1"));
+        }
+
+        // --- run_parallel_wave: orchestration + panic handling (AC 9, 10, 11, 12) ---
+
+        #[test]
+        fn test_run_parallel_wave_empty_slots_returns_empty_outcomes() {
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            let params = Arc::new(make_slot_params(
+                temp.path(),
+                base_prompt,
+                SignalFlag::new(),
+            ));
+            let wave = run_parallel_wave(&conn, vec![], params);
+            assert!(wave.outcomes.is_empty());
+        }
+
+        #[test]
+        fn test_run_parallel_wave_reports_claim_failure_for_done_task() {
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            // Task is already done — claim_slot_task returns false; wave must
+            // emit a Crash(RuntimeError) entry rather than silently drop the slot.
+            insert_task(&conn, "FEAT-DONE", "t", "done", 10);
+
+            let signal = SignalFlag::new();
+            // Pre-signal so if the claim logic regresses and still spawns Claude,
+            // the slot's early-signal check bails before touching the network.
+            signal.set();
+            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+
+            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-DONE", "t"));
+            let wave = run_parallel_wave(&conn, vec![slot], params);
+            assert_eq!(wave.outcomes.len(), 1);
+            assert_eq!(wave.outcomes[0].slot_index, 0);
+            assert!(matches!(
+                wave.outcomes[0].iteration_result.outcome,
+                IterationOutcome::Crash(_)
+            ));
+            assert_eq!(
+                wave.outcomes[0].iteration_result.task_id.as_deref(),
+                Some("FEAT-DONE"),
+            );
+        }
+
+        #[test]
+        fn test_run_parallel_wave_claims_all_tasks_before_spawning() {
+            // Main-thread claim must flip every task to in_progress before any
+            // slot thread runs. We verify by pre-signaling so slot threads bail
+            // immediately; the DB must still show in_progress for both tasks.
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            insert_task(&conn, "FEAT-A", "a", "todo", 10);
+            insert_task(&conn, "FEAT-B", "b", "todo", 10);
+
+            let signal = SignalFlag::new();
+            signal.set();
+            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+
+            let slot_a = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a"));
+            let slot_b = make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b"));
+
+            let wave = run_parallel_wave(&conn, vec![slot_a, slot_b], params);
+            assert_eq!(wave.outcomes.len(), 2);
+
+            let status_a: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-A'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let status_b: String = conn
+                .query_row("SELECT status FROM tasks WHERE id = 'FEAT-B'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status_a, "in_progress");
+            assert_eq!(status_b, "in_progress");
+        }
+
+        #[test]
+        fn test_run_parallel_wave_outcomes_sorted_by_slot_index() {
+            // Mix claim-failure and successful pre-signal early-exits to force
+            // the reorder path. Outcomes must always emerge slot-ordered.
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            insert_task(&conn, "FEAT-A", "a", "todo", 10);
+            insert_task(&conn, "FEAT-B", "b", "done", 10); // claim fails
+            insert_task(&conn, "FEAT-C", "c", "todo", 10);
+
+            let signal = SignalFlag::new();
+            signal.set();
+            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+
+            let slots = vec![
+                make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
+                make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
+                make_slot(2, tmp.path().to_path_buf(), Task::new("FEAT-C", "c")),
+            ];
+
+            let wave = run_parallel_wave(&conn, slots, params);
+            assert_eq!(wave.outcomes.len(), 3);
+            assert_eq!(wave.outcomes[0].slot_index, 0);
+            assert_eq!(wave.outcomes[1].slot_index, 1);
+            assert_eq!(wave.outcomes[2].slot_index, 2);
+        }
+
+        #[test]
+        fn test_run_parallel_wave_measures_wall_clock_duration() {
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+
+            let params = Arc::new(make_slot_params(
+                temp.path(),
+                base_prompt,
+                SignalFlag::new(),
+            ));
+            let wave = run_parallel_wave(&conn, vec![], params);
+            // Empty wave still records a non-negative duration; ensures the
+            // Instant::now() → elapsed() contract holds.
+            assert!(wave.wave_duration < Duration::from_secs(5));
+        }
+
+        // --- run_wave_iteration: dispatch & policy (FEAT-010) ---
+
+        #[allow(clippy::too_many_arguments)]
+        fn make_wave_params<'a>(
+            conn: &'a mut Connection,
+            db_dir: &'a Path,
+            source_root: &'a Path,
+            branch: &'a str,
+            slot_paths: &'a [PathBuf],
+            base_prompt: &'a Path,
+            permission_mode: &'a PermissionMode,
+            signal_flag: &'a SignalFlag,
+            tasks_dir: &'a Path,
+            prd_path: &'a Path,
+            progress_path: &'a Path,
+            parallel_slots: usize,
+        ) -> WaveIterationParams<'a> {
+            WaveIterationParams {
+                conn,
+                db_dir,
+                source_root,
+                branch,
+                parallel_slots,
+                slot_worktree_paths: slot_paths,
+                iteration: 1,
+                run_id: "test-run",
+                base_prompt_path: base_prompt,
+                permission_mode,
+                signal_flag,
+                default_model: None,
+                verbose: false,
+                task_prefix: None,
+                prd_path,
+                progress_path,
+                tasks_dir,
+                external_repo_path: None,
+                external_git_scan_depth: 50,
+                inter_iteration_delay: Duration::ZERO,
+            }
+        }
+
+        #[test]
+        fn test_run_wave_iteration_pre_set_signal_returns_terminal_signal() {
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            signal.set();
+            let mut ctx = IterationContext::new(5);
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                ),
+                &mut ctx,
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Some(WaveTerminal { exit_code: 130, .. })
+            ));
+            assert!(!outcome.iteration_consumed);
+            assert_eq!(outcome.tasks_completed, 0);
+        }
+
+        #[test]
+        fn test_run_wave_iteration_no_eligible_tasks_increments_stale_tracker() {
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(5);
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                ),
+                &mut ctx,
+            );
+            // Empty DB → empty group → wave consumes the iteration but does
+            // not flag terminal; stale_tracker bumps so 3 such waves abort.
+            assert!(outcome.terminal.is_none());
+            assert!(outcome.iteration_consumed);
+            assert_eq!(ctx.stale_tracker.count(), 1);
+            // log_iteration must have written a NoEligibleTasks entry.
+            let log = std::fs::read_to_string(&progress).unwrap();
+            assert!(log.contains("NoEligibleTasks"), "got: {log}");
+        }
+
+        #[test]
+        fn test_run_wave_iteration_third_no_eligible_wave_aborts_via_stale() {
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(5);
+            // Pre-stale twice so the next NoEligibleTasks wave hits threshold=3.
+            ctx.stale_tracker.check("x", "x");
+            ctx.stale_tracker.check("x", "x");
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                ),
+                &mut ctx,
+            );
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 1);
+            assert!(t.reason.contains("no eligible tasks"), "got: {}", t.reason);
+            assert!(t.run_status.is_none());
+        }
+
+        #[test]
+        fn test_run_wave_iteration_crash_should_abort_returns_terminal() {
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+            let signal = SignalFlag::new();
+            let mut ctx = IterationContext::new(1); // first crash aborts
+            ctx.crash_tracker.record_crash();
+            assert!(ctx.crash_tracker.should_abort());
+            let outcome = run_wave_iteration(
+                make_wave_params(
+                    &mut conn,
+                    temp.path(),
+                    tmp.path(),
+                    "main",
+                    &[],
+                    &base_prompt,
+                    &mode,
+                    &signal,
+                    tmp.path(),
+                    &prd,
+                    &progress,
+                    2,
+                ),
+                &mut ctx,
+            );
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(t.exit_code, 1);
+            assert!(t.reason.contains("too many crashes"), "got: {}", t.reason);
+        }
+
+        #[test]
+        fn test_run_wave_iteration_signal_during_inter_wave_delay_returns_130() {
+            // Regression: signal fired during inter-wave delay must return exit
+            // code 130 ("signal received"), not 0 ("stop signal"), so operators
+            // can distinguish SIGINT/SIGTERM from a clean .stop-file termination.
+            //
+            // Setup: point CLAUDE_BINARY at a nonexistent path so each slot
+            // thread fails instantly (no real Claude spawn), letting run_parallel_wave
+            // complete in microseconds.  Then the 500 ms delay starts, and the
+            // background thread fires the signal at 100 ms — well inside the
+            // delay window and well after steps 0-13 have already passed without
+            // seeing the signal.
+            let _env_lock = crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX
+                .lock()
+                .unwrap();
+            let _env_guard = crate::loop_engine::test_utils::EnvGuard::set(
+                "CLAUDE_BINARY",
+                "/nonexistent_binary_for_test",
+            );
+
+            let (temp, mut conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "base").unwrap();
+            let prd = tmp.path().join("prd.json");
+            let progress = tmp.path().join("progress.txt");
+            let mode = PermissionMode::Dangerous;
+
+            // Insert an eligible task so select_parallel_group returns it and
+            // run_parallel_wave actually spawns a slot thread (which fails fast
+            // because CLAUDE_BINARY is invalid, so should_stop stays false and
+            // step 13 sees no signal yet).
+            insert_task(&conn, "FEAT-DELAY-SIGNAL", "delay signal test", "todo", 1);
+
+            let signal = SignalFlag::new();
+            let signal_clone = signal.clone();
+            // Fire at 100 ms: steps 0-13 complete in < 10 ms (slot fails at process
+            // spawn with ENOENT), so the signal always lands inside the 500 ms delay.
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                signal_clone.set();
+            });
+
+            let mut ctx = IterationContext::new(5);
+            let outcome = run_wave_iteration(
+                WaveIterationParams {
+                    conn: &mut conn,
+                    db_dir: temp.path(),
+                    source_root: tmp.path(),
+                    branch: "main",
+                    parallel_slots: 1,
+                    slot_worktree_paths: &[tmp.path().to_path_buf()],
+                    iteration: 1,
+                    run_id: "test-run",
+                    base_prompt_path: &base_prompt,
+                    permission_mode: &mode,
+                    signal_flag: &signal,
+                    default_model: None,
+                    verbose: false,
+                    task_prefix: None,
+                    prd_path: &prd,
+                    progress_path: &progress,
+                    tasks_dir: tmp.path(),
+                    external_repo_path: None,
+                    external_git_scan_depth: 50,
+                    inter_iteration_delay: Duration::from_millis(500),
+                },
+                &mut ctx,
+            );
+            let t = outcome.terminal.expect("terminal expected");
+            assert_eq!(
+                t.exit_code, 130,
+                "expected 130 for SIGINT during delay, got {}",
+                t.exit_code
+            );
+            assert_eq!(t.reason, "signal received", "got: {}", t.reason);
+        }
+
+        #[test]
+        fn test_iteration_context_initializes_pending_reorder_hints_empty() {
+            let ctx = IterationContext::new(5);
+            assert!(ctx.pending_reorder_hints.is_empty());
+        }
+
+        // --- SlotIterationParams cloneability (Arc + clone into threads) ---
+
+        #[test]
+        fn test_slot_iteration_params_is_clone() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let params = SlotIterationParams {
+                db_dir: tmp.path().to_path_buf(),
+                base_prompt_path: tmp.path().join("base.md"),
+                permission_mode: PermissionMode::Dangerous,
+                signal_flag: SignalFlag::new(),
+                default_model: Some(OPUS_MODEL.to_string()),
+                verbose: true,
+            };
+            let cloned = params.clone();
+            assert_eq!(cloned.db_dir, params.db_dir);
+            assert_eq!(cloned.verbose, params.verbose);
+            assert_eq!(cloned.default_model.as_deref(), Some(OPUS_MODEL));
+        }
+
+        // --- TEST-001: Comprehensive parallel execution tests -------------
+        //
+        // End-to-end behavior of `run_parallel_wave` and `run_wave_iteration`
+        // using a mock Claude binary. Every test here mutates the process-wide
+        // `CLAUDE_BINARY` env var, so each one takes the shared mutex to
+        // serialize with other tests that touch the same variable.
+        mod comprehensive {
+            use super::*;
+            use crate::loop_engine::test_utils::{CLAUDE_BINARY_MUTEX, EnvGuard, insert_run};
+            use std::io::Write as _;
+            use std::os::unix::fs::PermissionsExt as _;
+
+            /// Create a mock `claude` script for wave tests.
+            ///
+            /// Behavior:
+            /// - Reads prompt from stdin (how `spawn_claude` delivers it).
+            /// - Extracts `TASK_ID` from the task JSON `"id": "TASK-ID"` line.
+            /// - Emits one stream-json `result` line so the claude wrapper's
+            ///   stream-json parser yields `<completed>TASK-ID</completed>`
+            ///   as the slot's output text.
+            /// - When the `MOCK_CRASH_TASKS` env var lists the extracted id
+            ///   (comma-delimited), exit 1 with no output so the slot outcome
+            ///   becomes `Crash(RuntimeError)`.
+            ///
+            /// The caller removes the script with `std::fs::remove_file` after
+            /// the wave completes.
+            fn make_mock_script(name: &str) -> PathBuf {
+                let path = std::env::temp_dir().join(format!("task_mgr_test_wave_{name}.sh"));
+                {
+                    let mut f = std::fs::File::create(&path).unwrap();
+                    writeln!(f, "#!/bin/sh").unwrap();
+                    writeln!(f, r#"PROMPT=$(cat)"#).unwrap();
+                    writeln!(
+                        f,
+                        r#"TASK_ID=$(printf '%s' "$PROMPT" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' | head -n 1)"#
+                    )
+                    .unwrap();
+                    writeln!(
+                        f,
+                        r#"case ",${{MOCK_CRASH_TASKS:-}}," in *",${{TASK_ID}},"*) exit 1 ;; esac"#
+                    )
+                    .unwrap();
+                    writeln!(
+                        f,
+                        r#"printf '{{"type":"result","result":"<completed>%s</completed>"}}\n' "$TASK_ID""#
+                    )
+                    .unwrap();
+                }
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            }
+
+            /// Fetch a task's status, panicking if the row is missing.
+            fn task_status(conn: &Connection, id: &str) -> String {
+                conn.query_row("SELECT status FROM tasks WHERE id = ?", [id], |r| r.get(0))
+                    .unwrap()
+            }
+
+            /// Minimal PRD with the given ids so `update_prd_task_passes`
+            /// finds matching `userStories` entries to flip `passes=true` on.
+            fn write_prd(dir: &Path, ids: &[&str]) -> PathBuf {
+                use serde_json::json;
+                let stories: Vec<_> = ids
+                    .iter()
+                    .map(|id| json!({"id": id, "title": "t", "priority": 10, "passes": false}))
+                    .collect();
+                let path = dir.join("prd.json");
+                std::fs::write(
+                    &path,
+                    serde_json::to_string(&json!({"userStories": stories})).unwrap(),
+                )
+                .unwrap();
+                path
+            }
+
+            /// Assemble a WaveIterationParams for the common test wiring.
+            #[allow(clippy::too_many_arguments)]
+            fn build_wave_params<'a>(
+                conn: &'a mut Connection,
+                db_dir: &'a Path,
+                source_root: &'a Path,
+                slot_paths: &'a [PathBuf],
+                base_prompt: &'a Path,
+                permission_mode: &'a PermissionMode,
+                signal_flag: &'a SignalFlag,
+                prd_path: &'a Path,
+                progress_path: &'a Path,
+                parallel_slots: usize,
+                run_id: &'a str,
+            ) -> WaveIterationParams<'a> {
+                WaveIterationParams {
+                    conn,
+                    db_dir,
+                    source_root,
+                    branch: "main",
+                    parallel_slots,
+                    slot_worktree_paths: slot_paths,
+                    iteration: 1,
+                    run_id,
+                    base_prompt_path: base_prompt,
+                    permission_mode,
+                    signal_flag,
+                    default_model: None,
+                    verbose: false,
+                    task_prefix: None,
+                    prd_path,
+                    progress_path,
+                    tasks_dir: source_root,
+                    external_repo_path: None,
+                    external_git_scan_depth: 50,
+                    inter_iteration_delay: Duration::ZERO,
+                }
+            }
+
+            /// AC1: two non-conflicting tasks complete in one wave (--parallel 2).
+            ///
+            /// Two eligible tasks with disjoint `touchesFiles` fill both slots;
+            /// the mock emits `<completed>` for each, so both rows flip to
+            /// `done` and `tasks_completed == 2` after the wave.
+            #[test]
+            fn test_wave_two_disjoint_tasks_both_complete() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("two_complete");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-complete";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-A", "Task A", "todo", 10);
+                insert_task(&conn, "FEAT-B", "Task B", "todo", 20);
+                insert_task_file(&conn, "FEAT-A", "src/a.rs");
+                insert_task_file(&conn, "FEAT-B", "src/b.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-A", "FEAT-B"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 2,
+                    "both slots should complete their tasks"
+                );
+                assert!(outcome.iteration_consumed);
+                assert_eq!(task_status(&conn, "FEAT-A"), "done");
+                assert_eq!(task_status(&conn, "FEAT-B"), "done");
+            }
+
+            /// AC2: signal during wave terminates all slots.
+            ///
+            /// Pre-set the shared signal before the wave starts. Steps 0/13 of
+            /// `run_wave_iteration` short-circuit on signal, so the direct
+            /// wave-iteration path is covered by
+            /// `test_run_wave_iteration_pre_set_signal_returns_terminal_signal`.
+            /// This test exercises `run_parallel_wave` itself: every spawned
+            /// slot thread must observe the signal and bail out of its iteration
+            /// without ever reaching the mock Claude process.
+            #[test]
+            fn test_wave_pre_signal_terminates_every_slot() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // Point the binary at a path that would crash if spawned, so a
+                // regression that skips the signal check would surface as a
+                // non-Empty outcome instead of a silent pass.
+                let _guard = EnvGuard::set("CLAUDE_BINARY", "/nonexistent_binary_for_signal_test");
+
+                let (temp, conn) = setup_test_db();
+                insert_task(&conn, "FEAT-A", "a", "todo", 10);
+                insert_task(&conn, "FEAT-B", "b", "todo", 20);
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+
+                let signal = SignalFlag::new();
+                signal.set();
+                let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal.clone()));
+
+                let slots = vec![
+                    make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
+                    make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
+                ];
+                let wave = run_parallel_wave(&conn, slots, params);
+
+                assert_eq!(wave.outcomes.len(), 2, "every slot must report an outcome");
+                for outcome in &wave.outcomes {
+                    assert!(
+                        outcome.iteration_result.should_stop,
+                        "slot {} must stop on signal",
+                        outcome.slot_index
+                    );
+                    assert!(
+                        matches!(outcome.iteration_result.outcome, IterationOutcome::Empty),
+                        "slot {} outcome must be Empty on pre-set signal, got {:?}",
+                        outcome.slot_index,
+                        outcome.iteration_result.outcome
+                    );
+                }
+            }
+
+            /// AC3: crash in one slot doesn't affect other slots.
+            ///
+            /// Mock crashes slot 0 (`FEAT-CRASH`) by setting `MOCK_CRASH_TASKS`
+            /// to that id; slot 1 (`FEAT-OK`) completes normally. We expect
+            /// one `Crash(RuntimeError)` outcome plus one completion mark; the
+            /// completion must not be lost because its peer crashed.
+            #[test]
+            fn test_wave_crash_in_one_slot_does_not_affect_others() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("mixed_crash");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-mixed";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-CRASH", "crash slot", "todo", 10);
+                insert_task(&conn, "FEAT-OK", "passing slot", "todo", 20);
+                insert_task_file(&conn, "FEAT-CRASH", "src/crash.rs");
+                insert_task_file(&conn, "FEAT-OK", "src/ok.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-CRASH", "FEAT-OK"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 1,
+                    "the non-crashing slot must still mark its task done"
+                );
+                assert_eq!(task_status(&conn, "FEAT-OK"), "done");
+                assert_ne!(
+                    task_status(&conn, "FEAT-CRASH"),
+                    "done",
+                    "the crashed slot must not mark its task done"
+                );
+            }
+
+            /// AC4: `--parallel 1` produces identical behavior to sequential.
+            ///
+            /// With `parallel_slots=1` and three eligible disjoint-file tasks,
+            /// `select_parallel_group` caps at one task — the same pick
+            /// sequential `select_next_task` would make. After the wave, the
+            /// winning task is `done` and the other two are still `todo`.
+            #[test]
+            fn test_wave_parallel_slots_one_runs_a_single_task() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("parallel_one");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-parallel-one";
+                insert_run(&conn, run_id);
+                // Priorities: 10 wins, 20 and 30 must not be touched.
+                insert_task(&conn, "FEAT-WIN", "winner", "todo", 10);
+                insert_task(&conn, "FEAT-SKIP1", "skip 1", "todo", 20);
+                insert_task(&conn, "FEAT-SKIP2", "skip 2", "todo", 30);
+                insert_task_file(&conn, "FEAT-WIN", "src/win.rs");
+                insert_task_file(&conn, "FEAT-SKIP1", "src/skip1.rs");
+                insert_task_file(&conn, "FEAT-SKIP2", "src/skip2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-WIN", "FEAT-SKIP1", "FEAT-SKIP2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        1,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(outcome.tasks_completed, 1, "exactly one slot runs");
+                assert_eq!(task_status(&conn, "FEAT-WIN"), "done");
+                assert_eq!(
+                    task_status(&conn, "FEAT-SKIP1"),
+                    "todo",
+                    "lower-priority task must be untouched by --parallel 1"
+                );
+                assert_eq!(task_status(&conn, "FEAT-SKIP2"), "todo");
+
+                // Only one progress entry was emitted — matches sequential cadence.
+                let log = std::fs::read_to_string(&progress).unwrap();
+                assert_eq!(
+                    log.matches("- Task: FEAT-").count(),
+                    1,
+                    "exactly one task entry in progress, got: {log}"
+                );
+            }
+
+            /// AC5: parallel group with all-overlapping tasks degenerates to
+            /// sequential.
+            ///
+            /// Three tasks all touch `src/shared.rs`. Even with
+            /// `parallel_slots=3`, `select_parallel_group` returns a group of
+            /// one; the wave runs a single slot and only the highest-priority
+            /// task advances.
+            #[test]
+            fn test_wave_all_overlapping_tasks_run_sequentially() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("all_overlap");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-overlap";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-HOT1", "hot 1", "todo", 10);
+                insert_task(&conn, "FEAT-HOT2", "hot 2", "todo", 20);
+                insert_task(&conn, "FEAT-HOT3", "hot 3", "todo", 30);
+                for id in ["FEAT-HOT1", "FEAT-HOT2", "FEAT-HOT3"] {
+                    insert_task_file(&conn, id, "src/shared.rs");
+                }
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-HOT1", "FEAT-HOT2", "FEAT-HOT3"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![
+                    tmp.path().to_path_buf(),
+                    tmp.path().to_path_buf(),
+                    tmp.path().to_path_buf(),
+                ];
+
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        3,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    outcome.tasks_completed, 1,
+                    "file-conflict collapse must leave only one slot running"
+                );
+                assert_eq!(task_status(&conn, "FEAT-HOT1"), "done");
+                assert_eq!(task_status(&conn, "FEAT-HOT2"), "todo");
+                assert_eq!(task_status(&conn, "FEAT-HOT3"), "todo");
+            }
+
+            /// AC7 — CrashTracker wave policy: all-slot crash increments the
+            /// tracker, any-slot success resets it.
+            ///
+            /// Two tasks → both crash → `record_crash()` called so
+            /// `ctx.crash_tracker.count() == 1` after the wave.
+            #[test]
+            fn test_wave_crash_tracker_all_crashed_increments() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("all_crash");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                // Both tasks crash.
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-X,FEAT-Y");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-all-crash";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-X", "x", "todo", 10);
+                insert_task(&conn, "FEAT-Y", "y", "todo", 20);
+                insert_task_file(&conn, "FEAT-X", "src/x.rs");
+                insert_task_file(&conn, "FEAT-Y", "src/y.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-X", "FEAT-Y"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(10);
+                assert_eq!(ctx.crash_tracker.count(), 0);
+
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(outcome.tasks_completed, 0, "no slot should complete");
+                assert_eq!(
+                    ctx.crash_tracker.count(),
+                    1,
+                    "all-slots-crashed must bump the crash tracker exactly once per wave"
+                );
+            }
+
+            /// AC7 — mirror: at least one slot completes, so the crash tracker
+            /// resets even if a sibling crashed. Seeds `count = 2` first so the
+            /// reset-to-zero assertion is meaningful.
+            #[test]
+            fn test_wave_crash_tracker_any_completed_resets() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("mixed_reset");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::set("MOCK_CRASH_TASKS", "FEAT-CRASH");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-mixed-reset";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-CRASH", "c", "todo", 10);
+                insert_task(&conn, "FEAT-OK2", "ok", "todo", 20);
+                insert_task_file(&conn, "FEAT-CRASH", "src/crash2.rs");
+                insert_task_file(&conn, "FEAT-OK2", "src/ok2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-CRASH", "FEAT-OK2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(10);
+                ctx.crash_tracker.record_crash();
+                ctx.crash_tracker.record_crash();
+                assert_eq!(ctx.crash_tracker.count(), 2);
+
+                run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                assert_eq!(
+                    ctx.crash_tracker.count(),
+                    0,
+                    "any-slot success must reset the crash tracker to zero"
+                );
+            }
+
+            /// AC8: progress file entries include slot numbers.
+            ///
+            /// After a 2-slot wave, the progress log must carry per-slot
+            /// headers (`Iteration N Slot M`) and body lines (`- Slot: M`)
+            /// so operators can correlate entries with wave slots.
+            #[test]
+            fn test_wave_progress_entries_include_slot_numbers() {
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("progress_slots");
+                let _bin_guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-progress";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-P1", "p1", "todo", 10);
+                insert_task(&conn, "FEAT-P2", "p2", "todo", 20);
+                insert_task_file(&conn, "FEAT-P1", "src/p1.rs");
+                insert_task_file(&conn, "FEAT-P2", "src/p2.rs");
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-P1", "FEAT-P2"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let mut ctx = IterationContext::new(5);
+                run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                    ),
+                    &mut ctx,
+                );
+
+                let _ = std::fs::remove_file(&script);
+
+                let log = std::fs::read_to_string(&progress).expect("progress file exists");
+                assert!(
+                    log.contains("Iteration 1 Slot 0"),
+                    "progress must tag slot 0 in iteration 1 header, got: {log}"
+                );
+                assert!(
+                    log.contains("Iteration 1 Slot 1"),
+                    "progress must tag slot 1 in iteration 1 header, got: {log}"
+                );
+                assert!(
+                    log.contains("- Slot: 0"),
+                    "progress body must contain '- Slot: 0', got: {log}"
+                );
+                assert!(
+                    log.contains("- Slot: 1"),
+                    "progress body must contain '- Slot: 1', got: {log}"
+                );
+            }
+        }
     }
 }

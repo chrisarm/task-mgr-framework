@@ -333,17 +333,17 @@ fn build_batch_items(
     Ok(items)
 }
 
-/// Applies a slice of proposals within a single transaction.
+/// Applies a slice of proposals, one `edit_learning` call per proposal.
 /// Returns the number of learnings actually enriched.
-/// On any error, rolls back the transaction and propagates the error.
+/// Each `edit_learning` manages its own transaction; this avoids nesting BEGIN
+/// inside the unchecked_transaction that `edit_learning` opens internally.
 fn apply_proposals_in_transaction(
     conn: &Connection,
     proposals: &[EnrichProposal],
 ) -> TaskMgrResult<usize> {
-    let tx = conn.unchecked_transaction()?;
     let mut enriched = 0usize;
     for proposal in proposals {
-        let Some(learning) = get_learning(&tx, proposal.learning_id)? else {
+        let Some(learning) = get_learning(conn, proposal.learning_id)? else {
             continue;
         };
         let current_files = learning.applies_to_files.as_deref();
@@ -353,11 +353,10 @@ fn apply_proposals_in_transaction(
         if let Some(edit_params) =
             proposal_to_edit_params(current_files, current_task_types, current_errors, proposal)
         {
-            edit_learning(&tx, proposal.learning_id, edit_params)?;
+            edit_learning(conn, proposal.learning_id, edit_params)?;
             enriched += 1;
         }
     }
-    tx.commit()?;
     Ok(enriched)
 }
 

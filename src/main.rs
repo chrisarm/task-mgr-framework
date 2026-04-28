@@ -56,6 +56,17 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 fn main() {
     let mut cli = Cli::parse();
 
+    // Make machine-readable output mode observable to library helpers that
+    // emit informational stderr notes (e.g., `loop_engine::env::resolve_paths`
+    // sibling-worktree fallback). The `human_output_enabled()` predicate
+    // keys off this var. Set before any thread spawns so it propagates to
+    // every subprocess.
+    if cli.format == OutputFormat::Json {
+        // SAFETY: single-threaded context — no other thread can observe the
+        // mutation. clap parsing runs synchronously above.
+        unsafe { std::env::set_var("TASK_MGR_FORMAT", "json") };
+    }
+
     // Resolve --dir to a canonical absolute path *once*, so every subcommand
     // inherits the same DB directory. See `src/db/path.rs` for the rules and
     // the worktree bug this fixes (spawned subprocesses creating stray
@@ -182,6 +193,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             run_id,
             decay_threshold,
             prefix,
+            parallel: _,
         } => {
             let _lock = if claim || decay_threshold > 0 {
                 Some(LockGuard::acquire(&cli.dir)?)
@@ -791,6 +803,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             no_worktree,
             external_repo,
             cleanup_worktree,
+            parallel,
         } => {
             let project_root = get_project_root()?;
 
@@ -800,6 +813,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             config.verbose = verbose || cli.verbose;
             config.use_worktrees = !no_worktree;
             config.cleanup_worktree = cleanup_worktree;
+            config.parallel_slots = parallel;
 
             // `cli.dir` is already absolute (resolved in `main()` via
             // `resolve_db_dir`, which anchors a relative default against

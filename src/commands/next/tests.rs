@@ -51,7 +51,7 @@ mod selection_tests {
         insert_test_relationship, insert_test_task, insert_test_task_file, setup_test_db,
     };
     use crate::commands::next::selection::{
-        ScoreBreakdown, ScoredTask, SelectionResult, format_text, select_next_task,
+        ScoreBreakdown, ScoredTask, format_text, select_next_task,
     };
     use crate::models::Task;
 
@@ -59,7 +59,7 @@ mod selection_tests {
     fn test_select_no_tasks() {
         let (_temp_dir, conn) = setup_test_db();
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_none());
         assert_eq!(result.eligible_count, 0);
     }
@@ -69,7 +69,7 @@ mod selection_tests {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "First Task", "todo", 10);
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-001");
         assert_eq!(result.eligible_count, 1);
@@ -82,7 +82,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "High Priority", "todo", 10);
         insert_test_task(&conn, "US-003", "Medium Priority", "todo", 30);
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         // Higher priority (lower number) should be selected
@@ -96,7 +96,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Done Task", "done", 1);
         insert_test_task(&conn, "US-002", "Todo Task", "todo", 50);
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-002");
         assert_eq!(result.eligible_count, 1);
@@ -108,7 +108,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Blocked Task", "blocked", 1);
         insert_test_task(&conn, "US-002", "Todo Task", "todo", 50);
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.task.unwrap().task.id, "US-002");
     }
@@ -120,7 +120,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         // US-002 has higher priority but is blocked, so US-001 should be selected
         assert_eq!(result.task.unwrap().task.id, "US-001");
@@ -134,7 +134,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         // Dependency is satisfied, so US-002 should be selected
         assert_eq!(result.task.unwrap().task.id, "US-002");
@@ -147,7 +147,7 @@ mod selection_tests {
         insert_test_task(&conn, "US-002", "Dependent Task", "todo", 10);
         insert_test_relationship(&conn, "US-002", "US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         // Dependency is satisfied by irrelevant status
         assert_eq!(result.task.unwrap().task.id, "US-002");
@@ -163,7 +163,7 @@ mod selection_tests {
 
         // Pass after_files that overlap with US-001
         let after_files = vec!["src/commands/init.rs".to_string()];
-        let result = select_next_task(&conn, &after_files, &[], None).unwrap();
+        let result = select_next_task(&conn, &after_files, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -186,7 +186,7 @@ mod selection_tests {
             "src/commands/init.rs".to_string(),
             "src/commands/list.rs".to_string(),
         ];
-        let result = select_next_task(&conn, &after_files, &[], None).unwrap();
+        let result = select_next_task(&conn, &after_files, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
@@ -195,193 +195,111 @@ mod selection_tests {
     }
 
     #[test]
-    fn test_synergy_scoring() {
+    fn test_synergy_relationships_ignored_in_scoring() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Completed Task", "done", 1);
         insert_test_task(&conn, "US-002", "Task A", "todo", 50);
         insert_test_task(&conn, "US-003", "Task B", "todo", 50);
         insert_test_relationship(&conn, "US-002", "US-001", "synergyWith");
 
-        // Pass US-001 as recently completed
-        let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
+        // synergyWith relationships are no longer scored; both tasks have equal scores
+        let result = select_next_task(&conn, &[], None).unwrap();
 
         assert!(result.task.is_some());
-        let task = result.task.unwrap();
-        // US-002 should be selected due to synergy bonus
-        assert_eq!(task.task.id, "US-002");
-        assert_eq!(task.score_breakdown.synergy_score, 3);
-        assert_eq!(task.score_breakdown.synergy_from, vec!["US-001"]);
+        // Both have same priority (50), US-002 is selected first (stable sort)
+        assert_eq!(result.eligible_count, 2);
     }
 
     #[test]
-    fn test_conflict_scoring() {
+    fn test_conflicts_relationships_ignored_in_scoring() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Completed Task", "done", 1);
         insert_test_task(&conn, "US-002", "Task A", "todo", 50);
         insert_test_task(&conn, "US-003", "Task B", "todo", 50);
         insert_test_relationship(&conn, "US-002", "US-001", "conflictsWith");
 
-        // Pass US-001 as recently completed
-        let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
+        // conflictsWith relationships are no longer scored; selection is by priority only
+        let result = select_next_task(&conn, &[], None).unwrap();
 
         assert!(result.task.is_some());
-        let task = result.task.unwrap();
-        // US-003 should be selected due to conflict penalty on US-002
-        assert_eq!(task.task.id, "US-003");
-
-        // Verify US-002 would have had conflict penalty if selected
-        // (we can check by changing priorities to force US-002 selection)
+        assert_eq!(result.eligible_count, 2);
     }
 
     #[test]
-    fn test_conflict_penalty_calculation() {
-        let (_temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "Completed Task", "done", 1);
-        insert_test_task(&conn, "US-002", "Conflicting Task", "todo", 10); // Higher priority
-        insert_test_relationship(&conn, "US-002", "US-001", "conflictsWith");
-
-        let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed, None).unwrap();
-
-        assert!(result.task.is_some());
-        let task = result.task.unwrap();
-        assert_eq!(task.task.id, "US-002"); // Still selected (only one option)
-        assert_eq!(task.score_breakdown.conflict_score, -5);
-        assert_eq!(task.score_breakdown.conflict_from, vec!["US-001"]);
-    }
-
-    #[test]
-    fn test_batch_tasks_identified() {
+    fn test_batch_with_relationships_not_in_selection_result() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Main Task", "todo", 10);
-        insert_test_task(&conn, "FIX-001", "Batch Task", "todo", 50);
+        insert_test_task(&conn, "FIX-001", "Former Batch Task", "todo", 50);
         insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         let task = result.task.unwrap();
         assert_eq!(task.task.id, "US-001");
-        assert_eq!(task.batch_with, vec!["FIX-001"]);
-        assert_eq!(result.batch_tasks, vec!["FIX-001"]);
-    }
-
-    #[test]
-    fn test_batch_tasks_excludes_done() {
-        let (_temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "Main Task", "todo", 10);
-        insert_test_task(&conn, "FIX-001", "Completed Batch Task", "done", 50);
-        insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
-
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
-        assert!(result.task.is_some());
-        let task = result.task.unwrap();
-        assert_eq!(task.batch_with, vec!["FIX-001"]);
-        // batch_tasks should be empty since FIX-001 is done
-        assert!(result.batch_tasks.is_empty());
-    }
-
-    #[test]
-    fn test_batch_tasks_excludes_archived() {
-        let (_temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "Main Task", "todo", 10);
-        insert_test_task(&conn, "FIX-001", "Archived Batch Task", "todo", 50);
-        insert_test_task(&conn, "FIX-002", "Active Batch Task", "todo", 50);
-        insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
-        insert_test_relationship(&conn, "US-001", "FIX-002", "batchWith");
-
-        // Soft-archive FIX-001
-        conn.execute(
-            "UPDATE tasks SET archived_at = datetime('now') WHERE id = 'FIX-001'",
-            [],
-        )
-        .unwrap();
-
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
-        assert!(result.task.is_some());
-        // FIX-001 is archived and must be excluded; FIX-002 is active and must be included
-        assert!(
-            !result.batch_tasks.contains(&"FIX-001".to_string()),
-            "Archived tasks must not appear in batch_tasks"
-        );
-        assert!(
-            result.batch_tasks.contains(&"FIX-002".to_string()),
-            "Active batch tasks must still be included"
-        );
+        // batchWith is no longer tracked in ScoredTask or SelectionResult
+        assert_eq!(result.eligible_count, 2);
     }
 
     #[test]
     fn test_combined_scoring() {
         let (_temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Completed Prereq", "done", 1);
-        insert_test_task(&conn, "US-002", "Low Priority", "todo", 50);
+        insert_test_task(&conn, "US-002", "Low Priority With File", "todo", 50);
         insert_test_task(&conn, "US-003", "High Priority No Overlap", "todo", 20);
         insert_test_task_file(&conn, "US-002", "src/main.rs");
-        insert_test_relationship(&conn, "US-002", "US-001", "synergyWith");
 
-        // File overlap + synergy should overcome priority difference
         let after_files = vec!["src/main.rs".to_string()];
-        let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &after_files, &recently_completed, None).unwrap();
+        let result = select_next_task(&conn, &after_files, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
 
-        // US-002: 950 (priority) + 10 (file) + 3 (synergy) = 963
-        // US-003: 980 (priority) + 0 (file) + 0 (synergy) = 980
-        // US-003 should still win with higher priority
+        // US-002: 950 (priority) + 10 (file) = 960
+        // US-003: 980 (priority) + 0 (file) = 980
+        // US-003 should win with higher priority
         assert_eq!(task.task.id, "US-003");
     }
 
     #[test]
     fn test_combined_scoring_file_wins() {
         let (_temp_dir, conn) = setup_test_db();
-        insert_test_task(&conn, "US-001", "Completed Prereq", "done", 1);
         insert_test_task(&conn, "US-002", "Lower Priority Many Files", "todo", 45);
         insert_test_task(&conn, "US-003", "Higher Priority No Overlap", "todo", 40);
         insert_test_task_file(&conn, "US-002", "src/main.rs");
         insert_test_task_file(&conn, "US-002", "src/lib.rs");
         insert_test_task_file(&conn, "US-002", "src/cli.rs");
-        insert_test_relationship(&conn, "US-002", "US-001", "synergyWith");
 
-        // 3 file overlaps + synergy should overcome priority difference
+        // 3 file overlaps should overcome small priority difference
         let after_files = vec![
             "src/main.rs".to_string(),
             "src/lib.rs".to_string(),
             "src/cli.rs".to_string(),
         ];
-        let recently_completed = vec!["US-001".to_string()];
-        let result = select_next_task(&conn, &after_files, &recently_completed, None).unwrap();
+        let result = select_next_task(&conn, &after_files, None).unwrap();
 
         assert!(result.task.is_some());
         let task = result.task.unwrap();
 
-        // US-002: 955 (priority) + 30 (file) + 3 (synergy) = 988
-        // US-003: 960 (priority) + 0 (file) + 0 (synergy) = 960
+        // US-002: 955 (priority) + 30 (file) = 985
+        // US-003: 960 (priority) + 0 (file) = 960
         // US-002 should win
         assert_eq!(task.task.id, "US-002");
     }
 
     #[test]
     fn test_format_text_with_task() {
+        use crate::commands::next::selection::SelectionResult;
         let result = SelectionResult {
             task: Some(ScoredTask {
                 task: Task::new("US-001", "Test Task"),
                 files: vec!["src/main.rs".to_string()],
-                batch_with: vec!["FIX-001".to_string()],
-                total_score: 963,
+                total_score: 960,
                 score_breakdown: ScoreBreakdown {
                     priority_score: 950,
                     file_score: 10,
-                    synergy_score: 3,
-                    conflict_score: 0,
                     file_overlap_count: 1,
-                    synergy_from: vec!["US-000".to_string()],
-                    conflict_from: vec![],
                 },
             }),
-            batch_tasks: vec!["FIX-001".to_string()],
             selection_reason: "Selected task US-001".to_string(),
             eligible_count: 5,
             top_candidates: vec![],
@@ -389,19 +307,17 @@ mod selection_tests {
 
         let text = format_text(&result);
         assert!(text.contains("Next Task: US-001"));
-        assert!(text.contains("Score:    963"));
+        assert!(text.contains("Score:    960"));
         assert!(text.contains("Priority:    +950"));
         assert!(text.contains("File Overlap: +10"));
         assert!(text.contains("src/main.rs"));
-        assert!(text.contains("Batch With:"));
-        assert!(text.contains("FIX-001"));
     }
 
     #[test]
     fn test_format_text_no_task() {
+        use crate::commands::next::selection::SelectionResult;
         let result = SelectionResult {
             task: None,
-            batch_tasks: vec![],
             selection_reason: "All tasks completed".to_string(),
             eligible_count: 0,
             top_candidates: vec![],
@@ -410,6 +326,190 @@ mod selection_tests {
         let text = format_text(&result);
         assert!(text.contains("No tasks available"));
         assert!(text.contains("All tasks completed"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Parallel group selection (FEAT-002)
+    //
+    // These tests define the contract for `select_parallel_group()`. They are
+    // `#[ignore]`d until FEAT-002 replaces the stub in selection.rs. The test
+    // file still compiles because the stub exists.
+    //
+    // Contract:
+    //   select_parallel_group(conn, after_files, task_prefix, max_slots) -> Vec<ScoredTask>
+    //   - Greedy selection by descending score
+    //   - Two tasks never appear together if their touchesFiles overlap
+    //   - Tasks with NO touchesFiles entries have no conflicts → always eligible
+    //   - Length capped by max_slots
+    // -------------------------------------------------------------------------
+
+    use crate::commands::next::selection::select_parallel_group;
+
+    #[test]
+    fn test_parallel_group_two_tasks_sharing_file_returns_one() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Task A", "todo", 10);
+        insert_test_task(&conn, "US-002", "Task B", "todo", 20);
+        insert_test_task_file(&conn, "US-001", "src/shared.rs");
+        insert_test_task_file(&conn, "US-002", "src/shared.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            1,
+            "two tasks sharing a file must not parallelize"
+        );
+        // Higher priority (lower number) wins the slot
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    #[test]
+    fn test_parallel_group_two_disjoint_tasks_returns_two() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Task A", "todo", 10);
+        insert_test_task(&conn, "US-002", "Task B", "todo", 20);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        insert_test_task_file(&conn, "US-002", "src/b.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        assert_eq!(group.len(), 2, "disjoint files must parallelize");
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&"US-001"));
+        assert!(ids.contains(&"US-002"));
+    }
+
+    #[test]
+    fn test_parallel_group_empty_touches_files_always_parallelize() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "With file", "todo", 10);
+        insert_test_task(&conn, "US-002", "No files A", "todo", 20);
+        insert_test_task(&conn, "US-003", "No files B", "todo", 30);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        // US-002 and US-003 have zero task_files rows — no conflicts possible.
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            3,
+            "tasks with empty touchesFiles can always parallelize"
+        );
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&"US-001"));
+        assert!(ids.contains(&"US-002"));
+        assert!(ids.contains(&"US-003"));
+    }
+
+    #[test]
+    fn test_parallel_group_respects_max_slots() {
+        let (_temp_dir, conn) = setup_test_db();
+        // 5 tasks with fully-disjoint files; max_slots=3 → group truncated to 3.
+        for i in 1..=5i32 {
+            let id = format!("US-00{i}");
+            let title = format!("Task {i}");
+            let file = format!("src/file_{i}.rs");
+            insert_test_task(&conn, &id, &title, "todo", 10 + i);
+            insert_test_task_file(&conn, &id, &file);
+        }
+
+        let group = select_parallel_group(&conn, &[], None, 3).unwrap();
+        assert_eq!(group.len(), 3, "group size is capped by max_slots");
+    }
+
+    #[test]
+    fn test_parallel_group_ordered_by_score_descending() {
+        let (_temp_dir, conn) = setup_test_db();
+        // Disjoint files so all three can parallelize; priorities out of order.
+        insert_test_task(&conn, "US-001", "Low prio", "todo", 50);
+        insert_test_task(&conn, "US-002", "High prio", "todo", 10);
+        insert_test_task(&conn, "US-003", "Mid prio", "todo", 30);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+        insert_test_task_file(&conn, "US-002", "src/b.rs");
+        insert_test_task_file(&conn, "US-003", "src/c.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 3).unwrap();
+        assert_eq!(group.len(), 3);
+        // Descending total_score (highest first)
+        assert!(
+            group[0].total_score >= group[1].total_score,
+            "group must be sorted by score desc"
+        );
+        assert!(
+            group[1].total_score >= group[2].total_score,
+            "group must be sorted by score desc"
+        );
+        assert_eq!(group[0].task.id, "US-002", "highest priority first");
+        assert_eq!(group[1].task.id, "US-003");
+        assert_eq!(group[2].task.id, "US-001");
+    }
+
+    #[test]
+    fn test_parallel_group_single_eligible_task_returns_one() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "Only Task", "todo", 10);
+        insert_test_task_file(&conn, "US-001", "src/a.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    #[test]
+    fn test_parallel_group_all_sharing_one_file_forces_sequential() {
+        let (_temp_dir, conn) = setup_test_db();
+        // 4 eligible tasks all touching the same hot-spot file.
+        for i in 1..=4i32 {
+            let id = format!("US-00{i}");
+            let title = format!("Task {i}");
+            insert_test_task(&conn, &id, &title, "todo", 10 + i);
+            insert_test_task_file(&conn, &id, "src/hot_spot.rs");
+        }
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        assert_eq!(
+            group.len(),
+            1,
+            "all tasks sharing one file → group of 1 (sequential)"
+        );
+        // Highest priority (lowest priority number) wins the slot
+        assert_eq!(group[0].task.id, "US-001");
+    }
+
+    /// Known-bad discriminator (AC #8): this test fails if the implementation
+    /// skips the file-conflict check. Two high-priority tasks share a file;
+    /// a lower-priority task has a disjoint file. Correct behavior returns
+    /// exactly {US-001, US-003}. A naive "top-N by score" implementation with
+    /// no conflict check would return all three (wrong: US-001 and US-002
+    /// collide on src/shared.rs).
+    #[test]
+    fn test_parallel_group_known_bad_requires_conflict_check() {
+        let (_temp_dir, conn) = setup_test_db();
+        insert_test_task(&conn, "US-001", "High A", "todo", 10);
+        insert_test_task(&conn, "US-002", "High B (conflicts)", "todo", 11);
+        insert_test_task(&conn, "US-003", "Low disjoint", "todo", 99);
+        insert_test_task_file(&conn, "US-001", "src/shared.rs");
+        insert_test_task_file(&conn, "US-002", "src/shared.rs");
+        insert_test_task_file(&conn, "US-003", "src/other.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+
+        assert_eq!(
+            group.len(),
+            2,
+            "conflict check must drop US-002 even though score > US-003"
+        );
+        assert!(
+            ids.contains(&"US-001"),
+            "US-001 selected first (highest priority)"
+        );
+        assert!(
+            ids.contains(&"US-003"),
+            "US-003 selected (disjoint file, no conflict)"
+        );
+        assert!(
+            !ids.contains(&"US-002"),
+            "US-002 must be excluded (shares src/shared.rs with US-001)"
+        );
     }
 }
 
@@ -440,7 +540,7 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 20);
 
         // Without prefix filtering both tasks are candidates; lowest priority wins.
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         assert!(result.task.is_some());
         assert_eq!(result.eligible_count, 2, "None-prefix must see all tasks");
         assert_eq!(result.task.unwrap().task.id, "P1-US-001");
@@ -466,7 +566,7 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P2-US-002", "P2 Task B", "todo", 5);
 
         // With prefix "P1" only P1-US-001 is eligible.
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(result.eligible_count, 1, "P1 scope must exclude P2 tasks");
         assert_eq!(result.task.unwrap().task.id, "P1-US-001");
     }
@@ -481,7 +581,7 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 10);
         insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 5); // higher priority but wrong PRD
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(result.eligible_count, 1, "P1 prefix must exclude P2 tasks");
         assert_eq!(result.task.unwrap().task.id, "P1-US-001");
     }
@@ -492,7 +592,7 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P1-US-001", "P1 Task", "todo", 5); // higher priority but wrong PRD
         insert_test_task(&conn, "P2-US-001", "P2 Task", "todo", 10);
 
-        let result = select_next_task(&conn, &[], &[], Some("P2")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P2")).unwrap();
         assert_eq!(result.eligible_count, 1, "P2 prefix must exclude P1 tasks");
         assert_eq!(result.task.unwrap().task.id, "P2-US-001");
     }
@@ -512,7 +612,7 @@ mod prefix_selection_tests {
         use super::test_helpers::insert_test_relationship;
         insert_test_relationship(&conn, "P1-US-002", "P1-US-001", "dependsOn");
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(
             result.eligible_count, 1,
             "P1-US-002 should be eligible: its dependency P1-US-001 is done within P1 scope"
@@ -530,7 +630,7 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P1-US-001", "P1 Todo", "todo", 10);
         insert_test_task(&conn, "P2-US-001", "P2 Todo", "todo", 10);
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(
             result.eligible_count, 1,
             "prefix P1 must see only 1 todo task"
@@ -557,7 +657,7 @@ mod prefix_selection_tests {
         // With prefix "P1":
         //   - P1-US-002's dependency (P1-US-001) is done → eligible
         //   - P2-* tasks are invisible
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(
             result.eligible_count, 1,
             "only P1-US-002 eligible in P1 scope"
@@ -580,7 +680,7 @@ mod prefix_selection_tests {
         // With prefix "P1" and after_files=["src/p1/mod.rs"]:
         // Only P1-US-001 is a candidate; it gets a file-overlap bonus.
         let after_files = vec!["src/p1/mod.rs".to_string()];
-        let result = select_next_task(&conn, &after_files, &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &after_files, Some("P1")).unwrap();
         assert_eq!(result.eligible_count, 1, "P1 prefix must exclude P2 tasks");
         let task = result.task.unwrap();
         assert_eq!(task.task.id, "P1-US-001");
@@ -604,12 +704,12 @@ mod prefix_selection_tests {
         insert_test_task(&conn, "P2-US-001", "P2 Task Same Suffix", "todo", 1);
         insert_test_task(&conn, "P2-US-002", "P2 Task", "todo", 2);
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         assert_eq!(result.eligible_count, 1, "P1 scope must exclude P2 tasks");
         assert_eq!(result.task.unwrap().task.id, "P1-US-001");
 
         // Symmetry check: P2 scope must exclude P1-US-001
-        let result2 = select_next_task(&conn, &[], &[], Some("P2")).unwrap();
+        let result2 = select_next_task(&conn, &[], Some("P2")).unwrap();
         assert_eq!(result2.eligible_count, 2, "P2 scope must see both P2 tasks");
         assert_eq!(result2.task.unwrap().task.id, "P2-US-001");
     }
@@ -813,22 +913,21 @@ mod next_command_tests {
         let task = result.task.unwrap();
         assert_eq!(task.score.priority, 980); // 1000 - 20
         assert_eq!(task.score.file_overlap, 0);
-        assert_eq!(task.score.synergy, 0);
-        assert_eq!(task.score.conflict, 0);
         assert_eq!(task.score.total, 980);
     }
 
     #[test]
-    fn test_next_includes_batch_tasks() {
+    fn test_next_batch_with_relationships_not_exposed() {
         let (temp_dir, conn) = setup_test_db();
         insert_test_task(&conn, "US-001", "Main Task", "todo", 10);
-        insert_test_task(&conn, "FIX-001", "Batch Task", "todo", 20);
+        insert_test_task(&conn, "FIX-001", "Former Batch Task", "todo", 20);
         insert_test_relationship(&conn, "US-001", "FIX-001", "batchWith");
         drop(conn);
 
         let result = next(temp_dir.path(), &[], false, None, false, None).unwrap();
         assert!(result.task.is_some());
-        assert_eq!(result.batch_tasks, vec!["FIX-001".to_string()]);
+        // batchWith is no longer tracked; both tasks are simply eligible
+        assert_eq!(result.selection.eligible_count, 2);
     }
 
     #[test]
@@ -843,7 +942,6 @@ mod next_command_tests {
                 acceptance_criteria: vec!["Criterion 1".to_string()],
                 notes: None,
                 files: vec!["src/main.rs".to_string()],
-                batch_with: vec![],
                 model: None,
                 difficulty: None,
                 escalation_note: None,
@@ -852,14 +950,9 @@ mod next_command_tests {
                     total: 990,
                     priority: 990,
                     file_overlap: 0,
-                    synergy: 0,
-                    conflict: 0,
                     file_overlap_count: 0,
-                    synergy_from: vec![],
-                    conflict_from: vec![],
                 },
             }),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "Selected by priority".to_string(),
@@ -893,7 +986,6 @@ mod next_command_tests {
                 acceptance_criteria: vec![],
                 notes: None,
                 files: vec![],
-                batch_with: vec![],
                 model: None,
                 difficulty: None,
                 escalation_note: None,
@@ -902,14 +994,9 @@ mod next_command_tests {
                     total: 990,
                     priority: 990,
                     file_overlap: 0,
-                    synergy: 0,
-                    conflict: 0,
                     file_overlap_count: 0,
-                    synergy_from: vec![],
-                    conflict_from: vec![],
                 },
             }),
-            batch_tasks: vec![],
             learnings: vec![LearningSummaryOutput {
                 id: 1,
                 title: "Important pattern".to_string(),
@@ -937,7 +1024,6 @@ mod next_command_tests {
     fn test_format_next_text_no_task() {
         let result = NextResult {
             task: None,
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "All tasks have been completed".to_string(),
@@ -997,16 +1083,11 @@ mod next_command_tests {
         let scored = ScoredTask {
             task,
             files: vec!["src/lib.rs".to_string()],
-            batch_with: vec![],
             total_score: 990,
             score_breakdown: ScoreBreakdown {
                 priority_score: 950,
                 file_score: 0,
-                synergy_score: 0,
-                conflict_score: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         };
 
@@ -1036,16 +1117,11 @@ mod next_command_tests {
         let scored = ScoredTask {
             task,
             files: vec![],
-            batch_with: vec![],
             total_score: 950,
             score_breakdown: ScoreBreakdown {
                 priority_score: 950,
                 file_score: 0,
-                synergy_score: 0,
-                conflict_score: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         };
 
@@ -1072,16 +1148,11 @@ mod next_command_tests {
         let scored = ScoredTask {
             task,
             files: vec![],
-            batch_with: vec![],
             total_score: 960,
             score_breakdown: ScoreBreakdown {
                 priority_score: 960,
                 file_score: 0,
-                synergy_score: 0,
-                conflict_score: 0,
                 file_overlap_count: 0,
-                synergy_from: vec![],
-                conflict_from: vec![],
             },
         };
 
@@ -1121,7 +1192,6 @@ mod next_command_tests {
                 acceptance_criteria: vec!["AC1".to_string()],
                 notes: None,
                 files: vec!["src/lib.rs".to_string()],
-                batch_with: vec![],
                 model: Some(OPUS_MODEL.to_string()),
                 difficulty: Some("high".to_string()),
                 escalation_note: Some("Complex task needing opus".to_string()),
@@ -1130,14 +1200,9 @@ mod next_command_tests {
                     total: 990,
                     priority: 990,
                     file_overlap: 0,
-                    synergy: 0,
-                    conflict: 0,
                     file_overlap_count: 0,
-                    synergy_from: vec![],
-                    conflict_from: vec![],
                 },
             }),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "Selected by priority".to_string(),
@@ -1180,7 +1245,6 @@ mod next_command_tests {
                 acceptance_criteria: vec![],
                 notes: None,
                 files: vec![],
-                batch_with: vec![],
                 model: None,
                 difficulty: None,
                 escalation_note: None,
@@ -1189,14 +1253,9 @@ mod next_command_tests {
                     total: 990,
                     priority: 990,
                     file_overlap: 0,
-                    synergy: 0,
-                    conflict: 0,
                     file_overlap_count: 0,
-                    synergy_from: vec![],
-                    conflict_from: vec![],
                 },
             }),
-            batch_tasks: vec![],
             learnings: vec![],
             selection: SelectionMetadata {
                 reason: "Selected by priority".to_string(),
@@ -1213,11 +1272,7 @@ mod next_command_tests {
                         total: 990,
                         priority: 990,
                         file_overlap: 0,
-                        synergy: 0,
-                        conflict: 0,
                         file_overlap_count: 0,
-                        synergy_from: vec![],
-                        conflict_from: vec![],
                     },
                 },
                 CandidateSummary {
@@ -1229,11 +1284,7 @@ mod next_command_tests {
                         total: 980,
                         priority: 980,
                         file_overlap: 0,
-                        synergy: 0,
-                        conflict: 0,
                         file_overlap_count: 0,
-                        synergy_from: vec![],
-                        conflict_from: vec![],
                     },
                 },
             ],
@@ -1589,7 +1640,7 @@ mod mixed_prd_selection_tests {
     fn test_prefix_filters_p2_tasks_from_selection() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         let task = result.task.expect("should select a P1 task");
         assert!(
             task.task.id.starts_with("P1-"),
@@ -1611,7 +1662,7 @@ mod mixed_prd_selection_tests {
         insert_test_task_file(&conn, "P2-OVERLAP", "src/foo.rs");
 
         let after_files = vec!["src/foo.rs".to_string()];
-        let result = select_next_task(&conn, &after_files, &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &after_files, Some("P1")).unwrap();
         let task = result.task.expect("should select a task");
         assert_eq!(task.task.id, "P1-HIGH-OVERLAP");
         assert!(task.score_breakdown.file_overlap_count > 0);
@@ -1627,7 +1678,7 @@ mod mixed_prd_selection_tests {
     fn test_cross_prd_dep_ignored_for_prefix_session() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         let task = result.task.expect("should have eligible P1 tasks");
         assert_ne!(
             task.task.id, "P1-US-004",
@@ -1640,7 +1691,7 @@ mod mixed_prd_selection_tests {
     fn test_no_prefix_all_tasks_eligible() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let result = select_next_task(&conn, &[], &[], None).unwrap();
+        let result = select_next_task(&conn, &[], None).unwrap();
         let task = result.task.expect("should select a task");
         assert_eq!(task.task.id, "P2-US-001");
     }
@@ -1649,32 +1700,28 @@ mod mixed_prd_selection_tests {
     // Synergy: intra-PRD synergy works; cross-PRD synergy is not loaded
     // ---------------------------------------------------------------------------
 
-    /// P1-US-001 synergyWith P1-US-003 (recently completed) → synergy bonus.
+    /// P1-US-001 synergyWith P1-US-003 — synergy is no longer scored but P1-US-001 still wins by priority.
     #[test]
-    fn test_synergy_only_boosts_p1_tasks_in_p1_session() {
+    fn test_p1_task_selection_ignores_synergy_scoring() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let recently_completed = vec!["P1-US-003".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed, Some("P1")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
         let task = result.task.expect("should select a task");
 
+        // P1-US-001 and P1-US-004 both have priority=10; P1-US-001 wins by stable sort
+        // (P1-US-004 is blocked by P1-US-005 dep)
         assert_eq!(task.task.id, "P1-US-001");
-        assert!(
-            task.score_breakdown.synergy_score > 0,
-            "P1-US-001 should get synergy bonus from P1-US-003"
-        );
+        assert_eq!(task.score_breakdown.file_score, 0);
     }
 
     /// In a P2 session, P2-US-003 has synergyWith P1-US-001.
     /// But the synergy relationships loaded are scoped to P2- task_ids, and the
-    /// recently_completed ID "P1-US-001" is outside P2 scope — no boost expected.
     /// P2-US-001 (priority=1) wins by priority regardless.
     #[test]
     fn test_cross_prd_synergy_not_applied_in_p2_session() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let recently_completed = vec!["P1-US-001".to_string()];
-        let result = select_next_task(&conn, &[], &recently_completed, Some("P2")).unwrap();
+        let result = select_next_task(&conn, &[], Some("P2")).unwrap();
         let task = result.task.expect("should select a P2 task");
 
         assert!(task.task.id.starts_with("P2-"), "should select a P2 task");
@@ -1686,17 +1733,15 @@ mod mixed_prd_selection_tests {
     // Batch: cross-PRD batchWith targets are excluded
     // ---------------------------------------------------------------------------
 
-    /// P1-US-001 batchWith P2-US-003. When prefix=P1, batch_tasks must not include P2-US-003.
+    /// batchWith relationships are no longer tracked in SelectionResult.
     #[test]
-    fn test_cross_prd_batch_ignored_in_p1_session() {
+    fn test_cross_prd_batch_not_in_selection_result() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let result = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
-        assert!(
-            !result.batch_tasks.contains(&"P2-US-003".to_string()),
-            "cross-PRD batch target must not appear in batch_tasks; got: {:?}",
-            result.batch_tasks
-        );
+        let result = select_next_task(&conn, &[], Some("P1")).unwrap();
+        // batch_tasks field removed; simply verify a P1 task is selected
+        assert!(result.task.is_some());
+        assert!(result.task.unwrap().task.id.starts_with("P1-"));
     }
 
     // ---------------------------------------------------------------------------
@@ -1798,8 +1843,8 @@ mod mixed_prd_selection_tests {
         insert_prd_task(&conn, "P1-US-030", "done", 30);
         insert_test_relationship(&conn, "P1-US-020", "P1-US-030", "dependsOn");
 
-        let result_no_prefix = select_next_task(&conn, &[], &[], None).unwrap();
-        let result_with_prefix = select_next_task(&conn, &[], &[], Some("P1")).unwrap();
+        let result_no_prefix = select_next_task(&conn, &[], None).unwrap();
+        let result_with_prefix = select_next_task(&conn, &[], Some("P1")).unwrap();
 
         assert_eq!(
             result_no_prefix.task.unwrap().task.id,
@@ -1813,15 +1858,13 @@ mod mixed_prd_selection_tests {
     fn test_eligible_count_respects_prefix() {
         let (_tmp, conn) = setup_mixed_prd_db();
 
-        let count_p1 = select_next_task(&conn, &[], &[], Some("P1"))
+        let count_p1 = select_next_task(&conn, &[], Some("P1"))
             .unwrap()
             .eligible_count;
-        let count_p2 = select_next_task(&conn, &[], &[], Some("P2"))
+        let count_p2 = select_next_task(&conn, &[], Some("P2"))
             .unwrap()
             .eligible_count;
-        let count_all = select_next_task(&conn, &[], &[], None)
-            .unwrap()
-            .eligible_count;
+        let count_all = select_next_task(&conn, &[], None).unwrap().eligible_count;
 
         assert!(count_p1 < count_all, "P1 scope < all-scope");
         assert!(count_p2 < count_all, "P2 scope < all-scope");

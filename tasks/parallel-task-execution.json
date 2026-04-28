@@ -52,6 +52,7 @@
       "medium": "21-50: Fix in current phase if time permits"
     }
   },
+  "taskPrefix": "ab55fca5",
   "userStories": [
     {
       "acceptanceCriteria": [
@@ -90,7 +91,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning [522]: Incremental field addition to IterationResult — follow same pattern for new structs. The existing get_all_task_files() (selection.rs:358) returns HashMap<String, Vec<String>> — use this to build the inverted file index for conflict detection.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "File conflict detection must be conservative: any shared file = conflict",
@@ -140,7 +141,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Learning [791]: Integration test pattern for worktree chaining — setup_git_repo_with_file for temp repo. Learning [1329]: git merge --no-commit --no-ff safely tests merges. CRITICAL: git worktrees cannot share a branch — this is the core constraint these tests verify.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "Tests must use real git repos (tempdir), not mocks",
@@ -174,7 +175,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": true,
       "notes": "selection.rs lines 121-124: remove 3 get_relationships_by_type calls. Lines 175-191: remove synergy/conflict scoring. Lines 233-247: remove batch_with handling. Lines 387-431: delete get_eligible_batch_tasks(). Learning [273]: Decompose long functions into per-dimension helpers.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Scoring formula simplified to total = priority_score + file_score",
@@ -206,7 +207,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "get_all_task_files() (selection.rs:358) already returns HashMap<String, Vec<String>>. Build inverted index: HashMap<&str, HashSet<usize>> mapping file_path → indices of already-selected tasks. O(tasks * avg_files) complexity, sub-10ms for 200 tasks. Data contract: get_all_task_files returns task_id→Vec<file_path>; invert to file_path→Set<selected_indices>.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "File conflict detection must be conservative: any shared file = conflict",
@@ -238,7 +239,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "output.rs lines 51-86: NextTaskOutput — remove batch_with. Lines 90-109: ScoreOutput — remove synergy, conflict, synergy_from, conflict_from. Lines 14-32: NextResult — remove batch_tasks. Learning [522]: Incremental field addition pattern — same in reverse for removal.",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "JSON output removes only deprecated fields",
@@ -270,7 +271,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "import.rs:370-393: insert_task_relationships() has 4 loops (depends_on, synergy_with, batch_with, conflicts_with) — remove the last 3. add.rs:98-105: apply_prefix() processes all relationship fields — keep for serde compat. parse.rs:36-42: PrdUserStory fields — keep with #[serde(default)].",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "Backward compat: old JSON parses without error",
@@ -310,7 +311,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "synergy.rs: build_synergy_section (line 14) and resolve_synergy_cluster (line 82) — gut implementations, keep signatures. calibrate.rs: SelectionWeights (line 29) — remove synergy/conflict. TaskOutcome (line 148) — remove synergy_count/conflict_count. compute_calibrated_weights (line 165) — simplify. export/prd.rs: ExportedUserStory (line 30) and load_all_relationships (line 333). show.rs: ShowResult (line 15). Learning [1229]: Soft-delete filter missed on secondary synergy query. Learning [1147]: Cross-task dependencies in batch can pre-satisfy later tasks.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "Synergy section callers see no behavior change (empty string returned)",
@@ -343,7 +344,7 @@
       "id": "FIX-001",
       "modifiesBehavior": false,
       "notes": "archive.rs:256: `let progress_path = tasks_dir.join(\"progress.txt\");`. Lines 126-131 already correctly skip all progress files from archiving — only the learning-extraction path at line 256 is wrong. Learning [565]: clear_prd_data skipped when no files on disk. Learning [516]: prd_metadata uses task_prefix for multi-PRD.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Only extracts learnings from the archived PRD's progress file",
@@ -373,7 +374,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "Learning [1448]: Stub migration pattern with #[ignore] tests enables TDD. Learning [15]: Comprehensive test coverage for migrations: up, down, defaults, writes. Learning [1027]: Migration tests should use >= assertions for schema version. Learning [1251]: Multiple modules may have ignored tests gated on the same migration. Check CURRENT_SCHEMA_VERSION at implementation time — if v17 doesn't exist yet, use v17 instead of v18.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Migration follows established v1-v16 file pattern",
@@ -414,7 +415,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1` — atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line progress note.",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "No unwrap() in production paths",
@@ -456,7 +457,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Run full workspace tests. If any fail (including pre-existing), fix them. Spawn FIX tasks for non-trivial failures.",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Full test suite green — no pre-existing failures left",
@@ -486,7 +487,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": false,
       "notes": "cli/commands.rs: Loop struct (line 715) — add #[arg(long, default_value_t = 1)] parallel: usize. Next struct — add same. config.rs: LoopConfig (line 14) — add parallel_slots. from_env() (line 93) — add LOOP_PARALLEL parsing. Validate: 0 rejected, 1-3 accepted, >3 rejected.",
-      "passes": false,
+      "passes": true,
       "priority": 22,
       "qualityDimensions": [
         "Validation: 0 rejected, 1-3 accepted, >3 rejected with clear error",
@@ -521,7 +522,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "CRITICAL: git worktree add refuses to check out a branch already checked out elsewhere. Slots 1+ must use ephemeral branches. Existing ensure_worktree (worktree.rs:103) already returns the existing worktree for slot 0. Learning [791]: Integration test pattern for worktree. Learning [1329]: git merge --no-commit --no-ff safely tests merges. Learning [311]: Worktree branch points can trail behind main.",
-      "passes": false,
+      "passes": true,
       "priority": 24,
       "qualityDimensions": [
         "Git's branch exclusivity constraint respected",
@@ -561,7 +562,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "IterationContext (engine.rs:176) is NOT thread-safe — do NOT share across threads. Each slot gets its own minimal state. spawn_claude already accepts working_dir (claude.rs SpawnOpts). Each spawn_claude creates its own watchdog thread — timeouts are per-subprocess. SignalFlag is Arc<AtomicBool> — thread-safe sharing. run_loop is async fn but blocking thread::join is fine (existing path already blocks on child.wait). Learning [1601]: Update all spawn_claude callers when adding new arg. Learning [135]: Use multi-iteration sequences to test state machine transitions.",
-      "passes": false,
+      "passes": true,
       "priority": 26,
       "qualityDimensions": [
         "IterationContext never shared across threads",
@@ -596,7 +597,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "engine.rs: main loop at line 1713. Insert branching on config.parallel_slots. After wave: merge results from WaveResult into IterationContext (extend last_files, update crash_tracker). Progress logging (progress.rs:38): add slot parameter, log sequentially after wave (not during). Learning [1005]: 9 consecutive retries on same blocked task wastes iterations — crash policy prevents this in parallel mode too.",
-      "passes": false,
+      "passes": true,
       "priority": 28,
       "qualityDimensions": [
         "Sequential path (parallel=1) completely unchanged",
@@ -737,7 +738,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "If tests reveal implementation gaps, spawn IMPL-FIX tasks.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "qualityDimensions": [
         "Full test suite green",
@@ -766,7 +767,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Focus on code quality, not behavior.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "DRY: no unnecessary duplication",
@@ -849,6 +850,86 @@
       "timeoutSecs": 1800,
       "title": "Final gate: parallel execution verified and documented",
       "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "cargo test --all-targets passes with no failures",
+        "dependsOn round-trip assertion is preserved",
+        "Deprecated relationship fields no longer asserted to round-trip"
+      ],
+      "description": "tests/import_export.rs::test_relationships_preserved_in_round_trip fails because it asserts synergyWith/batchWith/conflictsWith lengths round-trip, but FEAT-004 stopped importing these and FEAT-005 removed them from export. The test must be updated: assert that deprecated fields are intentionally dropped (length becomes 0 on export regardless of input) or remove the deprecated-field assertions entirely and keep only the dependsOn check.",
+      "id": "ab55fca5-CODE-FIX-001",
+      "passes": true,
+      "priority": 14,
+      "title": "Update import/export round-trip test for deprecated relationship fields",
+      "touchesFiles": [
+        "tests/import_export.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No references to synergies/conflicts/batch_tasks in src/commands/next/mod.rs doc comments",
+        "cargo doc builds without warnings"
+      ],
+      "description": "FEAT-003 simplified ScoreBreakdown to priority_score + file_score only, but module-level doc comments in src/commands/next/mod.rs still reference removed concepts: \"synergies, conflicts, and batch grouping\" (line 4) and \"batch tasks\" (line 133 in the next() docstring).",
+      "id": "ab55fca5-CODE-FIX-002",
+      "passes": true,
+      "priority": 15,
+      "title": "Update stale doc comments in next/mod.rs for simplified scoring",
+      "touchesFiles": [
+        "src/commands/next/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No unwrap()/expect() on branch_name in the parallel dispatch arm",
+        "Behavior preserved when branch_name is Some (the only real case)",
+        "cargo clippy --lib -- -D warnings still passes",
+        "cargo test loop_engine::engine still passes"
+      ],
+      "description": "From CODE-REVIEW-2: src/loop_engine/engine.rs:2835 uses `branch_name.as_deref().expect(\"parallel_active implies branch\")`. The invariant holds (Step 9.5 only sets parallel_active=true when branch is Some) but the global AC says 'No unwrap() in production code paths'. expect() panics on invariant violation, defeating the spirit of the rule. Refactor to a `let Some(branch) = branch_name.as_deref() else { /* warn + skip wave dispatch */ }` pattern so a programming error degrades to sequential rather than crashing.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-031",
+      "passes": true,
+      "priority": 31,
+      "title": "Replace expect() in parallel run_loop branch with graceful pattern",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Inter-wave signal returns exit code 130, matching step 0/step 13",
+        "Inter-wave .stop file path (if reachable here) still returns 0",
+        "Existing wave tests still pass",
+        "Add a regression test asserting 130 is returned when signal_flag is set during inter-wave delay"
+      ],
+      "description": "From CODE-REVIEW-2: in src/loop_engine/engine.rs:1217-1236, when the signal flag is set during the inter-wave sleep poll, the wave returns terminal Some((0, \"stop signal\", None)). All other signal paths in run_wave_iteration return (130, \"signal received\", None) — see step 0 (line 793) and step 13 (line 1174). The mismatched exit code muddies operator triage of why the loop stopped (clean stop file vs. SIGINT) and is inconsistent with sequential run_iteration semantics. Branch on `signal_flag.is_signaled()` after the loop exits and return 130 in that case.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-032",
+      "passes": true,
+      "priority": 32,
+      "title": "Use exit code 130 (not 0) when SIGINT/SIGTERM hits during inter-wave delay",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All three curate_enrich integration tests pass",
+        "cargo fmt --check passes",
+        "cargo clippy -- -D warnings passes",
+        "No other tests regress"
+      ],
+      "description": "Pre-existing bug surfaced by MILESTONE-3 gate: commit 456834f wrapped edit_learning in an unchecked_transaction. apply_proposals_in_transaction in src/commands/curate/enrich.rs also opens an unchecked_transaction and calls edit_learning inside, causing SQLite error: cannot start a transaction within a transaction. Three integration tests fail: test_curate_enrich_populates_metadata, test_curate_enrich_skips_retired_learnings, test_curate_enrich_idempotent_second_run_zero_candidates.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-CODE-FIX-040",
+      "passes": true,
+      "priority": 49,
+      "title": "Fix nested-transaction bug in curate enrich",
+      "touchesFiles": [
+        "src/commands/curate/enrich.rs"
+      ]
     }
   ],
   "version": "1.0"

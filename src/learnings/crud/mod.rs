@@ -26,7 +26,7 @@ pub mod writer;
 pub use create::record_learning;
 pub use delete::delete_learning;
 pub use output::{format_delete_text, format_edit_text};
-pub use read::{get_learning, get_learning_tags};
+pub use read::{ensure_learning_exists, get_learning, get_learning_tags};
 pub use types::{
     DeleteLearningResult, EditLearningParams, EditLearningResult, RecordLearningParams,
     RecordLearningResult,

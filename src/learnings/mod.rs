@@ -25,7 +25,8 @@ pub use bandit::{
 pub use crud::{
     DeleteLearningResult, EditLearningParams, EditLearningResult, LearningWriter,
     RecordLearningParams, RecordLearningResult, apply_supersession, delete_learning, edit_learning,
-    format_delete_text, format_edit_text, get_learning, get_learning_tags, record_learning,
+    ensure_learning_exists, format_delete_text, format_edit_text, get_learning, get_learning_tags,
+    record_learning,
 };
 pub use recall::{
     RecallParams, RecallResult, ScoredLearningOutput, ScoredRecallResult,

@@ -92,11 +92,13 @@ impl RetrievalBackend for VectorBackend {
         }
 
         // Filter out superseded learnings unless caller explicitly opts in.
-        // Graceful degradation: if the table is unreachable, assume nothing is superseded.
+        // A failure here is a real local-DB error (not a degradable dependency
+        // like Ollama), so propagate it rather than silently pretending nothing
+        // is superseded — callers need to know the filter did not run.
         let superseded: HashSet<i64> = if query.include_superseded {
             HashSet::new()
         } else {
-            load_superseded_ids(conn).unwrap_or_default()
+            load_superseded_ids(conn)?
         };
 
         // Score each stored embedding and collect (learning_id, score) pairs.

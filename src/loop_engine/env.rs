@@ -10,6 +10,16 @@ use std::process::Command;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 
+/// Returns `false` when the process is producing machine-readable output
+/// (currently `--format json`, signaled via `TASK_MGR_FORMAT=json` set by
+/// `main`). Use this to gate informational stderr notes that would otherwise
+/// land in the output stream a downstream consumer is parsing — stderr is a
+/// separate stream from stdout, but some consumers tee both and the noise
+/// hurts readability.
+pub(crate) fn human_output_enabled() -> bool {
+    std::env::var("TASK_MGR_FORMAT").as_deref() != Ok("json")
+}
+
 /// Prompt the user with a yes/no question on stderr and read their response from stdin.
 ///
 /// Returns `Ok(true)` if the user answers "y" or "yes" (case-insensitive),
@@ -319,11 +329,13 @@ pub fn resolve_paths(
             for root in super::worktree::list_other_roots(project_dir) {
                 let candidate = root.join(prd_file);
                 if candidate.exists() {
-                    eprintln!(
-                        "Note: '{}' not found locally; using file from worktree {}",
-                        prd_file.display(),
-                        root.display()
-                    );
+                    if human_output_enabled() {
+                        eprintln!(
+                            "Note: '{}' not found locally; using file from worktree {}",
+                            prd_file.display(),
+                            root.display()
+                        );
+                    }
                     found = Some(candidate);
                     break;
                 }
@@ -443,7 +455,44 @@ pub fn ensure_directories(db_dir: &Path) -> TaskMgrResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_engine::test_utils::EnvGuard;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Serialize tests that mutate `TASK_MGR_FORMAT` so parallel runs don't race.
+    static TASK_MGR_FORMAT_MUTEX: Mutex<()> = Mutex::new(());
+
+    // --- human_output_enabled ---
+
+    #[test]
+    fn test_human_output_enabled_default_when_unset() {
+        let _guard = TASK_MGR_FORMAT_MUTEX.lock().unwrap();
+        let _env = EnvGuard::remove("TASK_MGR_FORMAT");
+        assert!(
+            human_output_enabled(),
+            "default (no env var) must enable human output"
+        );
+    }
+
+    #[test]
+    fn test_human_output_enabled_disabled_when_json() {
+        let _guard = TASK_MGR_FORMAT_MUTEX.lock().unwrap();
+        let _env = EnvGuard::set("TASK_MGR_FORMAT", "json");
+        assert!(
+            !human_output_enabled(),
+            "TASK_MGR_FORMAT=json must suppress human-only stderr notes"
+        );
+    }
+
+    #[test]
+    fn test_human_output_enabled_other_values_treated_as_human() {
+        let _guard = TASK_MGR_FORMAT_MUTEX.lock().unwrap();
+        let _env = EnvGuard::set("TASK_MGR_FORMAT", "text");
+        assert!(
+            human_output_enabled(),
+            "non-'json' values must not suppress notes"
+        );
+    }
 
     // --- load_env ---
 
