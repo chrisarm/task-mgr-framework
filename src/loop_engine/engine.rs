@@ -767,6 +767,363 @@ pub struct WaveOutcome {
     pub was_stopped: bool,
 }
 
+/// Wave-mode aggregator collected during per-slot post-processing.
+///
+/// `all_crashed` starts true only if the wave produced at least one slot
+/// outcome — an empty `outcomes` list cannot be "all crashed" — and gets
+/// flipped to false the first time a slot doesn't crash (or its claimed
+/// task gets marked done despite a crash outcome flag).
+struct WaveAggregator {
+    tasks_completed: u32,
+    any_completed: bool,
+    all_crashed: bool,
+    aggregated_files: Vec<String>,
+    wave_should_stop: bool,
+}
+
+impl WaveAggregator {
+    fn new(num_outcomes: usize) -> Self {
+        Self {
+            tasks_completed: 0,
+            any_completed: false,
+            all_crashed: num_outcomes > 0,
+            aggregated_files: Vec::new(),
+            wave_should_stop: false,
+        }
+    }
+}
+
+/// Pre-wave preflight: signal/stop-file checks and crash backoff/abort.
+/// Returns `Some(WaveOutcome)` when the wave should bail out before doing
+/// any work, `None` when execution should proceed.
+fn wave_preflight_check(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+) -> Option<WaveOutcome> {
+    // Match sequential semantics so Ctrl+C and `.stop` files exit the loop
+    // the same way in both paths.
+    if params.signal_flag.is_signaled() {
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: false,
+            terminal: Some((130, "signal received".to_string(), None)),
+            was_stopped: false,
+        });
+    }
+    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
+        eprintln!("Stop signal detected (.stop file found)");
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: false,
+            terminal: Some((0, "stop signal".to_string(), None)),
+            was_stopped: true,
+        });
+    }
+
+    // Crash backoff + abort. Identical contract to the sequential path so
+    // learning [1005] (don't burn iterations on a wedged task) holds even
+    // when every slot of the previous wave crashed.
+    let backoff = ctx.crash_tracker.backoff_duration();
+    if !backoff.is_zero() {
+        eprintln!(
+            "Crash backoff: waiting {} before retry...",
+            display::format_duration(backoff.as_secs())
+        );
+        thread::sleep(backoff);
+    }
+    if ctx.crash_tracker.should_abort() {
+        eprintln!("Too many consecutive crashes, aborting loop");
+        return Some(WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some((1, "too many crashes".to_string(), None)),
+            was_stopped: false,
+        });
+    }
+    None
+}
+
+/// No eligible tasks were selected for this wave. Drives the stale tracker
+/// exactly like sequential does on `IterationOutcome::NoEligibleTasks`,
+/// returning a terminal outcome when the tracker tripped its abort threshold.
+fn handle_no_eligible_tasks(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+) -> WaveOutcome {
+    ctx.stale_tracker.check("stale", "stale");
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        None,
+        &IterationOutcome::NoEligibleTasks,
+        &[],
+        None,
+        None,
+        None,
+    );
+    if ctx.stale_tracker.should_abort() {
+        eprintln!(
+            "Aborting: no eligible tasks after {} consecutive stale iterations",
+            ctx.stale_tracker.count()
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some((
+                1,
+                format!(
+                    "no eligible tasks after {} consecutive stale iterations",
+                    ctx.stale_tracker.count()
+                ),
+                None,
+            )),
+            was_stopped: false,
+        };
+    }
+    WaveOutcome {
+        tasks_completed: 0,
+        iteration_consumed: true,
+        terminal: None,
+        was_stopped: false,
+    }
+}
+
+/// Build per-slot `SlotContext` entries, pairing each scored task with its
+/// pre-allocated worktree path. Each slot gets its own activity epoch —
+/// sharing one would let activity in one slot silently extend another
+/// slot's watchdog deadline.
+fn build_slot_contexts(
+    group: Vec<crate::commands::next::selection::ScoredTask>,
+    slot_paths: &[PathBuf],
+) -> Vec<SlotContext> {
+    group
+        .into_iter()
+        .zip(slot_paths.iter())
+        .enumerate()
+        .map(|(idx, (scored, path))| SlotContext {
+            slot_index: idx,
+            working_root: path.clone(),
+            task: scored.task,
+            last_activity_epoch: Arc::new(AtomicU64::new(0)),
+        })
+        .collect()
+}
+
+/// Build the shared per-slot `SlotIterationParams`. `SignalFlag` clones the
+/// inner `Arc` so all threads observe the same SIGINT/SIGTERM signal.
+fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterationParams> {
+    Arc::new(SlotIterationParams {
+        db_dir: params.db_dir.to_path_buf(),
+        base_prompt_path: params.base_prompt_path.to_path_buf(),
+        permission_mode: params.permission_mode.clone(),
+        signal_flag: params.signal_flag.clone(),
+        default_model: params.default_model.map(|s| s.to_string()),
+        verbose: params.verbose,
+    })
+}
+
+/// Per-slot post-processing on the main thread: progress logging, key
+/// decision storage, `<task-status>` dispatch, `<completed>` tag handling
+/// (with a scan-output fallback when no tags are present), reorder-hint
+/// queueing, and file/stop-flag aggregation.
+///
+/// Updates `agg.all_crashed` only when the slot crashed AND its claimed
+/// task did not finish — any non-crash slot (or a crashed slot whose task
+/// was nonetheless marked done) breaks the all-crashed invariant.
+fn process_slot_result(
+    slot_result: &SlotResult,
+    params: &mut WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+    agg: &mut WaveAggregator,
+) {
+    let slot_idx = slot_result.slot_index;
+    let result = &slot_result.iteration_result;
+    let task_id = result.task_id.clone();
+
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        task_id.as_deref(),
+        &result.outcome,
+        &result.files_modified,
+        result.effective_model.as_deref(),
+        result.effective_effort,
+        Some(slot_idx),
+    );
+
+    // Best-effort key decisions extraction so wave slots match sequential
+    // behavior. Failures only print a warning; we do not derail the wave.
+    let key_decisions = detection::extract_key_decisions(&result.output);
+    for decision in &key_decisions {
+        if let Err(e) = key_decisions_db::insert_key_decision(
+            params.conn,
+            params.run_id,
+            task_id.as_deref(),
+            i64::from(params.iteration),
+            decision,
+        ) {
+            eprintln!(
+                "Warning: [slot {}] failed to store key decision '{}': {}",
+                slot_idx, decision.title, e
+            );
+        }
+    }
+
+    let status_updates = detection::extract_status_updates(&result.output);
+    let status_updates_applied = if !status_updates.is_empty() {
+        apply_status_updates(
+            params.conn,
+            &status_updates,
+            Some(params.run_id),
+            Some(params.prd_path),
+            params.task_prefix,
+            Some(params.progress_path),
+            Some(params.db_dir),
+        )
+    } else {
+        0
+    };
+
+    let mut slot_marked_done = false;
+
+    if let Some(ref tid) = task_id {
+        if status_updates_applied > 0
+            && status_updates
+                .iter()
+                .any(|u| matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid)
+        {
+            slot_marked_done = true;
+            agg.tasks_completed += 1;
+            agg.any_completed = true;
+        }
+
+        // Primary completion path: <completed>TASK-ID</completed>.
+        let completed_tags = parse_completed_tasks(&result.output);
+        for cid in &completed_tags {
+            match mark_task_done(
+                params.conn,
+                cid,
+                params.run_id,
+                None,
+                params.prd_path,
+                params.task_prefix,
+            ) {
+                Ok(()) => {
+                    if cid == tid {
+                        slot_marked_done = true;
+                    }
+                    agg.tasks_completed += 1;
+                    agg.any_completed = true;
+                    eprintln!(
+                        "[slot {}] Task {} completed (<completed> tag)",
+                        slot_idx, cid
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[slot {}] Warning: mark_task_done({}) failed: {}",
+                        slot_idx, cid, e
+                    );
+                }
+            }
+        }
+
+        // Fallback: scan output for completed task IDs. Slot execution
+        // intentionally skips git-commit detection because the commit lives
+        // on an ephemeral branch we have not yet merged.
+        if completed_tags.is_empty() {
+            let scanned =
+                scan_output_for_completed_tasks(&result.output, params.conn, params.task_prefix);
+            for cid in &scanned {
+                let ids = [cid.clone()];
+                match complete_cmd::complete(params.conn, &ids, Some(params.run_id), None, false) {
+                    Ok(_) => {
+                        if cid == tid {
+                            slot_marked_done = true;
+                        }
+                        agg.tasks_completed += 1;
+                        agg.any_completed = true;
+                        if let Err(e) =
+                            update_prd_task_passes(params.prd_path, cid, true, params.task_prefix)
+                        {
+                            eprintln!(
+                                "[slot {}] Warning: PRD update for {} failed: {}",
+                                slot_idx, cid, e
+                            );
+                        } else {
+                            eprintln!("[slot {}] Task {} completed (output scan)", slot_idx, cid);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[slot {}] Warning: complete({}) failed: {}",
+                            slot_idx, cid, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
+        agg.all_crashed = false;
+    }
+
+    // FEAT-010 AC: queue reorder hints for the next wave. `select_parallel_group`
+    // does not yet honor hints (it ranks by score), so this acts as a
+    // preservation queue — operators see them in logs and a future selection
+    // pass can drain them.
+    if let IterationOutcome::Reorder(ref rid) = result.outcome {
+        ctx.pending_reorder_hints.push(rid.clone());
+        eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
+    }
+
+    for f in &result.files_modified {
+        if !agg.aggregated_files.contains(f) {
+            agg.aggregated_files.push(f.clone());
+        }
+    }
+
+    if result.should_stop {
+        agg.wave_should_stop = true;
+    }
+}
+
+/// Count tasks still in flight for the current PRD prefix. "Done",
+/// "skipped", "irrelevant" and "blocked" are terminal — anything else is
+/// still work to do.
+fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+    let (clause, param) = prefix_and(task_prefix);
+    let sql = format!(
+        "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
+         ('done','irrelevant','skipped','blocked') {clause}"
+    );
+    let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Sleep between waves so the loop respects `--iteration-delay` the same
+/// way it does between sequential iterations. Polls the signal flag every
+/// 200ms so SIGINT/SIGTERM short-circuits the delay; returns true if the
+/// signal fired during the wait so the caller can treat it as a stop.
+fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
+    if delay.is_zero() {
+        return false;
+    }
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if signal_flag.is_signaled() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
 ///
 /// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
@@ -781,52 +1138,15 @@ pub struct WaveOutcome {
 /// aggregation and PRD updates happen here so the per-thread invariants
 /// established by FEAT-009 stay intact.
 pub fn run_wave_iteration(
-    params: WaveIterationParams<'_>,
+    mut params: WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> WaveOutcome {
-    // 0. Stop-file / signal short circuits — match sequential semantics so
-    //    Ctrl+C and `.stop` files exit the loop the same way in both paths.
-    if params.signal_flag.is_signaled() {
-        return WaveOutcome {
-            tasks_completed: 0,
-            iteration_consumed: false,
-            terminal: Some((130, "signal received".to_string(), None)),
-            was_stopped: false,
-        };
-    }
-    if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
-        eprintln!("Stop signal detected (.stop file found)");
-        return WaveOutcome {
-            tasks_completed: 0,
-            iteration_consumed: false,
-            terminal: Some((0, "stop signal".to_string(), None)),
-            was_stopped: true,
-        };
+    if let Some(outcome) = wave_preflight_check(&params, ctx) {
+        return outcome;
     }
 
-    // 1. Crash backoff + abort. Identical contract to the sequential path so
-    //    learning [1005] (don't burn iterations on a wedged task) holds even
-    //    when every slot of the previous wave crashed.
-    let backoff = ctx.crash_tracker.backoff_duration();
-    if !backoff.is_zero() {
-        eprintln!(
-            "Crash backoff: waiting {} before retry...",
-            display::format_duration(backoff.as_secs())
-        );
-        thread::sleep(backoff);
-    }
-    if ctx.crash_tracker.should_abort() {
-        eprintln!("Too many consecutive crashes, aborting loop");
-        return WaveOutcome {
-            tasks_completed: 0,
-            iteration_consumed: true,
-            terminal: Some((1, "too many crashes".to_string(), None)),
-            was_stopped: false,
-        };
-    }
-
-    // 2. Parallel group selection. Reuses the same scoring + greedy
-    //    file-overlap walk as `task-mgr next`, capped at `parallel_slots`.
+    // Parallel group selection. Reuses the same scoring + greedy
+    // file-overlap walk as `task-mgr next`, capped at `parallel_slots`.
     let group = match select_parallel_group(
         params.conn,
         &ctx.last_files,
@@ -844,83 +1164,21 @@ pub fn run_wave_iteration(
     };
 
     if group.is_empty() {
-        // No eligible tasks → drive the stale tracker exactly like sequential
-        // does on `IterationOutcome::NoEligibleTasks`.
-        ctx.stale_tracker.check("stale", "stale");
-        progress::log_iteration(
-            params.progress_path,
-            params.iteration,
-            None,
-            &IterationOutcome::NoEligibleTasks,
-            &[],
-            None,
-            None,
-            None,
-        );
-        if ctx.stale_tracker.should_abort() {
-            eprintln!(
-                "Aborting: no eligible tasks after {} consecutive stale iterations",
-                ctx.stale_tracker.count()
-            );
-            return WaveOutcome {
-                tasks_completed: 0,
-                iteration_consumed: true,
-                terminal: Some((
-                    1,
-                    format!(
-                        "no eligible tasks after {} consecutive stale iterations",
-                        ctx.stale_tracker.count()
-                    ),
-                    None,
-                )),
-                was_stopped: false,
-            };
-        }
-        return WaveOutcome {
-            tasks_completed: 0,
-            iteration_consumed: true,
-            terminal: None,
-            was_stopped: false,
-        };
+        return handle_no_eligible_tasks(&params, ctx);
     }
 
-    // We selected at least one eligible task → reset stale tracker (mirrors
+    // Selected at least one eligible task → reset stale tracker (mirrors
     // the sequential `else` branch that calls `check("a", "b")`).
     ctx.stale_tracker.check("a", "b");
 
-    // 3. Build SlotContexts. Worktree paths are pre-allocated by
-    //    `ensure_slot_worktrees` in `run_loop`; we use the first N entries
-    //    matching the size of the selected group. Each slot gets its own
-    //    activity epoch — sharing one would let activity in slot A reset
-    //    the watchdog of slot B.
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_contexts: Vec<SlotContext> = group
-        .into_iter()
-        .zip(slot_paths.iter())
-        .enumerate()
-        .map(|(idx, (scored, path))| SlotContext {
-            slot_index: idx,
-            working_root: path.clone(),
-            task: scored.task,
-            last_activity_epoch: Arc::new(AtomicU64::new(0)),
-        })
-        .collect();
+    let slot_contexts = build_slot_contexts(group, slot_paths);
+    let slot_params = build_shared_slot_params(&params);
 
-    // 4. Shared per-slot params. SignalFlag clones the inner Arc so all
-    //    threads observe the same SIGINT/SIGTERM signal.
-    let slot_params = Arc::new(SlotIterationParams {
-        db_dir: params.db_dir.to_path_buf(),
-        base_prompt_path: params.base_prompt_path.to_path_buf(),
-        permission_mode: params.permission_mode.clone(),
-        signal_flag: params.signal_flag.clone(),
-        default_model: params.default_model.map(|s| s.to_string()),
-        verbose: params.verbose,
-    });
-
-    // 5. Snapshot epoch for `trigger_human_reviews`-style timestamp gating
-    //    (kept here for symmetry with sequential even though human reviews
-    //    are deferred per design — see comment near step 11).
+    // Snapshot epoch for `trigger_human_reviews`-style timestamp gating
+    // (kept here for symmetry with sequential even though human reviews
+    // are deferred per design).
     let _completion_epoch_start: i64 = params
         .conn
         .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
@@ -928,203 +1186,27 @@ pub fn run_wave_iteration(
         })
         .unwrap_or(0);
 
-    // 6. Run wave (blocks until every spawned slot thread joins).
+    // Run wave (blocks until every spawned slot thread joins).
     let wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
 
-    // 7. Per-slot post-processing on the main thread.
-    let mut tasks_completed: u32 = 0;
-    let mut any_completed = false;
-    let mut all_crashed = !wave_result.outcomes.is_empty();
-    let mut aggregated_files: Vec<String> = Vec::new();
-    let mut wave_should_stop = false;
-
+    // Per-slot post-processing on the main thread.
+    let mut agg = WaveAggregator::new(wave_result.outcomes.len());
     for slot_result in &wave_result.outcomes {
-        let slot_idx = slot_result.slot_index;
-        let result = &slot_result.iteration_result;
-        let task_id = result.task_id.clone();
-
-        progress::log_iteration(
-            params.progress_path,
-            params.iteration,
-            task_id.as_deref(),
-            &result.outcome,
-            &result.files_modified,
-            result.effective_model.as_deref(),
-            result.effective_effort,
-            Some(slot_idx),
-        );
-
-        // Best-effort key decisions extraction so wave slots match sequential
-        // behavior. Failures only print a warning; we do not derail the wave.
-        let key_decisions = detection::extract_key_decisions(&result.output);
-        for decision in &key_decisions {
-            if let Err(e) = key_decisions_db::insert_key_decision(
-                params.conn,
-                params.run_id,
-                task_id.as_deref(),
-                i64::from(params.iteration),
-                decision,
-            ) {
-                eprintln!(
-                    "Warning: [slot {}] failed to store key decision '{}': {}",
-                    slot_idx, decision.title, e
-                );
-            }
-        }
-
-        // Apply <task-status> tags from this slot's stdout.
-        let status_updates = detection::extract_status_updates(&result.output);
-        let status_updates_applied = if !status_updates.is_empty() {
-            apply_status_updates(
-                params.conn,
-                &status_updates,
-                Some(params.run_id),
-                Some(params.prd_path),
-                params.task_prefix,
-                Some(params.progress_path),
-                Some(params.db_dir),
-            )
-        } else {
-            0
-        };
-
-        let mut slot_marked_done = false;
-
-        if let Some(ref tid) = task_id {
-            // Did a <task-status> tag mark this slot's claimed task done?
-            if status_updates_applied > 0
-                && status_updates.iter().any(|u| {
-                    matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid
-                })
-            {
-                slot_marked_done = true;
-                tasks_completed += 1;
-                any_completed = true;
-            }
-
-            // Primary completion path: <completed>TASK-ID</completed>.
-            let completed_tags = parse_completed_tasks(&result.output);
-            for cid in &completed_tags {
-                match mark_task_done(
-                    params.conn,
-                    cid,
-                    params.run_id,
-                    None,
-                    params.prd_path,
-                    params.task_prefix,
-                ) {
-                    Ok(()) => {
-                        if cid == tid {
-                            slot_marked_done = true;
-                        }
-                        tasks_completed += 1;
-                        any_completed = true;
-                        eprintln!(
-                            "[slot {}] Task {} completed (<completed> tag)",
-                            slot_idx, cid
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[slot {}] Warning: mark_task_done({}) failed: {}",
-                            slot_idx, cid, e
-                        );
-                    }
-                }
-            }
-
-            // Fallback: scan output for any other completed task IDs. Slot
-            // execution intentionally skips git-commit detection because the
-            // commit lives on an ephemeral branch we have not yet merged.
-            if completed_tags.is_empty() {
-                let scanned = scan_output_for_completed_tasks(
-                    &result.output,
-                    params.conn,
-                    params.task_prefix,
-                );
-                for cid in &scanned {
-                    let ids = [cid.clone()];
-                    match complete_cmd::complete(
-                        params.conn,
-                        &ids,
-                        Some(params.run_id),
-                        None,
-                        false,
-                    ) {
-                        Ok(_) => {
-                            if cid == tid {
-                                slot_marked_done = true;
-                            }
-                            tasks_completed += 1;
-                            any_completed = true;
-                            if let Err(e) = update_prd_task_passes(
-                                params.prd_path,
-                                cid,
-                                true,
-                                params.task_prefix,
-                            ) {
-                                eprintln!(
-                                    "[slot {}] Warning: PRD update for {} failed: {}",
-                                    slot_idx, cid, e
-                                );
-                            } else {
-                                eprintln!(
-                                    "[slot {}] Task {} completed (output scan)",
-                                    slot_idx, cid
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[slot {}] Warning: complete({}) failed: {}",
-                                slot_idx, cid, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // CrashTracker AC: only "all crashed" flips the tracker. Any slot
-        // that did not crash (or that completed something despite a crash
-        // outcome flag) breaks the all-crashed invariant.
-        if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
-            all_crashed = false;
-        }
-
-        // FEAT-010 AC: queue reorder hints from slots for the next wave.
-        // `select_parallel_group` does not yet honor hints (it ranks by
-        // score), so this is a preservation queue — operators can read them
-        // from logs and a future selection pass can drain them.
-        if let IterationOutcome::Reorder(ref rid) = result.outcome {
-            ctx.pending_reorder_hints.push(rid.clone());
-            eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
-        }
-
-        for f in &result.files_modified {
-            if !aggregated_files.contains(f) {
-                aggregated_files.push(f.clone());
-            }
-        }
-
-        if result.should_stop {
-            wave_should_stop = true;
-        }
+        process_slot_result(slot_result, &mut params, ctx, &mut agg);
     }
 
-    // 8. CrashTracker policy per FEAT-010 AC.
-    if any_completed {
+    // CrashTracker policy per FEAT-010 AC.
+    if agg.any_completed {
         ctx.crash_tracker.record_success();
-    } else if all_crashed {
+    } else if agg.all_crashed {
         ctx.crash_tracker.record_crash();
     }
 
-    // 9. Update last_files for next wave's locality scoring.
-    ctx.last_files = aggregated_files.clone();
+    // Feed the next wave's locality scoring.
+    ctx.last_files = agg.aggregated_files.clone();
 
-    // 10. Merge ephemeral slot branches back into the main loop branch so
-    //     the next wave starts from a unified base. `merge_slot_branches`
-    //     is a no-op when parallel_slots <= 1.
+    // Merge ephemeral slot branches back into the main loop branch so the
+    // next wave starts from a unified base. No-op when parallel_slots <= 1.
     if params.parallel_slots > 1
         && let Err(e) =
             worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots)
@@ -1135,18 +1217,18 @@ pub fn run_wave_iteration(
         );
     }
 
-    // 11. Run-table bookkeeping (last commit + files).
     if let Err(e) = run_cmd::update(
         params.conn,
         params.run_id,
         ctx.last_commit.as_deref(),
-        Some(&aggregated_files),
+        Some(&agg.aggregated_files),
     ) {
         eprintln!("Warning: failed to update run: {}", e);
     }
 
-    // 12. Per-wave external-git reconciliation. Mirrors the sequential
-    //     "Post-iteration: reconcile external git completions" step.
+    // Per-wave external-git reconciliation. Mirrors the sequential
+    // "Post-iteration: reconcile external git completions" step.
+    let mut tasks_completed = agg.tasks_completed;
     if let Some(ext_repo) = params.external_repo_path {
         let count = reconcile_external_git_completions(
             ext_repo,
@@ -1158,14 +1240,14 @@ pub fn run_wave_iteration(
         );
         if count > 0 {
             tasks_completed += count as u32;
-            any_completed = true;
+            agg.any_completed = true;
             ctx.crash_tracker.record_success();
             eprintln!("Post-wave reconciliation: marked {} task(s) done", count);
         }
     }
 
-    // 13. Terminal conditions: signal precedes everything; crash abort wins
-    //     over completion-of-all-tasks because the abort is a hard stop.
+    // Terminal conditions: signal precedes everything; crash abort wins
+    // over completion-of-all-tasks because the abort is a hard stop.
     if params.signal_flag.is_signaled() {
         return WaveOutcome {
             tasks_completed,
@@ -1183,22 +1265,7 @@ pub fn run_wave_iteration(
         };
     }
 
-    // 14. Are there any tasks left to work? "Done", "skipped", "irrelevant"
-    //     and "blocked" are terminal — anything else is still in flight.
-    let (clause, param) = crate::db::prefix::prefix_and(params.task_prefix);
-    let sql = format!(
-        "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
-         ('done','irrelevant','skipped','blocked') {clause}"
-    );
-    let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    let remaining: i64 = params
-        .conn
-        .query_row(&sql, p_vec.as_slice(), |r| r.get(0))
-        .unwrap_or(0);
-    if remaining == 0 && any_completed {
+    if agg.any_completed && count_remaining_active_tasks(params.conn, params.task_prefix) == 0 {
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
@@ -1211,17 +1278,10 @@ pub fn run_wave_iteration(
         };
     }
 
-    // 15. Inter-wave delay so the loop respects `--iteration-delay` between
-    //     waves the same way it does between sequential iterations.
-    if !wave_should_stop && !params.inter_iteration_delay.is_zero() {
-        let deadline = std::time::Instant::now() + params.inter_iteration_delay;
-        while std::time::Instant::now() < deadline {
-            if params.signal_flag.is_signaled() {
-                wave_should_stop = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(200));
-        }
+    let mut wave_should_stop = agg.wave_should_stop;
+    if !wave_should_stop && wait_inter_wave_delay(params.inter_iteration_delay, params.signal_flag)
+    {
+        wave_should_stop = true;
     }
 
     WaveOutcome {
