@@ -163,7 +163,7 @@ impl RecallCmdResult {
             learnings,
             query: params.query.clone(),
             for_task: params.for_task.clone(),
-            outcome_filter: params.outcome.map(|o| format!("{:?}", o).to_lowercase()),
+            outcome_filter: params.outcome.map(|o| o.to_string()),
             tags_filter: params.tags.clone(),
         }
     }
