@@ -162,6 +162,14 @@ pub fn list_learnings(
         );
         let mut sup_stmt = conn.prepare(&sup_sql)?;
         let id_set: std::collections::HashSet<i64> = id_list.iter().copied().collect();
+        // Asymmetric representations are intentional:
+        // - `superseded_by_map: HashMap<i64, i64>` — a learning can be superseded
+        //   by several rows simultaneously (see SUPERSESSION_SUBQUERY doc), but
+        //   recall already filters such learnings out, so list output only needs
+        //   one successor for the annotation. Last-wins by SQL row order.
+        // - `supersedes_map: HashMap<i64, Vec<i64>>` — one new learning may
+        //   legitimately consolidate many olds, and we want to show all of them
+        //   in the `(supersedes #A, #B, #C)` annotation.
         let mut superseded_by_map: HashMap<i64, i64> = HashMap::new();
         let mut supersedes_map: HashMap<i64, Vec<i64>> = HashMap::new();
         let chained_params: Vec<i64> = id_list.iter().chain(id_list.iter()).copied().collect();
