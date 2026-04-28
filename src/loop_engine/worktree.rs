@@ -431,7 +431,6 @@ fn ephemeral_slot_branch(branch_name: &str, slot: usize) -> String {
 /// slots 1+ receive a distinct suffixed directory (`{branch}-slot-{N}` after
 /// branch-name sanitization) so git's one-branch-per-worktree rule is
 /// satisfied.
-#[allow(dead_code)] // First non-test caller lands with parallel wave execution.
 pub(crate) fn compute_slot_worktree_path(
     project_root: &Path,
     branch_name: &str,
@@ -456,7 +455,6 @@ pub(crate) fn compute_slot_worktree_path(
 ///
 /// Returns one PathBuf per slot, in slot-index order. Returns an empty vec
 /// when `num_slots == 0`.
-#[allow(dead_code)] // First non-test caller lands with parallel wave execution.
 pub(crate) fn ensure_slot_worktrees(
     project_root: &Path,
     branch_name: &str,
@@ -496,7 +494,6 @@ pub(crate) fn ensure_slot_worktrees(
 /// branch. Uncommitted changes on a slot branch cause the merge to succeed
 /// without picking them up — wave orchestration is responsible for enforcing
 /// the commit discipline.
-#[allow(dead_code)] // First non-test caller lands with parallel wave execution.
 pub(crate) fn merge_slot_branches(
     project_root: &Path,
     branch_name: &str,
@@ -569,7 +566,6 @@ pub(crate) fn merge_slot_branches(
 /// is printed — its ephemeral branch is then also preserved, since
 /// `git branch -D` refuses to delete a branch that is still checked out.
 /// Missing ephemeral branches (e.g., partial setup) are tolerated.
-#[allow(dead_code)] // First non-test caller lands with parallel wave execution.
 pub(crate) fn cleanup_slot_worktrees(
     project_root: &Path,
     branch_name: &str,
