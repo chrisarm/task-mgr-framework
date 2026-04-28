@@ -56,6 +56,17 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 fn main() {
     let mut cli = Cli::parse();
 
+    // Make machine-readable output mode observable to library helpers that
+    // emit informational stderr notes (e.g., `loop_engine::env::resolve_paths`
+    // sibling-worktree fallback). The `human_output_enabled()` predicate
+    // keys off this var. Set before any thread spawns so it propagates to
+    // every subprocess.
+    if cli.format == OutputFormat::Json {
+        // SAFETY: single-threaded context — no other thread can observe the
+        // mutation. clap parsing runs synchronously above.
+        unsafe { std::env::set_var("TASK_MGR_FORMAT", "json") };
+    }
+
     // Resolve --dir to a canonical absolute path *once*, so every subcommand
     // inherits the same DB directory. See `src/db/path.rs` for the rules and
     // the worktree bug this fixes (spawned subprocesses creating stray
