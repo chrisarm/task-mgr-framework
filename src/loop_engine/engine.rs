@@ -520,6 +520,10 @@ pub fn run_slot_iteration(
         Arc::clone(&slot.last_activity_epoch),
     );
 
+    // Prefix every line of this slot's tee output with its slot index so
+    // concurrent slots stay attributable on a shared stderr.
+    let slot_label_buf = format!("[slot {}]", slot.slot_index);
+
     let claude_result = claude::spawn_claude(
         &prompt,
         &params.permission_mode,
@@ -534,6 +538,7 @@ pub fn run_slot_iteration(
             db_dir: Some(&params.db_dir),
             use_pty: false,
             target_task_id: Some(&slot.task.id),
+            slot_label: Some(&slot_label_buf),
             ..Default::default()
         },
     )?;

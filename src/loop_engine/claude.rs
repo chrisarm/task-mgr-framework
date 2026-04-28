@@ -128,6 +128,14 @@ pub(crate) struct SpawnOpts<'a> {
     /// completion triggers the grace — other `<completed>` tags (e.g.
     /// tasks finished en route) are collected normally but do not arm it.
     pub target_task_id: Option<&'a str>,
+    /// Optional prefix applied to every live-output line this spawn emits
+    /// (assistant text, plain-mode stdout passthrough, malformed-JSON
+    /// warnings). Used by parallel-wave callers to disambiguate which
+    /// slot's Claude is talking when multiple subprocesses tee to stderr
+    /// concurrently. Sequential callers pass `None` and output is unprefixed.
+    /// Note: child stderr is inherited (not piped) and therefore cannot be
+    /// prefixed — only output that flows through our tee paths is tagged.
+    pub slot_label: Option<&'a str>,
 }
 
 /// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
@@ -259,6 +267,7 @@ pub(crate) fn spawn_claude(
         cleanup_title_artifact,
         use_pty,
         target_task_id,
+        slot_label,
     } = opts;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -505,20 +514,23 @@ pub(crate) fn spawn_claude(
     let reader = BufReader::new(reader_source);
 
     let (output, conversation, permission_denials) = if stream_json {
-        tee_stream_json(reader, target_task_id, &completion_epoch)
+        tee_stream_json(reader, target_task_id, &completion_epoch, slot_label)
     } else {
         let mut buf = String::new();
         for line_result in reader.lines() {
             match line_result {
                 Ok(line) => {
                     // Tee: echo to stderr (live display) and collect in buffer
-                    eprintln!("{}", line);
+                    emit_prefixed_lines(slot_label, &line);
                     buf.push_str(&line);
                     buf.push('\n');
                 }
                 Err(e) if is_pty_read_eof(&e) => break,
                 Err(e) => {
-                    eprintln!("Warning: error reading Claude stdout: {}", e);
+                    emit_prefixed_lines(
+                        slot_label,
+                        &format!("Warning: error reading Claude stdout: {}", e),
+                    );
                     break;
                 }
             }
@@ -573,6 +585,7 @@ fn tee_stream_json(
     reader: BufReader<impl std::io::Read>,
     target_task_id: Option<&str>,
     completion_epoch: &AtomicU64,
+    slot_label: Option<&str>,
 ) -> (String, Option<String>, Vec<serde_json::Value>) {
     let mut parsed: Vec<serde_json::Value> = Vec::new();
 
@@ -582,7 +595,7 @@ fn tee_stream_json(
                 match serde_json::from_str::<serde_json::Value>(&line) {
                     Ok(val) => {
                         // Tee assistant text live before collecting for conversation building
-                        tee_assistant_text(&val);
+                        tee_assistant_text(&val, slot_label);
                         // Arm the post-completion grace once we see the current
                         // task's `<completed>` in the stream. Other task IDs are
                         // ignored here and captured normally via the post-process
@@ -593,13 +606,19 @@ fn tee_stream_json(
                         parsed.push(val);
                     }
                     Err(_) => {
-                        eprintln!("Warning: malformed stream-json line (not valid JSON)");
+                        emit_prefixed_lines(
+                            slot_label,
+                            "Warning: malformed stream-json line (not valid JSON)",
+                        );
                     }
                 }
             }
             Err(e) if is_pty_read_eof(&e) => break,
             Err(e) => {
-                eprintln!("Warning: error reading Claude stdout: {}", e);
+                emit_prefixed_lines(
+                    slot_label,
+                    &format!("Warning: error reading Claude stdout: {}", e),
+                );
                 break;
             }
         }
@@ -632,7 +651,7 @@ fn assistant_content(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>>
         .and_then(|c| c.as_array())
 }
 
-fn tee_assistant_text(val: &serde_json::Value) {
+fn tee_assistant_text(val: &serde_json::Value, slot_label: Option<&str>) {
     if val.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return;
     }
@@ -641,10 +660,59 @@ fn tee_assistant_text(val: &serde_json::Value) {
             if block.get("type").and_then(|t| t.as_str()) == Some("text")
                 && let Some(text) = block.get("text").and_then(|t| t.as_str())
             {
-                eprintln!("{}", text);
+                emit_prefixed_lines(slot_label, text);
             }
         }
     }
+}
+
+/// Emit `text` to stderr with `slot_label` prepended to every line.
+///
+/// Splits on `\n` and prefixes each line independently so a multi-line
+/// assistant message stays attributable when interleaved with other slots'
+/// output. A single write per line keeps each line atomic at the stdio
+/// layer (the OS write is not split across threads), so even with concurrent
+/// slot tees the prefix is always at the start of its line.
+///
+/// `None` prefix is the legacy unprefixed path: a single write with the
+/// original text + trailing newline, preserving exact byte-for-byte behavior
+/// for the sequential `run_iteration` caller.
+pub(crate) fn emit_prefixed_lines(slot_label: Option<&str>, text: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = write_prefixed_lines(&mut stderr, slot_label, text);
+}
+
+/// Inner helper: same semantics as `emit_prefixed_lines` but writes to an
+/// arbitrary `Write` so the line-splitting logic is testable.
+///
+/// Returns `io::Result<()>` so a failed write surfaces in tests; production
+/// callers ignore it (stderr write failure isn't actionable).
+pub(crate) fn write_prefixed_lines<W: std::io::Write>(
+    out: &mut W,
+    slot_label: Option<&str>,
+    text: &str,
+) -> std::io::Result<()> {
+    match slot_label {
+        None => {
+            writeln!(out, "{}", text)?;
+        }
+        Some(prefix) => {
+            // `str::lines()` splits on `\n`/`\r\n` and drops a trailing empty
+            // token, matching the trailing-newline semantics of a single
+            // `writeln!("{}", text)`. Interior blank lines are preserved as
+            // empty strings so they still get a prefix (and stay attributable).
+            // An empty `text` produces zero lines — emit one prefixed blank so
+            // the slot's "I said nothing this turn" still shows up.
+            if text.is_empty() {
+                writeln!(out, "{}", prefix)?;
+                return Ok(());
+            }
+            for line in text.lines() {
+                writeln!(out, "{} {}", prefix, line)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan an assistant message for `<completed>TARGET</completed>` and arm the
@@ -3441,5 +3509,82 @@ mod tests {
         let _home = HomeGuard::set(&fake_home);
         cleanup_title_artifact_sync(uuid::Uuid::new_v4(), Some(&fake_cwd));
         // Test passes if we reach here without panic.
+    }
+
+    // --- emit_prefixed_lines / write_prefixed_lines ---
+    //
+    // Test the inner `write_prefixed_lines` against a Vec<u8> so we can
+    // assert exact bytes; `emit_prefixed_lines` is just a thin wrapper that
+    // points the same logic at stderr.
+
+    fn write_to_string(slot_label: Option<&str>, text: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_prefixed_lines(&mut buf, slot_label, text).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_none_prefix_passthrough() {
+        // No prefix: identical to a single writeln!("{}", text).
+        assert_eq!(write_to_string(None, "hello"), "hello\n");
+        assert_eq!(write_to_string(None, "a\nb"), "a\nb\n");
+        assert_eq!(write_to_string(None, ""), "\n");
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_single_line() {
+        assert_eq!(
+            write_to_string(Some("[slot 0]"), "hello"),
+            "[slot 0] hello\n"
+        );
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_multi_line_each_prefixed() {
+        // Each line of a multi-line message gets its own prefix so an
+        // interleaved peer slot can't make a line look like ours (or vice
+        // versa) — every line is attributable in isolation.
+        assert_eq!(
+            write_to_string(Some("[slot 1]"), "line one\nline two\nline three"),
+            "[slot 1] line one\n[slot 1] line two\n[slot 1] line three\n"
+        );
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_trailing_newline_dropped() {
+        // Matches `eprintln!("{}", "a\n")` semantics: writeln adds one newline,
+        // and `str::lines()` drops the trailing empty token, so we don't
+        // emit a stray "[slot 0] " line.
+        assert_eq!(
+            write_to_string(Some("[slot 0]"), "a\nb\n"),
+            "[slot 0] a\n[slot 0] b\n"
+        );
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_interior_blank_line_preserved() {
+        // A deliberately blank line between two non-empty lines is preserved
+        // as a prefixed-blank line so the slot's blank line is attributable.
+        assert_eq!(
+            write_to_string(Some("[slot 2]"), "a\n\nb"),
+            "[slot 2] a\n[slot 2] \n[slot 2] b\n"
+        );
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_empty_text_emits_prefix_only() {
+        // Empty text still produces a single prefixed line so a slot's
+        // "I said nothing this iteration" still shows up — distinguishes
+        // a slot that emitted nothing from a slot that wasn't there at all.
+        assert_eq!(write_to_string(Some("[slot 0]"), ""), "[slot 0]\n");
+    }
+
+    #[test]
+    fn test_write_prefixed_lines_crlf_split_like_lines() {
+        // `str::lines()` accepts both `\n` and `\r\n` line endings.
+        assert_eq!(
+            write_to_string(Some("[slot 0]"), "a\r\nb"),
+            "[slot 0] a\n[slot 0] b\n"
+        );
     }
 }
