@@ -947,6 +947,12 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         // still counts as "LLM said duplicates" (not to be dismissed).
         let mut cluster_internal_pairs: HashSet<(i64, i64)> = HashSet::new();
 
+        // Maps each retired source ID to the merged learning ID it was folded
+        // into within THIS batch. Populated only for clusters whose merge
+        // succeeded — used below to rewrite cross-cluster dismissals so they
+        // reference the surviving merged ID rather than the now-retired source.
+        let mut merge_map: HashMap<i64, i64> = HashMap::new();
+
         for raw in raw_clusters {
             let source_ids = match raw.source_ids {
                 Some(ids) if ids.len() >= 2 => ids,
@@ -996,10 +1002,18 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                         learnings_merged += result.retired_source_ids.len();
                         learnings_created += 1;
                         let id = result.merged_learning_id;
+                        for &src_id in &result.retired_source_ids {
+                            merge_map.insert(src_id, id);
+                        }
                         writer.push_existing(id, result.merged_title, result.merged_content);
                         Some(id)
                     }
                     Err(e) => {
+                        // The failed cluster's source IDs stay active (no `merged_ids`
+                        // insert below, no `merge_map` entry). Their pairs in the
+                        // dismissal block are NOT rewritten and NOT filtered out —
+                        // which is correct: the LLM did examine them, they're still
+                        // active, so a dismissal against the original ID is meaningful.
                         eprintln!("Warning: merge_cluster failed: {}", e);
                         continue;
                     }
@@ -1026,21 +1040,30 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         // Record dismissals for this batch: every C(N,2) pair from the batch,
         // minus pairs the LLM flagged as duplicates, minus any pair whose IDs
         // were retired by a strictly earlier batch (those IDs are gone).
+        // Pairs are rewritten via `merge_map` so a retired source ID is
+        // replaced by the merged learning ID it was folded into — otherwise
+        // the dismissal would reference a retired (inert) row and the next
+        // dedup run would re-examine the merged learning vs the survivors.
         //
         // Suppressed when dry_run is set (read-only convention) or when the
         // batch errored out (already handled via the `continue` above).
         if !params.dry_run {
-            let ids = &batch_item_ids[batch_idx];
-            if ids.len() >= 2 {
-                let to_dismiss: Vec<(i64, i64)> = unordered_pairs(ids)
-                    .filter(|pair| !cluster_internal_pairs.contains(pair))
-                    .filter(|(lo, hi)| {
-                        !prior_merged_ids.contains(lo) && !prior_merged_ids.contains(hi)
-                    })
-                    .collect();
-                if !to_dismiss.is_empty() {
-                    record_dismissals(conn, &to_dismiss)?;
+            let to_dismiss = compute_dismissal_pairs(
+                &batch_item_ids[batch_idx],
+                &cluster_internal_pairs,
+                &prior_merged_ids,
+                &merge_map,
+            );
+            if !to_dismiss.is_empty() {
+                if !merge_map.is_empty() {
+                    eprintln!(
+                        "Recording {} dismissal pair(s) for batch {} (rewrote {} retired source(s) via merge_map)",
+                        to_dismiss.len(),
+                        batch_idx + 1,
+                        merge_map.len(),
+                    );
                 }
+                record_dismissals(conn, &to_dismiss)?;
             }
         }
     }
@@ -1336,6 +1359,49 @@ pub(crate) fn is_fully_dismissed(cluster_ids: &[i64], dismissals: &HashSet<(i64,
         return false;
     }
     unordered_pairs(cluster_ids).all(|p| dismissals.contains(&p))
+}
+
+/// Computes the deduplicated set of dismissal pairs to record for one LLM batch,
+/// rewriting retired source IDs to their newly-merged learning IDs.
+///
+/// The LLM examines the *original* batch members, but a successful merge retires
+/// some of them. Recording dismissals with the original IDs leaves rows pointing
+/// at retired learnings — inert and useless to future runs. By substituting the
+/// new merged ID for any retired source, we record dismissals that future dedup
+/// runs (which only see the merged learning) can actually match.
+///
+/// Inputs:
+/// - `batch_ids`: every learning ID the LLM saw in this batch.
+/// - `cluster_internal_pairs`: pairs the LLM grouped together as duplicates
+///   (in *original* IDs, before merging) — these are NOT dismissals.
+/// - `prior_merged_ids`: IDs retired by *strictly earlier* batches. Any pair
+///   touching one of these is dropped (the ID is already gone).
+/// - `merge_map`: per-batch source-ID → merged-ID map. Only populated for
+///   clusters that successfully merged in *this* batch.
+///
+/// Returns a `Vec` of canonical (id_lo < id_hi) pairs ready for `record_dismissals`.
+/// Self-pairs that would arise from rewriting both sides of a same-cluster pair
+/// (defensive; cluster_internal_pairs should already filter them) are dropped.
+pub(crate) fn compute_dismissal_pairs(
+    batch_ids: &[i64],
+    cluster_internal_pairs: &HashSet<(i64, i64)>,
+    prior_merged_ids: &HashSet<i64>,
+    merge_map: &HashMap<i64, i64>,
+) -> Vec<(i64, i64)> {
+    if batch_ids.len() < 2 {
+        return Vec::new();
+    }
+    let rewritten: HashSet<(i64, i64)> = unordered_pairs(batch_ids)
+        .filter(|pair| !cluster_internal_pairs.contains(pair))
+        .filter(|(lo, hi)| !prior_merged_ids.contains(lo) && !prior_merged_ids.contains(hi))
+        .map(|(lo, hi)| {
+            let new_lo = *merge_map.get(&lo).unwrap_or(&lo);
+            let new_hi = *merge_map.get(&hi).unwrap_or(&hi);
+            normalize_pair(new_lo, new_hi)
+        })
+        .filter(|(lo, hi)| lo != hi)
+        .collect();
+    rewritten.into_iter().collect()
 }
 
 #[cfg(test)]

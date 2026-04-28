@@ -20,8 +20,8 @@ use crate::models::{Confidence, LearningOutcome};
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
     DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt,
-    clear_dismissals, curate_count, curate_retire, curate_unretire, is_fully_dismissed,
-    load_dismissals, merge_cluster, parse_dedup_response, record_dismissals,
+    clear_dismissals, compute_dismissal_pairs, curate_count, curate_retire, curate_unretire,
+    is_fully_dismissed, load_dismissals, merge_cluster, parse_dedup_response, record_dismissals,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -4680,11 +4680,14 @@ fn test_dedup_records_dismissals_when_llm_returns_empty() {
     assert!(dismissals.contains(&expect_pair(id2, id3)));
 }
 
-/// AC (positive): cluster {A,B} from batch {A,B,C,D} dismisses
-/// (A,C),(A,D),(B,C),(B,D),(C,D) — 5 pairs — but NOT (A,B).
+/// AC: cluster {A,B} merged to N from batch {A,B,C,D} records dismissals against
+/// the *merged* learning N — not the retired source IDs A,B. Expected pairs:
+/// (N,C), (N,D), (C,D) — three pairs. (A,B) is internal to the cluster and never
+/// dismissed; (A,C)/(A,D)/(B,C)/(B,D) would point at retired (inert) rows so we
+/// rewrite them to (N,C)/(N,D) instead.
 #[test]
 #[cfg(unix)]
-fn test_dedup_dismissals_exclude_merged_internal_pairs() {
+fn test_dedup_dismissals_rewrite_retired_sources_to_merged_id() {
     let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_dir, conn) = setup_db();
 
@@ -4702,6 +4705,9 @@ fn test_dedup_dismissals_exclude_merged_internal_pairs() {
     unsafe { std::env::remove_var("CLAUDE_BINARY") };
 
     assert_eq!(result.clusters_found, 1, "1 cluster {{A,B}} merged");
+    let n = result.clusters[0]
+        .merged_learning_id
+        .expect("merged learning id present");
 
     let dismissals = load_dismissals(&conn).expect("load dismissals");
     let pair = |x: i64, y: i64| if x < y { (x, y) } else { (y, x) };
@@ -4710,12 +4716,213 @@ fn test_dedup_dismissals_exclude_merged_internal_pairs() {
         !dismissals.contains(&pair(a, b)),
         "(A,B) is a merged cluster pair — must NOT be dismissed"
     );
-    assert!(dismissals.contains(&pair(a, c)), "(A,C) must be dismissed");
-    assert!(dismissals.contains(&pair(a, d)), "(A,D) must be dismissed");
-    assert!(dismissals.contains(&pair(b, c)), "(B,C) must be dismissed");
-    assert!(dismissals.contains(&pair(b, d)), "(B,D) must be dismissed");
+    assert!(
+        !dismissals.contains(&pair(a, c)),
+        "(A,C) must be rewritten to (N,C); A is retired/inert"
+    );
+    assert!(
+        !dismissals.contains(&pair(b, c)),
+        "(B,C) must be rewritten to (N,C); B is retired/inert"
+    );
+    assert!(
+        !dismissals.contains(&pair(a, d)),
+        "(A,D) must be rewritten to (N,D); A is retired/inert"
+    );
+    assert!(
+        !dismissals.contains(&pair(b, d)),
+        "(B,D) must be rewritten to (N,D); B is retired/inert"
+    );
+    assert!(
+        dismissals.contains(&pair(n, c)),
+        "(N,C) must be dismissed — LLM examined merged-source vs C"
+    );
+    assert!(
+        dismissals.contains(&pair(n, d)),
+        "(N,D) must be dismissed — LLM examined merged-source vs D"
+    );
     assert!(dismissals.contains(&pair(c, d)), "(C,D) must be dismissed");
-    assert_eq!(dismissals.len(), 5, "exactly 5 dismissed pairs expected");
+    assert_eq!(
+        dismissals.len(),
+        3,
+        "exactly 3 dismissed pairs expected after rewrite"
+    );
+}
+
+/// AC: two clusters in the same batch — {A,B}→N1 and {C,D}→N2 — produce a
+/// single (N1,N2) dismissal, not the four inert pairs (A,C)(A,D)(B,C)(B,D).
+#[test]
+#[cfg(unix)]
+fn test_dedup_dismissals_rewrite_two_clusters_in_same_batch() {
+    let _guard = DEDUP_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, conn) = setup_db();
+
+    let a = insert_learning(&conn, "A", Confidence::High, LearningOutcome::Pattern);
+    let b = insert_learning(&conn, "B", Confidence::High, LearningOutcome::Pattern);
+    let c = insert_learning(&conn, "C", Confidence::High, LearningOutcome::Pattern);
+    let d = insert_learning(&conn, "D", Confidence::High, LearningOutcome::Pattern);
+
+    let mock_json = format!(
+        r#"[
+          {{"source_ids": [{a},{b}], "merged_title": "AB", "merged_content": "x", "merged_outcome": "pattern", "reason": "dup"}},
+          {{"source_ids": [{c},{d}], "merged_title": "CD", "merged_content": "y", "merged_outcome": "pattern", "reason": "dup"}}
+        ]"#
+    );
+    let (_mock_dir, script) = setup_claude_mock(&mock_json);
+    unsafe { std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap()) };
+    let result = curate_dedup(&conn, DedupParams::default()).expect("curate_dedup");
+    unsafe { std::env::remove_var("CLAUDE_BINARY") };
+
+    assert_eq!(result.clusters_found, 2, "2 clusters merged");
+    let n1 = result.clusters[0]
+        .merged_learning_id
+        .expect("first merged id present");
+    let n2 = result.clusters[1]
+        .merged_learning_id
+        .expect("second merged id present");
+
+    let dismissals = load_dismissals(&conn).expect("load dismissals");
+    let pair = |x: i64, y: i64| if x < y { (x, y) } else { (y, x) };
+
+    assert!(
+        dismissals.contains(&pair(n1, n2)),
+        "(N1,N2) must be dismissed — both clusters are distinct survivors"
+    );
+    for (lo, hi) in [(a, c), (a, d), (b, c), (b, d)] {
+        assert!(
+            !dismissals.contains(&pair(lo, hi)),
+            "({},{}) points to retired rows — must be rewritten away",
+            lo,
+            hi
+        );
+    }
+    assert_eq!(
+        dismissals.len(),
+        1,
+        "exactly 1 dismissed pair (N1,N2) expected"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests for the pure compute_dismissal_pairs helper.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Helper: build a HashSet of pairs from an iterator of `(i64,i64)`.
+fn pair_set(pairs: &[(i64, i64)]) -> std::collections::HashSet<(i64, i64)> {
+    pairs.iter().copied().collect()
+}
+
+/// Builds a sorted Vec for stable comparison.
+fn sorted(mut v: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    v.sort();
+    v
+}
+
+/// AC: with no merges, helper returns every C(N,2) pair minus internal pairs and
+/// pairs touching prior_merged_ids — same behavior as before the rewrite fix.
+#[test]
+fn test_compute_dismissal_pairs_no_merges_acts_like_filter() {
+    let merge_map = std::collections::HashMap::new();
+    let internal = pair_set(&[(1, 2)]); // pretend (1,2) was a merged cluster
+    let prior = std::collections::HashSet::new();
+    let out = compute_dismissal_pairs(&[1, 2, 3, 4], &internal, &prior, &merge_map);
+    assert_eq!(
+        sorted(out),
+        sorted(vec![(1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]),
+        "no merges → original C(N,2) pairs minus internal"
+    );
+}
+
+/// AC: when sources are mapped to a merged ID, retired-source pairs are rewritten
+/// and self-pairs (both sides map to the same merged ID) are dropped.
+#[test]
+fn test_compute_dismissal_pairs_rewrites_retired_to_merged() {
+    // Simulating cluster {1,2} merged into 99, batch was [1,2,3,4].
+    let mut merge_map = std::collections::HashMap::new();
+    merge_map.insert(1, 99);
+    merge_map.insert(2, 99);
+    let internal = pair_set(&[(1, 2)]); // (1,2) is the merged-cluster's internal pair
+    let prior = std::collections::HashSet::new();
+    let out = compute_dismissal_pairs(&[1, 2, 3, 4], &internal, &prior, &merge_map);
+    // After rewrite: (1,3)→(3,99), (1,4)→(4,99), (2,3)→(3,99), (2,4)→(4,99), (3,4)
+    // dedup'd: (3,99), (4,99), (3,4)
+    assert_eq!(sorted(out), sorted(vec![(3, 4), (3, 99), (4, 99)]));
+}
+
+/// AC: two clusters merged in one batch — pair across clusters becomes (N1,N2).
+#[test]
+fn test_compute_dismissal_pairs_two_clusters_collapse_cross_pairs() {
+    // Cluster {1,2}→100, cluster {3,4}→200. Batch [1,2,3,4].
+    let mut merge_map = std::collections::HashMap::new();
+    merge_map.insert(1, 100);
+    merge_map.insert(2, 100);
+    merge_map.insert(3, 200);
+    merge_map.insert(4, 200);
+    let internal = pair_set(&[(1, 2), (3, 4)]);
+    let prior = std::collections::HashSet::new();
+    let out = compute_dismissal_pairs(&[1, 2, 3, 4], &internal, &prior, &merge_map);
+    // Cross pairs (1,3)(1,4)(2,3)(2,4) all rewrite to (100,200) — dedup'd to one.
+    assert_eq!(sorted(out), vec![(100, 200)]);
+}
+
+/// AC: prior_merged_ids causes pairs touching them to be dropped (they're retired).
+#[test]
+fn test_compute_dismissal_pairs_prior_merged_drops_pairs() {
+    let merge_map = std::collections::HashMap::new();
+    let internal = std::collections::HashSet::new();
+    // ID 2 was retired in a previous batch.
+    let prior: std::collections::HashSet<i64> = [2].into_iter().collect();
+    let out = compute_dismissal_pairs(&[1, 2, 3], &internal, &prior, &merge_map);
+    // (1,2) and (2,3) drop; (1,3) survives.
+    assert_eq!(sorted(out), vec![(1, 3)]);
+}
+
+/// AC: batch < 2 items yields an empty result (no pairs).
+#[test]
+fn test_compute_dismissal_pairs_short_batch_empty() {
+    let merge_map = std::collections::HashMap::new();
+    let internal = std::collections::HashSet::new();
+    let prior = std::collections::HashSet::new();
+    assert!(compute_dismissal_pairs(&[], &internal, &prior, &merge_map).is_empty());
+    assert!(compute_dismissal_pairs(&[7], &internal, &prior, &merge_map).is_empty());
+}
+
+/// AC: when one cluster in a batch merges and another fails (no merge_map entry),
+/// pairs touching the failed cluster's IDs stay un-rewritten — those IDs are
+/// still active learnings and a dismissal against them is meaningful.
+///
+/// Setup: batch [1,2,3,4]. Cluster {1,2}→100 succeeded, cluster {3,4} failed
+/// (so {3,4} is in cluster_internal_pairs but NOT in merge_map).
+#[test]
+fn test_compute_dismissal_pairs_failed_cluster_stays_unrewritten() {
+    let mut merge_map = std::collections::HashMap::new();
+    merge_map.insert(1, 100);
+    merge_map.insert(2, 100);
+    let internal = pair_set(&[(1, 2), (3, 4)]);
+    let prior = std::collections::HashSet::new();
+    let out = compute_dismissal_pairs(&[1, 2, 3, 4], &internal, &prior, &merge_map);
+    // (1,2) and (3,4) are internal — dropped.
+    // (1,3),(1,4),(2,3),(2,4): left side rewrites 1→100, 2→100; right side keeps 3, 4.
+    // Dedup'd to (3,100) and (4,100).
+    assert_eq!(sorted(out), sorted(vec![(3, 100), (4, 100)]));
+}
+
+/// AC: a hallucinated duplicate batch ID (e.g. LLM emits `source_ids:[A,A,B]`,
+/// upstream parsing leaves duplicates in batch_item_ids) does not produce
+/// degenerate self-pairs in the output. The defensive `lo != hi` filter and
+/// the HashSet collection together guarantee the property.
+///
+/// Note: in practice batch_item_ids comes from the original LearningRow query
+/// which yields distinct primary keys, so this is purely defensive.
+#[test]
+fn test_compute_dismissal_pairs_duplicate_batch_id_no_self_pair() {
+    let merge_map = std::collections::HashMap::new();
+    let internal = std::collections::HashSet::new();
+    let prior = std::collections::HashSet::new();
+    // Pretend ID 5 appears twice in a batch with 7.
+    let out = compute_dismissal_pairs(&[5, 5, 7], &internal, &prior, &merge_map);
+    // unordered_pairs([5,5,7]) yields (5,5), (5,7), (5,7). After dedup + self-pair
+    // drop: just (5,7).
+    assert_eq!(sorted(out), vec![(5, 7)]);
 }
 
 /// AC (positive): when all batches are fully dismissed, curate_dedup skips the LLM entirely.

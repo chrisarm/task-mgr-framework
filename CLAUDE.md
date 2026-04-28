@@ -193,6 +193,13 @@ users don't re-pay LLM calls for the same "no duplicates" output.
 - **When dismissals are recorded**: after a successful LLM batch, every C(N,2) pair
   from the batch minus (a) pairs the LLM grouped as duplicates and (b) pairs whose
   IDs were retired by a strictly earlier batch.
+- **Merge-map rewrite**: when the batch itself merges sources `{A,B}→N`, recorded
+  pairs are rewritten via a per-batch `merge_map` so retired source IDs become the
+  surviving merged ID. `(A,C)+(B,C)` collapse to `(N,C)`; two clusters in one batch
+  `{A,B}→N1, {C,D}→N2` collapse the four cross-pairs to a single `(N1,N2)`. Without
+  this rewrite the dismissals would point at retired (inert) rows and the next run
+  would re-call the LLM on `(N, survivor)` pairs the LLM has effectively already
+  judged. Logic lives in `compute_dismissal_pairs()` in `src/commands/curate/mod.rs`.
 - **When they are NOT recorded**: `dry_run=true` (read-only convention) OR the batch
   raised an LLM error (can't trust a batch whose result we never got). The
   `continue` in the LLM error arm short-circuits before any dismissal accounting.
@@ -206,7 +213,8 @@ users don't re-pay LLM calls for the same "no duplicates" output.
 
 Helpers live in `src/commands/curate/mod.rs` as `pub(crate)` (not exported outside
 the crate): `load_dismissals`, `record_dismissals`, `clear_dismissals`,
-`is_fully_dismissed`, plus the private `normalize_pair` / `unordered_pairs`.
+`is_fully_dismissed`, `compute_dismissal_pairs`, plus the private `normalize_pair`
+/ `unordered_pairs`.
 
 ## Curate session cleanup workaround
 
