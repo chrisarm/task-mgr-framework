@@ -3268,24 +3268,22 @@ mod tests {
 
     #[test]
     fn test_encoded_cwd_dir_simple_path() {
-        let got = encoded_cwd_dir(Path::new("$HOME/foo"), Path::new("$HOME"));
+        let got = encoded_cwd_dir(Path::new("/home/user/foo"), Path::new("/home/user"));
         assert_eq!(
             got,
-            PathBuf::from("$HOME/.claude/projects/-home-chris-foo")
+            PathBuf::from("/home/user/.claude/projects/-home-user-foo")
         );
     }
 
     #[test]
     fn test_encoded_cwd_dir_repo_path() {
         let got = encoded_cwd_dir(
-            Path::new("$HOME/projects/task-mgr"),
-            Path::new("$HOME"),
+            Path::new("/home/user/projects/task-mgr"),
+            Path::new("/home/user"),
         );
         assert_eq!(
             got,
-            PathBuf::from(
-                "$HOME/.claude/projects/-home-chris-Documents-startat0-Projects-task-mgr"
-            )
+            PathBuf::from("/home/user/.claude/projects/-home-user-projects-task-mgr")
         );
     }
 
@@ -3293,8 +3291,8 @@ mod tests {
     fn test_encoded_cwd_dir_trailing_slash_normalized() {
         // Trailing slash on cwd must encode identically to no trailing slash —
         // otherwise the cleanup target wouldn't match what Claude wrote.
-        let with_slash = encoded_cwd_dir(Path::new("$HOME/foo/"), Path::new("$HOME"));
-        let no_slash = encoded_cwd_dir(Path::new("$HOME/foo"), Path::new("$HOME"));
+        let with_slash = encoded_cwd_dir(Path::new("/home/user/foo/"), Path::new("/home/user"));
+        let no_slash = encoded_cwd_dir(Path::new("/home/user/foo"), Path::new("/home/user"));
         assert_eq!(with_slash, no_slash);
     }
 
