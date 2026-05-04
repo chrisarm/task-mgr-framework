@@ -16,6 +16,7 @@ pub mod env;
 pub mod feedback;
 pub mod git_reconcile;
 pub mod guidance;
+pub(crate) mod merge_resolver;
 pub mod model;
 pub mod monitor;
 pub mod oauth;

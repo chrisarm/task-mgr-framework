@@ -1,0 +1,286 @@
+{
+  "branchName": "feat/parallel-merge-claude-resolver",
+  "description": "When parallel-slot merge-back hits a non-progress conflict, spawn Claude in slot 0's worktree to resolve it instead of resetting and abandoning the slot's commits. Progress files are already handled cheaply by git's union driver (shipped pre-PRD). Adds a resolver-callback seam in worktree.rs so unit tests can exercise outcomes without spawning Claude, and a real implementation that calls spawn_claude with Auto permissions in the conflicted slot 0 worktree.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy` output for touched files",
+      "Rust: All tests pass in scoped `cargo test` for touched modules",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs without explicit need",
+      "All new functions have a single-paragraph rustdoc explaining intent + failure modes",
+      "Errors carry git stderr/stdout context, not just generic strings"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio)",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — every task tells you what 'good' looks like",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001",
+      "Resolver is a callback — production wires Claude, tests inject deterministic mocks",
+      "Failures must reset slot 0 cleanly; never leave the worktree in a half-merged state"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no panic' without verifying outcomes (merged_slots vs failed_slots membership, HEAD position)",
+    "Mock resolvers that bypass MERGE_HEAD / HEAD inspection — the inspection logic is the contract, not the resolver itself",
+    "Catch-all error handlers that swallow git stderr instead of formatting it into the failed_slots diagnostic",
+    "Spawning Claude with Dangerous permission mode — Auto with Read/Edit/Bash is the ceiling",
+    "Leaving MERGE_HEAD set after a failed resolution — every error path must reset to pre_merge_head",
+    "Hardcoding the task-mgr binary path in any new code — current_exe() with a labeled fallback only",
+    "Editing any tasks/*.json file directly during loop iterations"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "24865d18",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `merge_slot_branches_with_resolver` exists and accepts a `&dyn MergeResolver`; existing `merge_slot_branches` delegates to it with a no-op resolver and unchanged behavior on conflict (reset + failed_slots)",
+        "Positive: `MergeResolverOutcome` enum has exactly the three variants Resolved, Aborted, Failed(String)",
+        "Positive: Helpers `list_conflicted_files`, `has_unresolved_merge`, `rev_parse_head` exist as pub(crate) and use `git` Command invocations (no shelling out via `sh`)",
+        "Positive: On non-zero merge exit, resolver is called with the conflicted file list and ephemeral branch name; on resolver Resolved, the function verifies MERGE_HEAD is cleared AND HEAD advanced before pushing to merged_slots",
+        "Negative: When resolver returns Resolved but MERGE_HEAD is still set, slot is in failed_slots with diagnostic 'resolver claimed resolution but MERGE_HEAD remains' and slot 0 HEAD == pre_merge_head",
+        "Negative: When resolver returns Resolved but HEAD did not advance, slot is in failed_slots with 'resolution did not advance HEAD'",
+        "Unit test: With mock resolver returning Resolved + side-effecting a real commit on a fixture repo → slot in merged_slots, HEAD advanced, MERGE_HEAD absent",
+        "Unit test: With mock resolver returning Aborted + running real `git merge --abort` → slot in failed_slots with 'declined' diagnostic, HEAD == pre_merge_head",
+        "Unit test: With mock resolver returning Failed(\"timed out\") → slot in failed_slots, HEAD reset to pre_merge_head, diagnostic contains 'timed out'",
+        "Unit test: With mock resolver returning Resolved but doing nothing (no commit, MERGE_HEAD untouched) → slot in failed_slots, HEAD reset to pre_merge_head, diagnostic mentions MERGE_HEAD",
+        "Unit test: Existing test_merge_slot_branches_merges_disjoint_changes still passes (back-compat wrapper preserves behavior)",
+        "Unit test: Existing test_merge_slot_branches_recovers_from_partial_failure still passes",
+        "Known-bad: a resolver that simply trusts its return value (no MERGE_HEAD recheck) would let a silently-broken Claude resolution land on the main branch. The mock 'returns Resolved but did nothing' test catches this — a naive impl pushes to merged_slots and the test fails.",
+        "Failure mode: If `git rev-parse --verify MERGE_HEAD` itself fails to spawn (binary missing), treat as 'merge state unknown' → reset to pre_merge_head and push Failed with the spawn error"
+      ],
+      "dependsOn": [],
+      "description": "Refactor merge_slot_branches in src/loop_engine/worktree.rs to take a resolver callback. The resolver is invoked when `git merge --no-edit <ephemeral>` exits non-zero; it returns an outcome enum that drives slot accounting. Production wires a real Claude-spawning resolver (FEAT-002); tests inject deterministic mocks.\n\nDO:\n- Add `pub(crate) enum MergeResolverOutcome { Resolved, Aborted, Failed(String) }` describing the three terminal states the resolver can produce.\n- Add `pub(crate) struct ResolverContext<'a> { slot: usize, slot0_path: &'a Path, ephemeral_branch: &'a str, conflicted_files: &'a [String], pre_merge_head: &'a str }` carrying everything the resolver needs.\n- Add `pub(crate) trait MergeResolver { fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome; }` so tests can implement deterministic fakes.\n- Add `pub(crate) fn merge_slot_branches_with_resolver(project_root, branch_name, num_slots, resolver: &dyn MergeResolver) -> MergeOutcomes` containing the body that today lives in merge_slot_branches.\n- Make the existing `merge_slot_branches(project_root, branch_name, num_slots) -> MergeOutcomes` a thin wrapper that passes a no-op resolver returning `MergeResolverOutcome::Failed(\"no resolver\".into())` for callers that don't yet wire one. Behavior is unchanged for those callers (today's reset path).\n- Add helpers `fn list_conflicted_files(slot0_path: &Path) -> Result<Vec<String>, String>` (uses `git diff --name-only --diff-filter=U`), `fn has_unresolved_merge(slot0_path: &Path) -> bool` (checks `git rev-parse --verify MERGE_HEAD`), and `fn rev_parse_head(slot0_path: &Path) -> Result<String, String>` (re-uses the existing `capture_head` if the signature matches; otherwise add).\n- Inspection sequence on conflict: capture conflicted files → call resolver → re-inspect MERGE_HEAD/HEAD to validate the outcome the resolver claimed. If MERGE_HEAD still set → force `git reset --hard <pre_merge_head>` and treat as Failed regardless of resolver's claimed Resolved.\n\nDO NOT:\n- Change behavior for any existing call site in this task (they'll wire the real resolver in FEAT-003).\n- Make the inspection helpers public outside the crate.\n- Use stringly-typed outcomes (`String`/`bool` flags) instead of the enum.\n- Skip the post-resolver MERGE_HEAD re-check — the resolver could lie or partially succeed.\n\nEdge cases:\n- Resolver returns Resolved but MERGE_HEAD is still set → coerce to Failed, reset, log discrepancy.\n- Resolver returns Resolved and MERGE_HEAD cleared but HEAD didn't move → degenerate case, treat as Aborted.\n- Resolver returns Aborted and HEAD == pre_merge_head → expected, push to failed_slots with 'Resolver declined' note.\n- list_conflicted_files returns empty vec on a non-zero merge exit → defensive: still call resolver with empty list (it can `git merge --abort`).\n- capture_head fails before merge → push current behavior (rev-parse failure entry in failed_slots), no resolver invocation.\n\nKnown-bad to guard against:\n- A resolver-callback that bypasses MERGE_HEAD verification would silently accept incorrect resolutions. The contract is enforced by the OUTER inspection, not by the resolver's return value alone.\n- Re-using a single `pre_merge_head` across slots is correct (the loop captures fresh per iteration), but resetting to it after a slot's PRIOR merge succeeded would undo that prior slot's work. Reset must use the head captured for THIS slot's attempt.",
+      "edgeCases": [
+        "Resolver Resolved + MERGE_HEAD still set: coerce to Failed, reset, distinct diagnostic",
+        "Resolver Resolved + HEAD did not move: degenerate, treat as Aborted",
+        "Resolver Aborted + HEAD at pre_merge_head: expected; failed_slots with 'declined'",
+        "list_conflicted_files spawn failure: still attempt resolver with empty list (resolver may abort); never panic",
+        "capture_head fails: push existing rev-parse failure diagnostic, do NOT invoke resolver"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Resolver claims Resolved but MERGE_HEAD remains",
+          "expectedBehavior": "Force git reset --hard pre_merge_head; push to failed_slots with explicit MERGE_HEAD diagnostic"
+        },
+        {
+          "cause": "git rev-parse --verify MERGE_HEAD fails to spawn",
+          "expectedBehavior": "Treat merge state as unknown; reset and push Failed with spawn error text"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Existing capture_head() at src/loop_engine/worktree.rs:502 may serve as rev_parse_head — re-use rather than add a parallel helper. The MergeOutcomes struct at line 496 is already pub(crate). Patterns for git Command invocation: src/loop_engine/worktree.rs:568 (the existing merge call). Test fixtures: src/loop_engine/test_utils.rs::setup_git_repo_with_file at line 245. Learning [1804]: ephemeral branch per slot — preserved as-is. Learning [1870]: deterministic naming via ephemeral_slot_branch. Test for the no-op wrapper: invoke merge_slot_branches (the back-compat name) on a conflicting fixture and assert the same failed_slots membership the original test produced.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Resolver contract enforced by external inspection (MERGE_HEAD + HEAD position), never by resolver's word alone",
+        "All git failures preserve stderr/stdout in the failed_slots diagnostic via format_git_failure",
+        "Reset uses each attempt's captured pre_merge_head, never a stale one",
+        "Existing `merge_slot_branches` callers see unchanged behavior — back-compat wrapper passes a deterministic 'no resolver' marker",
+        "Helpers return Result<_, String>, not panic; spawn errors flow into failed_slots as diagnostics"
+      ],
+      "taskType": "implementation",
+      "title": "Add resolver-callback seam + post-merge inspection helpers",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/loop_engine/merge_resolver.rs` defines `ClaudeMergeResolver<'a>` and implements the `MergeResolver` trait from FEAT-001",
+        "Positive: `build_resolver_prompt(ephemeral_branch, conflicted_files)` returns a String containing the ephemeral branch name and every file from conflicted_files (literal substring match in tests)",
+        "Positive: `spawn_claude` is called with permission_mode == Auto, working_dir == slot0_path, model == self.model, effort == Some(\"medium\")",
+        "Negative: `spawn_claude` is NEVER called with permission_mode == Dangerous (grep test or static check via clippy if feasible)",
+        "Negative: Empty conflicted_files short-circuits to Failed BEFORE spawn — no Claude invocation",
+        "Unit test: `build_resolver_prompt(\"feat-x-slot-1\", &[\"src/foo.rs\".into(), \"src/bar.rs\".into()])` contains 'feat-x-slot-1', 'src/foo.rs', 'src/bar.rs', and the strings 'git merge --abort', 'git commit', '<<<<<<<'",
+        "Unit test: prompt contains explicit prohibitions for 'git push', 'branch -d', 'reset --hard' outside the merge",
+        "Unit test: outcome inference (extracted as a pure function) maps (MERGE_HEAD=absent, HEAD!=pre) → Resolved",
+        "Unit test: outcome inference maps (MERGE_HEAD=absent, HEAD==pre) → Aborted",
+        "Unit test: outcome inference maps (MERGE_HEAD=present, *) → Failed",
+        "Unit test: empty conflicted_files returns Failed('no conflicts reported, refusing to spawn') without invoking spawn (use a builder fn that doesn't take a real Claude binary)",
+        "Known-bad: a resolver that calls spawn_claude unconditionally would burn API budget on degenerate inputs. The empty-list short-circuit test catches this.",
+        "Failure mode: spawn_claude returning Err propagates as MergeResolverOutcome::Failed with the IO error text",
+        "CONTRACT: SpawnOpts field names match EXACTLY src/loop_engine/claude.rs:90 (working_dir, model, effort, signal_flag, db_dir, timeout) — grep to verify"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add a real resolver implementation that spawns Claude in slot 0's worktree to resolve merge conflicts. Lives in a new module so tests can exercise the prompt builder and outcome inference without spawning the binary.\n\nDO:\n- Create `src/loop_engine/merge_resolver.rs` (and add `pub(crate) mod merge_resolver;` to `src/loop_engine/mod.rs`).\n- Define `pub(crate) struct ClaudeMergeResolver<'a>` carrying the loop's resolved model, db_dir, signal_flag, and a configurable `claude_timeout: Duration`.\n- Implement `MergeResolver` (the trait from FEAT-001) for `ClaudeMergeResolver`.\n- The `resolve` method:\n  1. Build the prompt via `pub(crate) fn build_resolver_prompt(ephemeral_branch: &str, conflicted_files: &[String]) -> String`. Prompt content is documented inline (see below).\n  2. Call `crate::loop_engine::claude::spawn_claude` with:\n     - `permission_mode = PermissionMode::Auto { allowed_tools: None }`\n     - `working_dir = Some(slot0_path)`\n     - `model = Some(self.model.as_str())` (the loop's resolved default)\n     - `effort = Some(\"medium\")`\n     - `timeout = Some(TimeoutConfig { base_timeout: self.claude_timeout, initial_extension: Duration::from_secs(0), last_activity_epoch: Arc::new(AtomicU64::new(0)) })`\n     - `signal_flag = self.signal_flag`\n     - `db_dir = self.db_dir`\n     - everything else default\n  3. After spawn returns, inspect HEAD and MERGE_HEAD via the helpers from FEAT-001 and translate to MergeResolverOutcome:\n     - MERGE_HEAD absent + HEAD != pre_merge_head → Resolved\n     - MERGE_HEAD absent + HEAD == pre_merge_head → Aborted (Claude ran `git merge --abort`)\n     - MERGE_HEAD still set → Failed with reason from spawn (timed_out / non-zero exit / 'incomplete')\n     - spawn_claude Err → Failed with spawn error\n- The prompt MUST include: (a) the ephemeral branch name, (b) the bullet-list of conflicted files, (c) instruction to inspect via `<<<<<<<`/`=======`/`>>>>>>>` markers, (d) instruction to commit with `git commit --no-edit` on success or `git merge --abort` if unresolvable, (e) explicit DO NOT instructions for `git push`, branch deletion, or resetting outside the conflicted merge, (f) hard cap on response length to keep stream manageable.\n\nDO NOT:\n- Use `PermissionMode::Dangerous` — Auto is the ceiling.\n- Allow the resolver to write outside slot0_path (set `working_dir` so Claude's sandbox enforces this).\n- Add retry logic — one attempt per conflict; failure flows back to the loop.\n- Hardcode the model — pull from the loop's resolved default (passed in via the struct).\n- Spawn Claude on an empty conflicted_files list — short-circuit Failed with 'no conflicts reported' (defensive: shouldn't happen in practice, but the contract should be explicit).\n\nEdge cases:\n- Empty conflicted_files: short-circuit Failed('no conflicts reported, refusing to spawn'); no spawn.\n- spawn_claude returns Ok with timed_out=true: Failed('Claude timed out after Xs') AND inspect MERGE_HEAD (Claude may have committed mid-timeout — though unlikely with SIGTERM, defensive).\n- Claude exits 0 with MERGE_HEAD still set: Failed('non-zero merge state despite success exit') — coerce as the FEAT-001 contract demands.\n- signal_flag tripped during resolve: spawn_claude already handles SIGTERM/SIGKILL; we surface as Failed('signal received during resolve').\n\nKnown-bad to guard against:\n- A prompt that says 'fix all the issues you find' without scoping to MERGE_HEAD's conflicts would invite Claude to refactor unrelated code. Prompt MUST scope to the listed files only.\n- Spawning without `working_dir` would let Claude write to the source repo's main worktree (or wherever the loop runs from). working_dir = slot0_path is mandatory.",
+      "edgeCases": [
+        "Empty conflicted_files: short-circuit Failed without spawning",
+        "spawn_claude Err (binary missing): Failed with the IO error text",
+        "spawn_claude timed_out=true: Failed; still inspect MERGE_HEAD (defensive)",
+        "Claude exits 0 with MERGE_HEAD set: Failed (coerced) per FEAT-001 contract",
+        "Signal flag tripped mid-resolve: spawn_claude returns; outcome inferred from final state"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "spawn_claude returns Err",
+          "expectedBehavior": "Return MergeResolverOutcome::Failed with the spawn error text"
+        },
+        {
+          "cause": "Claude introduces a regression in the resolution",
+          "expectedBehavior": "Out of scope for FEAT-002 — REVIEW-001 / next loop iteration handles. The resolution is committed and visible in `git log`."
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "spawn_claude signature: src/loop_engine/claude.rs:253. SpawnOpts: src/loop_engine/claude.rs:90. PermissionMode enum: src/loop_engine/config.rs:206. TimeoutConfig: src/loop_engine/watchdog.rs (TimeoutConfig struct). Claude default model resolution: caller (FEAT-003) passes the resolved model in. For testing the prompt without spawning, isolate the prompt builder as a free function. For testing outcome inference, isolate the post-spawn inspection as a pure function `infer_outcome(merge_head_present: bool, head_changed: bool, spawn_result: SpawnResult) -> MergeResolverOutcome`. Learning [1828]: SpawnOpts is the clean abstraction — re-use it. Learning [1827]: TimeoutConfig pattern. Learning [1600]: cleanup_title_artifact is OPT-IN; do NOT enable it here (only curate uses it).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Prompt builder is a pure function returning String — testable without spawning anything",
+        "Outcome inference is a pure function on (merge_head_present, head_changed, spawn_result) — testable without git",
+        "Auto permission mode is enforced; Dangerous mode is statically unreachable from this module",
+        "Empty conflicted_files short-circuits before any I/O",
+        "Working directory is always the slot 0 path — Claude's sandbox enforces the boundary"
+      ],
+      "taskType": "implementation",
+      "title": "Implement Claude-spawning merge resolver",
+      "touchesFiles": [
+        "src/loop_engine/merge_resolver.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: engine.rs constructs `ClaudeMergeResolver` with params.model, params.signal_flag, params.db_dir, and a 600s timeout, then passes it to `merge_slot_branches_with_resolver`",
+        "Positive: When merge succeeds (no conflicts), resolver is never invoked (verified via existing tests; no Claude binary required)",
+        "Positive: Warning text reflects whether Claude was attempted vs pre-resolver failure",
+        "Negative: No hardcoded model string in engine.rs at the new call site (grep test: no `claude-sonnet-` / `claude-opus-` literal in the new lines)",
+        "Negative: No regression in `parallel_slots == 1` path (sequential mode still passes existing tests)",
+        "Unit test: build a ClaudeMergeResolver from a synthetic Params-like input; verify the model/timeout fields are propagated",
+        "Integration: in a multi-slot test fixture WITHOUT `claude` on PATH, force a conflict, run merge_slot_branches_with_resolver via engine, observe failed_slots with diagnostic mentioning 'spawn' or 'resolver' (binary missing path)",
+        "Known-bad: if engine still calls the back-compat `merge_slot_branches` (without _with_resolver), conflicts will silently fall through to the no-op resolver and lose work. Test by introducing a conflict and asserting the resolver was invoked (use a tracing flag or counter on a test-mode resolver wrapper).",
+        "Failure mode: if ClaudeMergeResolver construction itself fails (shouldn't, but defensive), engine logs and falls back to the no-op back-compat path so the wave still advances"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Replace the no-op resolver wrapper at the engine.rs call site (line ~1354) with a real `ClaudeMergeResolver` built from the loop's params. Update the warning text so users see whether Claude was attempted.\n\nDO:\n- In `src/loop_engine/engine.rs` around the existing call to `worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots)`:\n  - Build a `ClaudeMergeResolver` from `params` — model, db_dir, signal_flag, claude_timeout (use a 600s default — match the plan's '10 minutes').\n  - Switch to calling `worktree::merge_slot_branches_with_resolver(...)` with that resolver.\n- Update the failed_slots warning to indicate whether Claude was attempted: change the eprintln to read 'Warning: slot {} merge-back failed after Claude resolution attempt: {} (slot's commits remain on its ephemeral branch)' when the diagnostic indicates Claude was tried; keep the original wording when the diagnostic is a pre-resolver failure (e.g., spawn errors before the resolver was invoked). A simple discriminator: if the diagnostic contains 'resolver' or 'Claude', use the new wording.\n- No change to `merge_slot_branches`'s back-compat signature; this task only changes the call site.\n\nDO NOT:\n- Re-add a `MergeResolverConfig` struct — the resolver itself carries its config (FEAT-002).\n- Hardcode model strings — read from `params.model` (or the resolved default the engine already uses for waves).\n- Skip the warning text update — the operator needs to know whether Claude was even tried, not just that the merge failed.\n- Touch any code outside the call site at engine.rs:~1354.\n\nEdge cases:\n- params.model is None / empty: pass the resolved default (use the same lookup the wave uses for slot iterations); failing that, fall back to the SONNET_MODEL constant from src/loop_engine/model.rs.\n- params.signal_flag already tripped before merge-back: the resolver propagates SIGTERM via spawn_claude; the outer post-spawn inspection still runs and produces a clean failed_slots entry.\n- parallel_slots == 1: merge_slot_branches early-returns (existing behavior); resolver is never built/invoked. Verify no panic on this path.\n\nKnown-bad to guard against:\n- Building the resolver and never using it (because parallel_slots == 1) is wasteful but harmless. The existing early-return in merge_slot_branches makes this benign — but verify by walking the code path.",
+      "edgeCases": [
+        "params.model None/empty: fall back to resolved default → SONNET_MODEL last-resort",
+        "params.signal_flag tripped before merge-back: resolver still inspects post-spawn state",
+        "parallel_slots == 1: early return preserved; resolver unused"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Resolver construction fails",
+          "expectedBehavior": "Log error and call the back-compat merge_slot_branches; wave still advances"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": true,
+      "notes": "Call site: src/loop_engine/engine.rs:1354. WaveParams shape: search for `WaveParams` or the `params:` arg type around engine.rs:1280. params.model and params.signal_flag exist in the surrounding code — re-use the same accessors the wave uses. Default Claude model lookup pattern: see how select_next_task / spawn paths derive the model in engine.rs (likely via a helper). SONNET_MODEL constant: src/loop_engine/model.rs::SONNET_MODEL. Learning [1825]: slot-aware helpers exist; reuse them rather than re-deriving paths.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Single touch-point in engine.rs — no scope creep into wave orchestration",
+        "Resolver config is data-driven from params, not hardcoded",
+        "Warning text distinguishes pre-resolver failure (spawn) vs post-resolver failure (Claude declined / failed)",
+        "Sequential (parallel_slots==1) path unaffected"
+      ],
+      "taskType": "implementation",
+      "title": "Wire ClaudeMergeResolver into the parallel-wave path",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication: shared git-Command helpers used everywhere instead of per-call boilerplate",
+        "Functions under 30 lines (flag if any new ones exceed)",
+        "merge_resolver.rs depends on worktree.rs's `pub(crate)` API only — no reaching into private internals",
+        "Prompt builder uses format! / write! (not naive String + concat) for readability",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review all implementation in worktree.rs, merge_resolver.rs, and the engine.rs call site for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated git-Command boilerplate (compare with the existing `format_git_failure` and `capture_head` patterns), function lengths >30 lines, tight coupling between merge_resolver.rs and worktree.rs's internals, prompt-builder formatting hygiene (string concat vs format!).\nDO NOT: Skip — this gate catches issues before the final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>`.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across worktree.rs and merge_resolver.rs",
+        "Single-responsibility functions (≤30 lines)",
+        "Pattern consistency with existing engine code (format_git_failure, capture_head)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from engine.rs's wave path (grep confirms `merge_slot_branches_with_resolver` is the only caller in production)",
+        "Positive: All errors propagated with stderr/stdout context via `format_git_failure` style",
+        "Positive: FULL `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all clean (no scope filter)",
+        "Negative: No `unwrap()` in production paths within the new code (search for `.unwrap()` in worktree.rs, merge_resolver.rs additions)",
+        "Negative: No way for the resolver prompt to instruct Claude to push, force-push, or delete branches (audit the prompt text for explicit prohibitions)",
+        "Negative: No way for the resolver to operate outside slot0_path (verify working_dir is always set)",
+        "Documentation: CLAUDE.md gets a 4-8 line block under a 'Slot merge-back conflict resolution' heading describing the resolver-callback seam and the Claude-spawn fallback (only if the architect agrees it's quick-reference material)",
+        "Task update: If FEAT-001/2/3 implementation revealed an API divergence, update remaining task descriptions via `task-mgr init --from-json ... --append --update-existing`",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify the resolver-callback contract (FEAT-001's MERGE_HEAD inspection) holds end-to-end. Verify the Claude prompt cannot be coerced into destructive ops by malicious commit messages on the ephemeral branch. Run full `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`. Update CLAUDE.md if a new subsystem (merge_resolver) deserves a quick-reference block.\nDO NOT: Skip the integration wiring check — verify engine.rs actually calls `_with_resolver` and not the back-compat path. Do NOT scope the test suite — this is THE place the full suite runs.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. Architect-review focus areas (from the plan file): MERGE_HEAD inspection robustness, prompt safety, working_dir scoping, idempotency of the existing `info/attributes` rewrite (already shipped pre-PRD).",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to the engine's wave path (not just unit-tested)",
+        "Full suite green including pre-existing",
+        "Resolver prompt cannot be talked into destructive git ops by adversarial commit messages on the ephemeral branch"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/loop_engine/engine.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

@@ -50,6 +50,7 @@ use crate::loop_engine::git_reconcile::{
     check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
 };
 use crate::loop_engine::guidance::SessionGuidance;
+use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
@@ -1350,13 +1351,46 @@ pub fn run_wave_iteration(
     // HEAD via `git reset --hard`, and the next wave still benefits from any
     // slots that did merge.
     if params.parallel_slots > 1 {
-        let outcomes =
-            worktree::merge_slot_branches(params.source_root, params.branch, params.parallel_slots);
-        for (slot, detail) in &outcomes.failed_slots {
-            eprintln!(
-                "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
-                slot, detail
-            );
+        let resolved_model = params
+            .default_model
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(model::SONNET_MODEL)
+            .to_string();
+        // Per-project overrides for the merge-conflict resolver. Both fall
+        // back to safe defaults so projects without a config.json keep the
+        // pre-existing behavior (600s / "medium").
+        let project_cfg = crate::loop_engine::project_config::read_project_config(params.db_dir);
+        let claude_timeout =
+            Duration::from_secs(project_cfg.merge_resolver_timeout_secs.unwrap_or(600));
+        let effort = project_cfg
+            .merge_resolver_effort
+            .clone()
+            .unwrap_or_else(|| "medium".to_string());
+        let resolver = merge_resolver::ClaudeMergeResolver {
+            model: resolved_model,
+            db_dir: Some(params.db_dir),
+            signal_flag: Some(params.signal_flag),
+            claude_timeout,
+            effort,
+        };
+        let outcomes = worktree::merge_slot_branches_with_resolver(
+            params.source_root,
+            params.branch,
+            params.parallel_slots,
+            &resolver,
+        );
+        for (slot, detail, kind) in &outcomes.failed_slots {
+            if *kind == worktree::SlotFailureKind::ResolverAttempted {
+                eprintln!(
+                    "Warning: slot {} merge-back failed after Claude resolution attempt: {} (slot's commits remain on its ephemeral branch)",
+                    slot, detail
+                );
+            } else {
+                eprintln!(
+                    "Warning: slot {} merge-back failed: {} (slot's commits remain on its ephemeral branch)",
+                    slot, detail
+                );
+            }
         }
     }
 

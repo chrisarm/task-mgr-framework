@@ -227,3 +227,17 @@ and, after `child.wait()` returns, that exact file is removed synchronously. An 
 exits; synchronous post-wait cleanup is both simpler and guaranteed to run. Scope is narrow —
 loops and learning ingestion do NOT opt in; only the curate call sites do. See `spawn_claude`
 and `cleanup_title_artifact_sync` in `src/loop_engine/claude.rs`.
+
+## Slot merge-back conflict resolution
+
+When parallel-slot waves finish, `merge_slot_branches_with_resolver` (in
+`src/loop_engine/worktree.rs`) runs `git merge --no-edit` from slot 0 for each ephemeral
+slot branch. On a non-zero exit it lists the conflicted files and invokes a `MergeResolver`
+(callback seam, `pub(crate) trait`); the engine wires `ClaudeMergeResolver` from
+`src/loop_engine/merge_resolver.rs`, which spawns Claude in slot 0's already-conflicted
+worktree (`PermissionMode::Auto`, `working_dir = slot0_path`, 600s timeout) with a prompt
+that explicitly prohibits push, branch deletion, hard reset outside the merge, and history
+rewrites. The resolver's `Resolved` claim is **never trusted**: the caller re-inspects
+MERGE_HEAD and HEAD post-spawn and downgrades a lying resolver to `failed_slots` with a
+forced `git reset --hard pre_merge_head`. `SlotFailureKind::ResolverAttempted` vs
+`PreResolver` lets engine.rs pick the right warning text without string-sniffing.

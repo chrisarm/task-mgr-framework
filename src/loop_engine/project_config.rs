@@ -47,6 +47,18 @@ pub struct ProjectConfig {
     /// `loop_engine::model::resolve_task_model`).
     #[serde(default)]
     pub default_model: Option<String>,
+
+    /// Hard cap (seconds) on a single parallel-slot merge-conflict resolution
+    /// Claude run. Defaults to 600 (10 min). Lift for projects with large
+    /// merges; lower for tight feedback loops.
+    #[serde(default)]
+    pub merge_resolver_timeout_secs: Option<u64>,
+
+    /// `--effort` value passed to Claude when resolving a parallel-slot merge
+    /// conflict. Defaults to `"medium"`. Use `"high"` for cross-cutting
+    /// refactors that conflict on semantic logic.
+    #[serde(default)]
+    pub merge_resolver_effort: Option<String>,
 }
 
 impl Default for ProjectConfig {
@@ -59,6 +71,8 @@ impl Default for ProjectConfig {
             embedding_model: None,
             dedup_model: None,
             default_model: None,
+            merge_resolver_timeout_secs: None,
+            merge_resolver_effort: None,
         }
     }
 }

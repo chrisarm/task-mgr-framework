@@ -421,6 +421,119 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path) -> TaskMgrResu
 // use ephemeral branches named `{branch}-slot-{N}` that are merged back into
 // the main branch after each wave completes.
 
+/// Marker block delimiting task-mgr's managed entries in `.git/info/attributes`.
+/// The block is rewritten in place when its contents would change; any
+/// user-authored lines outside the markers are preserved untouched.
+const ATTR_MARKER_BEGIN: &str = "# task-mgr begin: progress union merge";
+const ATTR_MARKER_END: &str = "# task-mgr end: progress union merge";
+
+/// Body inserted between the markers. Uses git's built-in `union` merge driver
+/// so concurrent appends to per-PRD progress files produce a concatenation
+/// instead of a conflict. Patterns are anchored (they contain `/`) so they
+/// only match progress files in the conventional locations.
+const ATTR_BODY: &str =
+    "tasks/progress*.txt merge=union\n.task-mgr/tasks/progress*.txt merge=union\n";
+
+/// Resolve git's common directory (where `info/`, `config`, etc. live) for
+/// `repo_path`. For linked worktrees this is the main repo's `.git`, so a
+/// single write to `info/attributes` is visible to every slot worktree.
+fn git_common_dir(repo_path: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("git rev-parse --git-common-dir spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err("git rev-parse --git-common-dir returned empty output".to_string());
+    }
+    let candidate = PathBuf::from(&raw);
+    Ok(if candidate.is_absolute() {
+        candidate
+    } else {
+        repo_path.join(candidate)
+    })
+}
+
+/// Compute the new contents of `info/attributes` after ensuring the task-mgr
+/// managed block is present and has the expected body. Returns `None` when
+/// no rewrite is needed.
+fn merged_attributes_contents(existing: &str) -> Option<String> {
+    let desired_block = format!("{}\n{}{}\n", ATTR_MARKER_BEGIN, ATTR_BODY, ATTR_MARKER_END);
+
+    if let (Some(begin), Some(end)) = (
+        existing.find(ATTR_MARKER_BEGIN),
+        existing.find(ATTR_MARKER_END),
+    ) && begin < end
+    {
+        // End-of-line for the END marker — include the trailing newline if
+        // present so we don't accumulate blank lines on repeated rewrites.
+        let after_end = end + ATTR_MARKER_END.len();
+        let after_end = if existing[after_end..].starts_with('\n') {
+            after_end + 1
+        } else {
+            after_end
+        };
+        let current_block = &existing[begin..after_end];
+        if current_block == desired_block {
+            return None;
+        }
+        let mut rewritten = String::with_capacity(existing.len());
+        rewritten.push_str(&existing[..begin]);
+        rewritten.push_str(&desired_block);
+        rewritten.push_str(&existing[after_end..]);
+        return Some(rewritten);
+    }
+
+    // No marker block yet — append, ensuring exactly one blank line of
+    // separation from any pre-existing content.
+    let mut rewritten = String::with_capacity(existing.len() + desired_block.len() + 2);
+    rewritten.push_str(existing);
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    if !existing.is_empty() {
+        rewritten.push('\n');
+    }
+    rewritten.push_str(&desired_block);
+    Some(rewritten)
+}
+
+/// Ensure `.git/info/attributes` declares `merge=union` for per-PRD progress
+/// files so parallel slots can concurrently append without producing a merge
+/// conflict on merge-back.
+///
+/// Per-clone (lives in `info/`, not committed). Idempotent — only rewrites
+/// when the managed block is missing or its body has drifted. Failures are
+/// non-fatal and surface to the caller as `Err` so the caller can decide
+/// whether to log; merge-back will still attempt and conflicts (if any) will
+/// surface there as before.
+pub(crate) fn ensure_progress_union_merge(project_root: &Path) -> Result<(), String> {
+    let common_dir = git_common_dir(project_root)?;
+    let info_dir = common_dir.join("info");
+    if !info_dir.exists() {
+        std::fs::create_dir_all(&info_dir)
+            .map_err(|e| format!("create {}: {}", info_dir.display(), e))?;
+    }
+    let attrs_path = info_dir.join("attributes");
+    let existing = match std::fs::read_to_string(&attrs_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {}", attrs_path.display(), e)),
+    };
+    if let Some(updated) = merged_attributes_contents(&existing) {
+        std::fs::write(&attrs_path, updated)
+            .map_err(|e| format!("write {}: {}", attrs_path.display(), e))?;
+    }
+    Ok(())
+}
+
 /// Name of the ephemeral branch used by slot `N` (N > 0) for a loop running
 /// on `branch_name`. Slot 0 uses the loop's own branch directly.
 fn ephemeral_slot_branch(branch_name: &str, slot: usize) -> String {
@@ -466,6 +579,18 @@ pub(crate) fn ensure_slot_worktrees(
         return Ok(vec![]);
     }
 
+    // Configure git's union merge for per-PRD progress files before any slot
+    // commits exist. Concurrent slots both append to the same progress file;
+    // without this the merge-back step conflicts on otherwise-compatible
+    // line additions. Best-effort — a failure here is logged but does not
+    // block worktree creation, since the rest of the merge can still succeed
+    // when no slot touches a progress file.
+    if num_slots > 1
+        && let Err(e) = ensure_progress_union_merge(project_root)
+    {
+        eprintln!("Warning: failed to configure progress union merge: {}", e);
+    }
+
     let mut paths = Vec::with_capacity(num_slots);
 
     // Slot 0: the loop's main branch worktree. `ensure_worktree` returns the
@@ -485,21 +610,41 @@ pub(crate) fn ensure_slot_worktrees(
     Ok(paths)
 }
 
+/// Classifies why a slot's merge-back failed.
+///
+/// Carried on each `failed_slots` entry so engine.rs can choose appropriate
+/// user-facing diagnostic text without string-sniffing the detail message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum SlotFailureKind {
+    /// Failed before the resolver was invoked: rev-parse error on slot 0,
+    /// git-merge spawn error, or fast-forward failure after the merge loop.
+    #[default]
+    PreResolver,
+    /// The conflict resolver was invoked. The resolver may have failed,
+    /// aborted, or claimed `Resolved` but failed post-resolution verification.
+    ResolverAttempted,
+}
+
 /// Per-slot outcome returned by `merge_slot_branches`.
 ///
 /// Slots that merged cleanly into the main branch land in `merged_slots`
 /// (and get fast-forwarded). Slots whose merge or fast-forward failed land
-/// in `failed_slots` along with diagnostic text. On a merge conflict the
-/// function resets slot 0 to its pre-merge HEAD (captured before each
-/// attempt) so subsequent slots and the next wave start from a clean state.
+/// in `failed_slots` along with diagnostic text and a [`SlotFailureKind`]
+/// tag. On a merge conflict the function resets slot 0 to its pre-merge HEAD
+/// (captured before each attempt) so subsequent slots and the next wave start
+/// from a clean state.
 #[derive(Debug, Default)]
 pub(crate) struct MergeOutcomes {
     pub merged_slots: Vec<usize>,
-    pub failed_slots: Vec<(usize, String)>,
+    pub failed_slots: Vec<(usize, String, SlotFailureKind)>,
 }
 
-/// Capture the current HEAD commit-ish in `repo_path` for later restoration.
-fn capture_head(repo_path: &Path) -> Result<String, String> {
+/// Capture the current HEAD commit-ish in `repo_path` for later restoration
+/// or comparison.
+///
+/// Spawn or non-zero exit failures are returned as `Err(String)` so callers
+/// can fold the diagnostic into their per-slot failure entries.
+pub(crate) fn rev_parse_head(repo_path: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_path)
@@ -514,33 +659,127 @@ fn capture_head(repo_path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Merge ephemeral slot branches back into the loop's main branch.
+/// Conflicted files in `slot0_path` after a non-zero `git merge` exit.
 ///
-/// Runs `git merge --no-edit {branch}-slot-{N}` from slot 0 (the main branch
-/// worktree) for each slot in `1..num_slots`. On a merge failure the function
-/// captures slot 0's pre-merge HEAD and uses `git reset --hard <pre-merge>`
-/// (instead of `git merge --abort`) to restore it: reset is unconditionally
-/// idempotent, while abort fails silently if the merge driver only partially
-/// staged or the merge never reached the conflict-marker stage. This guards
-/// against the next wave spawning Claude in a half-merged worktree.
+/// Uses `git diff --name-only --diff-filter=U` (unmerged paths). May return
+/// `Ok(vec![])` if the merge failed before producing conflict markers (e.g.
+/// pre-commit hook reject); callers must still treat that as "merge failed"
+/// and invoke the resolver — the resolver can choose to abort.
+pub(crate) fn list_conflicted_files(slot0_path: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git diff spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Whether `slot0_path` is currently in the middle of a merge (MERGE_HEAD set).
+///
+/// Returns `Ok(true)` while a merge is in progress, `Ok(false)` once it's
+/// resolved or aborted. Spawn failures (e.g. missing `git` binary) bubble up
+/// as `Err(String)` so the caller can treat the merge state as unknown and
+/// force a reset rather than silently accept a Resolved outcome.
+pub(crate) fn has_unresolved_merge(slot0_path: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "MERGE_HEAD"])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git rev-parse spawn: {}", e))?;
+    Ok(output.status.success())
+}
+
+/// Terminal outcome the merge-conflict resolver returns for a slot.
+///
+/// `Resolved` claims the resolver finished and committed; the merge function
+/// re-inspects MERGE_HEAD and HEAD before trusting the claim. `Aborted`
+/// means the resolver intentionally backed out (e.g. the conflict was too
+/// large) and is expected to have already run `git merge --abort`. `Failed`
+/// is a hard error (timeout, spawn failure, internal exception) and triggers
+/// an unconditional reset to the pre-merge HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MergeResolverOutcome {
+    Resolved,
+    Aborted,
+    Failed(String),
+}
+
+/// Inputs handed to a `MergeResolver` when slot 0's `git merge` exits
+/// non-zero. Borrowed for the duration of a single resolver invocation; no
+/// field outlives the merge loop iteration.
+pub(crate) struct ResolverContext<'a> {
+    pub slot: usize,
+    pub slot0_path: &'a Path,
+    pub ephemeral_branch: &'a str,
+    pub conflicted_files: &'a [String],
+    pub pre_merge_head: &'a str,
+}
+
+/// Strategy for resolving an in-progress merge conflict in slot 0.
+///
+/// Implementations are responsible for either driving the conflict to a
+/// committed state (return `Resolved`), aborting the merge themselves
+/// (return `Aborted`), or surfacing a hard error (return `Failed`). The
+/// caller re-inspects MERGE_HEAD and HEAD afterwards, so a dishonest
+/// `Resolved` is detected and downgraded to a failure.
+pub(crate) trait MergeResolver {
+    fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome;
+}
+
+/// Test-only resolver that always reports failure. Used by unit tests that
+/// want to exercise the conflict-handling pipeline without spawning Claude;
+/// production callers always wire `ClaudeMergeResolver`.
+#[cfg(test)]
+pub(crate) struct NoOpResolver;
+
+#[cfg(test)]
+impl MergeResolver for NoOpResolver {
+    fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome {
+        MergeResolverOutcome::Failed(format!("no resolver wired (slot {})", ctx.slot))
+    }
+}
+
+/// Merge ephemeral slot branches back into the loop's main branch, invoking
+/// `resolver` whenever `git merge --no-edit` exits non-zero.
+///
+/// Runs `git merge --no-edit {branch}-slot-{N}` from slot 0 for each slot in
+/// `1..num_slots`. On a clean merge the slot lands in `merged_slots`. On a
+/// non-zero merge exit, the function lists the conflicted files, hands them
+/// (plus the ephemeral branch name and pre-merge HEAD) to `resolver`, then
+/// re-inspects MERGE_HEAD and HEAD to verify the claimed outcome:
+///   - `Resolved` only counts as a merge once MERGE_HEAD is cleared AND HEAD
+///     has advanced past `pre_merge_head`. Anything else is downgraded to
+///     `failed_slots` and forced back to `pre_merge_head`.
+///   - `Aborted` always lands in `failed_slots` with a 'declined' diagnostic;
+///     a defensive `git reset --hard pre_merge_head` runs if MERGE_HEAD is
+///     still set (resolver forgot to abort) or HEAD drifted.
+///   - `Failed(msg)` always resets to `pre_merge_head` and folds `msg` into
+///     the diagnostic.
+///
+/// Resets use `git reset --hard <pre-merge>` rather than `git merge --abort`
+/// because reset is idempotent regardless of how far the merge or resolver
+/// progressed; abort can fail silently against a half-staged tree.
 ///
 /// One bad slot does not poison the others — failures land in `failed_slots`
-/// and the loop continues. Spawn-level failures (`Command::output` errors)
-/// are also captured per-slot rather than discarded as `Err`. After the merge
-/// loop, successfully-merged slots are fast-forwarded; if their fast-forward
-/// itself fails the slot is demoted from `merged_slots` to `failed_slots`.
-/// Failed slots keep their ephemeral branches diverged so the wave
-/// orchestrator can decide what to do (next wave's group selection still
-/// respects file-disjointness).
-///
-/// Assumes all slot worktrees have their work committed to the ephemeral
-/// branch. Uncommitted changes on a slot branch cause the merge to succeed
-/// without picking them up — wave orchestration is responsible for enforcing
-/// the commit discipline.
-pub(crate) fn merge_slot_branches(
+/// and the loop continues. Spawn-level failures are also captured per-slot.
+/// After the merge loop, successfully-merged slots are fast-forwarded; if
+/// their fast-forward fails the slot is demoted from `merged_slots` to
+/// `failed_slots`.
+pub(crate) fn merge_slot_branches_with_resolver(
     project_root: &Path,
     branch_name: &str,
     num_slots: usize,
+    resolver: &dyn MergeResolver,
 ) -> MergeOutcomes {
     let mut outcomes = MergeOutcomes::default();
     if num_slots <= 1 {
@@ -549,86 +788,286 @@ pub(crate) fn merge_slot_branches(
 
     let slot0_path = compute_slot_worktree_path(project_root, branch_name, 0);
 
-    for slot in 1..num_slots {
-        let ephemeral = ephemeral_slot_branch(branch_name, slot);
+    // Slot-0 poisoning marker. Set when a `hard_reset` cleanup fails — at
+    // that point HEAD may have drifted from any sensible base, so subsequent
+    // slot iterations cannot trust their own `rev_parse_head` capture as a
+    // reset target. Once poisoned, every remaining slot short-circuits to a
+    // PreResolver failure with a clear diagnostic so the operator can see
+    // why slots after the failure point did nothing.
+    let mut slot0_poisoned: Option<String> = None;
 
-        // Capture HEAD before each merge attempt — earlier successful merges
-        // already advanced HEAD, and we want to restore to "after the previous
-        // good slot" if this one fails, not "before all merges".
-        let pre_merge_head = match capture_head(&slot0_path) {
+    for slot in 1..num_slots {
+        if let Some(ref reason) = slot0_poisoned {
+            outcomes.failed_slots.push((
+                slot,
+                format!(
+                    "skipped: slot 0 poisoned by earlier cleanup failure: {}",
+                    reason
+                ),
+                SlotFailureKind::PreResolver,
+            ));
+            continue;
+        }
+        let ephemeral = ephemeral_slot_branch(branch_name, slot);
+        let pre_merge_head = match rev_parse_head(&slot0_path) {
             Ok(h) => h,
             Err(e) => {
-                outcomes
-                    .failed_slots
-                    .push((slot, format!("rev-parse: {}", e)));
+                outcomes.failed_slots.push((
+                    slot,
+                    format!("rev-parse: {}", e),
+                    SlotFailureKind::PreResolver,
+                ));
                 continue;
             }
         };
-
         let merge_result = Command::new("git")
             .args(["merge", "--no-edit", &ephemeral])
             .current_dir(&slot0_path)
             .output();
-
         match merge_result {
-            Ok(output) if output.status.success() => {
-                outcomes.merged_slots.push(slot);
-            }
+            Ok(output) if output.status.success() => outcomes.merged_slots.push(slot),
             Ok(output) => {
-                // git writes conflict details to stdout and error context to
-                // stderr; either may be empty. Capture both for the caller's
-                // log entry.
                 let detail = format_git_failure(&output.stdout, &output.stderr);
-                // Reset to the captured pre-merge HEAD. Unlike `git merge
-                // --abort`, this works regardless of how far the merge
-                // progressed before failing — it discards any conflict
-                // markers, stages, or partial driver output, leaving slot 0
-                // exactly where it was before this slot's attempt.
-                let _ = Command::new("git")
-                    .args(["reset", "--hard", &pre_merge_head])
-                    .current_dir(&slot0_path)
-                    .output();
-                outcomes.failed_slots.push((slot, detail));
+                match handle_conflict_for_slot(
+                    slot,
+                    &slot0_path,
+                    &ephemeral,
+                    &pre_merge_head,
+                    &detail,
+                    resolver,
+                ) {
+                    Ok(()) => outcomes.merged_slots.push(slot),
+                    Err((msg, kind)) => {
+                        // PreResolver kind from handle_conflict_for_slot is the
+                        // signal that a cleanup reset failed — poison slot 0.
+                        if kind == SlotFailureKind::PreResolver
+                            && msg.contains("reset cleanup failed")
+                        {
+                            slot0_poisoned = Some(msg.clone());
+                        }
+                        outcomes.failed_slots.push((slot, msg, kind));
+                    }
+                }
             }
-            Err(e) => {
-                // Spawn failure (git binary missing, permission denied, etc).
-                // Capture as a per-slot failure so previously-accumulated
-                // outcomes survive — the caller logs them and continues.
-                outcomes
-                    .failed_slots
-                    .push((slot, format!("git merge spawn: {}", e)));
-            }
+            Err(e) => outcomes.failed_slots.push((
+                slot,
+                format!("git merge spawn: {}", e),
+                SlotFailureKind::PreResolver,
+            )),
         }
     }
 
-    // Fast-forward each successfully-merged slot worktree to the updated main
-    // branch head. After the merge-back loop, every merged ephemeral branch
-    // is an ancestor of the main branch, so --ff-only is always safe.
-    let merged = outcomes.merged_slots.clone();
+    fast_forward_merged_slots(&mut outcomes, project_root, branch_name);
+    outcomes
+}
+
+/// `git reset --hard <commit>` in `repo_path`. Returns `Err` with formatted
+/// stderr/stdout context on spawn failure or non-zero exit so the caller can
+/// poison slot 0 — a partially-failed reset can leave HEAD pointing at the
+/// post-failed-resolve state (drifted from pre_merge_head), which would taint
+/// every subsequent slot iteration's pre_merge_head capture.
+fn hard_reset(repo_path: &Path, commit: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["reset", "--hard", commit])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("git reset --hard spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git reset --hard {} failed: {}",
+            commit,
+            format_git_failure(&output.stdout, &output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Verify HEAD advanced past `pre_merge_head` after MERGE_HEAD was cleared.
+/// Returns `Ok(())` if HEAD moved forward, `Err(diagnostic)` if HEAD stayed
+/// in place (resolver silently aborted) or `rev-parse` failed.
+fn verify_resolver_advance(
+    slot0_path: &Path,
+    pre_merge_head: &str,
+    detail: &str,
+) -> Result<(), String> {
+    match rev_parse_head(slot0_path) {
+        Ok(post) if post == pre_merge_head => {
+            Err(format!("{} | resolution did not advance HEAD", detail))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "{} | post-resolver rev-parse failed: {}",
+            detail, e
+        )),
+    }
+}
+
+/// Validate a `Resolved` claim: MERGE_HEAD must be gone AND HEAD must have
+/// advanced. Hard-resets to `pre_merge_head` on any failure before returning
+/// `Err((diagnostic, kind))`. Returns `Ok(())` on success.
+///
+/// If the recovery `hard_reset` itself fails, the kind escalates to
+/// `PreResolver` and the diagnostic is annotated with the reset failure —
+/// the caller is expected to treat that as slot-0 poisoning.
+fn handle_resolved(
+    slot0_path: &Path,
+    pre_merge_head: &str,
+    detail: &str,
+) -> Result<(), (String, SlotFailureKind)> {
+    let check = match has_unresolved_merge(slot0_path) {
+        Err(e) => Err(format!(
+            "{} | merge state unknown after resolver: {}",
+            detail, e
+        )),
+        Ok(true) => Err(format!(
+            "{} | resolver claimed resolution but MERGE_HEAD remains",
+            detail
+        )),
+        Ok(false) => verify_resolver_advance(slot0_path, pre_merge_head, detail),
+    };
+    check.map_err(|e| {
+        reset_or_escalate(
+            slot0_path,
+            pre_merge_head,
+            e,
+            SlotFailureKind::ResolverAttempted,
+        )
+    })
+}
+
+/// Defensive reset for the `Aborted` outcome: resets only when MERGE_HEAD is
+/// still set or HEAD drifted, guarding against a resolver that forgot to abort.
+/// Returns `Ok(())` if no reset was needed or it succeeded; `Err(reset_failure)`
+/// if a reset was attempted and failed (caller poisons slot 0).
+fn conditional_reset(slot0_path: &Path, pre_merge_head: &str) -> Result<(), String> {
+    let stale = has_unresolved_merge(slot0_path).unwrap_or(true);
+    let drifted = rev_parse_head(slot0_path)
+        .map(|h| h != pre_merge_head)
+        .unwrap_or(true);
+    if stale || drifted {
+        return hard_reset(slot0_path, pre_merge_head);
+    }
+    Ok(())
+}
+
+/// Run a defensive `hard_reset` and fold the original diagnostic together.
+/// On reset success, returns `(original_msg, kind)`. On reset failure,
+/// escalates to `PreResolver` (slot-0 poisoning marker) and appends the
+/// reset error so the operator sees both failure modes.
+fn reset_or_escalate(
+    slot0_path: &Path,
+    pre_merge_head: &str,
+    original_msg: String,
+    kind: SlotFailureKind,
+) -> (String, SlotFailureKind) {
+    match hard_reset(slot0_path, pre_merge_head) {
+        Ok(()) => (original_msg, kind),
+        Err(reset_err) => {
+            eprintln!(
+                "warning: slot-0 cleanup reset failed; subsequent slots will short-circuit: {}",
+                reset_err
+            );
+            (
+                format!("{} | reset cleanup failed: {}", original_msg, reset_err),
+                SlotFailureKind::PreResolver,
+            )
+        }
+    }
+}
+
+/// Invoke `resolver` on an in-progress conflict and verify the outcome.
+/// Returns `Ok(())` on verified resolution or `Err((diagnostic, kind))` for
+/// every failure mode. Delegates reset logic to `handle_resolved` (Resolved)
+/// and `conditional_reset` (Aborted); always hard-resets for Failed.
+///
+/// `list_conflicted_files` errors are surfaced as `PreResolver` failures (the
+/// merge probe itself is broken — the resolver can't be expected to do useful
+/// work without knowing what's conflicted).
+fn handle_conflict_for_slot(
+    slot: usize,
+    slot0_path: &Path,
+    ephemeral: &str,
+    pre_merge_head: &str,
+    detail: &str,
+    resolver: &dyn MergeResolver,
+) -> Result<(), (String, SlotFailureKind)> {
+    let conflicted = match list_conflicted_files(slot0_path) {
+        Ok(v) => v,
+        Err(probe_err) => {
+            // S2 fix: don't silently coerce a probe failure into ResolverAttempted.
+            // Reset to pre_merge_head and surface as PreResolver so the operator
+            // knows the conflict resolution path was never even reached.
+            return Err(reset_or_escalate(
+                slot0_path,
+                pre_merge_head,
+                format!("{} | conflicted-files probe failed: {}", detail, probe_err),
+                SlotFailureKind::PreResolver,
+            ));
+        }
+    };
+    let outcome = resolver.resolve(ResolverContext {
+        slot,
+        slot0_path,
+        ephemeral_branch: ephemeral,
+        conflicted_files: &conflicted,
+        pre_merge_head,
+    });
+    match outcome {
+        MergeResolverOutcome::Resolved => handle_resolved(slot0_path, pre_merge_head, detail),
+        MergeResolverOutcome::Aborted => {
+            let original_msg = format!("{} | resolver declined", detail);
+            match conditional_reset(slot0_path, pre_merge_head) {
+                Ok(()) => Err((original_msg, SlotFailureKind::ResolverAttempted)),
+                Err(reset_err) => {
+                    eprintln!(
+                        "warning: slot-0 cleanup reset failed; subsequent slots will short-circuit: {}",
+                        reset_err
+                    );
+                    Err((
+                        format!("{} | reset cleanup failed: {}", original_msg, reset_err),
+                        SlotFailureKind::PreResolver,
+                    ))
+                }
+            }
+        }
+        MergeResolverOutcome::Failed(msg) => Err(reset_or_escalate(
+            slot0_path,
+            pre_merge_head,
+            format!("{} | resolver failed: {}", detail, msg),
+            SlotFailureKind::ResolverAttempted,
+        )),
+    }
+}
+
+/// Fast-forward each successfully-merged slot worktree to the updated main
+/// branch head. Slots whose `--ff-only` fails are demoted to `failed_slots`.
+fn fast_forward_merged_slots(outcomes: &mut MergeOutcomes, project_root: &Path, branch_name: &str) {
+    let merged: Vec<usize> = outcomes.merged_slots.clone();
     for slot in merged {
         let slot_path = compute_slot_worktree_path(project_root, branch_name, slot);
         let ff_result = Command::new("git")
             .args(["merge", "--ff-only", branch_name])
             .current_dir(&slot_path)
             .output();
-
         match ff_result {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 let detail = format_git_failure(&output.stdout, &output.stderr);
                 outcomes.merged_slots.retain(|s| *s != slot);
-                outcomes.failed_slots.push((slot, detail));
+                outcomes
+                    .failed_slots
+                    .push((slot, detail, SlotFailureKind::PreResolver));
             }
             Err(e) => {
                 outcomes.merged_slots.retain(|s| *s != slot);
-                outcomes
-                    .failed_slots
-                    .push((slot, format!("git ff spawn: {}", e)));
+                outcomes.failed_slots.push((
+                    slot,
+                    format!("git ff spawn: {}", e),
+                    SlotFailureKind::PreResolver,
+                ));
             }
         }
     }
-
-    outcomes
 }
 
 /// Pick the most informative non-empty git output for a failure summary.
@@ -1708,7 +2147,7 @@ detached
                 .expect("git commit in slot");
         }
 
-        let outcomes = merge_slot_branches(tmp.path(), branch, 3);
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver);
         assert!(
             outcomes.failed_slots.is_empty(),
             "disjoint changes must merge cleanly: {:?}",
@@ -1792,7 +2231,7 @@ detached
 
         let pre_merge_head = rev_parse(&slot0, "HEAD");
 
-        let outcomes = merge_slot_branches(tmp.path(), branch, 3);
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver);
 
         assert_eq!(
             outcomes.merged_slots,
@@ -1809,6 +2248,11 @@ detached
         assert!(
             !outcomes.failed_slots[0].1.is_empty(),
             "failure should capture stderr context"
+        );
+        assert_eq!(
+            outcomes.failed_slots[0].2,
+            SlotFailureKind::ResolverAttempted,
+            "NoOpResolver calls resolve() so kind must be ResolverAttempted"
         );
 
         // Slot 0 must NOT be in a half-merged state — `git merge --abort`
@@ -1993,5 +2437,511 @@ detached
             others_from_wt[0].canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap(),
         );
+    }
+
+    // --- FEAT-001: resolver-callback seam tests ---
+    //
+    // Set up a single conflicting slot (slot 1) on top of an out-of-band main
+    // commit, then exercise each MergeResolverOutcome variant via a mock
+    // resolver. The mock's `resolve` runs real git commands in slot 0 so the
+    // outer MERGE_HEAD/HEAD inspection sees authentic state, not a stub.
+
+    /// Mock resolver that runs an arbitrary closure inside slot 0 and returns
+    /// a configured `MergeResolverOutcome`. Captures the context it received
+    /// for assertion purposes.
+    struct MockResolver<F: Fn(&Path)> {
+        outcome: MergeResolverOutcome,
+        side_effect: F,
+        invocations: std::cell::RefCell<u32>,
+        last_conflicted: std::cell::RefCell<Vec<String>>,
+        last_branch: std::cell::RefCell<String>,
+    }
+
+    impl<F: Fn(&Path)> MockResolver<F> {
+        fn new(outcome: MergeResolverOutcome, side_effect: F) -> Self {
+            Self {
+                outcome,
+                side_effect,
+                invocations: std::cell::RefCell::new(0),
+                last_conflicted: std::cell::RefCell::new(Vec::new()),
+                last_branch: std::cell::RefCell::new(String::new()),
+            }
+        }
+    }
+
+    impl<F: Fn(&Path)> MergeResolver for MockResolver<F> {
+        fn resolve(&self, ctx: ResolverContext<'_>) -> MergeResolverOutcome {
+            *self.invocations.borrow_mut() += 1;
+            *self.last_conflicted.borrow_mut() = ctx.conflicted_files.to_vec();
+            *self.last_branch.borrow_mut() = ctx.ephemeral_branch.to_string();
+            (self.side_effect)(ctx.slot0_path);
+            self.outcome.clone()
+        }
+    }
+
+    /// Build a 2-slot repo where slot 1's commit conflicts with an
+    /// out-of-band commit on the main branch via slot 0. Returns
+    /// `(tmp, slot0_path, pre_merge_head)`.
+    fn setup_conflicting_slot1(branch: &str) -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = setup_git_repo_with_file();
+        let slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: conflicting commit on contended.txt
+        fs::write(paths[1].join("contended.txt"), "slot-1 version").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add slot 1");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 contended change"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit slot 1");
+
+        // Out-of-band conflicting commit on main via slot 0
+        fs::write(slot0.join("contended.txt"), "main version").expect("write main");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot0)
+            .output()
+            .expect("git add main");
+        Command::new("git")
+            .args(["commit", "-m", "main out-of-band change"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git commit main");
+
+        let pre = rev_parse(&slot0, "HEAD");
+        (tmp, slot0, pre)
+    }
+
+    /// AC7: resolver returns Resolved + creates a real commit → slot is
+    /// merged, MERGE_HEAD cleared, HEAD advanced.
+    #[test]
+    fn test_resolver_resolved_with_real_commit_lands_in_merged_slots() {
+        let branch = "feat/resolver-resolved";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+
+        let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
+            // Pretend to resolve by overwriting the file and committing.
+            // `git commit -am` inside an in-progress merge finalizes it.
+            fs::write(slot0_path.join("contended.txt"), "resolved version").expect("write");
+            let out = Command::new("git")
+                .args(["commit", "-am", "resolve conflict"])
+                .current_dir(slot0_path)
+                .output()
+                .expect("git commit");
+            assert!(
+                out.status.success(),
+                "merge-commit should succeed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        });
+
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+
+        assert_eq!(*resolver.invocations.borrow(), 1, "resolver called once");
+        assert!(
+            !resolver.last_conflicted.borrow().is_empty(),
+            "resolver received the conflicted-file list: {:?}",
+            resolver.last_conflicted.borrow()
+        );
+        assert_eq!(
+            resolver.last_branch.borrow().as_str(),
+            &format!("{}-slot-1", branch),
+            "resolver received the ephemeral branch name"
+        );
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot 1 should land in merged_slots: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should be failed: {:?}",
+            outcomes.failed_slots
+        );
+
+        let post = rev_parse(&slot0, "HEAD");
+        assert_ne!(post, pre_merge_head, "HEAD must advance past pre-merge");
+        assert!(
+            !slot0.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must be cleared"
+        );
+    }
+
+    /// AC8: resolver returns Aborted + runs real `git merge --abort` → slot
+    /// in failed_slots with 'declined' diagnostic, HEAD == pre_merge_head.
+    #[test]
+    fn test_resolver_aborted_lands_in_failed_slots_with_declined() {
+        let branch = "feat/resolver-aborted";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+
+        let resolver = MockResolver::new(MergeResolverOutcome::Aborted, |slot0_path| {
+            let out = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(slot0_path)
+                .output()
+                .expect("git merge --abort");
+            assert!(out.status.success(), "merge --abort should succeed");
+        });
+
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+
+        assert!(
+            outcomes.merged_slots.is_empty(),
+            "no slot should be merged: {:?}",
+            outcomes.merged_slots
+        );
+        assert_eq!(outcomes.failed_slots.len(), 1);
+        let (slot, diag, kind) = &outcomes.failed_slots[0];
+        assert_eq!(*slot, 1);
+        assert!(
+            diag.to_lowercase().contains("declined"),
+            "diagnostic should mention 'declined': {}",
+            diag
+        );
+        assert_eq!(*kind, SlotFailureKind::ResolverAttempted);
+        assert_eq!(
+            rev_parse(&slot0, "HEAD"),
+            pre_merge_head,
+            "HEAD must remain at pre_merge_head"
+        );
+        assert!(
+            !slot0.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must not remain set"
+        );
+    }
+
+    /// AC9: resolver returns Failed("timed out") → slot in failed_slots,
+    /// HEAD reset to pre_merge_head, diagnostic contains 'timed out'.
+    #[test]
+    fn test_resolver_failed_resets_head_and_records_message() {
+        let branch = "feat/resolver-failed";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+
+        // Resolver does nothing (simulating a hard error before any cleanup).
+        let resolver = MockResolver::new(MergeResolverOutcome::Failed("timed out".into()), |_| {});
+
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+
+        assert!(outcomes.merged_slots.is_empty());
+        assert_eq!(outcomes.failed_slots.len(), 1);
+        let (slot, diag, kind) = &outcomes.failed_slots[0];
+        assert_eq!(*slot, 1);
+        assert!(
+            diag.contains("timed out"),
+            "diagnostic should contain 'timed out': {}",
+            diag
+        );
+        assert_eq!(*kind, SlotFailureKind::ResolverAttempted);
+        assert_eq!(
+            rev_parse(&slot0, "HEAD"),
+            pre_merge_head,
+            "HEAD must be reset to pre_merge_head"
+        );
+        assert!(
+            !slot0.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must be cleared by the reset"
+        );
+    }
+
+    /// AC10 + known-bad: resolver returns Resolved but does NOTHING (no
+    /// commit, MERGE_HEAD untouched) → slot in failed_slots, HEAD reset,
+    /// diagnostic mentions MERGE_HEAD. Catches naive impls that trust the
+    /// resolver's return value.
+    #[test]
+    fn test_resolver_lying_resolved_is_downgraded_to_failed() {
+        let branch = "feat/resolver-lying";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+
+        // Lying resolver: claims Resolved but does NOT commit. MERGE_HEAD
+        // should still be set after this no-op runs.
+        let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |_| {});
+
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+
+        assert!(
+            outcomes.merged_slots.is_empty(),
+            "lying resolver must NOT push to merged_slots: {:?}",
+            outcomes.merged_slots
+        );
+        assert_eq!(outcomes.failed_slots.len(), 1);
+        let (slot, diag, kind) = &outcomes.failed_slots[0];
+        assert_eq!(*slot, 1);
+        assert!(
+            diag.contains("MERGE_HEAD"),
+            "diagnostic should mention MERGE_HEAD: {}",
+            diag
+        );
+        assert_eq!(*kind, SlotFailureKind::ResolverAttempted);
+        assert_eq!(
+            rev_parse(&slot0, "HEAD"),
+            pre_merge_head,
+            "HEAD must be reset to pre_merge_head"
+        );
+        assert!(
+            !slot0.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD must be cleared by the forced reset"
+        );
+    }
+
+    /// AC6: resolver clears MERGE_HEAD without advancing HEAD (degenerate
+    /// case — silent abort dressed up as Resolved) → slot in failed_slots
+    /// with 'resolution did not advance HEAD'.
+    #[test]
+    fn test_resolver_resolved_without_head_advance_is_failed() {
+        let branch = "feat/resolver-no-advance";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+
+        let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
+            // Clear MERGE_HEAD without committing — this is what `git merge
+            // --abort` does, but the resolver is lying about Resolved.
+            let out = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(slot0_path)
+                .output()
+                .expect("git merge --abort");
+            assert!(out.status.success());
+        });
+
+        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+
+        assert!(outcomes.merged_slots.is_empty());
+        assert_eq!(outcomes.failed_slots.len(), 1);
+        let (_, diag, kind) = &outcomes.failed_slots[0];
+        assert!(
+            diag.contains("did not advance HEAD"),
+            "diagnostic should mention HEAD non-advance: {}",
+            diag
+        );
+        assert_eq!(*kind, SlotFailureKind::ResolverAttempted);
+        assert_eq!(rev_parse(&slot0, "HEAD"), pre_merge_head);
+    }
+
+    /// SlotFailureKind::PreResolver is set when rev_parse_head fails before
+    /// the resolver is ever invoked (slot 0 worktree does not exist).
+    #[test]
+    fn test_slot_failure_kind_pre_resolver_on_missing_worktree() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // NoOpResolver must not be called — slot fails at rev_parse_head.
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), "test-branch", 2, &NoOpResolver);
+        assert_eq!(outcomes.failed_slots.len(), 1);
+        let (_, _, kind) = &outcomes.failed_slots[0];
+        assert_eq!(
+            *kind,
+            SlotFailureKind::PreResolver,
+            "rev-parse failure before resolver invocation must be PreResolver kind"
+        );
+    }
+
+    /// Helpers exist as pub(crate) and behave correctly.
+    #[test]
+    fn test_helpers_list_conflicted_and_has_unresolved_merge() {
+        let branch = "feat/resolver-helpers";
+        let (tmp, slot0, _pre) = setup_conflicting_slot1(branch);
+
+        // Trigger the conflict directly so we can inspect helpers without
+        // engaging the resolver path.
+        let ephemeral = format!("{}-slot-1", branch);
+        let merge = Command::new("git")
+            .args(["merge", "--no-edit", &ephemeral])
+            .current_dir(&slot0)
+            .output()
+            .expect("git merge");
+        assert!(!merge.status.success(), "merge should conflict");
+
+        // has_unresolved_merge should return Ok(true) mid-merge.
+        assert_eq!(has_unresolved_merge(&slot0), Ok(true));
+
+        // list_conflicted_files should mention contended.txt.
+        let conflicted = list_conflicted_files(&slot0).expect("list_conflicted_files");
+        assert!(
+            conflicted.iter().any(|f| f == "contended.txt"),
+            "conflicted list should contain contended.txt: {:?}",
+            conflicted
+        );
+
+        // rev_parse_head should return a non-empty SHA.
+        let head = rev_parse_head(&slot0).expect("rev_parse_head");
+        assert!(!head.is_empty());
+
+        // Cleanup so other tests / drop don't see a stuck merge.
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&slot0)
+            .output();
+        assert_eq!(has_unresolved_merge(&slot0), Ok(false));
+
+        // Keep `tmp` alive until after we've read from slot0.
+        drop(tmp);
+    }
+
+    /// MergeResolverOutcome has exactly the three variants Resolved, Aborted,
+    /// Failed(String) — compile-time check that nothing else exists.
+    #[test]
+    fn test_merge_resolver_outcome_has_three_variants() {
+        // Exhaustive match — adding a variant breaks this test.
+        fn classify(o: MergeResolverOutcome) -> &'static str {
+            match o {
+                MergeResolverOutcome::Resolved => "resolved",
+                MergeResolverOutcome::Aborted => "aborted",
+                MergeResolverOutcome::Failed(_) => "failed",
+            }
+        }
+        assert_eq!(classify(MergeResolverOutcome::Resolved), "resolved");
+        assert_eq!(classify(MergeResolverOutcome::Aborted), "aborted");
+        assert_eq!(classify(MergeResolverOutcome::Failed("x".into())), "failed");
+    }
+
+    #[test]
+    fn test_merged_attributes_inserts_block_into_empty_file() {
+        let result = merged_attributes_contents("").expect("must rewrite empty file");
+        assert!(result.contains(ATTR_MARKER_BEGIN));
+        assert!(result.contains(ATTR_MARKER_END));
+        assert!(result.contains("tasks/progress*.txt merge=union"));
+        assert!(result.contains(".task-mgr/tasks/progress*.txt merge=union"));
+    }
+
+    #[test]
+    fn test_merged_attributes_appends_to_existing_user_content() {
+        let existing = "*.bin binary\n";
+        let result = merged_attributes_contents(existing).expect("must rewrite");
+        // User content preserved at the top.
+        assert!(result.starts_with("*.bin binary\n"));
+        // Managed block follows.
+        assert!(result.contains(ATTR_MARKER_BEGIN));
+        assert!(result.contains("tasks/progress*.txt merge=union"));
+    }
+
+    #[test]
+    fn test_merged_attributes_idempotent_when_block_matches() {
+        let initial = merged_attributes_contents("").expect("first write");
+        // Second pass over the result of the first must be a no-op.
+        assert!(
+            merged_attributes_contents(&initial).is_none(),
+            "expected no rewrite when block already matches"
+        );
+    }
+
+    #[test]
+    fn test_merged_attributes_rewrites_drifted_block() {
+        // Simulate a stale block from a prior task-mgr version with a different body.
+        let stale = format!(
+            "{}\nold-pattern.txt merge=union\n{}\n",
+            ATTR_MARKER_BEGIN, ATTR_MARKER_END
+        );
+        let result = merged_attributes_contents(&stale).expect("must rewrite drifted block");
+        assert!(!result.contains("old-pattern.txt"));
+        assert!(result.contains("tasks/progress*.txt merge=union"));
+    }
+
+    #[test]
+    fn test_merged_attributes_preserves_user_lines_after_block() {
+        let stale = format!(
+            "*.bin binary\n{}\nold.txt merge=union\n{}\n*.lock -text\n",
+            ATTR_MARKER_BEGIN, ATTR_MARKER_END
+        );
+        let result = merged_attributes_contents(&stale).expect("must rewrite");
+        assert!(result.starts_with("*.bin binary\n"));
+        assert!(result.contains("*.lock -text"));
+        assert!(!result.contains("old.txt"));
+        assert!(result.contains("tasks/progress*.txt merge=union"));
+    }
+
+    #[test]
+    fn test_ensure_progress_union_merge_writes_attributes_file() {
+        let tmp = setup_git_repo_with_file();
+        ensure_progress_union_merge(tmp.path()).expect("ensure");
+        let attrs = tmp.path().join(".git/info/attributes");
+        let body = std::fs::read_to_string(&attrs).expect("read attributes");
+        assert!(body.contains("tasks/progress*.txt merge=union"));
+        assert!(body.contains(".task-mgr/tasks/progress*.txt merge=union"));
+    }
+
+    #[test]
+    fn test_ensure_progress_union_merge_is_idempotent_on_disk() {
+        let tmp = setup_git_repo_with_file();
+        ensure_progress_union_merge(tmp.path()).expect("first");
+        let first = std::fs::read_to_string(tmp.path().join(".git/info/attributes")).unwrap();
+        ensure_progress_union_merge(tmp.path()).expect("second");
+        let second = std::fs::read_to_string(tmp.path().join(".git/info/attributes")).unwrap();
+        assert_eq!(first, second, "second call must not modify file");
+    }
+
+    #[test]
+    fn test_progress_union_merge_resolves_concurrent_appends_without_conflict() {
+        // End-to-end: confirm git's union driver actually fires for the
+        // configured pattern when two branches each append distinct lines.
+        let tmp = setup_git_repo_with_file();
+        let repo = tmp.path();
+
+        std::fs::create_dir_all(repo.join("tasks")).unwrap();
+        let progress_path = repo.join("tasks/progress-test.txt");
+        std::fs::write(&progress_path, "line-base\n").unwrap();
+        Command::new("git")
+            .args(["add", "tasks/progress-test.txt"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "base progress"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        ensure_progress_union_merge(repo).expect("attrs");
+
+        // Branch A appends one line.
+        Command::new("git")
+            .args(["checkout", "-b", "branch-a"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(&progress_path, "line-base\nline-a\n").unwrap();
+        Command::new("git")
+            .args(["commit", "-am", "a"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        // Branch B (from main) appends a different line.
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["checkout", "-b", "branch-b"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(&progress_path, "line-base\nline-b\n").unwrap();
+        Command::new("git")
+            .args(["commit", "-am", "b"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        // Merge A into B — without union, this would conflict on the trailing line.
+        let merge = Command::new("git")
+            .args(["merge", "--no-edit", "branch-a"])
+            .current_dir(repo)
+            .output()
+            .expect("git merge");
+        assert!(
+            merge.status.success(),
+            "merge should succeed via union driver: stderr={}, stdout={}",
+            String::from_utf8_lossy(&merge.stderr),
+            String::from_utf8_lossy(&merge.stdout),
+        );
+
+        let merged_body = fs::read_to_string(&progress_path).unwrap();
+        assert!(merged_body.contains("line-a"));
+        assert!(merged_body.contains("line-b"));
     }
 }
