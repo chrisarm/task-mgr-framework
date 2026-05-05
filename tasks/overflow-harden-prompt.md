@@ -1,0 +1,395 @@
+# Claude Code Agent Instructions
+
+You are an autonomous coding agent implementing **Overflow Recovery — Hardening Pass** for **task-mgr**.
+
+## Problem Statement
+
+The `prd-overflow-recovery-and-diagnostics` PRD shipped a four-rung `PromptTooLong` recovery ladder + diagnostics bundle (prompt dump, JSONL event log, rotation). `/review-loop` validated the implementation against all PRD quality dimensions but flagged five small follow-ups:
+
+1. **M3 — `rotate_dumps_keep_n` aborts midway on first IO error** (`src/loop_engine/overflow.rs:241-258`). One unreadable dump leaves all older dumps in place; violates the best-effort observability contract.
+2. **M2 — JSONL `O_APPEND` ≤4 KB invariant unenforced** (`src/loop_engine/overflow.rs:218-225`). PRD/CLAUDE.md document the rule; nothing surfaces violations at runtime.
+3. **L1 — `dump_prompt` redundant `iter` parameter** (`src/loop_engine/overflow.rs:180-211`). Two sources of truth (param + `header.iteration`) at every call site; clean break drops one.
+4. **L2 — clippy `expect_fun_call` in tests/overflow_filesystem.rs:240** — `format!()` inside `expect()` evaluates eagerly on the happy path.
+5. **L4 — Unused `_task_id: &str` parameter on `make_header` test helper** (`tests/overflow_filesystem.rs:66-71`).
+
+L3 (`OverflowEvent.sections` allocation optimization) is intentionally skipped — fix would require `Cow<'static, str>` + serde lifetime annotations; not worth the complexity given overflow events are rare.
+
+The fixes ship on the existing `feat/overflow-recovery-and-diagnostics` branch in the same merge as the original feature.
+
+---
+
+## Non-Negotiable Process (Read Every Iteration)
+
+Before writing code:
+
+1. **Internalize quality targets** — Read `qualityDimensions`; that's what "done well" means for THIS task.
+2. **Plan edge-case handling** — For each `edgeCases` / `failureModes` entry on the task, decide how it'll be handled before coding.
+3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
+
+After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). Don't add a separate self-critique step; the linters, type-checker, and targeted tests catch more than a re-read does.
+
+---
+
+## Priority Philosophy
+
+In order: **PLAN** (anticipate edge cases) → **PHASE 2 FOUNDATION** (strong invariants now to save future debugging) → **FUNCTIONING CODE** (pragmatic, reliable) → **CORRECTNESS** (compiles, type-checks, scoped tests pass deterministically) → **CODE QUALITY** (clean, no warnings) → **POLISH** (docs, formatting).
+
+Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` entry; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
+
+**Prohibited outcomes:**
+
+- Tests that only assert 'no crash' or check type without verifying content
+- Tests that mirror implementation internals (break when refactoring)
+- Catch-all error handlers that swallow context (eprintln! must include the path/operation that failed)
+- Reorder of the contractual order-of-operations in handle_prompt_too_long (ctx → DB → stderr → dump → JSONL → rotate)
+- Truncation of OverflowEvent fields to enforce the 4 KB JSONL line limit — Fix B warns and proceeds, never silently drops data
+
+---
+
+## Global Acceptance Criteria
+
+These apply to **every** implementation task — the task-level `acceptanceCriteria` returned by `task-mgr next` are layered on top. If any of these fails, the task is not done.
+
+- Rust: No warnings in `cargo check` output
+- Rust: No warnings in `cargo clippy -- -D warnings` output
+- Rust: Scoped tests for touched files pass with `cargo test`
+- Rust: `cargo fmt --check` passes
+- No breaking changes to existing public APIs unless explicitly required by the task (Fix C is the one exception)
+- Production code paths use match/if-let on filesystem errors, never `.unwrap()` / `.expect()`
+- All `eprintln!` warnings include enough context to identify the failed operation and target (path, task ID, operation name)
+
+---
+
+## Task Files + CLI (IMPORTANT — context economy)
+
+**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about a task is returned by `task-mgr next`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+
+### Getting your task prefix
+
+The `taskPrefix` is auto-generated by `task-mgr init` and written into the JSON. Fetch it once at the start of an iteration (don't hardcode it):
+
+```bash
+PREFIX=$(jq -r '.taskPrefix' tasks/overflow-harden.json)
+```
+
+Use `$PREFIX` in every CLI call below so you stay scoped to this task list.
+
+### Commands you'll actually run
+
+| Need                                    | Command                                                                                                                                                                           |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pick + claim the next eligible task     | `task-mgr next --prefix $PREFIX --claim`                                                                                                                                          |
+| Inspect one task (full acceptance etc.) | `task-mgr show $PREFIX-TASK-ID`                                                                                                                                                   |
+| List remaining tasks (debug only)       | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
+| Recall learnings relevant to a task     | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
+| Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --depended-on-by REVIEW-001` — priority auto-computed; DB + PRD JSON updated atomically                                                    |
+| Mark status                             | Emit `<task-status>$PREFIX-TASK-ID:done</task-status>` (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`) — loop engine routes through `task-mgr` and syncs the JSON |
+
+If you genuinely need a top-level field that's not surfaced per-task (rare), pull it with `jq`, never a full Read:
+
+```bash
+jq '.globalAcceptanceCriteria' tasks/overflow-harden.json
+```
+
+### Files you DO touch
+
+| File                                  | Purpose                                                                    |
+| ------------------------------------- | -------------------------------------------------------------------------- |
+| `tasks/overflow-harden-prompt.md`     | This prompt file (read-only)                                               |
+| `tasks/progress-$PREFIX.txt`          | Progress log — **tail** for recent context, **append** after each task     |
+
+**Reading progress** — sections are separated by `---` lines and each starts with `## <Date> - <TASK-ID>`. Never Read the whole log; it grows every iteration. Two targeted patterns cover every case:
+
+```bash
+# Most recent section only (default recency check)
+tac tasks/progress-$PREFIX.txt 2>/dev/null | awk '/^---$/{exit} {print}' | tac
+
+# Specific prior task (e.g. a synergy task you're building on, or a dependsOn task)
+grep -n -A 40 '## .* - <TASK-ID>' tasks/progress-$PREFIX.txt
+```
+
+Skip the read entirely on the first iteration (file won't exist). Before appending, create it with a minimal header if missing; never crash on absent files.
+
+---
+
+## Your Task (every iteration)
+
+Optimize for context economy: pull only what's needed, don't dump whole files.
+
+1. **Resolve prefix and claim the next task**:
+   ```bash
+   PREFIX=$(jq -r '.taskPrefix' tasks/overflow-harden.json)
+   task-mgr next --prefix $PREFIX --claim
+   ```
+   The output includes `id`, `title`, `description`, `acceptanceCriteria`, `qualityDimensions`, `edgeCases`, `touchesFiles`, `dependsOn`, `branchName`, and `notes` — everything you need. If it reports no eligible task, output `<promise>BLOCKED</promise>` with the printed reason and stop.
+
+2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `task-mgr next` listed a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log. Skip entirely on the first iteration.
+
+3. **Recall focused learnings** — `task-mgr recall --for-task <TASK-ID>` returns the learnings scored highest for this specific task. That's the ONLY way to reach `tasks/long-term-learnings.md` / `tasks/learnings.md` content — **do not** Read those files directly.
+
+   **Never Read `CLAUDE.md` in full.** The relevant excerpts are embedded below. If you need a section not shown here, `grep -n -A 10 '<section header>' CLAUDE.md` for just that block.
+
+4. **Verify branch** — `git branch --show-current` should match `feat/overflow-recovery-and-diagnostics`. Switch if wrong.
+
+5. **Think before coding** (in context, not on disk):
+   - State assumptions to yourself.
+   - For each `edgeCases` / `failureModes` entry, note how it'll be handled.
+   - Cross-module data access → consult the **Data Flow Contracts** section or grep 2-3 existing call sites. Never guess key types from variable names.
+   - Pick an approach. Only survey alternatives when `estimatedEffort: "high"` OR `modifiesBehavior: true` — one rejected alternative with a one-line reason is enough. For normal tasks: pick and go.
+
+6. **Implement** — single task, code and tests in one coherent change.
+
+7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). Fix failures before committing; never commit broken code.
+
+8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:` as appropriate).
+
+9. **Emit status**: `<task-status><TASK-ID>:done</task-status>` — the loop engine flips `passes` and syncs the PRD JSON. Do NOT edit the JSON.
+
+10. **Append progress** — ONE post-implementation block, using the format below, terminated with `---` so the next iteration's tail works.
+
+---
+
+## Behavior Modification Protocol (only when `modifiesBehavior: true`)
+
+None of the FEAT tasks in this list set `modifiesBehavior: true`. FEAT-002 changes a public function signature (`dump_prompt`) but the call sites are exhaustive — see the task's CONTRACT criterion that requires grep-verifying both call sites are updated.
+
+---
+
+## Quality Checks
+
+The full test suite is expensive. Per-iteration tasks run a **scoped** gate; **REVIEW-001** runs the full gate and must leave the repo fully green (including pre-existing failures).
+
+### Per-iteration scoped gate (FEAT-001 / FEAT-002 / FEAT-003)
+
+Format → type-check → lint → **scoped tests for touched files** → pre-commit hooks. Fix every failure before committing.
+
+```bash
+# Rust — scope tests to overflow-related modules
+cargo fmt --check
+cargo check
+cargo clippy --tests --all-targets -- -D warnings   # FEAT-003 explicitly verifies clippy clean
+cargo test --test overflow_filesystem                # FEAT-001 + FEAT-003 main scope
+cargo test --test overflow_recovery                  # FEAT-002 (call site change in handle_prompt_too_long)
+cargo test -p task-mgr --lib loop_engine::overflow   # unit tests inside src/loop_engine/overflow.rs
+```
+
+Run all relevant scoped commands in a single tee'd invocation per CLAUDE.md test protocol:
+
+```bash
+cargo test --test overflow_filesystem --test overflow_recovery 2>&1 \
+  | tee /tmp/test-results.txt | tail -5 \
+  && grep "FAILED\|error\[" /tmp/test-results.txt | head -10
+```
+
+**Do NOT** run the entire workspace test suite (`cargo test` with no filter) during regular iterations — that's REVIEW-001's job.
+
+### Full gate (REFACTOR-001 / REVIEW-001)
+
+These tasks run the **full, unscoped** suite on a clean checkout and must finish green:
+
+```bash
+cargo fmt --check && cargo check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+If ANY test fails — including pre-existing failures that predate this change — REVIEW-001 fixes them. Default: **attempt every failure**, even ones that look out-of-scope. Trunk-green is the invariant this mechanism exists to protect.
+
+Pragmatic escape hatch: if there are **more than ~12 failures AND they're all clearly unrelated** (e.g., a sibling team's integration test against a now-missing service), triage:
+
+1. Fix everything attributable to this change's diff, inline in the REVIEW-001 commit.
+2. For the remaining unrelated failures: spawn a single `FIX-xxx` task via `task-mgr add --stdin --depended-on-by REVIEW-001` listing the failing test names + error summaries, and `<promise>BLOCKED</promise>` with that task ID.
+
+Below the ~12-failure threshold, just fix them.
+
+---
+
+## Common Wiring Failures (REVIEW-001 reference)
+
+New code must be reachable from production — REVIEW-001 verifies. Most common misses:
+
+- Test mocks bypass real wiring → verify production path separately
+- Wrong key type on map access (atom vs string) — struct keys ≠ JSONB keys → check Data Flow Contracts
+- Documentation comment in CLAUDE.md or rustdoc says X but the code now does Y → out of date
+
+For this task list: confirm `handle_prompt_too_long` still calls `rotate_dumps_keep_n`, `append_event_log`, and `dump_prompt` (FEAT-002 changes the latter's signature — verify the single call site in handle_prompt_too_long updates).
+
+---
+
+## Review Tasks
+
+REFACTOR-001 and REVIEW-001 spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
+
+### What each review looks for
+
+| Review         | Priority | Spawns (priority)                  | Focus                                                                                                   |
+| -------------- | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-97)         | DRY (eprintln! warning templates), function length, idiom consistency                                   |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Language idioms, no `unwrap()` in production, qualityDimensions met, wiring reachable, full-suite green |
+
+Use the **rust-python-code-reviewer** agent. **Important reminder for REFACTOR-001 and REVIEW-001**: before flagging "missing wiring" between modules, read the module-level rustdoc and the rustdoc directly above the entry-point function — they often document deliberate omissions (Learning #2029 — the parent PRD's review hit a false-positive on `run_slot_iteration`'s deliberate slot-mode bypass).
+
+### Spawning follow-up tasks
+
+```sh
+echo '{
+  "id": "FIX-001",
+  "title": "Fix: <specific issue>",
+  "description": "From REVIEW-001: <details>",
+  "rootCause": "<file:line + issue>",
+  "exactFix": "<specific change>",
+  "verifyCommand": "<shell command that proves the fix>",
+  "acceptanceCriteria": ["Issue resolved", "No new warnings"],
+  "priority": 60,
+  "touchesFiles": ["affected/file.rs"]
+}' | task-mgr add --stdin --depended-on-by REVIEW-001
+```
+
+`--depended-on-by` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+
+---
+
+## Progress Report Format
+
+APPEND a block to `tasks/progress-$PREFIX.txt` (create with a one-line header if missing). Keep it **tight** — future iterations tail this; verbosity here bloats every later context.
+
+```
+## [YYYY-MM-DD HH:MM] - [TASK-ID]
+Approach: [one sentence — what you chose and why]
+Files: [comma-separated paths touched]
+Learnings: [1-3 bullets, one line each]
+---
+```
+
+Target: ~10 lines per block. If your entry is longer than ~25 lines, compress it.
+
+---
+
+## Learnings Guidelines
+
+Learnings live in `tasks/long-term-learnings.md` (curated) and `tasks/learnings.md` (raw). **Do not Read those files directly** — use `task-mgr recall --for-task <TASK-ID>` or `task-mgr recall --query "<keywords>"`.
+
+Record your own learnings with `task-mgr learn` so they're indexed. Don't append directly to those files.
+
+**Write concise learnings** (1-2 lines each):
+
+- GOOD: "`PathBuf::display()` is the conventional way to interpolate paths in eprintln! warnings (matches existing overflow.rs style)"
+- BAD: "When formatting filesystem paths in error messages, you should use the display method on PathBuf because it returns a Display implementer that handles..."
+
+---
+
+## Stop and Blocked Conditions
+
+### Stop Condition
+
+Before outputting `<promise>COMPLETE</promise>`:
+
+1. Verify ALL tasks have `passes: true`
+2. Verify no new tasks were created in final review
+3. Verify REVIEW-001 passed with full suite green
+
+If verified:
+
+```
+<promise>COMPLETE</promise>
+```
+
+### Blocked Condition
+
+If blocked (missing dependencies, unclear requirements):
+
+1. Document blocker in the progress file
+2. Create clarification task via `echo '{...}' | task-mgr add --stdin --depended-on-by <blocked-task>` (priority 0)
+3. Output:
+
+```
+<promise>BLOCKED</promise>
+```
+
+---
+
+## Key Learnings (from task-mgr recall)
+
+These are pre-distilled learnings relevant to this task list. Treat them as authoritative — do NOT Read `tasks/long-term-learnings.md` or `tasks/learnings.md` unless a task explicitly needs a learning that isn't here.
+
+- **#2029** Parallel slot/wave mode bypasses sequential PromptTooLong recovery (intentional). Documented at `engine.rs:487-488`. Future PRDs proposing "extend overflow recovery to slot mode" must first justify breaking the minimal-slot-prompt invariant. Relevant context for REFACTOR-001/REVIEW-001 to avoid false-positive "missing wiring" calls.
+- **#2030** Filesystem rotation tests need ≥1100ms sleeps for mtime resolution. ext4/xfs have 1s mtime granularity; without padding, dumps share the same mtime and rotation can keep an arbitrary subset.
+- **#2031** PromptTooLong recovery: four-rung ladder contract. Order of operations: ctx → DB → stderr → dump → JSONL → rotate. Banner annotation gates on `overflow_recovered` HashSet, never inferred from `model_overrides`.
+- **#1856** Per-task model escalation after effort exhaustion on PromptTooLong. Documents existing rung-3 pattern, refined by #2031.
+- **#1877** Align logging mechanisms with existing codebase style. eprintln! is the convention in `overflow.rs`; do NOT introduce `tracing` / `log` crates.
+- **#602** Use `PathBuf::display()` for user-facing error messages in Rust. `path.display()` returns a Display implementer that handles non-UTF-8 paths gracefully.
+- **#1370** Rust error handling inflates function length beyond the 30-line guideline. Acceptable when the inflation comes from defensive Err arms, as in this hardening pass.
+- **#444** / **#643** `pub(crate)` visibility for cross-module helper reuse. Note: integration tests in `tests/` can ONLY see `pub` items, not `pub(crate)` — keep this in mind if you extract a helper.
+- **#893** Separate crash escalation from retry escalation. Drives the dedicated `overflow_recovered` HashSet design — do not infer recovery state from `model_overrides`.
+
+---
+
+## CLAUDE.md Excerpts (only what applies to this change)
+
+These bullets were extracted from `CLAUDE.md` for the subsystems this change touches.
+
+### Overflow recovery and diagnostics (from main CLAUDE.md)
+
+- **Four-rung ladder**: `downgrade_effort` → `escalate_below_opus` → `to_1m_model` → `Blocked`. Rung 4 still writes the dump and JSONL.
+- **Order of operations is contractual** (do not reorder): `ctx update → DB UPDATE → stderr → dump → JSONL → rotate`. Recovery state must be durable before any best-effort observability writes.
+- **Best-effort observability**: filesystem failures log via `eprintln!` and never propagate. Recovery itself must remain durable. **This task list extends "best-effort" to mean PER-ENTRY in `rotate_dumps_keep_n`** — currently the function aborts on the first failed entry; FEAT-001 makes each entry/deletion independent.
+- **Banner annotation** gates on `IterationContext::overflow_recovered` (HashSet of task IDs that hit the overflow handler), NEVER inferred from `model_overrides`. Crash escalation and consecutive-failure escalation stay in their own channels (Learning #893).
+- **JSONL line size**: PIPE_BUF on Linux is 4096 B; `O_APPEND` writes ≤ PIPE_BUF are atomic. Currently this is documented but not enforced — FEAT-001 surfaces violations via `debug_assert!` + runtime `eprintln!`.
+
+### Test & build output (from global CLAUDE.md §3)
+
+- **ALWAYS** pipe test runners, linters, and build commands to a temp file via `tee`, then grep for results **in the same command**. Example: `cargo test 2>&1 | tee /tmp/test-results.txt | tail -3 && grep "FAILED\|error\[" /tmp/test-results.txt | head -10`.
+- **NEVER** stream full output through the Bash tool and **NEVER** run the command once to see the tail, then again to grep — do it all in one shot.
+
+### task-mgr CLI patterns (from CLAUDE.md §3a)
+
+- The CLI does not have a `comment` or `notes-edit` subcommand. To attach context to a task after the fact: embed in JSON for machine-readable state, or use `task-mgr learn` for cross-task knowledge.
+- For the loop's permission model: use `--auto-mode` via `.task-mgr/config.json` (this project is configured this way per the user's auto memory `feedback_auto_mode.md`).
+
+### Sandbox (from auto memory)
+
+- Always pass `dangerouslyDisableSandbox: true` for Bash commands in this project (auto memory `feedback_sandbox.md`).
+
+---
+
+## Data Flow Contracts
+
+### `dump_prompt` signature change (FEAT-002)
+
+This is the only cross-module data path touched by the task list.
+
+| Layer | Type | Field used |
+| --- | --- | --- |
+| Caller (handle_prompt_too_long) | passes `iteration: u32` (from `params.iteration`) | currently passed to dump_prompt as both standalone arg AND inside `DumpHeader { iteration, ... }` |
+| Function signature (current) | `dump_prompt(dir: &Path, task_id: &str, iter: u32, header: &DumpHeader<'_>, prompt: &str)` | `iter` used at line 195 for filename; `header.iteration` used at line 201 for meta |
+| Function signature (new, FEAT-002) | `dump_prompt(dir: &Path, task_id: &str, header: &DumpHeader<'_>, prompt: &str)` | filename: `format!("{sanitized}-iter{}-{ts}.txt", header.iteration)` |
+
+Copy-pasteable access pattern after FEAT-002:
+
+```rust
+// In handle_prompt_too_long, AFTER fix C lands:
+overflow::dump_prompt(&dumps_dir, task_id, &header, &prompt_result.prompt)
+
+// In tests/overflow_filesystem.rs, AFTER fix C lands:
+overflow::dump_prompt(&dir, raw_id, &header, "prompt body here")
+
+// DumpHeader unchanged:
+let header = DumpHeader {
+    iteration: 1,                          // single source of truth
+    model: Some(model::SONNET_MODEL.to_string()),
+    effort: Some("high".to_string()),
+    ts_iso8601: "2026-05-04T12:00:00Z",
+    sections: &sections,
+    dropped_sections: &dropped,
+    total_bytes: 100,
+};
+```
+
+---
+
+## Important Rules
+
+- Work on **ONE task per iteration**
+- **Commit frequently** after each passing task
+- **Keep CI green** — never commit failing code
+- **Read before writing** — always read files first
+- **Minimal changes** — only implement what's required
+- Work on the correct branch: **feat/overflow-recovery-and-diagnostics**

@@ -221,6 +221,34 @@ pub fn escalate_model(model: Option<&str>) -> Option<String> {
     }
 }
 
+/// Escalate a sub-Opus model to the next tier below Opus's 1M ceiling.
+///
+/// This is the second rung of `PromptTooLong` recovery: once effort downgrade
+/// is exhausted (the `high` floor is preserved — effort never drops below `high`),
+/// escalate the model itself before reaching for `to_1m_model`. Mirrors
+/// `escalate_model` but stops at Opus instead of looping at it, so the caller
+/// can distinguish "moved up a tier" from "already at ceiling".
+///
+/// **High effort floor invariant**: `downgrade_effort` stops at `high`; when it
+/// returns `None` the loop calls this function instead of dropping effort further.
+/// The effort level is never lowered past `high` — model escalation is the next
+/// escape hatch, not a lower effort tier.
+///
+/// - haiku → sonnet
+/// - sonnet → opus
+/// - opus (incl. 1M variant) → None (already at ceiling)
+/// - None / unknown tier → None
+pub fn escalate_below_opus(model: Option<&str>) -> Option<&'static str> {
+    match model {
+        None => None,
+        Some(m) => match model_tier(Some(m)) {
+            ModelTier::Haiku => Some(SONNET_MODEL),
+            ModelTier::Sonnet => Some(OPUS_MODEL),
+            ModelTier::Opus | ModelTier::Default => None,
+        },
+    }
+}
+
 /// Check whether a model string is already a 1M-context variant (contains `[1m]`).
 pub fn is_1m_model(model: Option<&str>) -> bool {
     model.is_some_and(|m| m.to_lowercase().contains("[1m]"))
@@ -1136,5 +1164,46 @@ mod tests {
             ModelTier::Opus,
             "1M model should still be classified as Opus tier"
         );
+    }
+
+    // ============ escalate_below_opus tests ============
+
+    #[test]
+    fn test_escalate_below_opus_haiku_to_sonnet() {
+        assert_eq!(escalate_below_opus(Some(HAIKU_MODEL)), Some(SONNET_MODEL));
+    }
+
+    #[test]
+    fn test_escalate_below_opus_sonnet_to_opus() {
+        assert_eq!(escalate_below_opus(Some(SONNET_MODEL)), Some(OPUS_MODEL));
+    }
+
+    #[test]
+    fn test_escalate_below_opus_opus_is_ceiling() {
+        assert_eq!(
+            escalate_below_opus(Some(OPUS_MODEL)),
+            None,
+            "opus is the ceiling for this rung; further escalation handled by to_1m_model"
+        );
+    }
+
+    #[test]
+    fn test_escalate_below_opus_opus_1m_is_ceiling() {
+        assert_eq!(
+            escalate_below_opus(Some(OPUS_MODEL_1M)),
+            None,
+            "1M variant counts as Opus tier — no further escalation"
+        );
+    }
+
+    #[test]
+    fn test_escalate_below_opus_unknown_returns_none() {
+        assert_eq!(escalate_below_opus(Some("gpt-4")), None);
+        assert_eq!(escalate_below_opus(Some("")), None);
+    }
+
+    #[test]
+    fn test_escalate_below_opus_none_returns_none() {
+        assert_eq!(escalate_below_opus(None), None);
     }
 }

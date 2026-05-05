@@ -72,6 +72,60 @@ hint and skip — no hang.
 - **Permission guard**: loop iterations deny Edit/Write on `tasks/*.json` via `--disallowedTools`
 - **Never edit** `.task-mgr/tasks/*.json` directly — use the CLI and tags above
 
+## Overflow recovery and diagnostics
+
+When the Claude CLI subprocess returns "Prompt is too long", the loop engine
+walks a **four-rung recovery ladder** and writes a diagnostics bundle. Entry
+point: `overflow::handle_prompt_too_long` in `src/loop_engine/overflow.rs`,
+called from the `PromptTooLong` arm of `run_iteration` in
+`src/loop_engine/engine.rs`.
+
+**The ladder** (in order; first rung whose precondition is met wins):
+
+1. **Downgrade effort** — `model::downgrade_effort` (`xhigh → high`). Effort
+   never drops below `high` (see `escalate_below_opus` rustdoc on the high-effort
+   floor invariant).
+2. **Escalate model below Opus** — `model::escalate_below_opus`
+   (`haiku → sonnet`, `sonnet → opus`). Closes the Sonnet-default gap that
+   used to immediately block the loop on iteration 1.
+3. **Escalate to 1M-context Opus** — `model::to_1m_model` (`opus → opus[1m]`).
+4. **Block** — task status set to `blocked`; no further recovery attempts.
+
+Rungs 1-3 reset the task status to `todo` (and clear `started_at`) so the next
+iteration retries with the override applied; rung 4 sets `blocked`.
+
+**Diagnostics bundle (best-effort; failures log via `eprintln!` and never
+propagate)**:
+
+- **Prompt dump**: written to
+  `.task-mgr/overflow-dumps/<sanitized-task-id>-iter<n>-<unix-ts>.txt`. Contains
+  metadata + per-section byte breakdown + dropped sections + the raw assembled
+  prompt. Task IDs are sanitized via `overflow::sanitize_id_for_filename`
+  (path-traversal defense; `..` collapsed before allowlist filtering).
+- **JSONL event log**: appended one-line-per-event to
+  `.task-mgr/overflow-events.jsonl`. Each line is a serialized
+  `OverflowEvent` (`ts`, `task_id`, `run_id`, `iteration`, `model`, `effort`,
+  `prompt_bytes`, `sections`, `dropped_sections`, `recovery`, `dump_path`).
+  `sections` is an ordered JSON array of `[name, size]` pairs (NOT a map).
+  `recovery` is a tagged object with discriminator field `action` and
+  variant-specific siblings (e.g. `{"action": "escalate_model", "new_model": "..."}`).
+- **Rotation**: keeps newest 3 dumps per task ID via
+  `overflow::rotate_dumps_keep_n`. Each entry (unreadable dir entry, missing
+  metadata, failed deletion) is logged and skipped independently so a single
+  IO error never aborts the rest of the rotation pass.
+
+**Banner annotation**: when a task is mid-recovery, the iteration banner emits
+`(overflow recovery from <original-model>)` next to the model line. The banner
+gates on `IterationContext::overflow_recovered` (a `HashSet<String>` of task
+IDs that have hit the overflow handler at least once), NOT on `model_overrides`
+— see learning #893: crash escalation and consecutive-failure escalation must
+stay in their own channels. The original model is captured first-overflow only
+via `IterationContext::overflow_original_model.entry().or_insert_with(...)`.
+
+**Order of operations is contractual** (do not reorder):
+ctx update → DB UPDATE → stderr → dump → JSONL → rotate. Recovery state must
+be durable before any best-effort observability writes.
+
 ## Learning Creation Chokepoint
 
 All production code paths that create learnings must go through `LearningWriter` in

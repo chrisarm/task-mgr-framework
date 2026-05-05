@@ -55,6 +55,7 @@ use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
 use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
+use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::{
     self as prd_reconcile, hash_file, mark_task_done, read_prd_metadata, reconcile_passes_with_db,
     update_prd_task_passes,
@@ -206,6 +207,20 @@ pub struct IterationContext {
     /// the task can fit in the larger context window. Uses `String` values
     /// (not `&'static str`) to allow future dynamic model IDs.
     pub model_overrides: std::collections::HashMap<String, String>,
+    /// Dedicated marker set indicating which task IDs are currently in an
+    /// overflow-recovery state (i.e. recovered from a `Crash(PromptTooLong)`
+    /// at least once). The banner annotation gates on THIS set, NOT on
+    /// `model_overrides` — crash escalation and consecutive-failure escalation
+    /// also write model overrides, but only `Crash(PromptTooLong)` recovery
+    /// writes here. Keeping these channels separate prevents banner
+    /// false-positives when other escalation paths land (learning #893).
+    pub overflow_recovered: std::collections::HashSet<String>,
+    /// Per-task original model captured on the FIRST overflow, before any
+    /// recovery override is applied. Use `entry(task_id).or_insert(...)` —
+    /// never `insert(...)` — so subsequent overflows on the same task don't
+    /// overwrite the original with the post-escalation model. Read by the
+    /// banner annotation to render `(overflow recovery from <original>)`.
+    pub overflow_original_model: std::collections::HashMap<String, String>,
     /// Reorder hints emitted from parallel slots that haven't been consumed yet.
     /// Sequential mode consumes from `reorder_hint`; in wave mode we collect
     /// every `<reorder>` request a slot emits and append here so they survive
@@ -239,6 +254,8 @@ impl IterationContext {
             last_was_crash: false,
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
+            overflow_recovered: std::collections::HashSet::new(),
+            overflow_original_model: std::collections::HashMap::new(),
             pending_reorder_hints: Vec::new(),
             pending_slot_tasks: Vec::new(),
         }
@@ -1755,7 +1772,7 @@ pub fn run_iteration(
                 eprintln!("Crash escalation: {} → {}", old, escalated);
                 Some(escalated)
             }
-            None => prompt_result.resolved_model,
+            None => prompt_result.resolved_model.clone(),
         };
         // Apply per-task 1M model override from prior PromptTooLong recovery
         if let Some(override_model) = ctx.model_overrides.get(&task_id) {
@@ -1785,13 +1802,18 @@ pub fn run_iteration(
     }
 
     // Step 5: Print iteration header (with post-escalation effective_model + effort)
-    display::print_iteration_header(
-        params.iteration,
-        params.max_iterations,
-        &task_id,
-        params.elapsed_secs,
-        effective_model.as_deref(),
-        effort,
+    eprintln!(
+        "{}",
+        display::format_iteration_banner_with_recovery(
+            params.iteration,
+            params.max_iterations,
+            &task_id,
+            params.elapsed_secs,
+            effective_model.as_deref(),
+            effort,
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+        )
     );
 
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor.
@@ -2036,80 +2058,39 @@ pub fn run_iteration(
         eprintln!("Warning: failed to record iteration feedback: {}", e);
     }
 
-    // Step 8.5: Handle PromptTooLong — downgrade next-attempt effort and reset task.
-    // The Claude CLI exceeded the model context window; crash-tracker backoff still
-    // runs via update_trackers below, but we pre-seed a lower effort for the retry
-    // and reset the task so the next iteration picks it up fresh rather than leaving
-    // it wedged in_progress.
+    // Step 8.5: Handle PromptTooLong — walk the four-state recovery ladder
+    // and emit the diagnostics bundle (prompt dump + JSONL + rotation).
+    //
+    // The four rungs (first matching precondition wins, see
+    // `overflow::handle_prompt_too_long`):
+    //   1. `downgrade_effort`   — effort floor preserved at `high`.
+    //   2. `escalate_below_opus` — `haiku → sonnet`, `sonnet → opus`.
+    //   3. `to_1m_model`        — `opus → opus[1m]`.
+    //   4. blocked              — no recovery left.
+    //
+    // Each rung emits a distinct stderr message that names the current task,
+    // current effort/model, and the chosen action. The Blocked phrasing makes
+    // it explicit that we are at `Opus[1M]` with `effort=high`, so users do
+    // not chase a phantom "1M not tried" config. The crash-tracker backoff
+    // still runs via update_trackers below; rungs 1-3 reset the task row to
+    // `todo` (clearing `started_at`) so the next iteration retries with the
+    // override applied, while rung 4 sets `blocked` so it doesn't consume
+    // budget.
     if matches!(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) {
-        let has_recovery = match model::downgrade_effort(effort) {
-            Some(next) => {
-                eprintln!(
-                    "Prompt is too long for {} at effort {} — downgrading to {} and resetting task",
-                    task_id,
-                    effort.unwrap_or("(default)"),
-                    next,
-                );
-                ctx.effort_overrides.insert(task_id.clone(), next);
-                true
-            }
-            None => {
-                // Effort floor reached — try escalating to the 1M context model
-                match model::to_1m_model(effective_model.as_deref()) {
-                    Some(m1m) => {
-                        eprintln!(
-                            "Prompt is too long for {} at effort {} — effort floor reached, escalating to 1M context model ({}) and resetting task",
-                            task_id,
-                            effort.unwrap_or("(default)"),
-                            m1m,
-                        );
-                        ctx.model_overrides.insert(task_id.clone(), m1m.to_string());
-                        true
-                    }
-                    None => false,
-                }
-            }
-        };
-
-        if has_recovery {
-            // Reset to todo so the next iteration retries with the downgraded
-            // effort or escalated model.
-            match params.conn.execute(
-                "UPDATE tasks SET status = 'todo', started_at = NULL \
-                 WHERE id = ? AND status = 'in_progress'",
-                [&task_id],
-            ) {
-                Ok(1) => eprintln!("Reset task {} to todo after prompt overflow", task_id),
-                Ok(_) => {}
-                Err(e) => eprintln!(
-                    "Warning: failed to reset task {} after prompt overflow: {}",
-                    task_id, e,
-                ),
-            }
-        } else {
-            // All recovery options exhausted — block the task so it doesn't
-            // consume crash-tracker budget and abort the entire loop.
-            eprintln!(
-                "Prompt is too long for {} at effort {} — all recovery exhausted (effort floor + 1M model); blocking task",
-                task_id,
-                effort.unwrap_or("(default)"),
-            );
-            match params.conn.execute(
-                "UPDATE tasks SET status = 'blocked' \
-                 WHERE id = ? AND status = 'in_progress'",
-                [&task_id],
-            ) {
-                Ok(1) => eprintln!("Blocked task {} — prompt overflow unrecoverable", task_id),
-                Ok(_) => {}
-                Err(e) => eprintln!(
-                    "Warning: failed to block task {} after prompt overflow: {}",
-                    task_id, e,
-                ),
-            }
-        }
+        let _ = overflow::handle_prompt_too_long(
+            ctx,
+            params.conn,
+            &task_id,
+            effort,
+            effective_model.as_deref(),
+            &prompt_result,
+            params.iteration,
+            Some(params.run_id),
+            params.db_dir,
+        );
     }
 
     // Step 9: Update trackers based on outcome

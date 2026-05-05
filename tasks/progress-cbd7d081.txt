@@ -1,0 +1,135 @@
+# PRD: Prompt-Overflow Recovery Escalation + Diagnostics — progress log
+
+## [2026-05-04 18:00] - cbd7d081-ANALYSIS-001
+Approach: grep-verified the PRD Section 6 Consumer Impact Table against current main.
+Files: (read-only verification)
+Findings:
+- ctx.model_overrides readers in src/loop_engine/engine.rs:
+  - Definition: 208 (HashMap<String, String>); init: 241
+  - Reader: 1761 (effective_model derivation) — MATCHES PRD
+  - Writer: 2069 (PromptTooLong arm, Opus→Opus[1M] rung) — MATCHES PRD
+  - No other readers/writers in src/. No callers outside engine.rs.
+- ctx.effort_overrides readers in src/loop_engine/engine.rs:
+  - Definition: 203 (HashMap<String, &'static str>); init: 240
+  - Reader: 1778 (cluster_effort override) — MATCHES PRD
+  - Writer: 2056 (PromptTooLong arm, downgrade rung) — MATCHES PRD
+  - No other readers/writers in src/.
+- effective_model usages confirmed at 1745 (compute), 1793 (banner), 1811 (spawn_claude),
+  2061 (PromptTooLong to_1m_model lookup), 2154 (IterationResult). Plus IterationResult
+  field at 170 and many None-initializers on early-exit paths. All uses align with PRD.
+- Banner construction at engine.rs:1788-1795 (call to display::print_iteration_header
+  with effective_model.as_deref() at 1793) — MATCHES PRD's "~1793" expectation.
+- Crash escalation channels:
+  - check_crash_escalation defined at 4225, called at 1747 (transient per-iteration).
+  - escalate_task_model_if_needed defined at 4276, called at 4385 (DB-level consecutive
+    failures). Module-level doc at 4246 explicitly documents the two paths.
+  - Neither writes to ctx.model_overrides — confirmed via grep (only writer is line 2069).
+  - Confirms learning #893 invariant: crash escalation is separate from PromptTooLong
+    retry escalation. Banner gating must use a NEW dedicated set (overflow_recovered),
+    not infer from model_overrides (which check_crash_escalation legitimately doesn't
+    populate, and which crash escalation could also populate in the future).
+- Drift from PRD Consumer Impact Table: NONE. Line numbers match (1761, 1778, ~1793,
+  2044-2113). No new readers/writers added since 2026-05-04 PRD draft.
+Conclusion: PRD Section 6 Consumer Impact Table is accurate. FEAT-005 is safe to
+implement against the documented seams; no consumer-analysis refresh needed for
+downstream tasks.
+Learnings:
+- ctx.model_overrides has exactly one reader (1761) and one writer (2069) — narrow seam.
+- Crash escalation paths are DB/return-value based, never touching ctx maps; the
+  overflow_recovered HashSet for banner gating must remain its own channel.
+---
+## [2026-05-04 14:45] - cbd7d081-TEST-INIT-001
+Approach: Added escalate_below_opus helper plus six tier-by-tier tests, mirroring style of to_1m_model/downgrade_effort.
+Files: src/loop_engine/model.rs
+Learnings:
+- Followed #851: signature mirrors to_1m_model — `Option<&str> → Option<&'static str>`, no allocations.
+- Opus and Opus[1M] both classified Opus-tier via existing model_tier substring match, so a single `Opus | Default => None` arm covers AC3+AC4.
+- Tests use HAIKU_MODEL/SONNET_MODEL/OPUS_MODEL/OPUS_MODEL_1M constants — no literals (no_hardcoded_models.rs safe).
+---
+## [2026-05-04 22:00] - cbd7d081-TEST-INIT-004
+Approach: Wrote the integration test scaffold AND added the minimum scaffolding to make it executable: handle_prompt_too_long in overflow.rs (the linear pipeline per PRD §7), section_sizes on PromptResult, overflow_recovered+overflow_original_model on IterationContext. Engine.rs PromptTooLong arm UNCHANGED — FEAT-005 will rewire it. Helper marked #[allow(dead_code)] until then.
+Files: tests/overflow_recovery.rs, src/loop_engine/overflow.rs, src/loop_engine/engine.rs, src/loop_engine/prompt.rs
+Learnings:
+- Integration tests can only see `pub` items, not `pub(crate)` — PRD §7 said `pub(crate)` for handle_prompt_too_long but I had to relax to `pub` to be callable from tests/overflow_recovery.rs.
+- The helper's UPDATE uses WHERE status='in_progress' so multi-iteration tests must re-claim (UPDATE → in_progress) between calls; mirrors what the production task selector does.
+- Rotation test sleeps 1100ms between iterations so mtime resolution (1s on common ext4) can distinguish "newest 3" reliably — without the sleep, rotation can keep arbitrary 3-of-5.
+## [2026-05-04 22:00] - cbd7d081-TEST-INIT-005
+Approach: Added overflow_recovered/overflow_original_model fields to IterationContext + format_iteration_banner_with_recovery in display.rs, then 4 tests (positive, BLOCKER-1 negative, no-op, defensive missing-original).
+Files: src/loop_engine/engine.rs, src/loop_engine/display.rs
+Learnings:
+- BLOCKER-1 negative test asserts !contains("overflow recovery") when only model_overrides has the task — locks in learning #893's separation invariant for any future model_overrides writers.
+- `#[allow(clippy::too_many_arguments)]` on the 8-arg banner fn — signature is fixed by FEAT-006 AC1, no_args reduction would conflict with the contract.
+- No-op test asserts byte-equality with format_iteration_header output — guarantees zero behavioral drift in the common (non-recovery) path.
+---
+## [2026-05-04 22:30] - cbd7d081-FEAT-005
+Approach: Wired overflow::handle_prompt_too_long into engine.rs PromptTooLong arm (replaces ~75 lines of inline rung 1+3 logic with a 12-line call), restored overflow_recovered/overflow_original_model fields lost in the c51ce51 slot merge, removed dead_code allowance.
+Files: src/loop_engine/engine.rs, src/loop_engine/overflow.rs, tests/overflow_recovery.rs
+Learnings:
+- FEAT-004's "Add fields" merge actually removed the IterationContext fields it claimed to add (slot merge collision with TEST-INIT-005 duplicate inits) — restored via the original TEST-INIT-005 placement after model_overrides.
+- Cloned prompt_result.resolved_model in the None arm of the crash-escalation match so prompt_result remains available to pass into handle_prompt_too_long later in the function (was partial-moved before).
+- params.run_id is &str at the call site (not Option<&str>); wrapped as Some(params.run_id) per the helper's signature so JSONL records the loop's run_id.
+---
+
+## [2026-05-04 21:00] - cbd7d081-CODE-REVIEW-1
+Approach: Reviewed FEAT-001..006 against all 10 acceptance criteria; every check passed so no CODE-FIX/WIRE-FIX tasks were spawned.
+Files: src/loop_engine/overflow.rs, src/loop_engine/engine.rs, src/loop_engine/display.rs, src/loop_engine/prompt.rs, src/loop_engine/mod.rs (read-only review).
+Learnings:
+- All `unwrap()`/`expect()` in overflow.rs are inside `#[cfg(test)]`; production paths use `let _ =`, `match Err(e) => eprintln!`, and `if let Err(e) =>` so filesystem failures are warning-only.
+- Order in handle_prompt_too_long matches the contract: ctx (rung pick + overflow_recovered/original) → DB UPDATE → stderr → dump → JSONL → rotate.
+- Banner formatter gates on `overflow_recovered.contains(task_id)` (display.rs:211), not `model_overrides` — guards against false positives from crash-escalation paths (#893).
+- Rung 2 (escalate_below_opus) at overflow.rs:277-282 inserts only into `model_overrides`; effort_overrides untouched, preserving the high-effort floor.
+- Quality gate clean: cargo check, clippy -D warnings, and full workspace `cargo test loop_engine` (1523 pass) all green.
+---
+
+## [2026-05-04 23:00] - cbd7d081-MILESTONE-1
+Approach: Ran the full milestone gate; trunk was already green so no inline fixes or FIX-xxx spawns needed.
+Files: (none — verification only)
+Learnings:
+- cargo fmt --check, cargo check, and cargo clippy -- -D warnings all clean with zero output.
+- Full unscoped suite: 25 test result lines, all "ok" — 3208 unit + 257 integration (0 failed across the 25 binaries).
+- cargo run --bin gen-docs -- --check clean — model.rs additions in FEAT-002 didn't introduce drift in .claude/commands/tasks.md.
+---
+
+## [2026-05-04 16:00] - MILESTONE-2
+Approach: Full quality gate after test phase. cargo fmt/check/clippy/test all clean; 3488 tests passing across 26 binaries.
+Files: (none — verification only)
+Learnings:
+- overflow_filesystem.rs adds 7 tests; overflow_recovery.rs has 16 tests; both pass
+- No IMPL-FIX tasks spawned by TEST-001/002 — implementation was already correct
+- Test count strictly increased vs MILESTONE-1 (TEST-001 added new binary, TEST-002 expanded existing)
+---
+
+## [2026-05-04 23:30] - cbd7d081-INT-001
+Approach: Read each module boundary directly (no inferred connections); verified call sites for detect → dispatch → helper → fs.
+Files: (none — verification only)
+Trace:
+- DETECT: detection.rs:75 (analyze_output Step 3.5) emits IterationOutcome::Crash(CrashType::PromptTooLong) when is_prompt_too_long(output) matches. Note: prompt names "classify_crash" but actual entrypoint is analyze_output (categorize_crash handles exit-code only); routing is correct.
+- DISPATCH: engine.rs:2067-2082 matches Crash(PromptTooLong) and calls overflow::handle_prompt_too_long(ctx, conn, &task_id, effort, effective_model.as_deref(), &prompt_result, params.iteration, Some(params.run_id), params.db_dir) — signature matches Data Flow Contract.
+- HELPER: overflow.rs:259 picks rung (downgrade_effort → escalate_below_opus → to_1m_model → Blocked), mutates ctx.{effort_overrides,model_overrides,overflow_recovered,overflow_original_model} (or_insert_with → first-overflow only), runs DB UPDATE (todo with started_at=NULL on rungs 1-3, blocked on rung 4), emits one of 4 stderr messages.
+- FS: dump_prompt(base_dir/overflow-dumps, …) → append_event_log(base_dir, &event) → rotate_dumps_keep_n(dumps_dir, sanitized_task_id, 3). All wrapped in match/if let Err → eprintln; never propagates.
+- CONSUMER: engine.rs:1807 calls display::format_iteration_banner_with_recovery passing &ctx.overflow_recovered + &ctx.overflow_original_model; display.rs:211 gates suffix on overflow_recovered.contains(task_id) (NOT model_overrides) — learning #893 honored.
+- DATA CONTRACTS: section_sizes is Vec<(&'static str, usize)> in PromptResult (prompt.rs:90), iterated in order for DumpHeader (overflow.rs:355 borrows as_slice), cloned to Vec<(String,usize)> for OverflowEvent serialization (lines 386-390). Order preserved end-to-end. OverflowEvent.run_id ← Some(params.run_id), .iteration ← params.iteration — real loop state.
+- MODULE WIRING: mod.rs:24 declares `pub mod overflow;` ✓
+Result: Clean trace. No wiring gap; no WIRE-FIX task spawned.
+---
+
+## [2026-05-04 12:00] - REFACTOR-REVIEW-FINAL
+Approach: Full-context pass over model.rs / overflow.rs / engine.rs / display.rs / prompt.rs. Spawned 2 REFACTOR-N tasks for actionable findings.
+Files: src/loop_engine/{model.rs,overflow.rs,engine.rs,display.rs,prompt.rs}
+Findings:
+- handle_prompt_too_long is 148 lines vs ~80-line target (learning #1370). 30-line stderr match repeats (task_id, effort, model) tuple verbatim across 4 arms → REFACTOR-N-001 (priority 75): lift into RecoveryAction::user_message().
+- DumpHeader.task_id is set but never read. dump_prompt uses the function-arg task_id (sanitized); format_breakdown ignores it. Dead field → REFACTOR-N-002 (priority 78).
+Pattern adherence: escalate_below_opus mirrors to_1m_model exactly (`Option<&str> → Option<&'static str>`, match expr, no allocations) — learning #851 satisfied.
+DRY check: format_breakdown is the only prompt-size diagnostic in the codebase; sanitize_id_for_filename and worktree::sanitize_branch_name diverge (allowed by review criteria) since the former additionally collapses `..` for traversal defense.
+Wiring: parallel-slot path (run_slot_iteration) deliberately skips overflow recovery (engine.rs:88 comment), so format_iteration_header continues to be the right choice there — not a missed wiring.
+Learnings: Spawn at priority 71-85 against MILESTONE-FINAL (per criteria #5); both tasks land in the dependency chain ahead of VERIFY-001.
+---
+
+## [2026-05-04 12:00] - cbd7d081-VERIFY-001
+Approach: Final validation gate — verified all acceptance criteria pass; added missing CLAUDE.md "Overflow recovery and diagnostics" section and strengthened engine.rs rustdoc to call out the four-state recovery ladder + corrected message phrasings.
+Files: CLAUDE.md, src/loop_engine/engine.rs
+Learnings:
+- Reachability check via grep showed escalate_below_opus / OverflowEvent / handle_prompt_too_long / format_iteration_banner_with_recovery / sanitize_id_for_filename all wired into production call sites.
+- All overflow.rs `.unwrap()` calls live under `#[cfg(test)]`; production paths log via eprintln!.
+- Full quality gate green: fmt, check, clippy -D warnings, cargo test (3208 + 7 + 4 + 4 + ... all 0 failed), gen-docs --check.
+---

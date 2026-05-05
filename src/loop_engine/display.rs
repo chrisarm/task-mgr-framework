@@ -184,6 +184,51 @@ pub fn format_iteration_header(
     )
 }
 
+/// Format an iteration banner with optional overflow-recovery annotation.
+///
+/// Identical to [`format_iteration_header`] except the `Model:` field is
+/// suffixed with ` (overflow recovery from <original>)` when `task_id` is
+/// present in `overflow_recovered`. Gates on the dedicated `overflow_recovered`
+/// set rather than `model_overrides` so crash-escalation and consecutive-
+/// failure escalation paths (which also write `model_overrides`) cannot trip
+/// the annotation (learning #893).
+///
+/// If `overflow_recovered` flags the task but `overflow_original_model` lacks
+/// an entry (defensive — the recovery handler always inserts both together),
+/// falls back to ` (overflow recovery)` without the `from X` suffix.
+#[allow(clippy::too_many_arguments)]
+pub fn format_iteration_banner_with_recovery(
+    iteration: u32,
+    max_iterations: u32,
+    task_id: &str,
+    elapsed_secs: u64,
+    model: Option<&str>,
+    effort: Option<&str>,
+    overflow_recovered: &std::collections::HashSet<String>,
+    overflow_original_model: &std::collections::HashMap<String, String>,
+) -> String {
+    let model_display = model.unwrap_or("(default)");
+    let recovery_suffix = if overflow_recovered.contains(task_id) {
+        match overflow_original_model.get(task_id) {
+            Some(orig) => format!(" (overflow recovery from {})", orig),
+            None => " (overflow recovery)".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    let effort_display = effort.unwrap_or("(default)");
+    format!(
+        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {}{} ═══ Effort: {} ═══ Elapsed: {} ═══",
+        iteration,
+        max_iterations,
+        task_id,
+        model_display,
+        recovery_suffix,
+        effort_display,
+        format_duration(elapsed_secs)
+    )
+}
+
 /// Print an iteration header to stderr.
 pub fn print_iteration_header(
     iteration: u32,
@@ -498,6 +543,137 @@ mod tests {
         assert!(
             banner.contains("tasks.db"),
             "Banner must display the DB path hint, got:\n{}",
+            banner
+        );
+    }
+
+    // --- TEST-INIT-005: banner annotation gating on overflow_recovered ---
+
+    use crate::loop_engine::engine::IterationContext;
+    use crate::loop_engine::model::OPUS_MODEL;
+
+    /// Positive: overflow_recovered marks the task AND original is recorded →
+    /// banner Model field gets the "(overflow recovery from <orig>)" suffix.
+    #[test]
+    fn test_banner_annotated_when_overflow_recovered_with_original() {
+        let mut ctx = IterationContext::new(3);
+        let task_id = "FEAT-042".to_string();
+        ctx.overflow_recovered.insert(task_id.clone());
+        ctx.overflow_original_model
+            .insert(task_id.clone(), SONNET_MODEL.to_string());
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            &task_id,
+            30,
+            Some(OPUS_MODEL),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+        );
+
+        assert!(
+            banner.contains(&format!("(overflow recovery from {})", SONNET_MODEL)),
+            "Banner must include 'overflow recovery from <orig>' suffix; got:\n{}",
+            banner
+        );
+        assert!(
+            banner.contains(&format!("Model: {}", OPUS_MODEL)),
+            "Banner must still show current (post-escalation) model; got:\n{}",
+            banner
+        );
+    }
+
+    /// Negative (BLOCKER-1): model_overrides has the task but
+    /// overflow_recovered does NOT — banner MUST NOT carry the recovery
+    /// annotation. This guards against future writers to model_overrides
+    /// (e.g. crash escalation) tripping the banner.
+    #[test]
+    fn test_banner_not_annotated_when_only_model_overrides_set() {
+        let mut ctx = IterationContext::new(3);
+        let task_id = "FEAT-042".to_string();
+        ctx.model_overrides
+            .insert(task_id.clone(), OPUS_MODEL.to_string());
+        // Intentionally NOT inserting into overflow_recovered.
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            &task_id,
+            30,
+            Some(OPUS_MODEL),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+        );
+
+        assert!(
+            !banner.contains("overflow recovery"),
+            "Banner must NOT show overflow recovery when only model_overrides is set; got:\n{}",
+            banner
+        );
+    }
+
+    /// No-op: neither field set → banner matches existing format unchanged.
+    #[test]
+    fn test_banner_unchanged_when_no_overflow_state() {
+        let ctx = IterationContext::new(3);
+        let task_id = "FEAT-042";
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            task_id,
+            30,
+            Some(OPUS_MODEL),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+        );
+        let baseline = format_iteration_header(1, 10, task_id, 30, Some(OPUS_MODEL), Some("high"));
+
+        assert_eq!(
+            banner, baseline,
+            "Banner with no overflow state must equal the existing format_iteration_header output"
+        );
+        assert!(!banner.contains("overflow recovery"));
+    }
+
+    /// Defensive: overflow_recovered marks the task but overflow_original_model
+    /// has no entry. The annotation should appear without "from X" — and
+    /// crucially must not contain the literal "None".
+    #[test]
+    fn test_banner_falls_back_when_original_model_missing() {
+        let mut ctx = IterationContext::new(3);
+        let task_id = "FEAT-042".to_string();
+        ctx.overflow_recovered.insert(task_id.clone());
+        // overflow_original_model intentionally empty.
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            &task_id,
+            30,
+            Some(OPUS_MODEL),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+        );
+
+        assert!(
+            banner.contains("(overflow recovery)"),
+            "Defensive fallback annotation must appear; got:\n{}",
+            banner
+        );
+        assert!(
+            !banner.contains("from"),
+            "Fallback must omit the 'from <orig>' clause; got:\n{}",
+            banner
+        );
+        assert!(
+            !banner.contains("None"),
+            "Banner must never leak literal 'None' into user output; got:\n{}",
             banner
         );
     }

@@ -21,6 +21,7 @@ pub mod model;
 pub mod monitor;
 pub mod oauth;
 pub mod output_parsing;
+pub mod overflow;
 pub mod prd_reconcile;
 pub mod progress;
 pub mod project_config;

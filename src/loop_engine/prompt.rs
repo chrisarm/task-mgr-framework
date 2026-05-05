@@ -79,6 +79,15 @@ pub struct PromptResult {
     /// cluster so (Opus, `xhigh`) is chosen when a cluster contains a `high`-difficulty
     /// partner, even if the primary is only `medium`.
     pub cluster_effort: Option<&'static str>,
+    /// Per-section byte counts for the assembled prompt, in assembly order.
+    ///
+    /// Used by overflow diagnostics to attribute prompt size to specific
+    /// sections (task / learnings / source-context / etc.) without re-parsing
+    /// the prompt string. Empty when the prompt builder has not populated it
+    /// (e.g. legacy paths and tests that construct `PromptResult` literals).
+    /// Order is preserved: the dump header iterates the slice as-is and the
+    /// JSONL event log serializes it as a JSON array of `[name, size]` pairs.
+    pub section_sizes: Vec<(&'static str, usize)>,
 }
 
 /// Parameters for building a prompt.
@@ -364,22 +373,39 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // Display order: steering → guidance → hint → tools → source → deps → synergy →
     //                task → learnings → completion → escalation → reorder instr → base prompt
     let mut prompt = String::with_capacity(TOTAL_PROMPT_BUDGET);
+    let mut section_sizes: Vec<(&'static str, usize)> = Vec::new();
     prompt.push_str(&steering_section);
+    section_sizes.push(("steering", steering_section.len()));
     prompt.push_str(&guidance_section);
+    section_sizes.push(("session_guidance", guidance_section.len()));
     prompt.push_str(&hint_section);
+    section_sizes.push(("reorder_hint", hint_section.len()));
     prompt.push_str(&tool_awareness_section);
+    section_sizes.push(("tool_awareness", tool_awareness_section.len()));
     prompt.push_str(&source_section);
+    section_sizes.push(("source", source_section.len()));
     prompt.push_str(&dep_section);
+    section_sizes.push(("dependencies", dep_section.len()));
     prompt.push_str(&synergy_section);
+    section_sizes.push(("synergy", synergy_section.len()));
     prompt.push_str(&sibling_section);
+    section_sizes.push(("siblings", sibling_section.len()));
     prompt.push_str(&task_section);
+    section_sizes.push(("task", task_section.len()));
     prompt.push_str(&task_ops);
+    section_sizes.push(("task_ops", task_ops.len()));
     prompt.push_str(&learnings_section);
+    section_sizes.push(("learnings", learnings_section.len()));
     prompt.push_str(&completion_section);
+    section_sizes.push(("completion", completion_section.len()));
     prompt.push_str(&escalation_section);
+    section_sizes.push(("escalation", escalation_section.len()));
     prompt.push_str(&reorder_instr_section);
+    section_sizes.push(("reorder_instr", reorder_instr_section.len()));
     prompt.push_str(&key_decision_section);
+    section_sizes.push(("key_decision", key_decision_section.len()));
     prompt.push_str(&base_prompt_section);
+    section_sizes.push(("base_prompt", base_prompt_section.len()));
 
     Ok(Some(PromptResult {
         prompt,
@@ -390,6 +416,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         dropped_sections,
         task_difficulty: task_output.difficulty.clone(),
         cluster_effort,
+        section_sizes,
     }))
 }
 
@@ -848,6 +875,7 @@ mod tests {
             dropped_sections: vec![],
             task_difficulty: None,
             cluster_effort: None,
+            section_sizes: Vec::new(),
         };
 
         assert_eq!(result.task_id, "FEAT-001");
@@ -3289,6 +3317,89 @@ pub enum ApiError {
                 "task_ops (pos={}) must be positioned ABOVE learnings (pos={})",
                 task_ops_pos,
                 learnings_pos
+            );
+        }
+    }
+
+    // ===== FEAT-003: section_sizes sanity-check test =====
+
+    #[test]
+    fn test_section_sizes_populated_and_within_budget() {
+        let (temp_dir, conn) = setup_test_db();
+
+        insert_test_learning(&conn, "A relevant learning about task management");
+        insert_task_full(
+            &conn,
+            "SIZE-001",
+            "Test section sizes",
+            "todo",
+            10,
+            "Verify section_sizes is populated",
+            &["section_sizes is non-empty", "sum <= TOTAL_PROMPT_BUDGET"],
+        );
+        insert_task_file(&conn, "SIZE-001", "src/lib.rs");
+        create_source_file(temp_dir.path(), "src/lib.rs", "pub fn lib_fn() {}\n");
+
+        let base_prompt_path = create_base_prompt(temp_dir.path());
+        let steering_path = create_steering(temp_dir.path(), "Be thorough.");
+        let params = BuildPromptParams {
+            dir: temp_dir.path(),
+            project_root: temp_dir.path(),
+            conn: &conn,
+            after_files: &[],
+            run_id: None,
+            iteration: 1,
+            reorder_hint: Some("OTHER-001"),
+            session_guidance: "Focus on correctness",
+            base_prompt_path: &base_prompt_path,
+            steering_path: Some(&steering_path),
+            verbose: false,
+            default_model: None,
+            project_default_model: None,
+            user_default_model: None,
+            task_prefix: None,
+            batch_sibling_prds: &[],
+            permission_mode: &DEFAULT_PERM,
+        };
+
+        let result = build_prompt(&params)
+            .unwrap()
+            .expect("Should return a prompt");
+
+        // Must be populated — at minimum the critical sections
+        assert!(
+            !result.section_sizes.is_empty(),
+            "section_sizes must be populated by build_prompt"
+        );
+
+        // Sum of sizes must not exceed the total budget
+        let total: usize = result.section_sizes.iter().map(|(_, n)| n).sum();
+        assert!(
+            total <= 80_000,
+            "section_sizes sum ({total}) must be <= TOTAL_PROMPT_BUDGET (80_000)"
+        );
+
+        // Sum must equal the actual prompt length (each byte accounted for)
+        assert_eq!(
+            total,
+            result.prompt.len(),
+            "section_sizes sum must equal prompt.len()"
+        );
+
+        // All expected named sections must appear at least once
+        let names: Vec<&str> = result.section_sizes.iter().map(|(n, _)| *n).collect();
+        for expected in &[
+            "task",
+            "task_ops",
+            "completion",
+            "escalation",
+            "reorder_instr",
+            "base_prompt",
+        ] {
+            assert!(
+                names.contains(expected),
+                "section_sizes must contain '{}' entry",
+                expected
             );
         }
     }

@@ -1,0 +1,957 @@
+{
+  "branchName": "feat/overflow-recovery-and-diagnostics",
+  "description": "Add a third recovery rung (Sonnet→Opus before Opus→Opus[1M]) to the loop engine's PromptTooLong handler, plus diagnostics: per-section byte breakdown in PromptResult, prompt dumps to .task-mgr/overflow-dumps/, structured JSONL event log at .task-mgr/overflow-events.jsonl, banner annotation when a task is mid-recovery, and corrected stderr messages.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass (per-iteration); full `cargo test` passes at milestones",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs (PromptResult and IterationContext extensions are additive only)",
+      "Filesystem failures (disk full, permission errors) in the overflow module log warnings via eprintln! and do NOT propagate — observability is best-effort, recovery is not",
+      "Order of operations in PromptTooLong arm: ctx update → DB UPDATE → stderr → dump (best-effort) → JSONL (best-effort) → rotate (best-effort)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at milestones — milestones must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Banner annotation inferred from model_overrides (must use overflow_recovered HashSet — see learning #893)",
+    "Unsanitized task_id flowing into dump filenames (path traversal risk)",
+    "DB UPDATE that runs AFTER dump/JSONL writes (recovery state must be durable before observability)",
+    ".unwrap() on filesystem operations in the overflow module (warnings via eprintln!, never propagate)",
+    "Effort downgrade below 'high' (the ladder floor; preserves the model.rs:42-48 invariant)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "cbd7d081",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "All current readers of ctx.model_overrides re-confirmed via grep (engine.rs:1761 expected)",
+        "All current readers of ctx.effort_overrides re-confirmed via grep (engine.rs:1778 expected)",
+        "All current readers of effective_model re-confirmed via grep",
+        "Banner construction site re-confirmed (engine.rs ~1793) and any other call sites listed",
+        "Crash escalation channels (check_crash_escalation, escalate_task_model_if_needed) re-confirmed as separate from model_overrides",
+        "Any drift from the PRD's Consumer Impact Table documented in the progress file"
+      ],
+      "dependsOn": [],
+      "description": "The PRD's Section 6 already contains a Consumer Impact Table for the PromptTooLong recovery branch (engine.rs:2044-2113). This task verifies the table is still accurate against current main and surfaces any new consumers added since the PRD was drafted on 2026-05-04. Document findings in the progress file under ANALYSIS-001.",
+      "estimatedEffort": "low",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD section 6 \"Consumers of Changed Behavior\" and \"Semantic Distinctions\". Learning #893 (separate crash escalation from retry escalation) is the design invariant this task validates.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Grep with literal terms (model_overrides, effort_overrides, effective_model) — do not skim by visual inspection",
+        "Document file:line references in the progress file so downstream FEAT tasks can verify against the same anchors",
+        "Note any crash-escalation paths that have started writing to model_overrides (would invalidate the dedicated overflow_recovered marker design)"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Refresh Consumer Impact analysis for the PromptTooLong branch",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: escalate_below_opus(Some(\"claude-haiku-4-5-20251001\")) returns Some(SONNET_MODEL)",
+        "Test: escalate_below_opus(Some(\"claude-sonnet-4-6\")) returns Some(OPUS_MODEL)",
+        "Test: escalate_below_opus(Some(\"claude-opus-4-7\")) returns None (already at ceiling)",
+        "Test: escalate_below_opus(Some(\"claude-opus-4-7[1m]\")) returns None (1M variant counts as Opus, no further escalation)",
+        "Test: escalate_below_opus(Some(\"gpt-4\")) returns None (unknown tier)",
+        "Test: escalate_below_opus(None) returns None",
+        "Tests use OPUS_MODEL / SONNET_MODEL / HAIKU_MODEL constants from model.rs, never literal strings (regression test no_hardcoded_models.rs would catch literals)",
+        "Known-bad discriminator: a stub returning OPUS_MODEL unconditionally must fail at least the Opus and unknown-tier cases"
+      ],
+      "dependsOn": [],
+      "description": "TDD tests for the new model.rs::escalate_below_opus(model) helper. Tests must be specific enough to reject a naive stub that returns Some(OPUS_MODEL) for everything.",
+      "edgeCases": [
+        "Empty string input (Some(\"\")) — expected: None (model_tier returns Default for empty)",
+        "Whitespace-only input (Some(\"  \")) — expected: None",
+        "Case variants (Some(\"SONNET\"), Some(\"sOnNeT\")) — expected: Some(OPUS_MODEL) (model_tier is case-insensitive substring)",
+        "1M Opus variant (Some(\"claude-opus-4-7[1m]\")) — expected: None"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "model_tier substring matching false-positives (e.g., \"opusoidal\" model name)",
+          "expectedBehavior": "Returns None per current model_tier logic; this test does not need to fix model_tier"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "Returns Option<&'static str> matching the style of downgrade_effort and to_1m_model",
+        "Never returns Haiku (the function only escalates UP)",
+        "Never panics or unwraps"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD FR-001. Existing tests for downgrade_effort (model.rs:941+) and to_1m_model (model.rs:1097+) are the style template. Six explicit test functions, one per tier input.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Each test names a single tier transition; do not bundle multiple tier inputs into one test (clear failure attribution)",
+        "Match the existing test naming pattern (test_<function>_<case>) seen in model.rs:947+",
+        "Use #[test] attributes; do not use #[ignore] — tests should pass once FEAT-001 lands"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for escalate_below_opus helper",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: sanitize_id_for_filename(\"FOO-BAR_baz.42\") returns \"FOO-BAR_baz.42\" (allowlist passthrough)",
+        "Test: sanitize_id_for_filename(\"FOO/BAR..baz\") returns \"FOO-BAR--baz\" (slashes and double-dots replaced)",
+        "Test: sanitize_id_for_filename(\"\") returns \"_\" (empty-input placeholder, never produces an empty filename component)",
+        "Test: sanitize_id_for_filename(\"../../../etc/passwd\") returns a string with NO `/` and NO `..` substring",
+        "Test: sanitize_id_for_filename(\"task with spaces\") returns \"task-with-spaces\"",
+        "Test: sanitize_id_for_filename(\"\\0null\\0byte\") returns a string with NO `\\0` byte",
+        "Known-bad discriminator: a stub returning the input unchanged must fail at least 4 of these cases"
+      ],
+      "dependsOn": [],
+      "description": "TDD tests for overflow::sanitize_id_for_filename(id) — the path-traversal defense for dump filenames.",
+      "edgeCases": [
+        "Path traversal attempt (\"../../etc/passwd\") — expected: no path components escape",
+        "Empty string — expected: \"_\" (placeholder)",
+        "Pure special chars (\"///\") — expected: \"---\" or similar; no empty result",
+        "NUL byte injection — expected: replaced",
+        "Unicode chars (\"tâsk\") — expected: replaced (allowlist is ASCII-only)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Allowlist accidentally includes `/`",
+          "expectedBehavior": "Test \"FOO/BAR..baz\" case fails"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "Output contains only [A-Za-z0-9._-] characters",
+        "Output is never empty (minimum 1 character; empty input → \"_\")",
+        "Function is total (never panics, no Result type)"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "FEAT-002 implements the function. Reference: src/loop_engine/worktree.rs:24-33 for the established sanitization pattern. Learning #1853: \"Worktree paths sanitize branch names\".",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Mirror the worktree.rs::sanitize_branch_name allowlist style (learning #1853)",
+        "Test file lives at src/loop_engine/overflow.rs in a #[cfg(test)] mod tests block",
+        "ASCII allowlist — no need to support Unicode since dump filenames are diagnostics, not user-visible"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for sanitize_id_for_filename",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: OverflowEvent serializes to a single JSON object with snake_case keys (ts, task_id, run_id, iteration, model, effort, prompt_bytes, sections, dropped_sections, recovery, dump_path)",
+        "Test: RecoveryAction::DowngradeEffort { new_effort } serializes to {\"action\": \"downgrade_effort\", \"new_effort\": \"high\"}",
+        "Test: RecoveryAction::EscalateModel { new_model } serializes to {\"action\": \"escalate_model\", \"new_model\": \"claude-opus-4-7\"}",
+        "Test: RecoveryAction::To1mModel { new_model } serializes to {\"action\": \"to_1m_model\", \"new_model\": \"claude-opus-4-7[1m]\"}",
+        "Test: RecoveryAction::Blocked serializes to {\"action\": \"blocked\"} with no extra fields",
+        "Test: round-trip — serde_json::from_str(&serde_json::to_string(&event)?) reconstructs an equal OverflowEvent",
+        "Test: sections field serializes as an array of [name, size] pairs in declaration order (NOT a map; order matters for the dump header)",
+        "Test: run_id is Option<String>; None serializes as null OR is skipped via #[serde(skip_serializing_if = \"Option::is_none\")]"
+      ],
+      "dependsOn": [],
+      "description": "TDD tests for OverflowEvent and RecoveryAction serde behavior — ensure JSONL schema is stable and snake_case.",
+      "edgeCases": [
+        "Empty sections vector — serializes as [] not null",
+        "Empty dropped_sections vector — serializes as []",
+        "run_id: None — either skipped or null, but never serializes as empty string",
+        "Effort: None — same Option handling as run_id"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Forgetting #[serde(rename_all = \"snake_case\")] on RecoveryAction enum",
+          "expectedBehavior": "Tests asserting \"action\": \"downgrade_effort\" fail; CamelCase variant names leak into JSON"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "snake_case key names across the entire event tree (RecoveryAction included)",
+        "sections preserves Vec ordering through serialization (positional [name, size] tuples)",
+        "Round-trip is lossless"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "FEAT-002 implements OverflowEvent and RecoveryAction. RecoveryAction is a tagged enum: #[serde(tag = \"action\", rename_all = \"snake_case\")]. Reference: PRD FR-004 example JSONL line.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Use serde_json::Value to assert key names rather than substring grep on the serialized string (less brittle)",
+        "Construct OverflowEvent with realistic field values from the PRD's example (ca83bc7f-TEST-001, claude-sonnet-4-6, etc.)",
+        "Test exists in the same #[cfg(test)] mod tests block as TEST-INIT-002 since both target overflow.rs"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for OverflowEvent JSON serialization",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: ladder walk — starting Sonnet+xhigh, four synthetic PromptTooLong events produce [downgrade_effort → escalate_model → to_1m_model → blocked] in order",
+        "Test: explicit-Opus skip — task with model='claude-opus-4-7' set in DB hits to_1m_model on first overflow (escalate_below_opus returns None)",
+        "Test: filename sanitization — task_id 'FOO/BAR..baz' produces a dump at .task-mgr/overflow-dumps/FOO-BAR--baz-iter1-*.txt with no path traversal",
+        "Test: dump content — each dump file exists, header includes total bytes + section breakdown + auto-load NOTE, body is the assembled prompt verbatim",
+        "Test: JSONL append — each iteration appends one parseable line to .task-mgr/overflow-events.jsonl with recovery.action matching the rung",
+        "Test: rotation — after ≥4 overflows on one task, .task-mgr/overflow-dumps/ contains exactly 3 files for that task (newest by mtime)",
+        "Test: overflow_recovered — after iter 1, ctx.overflow_recovered.contains(&task_id) is true",
+        "Test: overflow_original_model — captured on first overflow only; banner annotation across iters 2/3/4 still says 'from claude-sonnet-4-6'",
+        "Test: rung 4 (blocked) writes BOTH dump and JSONL with recovery.action='blocked'",
+        "Tests use isolated tempdir for .task-mgr/ — no pollution of the real project state",
+        "Tests use real CrashType::PromptTooLong / IterationContext / OverflowEvent types from the production crate (no synthetic key-typed maps)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffold for tests/overflow_recovery.rs. Tests use direct outcome injection: a synthetic IterationOutcome::Crash(CrashType::PromptTooLong) feeds the recovery helper without orchestrating Claude spawn. Walks the full ladder + explicit-Opus skip + sanitization + rotation.",
+      "edgeCases": [
+        "Tempdir cleanup on test failure (use tempfile::TempDir for RAII)",
+        "Iteration counter advances correctly between synthetic overflows",
+        "Concurrent test execution doesn't share tempdir (each test gets its own)",
+        "Test runs deterministically across platforms (mtime resolution can be coarse on some FS — use sleep(10ms) between rotation events if needed)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Test pollutes real .task-mgr/ instead of tempdir",
+          "expectedBehavior": "Test must use tempfile::TempDir and pass an explicit dir parameter to overflow:: helpers; reject any test that writes to ./.task-mgr"
+        },
+        {
+          "cause": "Synthetic IterationContext built with hand-typed keys instead of using real struct",
+          "expectedBehavior": "Tests must construct via IterationContext::new() and mutate real fields; test must fail to compile if struct shape changes (catches drift)"
+        }
+      ],
+      "id": "TEST-INIT-004",
+      "invariants": [
+        "All test assertions reference real ctx fields (overflow_recovered, overflow_original_model) and real types — NEVER hand-built maps with stringly-typed keys",
+        "Production code path is exercised end-to-end (no skipping the actual fs writes via mocks)",
+        "Tests do NOT spawn Claude (direct outcome injection is the seam)"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "FEAT-005 will factor the recovery logic into a testable helper function so this test can call it directly. Per resolved Q8 (PRD section 7), the helper signature should be roughly: pub(crate) fn handle_prompt_too_long(ctx: &mut IterationContext, conn: &Connection, task_id: &str, effort: Option<&str>, effective_model: Option<&str>, prompt_result: &PromptResult, iteration: u32, run_id: Option<&str>, base_dir: &Path) -> RecoveryAction. Tests pass an isolated tempdir as base_dir.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Tests run via `cargo test --test overflow_recovery` independently of the rest of the suite",
+        "Each test has a single, named scenario — no umbrella 'test_everything' assertions",
+        "Use tempfile::TempDir for filesystem isolation (RAII cleanup even on panic)",
+        "Use the production CrashType enum from src/loop_engine/config.rs (variant: PromptTooLong)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Integration test scaffold: four-rung overflow ladder",
+      "touchesFiles": [
+        "tests/overflow_recovery.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive test: when ctx.overflow_recovered.contains(&task_id) AND ctx.overflow_original_model.get(&task_id) returns Some(\"claude-sonnet-4-6\"), the banner string includes \"(overflow recovery from claude-sonnet-4-6)\"",
+        "Negative test: when ctx.model_overrides has an entry for task_id BUT ctx.overflow_recovered does NOT, the banner string does NOT include \"overflow recovery\" (prevents false-positive from future non-overflow writers to model_overrides)",
+        "No-op test: when neither overflow_recovered nor model_overrides has the task, the banner is the existing format unchanged",
+        "Test: banner with overflow_original_model = None for task (shouldn't happen but defensive) — either omits the annotation or uses a fallback like \"overflow recovery (original model unknown)\"",
+        "Tests use the real IterationContext and the real banner-formatting function (not a re-implementation in test code)"
+      ],
+      "dependsOn": [],
+      "description": "TDD tests for the iteration banner annotation. Critically includes the negative test that prevents banner false-positives if a future code path writes to model_overrides for non-overflow reasons.",
+      "edgeCases": [
+        "Task in overflow_recovered but missing from overflow_original_model (race or programmer error) — expected: graceful fallback, no panic",
+        "Multiple tasks recovering simultaneously (overflow_recovered.len() > 1) — banner only annotates the current iteration's task",
+        "Iteration banner for a task that completed recovery and is now succeeding — annotation persists (override is for the loop's lifetime, per resolved Q4)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Banner reads model_overrides directly (incorrect implementation)",
+          "expectedBehavior": "Negative test fails: banner shows 'overflow recovery' for a model_overrides entry written by a non-overflow path"
+        }
+      ],
+      "id": "TEST-INIT-005",
+      "invariants": [
+        "Annotation never appears unless overflow_recovered.contains(&task_id) is true",
+        "Annotation source is overflow_original_model, never inferred from current model_overrides value"
+      ],
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "FEAT-006 implements both the extraction and the annotation. Reference: PRD FR-006 banner string format. Critical: the negative test is the BLOCKER-1 fix from the architect review.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Tests live in the engine.rs #[cfg(test)] mod tests block",
+        "If banner formatting is currently inline in run_iteration, FEAT-006 must extract it into a pure formatter function (e.g. format_iteration_banner_with_recovery) so the test can call it directly without orchestrating an iteration"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests for banner annotation gating",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Function signature exactly: pub fn escalate_below_opus(model: Option<&str>) -> Option<&'static str>",
+        "Implementation uses model_tier() for tier classification (case-insensitive substring)",
+        "Returns SONNET_MODEL constant for Haiku tier; OPUS_MODEL constant for Sonnet tier (no string literals)",
+        "Module-level rustdoc comment on the function explaining the 'high effort floor preserved' invariant",
+        "All TEST-INIT-001 tests pass",
+        "cargo clippy -- -D warnings on src/loop_engine/model.rs is clean",
+        "cargo run --bin gen-docs runs without error (in case the helper docs gain a generated-docs entry later)"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Implement model::escalate_below_opus(model: Option<&str>) -> Option<&'static str>. Returns Some(SONNET_MODEL) for Haiku, Some(OPUS_MODEL) for Sonnet, None for Opus / 1M / Default / None. Pure function, no I/O.",
+      "estimatedEffort": "low",
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD FR-001 and the plan's escalate_below_opus snippet. Learning #851: follow existing escalation patterns for consistency. The helper is a small, focused addition — one function, ~10 lines, no new types.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Mirror the style of downgrade_effort and to_1m_model: match expression, &'static str return, no allocations",
+        "Use SONNET_MODEL and OPUS_MODEL constants — the regression test no_hardcoded_models.rs will catch literal strings outside model.rs",
+        "Add the function near downgrade_effort and to_1m_model so all overflow-recovery primitives are co-located",
+        "Document the invariant: 'effort is NOT touched by this function; preserves the high floor for overflow recovery'"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add escalate_below_opus helper to model.rs",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "File created at src/loop_engine/overflow.rs",
+        "Module registered in src/loop_engine/mod.rs (`pub(crate) mod overflow;` or `pub mod overflow;` matching existing module visibility)",
+        "OverflowEvent struct: derives Debug, Clone, Serialize, Deserialize; #[serde(rename_all = \"snake_case\")]; fields per PRD FR-004",
+        "RecoveryAction enum: derives Debug, Clone, PartialEq, Serialize, Deserialize; #[serde(tag = \"action\", rename_all = \"snake_case\")]; variants DowngradeEffort{new_effort}, EscalateModel{new_model}, To1mModel{new_model}, Blocked",
+        "sanitize_id_for_filename(id: &str) -> String: ASCII allowlist [A-Za-z0-9._-], others replaced with '-', empty input returns \"_\"",
+        "dump_prompt(dir: &Path, task_id: &str, iter: u32, header: &DumpHeader, prompt: &str) -> io::Result<PathBuf>: creates dir if missing, writes <sanitized>-iter<N>-<unix-ts>.txt, returns the absolute path",
+        "DumpHeader struct: task_id, iteration, model: Option<String>, effort: Option<String>, ts_iso8601, total_bytes, sections: &[(&str, usize)], dropped_sections: &[String]",
+        "append_event_log(dir: &Path, event: &OverflowEvent) -> io::Result<()>: opens with OpenOptions::new().append(true).create(true), single write_all of serde_json::to_vec(&event)? + b'\\n'",
+        "rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> io::Result<()>: lists files matching <sanitized_task_id>-iter*-*.txt, sorts by mtime desc, deletes from index `keep` onward",
+        "format_breakdown(sections: &[(&str, usize)], dropped: &[String], total_bytes: usize) -> String: produces the dump header (multi-line, with the auto-load NOTE explaining Claude's CLAUDE.md/skills/agents auto-load layer)",
+        "All filesystem errors propagate as io::Result; callers (engine.rs) downgrade them to eprintln warnings",
+        "All TEST-INIT-002 and TEST-INIT-003 tests pass"
+      ],
+      "dependsOn": [
+        "TEST-INIT-002",
+        "TEST-INIT-003"
+      ],
+      "description": "New module hosting OverflowEvent, RecoveryAction, sanitize_id_for_filename, dump_prompt, append_event_log, rotate_dumps_keep_n, format_breakdown. Pure-fs helpers + serializable types; NO ctx mutation, NO DB access (those live in engine.rs::handle_prompt_too_long which composes these).",
+      "estimatedEffort": "medium",
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Pure module: types + filesystem helpers. NO ctx, NO DB. The orchestration that mutates IterationContext + runs DB UPDATE lives in engine.rs::handle_prompt_too_long (FEAT-005). This split keeps overflow.rs unit-testable in isolation and engine.rs can mock the helpers via direct calls. Reference: PRD FR-002, FR-003, FR-004, FR-005.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "No .unwrap() on filesystem operations — use ? operator or explicit match",
+        "No unsafe code",
+        "No allocations in sanitize_id_for_filename hot path beyond the single output String",
+        "format_breakdown produces deterministic output (sections rendered in input Vec order) so dump headers are reproducible",
+        "DumpHeader uses Option for model and effort so the (default) / None case is explicit at the type level (per resolved Q2)",
+        "append_event_log uses serde_json::to_vec NOT to_string — saves a UTF-8 validation pass"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Create src/loop_engine/overflow.rs module with types and helpers",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "PromptResult struct (prompt.rs:51) gains `pub section_sizes: Vec<(&'static str, usize)>` field",
+        "Field documented with rustdoc comment explaining purpose and ordering invariant (preserves assembly order)",
+        "build_prompt populates section_sizes as it assembles each named section: task, task_ops, completion, escalation, reorder_instr, base_prompt, learnings, source, dependencies, synergy, siblings, steering, session_guidance, reorder_hint",
+        "Section names are static string slices (&'static str) — no allocations per iteration",
+        "All PromptResult construction sites updated, including the early-return / test fixture site at prompt.rs:847 (initialize as Vec::new())",
+        "Sanity-check test: section_sizes.iter().map(|(_, n)| n).sum::<usize>() <= TOTAL_PROMPT_BUDGET (80_000) for a representative invocation",
+        "cargo test prompt::tests passes",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "dependsOn": [],
+      "description": "Extend PromptResult with `pub section_sizes: Vec<(&'static str, usize)>` (parallel to the existing dropped_sections field). Populate inside build_prompt as each named *_section: String is finalized.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD FR-002. Existing precedent: dropped_sections at prompt.rs:69. Construction sites to update: prompt.rs:389 (main path), prompt.rs:847 (early-return). Search for `PromptResult {` to find all sites. Learning #522: incremental field addition pattern.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Use &'static str for section names (no String allocations)",
+        "Vec preserves insertion order (per resolved Q5) — NEVER replace with HashMap or BTreeMap",
+        "Populate ONLY for sections that made it into the final prompt; sections dropped for budget already record in dropped_sections",
+        "Field is additive — no behavior change for current consumers (learning #522 pattern)",
+        "If a section is empty (zero bytes), still record (name, 0) so callers can distinguish 'absent' from 'dropped' (which goes into dropped_sections)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add section_sizes to PromptResult and populate in build_prompt",
+      "touchesFiles": [
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "IterationContext struct gains: pub overflow_recovered: HashSet<String>",
+        "IterationContext struct gains: pub overflow_original_model: HashMap<String, String>",
+        "Both fields initialized to empty in IterationContext::new() (no functional change to existing behavior)",
+        "Rustdoc on each field: overflow_recovered explains the dedicated-marker rationale (not inferred from model_overrides); overflow_original_model documents the entry().or_insert() (first-overflow-only) capture rule",
+        "All test fixtures and direct constructions of IterationContext updated (grep `IterationContext {` and `IterationContext::new`)",
+        "cargo build clean",
+        "cargo test loop_engine::engine passes",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "dependsOn": [],
+      "description": "Add two new fields to IterationContext (engine.rs ~line 203 area): overflow_recovered: HashSet<String> and overflow_original_model: HashMap<String, String>. Initialize both as empty in IterationContext::new(). Used by FEAT-005 (recovery logic) and FEAT-006 (banner annotation).",
+      "estimatedEffort": "low",
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD FR-006 and the resolved Q6 (capture only on first overflow per task). Learnings: #1832 (IterationContext pattern), #1861 (per-slot, not thread-safe), #106 (cross-iteration state precedent).",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Match existing IterationContext field documentation style (learning #1832)",
+        "Use std::collections::HashSet and HashMap (already imported in engine.rs)",
+        "Field visibility: pub (matches existing model_overrides / effort_overrides at engine.rs:203, 208)",
+        "Document the first-overflow-only capture rule on overflow_original_model so future maintainers know to use entry().or_insert() not insert()"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Add overflow_recovered and overflow_original_model fields to IterationContext",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Recovery branch walks rungs in order: downgrade_effort → escalate_below_opus → to_1m_model → block. Rung 2 inserts into ctx.model_overrides; rungs 2/3 do NOT touch ctx.effort_overrides (preserves high floor); rung 1 inserts into effort_overrides only.",
+        "All four rungs (including blocked) populate ctx.overflow_recovered (HashSet insert) and ctx.overflow_original_model (entry().or_insert() — first-overflow-only capture per resolved Q6)",
+        "Stderr messages match PRD FR-007 phrasings exactly, using effective_model.as_deref().unwrap_or(\"(default)\") so \"None\" never appears (learning #209)",
+        "Recovery body factored into pub(crate) fn handle_prompt_too_long(ctx, conn, task_id, effort, effective_model, prompt_result, iteration, run_id, base_dir) -> RecoveryAction so integration tests can call it directly",
+        "Order of operations within handle_prompt_too_long: (1) pick rung + ctx mutation, (2) DB UPDATE (status='todo' on rungs 1-3 with started_at=NULL, 'blocked' on rung 4), (3) eprintln stderr message, (4) dump_prompt (best-effort), (5) append_event_log (best-effort), (6) rotate_dumps_keep_n (best-effort, keep=3)",
+        "Filesystem failures (steps 4-6) log eprintln warnings and return the RecoveryAction unchanged — do NOT propagate, do NOT fail the iteration",
+        "Zero .unwrap() / .expect() in handle_prompt_too_long",
+        "TEST-INIT-001 tests pass (helper function tests)",
+        "TEST-INIT-004 tests pass (integration ladder + sanitization + rotation + skip-rung-2 + blocked observability)",
+        "ANALYSIS-001 has passes=true (verifies the consumer impact assumptions before this implementation lands)"
+      ],
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 1761,
+            "mitigation": "Rung 2 inserts into the same map exactly like rung 3 — reader is unchanged",
+            "usage": "Reads ctx.model_overrides.get(&task_id) when computing effective_model for next iteration"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 1778,
+            "mitigation": "Rung 1 inserts into this map; rungs 2/3/4 do not. No new write site.",
+            "usage": "Reads ctx.effort_overrides.get(&task_id) when computing effort for next iteration"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 1793,
+            "mitigation": "FEAT-006 extends banner to read overflow_recovered + overflow_original_model. Negative test in TEST-INIT-005 prevents false-positive.",
+            "usage": "Iteration banner formatting reads model field"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 4225,
+            "mitigation": "Separate channel — does not touch model_overrides. Learning #893 documents the invariant.",
+            "usage": "check_crash_escalation flowing into effective_model"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 4276,
+            "mitigation": "Separate channel — DB-level escalation, not in-memory override. No conflict with overflow recovery.",
+            "usage": "escalate_task_model_if_needed updates DB tasks.model column"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Overflow recovery (this PR's PromptTooLong arm)",
+            "currentBehavior": "Rung 1 then rung 3, then block. Sonnet+high → blocked",
+            "requiredBehavior": "Rung 1 → rung 2 (new) → rung 3 → block. Sonnet+high → Opus+high → Opus[1M]+high → blocked"
+          },
+          {
+            "context": "Per-iteration crash escalation (check_crash_escalation)",
+            "currentBehavior": "Returns Option<String> from local function; flows into effective_model directly",
+            "requiredBehavior": "Unchanged — stays in its own channel, does NOT write to model_overrides"
+          },
+          {
+            "context": "Cross-iteration crash tracker (escalate_task_model_if_needed)",
+            "currentBehavior": "Updates DB tasks.model column based on consecutive failures",
+            "requiredBehavior": "Unchanged — separate persistence channel"
+          }
+        ]
+      },
+      "dependsOn": [
+        "ANALYSIS-001",
+        "TEST-INIT-004",
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Refactor the PromptTooLong arm in engine.rs (~lines 2044-2113) to walk three recovery rungs (downgrade_effort → escalate_below_opus → to_1m_model) before blocking. Factor the body into pub(crate) fn handle_prompt_too_long so tests can call it directly. Modifies behavior — depends on ANALYSIS-001.",
+      "estimatedEffort": "high",
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Data contract: RecoveryAction (overflow.rs) → OverflowEvent (overflow.rs) → JSONL line. Source fields: ts (chrono), task_id (sanitized), run_id (loop's run_id, Option<String>, may be None), iteration (u32, the loop counter), model (Option<String>, effort_used: Option<String>), prompt_bytes (prompt_result.prompt.len()), sections (Vec<(&'static str, usize)> from prompt_result.section_sizes), dropped_sections (Vec<String> from prompt_result.dropped_sections), recovery (RecoveryAction enum), dump_path (PathBuf returned from dump_prompt). Access pattern: serde_json::to_vec(&event)?; file.write_all(&line)?. The loop's run_id is threaded through engine.rs as a String parameter — verify it's still in scope at the PromptTooLong arm before calling handle_prompt_too_long.",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Function length: handle_prompt_too_long can exceed 30 lines per learning #1370 (linear pipeline orchestrator). Stay under 80.",
+        "All branches return a RecoveryAction so callers can introspect what happened",
+        "No .unwrap() on conn.execute results — match Ok(1) / Ok(_) / Err(e) explicitly (existing pattern in this branch)",
+        "Effort downgrade preserves the model; model escalation preserves the effort — invariants from learning #1856",
+        "Override persistence is for the loop's lifetime (resolved Q4) — never clear ctx.model_overrides / overflow_recovered after a successful iteration",
+        "When the helper is called from the existing PromptTooLong arm, all current side effects (DB UPDATE, stderr) must continue to fire — do not silently drop them"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Three-rung recovery in PromptTooLong branch + corrected stderr messages",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Banner construction is extracted into a pure function format_iteration_banner_with_recovery(...) that takes model, effort, iteration, total_iterations, task_id, elapsed, ctx_overflow_recovered: &HashSet<String>, ctx_overflow_original_model: &HashMap<String, String>",
+        "When overflow_recovered.contains(task_id) AND overflow_original_model has the task, banner Model field becomes: 'Model: <current> (overflow recovery from <original>)'",
+        "When overflow_recovered.contains(task_id) but overflow_original_model is missing the entry, banner gracefully falls back (no panic, no 'None' literal in output) — e.g., '(overflow recovery)' without the 'from X' suffix",
+        "When neither overflow_recovered nor model_overrides has the task, banner is the existing format unchanged",
+        "TEST-INIT-005 tests pass (positive, negative, no-op, missing-original-model)",
+        "cargo test loop_engine::engine clean",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "dependsOn": [
+        "TEST-INIT-005",
+        "FEAT-004"
+      ],
+      "description": "Update the iteration banner construction (engine.rs ~line 1793) to append '(overflow recovery from <original-model>)' when ctx.overflow_recovered.contains(&task_id). Read the original model from ctx.overflow_original_model.",
+      "estimatedEffort": "low",
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD FR-006. The format extraction is what makes TEST-INIT-005 testable; without it the banner is built inline and tests would have to spin up an entire iteration. Architect's BLOCKER-1: do NOT gate the annotation on model_overrides; use the dedicated overflow_recovered HashSet.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Banner format function is pure (no I/O, deterministic output) so it's unit-testable without orchestrating an iteration",
+        "Annotation source is overflow_original_model, NEVER inferred from current model_overrides value (BLOCKER-1 fix)",
+        "Use &str / &HashSet / &HashMap parameters — no need to clone for the formatter"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Banner annotation when overflow recovery is active",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Wiring check: `grep -n 'pub mod overflow' src/loop_engine/mod.rs` returns a hit",
+        "Wiring check: handle_prompt_too_long is invoked from the PromptTooLong arm (no orphan helper)",
+        "Wiring check: format_iteration_banner_with_recovery is called from the iteration banner construction site (no orphan formatter)",
+        "Quality check: ZERO .unwrap() / .expect() in src/loop_engine/overflow.rs production code (test code allowed)",
+        "Quality check: ZERO .unwrap() / .expect() in handle_prompt_too_long",
+        "Order check: in handle_prompt_too_long, ctx mutations precede DB UPDATE, which precedes stderr, which precedes filesystem ops",
+        "Sanitization check: no path that writes to overflow-dumps/ uses raw task_id; all routes go through sanitize_id_for_filename",
+        "Banner gating check: format_iteration_banner_with_recovery reads overflow_recovered HashSet, NOT model_overrides",
+        "Effort floor check: rung 2 (escalate_below_opus path) does NOT touch ctx.effort_overrides",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added via task-mgr add --stdin --depended-on-by MILESTONE-1"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all FEAT-001 through FEAT-006 changes for: no .unwrap() in production paths, qualityDimensions satisfied, wiring reachability (overflow.rs registered in mod.rs, OverflowEvent reachable from engine.rs, format_iteration_banner_with_recovery called from the banner site), no banner false-positive (gated on overflow_recovered, not model_overrides), correct order of operations in handle_prompt_too_long.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1`. Use rootCause / exactFix / verifyCommand fields on spawned tasks so the implementing agent lands the fix in one pass.",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "Use the rust-python-code-reviewer agent for this review",
+        "Spawn one fix task per issue — do NOT batch unrelated issues into one task",
+        "If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line progress note 'No issues found'"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: implementation phase complete",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/prompt.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All FEAT-001 through FEAT-006 have passes=true",
+        "ANALYSIS-001 has passes=true",
+        "All TEST-INIT-001 through TEST-INIT-005 have passes=true",
+        "CODE-REVIEW-1 has passes=true (any spawned CODE-FIX/WIRE-FIX have also passed)",
+        "`cargo fmt --check` clean",
+        "`cargo check` clean",
+        "`cargo clippy -- -D warnings` clean",
+        "`cargo test` (full unscoped suite) clean — fix any pre-existing failures inline or spawn FIX-xxx tasks per the milestone protocol",
+        "`cargo run --bin gen-docs -- --check` clean (no doc drift from the model.rs additions)"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Full quality gate after implementation phase. Runs the unscoped test suite and must leave the trunk fully green, including pre-existing failures (per the milestone protocol).",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: prompt's Quality Checks § Milestone gate.",
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Full unscoped test suite — NOT scoped to touched files",
+        "Pre-existing failures get fixed inline if trivial, otherwise spawn FIX-xxx via task-mgr add --stdin --depended-on-by MILESTONE-1",
+        "Trunk-green is the invariant; the milestone does not pass with red tests"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Implementation phase gate",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: rotation_keeps_newest_3 — create 5 dumps with controlled mtimes (use std::fs::set_modified or ms-resolution sleeps), assert exactly 3 newest remain",
+        "Test: rotation_no_op_when_under_limit — with 2 dumps, rotate keeps both",
+        "Test: rotation_only_touches_matching_task — with dumps for task A and task B, rotating A leaves B untouched",
+        "Test: jsonl_append_preserves_existing_lines — pre-seed file with 3 lines, append, assert all 4 lines parseable",
+        "Test: jsonl_append_atomic_for_large_event — OverflowEvent with 50 sections + 5KB total serialization writes as a single line (no interleaving with simulated concurrent writer is in scope only if cheap; otherwise just assert single-line for the 5KB case)",
+        "Test: format_breakdown contains all expected substrings: 'Total assembled bytes:', 'Section breakdown:', 'NOTE:', 'auto-loaded layer'",
+        "Test: dump_prompt header reflects sanitized task_id (not raw input)",
+        "All tests use tempdir; no pollution of real .task-mgr/",
+        "cargo test --test overflow_filesystem (or whatever module name is used) passes",
+        "`cargo test` full suite still clean"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Beyond the TEST-INIT scaffolding, add tests for: rotation correctness with edge mtime resolution, JSONL atomicity (single-line writes even for >4KB events), dump header formatting, sanitize round-trip on a corpus of inputs.",
+      "edgeCases": [
+        "FS with second-level mtime resolution (rotation may need ms-level sleeps to disambiguate)",
+        "Empty sections vector in dump header",
+        "Long task_id (256 chars before sanitize) — filename should still be reasonable",
+        "Append to a file that doesn't exist yet (overflow-events.jsonl on first run) — must create with the right perms"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Test relies on filesystem mtime ordering without sleeping",
+          "expectedBehavior": "Add 10ms sleep between dump writes to ensure mtime distinction"
+        }
+      ],
+      "id": "TEST-001",
+      "invariants": [
+        "Rotation never deletes a file outside the dumps dir",
+        "JSONL append never truncates existing content"
+      ],
+      "modifiesBehavior": false,
+      "notes": "These are post-MILESTONE-1 tests — the basic behavior is already covered by TEST-INIT scaffolding. This task hardens edge cases and concurrency-adjacent behavior.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Use tempfile::TempDir for filesystem isolation",
+        "Each test scopes to one specific behavior — no umbrella tests",
+        "Avoid wall-clock timing dependencies where possible; when unavoidable (mtime), use minimum sleeps and document why"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Comprehensive tests for overflow.rs filesystem behavior",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: override_persists_across_iterations — after rung 2 fires, ctx.model_overrides[task_id] still contains Opus on iter 5 even with no further overflows",
+        "Test: original_model_captured_first_overflow_only — task walks Sonnet+xhigh → Sonnet+high → Opus+high; ctx.overflow_original_model[task_id] is 'claude-sonnet-4-6' on all three observations (never updated to current model)",
+        "Test: run_id_none_serializes_correctly — with run_id=None, JSONL line either omits the field or shows null, NEVER empty string",
+        "Test: effective_model_none_dump_header — with effective_model=None, dump header shows 'model: (default)' (not 'model: None' or empty)",
+        "Test: rung_4_writes_observability — blocked task creates BOTH dump and JSONL with recovery.action='blocked'",
+        "Test: dump_uses_sent_effort_not_resolved — task at Sonnet+xhigh hits rung 1; dump header shows 'effort: xhigh' (the sent value), JSONL shows recovery.action='downgrade_effort' with new_effort='high'",
+        "All tests pass against handle_prompt_too_long with synthetic IterationContext + tempdir",
+        "Full `cargo test` clean"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Beyond the TEST-INIT-004 ladder walk, add tests for: override persistence across iterations, overflow_original_model first-overflow-only capture, run_id None propagation through the JSONL, effective_model None producing 'model: (default)' in dump header.",
+      "edgeCases": [
+        "Task_id with sanitization needed (e.g., 'TEAM/PROJ-001') — dump file uses sanitized form, JSONL preserves the raw task_id field",
+        "Iteration counter at u32 boundary (well into the millions) — file format still correct",
+        "Empty section_sizes (early-exit prompt build) — dump header shows zero sections, total_bytes still accurate"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Implementation uses ctx.overflow_original_model.insert() instead of entry().or_insert()",
+          "expectedBehavior": "test_original_model_captured_first_overflow_only fails: original drifts to current model after each cascade"
+        }
+      ],
+      "id": "TEST-002",
+      "invariants": [
+        "Override persistence: once set, ctx.model_overrides[task_id] is never cleared by recovery code",
+        "Original model: captured on first overflow only, stable across cascading recoveries"
+      ],
+      "modifiesBehavior": false,
+      "notes": "Reference: resolved Q4 (override persistence), Q6 (first-overflow-only capture), Q7 (block-task observability), Q3 (sent-effort in dump).",
+      "passes": true,
+      "priority": 28,
+      "qualityDimensions": [
+        "Each test asserts ONE specific invariant — do not bundle multiple checks per test",
+        "Tests construct IterationContext via IterationContext::new() and mutate real fields, NEVER hand-built struct instances bypassing public API"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Comprehensive tests for handle_prompt_too_long state transitions",
+      "touchesFiles": [
+        "tests/overflow_recovery.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "TEST-001 and TEST-002 have passes=true",
+        "Any IMPL-FIX-xxx tasks spawned by TEST-001/002 have passes=true",
+        "`cargo fmt --check`, `cargo check`, `cargo clippy -- -D warnings`, `cargo test` all clean (full unscoped suite)",
+        "Test count strictly increased vs MILESTONE-1 (`cargo test 2>&1 | grep 'test result' | awk '{print $4}'` before and after)"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002"
+      ],
+      "description": "Full quality gate after the comprehensive test phase. Validates that the test additions don't regress existing behavior.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "If any pre-existing failure surfaces, follow the milestone protocol (fix inline if trivial, spawn FIX-xxx otherwise).",
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Full unscoped test suite — same milestone protocol as MILESTONE-1"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Test phase gate",
+      "touchesFiles": []
+    },
+    {
+      "acceptanceCriteria": [
+        "Path traced and documented in progress file: detect (detection.rs::classify_crash) → dispatch (engine.rs PromptTooLong arm) → helper (engine.rs::handle_prompt_too_long) → fs (overflow.rs::dump_prompt + append_event_log + rotate_dumps_keep_n)",
+        "Handoff verified at each boundary by reading actual call sites (no inferred connections)",
+        "All function signatures at boundaries match the data contract in the prompt's Data Flow Contracts section",
+        "PromptResult.section_sizes is consumed correctly by handle_prompt_too_long (Vec is iterated in order, not converted to a map)",
+        "OverflowEvent fields populated from real loop state (run_id from Loop's run_id, iteration from Loop's counter, etc.) — no synthetic placeholders",
+        "If the trace reveals any wiring gap (e.g., helper exists but never called, struct field never read), spawn a WIRE-FIX-xxx via task-mgr add --stdin --depended-on-by MILESTONE-FINAL",
+        "If the trace is clean, emit `<task-status>INT-001:done</task-status>` with the trace summary in the progress file"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace one complete overflow event through every module boundary: engine.rs (PromptTooLong detected) → handle_prompt_too_long (engine.rs) → overflow.rs helpers (sanitize, dump, append, rotate) → filesystem. Verify wiring is correct end-to-end and the assertions about the call graph hold.",
+      "estimatedEffort": "low",
+      "id": "INT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Cross-boundary INT task per /tasks Step 4.8. Path is engine.rs (top-level) → overflow.rs (helpers) → fs. Single trace covers the data path; no other INT tasks needed for this PRD.",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Trace is grep-verified, not narrated. Each handoff lists file:line on both sides of the call.",
+        "If a wiring gap is found, the WIRE-FIX-xxx task includes the exact missing call site in its description"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration verification: end-to-end overflow recovery trace",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/detection.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Review covers: model.rs (escalate_below_opus addition), overflow.rs (entire new module), engine.rs (handle_prompt_too_long, banner formatter, IterationContext fields), prompt.rs (section_sizes wiring)",
+        "Pattern check: escalate_below_opus signature/style matches downgrade_effort and to_1m_model (learning #851)",
+        "DRY check: format_breakdown does not duplicate logic from existing prompt assembly diagnostics; sanitize_id_for_filename and worktree::sanitize_branch_name are independent functions if they diverge by allowlist (acceptable)",
+        "Complexity check: handle_prompt_too_long stays under ~80 lines and reads as a linear pipeline (per learning #1370)",
+        "Each issue spawns a REFACTOR-N-xxx task with priority 71-85 via task-mgr add --stdin --depended-on-by MILESTONE-FINAL",
+        "If no issues, emit `<task-status>REFACTOR-REVIEW-FINAL:done</task-status>` with one-line progress note"
+      ],
+      "dependsOn": [
+        "INT-001"
+      ],
+      "description": "Full-context refactor review of all code touched in this PRD. Look for DRY violations, complexity, coupling, clarity, pattern adherence. Spawn REFACTOR-xxx tasks for findings (priority 71-85).",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Final pass with full PR context. The /simplify skill is also available for ad-hoc cleanup of specific touchpoints found during this review.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Use the rust-python-code-reviewer agent",
+        "Findings should target REAL issues (DRY/complexity/coupling), not style nits already enforced by clippy/fmt"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactor review: full-context pass",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/prompt.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "`cargo fmt --check`, `cargo check`, `cargo clippy -- -D warnings`, `cargo test` all clean (full unscoped)",
+        "`cargo run --bin gen-docs -- --check` clean",
+        "CLAUDE.md updated: new section 'Overflow recovery and diagnostics' under the Loop CLI Cheat Sheet, naming the three-rung ladder, dump path (.task-mgr/overflow-dumps/), JSONL log path (.task-mgr/overflow-events.jsonl), banner annotation behavior",
+        "model.rs rustdoc on escalate_below_opus describes the 'high effort floor preserved' invariant",
+        "overflow.rs module-level rustdoc covers: dump format, JSONL schema, sanitization rules, rotation policy",
+        "engine.rs rustdoc near handle_prompt_too_long documents the four-state recovery ladder and the corrected message phrasings",
+        "Reachability check: `grep -rn 'escalate_below_opus\\|sanitize_id_for_filename\\|handle_prompt_too_long\\|format_iteration_banner_with_recovery\\|OverflowEvent' src/` shows each new public symbol has at least one production call site (no orphans)",
+        "No `.unwrap()` in production code paths under src/loop_engine/overflow.rs or in handle_prompt_too_long",
+        "Test fixtures use real struct field names (grep-verified by reading the integration test)"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "Authoritative final check: full quality gate + documentation updates. Confirms the PRD's docs requirements (CLAUDE.md update, model.rs rustdoc, overflow.rs module rustdoc, engine.rs rustdoc on the PromptTooLong arm) are landed.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Final gate before MILESTONE-FINAL. If any issue found, spawn FIX-xxx tasks rather than fixing inline (keeps the verification atomic).",
+      "passes": true,
+      "priority": 90,
+      "qualityDimensions": [
+        "CLAUDE.md additions are concise (≄10-15 lines) and link to overflow.rs / engine.rs for full detail",
+        "Reachability check is grep-verified, not asserted by inference"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final validation + documentation update",
+      "touchesFiles": [
+        "CLAUDE.md",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All tasks (ANALYSIS, TEST-INIT, FEAT, CODE-REVIEW-1, MILESTONE-1, TEST-001/002, MILESTONE-2, INT-001, REFACTOR-REVIEW-FINAL, REFACTOR-N-xxx if any, VERIFY-001) have passes=true",
+        "Any spawned CODE-FIX/WIRE-FIX/IMPL-FIX/REFACTOR-N tasks have passes=true",
+        "`cargo fmt --check`, `cargo check`, `cargo clippy -- -D warnings`, `cargo test` all clean against current main + this PR",
+        "`cargo run --bin gen-docs -- --check` clean",
+        "Branch feat/overflow-recovery-and-diagnostics rebased onto current main with no merge conflicts"
+      ],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "Final gate. All work passes. Trunk fully green. Ready to merge to main.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Output `<promise>COMPLETE</promise>` after this milestone passes.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "Final milestone protocol: full unscoped suite, fix any pre-existing failures, leave trunk green"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Ready to merge",
+      "touchesFiles": []
+    }
+  ],
+  "version": "1.0"
+}

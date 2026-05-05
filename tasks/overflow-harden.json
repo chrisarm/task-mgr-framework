@@ -1,0 +1,294 @@
+{
+  "branchName": "feat/overflow-recovery-and-diagnostics",
+  "description": "Hardening pass on the just-shipped overflow-recovery-and-diagnostics feature: address validated medium/low findings from /review-loop. Best-effort observability must continue past per-entry IO errors (rotate_dumps_keep_n), JSONL line-size invariant must be runtime-visible (append_event_log debug_assert + warning), and dump_prompt loses its redundant iter parameter (header.iteration becomes the single source of truth). Two test cleanups bundled in.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests for touched files pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs unless explicitly required by the task (Fix C is the one exception)",
+      "Production code paths use match/if-let on filesystem errors, never .unwrap() / .expect()",
+      "All eprintln! warnings include enough context to identify the failed operation and target (path, task ID, operation name)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — strong invariants now to save future debugging",
+      "3. FUNCTIONING CODE — pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Best-effort observability is a contract: filesystem failures NEVER propagate, but they must also never short-circuit unrelated cleanup work",
+      "Edge cases = test cases — every identified edge case has a test",
+      "Scoped per-iteration tests, full suite at REVIEW-001",
+      "Single source of truth: when two parameters carry the same value at every call site, drop one"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Catch-all error handlers that swallow context (eprintln! must include the path/operation that failed)",
+    "Reorder of the contractual order-of-operations in handle_prompt_too_long (ctx → DB → stderr → dump → JSONL → rotate)",
+    "Truncation of OverflowEvent fields to enforce the 4 KB JSONL line limit — Fix B warns and proceeds, never silently drops data"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "a2af1e87",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `rotate_dumps_keep_n` deletes the correct subset even when ONE entry's metadata() fails — verified by a test that injects an unreadable file (e.g., chmod 000 on Unix, or simulate via a synthetic non-existent symlink target)",
+        "Positive: `rotate_dumps_keep_n` returns Ok(()) and emits warnings (visible via captured stderr) when individual entries fail; only a non-NotFound `read_dir` failure short-circuits with Err",
+        "Positive: `append_event_log` writes a > 4 KiB line successfully AND emits an eprintln! warning containing both the byte count and the substring 'O_APPEND atomicity'",
+        "Negative: `rotate_dumps_keep_n` MUST NOT short-circuit on the first failed `entry`/`metadata`/`remove_file`; existing rotation tests in tests/overflow_filesystem.rs continue to pass",
+        "Negative: `append_event_log` MUST NOT truncate or drop fields from `OverflowEvent` to satisfy the 4 KB rule — the full serialized JSON is still written",
+        "Negative: No `.unwrap()` / `.expect()` on filesystem ops in production paths (the existing `#[cfg(test)]` allow continues)",
+        "Unit test (filesystem): rotation_continues_past_unreadable_entry — create 5 dumps for a task, set one unreadable, call rotate_dumps_keep_n with keep=2, assert that all but 2 (newest) are deleted EXCEPT the unreadable one (which can't be deleted but doesn't block the others)",
+        "Unit test (filesystem): jsonl_oversize_emits_warning — construct an OverflowEvent with a `dump_path` long enough to push the serialized line past 4 KB, capture stderr (or use a wrapper), assert the line is present in the file AND a warning was emitted (debug_assert disabled via release-mode test or via a #[cfg(not(debug_assertions))] gate; use a #[ignore]-marked debug-only test for the panic case if needed)",
+        "Unit test (filesystem): rotation_no_op_when_dir_empty — empty dumps dir + dir exists; rotate keeps Ok(()) with no warnings",
+        "Failure mode: `read_dir` returns Err(NotFound) → return Ok(()) (existing behavior preserved)",
+        "Failure mode: `read_dir` returns Err(other) → propagate (existing behavior preserved)",
+        "Failure mode: individual `entry` / `metadata` / `remove_file` fails → eprintln! warning with `path.display()`, continue with next entry"
+      ],
+      "dependsOn": [],
+      "description": "Two best-effort-observability fixes in src/loop_engine/overflow.rs.\n\n**Fix A — rotate_dumps_keep_n log-and-continue (M3)**: Currently the function aborts on the first IO error in either the read_dir loop (entry?, metadata()?) or the deletion loop (fs::remove_file?). One unreadable file leaves all older dumps in place — violates the best-effort contract. Replace the ?-propagation in BOTH loops with match/if-let-Err and `eprintln!` warnings, so each entry/deletion is independent. The outer `read_dir` NotFound short-circuit (lines 235-238) STAYS — that's 'directory does not exist yet, no work to do'.\n\n**Fix B — append_event_log size visibility (M2)**: PRD/CLAUDE.md document that JSONL lines must be ≤ PIPE_BUF (4096B on Linux) for O_APPEND atomicity, but nothing enforces it. Single-writer-per-worktree topology hides the hazard today; bakes a future bug. Add `debug_assert!` (catches accidental growth in test builds) AND a `eprintln!` warning (covers release builds) when serialized line + newline exceeds 4096 bytes. **DO NOT TRUNCATE FIELDS** — the line still gets written; we just surface the topology assumption. This makes the assumption visible without breaking single-writer callers today.\n\nDO:\n- Replace `entry?` and `entry.metadata()?` in rotate_dumps_keep_n with explicit match/Err arms that eprintln! and continue\n- Replace `fs::remove_file(&path)?` with `if let Err(e) = ... { eprintln!(...); }`\n- Add `debug_assert!(line.len() <= 4096, \"...\")` plus a runtime `if line.len() > 4096 { eprintln!(\"warning: ...\") }` in append_event_log just before write_all\n- Keep the existing `read_dir` NotFound short-circuit (early return Ok(())) intact\n- Use `path.display()` for paths in eprintln! (Learning #602 pattern)\n- Match the existing eprintln! warning style elsewhere in overflow.rs (Learning #1877)\n\nDO NOT:\n- Reorder operations within handle_prompt_too_long\n- Truncate dropped_sections or dump_path to fit the 4 KB limit — warn only\n- Make the rotation function infallible — keep it returning io::Result<()> (the read_dir error path still propagates if the entire directory open fails for non-NotFound reasons)\n- Add a feature flag or env var gate — the warning fires unconditionally when oversized\n\nEdge cases:\n- One unreadable entry in dumps dir: deletion of OTHER eligible files still proceeds\n- One failed deletion: subsequent deletions in the same call still attempted\n- JSONL line at exactly 4096 bytes: NO warning (boundary inclusive); 4097 → warning fires\n- 4 KB warning fires in a debug build: panics via debug_assert (intentional, surfaces during test runs)\n- Empty dumps dir + dir exists: rotation no-ops cleanly, no warnings emitted\n\nKnown-bad to guard against:\n- A naive fix that wraps the whole loop body in a single `let _ = (|| -> io::Result<()> { ... })()` defeats per-entry isolation — must be inside the loop\n- `format!()` inside `expect()` is the L2 anti-pattern — don't introduce new instances",
+      "edgeCases": [
+        "Single unreadable file in a directory of 5 dumps: rotation deletes all OTHER eligible victims",
+        "Single failed deletion: subsequent deletions in the same call still attempted",
+        "JSONL line exactly 4096 bytes: no warning (boundary inclusive)",
+        "JSONL line 4097 bytes: warning fires, line still written, write_all succeeds",
+        "Empty dumps dir but dir exists: rotation no-ops, no warnings",
+        "Dumps dir does not exist: returns Ok(()) early (preserve existing semantics)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "fs::read_dir returns Err(other-than-NotFound)",
+          "expectedBehavior": "Propagate the Err — caller logs and continues per existing handle_prompt_too_long contract"
+        },
+        {
+          "cause": "Single DirEntry fails to yield (entry? would have errored)",
+          "expectedBehavior": "eprintln! warning with operation context; continue iterating"
+        },
+        {
+          "cause": "Single metadata().modified() call errors",
+          "expectedBehavior": "eprintln! warning with `path.display()`; continue iterating"
+        },
+        {
+          "cause": "Single fs::remove_file errors",
+          "expectedBehavior": "eprintln! warning with `path.display()`; continue with next victim in skip(keep) iterator"
+        },
+        {
+          "cause": "JSONL line exceeds 4096 bytes in release build",
+          "expectedBehavior": "eprintln! warning naming the byte count and 'O_APPEND atomicity'; line still written via write_all"
+        },
+        {
+          "cause": "JSONL line exceeds 4096 bytes in debug build (test runs)",
+          "expectedBehavior": "debug_assert! panics — surfaces accidental growth in test suites"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Files to read first: src/loop_engine/overflow.rs (lines 218-262 are the targets), tests/overflow_filesystem.rs (existing rotation tests pattern). Stderr-capture pattern: use `Command::new` invoking the test binary if needed, OR write the warning via a tracing-style abstraction if one already exists in the crate (it does not — eprintln! is the existing convention). The `chmod 000` trick for unreadable files is portable on Unix; gate the test with `#[cfg(unix)]` if the suite runs on Windows in CI. Learning #602: use `path.display()` for paths in user-facing error messages. Learning #1877: align logging mechanisms with existing codebase style — eprintln! is the convention in overflow.rs. Learning #1370: error handling can inflate function length above the 30-line guideline; OK if the inflation is from defensive Err arms.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Per-entry isolation: rotation continues past failed metadata or removal of one file",
+        "Best-effort contract preserved: no .unwrap()/.expect() in production paths; eprintln! includes path + operation",
+        "Read_dir NotFound vs other errors handled distinctly (existing semantics preserved)",
+        "JSONL atomicity assumption surfaced via debug_assert + eprintln warning, never via silent field truncation",
+        "Idiomatic match/if-let arms — no forced wrapper closures around loop bodies"
+      ],
+      "taskType": "implementation",
+      "title": "Harden rotate_dumps_keep_n + add append_event_log size visibility",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: dump_prompt signature drops the `iter: u32` parameter; filename and header both source from header.iteration",
+        "Positive: cargo build --tests is clean (no compile errors at remaining call sites)",
+        "Positive: existing test `dump_prompt_header_uses_sanitized_task_id` still passes with the updated call site",
+        "Negative: NO deprecated/forwarding old function left behind — clean break (per CONTRACT below)",
+        "Negative: No new public API added to compensate (e.g., a separate set_iteration() method)",
+        "Unit test (existing): dump_prompt_header_uses_sanitized_task_id continues to pass after the call-site update",
+        "CONTRACT: grep `dump_prompt(` across the entire workspace must show exactly TWO call sites — overflow.rs (handle_prompt_too_long) and tests/overflow_filesystem.rs. Any other hits indicate a missed consumer.",
+        "Failure mode: if a future caller forgets to set `header.iteration` and constructs DumpHeader { iteration: 0, ... } the filename will embed `-iter0-` — that's the caller's bug, not ours; document the requirement in the dump_prompt rustdoc"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "API cleanup. `overflow::dump_prompt` currently accepts `iter: u32` (used for the filename) AND reads `header.iteration` (used in the meta block). In production both always carry the same value, but the API permits divergence: a future caller could write a dump where the filename embeds `iter=5` but the header says `iteration=3`. Single source of truth: drop the parameter, use `header.iteration` for both.\n\nDO:\n- Change signature to `pub fn dump_prompt(dir: &Path, task_id: &str, header: &DumpHeader<'_>, prompt: &str) -> io::Result<PathBuf>`\n- Inside the body: `let filename = format!(\"{sanitized}-iter{}-{ts}.txt\", header.iteration);`\n- Update the single call site in `overflow::handle_prompt_too_long` (drop the `iteration` arg passed positionally before `&header`)\n- Update the single call site in `tests/overflow_filesystem.rs` (line 341, `dump_prompt_header_uses_sanitized_task_id`) to drop the leading `1` arg\n- Update the rustdoc on dump_prompt to reflect the new signature (the iteration source is now the header)\n\nDO NOT:\n- Add backward-compatibility shims (deprecated old fn forwarding to new)\n- Change DumpHeader's struct layout — `iteration: u32` field is already present\n- Rename DumpHeader.iteration\n- Touch any of the rotation, append_event_log, or sanitize_id_for_filename functions\n\nThis is a `pub fn` signature change in the loop_engine crate. There is exactly ONE production call (handle_prompt_too_long in overflow.rs itself) and ONE test call (tests/overflow_filesystem.rs:341). No external consumers.",
+      "edgeCases": [
+        "header.iteration == 0: filename embeds `-iter0-`; not a valid production case but the function does not validate",
+        "header.iteration == u32::MAX: format! handles it; filename is long but valid"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Caller constructs DumpHeader without setting iteration",
+          "expectedBehavior": "Compile fails — iteration is a required field on DumpHeader (no Default impl bypass)"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Files to read first: src/loop_engine/overflow.rs (dump_prompt at lines 180-211, call site inside handle_prompt_too_long below line 285), tests/overflow_filesystem.rs (one call at line 341). Confirm zero other call sites with: `rg -n 'dump_prompt\\(' --type rust`. The DumpHeader struct already has an `iteration: u32` field used for the meta block. No struct change needed. Data contract: dump_prompt (src/loop_engine/overflow.rs) ← handle_prompt_too_long (same file, ~line 285+). Both pass the same iteration u32; collapse to one source.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Single source of truth — header.iteration drives both filename and meta",
+        "Clean signature break (no shims)",
+        "Rustdoc on dump_prompt reflects the new contract: 'filename embeds header.iteration'"
+      ],
+      "taskType": "implementation",
+      "title": "Drop redundant iter parameter from dump_prompt",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `cargo clippy --tests --all-targets -- -D warnings` passes",
+        "Positive: tests/overflow_filesystem.rs has zero call sites of `make_header(` that pass a leading task-id-like string",
+        "Positive: tests/overflow_filesystem.rs has zero `.expect(&format!(...))` patterns",
+        "Negative: No `#[allow(clippy::expect_fun_call)]` or other lint suppressions added",
+        "Negative: No production code touched by this task",
+        "Unit test (existing): all tests in overflow_filesystem.rs continue to pass after the edits"
+      ],
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Two test-only cleanups in `tests/overflow_filesystem.rs`.\n\n**Fix D (L2) — clippy expect_fun_call**: Line 240 currently reads `serde_json::from_str(line).expect(&format!(\"parse line {i}: {line}\"))`. `format!()` inside `expect()` is eagerly evaluated even on the happy path. Replace with `.unwrap_or_else(|_| panic!(\"parse line {i}: {line}\"))`.\n\n**Fix E (L4) — unused parameter**: `make_header` test helper at line 66 declares `_task_id: &str` (the leading underscore signals unused). Drop the parameter and update the single call site at line 338 (`make_header(raw_id, &sections, &dropped, 100)` → `make_header(&sections, &dropped, 100)`).\n\nDO:\n- Replace the `.expect(&format!(...))` pattern with `.unwrap_or_else(|_| panic!(...))` on tests/overflow_filesystem.rs:240\n- Remove the `_task_id: &str` parameter from `make_header` (line 66-71)\n- Update the single call site at line 338\n- Run `cargo clippy --tests --all-targets -- -D warnings` to confirm no clippy warnings\n\nDO NOT:\n- Touch the production code (overflow.rs); these are test-only edits\n- Add `#[allow(...)]` attributes — the goal is to fix the warnings, not silence them\n- Change test names, structures, or other test logic\n\nIf FEAT-002 (the dump_prompt signature change) lands first, the make_header callers will have already been touched in that task — re-verify call site count before editing.",
+      "edgeCases": [
+        "make_header is called from another test added between FEAT-002 and this task: locate by symbol, not line number"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "FEAT-002 edits drift the call-site line numbers",
+          "expectedBehavior": "Locate make_header callers via `rg make_header tests/`; do not rely on the planning-document line numbers"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Files: tests/overflow_filesystem.rs only. Run `grep -n 'make_header\\|expect_fun' tests/overflow_filesystem.rs` to find all relevant lines before editing. Note that FEAT-002 already updates one call site at line 341 of dump_prompt — re-locate by name, not by line number, when this task runs.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Zero new clippy warnings on `--all-targets -- -D warnings`",
+        "Helper signature reflects only the parameters it actually uses",
+        "Test helpers don't silently degrade panic-on-success cost"
+      ],
+      "taskType": "implementation",
+      "title": "Test housekeeping: drop unused param + replace eager format!",
+      "touchesFiles": [
+        "tests/overflow_filesystem.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle) — if eprintln! warning templates repeat, evaluate lifting into a small helper (decline if it adds more abstraction than it saves)",
+        "Functions stay under 80 lines (rotate_dumps_keep_n grows by ~10 lines; that's acceptable per Learning #1370)",
+        "Clear separation of concerns: best-effort observability vs error-propagation paths remain visually distinct",
+        "Code follows existing project patterns (eprintln! with `path.display()`, match arms)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review the FEAT-001..003 changes for DRY violations, complexity, coupling, and consistency with the existing overflow.rs style.\n\nDO: Check for duplicated eprintln! patterns (e.g., the same warning template repeated across rotate_dumps_keep_n and append_event_log — could lift into a small helper), function length, idiomatic match arms vs nested if-let, and whether the per-entry warning text ergonomically tells the user what to do (path + operation).\nDO NOT: Skip — this gate catches issues before the trunk-green review.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note 'No issues found'. Use rust-python-code-reviewer agent for review — and explicitly remind it to read module-level rustdocs and the rustdoc directly above any function before flagging 'missing wiring' (Learning #2029 — slot-mode bypass false positive on the parent PRD review).",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across the two new eprintln! warnings",
+        "Single-responsibility functions — rotate_dumps_keep_n still does ONE thing",
+        "Pattern consistency with the existing overflow.rs idioms"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified — handle_prompt_too_long calls dump_prompt + append_event_log + rotate_dumps_keep_n)",
+        "Positive: All errors propagated with context (eprintln! with `path.display()`, no map_err-then-unwrap chains)",
+        "Positive: FULL `cargo test` (3212+ tests), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all clean (no scope filter)",
+        "Positive: `cargo run --bin gen-docs -- --check` is clean (no model.rs drift; this PRD doesn't touch model.rs but the regression test stays green)",
+        "Positive: tests/no_hardcoded_models.rs still passes (no literal model strings introduced outside model.rs)",
+        "Negative: No unwrap()/.expect() in production code paths (#[cfg(test)] allowance preserved)",
+        "Negative: No dead code warnings for new code",
+        "Negative: No clippy suppressions added (#[allow(...)] for clippy lints)",
+        "Documentation: CLAUDE.md 'Overflow recovery and diagnostics' section's 'best-effort' bullet still accurately reflects the per-entry log-and-continue behavior (update if the prior wording suggested whole-call short-circuit)",
+        "Documentation: rustdoc on rotate_dumps_keep_n updated to reflect 'per-entry log-and-continue' semantic (one sentence)",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Final review for quality, security, integration wiring, and trunk-green verification. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Verify every new code path is reachable from production (grep for handle_prompt_too_long and the new warnings); verify the 4 KB warning fires correctly under a synthetic oversized event; verify rotation is still bounded (no runaway under failures); confirm no new unwrap/expect in production code; run full cargo test, cargo clippy -- -D warnings, cargo fmt --check (no scope filter); update CLAUDE.md if the order-of-operations or best-effort contract phrasing needs adjustment to reflect the new per-entry log-and-continue semantic.\nDO NOT: Skip the full-suite run; this is THE place it runs. Do NOT scope the test suite. Do NOT silently skip cargo clippy warnings.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. The 4 KB JSONL warning is the most likely source of subtle issues — verify the boundary (4096 == no warning, 4097 == warning) with a focused test if not already covered. Tests run via `cargo test 2>&1 | tee /tmp/test-results.txt | tail -5 && grep 'FAILED\\|test result: FAILED' /tmp/test-results.txt | head -10` per CLAUDE.md test protocol.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point",
+        "Full suite green including pre-existing",
+        "Best-effort observability contract still upheld in CLAUDE.md text"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification (full unscoped suite)",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "debug_assert! block in append_event_log removed",
+        "jsonl_oversize_emits_warning runs and passes under default cargo test (debug build)",
+        "No new clippy warnings",
+        "cargo fmt --check passes"
+      ],
+      "description": "REFACTOR-001 review found the debug_assert! at src/loop_engine/overflow.rs:225-229 carries the same information as the if line.len() > 4096 { eprintln!(...) } immediately below. The runtime if is the contractual behavior; the debug_assert is just a louder restatement that pins the oversize test to release-only builds (tests/overflow_filesystem.rs:484 #[cfg(not(debug_assertions))]). Drop the debug_assert!, then drop the cfg gate on the test so it runs under default cargo test.",
+      "estimatedEffort": "easy",
+      "id": "a2af1e87-REFACTOR-FIX-001",
+      "passes": true,
+      "priority": 70,
+      "title": "Drop redundant debug_assert! in append_event_log; ungate jsonl_oversize_emits_warning",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "tests/overflow_filesystem.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
