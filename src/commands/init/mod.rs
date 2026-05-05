@@ -242,8 +242,13 @@ pub fn init(
     let mut resolved_prefix: Option<String> = None;
     let mut json_file_registrations: Vec<(std::path::PathBuf, PrdFile)> = Vec::new();
 
-    // Get existing task IDs if in append mode
-    if append && !fresh_import {
+    // Get existing task IDs in append mode. Includes archived rows so the
+    // importer can reconcile against an archived PRD instead of crashing on
+    // UNIQUE constraint when the same IDs are re-imported. The `fresh_import`
+    // gate is intentionally NOT applied: a database whose only rows are
+    // archived reports `fresh_import=true` but still has physical rows that
+    // would conflict on INSERT.
+    if append {
         existing_ids = get_existing_task_ids(&conn)?;
     }
 

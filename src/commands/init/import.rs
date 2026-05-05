@@ -161,9 +161,15 @@ pub fn is_fresh_database(conn: &Connection) -> TaskMgrResult<bool> {
     Ok(count == 0)
 }
 
-/// Get existing active (non-archived) task IDs from the database.
+/// Get all existing task IDs from the database, including soft-archived rows.
+///
+/// Archived rows must be included so `init --append --update-existing` can
+/// reconcile against them. If they were filtered out, the importer would
+/// route incoming stories to INSERT and trip the UNIQUE constraint on the
+/// physical row that still exists in the table. Callers in the update path
+/// are expected to clear `archived_at` so the row is revived on re-import.
 pub fn get_existing_task_ids(conn: &Connection) -> TaskMgrResult<HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE archived_at IS NULL")?;
+    let mut stmt = conn.prepare("SELECT id FROM tasks")?;
     let ids = stmt.query_map([], |row| row.get(0))?;
     let mut result = HashSet::new();
     for id in ids {
@@ -425,6 +431,10 @@ pub fn update_task(
 
     // Note: We don't update status from passes here - the task may have been
     // completed in the DB since the JSON was written. We only update metadata.
+    //
+    // archived_at is cleared so re-importing an archived PRD revives the rows.
+    // Without this, the row would remain invisible to the loop's `next` query
+    // even though metadata had just been refreshed from the JSON.
     conn.execute(
         r#"UPDATE tasks SET
            title = ?, description = ?, priority = ?, notes = ?,
@@ -432,6 +442,7 @@ pub fn update_task(
            source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
            required_tests = ?, max_retries = ?,
            requires_human = ?, human_review_timeout = ?,
+           archived_at = NULL,
            updated_at = datetime('now')
            WHERE id = ?"#,
         rusqlite::params![
