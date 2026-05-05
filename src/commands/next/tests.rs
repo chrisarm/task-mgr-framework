@@ -23,6 +23,22 @@ mod test_helpers {
         .unwrap();
     }
 
+    pub fn insert_test_task_with_criteria(
+        conn: &Connection,
+        id: &str,
+        title: &str,
+        status: &str,
+        priority: i32,
+        criteria: &[&str],
+    ) {
+        let criteria_json = serde_json::to_string(criteria).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, acceptance_criteria) VALUES (?, ?, ?, ?, ?)",
+            params![id, title, status, priority, criteria_json],
+        )
+        .unwrap();
+    }
+
     pub fn insert_test_task_file(conn: &Connection, task_id: &str, file_path: &str) {
         conn.execute(
             "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
@@ -1872,6 +1888,229 @@ mod mixed_prd_selection_tests {
             count_p1 + count_p2,
             count_all,
             "P1 + P2 eligible counts must equal all-tasks count"
+        );
+    }
+}
+
+#[cfg(test)]
+mod soft_dep_tests {
+    //! Soft-dependency filter: defer milestone-class candidates whose
+    //! acceptance_criteria reference a known spawned-fixup prefix while a
+    //! same-prefix active sibling exists.
+    //!
+    //! All assertions go through the public `select_parallel_group` /
+    //! `select_next_task` entry points — never the private filter.
+
+    use super::test_helpers::{insert_test_task, insert_test_task_with_criteria, setup_test_db};
+    use crate::commands::next::selection::{select_next_task, select_parallel_group};
+    use rusqlite::params;
+
+    const MILESTONE_AC: &[&str] = &[
+        "All required passes=true",
+        "Any spawned REFACTOR-N-xxx tasks have passes=true",
+    ];
+
+    /// Milestone candidate whose AC mentions REFACTOR-N-xxx is deferred while
+    /// a `todo` REFACTOR-N-001 sibling exists.
+    #[test]
+    fn test_soft_dep_blocks_milestone_with_active_refactor_n() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
+        insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "todo", 5);
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"MILESTONE-FINAL"),
+            "milestone must be deferred while REFACTOR-N-001 is todo, got: {ids:?}"
+        );
+    }
+
+    /// Same setup but REFACTOR-N-001 is `done` → milestone is selectable.
+    #[test]
+    fn test_soft_dep_releases_when_refactor_n_done() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
+        insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "done", 5);
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"MILESTONE-FINAL"),
+            "milestone should be selectable once REFACTOR-N-001 is done, got: {ids:?}"
+        );
+    }
+
+    /// `in_progress` sibling still blocks the milestone.
+    #[test]
+    fn test_soft_dep_in_progress_dep_blocks() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
+        insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "in_progress", 5);
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"MILESTONE-FINAL"),
+            "milestone must be deferred while REFACTOR-N-001 is in_progress, got: {ids:?}"
+        );
+    }
+
+    /// AC mentions REFACTOR-N-xxx but no matching active task exists → not blocked.
+    #[test]
+    fn test_soft_dep_no_match_unchanged() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
+        // Only an unrelated task is active.
+        insert_test_task(&conn, "OTHER-001", "Unrelated", "todo", 50);
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"MILESTONE-FINAL"),
+            "milestone should be selectable when no matching active fixup exists, got: {ids:?}"
+        );
+    }
+
+    /// A REFACTOR-N-001 candidate whose own AC mentions REFACTOR-N-xxx is
+    /// NEVER self-blocked (self-fixup short-circuit).
+    #[test]
+    fn test_soft_dep_self_reference_does_not_block() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(
+            &conn,
+            "REFACTOR-N-001",
+            "Spawned",
+            "todo",
+            10,
+            MILESTONE_AC,
+        );
+
+        let result = select_next_task(&conn, &[], None).unwrap();
+        let id = result.task.as_ref().map(|t| t.task.id.as_str());
+        assert_eq!(
+            id,
+            Some("REFACTOR-N-001"),
+            "candidate whose own ID matches a fixup prefix must NOT be self-blocked"
+        );
+    }
+
+    /// Two REFACTOR-N siblings with non-overlapping files are co-schedulable.
+    #[test]
+    fn test_soft_dep_two_sibling_fixups_co_schedulable() {
+        let (_tmp, conn) = setup_test_db();
+        // Both ACs mention the prefix to prove sibling fixups are NOT
+        // mutually blocked just because their ACs share the prefix.
+        insert_test_task_with_criteria(
+            &conn,
+            "REFACTOR-N-001",
+            "Fixup 1",
+            "todo",
+            10,
+            &["address REFACTOR-N-xxx feedback"],
+        );
+        insert_test_task_with_criteria(
+            &conn,
+            "REFACTOR-N-002",
+            "Fixup 2",
+            "todo",
+            11,
+            &["address REFACTOR-N-xxx feedback"],
+        );
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"REFACTOR-N-001") && ids.contains(&"REFACTOR-N-002"),
+            "sibling fixups must be co-schedulable, got: {ids:?}"
+        );
+    }
+
+    /// `CODE-FIXTURE-1` must NOT count as a CODE-FIX active sibling
+    /// (prefix-with-dash boundary).
+    #[test]
+    fn test_soft_dep_prefix_collision_does_not_block() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(
+            &conn,
+            "MILESTONE-FINAL",
+            "Final",
+            "todo",
+            10,
+            &["Any spawned CODE-FIX-xxx tasks have passes=true"],
+        );
+        insert_test_task(&conn, "CODE-FIXTURE-1", "Test fixture work", "todo", 5);
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"MILESTONE-FINAL"),
+            "CODE-FIXTURE-1 must NOT match the CODE-FIX prefix; milestone should be selectable, got: {ids:?}"
+        );
+    }
+
+    /// Prose AC `"document the CODE-FIX convention"` (no trailing dash) must
+    /// NOT trigger the filter — even if a CODE-FIX-001 active sibling exists.
+    #[test]
+    fn test_soft_dep_false_positive_prose_does_not_block() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(
+            &conn,
+            "DOC-001",
+            "Doc task",
+            "todo",
+            10,
+            &["document the CODE-FIX convention"],
+        );
+        insert_test_task(&conn, "CODE-FIX-001", "Real fixup", "todo", 5);
+
+        // The doc task's AC tokenizes to "CODE-FIX" (no trailing dash) — must
+        // not trigger the filter. Both should be eligible (different files,
+        // no conflict).
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"DOC-001"),
+            "AC prose 'CODE-FIX' (no trailing dash) must NOT defer DOC-001, got: {ids:?}"
+        );
+    }
+
+    /// PRD-A milestone is NOT blocked by an active REFACTOR-N task in PRD-B
+    /// (prefix scoping in `get_active_task_ids`).
+    #[test]
+    fn test_soft_dep_other_prd_prefix_does_not_block() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "PRD-A-MILESTONE", "Final", "todo", 10, MILESTONE_AC);
+        // PRD-B's active fixup must NOT block PRD-A's milestone.
+        insert_test_task(&conn, "PRD-B-REFACTOR-N-001", "Other PRD fixup", "todo", 5);
+
+        let group = select_parallel_group(&conn, &[], Some("PRD-A"), 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"PRD-A-MILESTONE"),
+            "PRD-A milestone must NOT be blocked by PRD-B's REFACTOR-N-001 (prefix scoping), got: {ids:?}"
+        );
+    }
+
+    /// Archived REFACTOR-N task does NOT block (archived_at IS NULL filter).
+    #[test]
+    fn test_soft_dep_archived_task_does_not_block() {
+        let (_tmp, conn) = setup_test_db();
+        insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
+        insert_test_task(&conn, "REFACTOR-N-001", "Archived fixup", "todo", 5);
+        // Archive the would-be blocker. The plain `insert_test_task` helper
+        // doesn't set `archived_at`, so flip it via raw SQL.
+        conn.execute(
+            "UPDATE tasks SET archived_at = datetime('now') WHERE id = ?",
+            params!["REFACTOR-N-001"],
+        )
+        .unwrap();
+
+        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"MILESTONE-FINAL"),
+            "archived REFACTOR-N-001 must NOT block the milestone, got: {ids:?}"
         );
     }
 }

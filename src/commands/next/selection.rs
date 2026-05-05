@@ -23,6 +23,96 @@ use crate::models::Task;
 pub const FILE_OVERLAP_SCORE: i32 = 10;
 pub const PRIORITY_BASE: i32 = 1000;
 
+/// Task-ID prefixes that the loop spawns as ad-hoc fixup children.
+///
+/// A milestone-class candidate whose acceptance_criteria text references one of
+/// these prefixes (with trailing dash, e.g. `REFACTOR-N-001`, `REFACTOR-N-xxx`)
+/// is deferred while a same-prefix sibling is still `todo`/`in_progress`.
+/// Tasks whose own ID body matches one of these prefixes are exempt — sibling
+/// fixups remain co-schedulable.
+///
+/// **AC writing convention** (PRD authors): `mentioned_fixup_prefixes` matches
+/// `token.starts_with("{prefix}-")` after splitting AC text on non-`[A-Z0-9-]`
+/// chars. So the guard fires when the prefix appears as a **standalone token**
+/// (`REFACTOR-N-xxx`, `CODE-FIX-001`, slash-separated lists like
+/// `CODE-FIX/WIRE-FIX/IMPL-FIX/REFACTOR-N`). Writing the fully task-prefixed
+/// form like `cbd7d081-REFACTOR-N-xxx` tokenizes as one token starting with
+/// `cbd7d081-` and **silently bypasses the guard**. If you're authoring an AC
+/// that should defer a milestone, use the bare prefix.
+const SPAWNED_FIXUP_PREFIXES: &[&str] = &["REFACTOR-N", "CODE-FIX", "WIRE-FIX", "IMPL-FIX"];
+
+/// True iff `id` contains the literal `{prefix}-` token at a `-`-bounded
+/// position (start-of-id OR following a `-`).
+///
+/// Examples (prefix = `CODE-FIX`):
+/// - `CODE-FIX-001` → true (starts with `CODE-FIX-`)
+/// - `PRD-A-CODE-FIX-001` → true (contains `-CODE-FIX-`)
+/// - `CODE-FIXTURE-1` → false (the trailing `-` boundary is mandatory)
+fn id_body_matches_prefix(id: &str, prefix: &str) -> bool {
+    let needle = format!("{prefix}-");
+    id.starts_with(&needle) || id.contains(&format!("-{needle}"))
+}
+
+/// True iff `task.id` itself matches any fixup prefix (sibling fixups are
+/// co-schedulable and must never self-block).
+fn task_is_self_fixup(task: &Task) -> bool {
+    SPAWNED_FIXUP_PREFIXES
+        .iter()
+        .any(|prefix| id_body_matches_prefix(&task.id, prefix))
+}
+
+/// Tokenize each AC string on non-`[A-Z0-9-]` chars and return every fixup
+/// prefix whose `{prefix}-` needle appears as a token. Needles are computed
+/// once per call, not once per token.
+fn mentioned_fixup_prefixes(task: &Task) -> Vec<&'static str> {
+    let needles: Vec<String> = SPAWNED_FIXUP_PREFIXES
+        .iter()
+        .map(|p| format!("{p}-"))
+        .collect();
+    let mut mentioned: Vec<&'static str> = Vec::new();
+    for ac in &task.acceptance_criteria {
+        for token in ac.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))
+        {
+            for (prefix, needle) in SPAWNED_FIXUP_PREFIXES.iter().copied().zip(needles.iter()) {
+                if token.starts_with(needle.as_str()) && !mentioned.contains(&prefix) {
+                    mentioned.push(prefix);
+                }
+            }
+        }
+    }
+    mentioned
+}
+
+/// Collect every active ID (excluding `self_id`) that matches any of the given
+/// fixup prefixes via [`id_body_matches_prefix`].
+fn find_active_blockers_for_prefixes(
+    prefixes: &[&str],
+    active_ids: &HashSet<String>,
+    self_id: &str,
+) -> Vec<String> {
+    let mut blockers: Vec<String> = active_ids
+        .iter()
+        .filter(|id| id.as_str() != self_id)
+        .filter(|id| prefixes.iter().any(|p| id_body_matches_prefix(id, p)))
+        .cloned()
+        .collect();
+    blockers.sort();
+    blockers
+}
+
+/// Return the active sibling IDs that block `task` per the soft-dep filter,
+/// or an empty vec if `task` is not blocked.
+fn find_blocking_active_fixups(task: &Task, active_ids: &HashSet<String>) -> Vec<String> {
+    if task_is_self_fixup(task) {
+        return Vec::new();
+    }
+    let mentioned = mentioned_fixup_prefixes(task);
+    if mentioned.is_empty() {
+        return Vec::new();
+    }
+    find_active_blockers_for_prefixes(&mentioned, active_ids, &task.id)
+}
+
 /// A scored task candidate for selection.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScoredTask {
@@ -67,12 +157,17 @@ pub struct SelectionResult {
 /// Shared by `select_next_task` and `select_parallel_group`. Returns tasks
 /// sorted by total_score DESC, priority ASC — the callers diverge only in how
 /// they pick from this ordered list.
+///
+/// Filters applied (in order): formal `dependsOn` deps complete, then the
+/// soft-dep guard (see [`find_blocking_active_fixups`]) which defers
+/// milestone candidates whose AC text references a same-prefix active sibling.
 fn build_scored_candidates(
     conn: &Connection,
     after_files: &[String],
     task_prefix: Option<&str>,
 ) -> TaskMgrResult<Vec<ScoredTask>> {
     let completed_ids = get_completed_task_ids(conn, task_prefix)?;
+    let active_ids = get_active_task_ids(conn, task_prefix)?;
     let todo_tasks = get_todo_tasks(conn, task_prefix)?;
     let dependencies = get_relationships_by_type(conn, "dependsOn", task_prefix)?;
     let task_files = get_all_task_files(conn, task_prefix)?;
@@ -87,6 +182,18 @@ fn build_scored_candidates(
             task_deps
                 .iter()
                 .all(|dep_id| completed_ids.contains(dep_id))
+        })
+        .filter(|task| {
+            let blockers = find_blocking_active_fixups(task, &active_ids);
+            if blockers.is_empty() {
+                return true;
+            }
+            eprintln!(
+                "Deferring {}: AC references active fixup task(s): {}",
+                task.id,
+                blockers.join(", ")
+            );
+            false
         })
         .collect();
 
@@ -192,6 +299,26 @@ fn get_completed_task_ids(
     let (prefix_clause, prefix_param) = prefix_and(task_prefix);
     let sql = format!(
         "SELECT id FROM tasks WHERE status IN ('done', 'irrelevant') AND archived_at IS NULL {prefix_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Result<HashSet<String>, rusqlite::Error> = if let Some(pattern) = prefix_param {
+        stmt.query_map([pattern], |row| row.get(0))?.collect()
+    } else {
+        stmt.query_map([], |row| row.get(0))?.collect()
+    };
+    Ok(ids?)
+}
+
+/// Get IDs of tasks that are currently active (todo or in_progress) and not
+/// archived. Used by the soft-dep filter to defer milestone candidates whose
+/// AC references a still-active fixup sibling.
+fn get_active_task_ids(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> TaskMgrResult<HashSet<String>> {
+    let (prefix_clause, prefix_param) = prefix_and(task_prefix);
+    let sql = format!(
+        "SELECT id FROM tasks WHERE status IN ('todo', 'in_progress') AND archived_at IS NULL {prefix_clause}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let ids: Result<HashSet<String>, rusqlite::Error> = if let Some(pattern) = prefix_param {

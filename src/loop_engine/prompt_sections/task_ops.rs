@@ -30,8 +30,8 @@ pub(crate) fn task_ops_section() -> &'static str {
      \u{20}     echo '{\"id\":\"CODE-FIX-001\",\"title\":\"Fix race in X\",\"difficulty\":\"medium\",\"touchesFiles\":[\"src/foo.rs\"],\"dependsOn\":[]}' \\\\\n\
      \u{20}       | task-mgr add --stdin\n\
      \n\
-       Priority is auto-computed to rank ahead of the current `next` pick. Omit it\n\
-       unless you explicitly need a lower priority.\n\
+       Priority is auto-computed; omit for lower priority.\n\
+     - **Fix in response to a milestone**: pass `--depended-on-by <id>`.\n\
      - For anything else (dependencies, status queries, etc.), use the `task-mgr`\n\
        CLI — see `task-mgr --help`.\n\
      \n"
@@ -68,6 +68,14 @@ mod tests {
         assert!(
             section.contains("<task-status>"),
             "section must contain '<task-status>'"
+        );
+        assert!(
+            section.contains("--depended-on-by"),
+            "section must teach --depended-on-by for milestone-spawned fixes"
+        );
+        assert!(
+            section.contains("in response to a milestone"),
+            "section must reference 'in response to a milestone' so the rule context is clear"
         );
 
         // All 5 status keywords

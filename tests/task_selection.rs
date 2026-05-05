@@ -11,6 +11,7 @@
 use std::fs;
 use tempfile::TempDir;
 
+use task_mgr::commands::next::selection::select_parallel_group;
 use task_mgr::commands::{complete, init, next};
 use task_mgr::db::open_connection;
 
@@ -935,4 +936,130 @@ fn test_verbose_output_includes_top_candidates() {
     assert_eq!(result.top_candidates[0].id, "TASK-001");
     assert_eq!(result.top_candidates[1].id, "TASK-002");
     assert_eq!(result.top_candidates[2].id, "TASK-003");
+}
+
+/// Reproduce the cbd7d081-MILESTONE-FINAL production bug.
+///
+/// A parallel-slot wave dispatched the milestone while REFACTOR-N-001
+/// (in_progress) and REFACTOR-N-002 (todo) were still active.  The fix
+/// defers any milestone-class candidate whose acceptance criteria mention a
+/// known spawned-fixup prefix while a same-prefix active sibling exists.
+///
+/// Acceptance criteria strings are taken verbatim from the real PRD that
+/// triggered the bug (tasks/overflow-recovery-and-diagnostics.json).
+#[test]
+fn test_milestone_soft_dep_cbd7d081_scenario() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Real-world AC strings from the production bug.
+    let milestone_ac = serde_json::json!([
+        "All tasks (ANALYSIS, TEST-INIT, FEAT, CODE-REVIEW-1, MILESTONE-1, TEST-001/002, MILESTONE-2, INT-001, REFACTOR-REVIEW-FINAL, REFACTOR-N-xxx if any, VERIFY-001) have passes=true",
+        "Any spawned CODE-FIX/WIRE-FIX/IMPL-FIX/REFACTOR-N tasks have passes=true"
+    ]);
+
+    let prd_content = serde_json::json!({
+        "project": "cbd7d081-test",
+        "branchName": "test/milestone-soft-dep",
+        "description": "Reproduce cbd7d081 scenario",
+        "userStories": [
+            {
+                "id": "cbd7d081-MILESTONE-FINAL",
+                "title": "Final milestone",
+                "description": "Milestone task that should be deferred while REFACTOR-N siblings are active",
+                "acceptanceCriteria": milestone_ac,
+                "priority": 100,
+                "passes": false,
+                "notes": "",
+                "touchesFiles": ["src/milestone.rs"],
+                "dependsOn": [],
+                "synergyWith": [],
+                "batchWith": [],
+                "conflictsWith": []
+            },
+            {
+                "id": "cbd7d081-REFACTOR-N-001",
+                "title": "Spawned refactor fixup 1",
+                "description": "Active sibling — will be set to in_progress",
+                "acceptanceCriteria": ["Fixup complete"],
+                "priority": 10,
+                "passes": false,
+                "notes": "",
+                "touchesFiles": ["src/refactor_a.rs"],
+                "dependsOn": [],
+                "synergyWith": [],
+                "batchWith": [],
+                "conflictsWith": []
+            },
+            {
+                "id": "cbd7d081-REFACTOR-N-002",
+                "title": "Spawned refactor fixup 2",
+                "description": "Active sibling — disjoint file so co-schedulable with REFACTOR-N-001",
+                "acceptanceCriteria": ["Fixup complete"],
+                "priority": 11,
+                "passes": false,
+                "notes": "",
+                "touchesFiles": ["src/refactor_b.rs"],
+                "dependsOn": [],
+                "synergyWith": [],
+                "batchWith": [],
+                "conflictsWith": []
+            }
+        ]
+    })
+    .to_string();
+
+    let prd_path = temp_dir.path().join("cbd7d081_prd.json");
+    fs::write(&prd_path, prd_content).unwrap();
+
+    init::init(
+        temp_dir.path(),
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        init::PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Replicate the production state: REFACTOR-N-001 is already in_progress
+    // (the wave claimed it in a prior iteration).
+    let conn = open_connection(temp_dir.path()).unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = 'cbd7d081-REFACTOR-N-001'",
+        [],
+    )
+    .unwrap();
+
+    // Phase 1 — milestone must be excluded while active fixup siblings exist.
+    let group =
+        select_parallel_group(&conn, &[], Some("cbd7d081"), 2).expect("select_parallel_group");
+    let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+
+    assert!(
+        !ids.contains(&"cbd7d081-MILESTONE-FINAL"),
+        "MILESTONE-FINAL must be deferred while REFACTOR-N-001/002 are active, got: {ids:?}"
+    );
+    // REFACTOR-N-001 is in_progress so it's not a todo candidate; REFACTOR-N-002
+    // (todo, disjoint file) must be schedulable.
+    assert!(
+        ids.contains(&"cbd7d081-REFACTOR-N-002"),
+        "REFACTOR-N-002 (todo, disjoint file) must be eligible for dispatch, got: {ids:?}"
+    );
+
+    // Phase 2 — once both fixups are done the milestone becomes re-eligible.
+    conn.execute(
+        "UPDATE tasks SET status = 'done' WHERE id IN ('cbd7d081-REFACTOR-N-001', 'cbd7d081-REFACTOR-N-002')",
+        [],
+    )
+    .unwrap();
+
+    let group =
+        select_parallel_group(&conn, &[], Some("cbd7d081"), 2).expect("select_parallel_group");
+    let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+
+    assert!(
+        ids.contains(&"cbd7d081-MILESTONE-FINAL"),
+        "MILESTONE-FINAL must be selectable once REFACTOR-N-001/002 are done, got: {ids:?}"
+    );
 }
