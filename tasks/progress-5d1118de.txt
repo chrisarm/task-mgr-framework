@@ -24,3 +24,11 @@ Learnings:
 - Live `extract_learnings_from_output` spawns a real Claude subprocess, so the learnings-extraction test is gated until FEAT-003 ships a mock seam — documented explicitly in the test's #[ignore] reason.
 - Already-complete fallback parity is split into two named tests (skip_git=true + skip_git=false) so the wave-mode parity bug is the focus, not buried in a generic "fallback works" test.
 ---
+## [2026-05-07 23:55] - 5d1118de-TEST-INIT-005
+Approach: Wrote tests/overflow_per_slot.rs covering per-slot dispatch contract: 4 active tests pin per-task keying isolation + sequential JSONL shape (passes today since handle_prompt_too_long is already keyed on task_id), and 1 #[ignore]'d test reserves the slot_index-in-JSONL contract for FEAT-008. The known-bad discriminator simulates the no-dispatch wave-mode regression and asserts ctx is empty + JSONL absent — proving the positive keying assertion has discriminating power.
+Files: tests/overflow_per_slot.rs
+Learnings:
+- AC #4 ("sequential omits slot_index") survives both today (no field) AND post-FEAT-008 (Option::is_none → skipped) by checking JSONL shape via serde_json::Value rather than the struct — the assertion locks in the contract before the field is added.
+- Set-size assertions (`overflow_recovered.len() == 1` etc.) catch silent contamination patterns the per-id `contains_key` checks would miss (e.g. an empty-string or wave-level key snuck in alongside slot 2's id).
+- Known-bad discriminator co-located with positive test makes the assertion's logic explicit: ctx empty in no-dispatch ↔ ctx populated only on slot-2 key in real dispatch.
+---

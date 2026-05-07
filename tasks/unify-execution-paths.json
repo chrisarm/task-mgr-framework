@@ -206,7 +206,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "These tests are the contract for FEAT-003. setup_db_with_migrations() required. Use real IterationOutcome and IterationContext structs. The mutation test must construct an Empty outcome and assert it mutates to Completed after pipeline call (matches sequential at engine.rs:3280, 3307, 3341, 3400, 3454).",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Idempotent post-processing — exactly-once-per-task semantics match today's sequential behavior",
