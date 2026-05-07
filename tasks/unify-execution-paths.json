@@ -301,7 +301,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Use synthetic SlotResult + IterationContext rather than running real waves. Read overflow.rs:316-423 for handle_prompt_too_long invariants — order of operations is contractual: ctx update → DB UPDATE → stderr → dump → JSONL → rotate.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Per-slot overflow isolation: PromptTooLong on slot 2 does not corrupt slots 0/1/3",

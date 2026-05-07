@@ -174,6 +174,14 @@ pub struct IterationResult {
     pub effective_effort: Option<&'static str>,
     /// Number of key decisions extracted and stored this iteration.
     pub key_decisions_count: u32,
+    /// Structured stream-json conversation transcript (when stream-json mode is
+    /// active). Threaded from `claude_result.conversation` at the post-Claude
+    /// success site; `None` on every early-exit path (signal, rate-limit, pause,
+    /// pre-iteration error). The wave path mirrors this through
+    /// `SlotResult.iteration_result.conversation` so the shared
+    /// `iteration_pipeline::process_iteration_output` can prefer the transcript
+    /// over raw output for learning extraction.
+    pub conversation: Option<String>,
 }
 
 /// Mutable context carried between iterations.
@@ -468,6 +476,7 @@ fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
             effective_model: exit.effective_model,
             effective_effort: exit.effective_effort,
             key_decisions_count: 0,
+            conversation: None,
         },
         // Early exit always runs after a successful claim (the slot thread
         // started); the orphan reset must consider this task pending until
@@ -644,6 +653,7 @@ pub fn run_slot_iteration(
             effective_model,
             effective_effort: effort,
             key_decisions_count: 0,
+            conversation: None,
         },
         claim_succeeded: true,
     })
@@ -706,6 +716,7 @@ fn slot_failure_result(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         },
         claim_succeeded,
     }
@@ -1529,6 +1540,7 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         });
     }
 
@@ -1544,6 +1556,7 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         });
     }
 
@@ -1575,6 +1588,7 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -1605,6 +1619,7 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         });
     }
 
@@ -1669,6 +1684,7 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
                 });
             }
 
@@ -1716,6 +1732,7 @@ pub fn run_iteration(
                             effective_model: None,
                             effective_effort: None,
                             key_decisions_count: 0,
+                            conversation: None,
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -1741,6 +1758,7 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
                 });
             }
         }
@@ -1926,6 +1944,7 @@ pub fn run_iteration(
             effective_model,
             effective_effort: effort,
             key_decisions_count: 0,
+            conversation: None,
         });
     }
 
@@ -1954,6 +1973,7 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         });
     }
 
@@ -1987,6 +2007,7 @@ pub fn run_iteration(
                         effective_model: None,
                         effective_effort: None,
                         key_decisions_count: 0,
+                        conversation: None,
                     });
                 }
                 UsageCheckResult::WaitedAndReset => {
@@ -2024,6 +2045,7 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
                 });
             }
         }
@@ -2135,6 +2157,7 @@ pub fn run_iteration(
         effective_model,
         effective_effort: effort,
         key_decisions_count: 0,
+        conversation: None,
     })
 }
 
@@ -4400,6 +4423,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         effective_model: None,
         effective_effort: None,
         key_decisions_count: 0,
+        conversation: None,
     }
 }
 
@@ -4597,6 +4621,7 @@ mod tests {
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);
@@ -6477,6 +6502,7 @@ mod tests {
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
                 },
                 claim_succeeded: true,
             };

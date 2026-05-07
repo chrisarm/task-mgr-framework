@@ -32,3 +32,11 @@ Learnings:
 - Set-size assertions (`overflow_recovered.len() == 1` etc.) catch silent contamination patterns the per-id `contains_key` checks would miss (e.g. an empty-string or wave-level key snuck in alongside slot 2's id).
 - Known-bad discriminator co-located with positive test makes the assertion's logic explicit: ctx empty in no-dispatch ↔ ctx populated only on slot-2 key in real dispatch.
 ---
+## [2026-05-08 00:30] - 5d1118de-TEST-INIT-007
+Approach: Added `conversation: Option<String>` to IterationResult (field at struct + `None` defaults at all 18 literal sites via perl one-liner) so tests/iteration_result_conversation.rs can pin the contract today; FEAT-004 only needs to flip the post-Claude success site to `Some(claude_result.conversation)`.
+Files: src/loop_engine/engine.rs, tests/iteration_result_conversation.rs
+Learnings:
+- TDD bootstrap pattern: when a contract test needs a struct field that doesn't exist yet, add the field with `None` defaults at every literal site so tests compile + pass today, leaving only the wiring flip for the impl task. Cleaner than the alternative (faking the contract or writing tests that don't compile).
+- AC #5 (known-bad discriminator) anchors at the caller boundary, not inside the pipeline — `result.conversation.as_deref() != None` is observable today; the symmetric None case (early-exit) intentionally agrees with the broken-stub None to prevent false positives once FEAT-004 lands.
+- ProcessingParams.conversation type is already `Option<&'a str>`; the threading test pins the borrow shape (`as_deref()`) so a future widening to `Option<String>` (forced clone) breaks here before silently degrading wave perf.
+---
