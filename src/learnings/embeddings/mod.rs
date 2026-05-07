@@ -55,6 +55,15 @@ impl OllamaEmbedder {
         &self.model
     }
 
+    /// The base URL this embedder targets (with any trailing slash already trimmed).
+    ///
+    /// Exposed so callers constructing `TaskMgrError::OllamaUnreachable` can
+    /// surface the exact URL that was contacted, rather than re-deriving it
+    /// from defaults or config.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Check whether Ollama is reachable AND the configured model is available.
     ///
     /// Calls `GET /api/tags` with a 3-second timeout and checks whether the

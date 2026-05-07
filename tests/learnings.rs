@@ -713,18 +713,18 @@ fn test_recall_increments_times_shown() {
     assert_eq!(initial.times_shown, 0);
 
     // Recall once
-    let params = RecallParams {
+    let make_params = || RecallParams {
         limit: 10,
         ..Default::default()
     };
-    recall_learnings(&conn, params.clone()).unwrap();
+    recall_learnings(&conn, make_params()).unwrap();
 
     // Recall no longer increments times_shown (bandit::record_learning_shown does)
     let after_one = get_learning(&conn, learning.learning_id).unwrap().unwrap();
     assert_eq!(after_one.times_shown, 0);
 
     // Recall again — still 0
-    recall_learnings(&conn, params.clone()).unwrap();
+    recall_learnings(&conn, make_params()).unwrap();
 
     let after_two = get_learning(&conn, learning.learning_id).unwrap().unwrap();
     assert_eq!(after_two.times_shown, 0);

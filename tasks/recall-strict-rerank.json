@@ -1,0 +1,533 @@
+{
+  "branchName": "feat/recall-strict-rerank",
+  "description": "Hard-fail recall on Ollama down (with --allow-degraded opt-out) and add cross-encoder reranking via gpustack/llama-box for free-text --query recall. Includes Dockerfiles + docker-compose for both services.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All tests pass with `cargo test` (per-iteration: scoped to touched modules)",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to public `recall_learnings()` / `recall_learnings_with_backend()` signatures",
+      "No `unwrap()` in production code paths — use `map_err`/`?` for proper error propagation",
+      "RetrievalBackend trait remains recall-policy-agnostic (no `allow_degraded` field on RetrievalQuery)",
+      "Reranker is opt-in: when `rerankerUrl` is unset, recall behavior is unchanged from today"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use that aren't justified by test injection",
+    "Error messages that don't identify which service is down or what to fix",
+    "Catch-all error handlers that swallow context",
+    "Reranker silently producing different results than requested model (no model-name verification)",
+    "Backward-incompatible changes to existing recall_learnings() public signature"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "72c7ec1b",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `cargo run -- recall --query \"x\"` with Ollama stopped exits non-zero and prints the OllamaUnreachable message containing all three actionable hints (`ollama serve`, `ollama pull`, `--allow-degraded`).",
+        "Positive: same command with `--allow-degraded` exits 0 and returns FTS5/patterns results (vector returns empty, no error propagated).",
+        "Positive: `recall --for-task TASK-ID` with Ollama stopped exits 0 (no Ollama call attempted because no query text).",
+        "Negative: `RetrievalQuery` struct does NOT contain an `allow_degraded` field. Grep `git diff` for it inside RetrievalQuery's definition — must be zero hits.",
+        "Negative: `recall_learnings()` legacy entry point signature unchanged (no new required parameters).",
+        "Unit test: `VectorBackend::default().with_strict_mode(true)` pointing at `127.0.0.1:0` with non-empty query text → `Err(TaskMgrError::OllamaUnreachable { url, model, .. })` with `url == \"http://127.0.0.1:0\"`.",
+        "Unit test: same backend with `with_strict_mode(false)` → `Ok(empty)`.",
+        "Unit test: empty query text (`Some(\"\")`) with `strict=true` → `Ok(empty)` (no Ollama call attempted).",
+        "Unit test: clap parses `task-mgr recall --query x --allow-degraded` and round-trips `allow_degraded=true`.",
+        "Known-bad: an implementation that calls `embedder.embed(\"\")` and then errors on the empty input would pass 'Ollama down test' but fail the 'empty query short-circuits' test. Must short-circuit BEFORE the HTTP call.",
+        "Known-bad: an implementation that propagates strict mode through `RetrievalQuery` would compile but pollute the trait. Test must inspect `RetrievalQuery`'s field list and assert no `allow_degraded`.",
+        "Failure mode: if Ollama returns valid HTTP but malformed JSON in strict mode → `Err(OllamaUnreachable)` with the underlying IoError as `source`, not a panic.",
+        "CONTRACT: `OllamaUnreachable.url` matches `OllamaEmbedder.base_url` exactly (verify by grepping `src/learnings/embeddings/mod.rs:25-50` for the field name and reusing it)."
+      ],
+      "dependsOn": [],
+      "description": "Wire hard-fail-on-Ollama-down through the entire recall path with `--allow-degraded` as the offline-use opt-out.\n\nDO:\n- Add `OllamaUnreachable { url: String, model: String, source: std::io::Error }` to `TaskMgrError` (src/error.rs) with a `Display` impl that produces actionable hints: 'Is Ollama running? Try: ollama serve', 'Is the model pulled? Try: ollama pull <model>', 'To run recall without semantic search, pass --allow-degraded'.\n- Add `strict: bool` field to `VectorBackend` (src/learnings/retrieval/vector.rs:41-54). Add `with_strict_mode(self, bool) -> Self` builder method. Default is `strict=false` to preserve existing callers (`CompositeBackend::default_backends`, `recall_learnings`).\n- In `VectorBackend::retrieve` at lines 79-82 and 86-89: when `strict=true`, propagate embed/load errors as `TaskMgrError::OllamaUnreachable` (use the embedder's URL+model fields). When `strict=false`, keep current `Ok(Vec::new())` swallow behavior.\n- Extend `CompositeBackend::with_ollama_config` (composite.rs:34-42) to accept `strict: bool` and construct `VectorBackend::new(...).with_strict_mode(strict)`.\n- Add `allow_degraded: bool` to `RecallParams` (src/learnings/mod.rs / src/learnings/recall/mod.rs:31-46). Do NOT add to `RetrievalQuery`.\n- Add `allow_degraded: bool` to `RecallCmdParams` (src/commands/recall.rs:18-35). At line 131, build `CompositeBackend::with_ollama_config(url, model, !allow_degraded)`.\n- Add `#[arg(long = \"allow-degraded\")] allow_degraded: bool` to `Commands::Recall` in src/cli/commands.rs:467-492.\n- Wire from CLI through main.rs:440-471 into `RecallCmdParams`.\n- Tests for both strict (errors out) and non-strict (returns empty) paths in vector.rs's existing test module.\n- Test that `--allow-degraded` parses correctly in src/cli/tests.rs.\n\nDO NOT:\n- Add `allow_degraded` to `RetrievalQuery` — backends are recall-policy-agnostic.\n- Change `recall_learnings()` legacy entry point's behavior — it stays non-strict for back-compat.\n- Use `unwrap()` on the embedder error — wrap in `OllamaUnreachable`.\n\nEdge cases:\n- Empty `--query \"\"`: clap treats it as `Some(\"\")`. Vector backend already handles via `Some(t) if !t.is_empty()` guard at vector.rs:73-75 — empty string returns Ok(empty) without an Ollama call. Strict mode should NOT fire here (no embedding attempted).\n- `--for-task` only (no query text): vector backend never embeds. No Ollama call. Strict mode does nothing. Behavior unchanged.\n- Ollama up but returns invalid JSON: parse error in `embed()` propagates as `OllamaUnreachable` source (use the IoError-wrapped variant — single error type per locked decision).\n\nKnown-bad to guard against:\n- `--allow-degraded` accidentally affecting `--for-task` recall (which doesn't use the embedder). Test must pass both flags together and verify no behavioral change.\n- Constructing `OllamaUnreachable` with the *configured default* URL when the user has set a custom one in config.json. Use the embedder's actual URL field.",
+      "edgeCases": [
+        "Empty query string `--query \"\"`: short-circuit before Ollama call regardless of strict mode (current behavior at vector.rs:73-75)",
+        "`--for-task` only (no query text): no Ollama call attempted; strict mode is inert",
+        "Ollama up but returns malformed JSON in strict mode: propagate as OllamaUnreachable with the parse error as source",
+        "`--allow-degraded` passed but Ollama is actually up: behavior unchanged from non-degraded path (vector results included)"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Ollama HTTP connect refused in strict mode",
+          "expectedBehavior": "Err(OllamaUnreachable { url, model, source: ConnectionRefused }) propagated to CLI; non-zero exit"
+        },
+        {
+          "cause": "Ollama HTTP timeout in strict mode",
+          "expectedBehavior": "Err(OllamaUnreachable) with the timeout IoError as source"
+        },
+        {
+          "cause": "Malformed JSON response in strict mode",
+          "expectedBehavior": "Err(OllamaUnreachable) with InvalidData IoError as source"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "modifiesBehavior=true because this changes failure semantics for `recall --query` callers. Affected callers: `src/main.rs:440-471` (CLI dispatch), any test fixture that ran recall with Ollama unavailable expecting Ok(empty). Reuse `OllamaEmbedder` URL/model fields directly — don't re-derive from defaults. Pattern reference: existing graceful-degradation in vector.rs lines 79-89 (the code being replaced). Learning [1400]: The current vector backend explicitly returns empty results when Ollama is unavailable as a graceful-degradation pattern — this task converts that to opt-in via `strict` flag. Learning [1401]: Embedding config flows from ProjectConfig with Option<String> — preserve that flow.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Error message gives the user three concrete commands to fix the problem (ollama serve / ollama pull / --allow-degraded flag)",
+        "RetrievalBackend trait remains recall-policy-agnostic — no `allow_degraded` on RetrievalQuery",
+        "Empty query string short-circuits before any HTTP call regardless of strict mode",
+        "Backward compatibility: existing callers of recall_learnings() and CompositeBackend::default_backends() see no behavioral change",
+        "Strict mode opt-in via builder method, not construction-time required parameter"
+      ],
+      "taskType": "implementation",
+      "title": "Failure-mode core: error variant, VectorBackend strict mode, --allow-degraded flag",
+      "touchesFiles": [
+        "src/error.rs",
+        "src/learnings/retrieval/vector.rs",
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/mod.rs",
+        "src/commands/recall.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `LlamaBoxReranker::new(\"http://x\", \"model\").rerank(\"q\", candidates)` returns Ok with each ScoredLearning's relevance_score set to the cross-encoder score (NOT the original FTS5/cosine score).",
+        "Positive: results are sorted descending by relevance_score on success.",
+        "Negative: trait file does NOT contain a second `impl Reranker for ...` block. Trait + LlamaBoxReranker only.",
+        "Negative: no `unwrap()` or `expect()` in production paths of reranker/mod.rs.",
+        "Negative: documents sent over the wire never exceed 1024 chars per entry (byte length OK to be larger but char count ≤1024).",
+        "Unit test: empty candidates → Ok(vec![]) with no HTTP call (verify via mockito mock that the endpoint is never hit).",
+        "Unit test: response with index out of [0, len) range → Err containing 'out of range' (or equivalent specific message).",
+        "Unit test: response with duplicate indices → Err containing 'duplicate'.",
+        "Unit test: response with results.len() != documents.len() → Err containing 'length mismatch' or similar.",
+        "Unit test: malformed JSON response → Err.",
+        "Unit test: candidates content longer than 1024 chars → request body contains content truncated to ≤1024 chars (verify via mockito body matcher).",
+        "Unit test: candidates with non-ASCII content → truncate uses chars().take(N), no panic on UTF-8 boundary.",
+        "Known-bad: an impl that maps results via positional iteration (ignoring `index` field) gets caught by `test_orders_by_score` because the mock returns indices [2, 0, 1] (not in sorted positional order).",
+        "Failure mode: HTTP 5xx response → Err containing the status code.",
+        "Failure mode: connection timeout → Err with the underlying ureq error as source.",
+        "CONTRACT: `RerankResponse` struct field names match the llama-box `/v1/rerank` API: `results: Vec<RerankResult>`, `index: usize`, `relevance_score: f64`. Verify against gpustack/llama-box docs."
+      ],
+      "dependsOn": [],
+      "description": "Add a `Reranker` trait and the only production impl, `LlamaBoxReranker`, that calls llama-box's `/v1/rerank` endpoint. Strict response validation. Trait exists ONLY to enable test-double injection.\n\nDO:\n- Create `src/learnings/reranker/mod.rs` containing `pub trait Reranker { fn rerank(&self, query: &str, candidates: Vec<ScoredLearning>) -> TaskMgrResult<Vec<ScoredLearning>>; }`. Document in the trait doc-comment that the implementation MUST replace each ScoredLearning's `relevance_score` with the cross-encoder score and return them in descending score order.\n- Implement `pub struct LlamaBoxReranker { base_url: String, model: String, agent: ureq::Agent }` with `new(base_url: &str, model: &str) -> Self`. Use the same connect=3s/read=30s timeout pattern as `OllamaEmbedder::new` at src/learnings/embeddings/mod.rs:36-44.\n- POST to `{base_url}/v1/rerank` with JSON body `{\"model\": <model>, \"query\": <query>, \"documents\": [<title + content truncated to 1024 chars> for each candidate], \"top_n\": documents.len()}`.\n- Document text format: build via `format!(\"{}\\n\\n{}\", learning.title, learning.content)`, then truncate to 1024 chars using `super::super::commands::truncate_str` (re-export if needed) or inline a char-safe truncate.\n- Parse response as `{\"results\": [{\"index\": usize, \"relevance_score\": f64}, ...]}`. Validate: HTTP 2xx; `results.len() == documents.len()`; every `index` in `0..documents.len()`; no duplicate indices.\n- On any validation failure: return `Err(TaskMgrError::IoError(...))` whose message includes the URL and a snippet of the bad response (first 200 chars).\n- Map response back: build `Vec<ScoredLearning>` where each entry's `relevance_score = response.results[i].relevance_score` (replacing the original retrieval score) and `match_reason = Some(\"cross-encoder rerank\")`. Sort descending by score.\n- Add `mockito = \"1\"` to `[dev-dependencies]` in Cargo.toml. Justify in a comment: 'Used by reranker HTTP tests.'\n- Tests in `src/learnings/reranker/tests.rs` (or inline `#[cfg(test)] mod tests`):\n  - `test_orders_by_score`: mockito returns `[{index:2,score:0.9},{index:0,score:0.5},{index:1,score:0.1}]` for 3 candidates → assert returned order is candidates[2], [0], [1] with relevance_score equal to the rerank scores.\n  - `test_unreachable_returns_err`: backend pointing at `127.0.0.1:0` → assert `Err`.\n  - `test_response_index_out_of_range_returns_err`: 3 docs in, response has `index: 5` → assert `Err` with message containing 'out of range'.\n  - `test_response_duplicate_index_returns_err`: response has same index twice → assert `Err` with message containing 'duplicate'.\n  - `test_response_length_mismatch_returns_err`: 3 docs in, 2 results out → assert `Err` with message containing 'length mismatch' or similar.\n  - `test_malformed_json_returns_err`: mockito returns body `not json` with content-type text/plain → assert `Err`.\n  - `test_document_text_format`: construct candidates with known title+content, capture mockito request body, assert documents[0] starts with title and contains content (or first N chars if truncated).\n- Re-export from `src/learnings/mod.rs`: `pub use reranker::{Reranker, LlamaBoxReranker};`.\n\nDO NOT:\n- Add a second production impl. The trait exists for test injection only.\n- Use `serde_json::Value` lookups for the response — define typed `RerankResponse` / `RerankResult` structs with `#[derive(Deserialize)]`.\n- Send entire content unbounded — must truncate to ≤1024 chars to stay under the model's context.\n- Swallow validation errors as `Ok(input)` — caller (FEAT-005) does the soft-fail; the reranker itself returns Err.\n\nEdge cases:\n- Empty candidates list: short-circuit, return `Ok(vec![])` without calling the HTTP endpoint.\n- Single candidate: HTTP call still made, but result ordering is trivially correct.\n- Candidate with empty title and empty content: send empty string as the document.\n- Very long content (>10k chars): truncate to 1024 chars (char-safe, not byte-safe — must not split a UTF-8 codepoint).\n\nKnown-bad to guard against:\n- An impl that returns `input.clone()` on parse failure would pass `test_orders_by_score` (because the mock returns valid data) but break the validation tests. Validation MUST return Err.\n- An impl that uses `String::truncate` or byte-slicing for the 1024-char cap would panic on non-ASCII. Use `chars().take(1024).collect::<String>()` or similar.\n- An impl that maps response indices via positional iteration (assuming response is already sorted by score) would silently produce wrong output if the server returned unsorted results. Must reorder by `index` field, not position.",
+      "edgeCases": [
+        "Empty candidates: Ok(vec![]) without HTTP call",
+        "Single candidate: HTTP call made, trivial ordering",
+        "Empty title+content: send empty string as document",
+        "Content longer than 1024 chars: truncate char-safely",
+        "Non-ASCII content: chars().take(N), no UTF-8 boundary panic",
+        "Response with extra fields not in our struct: serde ignores by default; OK",
+        "HTTP 4xx with valid JSON body: still Err (response validation fails on non-2xx)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Connection refused / timeout",
+          "expectedBehavior": "Err(IoError) with descriptive message including URL"
+        },
+        {
+          "cause": "HTTP 5xx response",
+          "expectedBehavior": "Err with status code in message"
+        },
+        {
+          "cause": "Response validation failure (index out of range, duplicate, length mismatch)",
+          "expectedBehavior": "Err with specific failure category in message; first 200 chars of body included"
+        }
+      ],
+      "id": "FEAT-002",
+      "notes": "Reuse `truncate_str` pattern from src/commands/mod.rs:139 (it does char-safe truncation; check signature to confirm it does NOT append '...' or adjust call site). If it appends '...', use a local helper. Time agent: same pattern as `OllamaEmbedder::new` lines 36-44 — connect=3s, read=30s. Trait doc must explicitly state 'this trait exists for test-double injection only'. Reranker output: replace `ScoredLearning.relevance_score` with cross-encoder score. Set `match_reason = Some(\"cross-encoder rerank\")` on each result.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Strict response validation: index range, no duplicates, length match, HTTP 2xx",
+        "Char-safe (not byte-safe) document truncation at 1024 chars",
+        "Typed deserialization (RerankResponse struct), not serde_json::Value lookups",
+        "Empty candidates short-circuit before HTTP call",
+        "Trait justification doc-comment says 'test-double injection only'",
+        "ScoredLearning.relevance_score replaced with cross-encoder score on success"
+      ],
+      "taskType": "implementation",
+      "title": "Reranker module: trait + LlamaBoxReranker + mockito tests",
+      "touchesFiles": [
+        "src/learnings/reranker/mod.rs",
+        "src/learnings/mod.rs",
+        "Cargo.toml"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `RetrievalBackend` trait has new `retrieve_for_rerank` method with default delegating to `retrieve`.",
+        "Positive: `CompositeBackend::retrieve_for_rerank` calls each child backend's `retrieve_for_rerank` (verify via stub backends counting calls).",
+        "Positive: VectorBackend::retrieve_for_rerank includes candidates with score == 0.0.",
+        "Positive: VectorBackend::retrieve_for_rerank includes candidates with negative score.",
+        "Negative: `CompositeBackend::retrieve()` (the non-rerank path) is byte-for-byte identical to today's behavior — diff against baseline.",
+        "Negative: `retrieve_for_rerank` does NOT truncate to `query.limit`. The slate returned can exceed the limit; the recall pipeline truncates after reranking.",
+        "Unit test: stub backends A, B, C each returning {L1, L2}, {L2, L3}, {L4} → composite returns {L1, L2, L3, L4} with L2's score = max across A and B.",
+        "Unit test: store a cosine=0 embedding → `retrieve_for_rerank` returns it; `retrieve` does not.",
+        "Unit test: store a cosine=-0.5 embedding → `retrieve_for_rerank` returns it.",
+        "Unit test: default trait impl on FTS5/Patterns backend delegates to retrieve (verify by ensuring same results from both methods).",
+        "Known-bad: an impl that internally calls `self.retrieve` from `CompositeBackend::retrieve_for_rerank` would pass single-backend tests but fail the per-child counting test.",
+        "Failure mode: child backend errors propagate up.",
+        "CONTRACT: `ScoredLearning` struct field names (`learning`, `relevance_score`, `match_reason`) match what FEAT-002's reranker produces (verify by grep)."
+      ],
+      "dependsOn": [],
+      "description": "Extend the RetrievalBackend trait so callers can request a candidate slate optimized for cross-encoder reranking — bypassing CompositeBackend's broken max-merge.\n\nDO:\n- Add a default-impl method to `RetrievalBackend` (src/learnings/retrieval/mod.rs):\n  ```\n  fn retrieve_for_rerank(&self, conn: &Connection, query: &RetrievalQuery) -> TaskMgrResult<Vec<ScoredLearning>> {\n      self.retrieve(conn, query)\n  }\n  ```\n  Default delegates to `retrieve()` so existing backends and tests are unaffected.\n- Override `retrieve_for_rerank` on `CompositeBackend` (composite.rs): call EACH child backend's `retrieve_for_rerank` separately. Dedupe by learning ID across child results, keeping the highest score per learning. Concatenate `match_reason` strings (semicolon-separated) when same learning matched by multiple backends. **Do NOT apply the global max-merge sort or truncate.** The caller chooses slate size via `query.limit`. Return order: by descending dedup score (stable sort to preserve insertion order for ties).\n- Override `retrieve_for_rerank` on `VectorBackend` (vector.rs): same logic as `retrieve()` BUT skip the `score > 0.0` filter at line 111. Cosine similarity in `[-1, 1]` is mapped via `score = sim * SCORE_SCALE`. Allow any finite score through so the cross-encoder can rescue moderate-similarity candidates.\n- Do NOT override on `Fts5Backend` or `PatternsBackend` — default-impl (delegate to `retrieve`) is correct since their score scales aren't compromised by the same filter.\n- Tests:\n  - `test_default_retrieve_for_rerank_delegates`: ensure the trait default just calls retrieve (existing FTS5/patterns backends behave unchanged).\n  - `test_composite_retrieve_for_rerank_unions_per_backend`: stub three backends each returning a different set of ScoredLearnings; assert composite returns deduped union with max-per-learning scores and concatenated match_reasons.\n  - `test_composite_retrieve_for_rerank_no_max_merge_truncation`: assert returned count >= sum of per-backend counts minus duplicates (i.e. NO global truncation regardless of `query.limit`). The caller-side truncation lives in the recall pipeline (FEAT-005).\n  - `test_vector_retrieve_for_rerank_keeps_zero_scores`: store an embedding orthogonal to the query (cosine ≈ 0, score = 0.0). `retrieve()` filters it out; `retrieve_for_rerank()` includes it.\n  - `test_vector_retrieve_for_rerank_keeps_negative_scores`: store a NEGATIVE-similarity embedding (cosine = -0.5, score = -7.5). `retrieve_for_rerank` includes it (cross-encoder may still promote it).\n\nDO NOT:\n- Modify `CompositeBackend::retrieve()` (the non-rerank path). Keep today's max-merge for backward compat.\n- Truncate inside `retrieve_for_rerank` — the recall pipeline does that AFTER reranking.\n- Override on Fts5/Patterns — default delegation is correct.\n\nEdge cases:\n- A backend's `retrieve_for_rerank` returns Err: composite propagates the error. (Future: per-backend soft-fail could be added but out of scope here.)\n- All backends return empty: composite returns Ok(empty); recall pipeline handles by skipping the rerank phase.\n- Same learning matched by all 3 backends: deduped to 1 entry with max score and concatenated reasons.\n\nKnown-bad to guard against:\n- An impl that calls `self.retrieve(...)` (the max-merged version) inside `CompositeBackend::retrieve_for_rerank` defeats the entire purpose. Test must verify per-child invocation by stubbing 3 children and asserting all 3 are called.\n- An impl that filters cosine = 0.0 in `VectorBackend::retrieve_for_rerank` (copy-paste from retrieve()). Test must include a known cosine=0 case.",
+      "edgeCases": [
+        "All backends empty: Ok(empty); recall pipeline detects and skips rerank",
+        "Same learning in all 3 backends: deduped to 1 entry, max score, concatenated reasons",
+        "Backend returns Err: composite propagates",
+        "Cosine == 0.0: included by retrieve_for_rerank (excluded by retrieve)",
+        "Cosine < 0 (negative): included by retrieve_for_rerank"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Child backend returns Err",
+          "expectedBehavior": "CompositeBackend::retrieve_for_rerank propagates the first error encountered"
+        }
+      ],
+      "id": "FEAT-003",
+      "notes": "Test stubs: implement `RetrievalBackend` on a small `MockBackend` struct that records calls and returns canned results. Useful pattern for FEAT-005 too. Composite dedup logic: use a HashMap<i64, ScoredLearning> keyed by learning ID; on collision, keep max score and concat match_reason. SCORE_SCALE = 15.0 in vector.rs:31; preserve. Reuse: `cosine_similarity` at src/learnings/embeddings/mod.rs:199-219.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Default trait impl preserves existing backend behavior (no overrides needed for FTS5/patterns)",
+        "Composite uses HashMap dedup, not nested loops (O(N) not O(N²))",
+        "VectorBackend keeps the SCORE_SCALE scaling but drops only the `> 0.0` filter",
+        "Stable sort within composite — equal scores preserve insertion order (matches existing retrieve() guarantee)",
+        "No truncation inside retrieve_for_rerank — pipeline-side concern"
+      ],
+      "taskType": "implementation",
+      "title": "retrieve_for_rerank trait method + composite per-backend union + vector skip-zero override",
+      "touchesFiles": [
+        "src/learnings/retrieval/mod.rs",
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/vector.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `ProjectConfig` deserializes JSON `{\"rerankerUrl\":\"http://x\",\"rerankerModel\":\"m\",\"rerankerOverFetch\":5}` correctly.",
+        "Positive: `resolved_reranker_config()` returns `Some((url, model, 5))` when all three set.",
+        "Positive: returns `Some((url, model, 3))` when over_fetch unset.",
+        "Negative: returns `None` (no panic) when neither url nor model set, no stderr output.",
+        "Negative: returns `None` when only one of url/model set, with stderr warning.",
+        "Negative: ProjectConfig::default() produces None for all three fields.",
+        "Unit test: each of the 6 helper test cases above.",
+        "Unit test: missing config file → defaults → resolved_reranker_config() returns None.",
+        "Known-bad: an impl that returns Some(default_url, model, 3) when only model is set would fail `test_resolved_reranker_config_only_model_set`.",
+        "Failure mode: malformed JSON in config.json → existing read_project_config falls back to defaults (existing behavior at line 75-78), reranker disabled.",
+        "CONTRACT: `RecallCmdParams.reranker_url` / `reranker_model` / `reranker_over_fetch` fields are Option types; main.rs unpacks the helper's tuple into these fields when Some, leaves None when helper returns None."
+      ],
+      "dependsOn": [],
+      "description": "Add the three new optional config keys to `ProjectConfig` and a helper that validates them, returning `Some((url, model, over_fetch))` only when both URL and model are set.\n\nDO:\n- In `src/loop_engine/project_config.rs:9-48`: add three optional fields (camelCase via existing `#[serde(rename_all = \"camelCase\")]`):\n  - `reranker_url: Option<String>`\n  - `reranker_model: Option<String>`\n  - `reranker_over_fetch: Option<u32>`\n- Add corresponding fields to `ProjectConfig::default()` (None, None, None).\n- Add `pub fn resolved_reranker_config(&self) -> Option<(String, String, u32)>`:\n  - Returns `Some((url, model, over_fetch))` when BOTH `reranker_url` AND `reranker_model` are `Some`.\n  - Default `over_fetch` is 3 when unset; clamp to >=1 if set to 0 (eprintln warning).\n  - When exactly one of url/model is set: print `eprintln!(\"\\x1b[33m[warn]\\x1b[0m rerankerUrl/rerankerModel: both must be set; reranker disabled\")` and return None.\n  - When neither is set: return None silently.\n- Tests:\n  - `test_resolved_reranker_config_both_set`: returns Some.\n  - `test_resolved_reranker_config_only_url_set`: returns None and (test the helper at least; warning capture is best-effort).\n  - `test_resolved_reranker_config_only_model_set`: returns None.\n  - `test_resolved_reranker_config_neither_set`: returns None silently.\n  - `test_resolved_reranker_config_default_over_fetch`: when over_fetch unset and both url/model set, returns 3.\n  - `test_resolved_reranker_config_over_fetch_zero_clamped_to_one`: explicit 0 → 1 with warning.\n- Add new fields to `RecallCmdParams` in src/commands/recall.rs:18-35:\n  - `reranker_url: Option<String>`\n  - `reranker_model: Option<String>`\n  - `reranker_over_fetch: Option<u32>`\n- Wire from `read_project_config` in main.rs:440-471: call `proj_config.resolved_reranker_config()` once and stash the result in RecallCmdParams (the three Option fields).\n\nDO NOT:\n- Make these fields required.\n- Hardcode default url/model — they must be Option<String> so absence means 'reranker disabled'.\n- Validate the URL syntactically (let llama-box error at runtime if URL is bogus; we already soft-fail on transport).\n\nEdge cases:\n- Config file doesn't exist: ProjectConfig::default(), all three None, reranker disabled.\n- Config has rerankerUrl but no rerankerModel: warn, return None.\n- Config has rerankerOverFetch=0: clamp to 1, warn.\n- Config has rerankerOverFetch=999: pass through; the cap to 30 lives in FEAT-005's pipeline.\n\nKnown-bad to guard against:\n- An impl that defaults reranker_url to 'http://localhost:8080' would silently enable the reranker for users who never opted in. Both keys MUST be Option with no default value.\n- An impl that returns Some when only one key is set (treating the other as default) — see above.",
+      "edgeCases": [
+        "Config file missing: defaults, reranker disabled silently",
+        "Both keys empty strings: returns Some('', '', 3) — let llama-box error at runtime",
+        "over_fetch = 0: clamp to 1 with warning",
+        "over_fetch unset: defaults to 3"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Malformed config.json",
+          "expectedBehavior": "Existing fallback to defaults (line 75-78); reranker disabled"
+        }
+      ],
+      "id": "FEAT-004",
+      "notes": "ProjectConfig already uses `#[serde(rename_all = \"camelCase\")]` at line 11 — new fields just need snake_case Rust names. Pattern reference: existing `ollama_url` / `embedding_model` Option<String> handling. Default trait impl already covers None case at lines 50-62. The helper's stderr warning for the asymmetric case fires once at config-load time (before recall runs); no need to wire through verbose flag.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Both keys required to enable reranker — neither defaults",
+        "Asymmetric config (one key set) emits a clear warning and disables the reranker",
+        "over_fetch clamped to >=1 if set to 0",
+        "ProjectConfig::default() unchanged for users who never set these keys"
+      ],
+      "taskType": "implementation",
+      "title": "Reranker config keys + resolved_reranker_config helper",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/commands/recall.rs",
+        "src/main.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `recall --query 'x'` with reranker configured and llama-box mock up → results in mock-defined order, with each ScoredLearning's relevance_score replaced by cross-encoder score.",
+        "Positive: `recall --query 'x' --for-task TASK` with reranker → rerank applied first, UCB breaks ties within ±0.05 score band.",
+        "Positive: `recall --query 'x'` with reranker configured but llama-box DOWN → stderr warning printed, results returned in un-reranked order (NO error propagated, exit 0).",
+        "Positive: `recall --for-task TASK` (no query) → today's UCB pipeline; reranker NOT called even if configured.",
+        "Positive: CLI `--help` shows the new `--allow-degraded` flag and updated MATCHING BEHAVIOR section.",
+        "Positive: CLAUDE.md has a 'Reranker (optional)' subsection.",
+        "Negative: `recall --query ''` (empty) → no Ollama call, no reranker call.",
+        "Negative: `recall_learnings()` legacy entry signature unchanged — grep `pub fn recall_learnings` shows same signature.",
+        "Negative: reranker Err does NOT propagate to caller. Test asserts Ok and stderr capture.",
+        "Unit test: `test_over_fetch_caps_at_30` — limit=20, over_fetch=3, slate_limit=30.",
+        "Unit test: `test_over_fetch_min` — limit=5, over_fetch=3, slate_limit=15.",
+        "Unit test: `test_recall_query_and_for_task_rerank_then_ucb_tiebreak` — UCB only fires within ±0.05 bands.",
+        "Unit test: `test_recall_reranker_err_falls_back` — Err → un-reranked results + stderr warning.",
+        "Known-bad: an impl calling `backend.retrieve` instead of `backend.retrieve_for_rerank` would still pass `test_recall_query_only_applies_rerank` (because rerank still happens) but fail tests that depend on union-of-backends diversity. Add a test that the rerank slate includes a learning matched only by vector but with a low score (filtered by `retrieve` but kept by `retrieve_for_rerank`).",
+        "Failure mode: reranker times out → soft-fail (warn + un-reranked); recall exits 0.",
+        "Failure mode: rerank validation error (FEAT-002 returns Err) → soft-fail.",
+        "CONTRACT: `RecallParams.reranker` is `Option<Box<dyn Reranker + Send + Sync>>` (verify Send/Sync because RecallParams is passed across modules).",
+        "CONTRACT: `Reranker::rerank` (FEAT-002) replaces `relevance_score` with cross-encoder score — pipeline relies on this for `combine_scores` and ±0.05 banding."
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Wire the reranker into `retrieve_and_rank`. Apply only when query text is non-empty. Over-fetch from per-backend union, rerank, optionally UCB-tiebreak, truncate. Soft-fail with stderr warning on reranker errors.\n\nDO:\n- Modify `retrieve_and_rank` in src/learnings/recall/mod.rs:102-147:\n  1. Build RetrievalQuery as today (lines 110-117).\n  2. If `params.for_task` set, resolve task context (lines 119-126).\n  3. **If reranker configured AND query.text is Some(non-empty)**:\n     a. Compute slate_limit = `min(params.limit * over_fetch, 30)`. Inflate `query.limit = slate_limit`.\n     b. Call `backend.retrieve_for_rerank(conn, &query)` (the per-backend union from FEAT-003).\n     c. Call `reranker.rerank(query.text.as_deref().unwrap(), candidates)`.\n     d. On `Err`: `eprintln!(\"\\x1b[33m[warn]\\x1b[0m reranker {url}: {err}; using un-reranked order\")` and use the un-reranked candidates with their original scores.\n     e. If `params.for_task.is_some()`: apply UCB tiebreak — group consecutive results within ±0.05 normalized rerank score; within each band sort by UCB descending. Use existing `ucb_for_learning` and `bandit::get_total_window_shows`.\n     f. Truncate to `params.limit`. Return.\n  4. **Else** (no reranker OR no query text): existing pipeline (`backend.retrieve` + UCB fallback + `rerank_with_ucb`).\n- Pass the reranker through. Approach: extend `RecallParams` with `reranker: Option<Box<dyn Reranker + Send + Sync>>` and `reranker_over_fetch: u32` (default 3). Plumb from `RecallCmdParams::reranker_url`/`reranker_model`/`reranker_over_fetch` in src/commands/recall.rs:113-137 — when both url+model are Some, build `Some(Box::new(LlamaBoxReranker::new(url, model)))` and put on RecallParams.\n- Update `recall_learnings_scored` (line 205) to accept the new RecallParams shape. Keep `recall_learnings()` (line 153) unchanged — it builds RecallParams without reranker.\n- Update CLI after_help block at src/cli/commands.rs:440-467:\n  - Document `--allow-degraded`.\n  - Add a 'RERANKER' section: 'Set rerankerUrl + rerankerModel in .task-mgr/config.json to enable cross-encoder reranking via gpustack/llama-box. Optional rerankerOverFetch (default 3) controls candidate over-retrieval.'\n  - Fix the inaccurate 'Results are ranked by last_applied_at' line — replace with: 'Results are ranked by relevance, with UCB exploration breaking ties within the same relevance tier (or within ±0.05 rerank score when a reranker is configured).'\n- Update CLAUDE.md: add a 'Reranker (optional)' subsection under 'Embedding / Ollama Configuration' documenting:\n  - The three config keys.\n  - llama-box install pointer (https://github.com/gpustack/llama-box) and example invocation.\n  - Soft-fail asymmetry: reranker = quality booster (warn + skip), Ollama = correctness primitive (hard-fail unless --allow-degraded).\n  - `--query \"X\" --for-task Y` runs both rerank and UCB tiebreak.\n  - Pointer to docker-compose at `docker/docker-compose.yml` (FEAT-006).\n- Tests in src/commands/recall.rs:\n  - `test_recall_skips_reranker_when_no_query_text`: --for-task only + reranker mock that panics if called → assert no call (verify panic doesn't fire).\n  - `test_recall_skips_reranker_when_unconfigured`: no reranker on RecallParams → today's pipeline runs.\n  - `test_recall_query_only_applies_rerank`: mock reranker returns deterministic order [2, 0, 1] → assert recall returns matching order.\n  - `test_recall_query_and_for_task_rerank_then_ucb_tiebreak`: pre-populate UCB stats, mock reranker returns same score for two learnings → assert UCB stats break the tie.\n  - `test_recall_reranker_err_falls_back_to_unreranked`: mock reranker returns Err → assert eprintln warning emitted (capture stderr) AND results returned in un-reranked order, no error to caller.\n  - `test_over_fetch_caps_at_30`: limit=20, over_fetch=3 → effective slate=30 (not 60). Mock reranker assertion on candidates length.\n  - `test_over_fetch_uses_min_with_30`: limit=5, over_fetch=3 → slate=15.\n\nDO NOT:\n- Run reranker when query text is empty or None — short-circuit at the top of the if branch.\n- Truncate the slate before reranking — let `retrieve_for_rerank` return the full union, then rerank, then truncate.\n- Convert reranker errors to recall errors — soft-fail behavior is mandatory.\n- Use `recall_learnings()` legacy entry to plumb reranker — that entry stays unchanged (back-compat).\n\nEdge cases:\n- query text == \"\": no rerank (matches FEAT-001's empty-string short-circuit).\n- limit == 0: existing code at line 107 normalizes to 5; over_fetch then runs against 5.\n- over_fetch == 1: slate_limit == limit; rerank still runs but adds no headroom.\n- backend.retrieve_for_rerank returns empty: skip rerank, return empty.\n- All candidates have identical rerank scores: UCB tiebreak applies entirely within one band.\n\nKnown-bad to guard against:\n- Calling `backend.retrieve` (the max-merge path) instead of `backend.retrieve_for_rerank` defeats FEAT-003. Test must inspect the call (e.g. via mock CompositeBackend or by asserting result diversity that only union provides).\n- Forgetting to restore `query.limit` to params.limit after the inflated slate fetch — would cause double-truncation. Either don't mutate `query`, or save/restore.\n- Using ±0.05 against raw rerank scores instead of normalized — rerank scores can be in (0, 1) for jina-v2 OR in (-inf, +inf) for some models. Normalize via min-max within the result set OR document the assumption that jina-v2 returns sigmoid-bounded scores and the band is in absolute units.",
+      "edgeCases": [
+        "Empty query: no rerank, no Ollama call",
+        "limit=0: existing normalization to 5 applies, over_fetch on top",
+        "over_fetch=1: slate equals limit, rerank still runs",
+        "Empty candidate slate: skip rerank, return empty",
+        "All identical rerank scores: UCB tiebreak applies across whole band",
+        "--query + --for-task: rerank first, UCB tiebreak within bands"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Reranker connection refused / timeout",
+          "expectedBehavior": "Soft-fail: stderr warning + un-reranked results, exit 0"
+        },
+        {
+          "cause": "Reranker response validation error",
+          "expectedBehavior": "Soft-fail: stderr warning + un-reranked results, exit 0"
+        },
+        {
+          "cause": "Backend (FTS5/patterns/vector) returns Err during retrieve_for_rerank",
+          "expectedBehavior": "Propagate Err — backend errors are not soft-failable (DB-level issues)"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "modifiesBehavior=true because this changes recall ordering semantics for callers using --query when reranker is configured. Affected callers: src/main.rs:440-471 (CLI), any external consumer using `recall_learnings_scored`. Reuse: `combine_scores` and `ucb_for_learning` at recall/mod.rs:351-365. Stable sort within UCB band — Rust's `slice::sort_by` is stable. ±0.05 band: apply against the rerank score AS-RETURNED by the cross-encoder (jina-v2 returns sigmoid-bounded scores in (0, 1)). Document the assumption in a code comment. Soft-fail message format: `\\x1b[33m[warn]\\x1b[0m reranker <url>: <err>; using un-reranked order`. Capture stderr in tests via `gag` crate or by redirecting via a custom hook (check what the project already uses; otherwise log via `eprintln!` and don't assert on stderr text — assert behaviorally that results came back in original order).",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Soft-fail on reranker errors: stderr warning + return un-reranked, never propagate Err",
+        "Empty query short-circuits before any rerank attempt",
+        "Over-fetch capped at 30 to bound llama-box load",
+        "UCB tiebreak only fires when both --query and --for-task are set",
+        "±0.05 band documented in code comment as 'jina-v2 sigmoid score'",
+        "recall_learnings() legacy entry signature unchanged",
+        "Stable sort within UCB tie bands"
+      ],
+      "taskType": "implementation",
+      "title": "Recall pipeline integration: over-fetch + rerank + UCB tiebreak + soft-fail + docs",
+      "touchesFiles": [
+        "src/learnings/recall/mod.rs",
+        "src/learnings/mod.rs",
+        "src/commands/recall.rs",
+        "src/cli/commands.rs",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `docker/ollama/Dockerfile` exists, FROM ollama/ollama, bakes the embedding model via ENV + RUN ollama pull pattern.",
+        "Positive: `docker/llama-box/Dockerfile` exists, FROM gpustack/llama-box, bakes jina-reranker-v2-base-multilingual GGUF.",
+        "Positive: `docker/docker-compose.yml` defaults to GPU, has `--profile cpu` for CPU-only.",
+        "Positive: `docker compose --profile cpu config` exits 0 (validates compose syntax) — verifiable in CI / locally.",
+        "Positive: `docker/README.md` documents both profiles with copy-pasteable commands.",
+        "Negative: compose default profile is NOT cpu — user must explicitly --profile cpu to disable GPU.",
+        "Negative: Dockerfiles do NOT pull models at container start; models are on-disk after build.",
+        "Negative: no `latest` Docker image tag used without a TODO comment about pinning.",
+        "Verify: built images launch successfully with `docker compose --profile cpu up -d --build` (manual smoke; document in PR description).",
+        "Verify: from host, `curl localhost:11434/api/tags` returns the baked embedding model in the list.",
+        "Verify: from host, `curl -X POST localhost:8080/v1/rerank -H 'Content-Type: application/json' -d '{\"model\":\"jina-reranker-v2-base-multilingual\",\"query\":\"test\",\"documents\":[\"a\",\"b\"],\"top_n\":2}'` returns a valid response.",
+        "Known-bad: a compose file with profile [gpu] on the GPU-only service (instead of [cpu] on the CPU-only variant) would mean the default `docker compose up` runs nothing — verify by ensuring `docker compose config` (no profile) shows BOTH services.",
+        "Failure mode: GPU host without Nvidia driver — compose up errors with a clear message (Docker's behavior; document in README).",
+        "Failure mode: build network failure on model download — RUN command retries; document timeout expectations in README.",
+        "CONTRACT: compose service ports match `ollamaUrl: http://localhost:11434` and `rerankerUrl: http://localhost:8080` — verify by grepping the example config in README.md against compose port mappings."
+      ],
+      "dependsOn": [],
+      "description": "Add `docker/` directory with Dockerfiles that bake the configured embedding and reranker models, plus a docker-compose file that defaults to Nvidia GPU and falls back to CPU via `--profile cpu`.\n\nDO:\n- Create `docker/ollama/Dockerfile`:\n  - `FROM ollama/ollama:latest`\n  - Bake the embedding model: `ENV OLLAMA_MODEL=hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`\n  - Use a build script that starts ollama, runs `ollama pull $OLLAMA_MODEL`, then commits — typical pattern is a multi-stage build or a `RUN` that starts the daemon, pulls, and stops.\n  - Concrete pattern: `RUN ollama serve & sleep 3 && ollama pull $OLLAMA_MODEL && pkill ollama`. Use `&& sleep 1` to let pkill complete.\n  - `EXPOSE 11434`\n  - Default `CMD [\"serve\"]` (inherited from base).\n- Create `docker/llama-box/Dockerfile`:\n  - `FROM ghcr.io/gpustack/llama-box:latest` (or pin to a specific version for reproducibility — leave a TODO comment with version pin guidance)\n  - Bake the reranker model: download `gpustack/jina-reranker-v2-base-multilingual-GGUF` to a known path.\n  - Use `huggingface-cli download` if the base image has it, OR `wget` from huggingface.co directly with retry.\n  - `EXPOSE 8080`\n  - `CMD` runs llama-box with the rerank flag and the baked model path: `[\"--rerank\", \"--model\", \"/models/jina-reranker-v2.gguf\", \"--port\", \"8080\", \"--host\", \"0.0.0.0\"]` (verify exact arg shape from llama-box docs/help — link to https://github.com/gpustack/llama-box in the Dockerfile comment).\n- Create `docker/docker-compose.yml`:\n  - Two services: `ollama` and `llama-box`.\n  - **Default profile = GPU**: each service has `deploy.resources.reservations.devices` block requesting Nvidia GPU.\n  - **Optional CPU profile**: `profiles: [cpu]` on duplicated services (or use compose's profile mechanism) that omits the GPU reservation. Users run `docker compose up` for GPU (default) or `docker compose --profile cpu up` for CPU.\n  - Healthchecks: both services have HTTP healthchecks against their respective endpoints (`/api/tags` for Ollama, `/v1/rerank` not idempotent — use `/health` if llama-box exposes one, else a simple TCP check via `nc -z`).\n  - Network: shared bridge so task-mgr (on host) can reach both via published ports.\n  - Ports: Ollama → 11434, llama-box → 8080.\n  - Volumes: model cache shared via named volumes so rebuilds don't re-download. (Even with baked-in models, a volume helps with first-run resilience and lets the user pull additional models without rebuild.)\n- Create `docker/README.md` (one screen):\n  - `docker compose up -d` (GPU) — primary path\n  - `docker compose --profile cpu up -d` — CPU fallback\n  - Pointer to `.task-mgr/config.json` example: `{\"version\":1,\"rerankerUrl\":\"http://localhost:8080\",\"rerankerModel\":\"jina-reranker-v2-base-multilingual\",\"ollamaUrl\":\"http://localhost:11434\"}`\n  - Note that the embedding model is baked at build time — change `OLLAMA_MODEL` ENV in `docker/ollama/Dockerfile` and rebuild to swap.\n- Verification: `docker compose config --profile cpu` succeeds (validates compose syntax), and `docker compose --profile cpu up -d --build` succeeds in the verification step.\n\nDO NOT:\n- Use the `:latest` tag in production guidance — leave a TODO for pinning, but use latest for the initial PR to avoid stale-pin churn.\n- Hardcode the embedding model in the compose file — keep it in the Dockerfile so swapping is one place.\n- Run as root if the base image supports a non-root user — but don't fight Ollama's image conventions.\n- Make GPU the silent default that fails on machines without Nvidia drivers — the CPU profile MUST be documented prominently.\n- Add the Docker assets to CI yet (out of scope; users run locally).\n\nEdge cases:\n- User has no Nvidia driver: `docker compose up` fails fast with a clear error from compose. They run `--profile cpu`.\n- User on Apple Silicon: GPU profile fails (no Nvidia); CPU profile works but is slow. README notes Mac users may prefer host-native ollama+llama-box for MPS.\n- User on Linux without GPU: same as no-driver case.\n- Model GGUF file size exceeds Docker layer limits: jina-reranker-v2 base is ~600MB, jina-embeddings-v5 small Q8_0 is ~150MB. Both well within layer limits. No action needed.\n- Network failure during build: `RUN ollama pull` retries automatically; for llama-box's wget, add `--tries=3 --waitretry=10`.\n\nKnown-bad to guard against:\n- A compose file that defaults to CPU (forgetting GPU as default) — user explicitly asked for GPU-default.\n- A Dockerfile that pulls the model at runtime (defeats 'baked in' decision). Test: `docker run` the image without network access — embedding/rerank should still work because models are on-disk.\n- A compose file that uses `command:` to override the Dockerfile CMD — instead, put CMD in the Dockerfile for portability across non-compose runtimes.\n- A llama-box command line that points at a non-existent model file (typo in the path between Dockerfile bake and compose CMD) — verify by running `docker compose --profile cpu up` and checking llama-box logs for the model load.",
+      "edgeCases": [
+        "No Nvidia driver: compose errors clearly; CPU profile workaround documented",
+        "Apple Silicon: GPU fails; CPU works slowly; README points at host-native alternative for MPS",
+        "Build network failure during model pull: retries documented",
+        "Different embedding model preferred: change ENV in Dockerfile and rebuild"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Build-time model download fails",
+          "expectedBehavior": "RUN retries; on persistent failure, build fails with descriptive error"
+        },
+        {
+          "cause": "GPU profile without Nvidia driver at runtime",
+          "expectedBehavior": "Compose up errors with Docker's standard 'GPU not available' message"
+        }
+      ],
+      "id": "FEAT-006",
+      "notes": "Use the SAME embedding model already in the codebase: `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0` (defined as DEFAULT_EMBEDDING_MODEL at src/learnings/embeddings/mod.rs:14-15). For reranker: `jina-reranker-v2-base-multilingual` from gpustack/jina-reranker-v2-base-multilingual-GGUF on huggingface. llama-box CLI flag exact format: check https://github.com/gpustack/llama-box README; reference shows `--rerank --model PATH --port N --host 0.0.0.0`. GPU profile syntax for Nvidia in compose: `deploy.resources.reservations.devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]`. The user explicitly requested 'nvidia GPU required unless --profile cpu' — that's the default behavior.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Models baked into images at build time (verifiable: container runs without network)",
+        "GPU is the default; CPU is a documented opt-out via profile",
+        "compose syntax validates (`docker compose config` succeeds)",
+        "Healthchecks defined for both services",
+        "README has copy-pasteable commands and matches compose port mappings"
+      ],
+      "taskType": "implementation",
+      "title": "Docker assets: Dockerfiles for Ollama + llama-box and docker-compose with GPU/CPU profiles",
+      "touchesFiles": [
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile",
+        "docker/docker-compose.yml",
+        "docker/README.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: No code duplication that crosses 2+ call sites without justification",
+        "Positive: Functions in retrieve_and_rank kept under ~50 lines (the two-branch structure is acceptable but watch for nested complexity)",
+        "Positive: LlamaBoxReranker HTTP error handling consistent with OllamaEmbedder pattern (timeout + descriptive error)",
+        "Positive: Reranker trait has explicit 'test-double injection only' doc-comment",
+        "Positive: Code follows existing project patterns (ureq agents, ProjectConfig camelCase, Send + Sync trait objects)",
+        "Negative: No premature abstraction — additional Reranker impls or retrieval-policy types beyond what FEAT-001..006 require",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability across the recall pipeline, reranker module, retrieval trait extension, config plumbing, and Docker assets.\n\nDO: Check for duplicated logic between LlamaBoxReranker's HTTP error handling and OllamaEmbedder's; check function lengths in the new retrieve_and_rank flow; check that the Reranker trait justification doc-comment is present; check that the asymmetric soft-fail (reranker) vs hard-fail (Ollama) is documented in code, not just CLAUDE.md.\nDO NOT: Skip — this gate catches issues before final review. Do NOT propose new abstractions just to look thorough; only flag duplication that crosses 2+ call sites with the same shape.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across modules (ureq agent setup, error message formatting)",
+        "Single-responsibility functions",
+        "Pattern consistency with existing OllamaEmbedder, RetrievalBackend impls, ProjectConfig handling",
+        "No premature abstraction (Reranker trait stays single-impl in production)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/error.rs",
+        "src/learnings/retrieval/vector.rs",
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/mod.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/reranker/mod.rs",
+        "src/learnings/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/commands/recall.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "Cargo.toml",
+        "CLAUDE.md",
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile",
+        "docker/docker-compose.yml",
+        "docker/README.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified) — `OllamaUnreachable` constructed in vector.rs, `LlamaBoxReranker::new` called in commands/recall.rs, `retrieve_for_rerank` called in recall/mod.rs.",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: FULL `cargo test` with no scope filter clean",
+        "Positive: `cargo clippy -- -D warnings` clean",
+        "Positive: `cargo fmt --check` clean",
+        "Positive: `docker compose --profile cpu config` validates (compose syntax check)",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings",
+        "Negative: `recall_learnings()` legacy entry signature unchanged (back-compat verified)",
+        "Documentation: CLAUDE.md updated with 'Reranker (optional)' subsection",
+        "Documentation: src/cli/commands.rs after_help reflects --allow-degraded and reranker config",
+        "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "End-to-end smoke completed and documented in progress-$PREFIX.txt"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Check every new function for error handling, check callers still work, verify no dead code, check that CLAUDE.md and after_help doc reflect the shipped behavior, manually verify the behavior matrix end-to-end where possible. Run full cargo test (no scope filter), cargo clippy -- -D warnings, cargo fmt --check.\n\nManual end-to-end smoke (document outcome in progress file):\n- Stop Ollama, run `task-mgr recall --query 'x'` → expect non-zero exit + OllamaUnreachable hints.\n- Same with `--allow-degraded` → expect exit 0.\n- Start docker-compose with `--profile cpu` → expect both services up; verify `curl localhost:11434/api/tags` and `curl localhost:8080` (or appropriate llama-box endpoint).\n- Configure rerankerUrl/rerankerModel, run `recall --query` with mock data → expect rerank applied (visible in --verbose output).\n- Stop llama-box, same recall → expect stderr warning + un-reranked results.\n\nDO NOT: Skip the integration wiring check. Do NOT scope the test suite — this is THE place the full suite runs.",
+      "estimatedEffort": "high",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically. End-to-end smoke MUST be documented (which steps ran, which were skipped if Docker is unavailable in the test environment). For mockito-based reranker tests, ensure stderr capture works without leaking warnings into other tests.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point",
+        "Full suite green including pre-existing",
+        "End-to-end behavior matrix verified by smoke test (or smoke-test failure documented with reason)",
+        "CLAUDE.md + CLI after_help match shipped behavior"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/error.rs",
+        "src/learnings/retrieval/vector.rs",
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/mod.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/reranker/mod.rs",
+        "src/learnings/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/commands/recall.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "Cargo.toml",
+        "CLAUDE.md",
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile",
+        "docker/docker-compose.yml",
+        "docker/README.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

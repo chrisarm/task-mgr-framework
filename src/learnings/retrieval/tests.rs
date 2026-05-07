@@ -9,7 +9,11 @@ use crate::models::{Confidence, LearningOutcome};
 
 use super::fts5::{escape_fts5_query, is_fts5_available};
 use super::patterns::{extract_task_prefix, file_matches_pattern};
-use super::{CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery};
+use super::{
+    CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery,
+    ScoredLearning,
+};
+use crate::models::Learning;
 
 fn setup_db() -> (TempDir, Connection) {
     use crate::db::migrations::run_migrations;
@@ -1785,4 +1789,296 @@ fn test_supersession_filter_is_transitive_over_chain() {
         ids.contains(&Some(c_id)),
         "C (id={c_id}) is the terminal supersession — must appear; got {ids:?}"
     );
+}
+
+// ========== retrieve_for_rerank Tests (FEAT-003) ==========
+
+/// Stub backend whose retrieve / retrieve_for_rerank call counts are observable.
+struct StubBackend {
+    backend_name: &'static str,
+    results: Vec<ScoredLearning>,
+    retrieve_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    rerank_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StubBackend {
+    fn new(name: &'static str, results: Vec<ScoredLearning>) -> Self {
+        Self {
+            backend_name: name,
+            results,
+            retrieve_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rerank_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl RetrievalBackend for StubBackend {
+    fn name(&self) -> &str {
+        self.backend_name
+    }
+
+    fn retrieve(
+        &self,
+        _conn: &rusqlite::Connection,
+        _query: &RetrievalQuery,
+    ) -> crate::TaskMgrResult<Vec<ScoredLearning>> {
+        self.retrieve_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.results.clone())
+    }
+
+    fn retrieve_for_rerank(
+        &self,
+        _conn: &rusqlite::Connection,
+        _query: &RetrievalQuery,
+    ) -> crate::TaskMgrResult<Vec<ScoredLearning>> {
+        self.rerank_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.results.clone())
+    }
+}
+
+fn make_scored(id: i64, score: f64, reason: &str) -> ScoredLearning {
+    let mut learning = Learning::new(crate::models::LearningOutcome::Pattern, "title", "content");
+    learning.id = Some(id);
+    ScoredLearning {
+        learning,
+        relevance_score: score,
+        match_reason: Some(reason.to_string()),
+    }
+}
+
+#[test]
+fn test_default_retrieve_for_rerank_delegates_to_retrieve() {
+    // For Fts5Backend (no override), retrieve_for_rerank must return the same
+    // results as retrieve when called with the same query.
+    let (_dir, conn) = setup_db_with_fts5();
+
+    create_test_learning(&conn, "Alpha", "content alpha", LearningOutcome::Pattern);
+    create_test_learning(&conn, "Beta", "content beta", LearningOutcome::Pattern);
+
+    let backend = Fts5Backend;
+    let query = RetrievalQuery {
+        text: Some("alpha".to_string()),
+        limit: 10,
+        ..Default::default()
+    };
+
+    let via_retrieve = backend.retrieve(&conn, &query).unwrap();
+    let via_rerank = backend.retrieve_for_rerank(&conn, &query).unwrap();
+
+    let ids_retrieve: Vec<_> = via_retrieve.iter().map(|r| r.learning.id).collect();
+    let ids_rerank: Vec<_> = via_rerank.iter().map(|r| r.learning.id).collect();
+    assert_eq!(
+        ids_retrieve, ids_rerank,
+        "default retrieve_for_rerank must delegate to retrieve (same results)"
+    );
+}
+
+#[test]
+fn test_composite_retrieve_for_rerank_calls_child_retrieve_for_rerank() {
+    // CompositeBackend::retrieve_for_rerank must call each child's retrieve_for_rerank,
+    // not retrieve. Verified via per-stub call counters.
+    let (_dir, conn) = setup_db();
+
+    let a_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let b_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let stub_a = StubBackend {
+        backend_name: "A",
+        results: vec![make_scored(1, 5.0, "A")],
+        retrieve_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        rerank_calls: a_calls.clone(),
+    };
+    let stub_b = StubBackend {
+        backend_name: "B",
+        results: vec![make_scored(2, 3.0, "B")],
+        retrieve_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        rerank_calls: b_calls.clone(),
+    };
+
+    let composite = CompositeBackend::new(vec![Box::new(stub_a), Box::new(stub_b)]);
+    let query = RetrievalQuery {
+        limit: 10,
+        ..Default::default()
+    };
+    composite.retrieve_for_rerank(&conn, &query).unwrap();
+
+    assert_eq!(
+        a_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "stub A's retrieve_for_rerank must be called exactly once"
+    );
+    assert_eq!(
+        b_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "stub B's retrieve_for_rerank must be called exactly once"
+    );
+}
+
+#[test]
+fn test_composite_retrieve_for_rerank_unions_per_backend() {
+    // A:{L1,L2}, B:{L2,L3}, C:{L4} → union {L1,L2,L3,L4} with L2 score = max(A,B).
+    let (_dir, conn) = setup_db();
+
+    // L2 appears in both A (score 3.0) and B (score 8.0) — composite should keep 8.0
+    // and concatenate the reasons.
+    let stub_a = StubBackend::new(
+        "A",
+        vec![make_scored(1, 5.0, "A"), make_scored(2, 3.0, "A")],
+    );
+    let stub_b = StubBackend::new(
+        "B",
+        vec![make_scored(2, 8.0, "B"), make_scored(3, 4.0, "B")],
+    );
+    let stub_c = StubBackend::new("C", vec![make_scored(4, 2.0, "C")]);
+
+    let composite =
+        CompositeBackend::new(vec![Box::new(stub_a), Box::new(stub_b), Box::new(stub_c)]);
+    let query = RetrievalQuery {
+        limit: 10,
+        ..Default::default()
+    };
+    let results = composite.retrieve_for_rerank(&conn, &query).unwrap();
+
+    assert_eq!(results.len(), 4, "must return all 4 distinct learnings");
+
+    // Results must be sorted descending by score.
+    let ids: Vec<i64> = results.iter().map(|r| r.learning.id.unwrap()).collect();
+    assert_eq!(ids[0], 2, "L2 (score 8.0) must be first");
+    assert_eq!(ids[1], 1, "L1 (score 5.0) must be second");
+    assert_eq!(ids[2], 3, "L3 (score 4.0) must be third");
+    assert_eq!(ids[3], 4, "L4 (score 2.0) must be fourth");
+
+    // L2 score must be max(3.0, 8.0) = 8.0
+    let l2 = results.iter().find(|r| r.learning.id == Some(2)).unwrap();
+    assert!(
+        (l2.relevance_score - 8.0).abs() < 1e-9,
+        "L2 score must be max(3.0, 8.0) = 8.0, got {}",
+        l2.relevance_score
+    );
+
+    // L2 match_reason must concatenate both backends' reasons.
+    let reason = l2.match_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("A") && reason.contains("B"),
+        "L2 match_reason must include both 'A' and 'B', got: {reason}"
+    );
+}
+
+#[test]
+fn test_composite_retrieve_for_rerank_no_truncation() {
+    // retrieve_for_rerank must NOT truncate to query.limit regardless of how small the limit is.
+    let (_dir, conn) = setup_db();
+
+    let stub_a = StubBackend::new(
+        "A",
+        vec![
+            make_scored(1, 9.0, "A"),
+            make_scored(2, 8.0, "A"),
+            make_scored(3, 7.0, "A"),
+        ],
+    );
+    let stub_b = StubBackend::new(
+        "B",
+        vec![
+            make_scored(4, 6.0, "B"),
+            make_scored(5, 5.0, "B"),
+            make_scored(6, 4.0, "B"),
+        ],
+    );
+    let stub_c = StubBackend::new(
+        "C",
+        vec![make_scored(7, 3.0, "C"), make_scored(8, 2.0, "C")],
+    );
+
+    let composite =
+        CompositeBackend::new(vec![Box::new(stub_a), Box::new(stub_b), Box::new(stub_c)]);
+    let query = RetrievalQuery {
+        limit: 1, // deliberately tiny — rerank path must ignore it
+        ..Default::default()
+    };
+
+    let results = composite.retrieve_for_rerank(&conn, &query).unwrap();
+    assert!(
+        results.len() >= 8,
+        "retrieve_for_rerank must not truncate to limit=1; got {} results",
+        results.len()
+    );
+}
+
+#[test]
+fn test_composite_hashmap_dedup_30_candidates_3_backends() {
+    // 30 candidates across 3 mock backends: IDs 1-10 each appear in all three backends
+    // with different scores and reasons. The merged slate must have exactly 10 unique IDs,
+    // each with the max score from any backend and all reasons concatenated.
+    let (_dir, conn) = setup_db();
+
+    // Backend A: IDs 1-10, scores 1.0..10.0, reason "A"
+    let a_results: Vec<ScoredLearning> = (1..=10).map(|i| make_scored(i, i as f64, "A")).collect();
+    // Backend B: IDs 1-10, scores 11.0..20.0 for even IDs, 0.5 for odd, reason "B"
+    let b_results: Vec<ScoredLearning> = (1..=10)
+        .map(|i| {
+            let score = if i % 2 == 0 { i as f64 + 10.0 } else { 0.5 };
+            make_scored(i, score, "B")
+        })
+        .collect();
+    // Backend C: IDs 1-10, same score as A (ties must not lower existing score), reason "C"
+    let c_results: Vec<ScoredLearning> = (1..=10).map(|i| make_scored(i, i as f64, "C")).collect();
+
+    let composite = CompositeBackend::new(vec![
+        Box::new(StubBackend::new("A", a_results)),
+        Box::new(StubBackend::new("B", b_results)),
+        Box::new(StubBackend::new("C", c_results)),
+    ]);
+    let query = RetrievalQuery {
+        limit: 30,
+        ..Default::default()
+    };
+    let results = composite.retrieve(&conn, &query).unwrap();
+
+    // Exactly 10 unique IDs
+    assert_eq!(
+        results.len(),
+        10,
+        "must deduplicate to exactly 10 unique IDs"
+    );
+
+    // All IDs 1-10 present exactly once
+    let mut seen_ids: Vec<i64> = results.iter().map(|r| r.learning.id.unwrap()).collect();
+    seen_ids.sort_unstable();
+    assert_eq!(seen_ids, (1..=10).collect::<Vec<i64>>());
+
+    // Each even ID must have max score from B (i + 10), not A's score i
+    for r in &results {
+        let id = r.learning.id.unwrap();
+        if id % 2 == 0 {
+            let expected = id as f64 + 10.0;
+            assert!(
+                (r.relevance_score - expected).abs() < 1e-9,
+                "id={id}: expected score {expected}, got {}",
+                r.relevance_score
+            );
+        }
+    }
+
+    // Each result's match_reason must contain all three backend tags ("A", "B", "C")
+    for r in &results {
+        let reason = r.match_reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("A") && reason.contains("B") && reason.contains("C"),
+            "id={}: match_reason must include A, B, C; got: {reason}",
+            r.learning.id.unwrap()
+        );
+    }
+
+    // Results sorted descending by score (max-merge scores)
+    for w in results.windows(2) {
+        assert!(
+            w[0].relevance_score >= w[1].relevance_score,
+            "results must be sorted descending: {} < {}",
+            w[0].relevance_score,
+            w[1].relevance_score
+        );
+    }
 }

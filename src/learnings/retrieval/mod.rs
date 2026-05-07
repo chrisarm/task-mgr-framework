@@ -74,6 +74,19 @@ pub trait RetrievalBackend: Send + Sync {
         query: &RetrievalQuery,
     ) -> TaskMgrResult<Vec<ScoredLearning>>;
 
+    /// Retrieve a broad candidate slate optimised for cross-encoder reranking.
+    ///
+    /// By default, delegates to [`retrieve`]. Backends may override to widen the
+    /// slate (e.g., skipping score thresholds). The result is **not** truncated to
+    /// `query.limit` — the recall pipeline truncates after reranking.
+    fn retrieve_for_rerank(
+        &self,
+        conn: &Connection,
+        query: &RetrievalQuery,
+    ) -> TaskMgrResult<Vec<ScoredLearning>> {
+        self.retrieve(conn, query)
+    }
+
     /// Index a new learning. No-op for backends that use SQLite triggers (e.g., FTS5).
     fn index(&self, _conn: &Connection, _learning: &Learning) -> TaskMgrResult<()> {
         Ok(())

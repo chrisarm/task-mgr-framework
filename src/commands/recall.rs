@@ -9,7 +9,8 @@ use crate::TaskMgrResult;
 use crate::cli::LearningOutcome as CliOutcome;
 use crate::learnings::embeddings::{DEFAULT_EMBEDDING_MODEL, DEFAULT_OLLAMA_URL};
 use crate::learnings::{
-    CompositeBackend, RecallParams as LibRecallParams, ScoredRecallResult, recall_learnings_scored,
+    CompositeBackend, LlamaBoxReranker, RecallParams as LibRecallParams, Reranker,
+    ScoredRecallResult, recall_learnings_scored,
 };
 use crate::models::LearningOutcome;
 
@@ -32,6 +33,16 @@ pub struct RecallCmdParams {
     pub embedding_model: Option<String>,
     /// When `true`, include superseded learnings in results (default: exclude them).
     pub include_superseded: bool,
+    /// llama-box reranker endpoint (None = reranker disabled).
+    pub reranker_url: Option<String>,
+    /// Cross-encoder model for the reranker endpoint (None = reranker disabled).
+    pub reranker_model: Option<String>,
+    /// Candidates per backend fetched before reranking (None = reranker disabled).
+    pub reranker_over_fetch: Option<u32>,
+    /// When `true`, vector recall degrades gracefully if Ollama is unreachable
+    /// (empty results instead of `OllamaUnreachable` error). Set by the
+    /// `--allow-degraded` CLI flag.
+    pub allow_degraded: bool,
 }
 
 /// Result of the recall command (wrapper for serialization).
@@ -111,6 +122,18 @@ fn cli_outcome_to_model(outcome: CliOutcome) -> LearningOutcome {
 ///
 /// Result containing the matching learnings.
 pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<RecallCmdResult> {
+    // Build the cross-encoder reranker if both URL + model were resolved from
+    // config. Either-or is treated as misconfiguration and silently disables
+    // rerank — the loud-failure path is the runtime soft-fail when the
+    // configured server is unreachable, not a startup config error.
+    let reranker: Option<Box<dyn Reranker + Send + Sync>> = match (
+        params.reranker_url.as_deref(),
+        params.reranker_model.as_deref(),
+    ) {
+        (Some(url), Some(model)) => Some(Box::new(LlamaBoxReranker::new(url, model))),
+        _ => None,
+    };
+
     // Convert CLI params to library params
     let lib_params = LibRecallParams {
         query: params.query.clone(),
@@ -119,16 +142,25 @@ pub fn recall(conn: &Connection, params: RecallCmdParams) -> TaskMgrResult<Recal
         outcome: params.outcome.map(cli_outcome_to_model),
         limit: params.limit,
         include_superseded: params.include_superseded,
+        allow_degraded: params.allow_degraded,
+        reranker,
+        reranker_over_fetch: params.reranker_over_fetch.unwrap_or(3),
     };
 
-    // Build composite backend with config-aware VectorBackend
+    // Build composite backend with config-aware VectorBackend.
+    //
+    // Strict mode is the default for free-text recall: if the user passed
+    // `--query` and Ollama is unreachable, hard-fail with actionable hints
+    // rather than silently dropping the semantic-search half of the result.
+    // `--allow-degraded` flips this back to the historical empty-on-error
+    // behavior for offline use.
     let ollama_url = params.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL);
     let model = params
         .embedding_model
         .as_deref()
         .unwrap_or(DEFAULT_EMBEDDING_MODEL);
 
-    let backend = CompositeBackend::with_ollama_config(ollama_url, model);
+    let backend = CompositeBackend::with_ollama_config(ollama_url, model, !params.allow_degraded);
 
     let result = recall_learnings_scored(conn, lib_params, &backend)?;
 

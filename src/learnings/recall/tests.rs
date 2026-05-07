@@ -1273,3 +1273,802 @@ fn test_learning_summary_deserializes_with_all_score_fields() {
     assert_eq!(parsed_no_ucb.match_reason, None);
     assert_eq!(parsed_no_ucb.relevance_score, 0.5);
 }
+
+// ========== FEAT-005: rerank pipeline integration ==========
+
+mod rerank {
+    use super::*;
+    use crate::TaskMgrResult;
+    use crate::learnings::recall::{recall_learnings_scored, recall_learnings_with_backend};
+    use crate::learnings::reranker::Reranker;
+    use crate::learnings::retrieval::{
+        Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery, ScoredLearning,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Test reranker that captures every call (for assertions on
+    /// candidate slate size, call count, etc.) and applies a configurable
+    /// behavior to the candidates.
+    type RerankFn =
+        Arc<dyn Fn(Vec<ScoredLearning>) -> TaskMgrResult<Vec<ScoredLearning>> + Send + Sync>;
+
+    struct MockReranker {
+        behavior: RerankFn,
+        captured: Mutex<Vec<Vec<ScoredLearning>>>,
+    }
+
+    impl MockReranker {
+        fn new<F>(behavior: F) -> Self
+        where
+            F: Fn(Vec<ScoredLearning>) -> TaskMgrResult<Vec<ScoredLearning>>
+                + Send
+                + Sync
+                + 'static,
+        {
+            Self {
+                behavior: Arc::new(behavior),
+                captured: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.captured.lock().unwrap().len()
+        }
+
+        fn last_candidates_len(&self) -> Option<usize> {
+            self.captured.lock().unwrap().last().map(Vec::len)
+        }
+    }
+
+    impl Reranker for MockReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            candidates: Vec<ScoredLearning>,
+        ) -> TaskMgrResult<Vec<ScoredLearning>> {
+            self.captured.lock().unwrap().push(candidates.clone());
+            (self.behavior)(candidates)
+        }
+    }
+
+    impl Reranker for Arc<MockReranker> {
+        fn rerank(
+            &self,
+            query: &str,
+            candidates: Vec<ScoredLearning>,
+        ) -> TaskMgrResult<Vec<ScoredLearning>> {
+            (**self).rerank(query, candidates)
+        }
+    }
+
+    /// Reranker that fails the test if rerank() is ever called.
+    struct PanicReranker;
+    impl Reranker for PanicReranker {
+        fn rerank(
+            &self,
+            _query: &str,
+            _candidates: Vec<ScoredLearning>,
+        ) -> TaskMgrResult<Vec<ScoredLearning>> {
+            panic!("rerank() must not be called for this case");
+        }
+    }
+
+    /// Composite without the vector backend (avoids Ollama in unit tests).
+    fn fts5_and_patterns() -> CompositeBackend {
+        CompositeBackend::new(vec![Box::new(Fts5Backend), Box::new(PatternsBackend)])
+    }
+
+    fn make_box_with<F>(behavior: F) -> (Box<dyn Reranker + Send + Sync>, Arc<MockReranker>)
+    where
+        F: Fn(Vec<ScoredLearning>) -> TaskMgrResult<Vec<ScoredLearning>> + Send + Sync + 'static,
+    {
+        let mock = Arc::new(MockReranker::new(behavior));
+        (Box::new(Arc::clone(&mock)), mock)
+    }
+
+    fn insert_task_with_file(conn: &Connection, task_id: &str, file_path: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title) VALUES (?1, 'Test Task')",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
+            [task_id, file_path],
+        )
+        .unwrap();
+    }
+
+    fn create_pattern_learning(
+        conn: &Connection,
+        title: &str,
+        content: &str,
+        applies_to_files: Option<Vec<String>>,
+    ) -> i64 {
+        let params = RecordLearningParams {
+            outcome: LearningOutcome::Pattern,
+            title: title.to_string(),
+            content: content.to_string(),
+            task_id: None,
+            run_id: None,
+            root_cause: None,
+            solution: None,
+            applies_to_files,
+            applies_to_task_types: None,
+            applies_to_errors: None,
+            tags: None,
+            confidence: Confidence::High,
+        };
+        record_learning(conn, params).unwrap().learning_id
+    }
+
+    // -- Acceptance #4 / #7: empty/None query must not call reranker --
+
+    #[test]
+    fn test_recall_skips_reranker_when_no_query_text() {
+        let (_temp_dir, conn) = setup_db();
+        insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+        create_pattern_learning(
+            &conn,
+            "DB pattern",
+            "transactions",
+            Some(vec!["src/db/*.rs".to_string()]),
+        );
+
+        let params = RecallParams {
+            for_task: Some("US-001".to_string()),
+            limit: 5,
+            // PanicReranker — if called the test fails.
+            reranker: Some(Box::new(PanicReranker)),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let result = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        // Today's UCB pipeline should still fire and surface the file-matched learning.
+        assert!(
+            result.learnings.iter().any(|l| l.title == "DB pattern"),
+            "for_task UCB pipeline must run when reranker is configured but no query"
+        );
+    }
+
+    #[test]
+    fn test_recall_skips_reranker_when_query_is_empty() {
+        let (_temp_dir, conn) = setup_db();
+        create_test_learning(&conn, "anything", "body", LearningOutcome::Pattern);
+
+        let params = RecallParams {
+            query: Some(String::new()),
+            limit: 5,
+            reranker: Some(Box::new(PanicReranker)),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        // Must not panic via PanicReranker.
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+    }
+
+    // -- Acceptance #1: rerank applied for --query --
+
+    #[test]
+    fn test_recall_query_only_applies_rerank() {
+        let (_temp_dir, conn) = setup_db();
+        let _id_a = create_test_learning(
+            &conn,
+            "Alpha post",
+            "alpha shared",
+            LearningOutcome::Pattern,
+        );
+        let _id_b = create_test_learning(
+            &conn,
+            "Bravo post",
+            "bravo shared",
+            LearningOutcome::Pattern,
+        );
+        let _id_c = create_test_learning(
+            &conn,
+            "Charlie post",
+            "charlie shared",
+            LearningOutcome::Pattern,
+        );
+
+        // Mock returns a deterministic descending order (positions 2, 0, 1) with
+        // explicit cross-encoder scores. Verifies (a) recall returns rows in the
+        // mock-defined order and (b) `relevance_score` is replaced by the
+        // cross-encoder score.
+        let (boxed, mock) = make_box_with(|mut candidates: Vec<ScoredLearning>| {
+            // Reorder: candidate at index 2 first (score 0.9), then 0 (0.5), then 1 (0.1).
+            assert!(
+                candidates.len() >= 3,
+                "expected >=3 candidates from FTS5/patterns"
+            );
+            let order = [2usize, 0, 1];
+            let mut out: Vec<ScoredLearning> = Vec::with_capacity(order.len());
+            for (rank, idx) in order.iter().enumerate() {
+                let score = match rank {
+                    0 => 0.9,
+                    1 => 0.5,
+                    _ => 0.1,
+                };
+                let mut s = candidates[*idx].clone();
+                s.relevance_score = score;
+                out.push(s);
+            }
+            // Drop unused candidates (over-fetch may return more than we reorder).
+            candidates.clear();
+            Ok(out)
+        });
+
+        let params = RecallParams {
+            query: Some("shared".to_string()),
+            limit: 3,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let result = recall_learnings_scored(&conn, params, &backend).unwrap();
+
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "reranker must be invoked exactly once"
+        );
+        assert_eq!(result.scored_learnings.len(), 3);
+        assert!(
+            (result.scored_learnings[0].relevance_score - 0.9).abs() < 1e-9,
+            "first row's relevance must be the cross-encoder 0.9"
+        );
+        assert!((result.scored_learnings[1].relevance_score - 0.5).abs() < 1e-9);
+        assert!((result.scored_learnings[2].relevance_score - 0.1).abs() < 1e-9);
+        // Free-text recall (no for_task) must not populate ucb_score.
+        assert!(
+            result
+                .scored_learnings
+                .iter()
+                .all(|s| s.ucb_score.is_none())
+        );
+    }
+
+    // -- Acceptance #2 / #12: rerank then UCB tiebreak within ±0.05 band --
+
+    #[test]
+    fn test_recall_query_and_for_task_rerank_then_ucb_tiebreak() {
+        use crate::learnings::bandit::{record_learning_applied, record_learning_shown};
+        let (_temp_dir, conn) = setup_db();
+        insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+
+        let id_a = create_test_learning(
+            &conn,
+            "Alpha shared",
+            "shared body",
+            LearningOutcome::Pattern,
+        );
+        let id_b = create_test_learning(
+            &conn,
+            "Bravo shared",
+            "shared body",
+            LearningOutcome::Pattern,
+        );
+        let id_c = create_test_learning(
+            &conn,
+            "Charlie shared",
+            "shared body",
+            LearningOutcome::Pattern,
+        );
+
+        // Give all three >= 3 window shows (UCB returns NEW_LEARNING_BONUS for
+        // <3) so the tiebreak compares exploitation+exploration. Bravo also
+        // gets applies, giving it the highest UCB exploitation rate.
+        for _ in 0..5 {
+            record_learning_shown(&conn, id_a, 1).unwrap();
+            record_learning_shown(&conn, id_b, 1).unwrap();
+            record_learning_shown(&conn, id_c, 1).unwrap();
+        }
+        for _ in 0..5 {
+            record_learning_applied(&conn, id_b).unwrap();
+        }
+
+        // Mock assigns Alpha=0.95, Bravo=0.92 (in band with Alpha), Charlie=0.50 (own band).
+        let (boxed, _mock) = make_box_with(move |candidates: Vec<ScoredLearning>| {
+            let mut out: Vec<ScoredLearning> = Vec::new();
+            for c in candidates {
+                let id = c.learning.id.unwrap_or(-1);
+                let score = if id == id_a {
+                    0.95
+                } else if id == id_b {
+                    0.92
+                } else if id == id_c {
+                    0.50
+                } else {
+                    0.10
+                };
+                let mut s = c;
+                s.relevance_score = score;
+                out.push(s);
+            }
+            out.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Ok(out)
+        });
+
+        let params = RecallParams {
+            query: Some("shared".to_string()),
+            for_task: Some("US-001".to_string()),
+            limit: 5,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let result = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+
+        // Bravo (higher UCB) tiebreaks above Alpha within the [0.95, 0.90] band.
+        // Charlie sits in its own band below the floor.
+        let titles: Vec<String> = result.learnings.iter().map(|l| l.title.clone()).collect();
+        let pos = |t: &str| titles.iter().position(|x| x == t).unwrap_or(usize::MAX);
+        assert!(
+            pos("Bravo shared") < pos("Alpha shared"),
+            "UCB tiebreak must place Bravo above Alpha within the rerank band; got {titles:?}"
+        );
+        assert!(
+            pos("Charlie shared") > pos("Bravo shared")
+                && pos("Charlie shared") > pos("Alpha shared"),
+            "Charlie's lower rerank tier must rank below the band; got {titles:?}"
+        );
+    }
+
+    #[test]
+    fn test_recall_ucb_tiebreak_does_not_invert_distinct_bands() {
+        use crate::learnings::bandit::{record_learning_applied, record_learning_shown};
+        let (_temp_dir, conn) = setup_db();
+        insert_task_with_file(&conn, "US-001", "src/db/schema.rs");
+
+        let id_low =
+            create_test_learning(&conn, "Low rerank", "shared body", LearningOutcome::Pattern);
+        let id_high = create_test_learning(
+            &conn,
+            "High rerank",
+            "shared body",
+            LearningOutcome::Pattern,
+        );
+
+        // Give the LOW-rerank candidate massive UCB. It must still rank below
+        // the HIGH-rerank candidate because they're in different ±0.05 bands.
+        for _ in 0..5 {
+            record_learning_applied(&conn, id_low).unwrap();
+        }
+        record_learning_shown(&conn, id_high, 1).unwrap();
+
+        let (boxed, _mock) = make_box_with(move |candidates: Vec<ScoredLearning>| {
+            let mut out: Vec<ScoredLearning> = Vec::new();
+            for c in candidates {
+                let id = c.learning.id.unwrap_or(-1);
+                let score = if id == id_high { 0.95 } else { 0.50 };
+                let mut s = c;
+                s.relevance_score = score;
+                out.push(s);
+            }
+            out.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Ok(out)
+        });
+
+        let params = RecallParams {
+            query: Some("shared".to_string()),
+            for_task: Some("US-001".to_string()),
+            limit: 5,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let result = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let titles: Vec<&str> = result.learnings.iter().map(|l| l.title.as_str()).collect();
+        let high_pos = titles.iter().position(|t| *t == "High rerank").unwrap();
+        let low_pos = titles.iter().position(|t| *t == "Low rerank").unwrap();
+        assert!(
+            high_pos < low_pos,
+            "high-rerank band must outrank low-rerank band even with stronger UCB on low; got {titles:?}"
+        );
+    }
+
+    // -- Acceptance #3 / #9 / #13 / #15 / #16: reranker Err soft-fails --
+
+    #[test]
+    fn test_recall_reranker_err_falls_back_to_unreranked() {
+        let (_temp_dir, conn) = setup_db();
+        let _ = create_test_learning(&conn, "Alpha", "shared body", LearningOutcome::Pattern);
+        let _ = create_test_learning(&conn, "Bravo", "shared body", LearningOutcome::Pattern);
+
+        let (boxed, mock) = make_box_with(|_candidates: Vec<ScoredLearning>| {
+            Err(crate::TaskMgrError::IoError(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "rerank request to http://127.0.0.1:9 failed: simulated outage",
+            )))
+        });
+
+        let params = RecallParams {
+            query: Some("shared".to_string()),
+            limit: 5,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+
+        // Soft-fail: returns Ok with un-reranked candidates in their original
+        // (per-backend union) order.
+        let result = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        assert_eq!(mock.call_count(), 1);
+        assert!(result.count >= 2, "un-reranked candidates must be returned");
+    }
+
+    // -- Acceptance #10 / #11: over-fetch slate sizing --
+
+    #[test]
+    fn test_over_fetch_caps_at_30() {
+        let (_temp_dir, conn) = setup_db();
+        // Insert 60 distinct learnings whose content matches the query so FTS5
+        // would return all of them if not capped.
+        for i in 0..60 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 20,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let n = mock
+            .last_candidates_len()
+            .expect("reranker should have been called");
+        assert_eq!(n, 30, "slate must cap at MAX_RERANK_SLATE (30), got {n}");
+    }
+
+    #[test]
+    fn test_over_fetch_min() {
+        let (_temp_dir, conn) = setup_db();
+        for i in 0..20 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 5,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let n = mock.last_candidates_len().unwrap();
+        assert_eq!(n, 15, "slate must be limit*over_fetch = 15, got {n}");
+    }
+
+    // -- Clamping: over_fetch == 0 clamps to 1 (NOT to 3) --
+
+    #[test]
+    fn test_over_fetch_zero_clamps_to_one() {
+        let (_temp_dir, conn) = setup_db();
+        for i in 0..20 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 4,
+            reranker: Some(boxed),
+            reranker_over_fetch: 0, // clamps to 1
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        let n = mock.last_candidates_len().unwrap();
+        assert_eq!(
+            n, 4,
+            "slate must be limit*1 = 4 when over_fetch=0 is clamped, got {n}"
+        );
+    }
+
+    // -- Truncation: result is capped at params.limit even though slate > limit --
+
+    #[test]
+    fn test_result_truncates_to_limit_after_rerank() {
+        let (_temp_dir, conn) = setup_db();
+        for i in 0..15 {
+            create_test_learning(
+                &conn,
+                &format!("Learning {i}"),
+                "common content keyword",
+                LearningOutcome::Pattern,
+            );
+        }
+
+        let (boxed, _mock) = make_box_with(Ok);
+        let params = RecallParams {
+            query: Some("keyword".to_string()),
+            limit: 4,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let backend = fts5_and_patterns();
+        let result = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+        assert_eq!(result.count, 4, "result must be truncated to limit");
+    }
+
+    // -- Acceptance #14 (Known-bad): vector-only matched learning kept by retrieve_for_rerank
+    //                                even with a low score (no max-merge filter). --
+
+    #[test]
+    fn test_rerank_slate_includes_vector_only_low_score() {
+        // We don't have a real Vector backend in tests (no Ollama), so we
+        // simulate the scenario with a small custom backend that returns a
+        // candidate ONLY via retrieve_for_rerank (and NOT via retrieve). If the
+        // pipeline mistakenly used backend.retrieve, the candidate would be
+        // missing from the slate.
+        struct VectorOnlyBackend {
+            id_to_emit: i64,
+            title: String,
+        }
+        impl RetrievalBackend for VectorOnlyBackend {
+            fn name(&self) -> &str {
+                "vector-only-mock"
+            }
+            fn retrieve(
+                &self,
+                _conn: &Connection,
+                _query: &RetrievalQuery,
+            ) -> TaskMgrResult<Vec<ScoredLearning>> {
+                // Simulate the broken max-merge path: never returns this candidate.
+                Ok(Vec::new())
+            }
+            fn retrieve_for_rerank(
+                &self,
+                conn: &Connection,
+                query: &RetrievalQuery,
+            ) -> TaskMgrResult<Vec<ScoredLearning>> {
+                // Look up the learning by id and return it with a low score.
+                let row = conn
+                    .query_row(
+                        "SELECT id, created_at, task_id, run_id, outcome, title, content,
+                                root_cause, solution,
+                                applies_to_files, applies_to_task_types, applies_to_errors,
+                                confidence, times_shown, times_applied, last_shown_at, last_applied_at
+                         FROM learnings WHERE id = ?1",
+                        [self.id_to_emit],
+                        |row| {
+                            Learning::try_from(row).map_err(|e| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+                            })
+                        },
+                    )
+                    .ok();
+                let _ = query; // unused
+                Ok(row
+                    .map(|l| ScoredLearning {
+                        learning: l,
+                        relevance_score: 0.05, // would be filtered by a max-merge threshold
+                        match_reason: Some(format!("vector-only: {}", self.title)),
+                    })
+                    .into_iter()
+                    .collect())
+            }
+        }
+
+        let (_temp_dir, conn) = setup_db();
+        let _ = create_test_learning(
+            &conn,
+            "Visible via FTS5",
+            "alpha shared",
+            LearningOutcome::Pattern,
+        );
+        let vector_id = create_test_learning(
+            &conn,
+            "Vector-only learning",
+            "embedded body",
+            LearningOutcome::Pattern,
+        );
+
+        let backend = CompositeBackend::new(vec![
+            Box::new(Fts5Backend),
+            Box::new(VectorOnlyBackend {
+                id_to_emit: vector_id,
+                title: "Vector-only learning".to_string(),
+            }),
+        ]);
+
+        // Mock asserts the slate it received includes the vector-only id even
+        // though FTS5 would not have surfaced it.
+        let captured: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_closure = Arc::clone(&captured);
+        let (boxed, _mock) = make_box_with(move |candidates: Vec<ScoredLearning>| {
+            let ids: Vec<i64> = candidates.iter().filter_map(|c| c.learning.id).collect();
+            *captured_for_closure.lock().unwrap() = ids;
+            Ok(candidates)
+        });
+
+        let params = RecallParams {
+            query: Some("shared".to_string()),
+            limit: 5,
+            reranker: Some(boxed),
+            reranker_over_fetch: 3,
+            ..Default::default()
+        };
+        let _ = recall_learnings_with_backend(&conn, params, &backend).unwrap();
+
+        let observed_ids = captured.lock().unwrap().clone();
+        assert!(
+            observed_ids.contains(&vector_id),
+            "rerank slate must include vector-only candidate (id={vector_id}) via retrieve_for_rerank; got {observed_ids:?}"
+        );
+    }
+}
+
+// ========== FIX-006: UCB stats pre-fetched outside sort closure ==========
+
+mod ucb_prefetch {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::learnings::bandit::WindowStats;
+    use crate::learnings::recall::apply_ucb_tiebreak_inner;
+    use crate::learnings::retrieval::ScoredLearning;
+    use crate::models::{Confidence, Learning, LearningOutcome};
+
+    fn scored(id: i64, score: f64) -> ScoredLearning {
+        let mut l = Learning::new(LearningOutcome::Pattern, format!("L{id}"), "body");
+        l.id = Some(id);
+        l.confidence = Confidence::Medium;
+        ScoredLearning {
+            learning: l,
+            relevance_score: score,
+            match_reason: None,
+        }
+    }
+
+    /// `stats_fn` must be called exactly once per unique id in the tiebreak band.
+    #[test]
+    fn test_stats_fn_called_once_per_unique_id() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        // Three candidates in a single band (scores within RERANK_TIEBREAK_BAND=0.05
+        // of each other). IDs 1, 2, 3 → 3 unique IDs → exactly 3 calls expected.
+        let mut slate = vec![scored(1, 0.95), scored(2, 0.93), scored(3, 0.91)];
+
+        let stats_fn = move |_id: i64| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Some(WindowStats::default())
+        };
+
+        apply_ucb_tiebreak_inner(&mut slate, stats_fn, 0);
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "stats_fn must be called exactly once per unique id (3 unique ids in band)"
+        );
+    }
+
+    /// Duplicate ids in the slate must result in only one call per unique id.
+    #[test]
+    fn test_stats_fn_deduped_for_duplicate_ids() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        // IDs 1, 1, 2 — only 2 unique ids → exactly 2 calls.
+        let mut slate = vec![scored(1, 0.95), scored(1, 0.93), scored(2, 0.91)];
+
+        let stats_fn = move |_id: i64| {
+            cc.fetch_add(1, Ordering::SeqCst);
+            Some(WindowStats::default())
+        };
+
+        apply_ucb_tiebreak_inner(&mut slate, stats_fn, 0);
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "stats_fn must be called only once per unique id (2 unique ids for 3 candidates)"
+        );
+    }
+
+    /// When `stats_fn` returns `None` for one id, sort must still complete and
+    /// that candidate is treated as if it has sentinel (zero) stats.
+    #[test]
+    fn test_missing_stats_uses_sentinel_and_sort_completes() {
+        // ID 1 has no stats (returns None); ID 2 has high UCB stats.
+        // After tiebreak, ID 2 should sort above ID 1.
+        let mut slate = vec![
+            scored(1, 0.95), // no stats → sentinel UCB=0
+            scored(2, 0.93), // stats with high applied rate → higher UCB
+        ];
+
+        let stats_fn = |id: i64| {
+            if id == 2 {
+                Some(WindowStats {
+                    window_shown: 10,
+                    window_applied: 8,
+                    window_start_iteration: 0,
+                })
+            } else {
+                None // triggers sentinel path
+            }
+        };
+
+        // total_window_shows > 0 so UCB exploration kicks in
+        apply_ucb_tiebreak_inner(&mut slate, stats_fn, 20);
+
+        // ID 2 has real stats and high apply rate → higher UCB than sentinel
+        let ids: Vec<i64> = slate.iter().filter_map(|s| s.learning.id).collect();
+        assert_eq!(
+            ids[0], 2,
+            "candidate with real stats must sort above sentinel; got {ids:?}"
+        );
+    }
+
+    /// Empty slate: no call to stats_fn, returns without panic.
+    #[test]
+    fn test_empty_slate_no_stats_calls() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let mut slate: Vec<ScoredLearning> = vec![];
+        apply_ucb_tiebreak_inner(
+            &mut slate,
+            move |_| {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Some(WindowStats::default())
+            },
+            0,
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Single-element slate: no sort needed, no stats calls.
+    #[test]
+    fn test_single_element_slate_no_stats_calls() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let mut slate = vec![scored(1, 0.9)];
+        apply_ucb_tiebreak_inner(
+            &mut slate,
+            move |_| {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Some(WindowStats::default())
+            },
+            0,
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+}

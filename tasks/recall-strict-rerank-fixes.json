@@ -1,0 +1,512 @@
+{
+  "branchName": "feat/recall-strict-rerank",
+  "description": "Address /review-loop findings on feat/recall-strict-rerank: 3 HIGH (composite HashMap dedup, compose healthchecks, Docker :latest pinning), 4 MEDIUM (over_fetch=0 unification, ureq error classification, warn helper, UCB stats pre-fetch), and 1 LOW (ArcAdapter test cleanup). Lands on the same branch as the original PRD; goal is to clear all HIGH findings so /review-loop re-runs clean and auto-chains to /compound.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test <module>` per iteration",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to public `recall_learnings()` / `recall_learnings_with_backend()` signatures",
+      "No `unwrap()` in production code paths — use `map_err`/`?` for proper error propagation",
+      "RetrievalBackend trait remains recall-policy-agnostic (no `allow_degraded` field on RetrievalQuery)",
+      "Reranker is opt-in: when `rerankerUrl` is unset, recall behavior is unchanged from today"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use that aren't justified by test injection",
+    "Error messages that don't identify which service is down or what to fix",
+    "Catch-all error handlers that swallow context",
+    "Backward-incompatible changes to existing recall_learnings() public signature",
+    "Reintroducing the silent Ok(Vec::new()) fallback in VectorBackend strict mode",
+    "Adding allow_degraded or any recall-policy field to RetrievalQuery (must stay backend-agnostic)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "53eef10e",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `merge_from_backends` uses `HashMap<i64, usize>` keyed on learning id, indexing into a `Vec<ScoredLearning>`",
+        "Positive: Existing test `test_composite_max_merge_score` (or equivalent) still passes — semantics preserved",
+        "Positive: New unit test asserts that dedup runs with 30 candidates across 3 mock backends correctly produces a unique-id slate with max scores and concatenated reasons",
+        "Negative: No `iter_mut().find()`, `iter().position()`, or any nested-loop dedup remains in the function",
+        "Negative: The misleading 'O(n) scan — fine for small result sets' comment is removed",
+        "Negative: Public method signatures of `merge_from_backends`, `retrieve`, `retrieve_for_rerank` unchanged",
+        "Known-bad: an implementation that uses `HashMap<i64, ScoredLearning>` (by-value) and clones on every update would pass functional tests but is wasteful — the unit test should not depend on it; verify the implementation uses `HashMap<i64, usize>` by reading the source",
+        "Failure mode: if a backend returns a duplicate (id, score) pair, the second occurrence must not lower the score (max wins, equality is no-op)"
+      ],
+      "dependsOn": [],
+      "description": "Replace the O(N^2) linear-scan dedup in `merge_from_backends` (src/learnings/retrieval/composite.rs:70-118) with a HashMap-indexed dedup. The existing acceptance criterion FEAT-003 from the original PRD required this explicitly — current implementation at line 86 uses `merged.iter_mut().find(|s| s.learning.id == Some(id))` which is O(N) per insert, O(N^2) total. The inline comment 'O(n) scan — fine for small result sets' on line 85 directly contradicts the acceptance criterion and must be removed.\n\nDO: Use a `HashMap<i64, usize>` index alongside `merged: Vec<ScoredLearning>`. On each candidate, look up by id; if present, mutate `merged[*idx]` (max-merge score, concat reasons exactly as today); if absent, `index.insert(id, merged.len()); merged.push(scored);`.\n\nDO: Preserve EXACT existing semantics — same max-merge rule (`>`, not `>=`), same `; ` separator on concatenated reasons, same handling for missing ids (skip), same stable sort + truncation.\n\nDO NOT: Change the public method signature.\nDO NOT: Truncate inside `merge_from_backends` for the rerank path — caller still controls that.\nDO NOT: Switch to `BTreeMap` — insertion order isn't preserved by either; the stable sort comes after.\n\nEdge cases:\n- Multiple backends return the same id with different scores: max wins, both reasons concatenated\n- A backend returns a Learning with `id == None`: skipped (existing behavior)\n- All backends return empty: result is empty Vec\n- Same id from same backend twice (shouldn't happen but defensible): second occurrence is treated as 'existing' and merged via max\n\nKnown-bad to guard against:\n- Replacing `iter_mut().find()` with `iter().position()` is still O(N) — must be a hash lookup\n- Using `Learning.id.unwrap_or(-1)` then keying on -1 would cluster all None-id learnings together; the existing `if id < 0 { continue; }` guard prevents this — keep it\n- HashMap<i64, ScoredLearning> by-value would force a clone on every max-merge update — use HashMap<i64, usize> indexing into the Vec instead",
+      "edgeCases": [
+        "Multiple backends return same id with different scores: max wins, reasons concatenated with '; '",
+        "Learning with id == None: skipped (existing behavior preserved)",
+        "All backends return empty: result is empty Vec",
+        "Same id from same backend twice: second occurrence merges via max"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Backend returns duplicate (id, score) pairs",
+          "expectedBehavior": "max-merge is idempotent; equality is no-op"
+        },
+        {
+          "cause": "HashMap insert collision (impossible since we control the key)",
+          "expectedBehavior": "N/A — key is unique by construction"
+        }
+      ],
+      "id": "FIX-001",
+      "modifiesBehavior": false,
+      "notes": "File: src/learnings/retrieval/composite.rs (lines 70-118). The PRD FEAT-003 acceptance criterion was explicit and was missed in the original implementation. Learning [1944]: HTTP error handling consistency. Learning [1929]: see TODO comments pattern (also relevant to FIX-003).",
+      "passes": true,
+      "priority": 95,
+      "qualityDimensions": [
+        "Composite uses HashMap dedup, not nested loops (O(N) not O(N^2))",
+        "Stable sort within composite — equal scores preserve insertion order (matches existing retrieve() guarantee)",
+        "Same max-merge / reason-concatenation semantics as the existing implementation",
+        "No truncation inside retrieve_for_rerank path — pipeline-side concern",
+        "Public method signatures unchanged"
+      ],
+      "taskType": "implementation",
+      "title": "Composite HashMap dedup (HIGH-1, replaces O(N^2) iter_mut().find)",
+      "touchesFiles": [
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All 4 services in docker/docker-compose.yml have `healthcheck:` blocks",
+        "Positive: `docker compose --profile cpu config` validates with no errors",
+        "Positive: `docker compose --profile cpu up --wait` reports both services healthy within ~3 minutes of cold start (manual verification — document the output in progress log if a CPU host is available)",
+        "Negative: No healthcheck probes a path that requires auth or returns >1KB body",
+        "Negative: `start_period` >= 60s for all 4 services",
+        "Failure mode: if curl is unavailable in the base image, fall back to nc -z, documented in a YAML comment"
+      ],
+      "dependsOn": [],
+      "description": "Add `healthcheck:` blocks to all 4 services in `docker/docker-compose.yml` (`ollama`, `llama-box`, `ollama-cpu`, `llama-box-cpu`). The original PRD FEAT-006 acceptance criterion required healthchecks for both services and they were omitted.\n\nDO: For ollama services, probe `http://localhost:11434/api/tags` (cheap, lists installed models, OK output even on empty install).\nDO: For llama-box services, probe `http://localhost:8080/health` if available, else `/v1/models` (OpenAI-compat endpoint that's almost always served), else fall back to a TCP probe via `nc -z localhost 8080`. Pick whichever the running container supports — verify by `docker compose up` + `curl` during implementation.\nDO: Use `start_period: 60s` so initial model load doesn't trigger spurious `unhealthy` states.\nDO: Use `interval: 30s timeout: 5s retries: 5`.\nDO: `test:` field uses `[\"CMD-SHELL\", \"...\"]` form (not `[\"CMD\", ...]`) so shell `||` works for fallback.\n\nDO NOT: Add a healthcheck to a service profile that doesn't have curl/nc in its base image — verify first; adjust the test command to use whatever's available.\nDO NOT: Lower `start_period` below 60s — both services bake models that take time to load into VRAM/RAM on first start.\nDO NOT: Probe an endpoint that requires authentication or large memory.\n\nEdge cases:\n- Base image lacks `curl`: fall back to wget or nc; document the choice in a YAML comment\n- llama-box has no /health endpoint: use /v1/models (returns 200 with [] when no model is loaded — but the model IS baked, so it should always return populated)\n- CPU profile takes longer to warm: 60s should still be enough; if not, bump start_period for cpu variants only\n\nKnown-bad to guard against:\n- Probing `:11434/` (root) returns 404 from ollama — must use `/api/tags` or `/api/version`\n- Using `[\"CMD\", \"curl\", ...]` array form prevents shell `||` chains; use `CMD-SHELL` for those\n- Setting interval=5s creates excessive log noise without improving signal",
+      "edgeCases": [
+        "Base image lacks curl: fall back to wget or nc",
+        "llama-box has no /health endpoint: probe /v1/models",
+        "CPU profile slower to warm: start_period covers worst-case cold start"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Probe endpoint returns 404",
+          "expectedBehavior": "test fails healthcheck; fix endpoint path"
+        },
+        {
+          "cause": "Model load exceeds start_period",
+          "expectedBehavior": "raise start_period for that service profile"
+        }
+      ],
+      "id": "FIX-002",
+      "modifiesBehavior": false,
+      "notes": "File: docker/docker-compose.yml. Use CMD-SHELL form to allow `|| exit 1` and shell pipes. Verify endpoints by running the container locally and curl-ing them before committing.",
+      "passes": true,
+      "priority": 94,
+      "qualityDimensions": [
+        "Healthchecks defined for all 4 services",
+        "Endpoint chosen is cheap and reliably available in the baked image",
+        "start_period accommodates model load time (60s minimum)",
+        "Compose syntax validates with `docker compose config`"
+      ],
+      "taskType": "implementation",
+      "title": "Docker compose healthchecks (HIGH-2)",
+      "touchesFiles": [
+        "docker/docker-compose.yml"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: docker/ollama/Dockerfile uses a specific versioned tag (NOT :latest)",
+        "Positive: docker/llama-box/Dockerfile uses a specific versioned tag (NOT :latest)",
+        "Positive: huggingface-cli download invocation includes --revision <commit-sha>",
+        "Positive: wget fallback URL uses resolve/<commit-sha>/ in place of resolve/main/",
+        "Positive: `docker compose build` (or `docker compose --profile cpu build`) succeeds against the new tags",
+        "Positive: Obsolete TODO comments about pinning are removed",
+        "Negative: No `:latest` references remain in either Dockerfile",
+        "Negative: huggingface-cli and wget revision pins must agree (same commit SHA)",
+        "Failure mode: if a chosen tag doesn't exist on the registry, the build fails fast with clear error — no fallback to :latest"
+      ],
+      "dependsOn": [],
+      "description": "Replace `:latest` tags on both Dockerfiles with versioned tags, and pin the HuggingFace model download to a specific commit revision. Original PRD security note flagged `:latest` as supply-chain risk; current TODO comments document the intent without fixing it.\n\nDO: `docker/ollama/Dockerfile` line 7 — change `FROM ollama/ollama:latest` to `FROM ollama/ollama:<latest-stable-tag>`. Pick the latest stable tag from Docker Hub at implementation time (e.g., `0.4.7` or whatever is current); verify the tag actually exists with `docker manifest inspect`.\nDO: `docker/llama-box/Dockerfile` line 9 — change `FROM ghcr.io/gpustack/llama-box:latest` to a versioned tag from https://github.com/gpustack/llama-box/releases (e.g. `v0.0.x`); verify it exists.\nDO: `docker/llama-box/Dockerfile` lines 20-27 — add `--revision <commit-sha>` to the `huggingface-cli download` invocation. Use the latest commit on `main` for `gpustack/jina-reranker-v2-base-multilingual-GGUF` at implementation time. The wget fallback URL must also be updated to `resolve/<commit-sha>/$HF_FILE` so both paths pin the same revision.\nDO: Remove the now-obsolete TODO comments on lines 5-7 (ollama) and 6-8 (llama-box) since the work is done.\n\nDO NOT: Use a digest pin (`@sha256:...`) — the user chose versioned tags for readability and bumpability.\nDO NOT: Pin to a tag that doesn't exist on the registry — verify with `docker pull <tag>` or `docker manifest inspect` first.\nDO NOT: Forget to update the wget fallback URL when changing the HF revision — both paths must agree.\n\nEdge cases:\n- Tag doesn't exist: `docker compose build` will fail clearly; pick a different tag\n- HF model rotated `main` and the old commit is gone: extremely unlikely for a published model; if it happens, switch to a tag-style pin (e.g. a branch or release tag)\n- huggingface-cli supports --revision; wget's URL form `resolve/<sha>/<file>` is the equivalent\n\nKnown-bad to guard against:\n- Pinning to a tag that's still rolling (e.g., `0.4` instead of `0.4.7`) gives only partial reproducibility\n- Forgetting to bump `--revision` on wget fallback while bumping `huggingface-cli --revision` would silently produce different artifacts depending on which branch ran\n- Pinning ollama to a version that has incompatible API surface vs. what the recall code calls (low risk for /api/embed which is stable, but verify with a smoke test)",
+      "edgeCases": [
+        "Chosen tag doesn't exist on registry: build fails clearly",
+        "HF main branch has rotated: extremely unlikely; switch to a tag pin"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Tag doesn't exist",
+          "expectedBehavior": "docker build fails with clear pull error; pick a different tag"
+        },
+        {
+          "cause": "huggingface-cli and wget revision pins disagree",
+          "expectedBehavior": "Test by deliberately running both code paths and verifying same checksum"
+        }
+      ],
+      "id": "FIX-003",
+      "modifiesBehavior": false,
+      "notes": "Files: docker/ollama/Dockerfile, docker/llama-box/Dockerfile. The HF repo is gpustack/jina-reranker-v2-base-multilingual-GGUF (line 13). Verify tag existence before committing. Learning [1929]: TODO comments for unpinned tags pattern (now being resolved).",
+      "passes": true,
+      "priority": 93,
+      "qualityDimensions": [
+        "Versioned tags pinned on both Docker base images",
+        "HF model snapshot pinned via --revision <commit-sha> on both download paths",
+        "Build remains reproducible across re-runs (same input -> same image bytes for the model layer)",
+        "Obsolete TODOs removed once their purpose is served"
+      ],
+      "taskType": "implementation",
+      "title": "Pin Docker base images and HF model revision (HIGH-3 + LOW-10)",
+      "touchesFiles": [
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/learnings/recall/mod.rs` no longer references DEFAULT_RERANKER_OVER_FETCH (constant deleted)",
+        "Positive: `RecallParams { reranker_over_fetch: 0, ... }` produces effective slate-per-backend of 1 (NOT 3)",
+        "Positive: doc-comment on RecallParams.reranker_over_fetch states 'values of 0 are clamped to 1'",
+        "Positive: config-side warning on rerankerOverFetch=0 still emits (project_config.rs unchanged)",
+        "Negative: No silent 0->3 fallback remains anywhere in the recall pipeline",
+        "Unit test: `recall(RecallParams { reranker_over_fetch: 0, ... })` produces a slate of size `1 * limit` per backend (capped by MAX_RERANK_SLATE)",
+        "Unit test: omitting rerankerOverFetch from config still defaults to 3 (via project_config helper)",
+        "CONTRACT: src/commands/recall.rs:147 .unwrap_or(0) is updated to match the new semantic — verify the resolved value flows correctly through main.rs's RecallCmdParams assembly"
+      ],
+      "dependsOn": [],
+      "description": "The `reranker_over_fetch` value of 0 has inconsistent semantics: `src/loop_engine/project_config.rs:88-95` clamps to 1 with a stderr warning, but `src/learnings/recall/mod.rs:237-241` silently normalizes to `DEFAULT_RERANKER_OVER_FETCH = 3`. CLI users hit the config path (clamp to 1), but anyone constructing `RecallParams` programmatically with `reranker_over_fetch: 0` gets 3. This is internally inconsistent.\n\nDO: Pick the conservative semantic — clamp 0 to 1 everywhere. The user-facing path already does this; align the library layer.\nDO: In `src/learnings/recall/mod.rs:237-241`, change the `if params.reranker_over_fetch == 0 { DEFAULT_RERANKER_OVER_FETCH } else { params.reranker_over_fetch }` to `params.reranker_over_fetch.max(1)`.\nDO: Remove the `DEFAULT_RERANKER_OVER_FETCH` constant entirely — it's no longer load-bearing. The doc-comment on `RecallParams.reranker_over_fetch` (lines 81-84) referencing `DEFAULT_RERANKER_OVER_FETCH` must be rewritten to say 'must be >= 1; values of 0 are clamped to 1'.\nDO: In `src/commands/recall.rs:147`, change the `params.reranker_over_fetch.unwrap_or(0)` (which paired with the now-removed library-side normalization) to `.unwrap_or(3)` so unset config still defaults to 3 candidates per backend (matching today's effective behavior on the unset path), OR thread the resolved-or-default through without the Option wrapper. Confirm by reading the call site at main.rs which assembles RecallCmdParams.\nDO: Remove or update any test that asserted the silent 0->3 normalization.\n\nDO NOT: Change the config-side clamp at project_config.rs (already correct).\nDO NOT: Change the public type of `RecallParams.reranker_over_fetch` (still `u32`).\nDO NOT: Drop the warning emitted by the config-side clamp.\n\nEdge cases:\n- User sets rerankerOverFetch: 0 in config.json: warning, clamp to 1 (existing behavior)\n- User omits rerankerOverFetch from config: defaults to 3 via `match self.reranker_over_fetch { None => 3, ... }` (existing behavior)\n- Library caller passes `RecallParams { reranker_over_fetch: 0 }`: now clamped to 1 (NEW — was silently 3)\n- Library caller passes `RecallParams { reranker_over_fetch: 5 }`: stays 5 (unchanged)\n\nKnown-bad to guard against:\n- A test that constructs RecallParams with `reranker_over_fetch: 0` and expects 3 will now fail correctly — update or delete it\n- Forgetting to update the docstring on RecallParams.reranker_over_fetch leaves a misleading 'normalized to DEFAULT_RERANKER_OVER_FETCH' note in the public docs",
+      "edgeCases": [
+        "config.json sets rerankerOverFetch: 0: warning + clamp to 1",
+        "config.json omits rerankerOverFetch: defaults to 3",
+        "Library caller passes 0: clamped to 1 (NEW)",
+        "Library caller passes 5: stays 5"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Test assertion expects old 0->3 normalization",
+          "expectedBehavior": "Update or delete the test"
+        }
+      ],
+      "id": "FIX-004",
+      "modifiesBehavior": true,
+      "notes": "Files: src/learnings/recall/mod.rs:34-50 (constant + docstrings), 237-241 (normalization), src/commands/recall.rs:147 (.unwrap_or). Verify call chain from main.rs through RecallCmdParams to RecallParams. Existing test `test_*reranker_over_fetch*` likely needs update — grep first.",
+      "passes": true,
+      "priority": 85,
+      "qualityDimensions": [
+        "Single source of truth for over_fetch=0 semantics (clamped to 1)",
+        "DEFAULT_RERANKER_OVER_FETCH constant removed (no longer load-bearing)",
+        "Docstring accurately describes the public contract",
+        "Both config-side and library-side paths produce the same value for the same input"
+      ],
+      "taskType": "implementation",
+      "title": "Unify reranker_over_fetch=0 semantic (MED-4 + LOW-12)",
+      "touchesFiles": [
+        "src/learnings/recall/mod.rs",
+        "src/commands/recall.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `match` on `ureq::Error::Status(code, resp)` vs `ureq::Error::Transport(t)` replaces the previous flat `.map_err`",
+        "Positive: Status errors use `io::ErrorKind::Other` and include 'HTTP {code}' plus body in the message",
+        "Positive: Transport errors map kind() to the matching io::ErrorKind",
+        "Positive: All error messages still include the URL",
+        "Unit test: mockito returns 500; assert error message contains 'HTTP 500'",
+        "Unit test: mockito server is unreachable; assert error kind is ConnectionRefused",
+        "Negative: `unwrap()` is not introduced — use `.unwrap_or_default()` on `resp.into_string()`",
+        "Negative: The existing test that accepted either '500' or 'rerank request' is tightened to assert the specific message structure now that behavior is deterministic"
+      ],
+      "dependsOn": [],
+      "description": "`src/learnings/reranker/mod.rs:140-145` flattens all `ureq::Error` cases (status errors AND transport errors) into `io::Error::new(ErrorKind::ConnectionRefused, ...)`. This loses the distinction between 'server reachable but returned 5xx' and 'connection refused at TCP layer'. The existing test at line 421 acknowledges this by accepting either '500' or 'rerank request' in the message.\n\nDO: Replace the `.map_err()` call with an explicit `match` on `ureq::Error::Status(code, resp)` vs `ureq::Error::Transport(t)`.\nDO: For Status errors, use `io::ErrorKind::Other` and include `HTTP {code}` in the message; capture `resp.into_string()` (best-effort) for the body so server-side error detail is visible.\nDO: For Transport errors, map `t.kind()` to the appropriate `io::ErrorKind` (ConnectionFailed -> ConnectionRefused, Io -> Other, others -> Other). Include the kind name in the message.\nDO: Keep the URL in the error message regardless of variant.\n\nDO NOT: Use `.unwrap()` on `resp.into_string()` — it can fail on non-UTF8 bodies; use `.unwrap_or_default()`.\nDO NOT: Change the public function signature of `LlamaBoxReranker::rerank()`.\nDO NOT: Drop the URL from the message — operators rely on it for debugging.\n\nEdge cases:\n- Server returns 500 with empty body: message says 'HTTP 500: ' (empty body suffix is fine)\n- Server returns 500 with non-UTF8 body: `into_string().unwrap_or_default()` gives empty string\n- Connection refused (no listener): ConnectionRefused with the URL in the message\n- Read timeout (slow server): Transport(Io) -> ErrorKind::Other with 'rerank request to {url} failed: ...'\n\nKnown-bad to guard against:\n- Returning ConnectionRefused for a 5xx response misleads operators into checking firewalls when the server is actually reachable\n- Using `t.to_string()` instead of `t.kind()` matching loses structured info; use both (kind for ErrorKind classification, full to_string in the message)\n- Calling `.into_string()` on a streamed response twice (it consumes the body) — only call once",
+      "edgeCases": [
+        "500 with empty body: message says 'HTTP 500: '",
+        "500 with non-UTF8 body: empty body suffix",
+        "Connection refused: ErrorKind::ConnectionRefused",
+        "Read timeout: ErrorKind::Other with 'rerank request to {url} failed: ...'"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Server returns malformed JSON with 200 OK",
+          "expectedBehavior": "Falls through to existing JSON deserialization error path (not this fix's scope)"
+        }
+      ],
+      "id": "FIX-005",
+      "modifiesBehavior": true,
+      "notes": "File: src/learnings/reranker/mod.rs:140-145. Existing test that's lenient about message content lives near line 421 — tighten it. Learning [1944]: HTTP error handling consistency between LlamaBoxReranker and OllamaEmbedder — keep them aligned. Learning [1935]: error variants carry context for actionable user messages.",
+      "passes": true,
+      "priority": 80,
+      "qualityDimensions": [
+        "Status (5xx) errors distinguished from transport (connection) errors at io::ErrorKind level",
+        "Body of failed response captured (best-effort) for operator visibility",
+        "URL preserved in every error message",
+        "No unwrap() on response body parsing"
+      ],
+      "taskType": "implementation",
+      "title": "Preserve ureq error classification in reranker (MED-5)",
+      "touchesFiles": [
+        "src/learnings/reranker/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `apply_ucb_tiebreak` builds a HashMap<i64, WindowStats> before the sort_by call",
+        "Positive: Sort closure looks up via HashMap, defaulting to a sentinel WindowStats on miss",
+        "Positive: Each unique id triggers at most one `get_window_stats` call",
+        "Negative: No `bandit::get_window_stats` call inside the sort_by closure",
+        "Negative: get_window_stats errors are absorbed (logged or silent), not propagated",
+        "Unit test: stub bandit module returns deterministic stats; assert count of get_window_stats calls equals the number of unique ids in the input slate (use a counter wrapper)",
+        "Unit test: when get_window_stats returns Err for one id, sort still completes and the affected entry sorts as if it had sentinel stats"
+      ],
+      "dependsOn": [],
+      "description": "`apply_ucb_tiebreak` in `src/learnings/recall/mod.rs:301-309` calls `bandit::get_window_stats(conn, learning_id)` inside the sort closure. With N candidates, this performs O(N log N) DB queries (one per comparison). For N up to 30 it's tolerable but worth fixing — it's a known performance gotcha and matches the same pattern used by the legacy `rerank_with_ucb`.\n\nConfirmed signature: `pub fn get_window_stats(conn: &Connection, learning_id: i64) -> TaskMgrResult<WindowStats>` at `src/learnings/bandit.rs:249`. No batched variant exists; one `conn.query_row` per call.\n\nDO: Before the `sort_by` call, build a `HashMap<i64, WindowStats>` by iterating `&candidates` and calling `get_window_stats` once per unique id.\nDO: Have the sort closure look up from the HashMap; on cache miss (id is None or stats fetch failed), use a sentinel `WindowStats` (zero-initialized) so the closure remains total.\nDO: Errors from `get_window_stats` are absorbed into 'no stats' rather than propagated — matching the legacy sort closure's effective behavior (it has no error path either; today's impl is `let stats = bandit::get_window_stats(conn, ...).unwrap_or_default()` style).\n\nDO NOT: Hold the `Connection` reference across the sort closure boundary in a way that prevents the existing borrow scheme — if the sort closure can't borrow `conn`, neither could the pre-fetch loop, so this is safe.\nDO NOT: Change the public signature of `apply_ucb_tiebreak`.\nDO NOT: Add a global cache that outlives the call.\n\nEdge cases:\n- Empty candidates: HashMap is empty; sort is a no-op; returns immediately\n- All candidates have id == None: HashMap is empty; sort closure looks up sentinel for all\n- get_window_stats returns Err for one id: that id's entry is absent from the cache; closure falls back to sentinel\n- Same id appears twice in candidates: HashMap dedupes the fetch (cheaper than today)\n\nKnown-bad to guard against:\n- A naive `for c in &candidates { stats.insert(id, get_window_stats(conn, id)?); }` propagates Err and breaks the soft-fail semantic — use `if let Ok(s) = ...` and absorb errors\n- Building `Vec<(i64, WindowStats)>` and using `iter().find()` re-introduces O(N^2) — must be HashMap\n- Calling `get_window_stats` for ids that aren't actually compared (e.g., outside the tiebreak band) wastes queries but is functionally correct; acceptable for simplicity",
+      "edgeCases": [
+        "Empty candidates: HashMap empty, sort is no-op",
+        "All ids None: HashMap empty, sentinel used for all",
+        "get_window_stats Err: id absent from cache, sentinel used",
+        "Duplicate ids: HashMap dedupes the fetch"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "WindowStats lacks a Default impl",
+          "expectedBehavior": "Add #[derive(Default)] to WindowStats or use an explicit zero-initialized literal"
+        }
+      ],
+      "id": "FIX-006",
+      "modifiesBehavior": false,
+      "notes": "File: src/learnings/recall/mod.rs:301-309. Bandit signature confirmed at src/learnings/bandit.rs:249. WindowStats type is in scope (already imported). Sentinel: `WindowStats::default()` if the impl exists, else zero-initialized struct literal.",
+      "passes": true,
+      "priority": 75,
+      "qualityDimensions": [
+        "Per-id DB query happens at most once",
+        "Sort closure is pure (HashMap lookup only, no I/O)",
+        "Errors absorbed to preserve soft-fail behavior",
+        "No regression in sort stability"
+      ],
+      "taskType": "implementation",
+      "title": "Pre-fetch UCB stats outside sort closure (MED-7)",
+      "touchesFiles": [
+        "src/learnings/recall/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/output.rs` (or `src/output/mod.rs`) exists with a single `pub fn warn(msg: &str)` function",
+        "Positive: Helper respects `NO_COLOR` env var and stderr `is_terminal()`",
+        "Positive: All 3 in-scope call sites migrated to `output::warn(...)` form",
+        "Positive: `pub mod output;` declared in main.rs",
+        "Negative: No third-party color/term crate added to Cargo.toml",
+        "Negative: Pre-existing eprintln warns elsewhere in the codebase are NOT modified",
+        "Unit test: `NO_COLOR=1` env var produces no ANSI escapes (capture via `std::process::Command` from a small integration test, OR refactor `warn` to take a writer + tty flag for direct unit testability)",
+        "Manual smoke: `NO_COLOR=1 task-mgr recall --query test 2>&1 | cat | grep '\\\\x1b'` produces zero matches"
+      ],
+      "dependsOn": [],
+      "description": "Multiple call sites emit raw `eprintln!(\"\\x1b[33m[warn]\\x1b[0m ...\")` with no `NO_COLOR` or stderr-TTY check, leaking ANSI escapes when stderr is redirected. Confirmed (via Explore): no centralized warn helper exists in the crate. Closest precedent is `src/commands/models/ensure_default.rs:45-48` (uses `io::stdin().is_terminal()` for prompt gating, not warn formatting).\n\nDO: Add a new module `src/output.rs` (or `src/output/mod.rs` if you prefer the directory form) exporting `pub fn warn(msg: &str)` that:\n  - Checks `std::env::var_os(\"NO_COLOR\").is_none()` AND `std::io::stderr().is_terminal()` to decide whether to emit ANSI yellow.\n  - On color: `eprintln!(\"\\x1b[33m[warn]\\x1b[0m {msg}\")`\n  - On no-color: `eprintln!(\"[warn] {msg}\")`\n  - One short doc-comment explaining the gating.\nDO: Add `pub mod output;` to `src/main.rs` so the binary can use it.\nDO: Migrate ONLY the call sites this PR introduced or recently touched:\n  - `src/learnings/recall/mod.rs:262` (reranker soft-fail warning)\n  - `src/loop_engine/project_config.rs:91-93` (rerankerOverFetch=0 clamp)\n  - `src/loop_engine/project_config.rs:102-104` (asymmetric url/model warning)\n  Verify each by grep before/after.\n\nDO NOT: Migrate pre-existing `eprintln!` warns elsewhere in the codebase (e.g., main.rs:86, ensure_default.rs:46) — out of scope, avoids churn.\nDO NOT: Pull in a third-party color crate (e.g., `colored`, `owo-colors`). Stay raw-ANSI per Learning [1055].\nDO NOT: Change the wording of any migrated warning — only the formatting wrapper changes.\nDO NOT: Add a `hint()` or `error()` companion in this PR — keep scope to `warn` only; siblings can be added when needed.\n\nEdge cases:\n- NO_COLOR env var set to anything (even empty): treat as 'no color requested' (per https://no-color.org spec)\n- stderr is a pipe: `is_terminal()` returns false; emit no-color\n- stderr is a real TTY and NO_COLOR unset: emit color\n- Test environments: tests usually capture stderr; the helper just emits — assertions should match `[warn]` prefix without ANSI; if any test was relying on the literal `\\x1b[33m` prefix, it must be updated\n\nKnown-bad to guard against:\n- Checking `NO_COLOR.is_some()` AND empty-string treats `NO_COLOR=` as 'still color' — the spec says any presence (including empty) disables color; use `var_os().is_none()` for the 'use color' branch\n- Calling `is_terminal()` on stdout instead of stderr decides on the wrong stream\n- Concatenating `[warn]` into the formatted message before the helper means future migrations have to strip it; the helper owns the prefix",
+      "edgeCases": [
+        "NO_COLOR set (any value): no ANSI",
+        "stderr piped: no ANSI",
+        "stderr TTY + no NO_COLOR: ANSI",
+        "Test capture: helper still emits, asserts match '[warn]' prefix"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "is_terminal() returns false in CI",
+          "expectedBehavior": "Helper emits non-color form; CI logs are clean"
+        }
+      ],
+      "id": "FIX-007",
+      "modifiesBehavior": false,
+      "notes": "Files: NEW src/output.rs, src/main.rs (one mod line), src/learnings/recall/mod.rs:262, src/loop_engine/project_config.rs:91-104. Learning [1055]: raw ANSI constants pattern (no color crate). Learning [664]: yellow [hint] pattern on stderr. Helper is testable if you split logic into `fn format_warn(msg: &str, color: bool) -> String` + `fn should_color() -> bool`; recommend that split.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Single source of truth for warn formatting",
+        "Respects NO_COLOR (https://no-color.org) and stderr TTY detection",
+        "Testable via decomposition (format_warn + should_color)",
+        "Migration scope kept narrow to avoid churn"
+      ],
+      "taskType": "implementation",
+      "title": "Centralize warn helper with NO_COLOR + IsTerminal gating (MED-6)",
+      "touchesFiles": [
+        "src/output.rs",
+        "src/main.rs",
+        "src/learnings/recall/mod.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `ArcAdapter` newtype is removed from tests",
+        "Positive: All call sites of ArcAdapter switched to either `impl Reranker for Arc<MockReranker>` or `Clone`-based",
+        "Positive: All tests in `recall/tests.rs` that used ArcAdapter still pass with no semantic change",
+        "Negative: No production code modified",
+        "Negative: No new test helper or shim is added beyond what's needed"
+      ],
+      "dependsOn": [],
+      "description": "`src/learnings/recall/tests.rs:1361-1370` defines an inline `ArcAdapter` newtype to satisfy `Box<dyn Reranker>` requirements when sharing a `MockReranker` across threads/test setups. This obfuscates intent — there are simpler patterns.\n\nDO: Pick the simplest of these two replacements (let the implementing agent decide based on what compiles cleanly):\n  1. Add `impl Reranker for Arc<MockReranker>` (blanket-style on the test-side mock) and pass `Box::new(arc.clone())` directly.\n  2. Make `MockReranker: Clone` (it likely is already, since its state is `Arc<Mutex<...>>` or similar) and pass `Box::new((*arc).clone())`.\nDO: Verify the chosen pattern still gives the same call-count visibility through the original `Arc` (test assertions reference `mock.call_count()` after the recall pipeline runs).\n\nDO NOT: Change MockReranker's public API.\nDO NOT: Bring in a third-party crate for this.\nDO NOT: Touch production code — this is purely a test-side cleanup.\n\nEdge cases:\n- MockReranker holds Arc<Mutex<Vec<...>>> internally: clone shares state; both options preserve call-count visibility\n- MockReranker holds owned state: clone produces independent state; option 1 (impl Reranker for Arc) is required\n\nKnown-bad to guard against:\n- Replacing ArcAdapter with `Box::new(arc)` directly fails because `Arc<T>` doesn't impl Reranker unless we add it\n- Cloning a MockReranker that holds owned state breaks tests that assert call counts via the original Arc handle",
+      "edgeCases": [
+        "MockReranker holds shared state (Arc<Mutex>): both options work",
+        "MockReranker holds owned state: only option 1 works"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Chosen pattern doesn't compile",
+          "expectedBehavior": "Try the other; if neither, leave ArcAdapter and skip this task"
+        }
+      ],
+      "id": "FIX-008",
+      "modifiesBehavior": false,
+      "notes": "File: src/learnings/recall/tests.rs:1361-1370 plus call sites. Pure cosmetic test cleanup. If MockReranker isn't Clone, option 1 (blanket impl) is the right call.",
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Test code reads as straightforwardly as production code",
+        "No needless newtype",
+        "Same call-count visibility through original Arc handle"
+      ],
+      "taskType": "implementation",
+      "title": "Replace ArcAdapter newtype in reranker tests (LOW-9)",
+      "touchesFiles": [
+        "src/learnings/recall/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication across FIX-* changes (DRY principle)",
+        "Functions stay under 30 lines",
+        "Clear separation of concerns",
+        "Code follows existing project patterns (raw ANSI per [1055], builder pattern per FEAT-001)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FIX-005",
+        "FIX-006",
+        "FIX-007",
+        "FIX-008"
+      ],
+      "description": "Review all FIX-001 through FIX-008 changes for DRY violations, complexity, coupling, and maintainability before final review.\n\nDO: Look for duplicated logic across the warn helper migration sites — e.g., if multiple call sites have very similar message-construction patterns, consider parameterizing.\nDO: Verify `apply_ucb_tiebreak` HashMap pre-fetch (FIX-006) doesn't accidentally duplicate work with composite-side dedup (FIX-001).\nDO: Check whether `format_warn` and `should_color` from FIX-007 should be `pub(crate)` for testability or `pub` for external reuse.\nDO: Spot-check the new healthchecks (FIX-002) for any docker-compose.yml duplication that could be folded into a YAML anchor.\n\nDO NOT: Skip — this gate catches issues before the final review.\nDO NOT: Spawn refactor-fix tasks for cosmetic preference; only structural issues warrant follow-up tasks.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: spawn each as a REFACTOR-FIX-xxx via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (priority 50-97). Atomic DB+JSON sync. If no issues, invoke /simplify on any visibly ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>`.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across all FIX-* tasks (especially the warn helper migration)",
+        "Single-responsibility functions",
+        "Pattern consistency with existing OllamaEmbedder, RetrievalBackend impls, ProjectConfig handling",
+        "No premature abstraction"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities across the fix bundle",
+      "touchesFiles": [
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/recall/tests.rs",
+        "src/learnings/reranker/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/commands/recall.rs",
+        "src/output.rs",
+        "src/main.rs",
+        "docker/docker-compose.yml",
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All 8 FIX-NNN tasks have `passes: true`",
+        "Positive: `recall_learnings()` / `recall_learnings_with_backend()` signatures unchanged (verify via grep against pre-fix versions)",
+        "Positive: `RetrievalQuery` has no `allow_degraded` field",
+        "Positive: FULL `cargo test` (no filter), `cargo clippy -- -D warnings`, `cargo fmt --check` all clean",
+        "Positive: `docker compose --profile cpu config` validates",
+        "Positive: `docker compose --profile cpu build` succeeds against pinned tags + HF revision",
+        "Negative: No `unwrap()` introduced in production code paths in any FIX-NNN",
+        "Negative: No `iter_mut().find()` or `iter().position()` for dedup remains in composite.rs",
+        "Negative: `bandit::get_window_stats` not called inside any sort closure",
+        "Negative: `DEFAULT_RERANKER_OVER_FETCH` constant fully removed",
+        "Documentation: CLAUDE.md updated only if a fix introduces a new public pattern (e.g. the `output::warn` helper) — short subsection, not a redoc of the whole reranker pipeline",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FIX-001",
+        "FIX-002",
+        "FIX-003",
+        "FIX-004",
+        "FIX-005",
+        "FIX-006",
+        "FIX-007",
+        "FIX-008",
+        "REFACTOR-001"
+      ],
+      "description": "Final review of the entire fix bundle. RUN THE FULL QUALITY GATE (unscoped test suite + clippy + fmt + docker compose validation).\n\nDO: Verify each FIX-NNN actually addresses its corresponding finding from the review transcript (HIGH-1 through LOW-9). Concretely, read the produced diff, not just the commit messages.\nDO: Confirm `recall_learnings()` and `recall_learnings_with_backend()` public signatures unchanged.\nDO: Verify `RetrievalQuery` has no `allow_degraded` field (still backend-agnostic).\nDO: Run `docker compose --profile cpu config` and `docker compose --profile cpu build` to validate FIX-002 + FIX-003 end-to-end. If a CPU host is available, also run `docker compose --profile cpu up --wait` and verify both services report healthy. Document any failures in the progress log.\nDO: Run the full quality gate: `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test`. No scope filter.\nDO: Re-run `task-mgr recall --query 'composite hashmap' --limit 3` (or similar) as a smoke test after FIX-006 to confirm UCB tiebreak still works in practice.\n\nDO NOT: Skip the integration wiring check — confirm `output::warn` is invoked in all 3 migrated sites.\nDO NOT: Scope the test suite — this is the unscoped run.\n\nKnown wiring failures specific to this fix bundle:\n- FIX-001 HashMap not actually used (check for absence of `iter_mut().find()` / `iter().position()` in composite.rs)\n- FIX-002 healthcheck added but fails because curl missing in base image — must verify with actual docker build\n- FIX-003 tag pinned but not pushed to registry — verify with `docker manifest inspect`\n- FIX-004 DEFAULT_RERANKER_OVER_FETCH still referenced somewhere (grep for the symbol)\n- FIX-005 `unwrap()` accidentally introduced on `resp.into_string()`\n- FIX-006 `bandit::get_window_stats` still called inside sort closure (grep for it)\n- FIX-007 helper defined but pre-existing eprintln warns NOT touched (verify scope discipline) AND the 3 in-scope sites ARE migrated\n- FIX-008 ArcAdapter still defined somewhere",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If clean, emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point",
+        "Full suite green including pre-existing failures",
+        "End-to-end behavior matrix verified (composite dedup, healthchecks, pinned images, over_fetch=0 semantic, ureq error classification, UCB stats prefetch, warn helper, ArcAdapter removal)",
+        "CLAUDE.md updated only when warranted by new public surface"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification (full quality gate)",
+      "touchesFiles": [
+        "src/learnings/retrieval/composite.rs",
+        "src/learnings/retrieval/tests.rs",
+        "src/learnings/recall/mod.rs",
+        "src/learnings/recall/tests.rs",
+        "src/learnings/reranker/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/commands/recall.rs",
+        "src/output.rs",
+        "src/main.rs",
+        "docker/docker-compose.yml",
+        "docker/ollama/Dockerfile",
+        "docker/llama-box/Dockerfile",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

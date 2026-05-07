@@ -475,6 +475,9 @@ EXAMPLES:
     # Combine filters with more results
     task-mgr recall --query 'timeout' --tags database --limit 10
 
+    # Run offline (vector backend silently empty if Ollama is unreachable)
+    task-mgr recall --query 'timeout' --allow-degraded
+
     # Get learnings as JSON for script processing
     task-mgr --format json recall --for-task US-015 | jq '.learnings[].title'
 
@@ -484,7 +487,23 @@ MATCHING BEHAVIOR:
       - Task type prefix (e.g., US- tasks match learnings for US-)
       - Error patterns (if task has last_error)
 
-    Results are ranked by last_applied_at (most recently useful first).
+    Results are ranked by relevance, with UCB exploration breaking ties within
+    the same relevance tier (or within +/-0.05 rerank score when a reranker
+    is configured).
+
+OLLAMA / VECTOR BACKEND:
+    --query runs the vector backend, which embeds the query via Ollama. If
+    Ollama is unreachable, recall HARD-FAILS by default with hints to start
+    the daemon. Pass --allow-degraded to opt back into the historical
+    silently-empty-vector-results behaviour (useful offline). --for-task only
+    (no query) does not require Ollama.
+
+RERANKER:
+    Set rerankerUrl + rerankerModel in .task-mgr/config.json to enable
+    cross-encoder reranking via gpustack/llama-box. Optional rerankerOverFetch
+    (default 3) controls candidate over-retrieval before rerank. Reranker
+    soft-fails: if the server is unreachable, recall returns the un-reranked
+    candidates with a stderr warning (NOT a hard error).
 ")]
     Recall {
         /// Text query to search for in title and content
@@ -510,6 +529,13 @@ MATCHING BEHAVIOR:
         /// Include superseded learnings in the results (default: exclude them)
         #[arg(long = "include-superseded", default_value_t = false)]
         include_superseded: bool,
+
+        /// Tolerate an unreachable Ollama embedding service: vector results are
+        /// silently empty instead of hard-failing. Useful for offline runs.
+        /// Without this flag, `recall --query` exits non-zero with hints when
+        /// Ollama is down.
+        #[arg(long = "allow-degraded", default_value_t = false)]
+        allow_degraded: bool,
     },
 
     /// List all learnings

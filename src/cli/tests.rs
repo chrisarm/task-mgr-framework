@@ -1060,6 +1060,7 @@ fn test_recall_minimal() {
             outcome,
             limit,
             include_superseded,
+            allow_degraded,
         } => {
             assert!(query.is_none());
             assert!(for_task.is_none());
@@ -1067,6 +1068,7 @@ fn test_recall_minimal() {
             assert!(outcome.is_none());
             assert_eq!(limit, 5); // default
             assert!(!include_superseded, "default must exclude superseded");
+            assert!(!allow_degraded, "default must hard-fail on Ollama down");
         }
         _ => panic!("Expected Recall command"),
     }
@@ -1158,6 +1160,7 @@ fn test_recall_with_all_options() {
             outcome,
             limit,
             include_superseded,
+            allow_degraded,
         } => {
             assert_eq!(query, Some("SQL error".to_string()));
             assert_eq!(for_task, Some("US-010".to_string()));
@@ -1168,6 +1171,7 @@ fn test_recall_with_all_options() {
             assert_eq!(outcome, Some(LearningOutcome::Workaround));
             assert_eq!(limit, 3);
             assert!(!include_superseded);
+            assert!(!allow_degraded);
         }
         _ => panic!("Expected Recall command"),
     }
@@ -1183,6 +1187,39 @@ fn test_recall_include_superseded_flag() {
             assert!(
                 include_superseded,
                 "--include-superseded must set the flag to true"
+            );
+        }
+        _ => panic!("Expected Recall command"),
+    }
+}
+
+#[test]
+fn test_recall_allow_degraded_flag_round_trips() {
+    // AC: clap parses `task-mgr recall --query x --allow-degraded` and the
+    // boolean round-trips as `allow_degraded == true`.
+    let cli = Cli::parse_from(["task-mgr", "recall", "--query", "x", "--allow-degraded"]);
+    match cli.command {
+        Commands::Recall {
+            query,
+            allow_degraded,
+            ..
+        } => {
+            assert_eq!(query, Some("x".to_string()));
+            assert!(allow_degraded, "--allow-degraded must set the flag to true");
+        }
+        _ => panic!("Expected Recall command"),
+    }
+}
+
+#[test]
+fn test_recall_allow_degraded_default_false() {
+    // AC: omitting `--allow-degraded` keeps the strict default.
+    let cli = Cli::parse_from(["task-mgr", "recall", "--query", "anything"]);
+    match cli.command {
+        Commands::Recall { allow_degraded, .. } => {
+            assert!(
+                !allow_degraded,
+                "default for --allow-degraded must be false (strict mode)"
             );
         }
         _ => panic!("Expected Recall command"),

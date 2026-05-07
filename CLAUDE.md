@@ -224,6 +224,61 @@ existing CLI formatters.
 - `curate dedup` works without Ollama — falls back to standard batch sizing when no embeddings exist
 - `curate embed --status` only queries the DB (no Ollama connection needed)
 - `curate embed` returns a clear error if Ollama is unreachable or the model is missing
+- `recall --query <text>` HARD-FAILS by default if Ollama is unreachable. Pass
+  `--allow-degraded` to fall back to silently-empty vector results (useful for
+  offline runs). `recall --for-task <id>` (no `--query`) does not need Ollama.
+
+### Reranker (optional)
+
+The recall pipeline can layer a cross-encoder reranker on top of the per-backend
+union slate. Reranking only fires for `recall --query <text>` (with or without
+`--for-task`); `--for-task` alone runs the today's UCB-only pipeline.
+
+Configure in `.task-mgr/config.json`:
+
+```json
+{
+  "rerankerUrl": "http://localhost:8080",
+  "rerankerModel": "jina-reranker-v2-base-multilingual",
+  "rerankerOverFetch": 3
+}
+```
+
+- **`rerankerUrl`** — base URL of a [gpustack/llama-box](https://github.com/gpustack/llama-box)
+  server exposing OpenAI-compatible `/v1/rerank`. Reranker is disabled when unset.
+- **`rerankerModel`** — model name passed in the `model` field of the rerank
+  request. Required alongside `rerankerUrl`; either-or disables rerank.
+- **`rerankerOverFetch`** — per-backend over-fetch factor. Slate size is
+  `min(limit * over_fetch, 30)`. Default `3`. Higher = better recall headroom,
+  longer rerank latency.
+- **Example llama-box invocation** (CPU, port 8080):
+
+  ```sh
+  llama-box --rerank-only --port 8080 \
+      --model /models/jina-reranker-v2-base-multilingual.gguf
+  ```
+
+  See `docker/docker-compose.yml` for a full Docker setup that bundles Ollama
+  embeddings + llama-box rerank, GPU-by-default with a `--profile cpu` fallback.
+
+#### Soft-fail asymmetry
+
+The reranker is a quality booster, not a correctness primitive: when the
+server is unreachable, recall emits a `[warn]` line to stderr and returns the
+un-reranked candidates with their original BM25/cosine/pattern scores. Recall
+still exits `0`. Contrast with Ollama, which by default hard-fails because the
+vector backend is part of the recall result, not just an ordering heuristic.
+
+#### `--query "X" --for-task Y` interaction
+
+When both are set:
+1. Per-backend top-N union slate is fetched (FEAT-003's `retrieve_for_rerank`).
+2. Cross-encoder reranks the slate by `(query, candidate)` similarity.
+3. UCB tiebreaks within ±0.05 rerank-score bands (same band → higher UCB wins).
+4. Slate is truncated to `--limit`.
+
+`--for-task` alone (no `--query`) skips steps 1-3 entirely; the reranker is
+NOT consulted.
 
 ## Dedup Dismissal Memory
 

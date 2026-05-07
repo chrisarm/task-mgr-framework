@@ -1280,6 +1280,22 @@
         "src/commands/curate/mod.rs",
         "src/commands/curate/enrich.rs"
       ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: HF_FILE points to existing file (FP16, uppercase)",
+        "Positive: curl HEAD on the resolve URL returns 200/302 (not 404)",
+        "Negative: lowercase f16 no longer appears in docker/llama-box/Dockerfile"
+      ],
+      "description": "From REVIEW-001: docker compose --profile cpu build fails with HTTP 404 from Hugging Face because the pinned filename uses lowercase f16. The actual file at gpustack/jina-reranker-v2-base-multilingual-GGUF revision 09a0e5b9f3d193a4f1e771ba6ceccdf1153d3a9a is jina-reranker-v2-base-multilingual-FP16.gguf (uppercase FP). Verified via the HF API siblings list which shows FP16, not f16. Introduced in commit 9ff97f4 (FEAT-006 of recall-strict-rerank PRD); survived FIX-003 and FIX-009 unchanged.",
+      "estimatedEffort": "low",
+      "id": "FIX-010",
+      "passes": false,
+      "priority": 60,
+      "title": "Fix HF filename: f16.gguf -> FP16.gguf in llama-box Dockerfile",
+      "touchesFiles": [
+        "docker/llama-box/Dockerfile"
+      ]
     }
   ],
   "version": "1.0"

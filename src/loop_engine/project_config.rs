@@ -48,6 +48,20 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub default_model: Option<String>,
 
+    /// llama-box reranker endpoint. Must be set together with `reranker_model`;
+    /// if only one is present the reranker is disabled with a warning.
+    #[serde(default)]
+    pub reranker_url: Option<String>,
+
+    /// Cross-encoder model name served by the llama-box `/v1/rerank` endpoint.
+    #[serde(default)]
+    pub reranker_model: Option<String>,
+
+    /// How many candidates per backend to fetch before reranking.
+    /// Defaults to 3 when unset; values of 0 are clamped to 1 with a warning.
+    #[serde(default)]
+    pub reranker_over_fetch: Option<u32>,
+
     /// Hard cap (seconds) on a single parallel-slot merge-conflict resolution
     /// Claude run. Defaults to 600 (10 min). Lift for projects with large
     /// merges; lower for tight feedback loops.
@@ -71,8 +85,39 @@ impl Default for ProjectConfig {
             embedding_model: None,
             dedup_model: None,
             default_model: None,
+            reranker_url: None,
+            reranker_model: None,
+            reranker_over_fetch: None,
             merge_resolver_timeout_secs: None,
             merge_resolver_effort: None,
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// Returns `Some((url, model, over_fetch))` only when both `reranker_url`
+    /// AND `reranker_model` are set. Returns `None` silently when neither is
+    /// set; warns and returns `None` when exactly one is present.
+    pub fn resolved_reranker_config(&self) -> Option<(String, String, u32)> {
+        match (&self.reranker_url, &self.reranker_model) {
+            (Some(url), Some(model)) => {
+                let over_fetch = match self.reranker_over_fetch {
+                    None => 3,
+                    Some(0) => {
+                        crate::output::warn("rerankerOverFetch=0 is invalid; clamping to 1");
+                        1
+                    }
+                    Some(n) => n,
+                };
+                Some((url.clone(), model.clone(), over_fetch))
+            }
+            (None, None) => None,
+            _ => {
+                crate::output::warn(
+                    "rerankerUrl/rerankerModel: both must be set; reranker disabled",
+                );
+                None
+            }
         }
     }
 }
@@ -318,6 +363,99 @@ mod tests {
         assert!(
             !raw.contains("defaultModel"),
             "key should be removed, got: {raw}"
+        );
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_both_set() {
+        let config = ProjectConfig {
+            reranker_url: Some("http://x".to_string()),
+            reranker_model: Some("m".to_string()),
+            reranker_over_fetch: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_reranker_config(),
+            Some(("http://x".to_string(), "m".to_string(), 5))
+        );
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_default_over_fetch() {
+        let config = ProjectConfig {
+            reranker_url: Some("http://x".to_string()),
+            reranker_model: Some("m".to_string()),
+            reranker_over_fetch: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_reranker_config(),
+            Some(("http://x".to_string(), "m".to_string(), 3))
+        );
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_over_fetch_zero_clamped_to_one() {
+        let config = ProjectConfig {
+            reranker_url: Some("http://x".to_string()),
+            reranker_model: Some("m".to_string()),
+            reranker_over_fetch: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_reranker_config(),
+            Some(("http://x".to_string(), "m".to_string(), 1))
+        );
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_only_url_set() {
+        let config = ProjectConfig {
+            reranker_url: Some("http://x".to_string()),
+            reranker_model: None,
+            ..Default::default()
+        };
+        assert!(config.resolved_reranker_config().is_none());
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_only_model_set() {
+        let config = ProjectConfig {
+            reranker_url: None,
+            reranker_model: Some("m".to_string()),
+            ..Default::default()
+        };
+        assert!(config.resolved_reranker_config().is_none());
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_neither_set() {
+        let config = ProjectConfig::default();
+        assert!(config.resolved_reranker_config().is_none());
+    }
+
+    #[test]
+    fn test_resolved_reranker_config_from_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.resolved_reranker_config().is_none());
+    }
+
+    #[test]
+    fn test_reranker_config_deserializes_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"rerankerUrl":"http://x","rerankerModel":"m","rerankerOverFetch":5}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.reranker_url.as_deref(), Some("http://x"));
+        assert_eq!(config.reranker_model.as_deref(), Some("m"));
+        assert_eq!(config.reranker_over_fetch, Some(5));
+        assert_eq!(
+            config.resolved_reranker_config(),
+            Some(("http://x".to_string(), "m".to_string(), 5))
         );
     }
 

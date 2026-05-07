@@ -27,11 +27,32 @@ use crate::TaskMgrResult;
 use crate::models::{Learning, LearningOutcome};
 
 use super::bandit;
+use super::reranker::Reranker;
 use super::retrieval::patterns::resolve_task_context;
 use super::retrieval::{CompositeBackend, RetrievalBackend, RetrievalQuery, ScoredLearning};
 
+/// Hard cap on the candidate slate size sent to the reranker.
+///
+/// Bounds rerank latency and request body size regardless of `limit *
+/// reranker_over_fetch`. Cross-encoder rerank is the dominant cost of recall
+/// when enabled; 30 docs keeps p99 latency reasonable on commodity GPUs.
+const MAX_RERANK_SLATE: usize = 30;
+
+/// Width of the rerank-score band inside which UCB breaks ties.
+///
+/// jina-v2 reranker emits sigmoid-bounded scores in `(0, 1)`, so 0.05 ≈ 5
+/// score points — small enough that UCB exploration only fires between
+/// near-identical candidates, never between clearly-better and clearly-worse
+/// ones. If a future reranker model returns scores outside `(0, 1)` this
+/// constant should be revisited (or replaced with a min-max normalisation).
+const RERANK_TIEBREAK_BAND: f64 = 0.05;
+
 /// Parameters for recalling learnings.
-#[derive(Debug, Clone, Default)]
+///
+/// Not `Clone` because [`Self::reranker`] holds a `Box<dyn Reranker>` trait
+/// object. Callers move the params into [`recall_learnings`] /
+/// [`recall_learnings_scored`] / [`recall_learnings_with_backend`] by value.
+#[derive(Default)]
 pub struct RecallParams {
     /// Free-text search query (LIKE matching on title and content)
     pub query: Option<String>,
@@ -45,6 +66,20 @@ pub struct RecallParams {
     pub limit: usize,
     /// When `false` (default), superseded learnings are excluded from results.
     pub include_superseded: bool,
+    /// When `true`, the caller has opted into degraded recall: an unreachable
+    /// Ollama returns empty vector results instead of a hard error. Plumbed
+    /// through to the `VectorBackend` strict-mode toggle by the command layer.
+    /// Lives here (not on `RetrievalQuery`) so backends stay
+    /// recall-policy-agnostic.
+    pub allow_degraded: bool,
+    /// Optional cross-encoder reranker. When `Some` AND `query` is non-empty,
+    /// the recall pipeline switches to over-fetch + per-backend union +
+    /// rerank + truncate. `Send + Sync` so `RecallParams` can cross threads.
+    pub reranker: Option<Box<dyn Reranker + Send + Sync>>,
+    /// Per-backend over-fetch factor when reranking. Effective slate size is
+    /// `min(limit * reranker_over_fetch, MAX_RERANK_SLATE)`. Must be >= 1;
+    /// values of 0 are clamped to 1.
+    pub reranker_over_fetch: u32,
 }
 
 /// Result of recalling learnings.
@@ -109,6 +144,19 @@ type RankedWithUcb = (Vec<ScoredLearning>, Option<HashMap<i64, f64>>);
 /// [`recall_learnings_scored`] uses the cache to avoid redundant
 /// `bandit::get_window_stats` calls; [`recall_learnings_with_backend`] ignores
 /// it.
+///
+/// ## Pipeline branches
+///
+/// * **Rerank path** — taken when `params.reranker.is_some()` AND
+///   `params.query` is `Some(non-empty)`. Over-fetches a per-backend union
+///   slate via [`RetrievalBackend::retrieve_for_rerank`], invokes the
+///   cross-encoder reranker, optionally applies UCB tiebreaking inside ±0.05
+///   rerank-score bands when `params.for_task` is also set, then truncates to
+///   `limit`. A reranker `Err` is logged to stderr and the un-reranked slate is
+///   returned in its original (per-backend union) order — the recall API
+///   never propagates reranker failures.
+/// * **Legacy path** — preserved verbatim for the no-reranker / no-query-text
+///   case: `backend.retrieve` (max-merge) + UCB fallback + `rerank_with_ucb`.
 fn retrieve_and_rank(
     conn: &Connection,
     params: &RecallParams,
@@ -135,7 +183,28 @@ fn retrieve_and_rank(
         query.task_error = task_error;
     }
 
-    // Retrieve via backend
+    // Rerank path: only when a reranker is configured AND we have non-empty
+    // query text. `--for-task` without `--query` deliberately skips rerank
+    // (the cross-encoder needs a query string; FEAT-001's empty-string
+    // short-circuit also bypasses Ollama).
+    let rerank_query: Option<String> = query
+        .text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let (Some(reranker), Some(query_text)) = (params.reranker.as_ref(), rerank_query) {
+        return rerank_pipeline(
+            conn,
+            backend,
+            reranker.as_ref(),
+            &mut query,
+            &query_text,
+            limit,
+            params,
+        );
+    }
+
+    // Legacy path: backend max-merge + UCB fallback + UCB-based re-rank.
     let mut scored = backend.retrieve(conn, &query)?;
 
     // UCB fallback + re-ranking only for task-based recall (not CLI free-text queries)
@@ -158,6 +227,148 @@ fn retrieve_and_rank(
     };
 
     Ok((scored, ucb_cache))
+}
+
+/// Cross-encoder rerank pipeline: over-fetch → rerank → optional UCB tiebreak → truncate.
+///
+/// Mutates `query.limit` to the inflated slate size before fetching candidates;
+/// the original `limit` is applied as the final truncation. A reranker error
+/// soft-fails: emits a stderr warning and returns the un-reranked slate in
+/// per-backend union order.
+fn rerank_pipeline(
+    conn: &Connection,
+    backend: &dyn RetrievalBackend,
+    reranker: &(dyn Reranker + Send + Sync),
+    query: &mut RetrievalQuery,
+    query_text: &str,
+    limit: usize,
+    params: &RecallParams,
+) -> TaskMgrResult<RankedWithUcb> {
+    let over_fetch = params.reranker_over_fetch.max(1);
+    let slate_limit = limit
+        .saturating_mul(over_fetch as usize)
+        .min(MAX_RERANK_SLATE);
+    query.limit = slate_limit;
+
+    let candidates = backend.retrieve_for_rerank(conn, query)?;
+    if candidates.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    // Clone before passing to rerank so we can fall back to the un-reranked
+    // slate on Err. Cheap relative to the cross-encoder HTTP round-trip we're
+    // about to make: ScoredLearning::clone is mostly a Vec<Learning> clone.
+    let fallback = candidates.clone();
+    let mut ranked = match reranker.rerank(query_text, candidates) {
+        Ok(reranked) => reranked,
+        Err(e) => {
+            // Soft-fail: a reranker outage must never break recall. The Err
+            // already carries the URL (LlamaBoxReranker formats the request
+            // URL into its connection error); we don't duplicate it here.
+            crate::output::warn(&format!("reranker: {e}; using un-reranked order"));
+            fallback
+        }
+    };
+
+    // UCB tiebreak only fires when both --query and --for-task are present.
+    // Free-text recall (--query alone) intentionally skips UCB so CLI users
+    // get a deterministic relevance ordering.
+    let ucb_cache = if params.for_task.is_some() {
+        apply_ucb_tiebreak(conn, &mut ranked)?;
+        ranked.truncate(limit);
+        // Populate the cache from the final truncated set so
+        // recall_learnings_scored surfaces UCB values without a second
+        // bandit::get_window_stats round-trip per row. Mirrors the legacy
+        // path's invariant: ucb_score is Some iff for_task is set.
+        let total_window_shows = bandit::get_total_window_shows(conn)?;
+        let mut cache: HashMap<i64, f64> = HashMap::new();
+        for s in ranked.iter() {
+            if let Some(id) = s.learning.id {
+                cache.insert(id, ucb_for_learning(conn, &s.learning, total_window_shows));
+            }
+        }
+        Some(cache)
+    } else {
+        ranked.truncate(limit);
+        None
+    };
+
+    Ok((ranked, ucb_cache))
+}
+
+/// In-band UCB tiebreak: stable-sort each ±0.05 rerank-score band by UCB desc.
+///
+/// Assumes `ranked` is already sorted descending by `relevance_score` (the
+/// cross-encoder score, in `(0, 1)` for jina-v2). Walks contiguous runs whose
+/// scores fall within [`RERANK_TIEBREAK_BAND`] of the band-anchor (the
+/// highest-scored element in the band) and reorders inside the run by UCB
+/// descending. The relative order of bands is preserved.
+fn apply_ucb_tiebreak(conn: &Connection, ranked: &mut [ScoredLearning]) -> TaskMgrResult<()> {
+    let total_window_shows = bandit::get_total_window_shows(conn)?;
+    let stats_fn = |id: i64| bandit::get_window_stats(conn, id).ok();
+    apply_ucb_tiebreak_inner(ranked, stats_fn, total_window_shows);
+    Ok(())
+}
+
+/// Inner implementation that accepts an injectable stats fetcher for testability.
+///
+/// Each unique learning id triggers at most one `stats_fn` call; errors are
+/// absorbed via `Option` (absent entry → sentinel `WindowStats::default()`).
+pub(crate) fn apply_ucb_tiebreak_inner(
+    ranked: &mut [ScoredLearning],
+    stats_fn: impl Fn(i64) -> Option<bandit::WindowStats>,
+    total_window_shows: i64,
+) {
+    if ranked.len() < 2 {
+        return;
+    }
+
+    let mut start = 0;
+    while start < ranked.len() {
+        let band_top = ranked[start].relevance_score;
+        let band_floor = band_top - RERANK_TIEBREAK_BAND;
+        let mut end = start + 1;
+        while end < ranked.len() && ranked[end].relevance_score >= band_floor {
+            end += 1;
+        }
+        if end - start > 1 {
+            // Pre-fetch UCB stats so the sort closure makes zero DB calls.
+            let mut stats_cache: HashMap<i64, bandit::WindowStats> = HashMap::new();
+            for c in &ranked[start..end] {
+                if let Some(id) = c.learning.id
+                    && let std::collections::hash_map::Entry::Vacant(e) = stats_cache.entry(id)
+                    && let Some(s) = stats_fn(id)
+                {
+                    e.insert(s);
+                }
+            }
+
+            // Stable sort by UCB descending — preserves rerank order within
+            // ties at the UCB level.
+            ranked[start..end].sort_by(|a, b| {
+                let ucb_a = a
+                    .learning
+                    .id
+                    .and_then(|id| stats_cache.get(&id))
+                    .map(|s| {
+                        bandit::calculate_ucb_score(s, a.learning.confidence, total_window_shows)
+                    })
+                    .unwrap_or(0.0);
+                let ucb_b = b
+                    .learning
+                    .id
+                    .and_then(|id| stats_cache.get(&id))
+                    .map(|s| {
+                        bandit::calculate_ucb_score(s, b.learning.confidence, total_window_shows)
+                    })
+                    .unwrap_or(0.0);
+                ucb_b
+                    .partial_cmp(&ucb_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        start = end;
+    }
 }
 
 /// Recalls learnings using the default composite backend.

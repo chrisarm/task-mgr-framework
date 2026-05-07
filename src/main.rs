@@ -456,11 +456,13 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             outcome,
             limit,
             include_superseded,
+            allow_degraded,
         } => {
             use task_mgr::loop_engine::project_config::read_project_config;
 
             let conn = open_connection(&cli.dir)?;
             let proj_config = read_project_config(&cli.dir);
+            let reranker = proj_config.resolved_reranker_config();
 
             let params = RecallCmdParams {
                 query,
@@ -471,6 +473,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 ollama_url: proj_config.ollama_url,
                 embedding_model: proj_config.embedding_model,
                 include_superseded,
+                reranker_url: reranker.as_ref().map(|(u, _, _)| u.clone()),
+                reranker_model: reranker.as_ref().map(|(_, m, _)| m.clone()),
+                reranker_over_fetch: reranker.map(|(_, _, n)| n),
+                allow_degraded,
             };
 
             let result = recall(&conn, params)?;

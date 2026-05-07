@@ -146,6 +146,28 @@ pub enum TaskMgrError {
         /// Explanation of why the path is unsafe
         reason: String,
     },
+
+    /// Ollama embedding service is unreachable or returned an unparseable response.
+    ///
+    /// Raised by `VectorBackend` when running in strict mode (i.e. recall was
+    /// invoked with `--query` and `--allow-degraded` was *not* passed). The
+    /// underlying `std::io::Error` is preserved as `source`.
+    #[error(
+        "Ollama embedding service unreachable at {url} (model: {model}): {source}\n\n\
+         Hints:\n  \
+         - Is Ollama running? Try: ollama serve\n  \
+         - Is the model pulled? Try: ollama pull {model}\n  \
+         - To run recall without semantic search, pass --allow-degraded"
+    )]
+    OllamaUnreachable {
+        /// The Ollama base URL that was contacted (matches `OllamaEmbedder.base_url`).
+        url: String,
+        /// The embedding model that was requested.
+        model: String,
+        /// Underlying I/O failure (connection refused, timeout, malformed JSON, ...).
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Default hint for lock errors when a specific PID is known.

@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod learnings;
 pub mod loop_engine;
 pub mod models;
+pub mod output;
 pub mod paths;
 
 // Re-export commonly used error types

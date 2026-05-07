@@ -14,6 +14,7 @@ pub mod crud;
 pub mod embeddings;
 pub mod ingestion;
 pub mod recall;
+pub mod reranker;
 pub mod retrieval;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -33,6 +34,7 @@ pub use recall::{
     format_text as format_recall_text, recall_learnings, recall_learnings_scored,
     recall_learnings_with_backend,
 };
+pub use reranker::{LlamaBoxReranker, Reranker};
 pub use retrieval::{
     CompositeBackend, Fts5Backend, PatternsBackend, RetrievalBackend, RetrievalQuery,
     ScoredLearning, VectorBackend,
