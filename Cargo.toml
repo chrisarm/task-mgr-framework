@@ -65,3 +65,4 @@ predicates = "3"
 rstest = "0.24"
 # Used by reranker HTTP tests.
 mockito = "1"
+static_assertions = "1"

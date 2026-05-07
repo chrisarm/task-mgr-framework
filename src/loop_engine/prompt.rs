@@ -23,6 +23,10 @@ use rusqlite::Connection;
 /// Implementations land in FEAT-001; current contents are placeholders.
 pub mod core;
 
+/// Slot-mode prompt builder. See `tests/prompt_slot.rs` for the contract.
+/// Implementation lands in FEAT-001; current contents are placeholders.
+pub mod slot;
+
 use crate::commands::next;
 use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};

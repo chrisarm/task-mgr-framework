@@ -8,3 +8,11 @@ Learnings:
 - Integration tests in `tests/` cannot reach `pub(crate)` `loop_engine::test_utils` (learning #896); used `open_connection` + `create_schema` (+ optional `run_migrations`) directly. Skipping migrations is the simplest way to provoke the missing-FTS5 retrieval-error path.
 - The "stub returns empty" discriminator is enforced via `#[ignore]` per learning #862; `cargo test --test prompt_core -- --include-ignored` still shows 8 failures against the stub, which is the contract FEAT-001 will satisfy.
 ---
+## [2026-05-07 23:35] - 5d1118de-TEST-INIT-002
+Approach: TDD scaffolding — created stub src/loop_engine/prompt/slot.rs (SlotPromptBundle + SlotPromptParams + build_prompt stub), wired into prompt/mod.rs, added static_assertions dev-dep, and wrote tests/prompt_slot.rs. Compile-time `assert_impl_all!(SlotPromptBundle: Send)` runs every build; content tests are #[ignore]'d for FEAT-001; slot-worker-panic test is gated on FEAT-002. The task_id-alignment test runs today against the stub.
+Files: Cargo.toml, src/loop_engine/prompt.rs, src/loop_engine/prompt/slot.rs, tests/prompt_slot.rs
+Learnings:
+- Send guarantee is best enforced at compile time via static_assertions; runtime Send tests would only catch field types after construction.
+- Stub bundle must populate task_id even when prompt is empty so orphan-reset accounting tests can run before FEAT-001 lands.
+- Mirroring prompt_core.rs scaffolding pattern keeps the FEAT-001/FEAT-002 implementation surface predictable.
+---

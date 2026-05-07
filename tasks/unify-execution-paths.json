@@ -91,7 +91,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "TDD: write tests first. These tests must reject a stub that returns empty strings unconditionally. Use real Task structs (per src/models/task.rs) — never hand-built JSON maps. Setup uses setup_db_with_migrations() per CLAUDE.md note about supersession-aware tests.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "All `&Connection` reads stay on the main thread; helpers take &Connection by reference",
