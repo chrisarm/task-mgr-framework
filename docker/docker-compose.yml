@@ -1,3 +1,5 @@
+name: task-mgr-recall
+
 services:
   # --- GPU variants (default — no --profile flag required) ---
 
