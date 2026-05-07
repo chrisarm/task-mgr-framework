@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+/// Bedrock prompt section helpers shared by sequential and slot prompt builders.
+///
+/// See `tests/prompt_core.rs` for the contract these helpers must honor.
+/// Implementations land in FEAT-001; current contents are placeholders.
+pub mod core;
+
 use crate::commands::next;
 use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};

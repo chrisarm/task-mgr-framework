@@ -1,0 +1,10 @@
+# Progress log for PRD: unify-execution-paths (prefix 5d1118de)
+
+## [2026-05-07 00:00] - 5d1118de-TEST-INIT-001
+Approach: TDD scaffolding. Added `pub mod core;` to `src/loop_engine/prompt.rs` plus a sibling `prompt/core.rs` stub returning empty values; wrote `tests/prompt_core.rs` with 11 contract tests (8 happy-path/discriminator marked `#[ignore]` so FEAT-001 must remove them, 3 degradation tests pass against stubs).
+Files: src/loop_engine/prompt.rs, src/loop_engine/prompt/core.rs, tests/prompt_core.rs
+Learnings:
+- Edition 2024 lets `prompt.rs` declare `pub mod core;` while `prompt/core.rs` lives alongside — avoids restructuring `prompt.rs` into `prompt/mod.rs` ahead of FEAT-001.
+- Integration tests in `tests/` cannot reach `pub(crate)` `loop_engine::test_utils` (learning #896); used `open_connection` + `create_schema` (+ optional `run_migrations`) directly. Skipping migrations is the simplest way to provoke the missing-FTS5 retrieval-error path.
+- The "stub returns empty" discriminator is enforced via `#[ignore]` per learning #862; `cargo test --test prompt_core -- --include-ignored` still shows 8 failures against the stub, which is the contract FEAT-001 will satisfy.
+---
