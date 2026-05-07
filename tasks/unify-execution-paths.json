@@ -148,7 +148,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Test fixtures must use real Task struct from src/models/task.rs. setup_db_with_migrations() required for FTS5 / supersession-aware retrieval. Add `static_assertions = \"1\"` to dev-dependencies if not already present (check Cargo.toml first).",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "SlotPromptBundle is Send and not Sync (matches SlotContext per learning #1864)",

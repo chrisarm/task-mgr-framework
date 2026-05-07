@@ -16,3 +16,11 @@ Learnings:
 - Stub bundle must populate task_id even when prompt is empty so orphan-reset accounting tests can run before FEAT-001 lands.
 - Mirroring prompt_core.rs scaffolding pattern keeps the FEAT-001/FEAT-002 implementation surface predictable.
 ---
+## [2026-05-07 23:55] - 5d1118de-TEST-INIT-003
+Approach: TDD scaffolding — created src/loop_engine/iteration_pipeline.rs stub (ProcessingOutcome + ProcessingParams + process_iteration_output returning default), wired via mod.rs, and wrote tests/iteration_pipeline.rs covering all 9 ACs. Body-level tests are #[ignore]'d for FEAT-003 (each carries the AC text and known-bad discriminator note); 2 type-level guards (default-empty + signature-compile) run unconditionally.
+Files: src/loop_engine/mod.rs, src/loop_engine/iteration_pipeline.rs, tests/iteration_pipeline.rs
+Learnings:
+- ProcessingParams holds &mut Connection + &mut IterationOutcome + &mut IterationContext simultaneously; one signature-compile test exercises the worst-case borrow shape so FEAT-003 can't accidentally narrow it.
+- Live `extract_learnings_from_output` spawns a real Claude subprocess, so the learnings-extraction test is gated until FEAT-003 ships a mock seam — documented explicitly in the test's #[ignore] reason.
+- Already-complete fallback parity is split into two named tests (skip_git=true + skip_git=false) so the wave-mode parity bug is the focus, not buried in a generic "fallback works" test.
+---
