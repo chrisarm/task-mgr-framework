@@ -7,7 +7,7 @@ services:
     build:
       context: ./ollama
     ports:
-      - "11434:11434"
+      - "11435:11434"
     restart: unless-stopped
     healthcheck:
       # /api/tags lists installed models — cheap, 200 even on empty install.
@@ -57,7 +57,7 @@ services:
     build:
       context: ./ollama
     ports:
-      - "11434:11434"
+      - "11435:11434"
     restart: unless-stopped
     healthcheck:
       # Same probe as GPU variant; start_period 60s covers model load on CPU.

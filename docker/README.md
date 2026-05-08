@@ -4,7 +4,7 @@ Two services that back the optional recall features:
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| `ollama` / `ollama-cpu` | 11434 | Hosts the jina-embeddings model for semantic recall |
+| `ollama` / `ollama-cpu` | 11435 | Hosts the jina-embeddings model for semantic recall |
 | `llama-box` / `llama-box-cpu` | 8080 | Hosts the jina-reranker cross-encoder for recall reranking |
 
 Both models are baked into the image at build time — container startup is instant
@@ -25,7 +25,7 @@ with no network dependency at runtime.
 docker compose -f docker/docker-compose.yml up -d --build
 
 # Verify
-curl localhost:11434/api/tags
+curl localhost:11435/api/tags
 curl -X POST localhost:8080/v1/rerank \
   -H 'Content-Type: application/json' \
   -d '{"model":"jina-reranker-v2-base-multilingual","query":"test","documents":["a","b"],"top_n":2}'
@@ -50,7 +50,7 @@ Add to `.task-mgr/config.json`:
 
 ```json
 {
-  "ollamaUrl": "http://localhost:11434",
+  "ollamaUrl": "http://localhost:11435",
   "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0",
   "rerankerUrl": "http://localhost:8080",
   "rerankerModel": "jina-reranker-v2-base-multilingual",
@@ -65,7 +65,7 @@ Add to `.task-mgr/config.json`:
 - Base image: `ollama/ollama:latest`
   (TODO: pin to a specific version, e.g. `ollama/ollama:0.6.x`, for reproducibility)
 - Baked model: `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0`
-- Port: `11434`
+- Host port: `11435` (mapped to container port `11434`, ollama's internal default)
 
 ### llama-box (`docker/llama-box/Dockerfile`)
 
@@ -88,7 +88,7 @@ Add to `.task-mgr/config.json`:
 
 ```bash
 # Confirms ollama is up and the baked model is listed
-curl localhost:11434/api/tags | python3 -m json.tool
+curl localhost:11435/api/tags | python3 -m json.tool
 
 # Confirms llama-box rerank endpoint is alive
 curl -s -X POST localhost:8080/v1/rerank \
