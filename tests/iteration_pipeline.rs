@@ -189,6 +189,10 @@ fn process_iteration_output_extracts_learnings_from_fixture_output() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     let after: i64 = conn
@@ -250,6 +254,10 @@ fn process_iteration_output_records_bandit_feedback_for_shown_learnings() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     let stats_a = get_window_stats(&conn, id_a).expect("window stats A");
@@ -311,6 +319,10 @@ fn process_iteration_output_skip_git_true_does_not_attempt_git_detection() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     // Without a git-detected completion AND without any other completion
@@ -400,6 +412,10 @@ fn process_iteration_output_skip_git_false_attempts_git_detection() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -447,6 +463,10 @@ fn already_complete_fallback_fires_in_skip_git_true_mode() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -485,6 +505,10 @@ fn already_complete_fallback_fires_in_skip_git_false_mode() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -535,6 +559,10 @@ fn tasks_completed_dedups_across_status_and_completed_branches() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -590,6 +618,10 @@ fn process_iteration_output_mutates_empty_outcome_to_completed_on_retroactive_co
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -641,6 +673,10 @@ fn completed_task_ids_includes_processed_task_and_cross_task_ids() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert!(
@@ -709,6 +745,10 @@ fn process_iteration_output_does_not_invoke_wrapper_commit() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -764,6 +804,10 @@ fn no_op_stub_fails_combined_contract_assertions() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     let stats = get_window_stats(&conn, learning_id).expect("window stats");
@@ -835,5 +879,9 @@ fn processing_params_constructs_against_real_signature() {
         db_dir: project.path(),
         signal_flag: &signal_flag,
         ctx: &mut ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     };
 }

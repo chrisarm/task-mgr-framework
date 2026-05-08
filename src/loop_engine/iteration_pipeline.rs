@@ -127,6 +127,21 @@ pub struct ProcessingParams<'a> {
     /// Iteration context. The pipeline updates `crash_tracker` and the
     /// per-task crash-tracking fields (`last_task_id`, `last_was_crash`).
     pub ctx: &'a mut IterationContext,
+    /// Files modified by the iteration's task (from task metadata). Used
+    /// only by `progress::log_iteration` — the pipeline does not consult
+    /// this for completion detection.
+    pub files_modified: &'a [String],
+    /// Effective model used for this iteration (post-crash-escalation).
+    /// Threaded into the progress log entry. `None` for early-exit paths.
+    pub effective_model: Option<&'a str>,
+    /// Effective `--effort` level for this iteration. Threaded into the
+    /// progress log entry. `None` when difficulty is unset/unknown or for
+    /// early-exit paths.
+    pub effective_effort: Option<&'static str>,
+    /// Slot index when the pipeline runs from a parallel wave; `None` for
+    /// the sequential `run_loop` call site. Threaded into the progress log
+    /// entry header (`Slot N`) so wave entries are distinguishable.
+    pub slot_index: Option<usize>,
 }
 
 /// Run the shared post-Claude pipeline.
@@ -158,6 +173,10 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         db_dir,
         signal_flag,
         ctx,
+        files_modified,
+        effective_model,
+        effective_effort,
+        slot_index,
     } = params;
 
     let mut result = ProcessingOutcome::default();
@@ -167,21 +186,18 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     // `counted` HashSet from process_slot_result (engine.rs:1136).
     let mut completed_set: HashSet<String> = HashSet::new();
 
-    // Step 1: progress log entry.
-    // Sequential and wave call sites currently log_iteration directly with
-    // files/model/effort/slot threaded from the IterationResult; FEAT-005 /
-    // FEAT-006 widen ProcessingParams and remove the duplicate call. Until
-    // then we emit a degraded entry so the pipeline stays observable in
-    // tests that don't go through the call sites.
+    // Step 1: progress log entry. FEAT-005 widened `ProcessingParams` so the
+    // sequential call site no longer needs to log separately; FEAT-006 wires
+    // the wave call site through the same path.
     progress::log_iteration(
         progress_path,
         iteration,
         task_id,
         outcome,
-        &[],
-        None,
-        None,
-        None,
+        files_modified,
+        effective_model,
+        effective_effort,
+        slot_index,
     );
 
     // Step 2: extract `<key-decision>` tags and persist.

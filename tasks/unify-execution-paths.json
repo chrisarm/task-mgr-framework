@@ -254,7 +254,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Use a synthetic IterationContext + repeated invocations rather than the real loop. Test must construct two consecutive iterations across paths (wave → sequential) and assert escalation fires on the second.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Crash escalation correctness via per-task HashMap",
@@ -394,7 +394,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Many existing IterationResult construction sites in engine.rs will need updating in FEAT-004 (per architect grep, ~19 sites; most pass None). This test asserts the threading is correct without depending on the exact site count.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Wave slot's Claude conversation threads to learnings extraction (closes a gap today)",
@@ -605,7 +605,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": true,
       "notes": "This task creates the module SHELL — body of behaviors is implemented here, but call sites are NOT switched yet (that's FEAT-005 + FEAT-006). Lift bodies from engine.rs:2032-2059 (run_iteration learnings/feedback) and engine.rs:3178-3530 (run_loop progress/key-decisions/status/completion ladder/already-complete). DO NOT lift wrapper-commit, external-git, human-review, rate-limit, pause-signal — those stay at call site (per FR-003 'Behaviors STAYING at the call site'). Read learning #2031 for overflow ladder contract.",
-      "passes": false,
+      "passes": true,
       "priority": 9,
       "qualityDimensions": [
         "Idempotent post-processing: exactly-once-per-task semantics",
@@ -641,7 +641,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Run `git grep -n 'IterationResult {' src/` and `git grep -n 'IterationResult::' src/` to enumerate construction sites before edits. The sequential post-Claude success path is the only site that passes Some(...). Verify no bin targets construct IterationResult.",
-      "passes": false,
+      "passes": true,
       "priority": 10,
       "qualityDimensions": [
         "Field is additive; no existing consumer breaks at the type level",

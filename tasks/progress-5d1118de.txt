@@ -56,3 +56,19 @@ Learnings:
 - The structural compile-time guard for AC #4 ("legacy fields removed") is encoded by simply NOT referencing ctx.last_task_id / ctx.last_was_crash anywhere in the test file; FEAT-007's deletion can't break this file. Cleaner than #[cfg]-style compile_error! gymnastics.
 - check_crash_escalation_via_ctx adapter bridges new contract (read map) to today's 4-arg signature — explicit "delete this when FEAT-007 lands" doc keeps the cleanup obvious. Two of four #[ignore]'d tests fail today against the real pipeline (proving the contract has discriminating power); the other two pass through the adapter (locking in the post-FEAT-007 escalation outcome).
 ---
+## [2026-05-07 00:00] - 5d1118de-FEAT-004
+Approach: Single-line fix — changed `conversation: None` to `conversation: claude_conversation` at the final return of `run_iteration` (engine.rs:2184). The struct field and all other ~19 construction sites (all `None`) were already in place from TEST-INIT-007.
+Files: src/loop_engine/engine.rs
+Learnings:
+- TEST-INIT-007 pre-landed both the struct field definition and `None` at every literal site; FEAT-004's only code change was the post-Claude success site.
+- `claude_conversation` was already captured from `claude_result.conversation` at line 2005, just not forwarded to the return value.
+- All 3 active `iteration_result_conversation` tests pass; 1 correctly remains `#[ignore]`d awaiting FEAT-003 pipeline body.
+---
+## [2026-05-08 02:30] - 5d1118de-FEAT-005
+Approach: Wired run_loop to call iteration_pipeline::process_iteration_output once after run_iteration returns. Removed Step 7.7 / Step 8 from run_iteration (~28 lines) and the inline progress/key-decision/status-tag/completion-ladder/already-complete block from run_loop (~280 lines), replaced by a single ~50-line pipeline call. Widened ProcessingParams with files_modified/effective_model/effective_effort/slot_index and dropped the pipeline's degraded progress::log_iteration. Added IterationResult.shown_learning_ids so feedback can run from the pipeline (TDD-bootstrap pattern from TEST-INIT-007).
+Files: src/loop_engine/engine.rs, src/loop_engine/iteration_pipeline.rs, tests/iteration_pipeline.rs, tests/iteration_result_conversation.rs, tests/crash_escalation_per_task.rs
+Learnings:
+- last_claimed_task clearing is now driven by ProcessingOutcome.completed_task_ids (claimed-task-only check), not the legacy "outcome==Completed" predicate which over-cleared on cross-task completions.
+- The pipeline's outcome mutation is observed correctly by downstream run_loop blocks (external-git reconciliation, human-review trigger, retry tracking) because those branches read result.outcome AFTER the pipeline call site.
+- Wrapper-commit precondition shifts from a local task_marked_done_this_iteration bool to claimed_was_completed (derived from completed_task_ids); same semantics, no string-sniffing.
+---

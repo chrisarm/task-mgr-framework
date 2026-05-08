@@ -57,6 +57,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         effective_effort: Some("high"),
         key_decisions_count: 0,
         conversation: Some("[user] go\n[assistant] done\n".into()),
+        shown_learning_ids: Vec::new(),
     };
     assert_eq!(
         success.conversation.as_deref(),
@@ -75,6 +76,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         effective_effort: None,
         key_decisions_count: 0,
         conversation: None,
+        shown_learning_ids: Vec::new(),
     };
     assert!(
         early_exit.conversation.is_none(),
@@ -114,6 +116,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             effective_effort: None,
             key_decisions_count: 0,
             conversation: Some(transcript.into()),
+            shown_learning_ids: Vec::new(),
         },
         claim_succeeded: true,
     };
@@ -141,6 +144,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         claim_succeeded: true,
     };
@@ -225,6 +229,7 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         effective_effort: None,
         key_decisions_count: 0,
         conversation: Some(transcript.into()),
+        shown_learning_ids: Vec::new(),
     };
 
     // Correct threading: the value seen by the pipeline equals the field.
@@ -257,6 +262,7 @@ fn dropping_conversation_at_caller_is_observably_different_from_threading_it() {
         effective_effort: None,
         key_decisions_count: 0,
         conversation: None,
+        shown_learning_ids: Vec::new(),
     };
     let early_correct: Option<&str> = early.conversation.as_deref();
     let early_broken: Option<&str> = None;

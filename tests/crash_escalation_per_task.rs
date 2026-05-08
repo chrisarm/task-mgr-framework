@@ -262,6 +262,10 @@ fn wave_crash_on_task_populates_crashed_last_iteration_true() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -353,6 +357,10 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
         db_dir: &fx.db_dir,
         signal_flag: &fx.signal_flag,
         ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
     });
 
     assert_eq!(
@@ -417,6 +425,10 @@ fn pipeline_loop_keeps_crashed_last_iteration_bounded_by_task_count() {
             db_dir: &fx.db_dir,
             signal_flag: &fx.signal_flag,
             ctx: &mut fx.ctx,
+            files_modified: &[],
+            effective_model: None,
+            effective_effort: None,
+            slot_index: None,
         });
     }
 

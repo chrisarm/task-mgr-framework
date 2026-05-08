@@ -45,11 +45,11 @@ use crate::loop_engine::deadline;
 use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::env;
-use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::{
     check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
 };
 use crate::loop_engine::guidance::SessionGuidance;
+use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
@@ -182,6 +182,13 @@ pub struct IterationResult {
     /// `iteration_pipeline::process_iteration_output` can prefer the transcript
     /// over raw output for learning extraction.
     pub conversation: Option<String>,
+    /// Learnings shown to Claude during prompt assembly this iteration.
+    /// Threaded from `prompt_result.shown_learning_ids` at the post-Claude
+    /// success site; empty on every early-exit path (signal, rate-limit, pause,
+    /// pre-iteration error). The shared
+    /// `iteration_pipeline::process_iteration_output` consumes this via
+    /// `ProcessingParams.shown_learning_ids` to record bandit feedback.
+    pub shown_learning_ids: Vec<i64>,
 }
 
 /// Mutable context carried between iterations.
@@ -501,6 +508,7 @@ fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
             effective_effort: exit.effective_effort,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         // Early exit always runs after a successful claim (the slot thread
         // started); the orphan reset must consider this task pending until
@@ -678,6 +686,7 @@ pub fn run_slot_iteration(
             effective_effort: effort,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         claim_succeeded: true,
     })
@@ -741,6 +750,7 @@ fn slot_failure_result(
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         claim_succeeded,
     }
@@ -1565,6 +1575,7 @@ pub fn run_iteration(
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1581,6 +1592,7 @@ pub fn run_iteration(
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1613,6 +1625,7 @@ pub fn run_iteration(
                     effective_effort: None,
                     key_decisions_count: 0,
                     conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -1644,6 +1657,7 @@ pub fn run_iteration(
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1709,6 +1723,7 @@ pub fn run_iteration(
                     effective_effort: None,
                     key_decisions_count: 0,
                     conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
 
@@ -1757,6 +1772,7 @@ pub fn run_iteration(
                             effective_effort: None,
                             key_decisions_count: 0,
                             conversation: None,
+                            shown_learning_ids: Vec::new(),
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -1783,6 +1799,7 @@ pub fn run_iteration(
                     effective_effort: None,
                     key_decisions_count: 0,
                     conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
         }
@@ -1969,6 +1986,7 @@ pub fn run_iteration(
             effective_effort: effort,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1998,6 +2016,7 @@ pub fn run_iteration(
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -2032,6 +2051,7 @@ pub fn run_iteration(
                         effective_effort: None,
                         key_decisions_count: 0,
                         conversation: None,
+                        shown_learning_ids: Vec::new(),
                     });
                 }
                 UsageCheckResult::WaitedAndReset => {
@@ -2070,39 +2090,17 @@ pub fn run_iteration(
                     effective_effort: None,
                     key_decisions_count: 0,
                     conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
         }
     }
 
-    // Step 7.7: Extract learnings from output (best-effort, opt-out via env var)
-    // Prefer the structured conversation from stream-json mode; fall back to raw output.
-    let learning_source = claude_conversation.as_deref().unwrap_or(&claude_output);
-    if !crate::learnings::ingestion::is_extraction_disabled() && !learning_source.is_empty() {
-        match crate::learnings::ingestion::extract_learnings_from_output(
-            params.conn,
-            learning_source,
-            Some(&task_id),
-            Some(params.run_id),
-            Some(params.db_dir),
-            Some(params.signal_flag),
-        ) {
-            Ok(r) if r.learnings_extracted > 0 => {
-                eprintln!(
-                    "Extracted {} learning(s) from output",
-                    r.learnings_extracted
-                );
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("Warning: learning extraction failed: {}", e),
-        }
-    }
-
-    // Step 8: Record learning feedback
-    if let Err(e) = feedback::record_iteration_feedback(params.conn, &shown_learning_ids, &outcome)
-    {
-        eprintln!("Warning: failed to record iteration feedback: {}", e);
-    }
+    // Step 7.7 / Step 8 (extract_learnings_from_output, record_iteration_feedback)
+    // were lifted into `iteration_pipeline::process_iteration_output` (FEAT-005).
+    // The pipeline now runs from the call site (`run_loop`, `run_wave_iteration`)
+    // after `run_iteration` returns. `shown_learning_ids` rides on
+    // `IterationResult.shown_learning_ids` to reach the pipeline.
 
     // Step 8.5: Handle PromptTooLong — walk the four-state recovery ladder
     // and emit the diagnostics bundle (prompt dump + JSONL + rotation).
@@ -2182,6 +2180,7 @@ pub fn run_iteration(
         effective_effort: effort,
         key_decisions_count: 0,
         conversation: claude_conversation,
+        shown_learning_ids,
     })
 }
 
@@ -3221,45 +3220,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             break;
         }
 
-        // Log progress (sequential path: slot=None)
-        progress::log_iteration(
-            &paths.progress_file,
-            iteration,
-            result.task_id.as_deref(),
-            &result.outcome,
-            &result.files_modified,
-            result.effective_model.as_deref(),
-            result.effective_effort,
-            None,
-        );
-
-        // Extract and store key decisions (non-fatal: DB errors are warnings only)
-        let key_decisions = detection::extract_key_decisions(&result.output);
-        let mut kd_count: u32 = 0;
-        for decision in &key_decisions {
-            match key_decisions_db::insert_key_decision(
-                &conn,
-                &run_id,
-                result.task_id.as_deref(),
-                i64::from(iteration),
-                decision,
-            ) {
-                Ok(_) => kd_count += 1,
-                Err(e) => eprintln!(
-                    "Warning: failed to store key decision '{}': {}",
-                    decision.title, e
-                ),
-            }
-        }
-        result.key_decisions_count = kd_count;
-
-        // Track last claimed task for cleanup on exit
+        // Track the claimed task before the pipeline runs. Cleared below if
+        // the pipeline reports the claimed task as completed.
         last_claimed_task = result.task_id.clone();
-        if matches!(result.outcome, IterationOutcome::Completed) {
-            last_claimed_task = None;
-        }
 
-        // Update run with last files
+        // Update run with last files (stays at the call site — pipeline only
+        // covers post-Claude completion / learning bookkeeping).
         if let Err(e) = run_cmd::update(
             &conn,
             &run_id,
@@ -3277,245 +3243,71 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             })
             .unwrap_or(0);
 
-        // Side-band `<task-status>` tag dispatch (FEAT-003).
-        // Parses every tag regardless of claimed task_id, dispatches through
-        // the existing command handlers, and (for Done) syncs PRD JSON.
-        // Runs BEFORE `<completed>` detection so a Done tag that maps to the
-        // claimed task sets task_marked_done_this_iteration below via outcome.
-        let status_updates = detection::extract_status_updates(&result.output);
-        let status_updates_applied = if !status_updates.is_empty() {
-            apply_status_updates(
-                &mut conn,
-                &status_updates,
-                Some(&run_id),
-                Some(&paths.prd_file),
-                task_prefix.as_deref(),
-                Some(&paths.progress_file),
-                Some(&run_config.db_dir),
+        // Run the shared post-Claude pipeline: progress logging, key-decision
+        // extraction, `<task-status>` dispatch, completion ladder
+        // (status-tag → completed-tag → git/scan → already-complete fallback),
+        // learning extraction, bandit feedback, and per-task crash-tracking.
+        // Wrapper-commit, external-git reconciliation, and human-review
+        // triggering stay at this call site (FEAT-005).
+        let processing_outcome =
+            iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+                conn: &mut conn,
+                run_id: &run_id,
+                iteration,
+                task_id: result.task_id.as_deref(),
+                output: &result.output,
+                conversation: result.conversation.as_deref(),
+                shown_learning_ids: &result.shown_learning_ids,
+                outcome: &mut result.outcome,
+                working_root: &working_root,
+                git_scan_depth: run_config.config.git_scan_depth,
+                skip_git_completion_detection: false,
+                prd_path: &paths.prd_file,
+                task_prefix: task_prefix.as_deref(),
+                progress_path: &paths.progress_file,
+                db_dir: &run_config.db_dir,
+                signal_flag: &signal_flag,
+                ctx: &mut ctx,
+                files_modified: &result.files_modified,
+                effective_model: result.effective_model.as_deref(),
+                effective_effort: result.effective_effort,
+                slot_index: None,
+            });
+        tasks_completed += processing_outcome.tasks_completed;
+        result.key_decisions_count = processing_outcome.key_decisions_count;
+
+        // Clear `last_claimed_task` only if the pipeline marked the claimed
+        // task itself as completed (any branch of the completion ladder).
+        // Cross-task `<completed>Y</completed>` completions do NOT clear it —
+        // the claimed task may still be in flight.
+        let claimed_was_completed = result
+            .task_id
+            .as_ref()
+            .map(|tid| {
+                processing_outcome
+                    .completed_task_ids
+                    .iter()
+                    .any(|c| c == tid)
+            })
+            .unwrap_or(false);
+        if claimed_was_completed {
+            last_claimed_task = None;
+        }
+
+        // Wrapper commit: if the claimed task was completed but no git commit
+        // exists (Claude couldn't commit in scoped permission mode), commit on
+        // its behalf.
+        if claimed_was_completed
+            && let Some(ref task_id) = result.task_id
+            && check_git_for_task_completion(
+                &working_root,
+                task_id,
+                run_config.config.git_scan_depth,
             )
-        } else {
-            0
-        };
-
-        // Check for task completion via multiple detection paths.
-        // Priority: <completed> tags > git commit > output scan > already-complete
-        if let Some(ref task_id) = result.task_id
-            && !matches!(result.outcome, IterationOutcome::Empty)
+            .is_none()
+            && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
         {
-            let mut task_marked_done_this_iteration = false;
-            // Iteration output may emit `<task-status>:done`, `<completed>`,
-            // commit-detection, output-scan, and "already complete" for the
-            // same task ID — count each task at most once per iteration to
-            // keep the wave summary honest.
-            let mut counted_this_iteration: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            // If a <task-status>...:done</task-status> referenced the claimed
-            // task, treat it identically to a <completed> tag: mark the task
-            // as done for this iteration, clear claim tracking, and push the
-            // outcome to Completed so stale/crash trackers reset.
-            if status_updates_applied > 0
-                && status_updates.iter().any(|u| {
-                    matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == task_id
-                })
-            {
-                task_marked_done_this_iteration = true;
-                last_claimed_task = None;
-                if counted_this_iteration.insert(task_id.clone()) {
-                    tasks_completed += 1;
-                }
-                result.outcome = IterationOutcome::Completed;
-                ctx.crash_tracker.record_success();
-                eprintln!(
-                    "Task {} completed (detected from <task-status> tag)",
-                    task_id,
-                );
-            }
-
-            // Primary: parse <completed> tags from output
-            let completed_tags = parse_completed_tasks(&result.output);
-            if !completed_tags.is_empty() {
-                for completed_id in &completed_tags {
-                    if let Ok(()) = mark_task_done(
-                        &mut conn,
-                        completed_id,
-                        &run_id,
-                        None,
-                        &paths.prd_file,
-                        task_prefix.as_deref(),
-                    ) {
-                        if completed_id == task_id {
-                            last_claimed_task = None;
-                            task_marked_done_this_iteration = true;
-                        }
-                        if counted_this_iteration.insert(completed_id.clone()) {
-                            tasks_completed += 1;
-                        }
-                        result.outcome = IterationOutcome::Completed;
-                        ctx.crash_tracker.record_success();
-                        eprintln!(
-                            "Task {} completed (detected from <completed> tag)",
-                            completed_id
-                        );
-                    }
-                }
-            }
-
-            // Fallback 1: git commit detection (only if no <completed> tags found)
-            if completed_tags.is_empty() {
-                if let Some(commit_hash) = check_git_for_task_completion(
-                    &working_root,
-                    task_id,
-                    run_config.config.git_scan_depth,
-                ) {
-                    // Mark task done in DB
-                    let task_ids = [task_id.clone()];
-                    match complete_cmd::complete(
-                        &mut conn,
-                        &task_ids,
-                        Some(&run_id),
-                        Some(&commit_hash),
-                        false, // force
-                    ) {
-                        Ok(_) => {
-                            last_claimed_task = None;
-                            if counted_this_iteration.insert(task_id.clone()) {
-                                tasks_completed += 1;
-                            }
-                            task_marked_done_this_iteration = true;
-
-                            // Override outcome so stale/crash trackers reset — task was actually completed
-                            result.outcome = IterationOutcome::Completed;
-                            ctx.crash_tracker.record_success();
-
-                            // Update PRD JSON to set passes: true
-                            if let Err(e) = update_prd_task_passes(
-                                &paths.prd_file,
-                                task_id,
-                                true,
-                                task_prefix.as_deref(),
-                            ) {
-                                eprintln!(
-                                    "Warning: failed to update PRD for task {}: {}",
-                                    task_id, e
-                                );
-                            } else {
-                                eprintln!(
-                                    "Task {} completed (commit {})",
-                                    task_id,
-                                    &commit_hash[..7.min(commit_hash.len())]
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: failed to mark task {} as done in DB: {}",
-                                task_id, e
-                            );
-                        }
-                    }
-                } else {
-                    // Fallback: scan Claude's output for ANY completed task IDs.
-                    // Claude may complete the claimed task or others in a single iteration,
-                    // and commits happen in a different repo (e.g. restaurant_agent_ex/).
-                    let completed_ids = scan_output_for_completed_tasks(
-                        &result.output,
-                        &conn,
-                        task_prefix.as_deref(),
-                    );
-                    for completed_id in &completed_ids {
-                        let ids = [completed_id.clone()];
-                        match complete_cmd::complete(
-                            &mut conn,
-                            &ids,
-                            Some(&run_id),
-                            None, // no commit hash — different repo
-                            false,
-                        ) {
-                            Ok(_) => {
-                                // Clear tracker if the claimed task was completed via output scan
-                                if result.task_id.as_deref() == Some(completed_id.as_str()) {
-                                    last_claimed_task = None;
-                                    task_marked_done_this_iteration = true;
-                                }
-
-                                if counted_this_iteration.insert(completed_id.clone()) {
-                                    tasks_completed += 1;
-                                }
-
-                                // Override outcome so stale/crash trackers reset — task was actually completed
-                                result.outcome = IterationOutcome::Completed;
-                                ctx.crash_tracker.record_success();
-
-                                if let Err(e) = update_prd_task_passes(
-                                    &paths.prd_file,
-                                    completed_id,
-                                    true,
-                                    task_prefix.as_deref(),
-                                ) {
-                                    eprintln!(
-                                        "Warning: failed to update PRD for task {}: {}",
-                                        completed_id, e
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Task {} completed (detected from output)",
-                                        completed_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to mark task {} as done: {}",
-                                    completed_id, e
-                                );
-                            }
-                        }
-                    }
-                }
-            } // end: if completed_tags.is_empty()
-
-            // Final fallback: Claude reports the task as "already complete" without committing.
-            // This catches tasks completed in a prior run where the DB was never updated.
-            // Use task_marked_done_this_iteration (not outcome) to avoid skipping when
-            // <promise>COMPLETE</promise> set outcome to Completed but no prior path marked the task done.
-            if !task_marked_done_this_iteration
-                && detection::is_task_reported_already_complete(
-                    &result.output,
-                    task_id,
-                    task_prefix.as_deref(),
-                )
-                && let Ok(()) = mark_task_done(
-                    &mut conn,
-                    task_id,
-                    &run_id,
-                    None,
-                    &paths.prd_file,
-                    task_prefix.as_deref(),
-                )
-            {
-                last_claimed_task = None;
-                if counted_this_iteration.insert(task_id.clone()) {
-                    tasks_completed += 1;
-                }
-                result.outcome = IterationOutcome::Completed;
-                ctx.crash_tracker.record_success();
-                eprintln!("Task {} completed (reported as already done)", task_id);
-            }
-
-            // Wrapper commit: if task was completed but no git commit exists
-            // (Claude couldn't commit in scoped permission mode), commit on its behalf.
-            if task_marked_done_this_iteration
-                && check_git_for_task_completion(
-                    &working_root,
-                    task_id,
-                    run_config.config.git_scan_depth,
-                )
-                .is_none()
-                && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
-            {
-                ctx.last_commit = Some(hash);
-            }
+            ctx.last_commit = Some(hash);
         }
 
         // Post-iteration: reconcile external git completions
@@ -4448,6 +4240,7 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         effective_effort: None,
         key_decisions_count: 0,
         conversation: None,
+        shown_learning_ids: Vec::new(),
     }
 }
 
@@ -4650,6 +4443,7 @@ mod tests {
             effective_effort: None,
             key_decisions_count: 0,
             conversation: None,
+            shown_learning_ids: Vec::new(),
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);
@@ -6531,6 +6325,7 @@ mod tests {
                     effective_effort: None,
                     key_decisions_count: 0,
                     conversation: None,
+                    shown_learning_ids: Vec::new(),
                 },
                 claim_succeeded: true,
             };
