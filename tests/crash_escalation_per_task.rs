@@ -37,7 +37,10 @@ use tempfile::TempDir;
 use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::loop_engine::config::IterationOutcome;
-use task_mgr::loop_engine::engine::{IterationContext, check_crash_escalation};
+use task_mgr::loop_engine::detection::{TaskStatusChange, TaskStatusUpdate};
+use task_mgr::loop_engine::engine::{
+    IterationContext, apply_status_updates, check_crash_escalation,
+};
 use task_mgr::loop_engine::iteration_pipeline::{ProcessingParams, process_iteration_output};
 use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 use task_mgr::loop_engine::signals::SignalFlag;
@@ -360,10 +363,12 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
         slot_index: None,
     });
 
+    // CODE-FIX-003: terminal transitions prune the entry entirely rather than
+    // flipping to false. The task is done — it has no active lifetime in the map.
     assert_eq!(
-        fx.ctx.crashed_last_iteration.get("TASK-SUCC"),
-        Some(&false),
-        "successful iteration on TASK-SUCC must flip crashed_last_iteration[TASK-SUCC] = false"
+        fx.ctx.crashed_last_iteration.contains_key("TASK-SUCC"),
+        false,
+        "done task must be pruned from crashed_last_iteration (entry must be absent)"
     );
 
     // Next pick of TASK-SUCC must NOT escalate.
@@ -472,6 +477,81 @@ fn discriminator_check_crash_escalation_returns_some_for_same_task_crash() {
         cross.is_none(),
         "cross-task crash must NOT escalate — got {:?}",
         cross,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CODE-FIX-003: crashed_last_iteration pruned on terminal transitions.
+// ---------------------------------------------------------------------------
+
+/// Crash task X in iteration N, mark X done via apply_status_updates in
+/// iteration N+1 — entry must be absent (contains_key == false).
+#[test]
+fn terminal_done_via_status_tag_prunes_crashed_last_iteration() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    // Insert task as in_progress so the Done dispatch succeeds.
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, priority) VALUES ('FIX003-TASK', 't', 'in_progress', 50)",
+        [],
+    )
+    .unwrap();
+
+    let mut ctx = IterationContext::new(5);
+    // Pre-state: task was recorded as crashed in a prior iteration.
+    ctx.crashed_last_iteration
+        .insert("FIX003-TASK".to_string(), true);
+
+    let updates = vec![TaskStatusUpdate {
+        task_id: "FIX003-TASK".to_string(),
+        status: TaskStatusChange::Done,
+    }];
+    apply_status_updates(
+        &mut conn,
+        &updates,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut ctx),
+    );
+
+    assert!(
+        !ctx.crashed_last_iteration.contains_key("FIX003-TASK"),
+        "terminal Done dispatch must prune FIX003-TASK from crashed_last_iteration"
+    );
+}
+
+/// Dispatch failure (task not in DB → complete fails) must NOT prune the
+/// entry — the DB row never reached terminal state.
+#[test]
+fn failed_dispatch_does_not_prune_crashed_last_iteration() {
+    let (_tmp, mut conn) = setup_migrated_db();
+    // Intentionally do NOT insert the task — complete_cmd::complete will fail.
+
+    let mut ctx = IterationContext::new(5);
+    ctx.crashed_last_iteration
+        .insert("GHOST-TASK".to_string(), true);
+
+    let updates = vec![TaskStatusUpdate {
+        task_id: "GHOST-TASK".to_string(),
+        status: TaskStatusChange::Done,
+    }];
+    apply_status_updates(
+        &mut conn,
+        &updates,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut ctx),
+    );
+
+    assert_eq!(
+        ctx.crashed_last_iteration.get("GHOST-TASK"),
+        Some(&true),
+        "failed dispatch must NOT prune crashed_last_iteration"
     );
 }
 

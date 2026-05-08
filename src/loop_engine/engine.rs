@@ -3908,6 +3908,7 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 /// granularity lets the iteration_pipeline gate test for the specific
 /// `(claimed_id, Done, true)` tuple instead of a global "any update
 /// succeeded" flag (M2 fix — learning #2238).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_status_updates(
     conn: &mut Connection,
     updates: &[detection::TaskStatusUpdate],
@@ -3916,6 +3917,7 @@ pub fn apply_status_updates(
     task_prefix: Option<&str>,
     progress_path: Option<&Path>,
     db_dir: Option<&Path>,
+    mut ctx: Option<&mut IterationContext>,
 ) -> Vec<(String, detection::TaskStatusChange, bool)> {
     use detection::TaskStatusChange;
 
@@ -4012,6 +4014,21 @@ pub fn apply_status_updates(
                     if is_milestone && let Some(pp) = progress_path {
                         progress::summarize_milestone(pp, &update.task_id, db_dir);
                     }
+                }
+                // Prune crashed_last_iteration for terminal transitions. A
+                // terminal row is no longer "active", so the map entry would
+                // accumulate past the "bounded by active task count" invariant
+                // documented on the field. Reset and Unblock are NOT terminal.
+                if let Some(ref mut c) = ctx
+                    && matches!(
+                        update.status,
+                        TaskStatusChange::Done
+                            | TaskStatusChange::Failed
+                            | TaskStatusChange::Skipped
+                            | TaskStatusChange::Irrelevant
+                    )
+                {
+                    c.crashed_last_iteration.remove(&update.task_id);
                 }
             }
             Err(e) => {
@@ -6024,8 +6041,16 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
@@ -6048,8 +6073,16 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             applied_count(&results),
             1,
@@ -6092,6 +6125,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(applied_count(&results), 1);
 
@@ -6118,8 +6152,16 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(applied_count(&results), 1);
 
         let prd: serde_json::Value =
@@ -6159,8 +6201,16 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             applied_count(&results),
             1,
@@ -6192,8 +6242,16 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
@@ -6232,6 +6290,7 @@ mod tests {
             Some(&prd_path),
             None,
             Some(&progress_path),
+            None,
             None,
         );
         assert_eq!(applied_count(&results), 1);
@@ -6275,6 +6334,7 @@ mod tests {
             None,
             Some(&progress_path),
             None,
+            None,
         );
         assert_eq!(applied_count(&results), 1);
 
@@ -6304,8 +6364,16 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let results =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             applied_count(&results),
             1,

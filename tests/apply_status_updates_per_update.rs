@@ -84,7 +84,7 @@ fn apply_status_updates_return_type_is_per_update_vec() {
     // The explicit type binding is the assertion. If the return type is not
     // Vec<(String, TaskStatusChange, bool)> this line is a compile error.
     let result: Vec<(String, TaskStatusChange, bool)> =
-        apply_status_updates(&mut conn, &[], None, None, None, None, None);
+        apply_status_updates(&mut conn, &[], None, None, None, None, None, None);
 
     // Empty updates slice → empty result vec (not None, not 0, not a panic).
     assert!(
@@ -114,8 +114,16 @@ fn apply_status_updates_all_success_returns_all_true() {
             status: TaskStatusChange::Done,
         },
     ];
-    let result: Vec<(String, TaskStatusChange, bool)> =
-        apply_status_updates(&mut conn, &updates, None, Some(&prd), None, None, None);
+    let result: Vec<(String, TaskStatusChange, bool)> = apply_status_updates(
+        &mut conn,
+        &updates,
+        None,
+        Some(&prd),
+        None,
+        None,
+        None,
+        None,
+    );
 
     assert_eq!(result.len(), 2, "one result entry per update");
 
@@ -161,8 +169,16 @@ fn apply_status_updates_rejected_dispatch_returns_false_for_that_entry() {
             status: TaskStatusChange::Done,
         },
     ];
-    let result: Vec<(String, TaskStatusChange, bool)> =
-        apply_status_updates(&mut conn, &updates, None, Some(&prd), None, None, None);
+    let result: Vec<(String, TaskStatusChange, bool)> = apply_status_updates(
+        &mut conn,
+        &updates,
+        None,
+        Some(&prd),
+        None,
+        None,
+        None,
+        None,
+    );
 
     assert_eq!(result.len(), 2, "one result entry per update");
 
@@ -201,8 +217,16 @@ fn apply_status_updates_same_task_different_statuses_tracked_independently() {
             status: TaskStatusChange::Skipped,
         },
     ];
-    let result: Vec<(String, TaskStatusChange, bool)> =
-        apply_status_updates(&mut conn, &updates, None, Some(&prd), None, None, None);
+    let result: Vec<(String, TaskStatusChange, bool)> = apply_status_updates(
+        &mut conn,
+        &updates,
+        None,
+        Some(&prd),
+        None,
+        None,
+        None,
+        None,
+    );
 
     assert_eq!(result.len(), 2, "each update gets its own result entry");
 

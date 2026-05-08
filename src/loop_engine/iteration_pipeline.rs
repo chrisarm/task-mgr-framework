@@ -259,6 +259,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                 task_prefix,
                 Some(progress_path),
                 Some(db_dir),
+                Some(ctx),
             )
         };
     // ProcessingOutcome.status_updates_applied preserves its external semantics:
@@ -307,7 +308,15 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         // (peer tasks Claude finished alongside the claimed one).
         let completed_tags = parse_completed_tasks(output);
         for completed_id in &completed_tags {
-            match mark_task_done(conn, completed_id, run_id, None, prd_path, task_prefix) {
+            match mark_task_done(
+                conn,
+                completed_id,
+                run_id,
+                None,
+                prd_path,
+                task_prefix,
+                Some(ctx),
+            ) {
                 Ok(()) => {
                     if completed_id == claimed_id {
                         task_marked_done = true;
@@ -418,7 +427,15 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         // PRD parity fix that today's process_slot_result misses entirely.
         if !task_marked_done
             && detection::is_task_reported_already_complete(output, claimed_id, task_prefix)
-            && let Ok(()) = mark_task_done(conn, claimed_id, run_id, None, prd_path, task_prefix)
+            && let Ok(()) = mark_task_done(
+                conn,
+                claimed_id,
+                run_id,
+                None,
+                prd_path,
+                task_prefix,
+                Some(ctx),
+            )
         {
             record_completion(claimed_id, &mut completed_set, &mut result, outcome);
             eprintln!("Task {} completed (reported as already done)", claimed_id);
@@ -466,11 +483,19 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     // Step 7: per-task crash-tracking write. Keys by task_id so the map size
     // is bounded by active task count (not iteration count) — contract from
     // the FEAT-007 AC.
+    //
+    // Skip when the claimed task went terminal this iteration: the completion
+    // ladder already pruned the entry (CODE-FIX-003). Re-inserting here would
+    // undo that prune and keep a dead task's entry in the map past its
+    // active lifetime.
     if let Some(claimed_id) = task_id {
-        ctx.crashed_last_iteration.insert(
-            claimed_id.to_string(),
-            matches!(outcome, IterationOutcome::Crash(_)),
-        );
+        let went_terminal = result.completed_task_ids.iter().any(|id| id == claimed_id);
+        if !went_terminal {
+            ctx.crashed_last_iteration.insert(
+                claimed_id.to_string(),
+                matches!(outcome, IterationOutcome::Crash(_)),
+            );
+        }
     }
 
     result

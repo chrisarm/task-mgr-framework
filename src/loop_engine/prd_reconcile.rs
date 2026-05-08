@@ -196,9 +196,15 @@ pub(crate) fn mark_task_done(
     commit_hash: Option<&str>,
     prd_path: &Path,
     task_prefix: Option<&str>,
+    ctx: Option<&mut crate::loop_engine::engine::IterationContext>,
 ) -> Result<(), crate::TaskMgrError> {
     let task_ids = [task_id.to_string()];
     complete_cmd::complete(conn, &task_ids, Some(run_id), commit_hash, false)?;
+    // Prune after the DB write succeeds so the entry doesn't outlive the active
+    // task. Skipped when ctx is None (e.g., callers outside the loop engine).
+    if let Some(ctx) = ctx {
+        ctx.crashed_last_iteration.remove(task_id);
+    }
     if let Err(e) = update_prd_task_passes(prd_path, task_id, true, task_prefix) {
         eprintln!("Warning: failed to update PRD for task {}: {}", task_id, e);
     }
