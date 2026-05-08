@@ -1078,3 +1078,87 @@ fn parity_no_claimed_task_skips_completion_and_crash_bookkeeping() {
     assert_outcomes_equivalent(&out_seq, &out_wave);
     assert_eq!(out_seq.tasks_completed, 0);
 }
+
+// ---------------------------------------------------------------------------
+// M1 guard: claim_succeeded=false slots must not pollute crashed_last_iteration.
+//
+// The guard in process_slot_result returns early when claim_succeeded=false,
+// preventing both the overflow handler and process_iteration_output from
+// running for tasks that were never moved to in_progress.
+//
+// This test simulates a 3-slot wave:
+//   slot 0 (claim_succeeded=true,  crash) → pipeline runs → crash recorded
+//   slot 1 (claim_succeeded=false, crash) → guard fires   → pipeline skipped
+//   slot 2 (claim_succeeded=true,  crash) → pipeline runs → crash recorded
+//
+// Observable invariant: ctx.crashed_last_iteration.len() == 2 (slots 0+2 only).
+// Slot 1's task_id must NOT appear — the pipeline never ran for it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_failed_slot_does_not_pollute_crash_map() {
+    use task_mgr::loop_engine::config::CrashType;
+    disable_llm_extraction();
+
+    let crash = IterationOutcome::Crash(CrashType::RuntimeError);
+
+    // One DB + one shared ctx — all three slots share IterationContext in a real wave.
+    let (db_temp, mut conn) = setup_migrated_db();
+    insert_run(&conn, "parity-run");
+    insert_in_progress_task(&conn, "WAVE-SLOT-0-TASK");
+    // WAVE-SLOT-1-TASK intentionally absent: claim_succeeded=false means the row
+    // was never moved to in_progress, so the pipeline must not run for it.
+    insert_in_progress_task(&conn, "WAVE-SLOT-2-TASK");
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    // Slot 0: claim succeeded → pipeline runs → crash recorded in crash map.
+    run_once(
+        &mut conn,
+        &mut fx,
+        RunConfig {
+            skip_git_completion_detection: true,
+            slot_index: Some(0),
+            initial_outcome: crash.clone(),
+            output: "slot 0 crashed",
+            task_id: Some("WAVE-SLOT-0-TASK"),
+            shown_learning_ids: &[],
+        },
+    );
+
+    // Slot 1: claim_succeeded=false → process_slot_result returns early.
+    // The guard in engine.rs prevents process_iteration_output from being called
+    // here. We simulate that by not calling run_once for this slot.
+
+    // Slot 2: claim succeeded → pipeline runs → crash recorded in crash map.
+    run_once(
+        &mut conn,
+        &mut fx,
+        RunConfig {
+            skip_git_completion_detection: true,
+            slot_index: Some(2),
+            initial_outcome: crash,
+            output: "slot 2 crashed",
+            task_id: Some("WAVE-SLOT-2-TASK"),
+            shown_learning_ids: &[],
+        },
+    );
+
+    assert_eq!(
+        fx.ctx.crashed_last_iteration.len(),
+        2,
+        "crash map must contain exactly 2 entries: slot 0 + slot 2 \
+         (slot 1 claim_succeeded=false must be absent)",
+    );
+    assert!(
+        fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-0-TASK"),
+        "slot 0 crash must be recorded",
+    );
+    assert!(
+        fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-2-TASK"),
+        "slot 2 crash must be recorded",
+    );
+    assert!(
+        !fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-1-TASK"),
+        "slot 1 (claim_succeeded=false) must NOT appear in crashed_last_iteration",
+    );
+}

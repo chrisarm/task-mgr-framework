@@ -1115,6 +1115,15 @@ fn process_slot_result(
         ctx.pending_slot_tasks.push(tid.clone());
     }
 
+    // Synthetic slot_failure_result entries with claim_succeeded=false represent
+    // tasks that were never moved to in_progress. Running the overflow handler or
+    // the pipeline for them would pollute ctx.crashed_last_iteration past its
+    // 'bounded by active task count' invariant (engine.rs:218-221) and emit
+    // spurious JSONL overflow events for tasks that never executed.
+    if !slot_result.claim_succeeded {
+        return;
+    }
+
     // Per-slot PromptTooLong recovery — mirrors the sequential Step 8.5 in
     // `run_iteration`. Must run BEFORE `process_iteration_output` so the
     // task row is reset to `todo` (rungs 1-3) or `blocked` (rung 4) before
