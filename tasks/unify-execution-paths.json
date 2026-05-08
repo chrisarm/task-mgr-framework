@@ -426,7 +426,7 @@
       "id": "REFACTOR-001",
       "modifiesBehavior": false,
       "notes": "PRE-REQUISITE: TEST-INIT-006 must capture the baseline snapshot BEFORE any edits to prompt.rs. Use `cargo grep \"HashMap<.*Section|prompt\"` pre-merge to surface ordering issues. This is the highest-stakes task in the PRD: the sequential prompt is on every loop iteration. Read learning #128 (prompt builder test coverage) before edits. Phase A snapshot is the only regression guard.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Phase A regression freedom: snapshot byte-identical",
@@ -464,7 +464,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Add `static_assertions = \"1\"` to dev-dependencies if not already present. SlotPromptBundle: Send but NOT Sync (matches SlotContext per learning #1864). Drops synergy cluster escalation, reorder instruction, sibling PRD context — wave slots are disjoint by design (engine.rs:516-518).",
-      "passes": false,
+      "passes": true,
       "priority": 7,
       "qualityDimensions": [
         "SlotPromptBundle is Send and not Sync (matches SlotContext per learning #1864)",
@@ -540,7 +540,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": true,
       "notes": "Read slot construction sites: build_slot_contexts, run_parallel_wave's spawn loop. Existing tests asserting build_slot_prompt content (per Risks table item) need updating to match the new bundle-driven prompts.",
-      "passes": false,
+      "passes": true,
       "priority": 8,
       "qualityDimensions": [
         "All `&Connection` reads stay on the main thread",

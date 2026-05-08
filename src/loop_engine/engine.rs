@@ -54,10 +54,9 @@ use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
-use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
 use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::{
-    self as prd_reconcile, hash_file, mark_task_done, read_prd_metadata, reconcile_passes_with_db,
+    self as prd_reconcile, hash_file, read_prd_metadata, reconcile_passes_with_db,
     update_prd_task_passes,
 };
 use crate::loop_engine::progress;
@@ -1059,28 +1058,37 @@ fn build_slot_prompt_params(params: &WaveIterationParams<'_>) -> prompt::slot::S
     }
 }
 
-/// Per-slot post-processing on the main thread: progress logging, key
-/// decision storage, `<task-status>` dispatch, `<completed>` tag handling
-/// (with a scan-output fallback when no tags are present), reorder-hint
-/// queueing, and file/stop-flag aggregation.
+/// Per-slot post-processing on the main thread.
+///
+/// The post-Claude work shared with the sequential path — progress logging,
+/// `<key-decision>` extraction, `<task-status>` dispatch, the full completion
+/// ladder (status-tag → completed-tag → output-scan → already-complete
+/// fallback), learning extraction, and bandit feedback — runs inside
+/// `iteration_pipeline::process_iteration_output`. `skip_git_completion_detection`
+/// is `true` because slot commits live on an unmerged ephemeral branch; git
+/// reconciliation happens once at the `run_wave_iteration` boundary after the
+/// merge-back step.
+///
+/// Slot-specific bookkeeping stays here: pending-slot-task accounting, the
+/// `agg.all_crashed` invariant, reorder hint queueing (with `[slot N]` log
+/// prefix), file aggregation, and the wave-level stop flag.
 ///
 /// Updates `agg.all_crashed` only when the slot crashed AND its claimed
 /// task did not finish — any non-crash slot (or a crashed slot whose task
 /// was nonetheless marked done) breaks the all-crashed invariant.
 fn process_slot_result(
-    slot_result: &SlotResult,
+    slot_result: &mut SlotResult,
     params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
     agg: &mut WaveAggregator,
 ) {
     let slot_idx = slot_result.slot_index;
-    let result = &slot_result.iteration_result;
-    let task_id = result.task_id.clone();
+    let task_id = slot_result.iteration_result.task_id.clone();
 
     // Track every claimed slot task as pending until we observe a "done"
-    // signal in this slot's output. The post-loop cleanup uses this to reset
-    // any rows still in `in_progress` when the loop exits via deadline /
-    // max-iterations rather than waiting for the next process's step 6.6.
+    // signal for it. The post-loop cleanup uses this to reset rows still in
+    // `in_progress` when the loop exits via deadline / max-iterations rather
+    // than waiting for the next process's step 6.6 recovery.
     if slot_result.claim_succeeded
         && let Some(ref tid) = task_id
         && !ctx.pending_slot_tasks.contains(tid)
@@ -1088,156 +1096,75 @@ fn process_slot_result(
         ctx.pending_slot_tasks.push(tid.clone());
     }
 
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        task_id.as_deref(),
-        &result.outcome,
-        &result.files_modified,
-        result.effective_model.as_deref(),
-        result.effective_effort,
-        Some(slot_idx),
-    );
+    // Pipeline contract requires a `working_root` even when skip_git is on
+    // (the field is unused in that mode but still part of the struct). Use
+    // the slot's pre-allocated worktree path so a future change that begins
+    // honoring git history wouldn't silently fall back to the source tree.
+    let working_root = params
+        .slot_worktree_paths
+        .get(slot_idx)
+        .cloned()
+        .unwrap_or_else(|| params.source_root.to_path_buf());
 
-    // Best-effort key decisions extraction so wave slots match sequential
-    // behavior. Failures only print a warning; we do not derail the wave.
-    let key_decisions = detection::extract_key_decisions(&result.output);
-    for decision in &key_decisions {
-        if let Err(e) = key_decisions_db::insert_key_decision(
-            params.conn,
-            params.run_id,
-            task_id.as_deref(),
-            i64::from(params.iteration),
-            decision,
-        ) {
-            eprintln!(
-                "Warning: [slot {}] failed to store key decision '{}': {}",
-                slot_idx, decision.title, e
-            );
-        }
-    }
+    let processing_outcome =
+        iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+            conn: params.conn,
+            run_id: params.run_id,
+            iteration: params.iteration,
+            task_id: task_id.as_deref(),
+            output: &slot_result.iteration_result.output,
+            conversation: slot_result.iteration_result.conversation.as_deref(),
+            shown_learning_ids: &slot_result.shown_learning_ids,
+            outcome: &mut slot_result.iteration_result.outcome,
+            working_root: &working_root,
+            git_scan_depth: 0,
+            skip_git_completion_detection: true,
+            prd_path: params.prd_path,
+            task_prefix: params.task_prefix,
+            progress_path: params.progress_path,
+            db_dir: params.db_dir,
+            signal_flag: params.signal_flag,
+            ctx,
+            files_modified: &slot_result.iteration_result.files_modified,
+            effective_model: slot_result.iteration_result.effective_model.as_deref(),
+            effective_effort: slot_result.iteration_result.effective_effort,
+            slot_index: Some(slot_idx),
+        });
 
-    let status_updates = detection::extract_status_updates(&result.output);
-    let status_updates_applied = if !status_updates.is_empty() {
-        apply_status_updates(
-            params.conn,
-            &status_updates,
-            Some(params.run_id),
-            Some(params.prd_path),
-            params.task_prefix,
-            Some(params.progress_path),
-            Some(params.db_dir),
-        )
-    } else {
-        0
-    };
+    slot_result.iteration_result.key_decisions_count = processing_outcome.key_decisions_count;
 
-    let mut slot_marked_done = false;
-
-    if let Some(ref tid) = task_id {
-        // Slot output may emit `<task-status>X:done</task-status>` AND
-        // `<completed>X</completed>` for the same task ID — count each
-        // task at most once per wave per slot, otherwise the wave summary
-        // overstates progress (telemetry skew, not correctness).
-        let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut count_once = |cid: &str, agg: &mut WaveAggregator| {
-            if counted.insert(cid.to_string()) {
-                agg.tasks_completed += 1;
-            }
-            agg.any_completed = true;
-        };
-
-        if status_updates_applied > 0
-            && status_updates
+    // The claimed task was completed in this pass iff its id appears in the
+    // pipeline's deduped completion list. Cross-task `<completed>Y</completed>`
+    // entries land in the list too but never satisfy this predicate — Y stays
+    // out of `pending_slot_tasks` (it was a peer slot's task or was already
+    // terminal), so the orphan-reset semantics are preserved.
+    let slot_marked_done = task_id
+        .as_ref()
+        .map(|tid| {
+            processing_outcome
+                .completed_task_ids
                 .iter()
-                .any(|u| matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid)
-        {
-            slot_marked_done = true;
-            count_once(tid, agg);
-        }
+                .any(|c| c == tid)
+        })
+        .unwrap_or(false);
 
-        // Primary completion path: <completed>TASK-ID</completed>.
-        let completed_tags = parse_completed_tasks(&result.output);
-        for cid in &completed_tags {
-            match mark_task_done(
-                params.conn,
-                cid,
-                params.run_id,
-                None,
-                params.prd_path,
-                params.task_prefix,
-            ) {
-                Ok(()) => {
-                    if cid == tid {
-                        slot_marked_done = true;
-                    }
-                    count_once(cid, agg);
-                    eprintln!(
-                        "[slot {}] Task {} completed (<completed> tag)",
-                        slot_idx, cid
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[slot {}] Warning: mark_task_done({}) failed: {}",
-                        slot_idx, cid, e
-                    );
-                }
-            }
-        }
-
-        // Fallback: scan output for completed task IDs. Slot execution
-        // intentionally skips git-commit detection because the commit lives
-        // on an ephemeral branch we have not yet merged.
-        if completed_tags.is_empty() {
-            let scanned =
-                scan_output_for_completed_tasks(&result.output, params.conn, params.task_prefix);
-            for cid in &scanned {
-                let ids = [cid.clone()];
-                match complete_cmd::complete(params.conn, &ids, Some(params.run_id), None, false) {
-                    Ok(_) => {
-                        if cid == tid {
-                            slot_marked_done = true;
-                        }
-                        count_once(cid, agg);
-                        if let Err(e) =
-                            update_prd_task_passes(params.prd_path, cid, true, params.task_prefix)
-                        {
-                            eprintln!(
-                                "[slot {}] Warning: PRD update for {} failed: {}",
-                                slot_idx, cid, e
-                            );
-                        } else {
-                            eprintln!("[slot {}] Task {} completed (output scan)", slot_idx, cid);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[slot {}] Warning: complete({}) failed: {}",
-                            slot_idx, cid, e
-                        );
-                    }
-                }
-            }
-        }
+    agg.tasks_completed += processing_outcome.tasks_completed;
+    if processing_outcome.tasks_completed > 0 {
+        agg.any_completed = true;
     }
 
-    if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
+    // Pipeline may have flipped the outcome from a non-Completed value to
+    // `Completed` via the completion ladder; checking `outcome` post-pipeline
+    // collapses the legacy "crash but task done" branch into the same arm as
+    // a clean success.
+    if !matches!(
+        slot_result.iteration_result.outcome,
+        IterationOutcome::Crash(_)
+    ) || slot_marked_done
+    {
         agg.all_crashed = false;
     }
 
-    // Slot's task transitioned to terminal state — drop from the pending set
-    // so the post-loop orphan reset doesn't bounce a `done` row back to
-    // `todo` on shutdown.
-    //
-    // Cross-task case: if this slot was assigned X but emitted
-    // `<completed>Y</completed>`, `mark_task_done(Y)` ran above and Y is now
-    // `done`. `slot_marked_done` is gated on `cid == tid`, so X stays in
-    // `pending_slot_tasks` and Y was never added (it was a peer slot's task
-    // or was already terminal). Both behaviors are correct: step 17.6's
-    // UPDATE is guarded by `AND status='in_progress'`, so the orphan reset
-    // is a no-op for Y (now `done`) and correctly resets X (genuinely still
-    // `in_progress` — the slot's actual task was never completed by any path).
     if slot_marked_done && let Some(ref tid) = task_id {
         ctx.pending_slot_tasks.retain(|t| t != tid);
     }
@@ -1246,18 +1173,18 @@ fn process_slot_result(
     // does not yet honor hints (it ranks by score), so this acts as a
     // preservation queue — operators see them in logs and a future selection
     // pass can drain them.
-    if let IterationOutcome::Reorder(ref rid) = result.outcome {
+    if let IterationOutcome::Reorder(ref rid) = slot_result.iteration_result.outcome {
         ctx.pending_reorder_hints.push(rid.clone());
         eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
     }
 
-    for f in &result.files_modified {
+    for f in &slot_result.iteration_result.files_modified {
         if !agg.aggregated_files.contains(f) {
             agg.aggregated_files.push(f.clone());
         }
     }
 
-    if result.should_stop {
+    if slot_result.iteration_result.should_stop {
         agg.wave_should_stop = true;
     }
 }
@@ -1361,11 +1288,13 @@ pub fn run_wave_iteration(
         .unwrap_or(0);
 
     // Run wave (blocks until every spawned slot thread joins).
-    let wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
+    let mut wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
 
-    // Per-slot post-processing on the main thread.
+    // Per-slot post-processing on the main thread. The pipeline mutates each
+    // slot's `IterationOutcome` in place when retroactive completion is
+    // detected, so the iteration borrows mutably.
     let mut agg = WaveAggregator::new(wave_result.outcomes.len());
-    for slot_result in &wave_result.outcomes {
+    for slot_result in &mut wave_result.outcomes {
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
     }
 

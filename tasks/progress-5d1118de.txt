@@ -102,3 +102,12 @@ Learnings:
 - SlotEarlyExit dropped its task_id field — passing &SlotContext is cleaner than threading the same id through a parameter struct
 - Pre-bundle status mutation (`task.status = TaskStatus::InProgress`) lets bundle JSON honestly reflect post-claim state without ordering the claim-then-build steps in the same function
 ---
+
+## [2026-05-07 21:30] - 5d1118de-FEAT-006
+Approach: Replaced inline post-Claude work in process_slot_result with a single iteration_pipeline::process_iteration_output call (skip_git_completion_detection: true). Took &mut SlotResult so the pipeline can mutate iteration_result.outcome to Completed when retroactive completion fires; threaded conversation/shown_learning_ids from the slot bundle. slot_marked_done is now derived from ProcessingOutcome.completed_task_ids.contains(tid) — same orphan-reset semantics as before for cross-task completions. Slot-prefixed reorder log preserved; pipeline emits its own non-prefixed completion lines.
+Files: src/loop_engine/engine.rs
+Learnings:
+- Pipeline call site need only pass slot_worktree_paths[idx] as working_root since skip_git=true never reads it, but binding to the slot's path future-proofs against a later mode flip
+- Crash policy invariant `!Crash || slot_marked_done` collapses naturally post-pipeline because record_completion flips outcome→Completed for the "crash but task done" case
+- Removed parse_completed_tasks/scan_output_for_completed_tasks/mark_task_done imports from engine.rs — they live entirely inside iteration_pipeline now
+---
