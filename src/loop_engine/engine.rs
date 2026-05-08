@@ -2181,7 +2181,7 @@ pub fn run_iteration(
         effective_model,
         effective_effort: effort,
         key_decisions_count: 0,
-        conversation: None,
+        conversation: claude_conversation,
     })
 }
 
