@@ -1253,7 +1253,7 @@
       "id": "REFACTOR-REVIEW-FINAL",
       "model": "claude-opus-4-7",
       "notes": "Use the rust-python-code-reviewer agent for the full-context pass. For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. If no issues, emit `<task-status>REFACTOR-REVIEW-FINAL:done</task-status>` with a one-line note.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "taskType": "review",
       "title": "Final refactor review — DRY, complexity, coupling, clarity",

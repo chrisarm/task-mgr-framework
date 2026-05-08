@@ -1,26 +1,53 @@
 //! Shared post-Claude pipeline used by both the sequential `run_iteration`
 //! path and the parallel-slot `process_slot_result` path.
 //!
-//! `process_iteration_output` is the canonical home for the post-Claude
-//! behaviors that previously diverged between the two paths:
+//! # Call sites
 //!
-//! - `progress::log_iteration` (degraded entry — files/model/effort/slot are
-//!   threaded through the existing call sites until FEAT-005/FEAT-006 widens
-//!   `ProcessingParams`).
-//! - `<key-decision>` extraction + `key_decisions_db::insert_key_decision`.
-//! - `<task-status>` dispatch via `engine::apply_status_updates`.
-//! - The full completion ladder: status-tag → completed-tag → git commit
-//!   detection (gated on `skip_git_completion_detection`) → output scan →
-//!   `is_task_reported_already_complete` fallback. The fallback fires in
-//!   BOTH skip-git modes (the wave-mode parity fix the PRD calls out).
-//! - `learnings::ingestion::extract_learnings_from_output` (governed by the
-//!   `TASK_MGR_NO_EXTRACT_LEARNINGS=1` opt-out).
-//! - `feedback::record_iteration_feedback` for shown bandit learnings.
-//! - Per-task crash-tracking writes onto the iteration context.
+//! `process_iteration_output` is invoked from exactly two places:
 //!
-//! Out of scope (those stay at the `run_loop` / `run_wave_iteration` call
-//! sites): wrapper-commit, external-git reconciliation, human-review trigger,
-//! rate-limit waits, pause-signal handling, merge resolution.
+//! - **Sequential** — `run_loop` in `src/loop_engine/engine.rs` (~line 3204),
+//!   immediately after `run_iteration` returns. Replaces the inline post-Claude
+//!   block that previously lived at engine.rs ~lines 2032-2113 in the
+//!   pre-FEAT-005 layout.
+//! - **Wave** — `process_slot_result` in `src/loop_engine/engine.rs` (~line
+//!   1166), called by `run_wave_iteration` once per finished slot. Replaces
+//!   the inline wave-mode glue that lived at engine.rs ~lines 1053-1246 before
+//!   the unification.
+//!
+//! Keeping a single pipeline means wave mode can no longer silently skip
+//! behaviors the sequential path treats as core (the original drift this PRD
+//! exists to fix).
+//!
+//! # Pipeline steps (in order)
+//!
+//! 1. `progress::log_iteration` — appends a structured entry to
+//!    `tasks/progress-<prefix>.txt` (model, effort, files, slot threaded via
+//!    `ProcessingParams`).
+//! 2. `<key-decision>` extraction + `key_decisions_db::insert_key_decision` —
+//!    parses any decision tags emitted by Claude and persists them for later
+//!    `tm-decisions` review.
+//! 3. `<task-status>` tag dispatch via `engine::apply_status_updates` —
+//!    routes `done`/`failed`/`skipped`/`irrelevant`/`blocked` updates through
+//!    the `task-mgr` CLI.
+//! 4. Completion ladder (first hit wins):
+//!    `<task-status>:done` → `<completed>` tag → git commit detection (gated
+//!    on `skip_git_completion_detection`) → output scan
+//!    (`scan_output_for_completed_tasks`) →
+//!    `is_task_reported_already_complete` fallback. The fallback fires in
+//!    BOTH skip-git modes — that's the wave-mode parity fix the PRD calls out.
+//! 5. `learnings::ingestion::extract_learnings_from_output` — opt-out via the
+//!    `TASK_MGR_NO_EXTRACT_LEARNINGS=1` env var.
+//! 6. `feedback::record_iteration_feedback` — bandit reward signal for the
+//!    learnings that were actually shown to Claude this iteration.
+//! 7. Per-task crash-tracking writes onto `IterationContext.crashed_last_iteration`
+//!    (replaces the legacy `last_task_id` / `last_was_crash` scalars).
+//!
+//! # Out of scope
+//!
+//! These stay at the `run_loop` / `run_wave_iteration` call sites because
+//! they require the outer-loop context (working tree, signals, run config):
+//! wrapper-commit, external-git reconciliation, human-review trigger,
+//! rate-limit waits, pause-signal handling, slot merge resolution.
 
 use std::collections::HashSet;
 use std::path::Path;

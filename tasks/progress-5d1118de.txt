@@ -224,3 +224,38 @@ Learnings:
 - Orphan record_shown_learnings docstring still attached to build_steering_section. REFACTOR-N-006.
 - AC 3 (legacy field cleanup), 4 (no TODO/FIXME), 5 (prompt::build_prompt re-export) all confirmed clean.
 ---
+## [2026-05-07 00:00] - 5d1118de-REFACTOR-N-001
+Approach: Extracted private format_task_json_raw in core.rs as canonical body; added public format_next_task_json(NextTaskOutput) adapter; sequential.rs drops build_task_json and calls core.
+Files: src/loop_engine/prompt/core.rs, src/loop_engine/prompt/sequential.rs
+Learnings:
+- `use item` without `pub` means the type is still accessible in same-file test modules but not needed explicitly for inference-resolved variables; only explicit type names in fn signatures need the import
+- format_task_json(Task) and format_next_task_json(NextTaskOutput) both delegate to format_task_json_raw — single canonical body, two thin public adapters
+---
+## [2026-05-07 00:00] - 5d1118de-REFACTOR-N-003
+Approach: Right fix — added section_sizes to SlotPromptBundle at build time, threaded through SlotResult, used in process_slot_result synthetic PromptResult.
+Files: src/loop_engine/prompt/slot.rs, src/loop_engine/engine.rs, tests/iteration_result_conversation.rs
+Learnings:
+- dropped_sections stays Vec::new() for wave slots (they use truncate_to_budget per section, not whole-section dropping)
+- 5 SlotResult construction sites needed updating (3 prod + 2 test inline + 1 test file)
+---
+## [2026-05-07 22:32] - 5d1118de-REFACTOR-N-004
+Approach: Change prompt_for_overflow to Option<String>, populate only on PromptTooLong outcome
+Files: src/loop_engine/engine.rs, tests/iteration_result_conversation.rs
+Learnings:
+- Check outcome before moving it into struct to avoid E0382 borrow errors
+- .then() on bool is idiomatic for conditional Option wrapping
+---
+## [2026-05-07 00:00] - 5d1118de-REFACTOR-N-005
+Approach: Doc-only fix — updated key_decisions_count field comment to document the write-back pattern.
+Files: src/loop_engine/engine.rs
+Learnings:
+- key_decisions_count is always 0 inside runners; real count written back by run_loop/process_slot_result post-pipeline.
+---
+## [2026-05-07 02:00] - 5d1118de-VERIFY-001
+Approach: Doc-only verification gate — added "Iteration pipeline (shared)" CLAUDE.md section with cross-ref from "Slot merge-back conflict resolution"; expanded module-level rustdoc in prompt/mod.rs (three-builder split + main-thread bundle rule + Send compile-time backstop) and iteration_pipeline.rs (numbered steps + engine.rs call-site line refs ~3204 sequential / ~1166 wave). Created learnings #2222 (supersedes #2029, wave PromptTooLong now uses recovery ladder) and #2223 (supersedes #106/#1813/#213, per-task crashed_last_iteration map replaces legacy scalars).
+Files: CLAUDE.md, src/loop_engine/prompt/mod.rs, src/loop_engine/iteration_pipeline.rs
+Learnings:
+- All .unwrap() calls under src/loop_engine/prompt/ are inside `#[cfg(test)] mod tests` (sequential.rs:534+); core/slot/mod have zero unwraps.
+- prompt::build_prompt is reachable from tests/ (external-crate path) — verified with grep + `cargo doc --no-deps` exit 0.
+- `task-mgr edit-learning <new-id> --supersedes <old>` lets one new learning supersede multiple old ones; chain calls — supersession joins are additive.
+---
