@@ -380,47 +380,51 @@ fn resolve_priority(
     }
 }
 
+/// Returns all non-NULL `task_prefix` values from `prd_metadata`.
+///
+/// Single canonical home for the `WHERE task_prefix IS NOT NULL` query —
+/// callers must not repeat this SQL directly.
+fn load_known_prefixes(conn: &Connection) -> TaskMgrResult<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect())
+}
+
+fn prefix_exists_in_metadata(conn: &Connection, prefix: &str) -> TaskMgrResult<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM prd_metadata WHERE task_prefix = ? LIMIT 1")?;
+    let found: Option<i64> = stmt
+        .query_row([prefix], |row| row.get(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(found.is_some())
+}
+
 /// Query `prd_metadata` for the active effort prefix.
 ///
 /// Resolution order:
 /// 1. If `TASK_MGR_ACTIVE_PREFIX` is set (non-empty), verify the value exists
 ///    in `prd_metadata.task_prefix`. Return `Ok(Some(value))` on hit; return
 ///    `Err(invalid_state)` when the env value is NOT registered (stale pin —
-///    surfaces typos / cross-PRD leakage immediately rather than silently
-///    falling through to fallback). Empty string is treated as unset.
-/// 2. Env unset/empty → existing single-prefix fallback. Returns
-///    `Ok(Some(prefix))` when exactly one non-NULL `task_prefix` exists in
-///    `prd_metadata`; `Ok(None)` when zero or multiple prefixes exist.
+///    surfaces typos / cross-PRD leakage immediately). Empty string is treated
+///    as unset.
+/// 2. Env unset/empty → single-prefix fallback: `Ok(Some(prefix))` when
+///    exactly one non-NULL `task_prefix` exists; `Ok(None)` otherwise.
 ///
-/// DB errors propagate via `?` rather than being coerced to `None` — an
-/// unexpected schema/I/O failure must not silently bypass auto-prefixing.
-///
-/// `std::env::var` is read exactly once at function entry.
+/// DB errors propagate via `?` — an unexpected failure must not silently
+/// bypass auto-prefixing. `std::env::var` is read exactly once at entry.
 fn resolve_active_prefix(conn: &Connection) -> TaskMgrResult<Option<String>> {
     let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
     if let Some(env_prefix) = env_value.as_deref().filter(|v| !v.is_empty()) {
-        // Verify the pinned prefix is registered. A stale pin is a hard error
-        // so the operator notices the typo / cross-PRD pin instead of the
-        // loop silently writing un-prefixed task IDs.
-        let mut stmt = conn.prepare("SELECT 1 FROM prd_metadata WHERE task_prefix = ? LIMIT 1")?;
-        let found: Option<i64> = stmt
-            .query_row([env_prefix], |row| row.get(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        if found.is_some() {
+        if prefix_exists_in_metadata(conn, env_prefix)? {
             return Ok(Some(env_prefix.to_string()));
         }
-        // Stale pin — collect known prefixes for the error message so the
-        // operator can immediately spot the mismatch.
-        let mut known_stmt =
-            conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
-        let known: Vec<String> = known_stmt
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let known = load_known_prefixes(conn)?;
         let known_display = if known.is_empty() {
             "(none registered)".to_string()
         } else {
@@ -433,19 +437,29 @@ fn resolve_active_prefix(conn: &Connection) -> TaskMgrResult<Option<String>> {
             format!("{env_prefix} (not found in prd_metadata)"),
         ));
     }
-
-    // Fallback: single-PRD auto-detect.
-    let mut stmt =
-        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
-    let prefixes: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let prefixes = load_known_prefixes(conn)?;
     if prefixes.len() == 1 {
         Ok(Some(prefixes.into_iter().next().unwrap()))
     } else {
         Ok(None)
     }
+}
+
+fn foreign_prefix_err(
+    field: &str,
+    offender: &str,
+    foreign: &str,
+    active_prefix: &str,
+) -> TaskMgrError {
+    TaskMgrError::invalid_state(
+        "add",
+        field,
+        format!("IDs with the active prefix '{active_prefix}' or bare IDs"),
+        format!(
+            "{offender} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
+             pass --from-json or correct the ID"
+        ),
+    )
 }
 
 /// Reject task IDs that carry a known foreign PRD prefix before auto-prefixing
@@ -466,59 +480,34 @@ fn reject_foreign_prefix(
     depended_on_by: &[String],
     active_prefix: &str,
 ) -> TaskMgrResult<()> {
-    let mut stmt =
-        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
-    let foreign_prefixes: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .filter(|p: &String| p.as_str() != active_prefix)
+    let foreign_prefixes: Vec<String> = load_known_prefixes(conn)?
+        .into_iter()
+        .filter(|p| p.as_str() != active_prefix)
         .collect();
-
     if foreign_prefixes.is_empty() {
         return Ok(());
     }
-
     for foreign in &foreign_prefixes {
         let fwd = format!("{foreign}-");
         if id.starts_with(&fwd) {
-            return Err(TaskMgrError::invalid_state(
-                "add",
-                "id",
-                format!("an ID with the active prefix '{active_prefix}' or a bare ID"),
-                format!(
-                    "{id} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
-                     pass --from-json or correct the ID"
-                ),
-            ));
+            return Err(foreign_prefix_err("id", id, foreign, active_prefix));
         }
         for dep in depends_on {
             if dep.starts_with(&fwd) {
-                return Err(TaskMgrError::invalid_state(
-                    "add",
-                    "dependsOn",
-                    format!("IDs with the active prefix '{active_prefix}' or bare IDs"),
-                    format!(
-                        "{dep} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
-                         pass --from-json or correct the ID"
-                    ),
-                ));
+                return Err(foreign_prefix_err("dependsOn", dep, foreign, active_prefix));
             }
         }
         for dep in depended_on_by {
             if dep.starts_with(&fwd) {
-                return Err(TaskMgrError::invalid_state(
-                    "add",
+                return Err(foreign_prefix_err(
                     "depended-on-by",
-                    format!("IDs with the active prefix '{active_prefix}' or bare IDs"),
-                    format!(
-                        "{dep} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
-                         pass --from-json or correct the ID"
-                    ),
+                    dep,
+                    foreign,
+                    active_prefix,
                 ));
             }
         }
     }
-
     Ok(())
 }
 
