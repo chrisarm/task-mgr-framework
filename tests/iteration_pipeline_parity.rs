@@ -354,9 +354,8 @@ fn parity_db_state_after_completed_tag() {
         "crashed_last_iteration[task_id] must match across sequential ↔ wave",
     );
     assert_eq!(
-        crash_seq,
-        Some(false),
-        "Completed outcome must record crashed=false in both modes",
+        crash_seq, None,
+        "Completed outcome must prune crashed_last_iteration entry in both modes (CODE-FIX-003)",
     );
 }
 

@@ -462,7 +462,9 @@ fn done_task_via_pipeline_sets_crash_flag_false() {
         "crash must set flag = true"
     );
 
-    // Completion: outcome is mutated to Completed → pipeline step 7 writes false.
+    // Completion: outcome is mutated to Completed → pipeline step 7 prunes the
+    // entry (CODE-FIX-003: terminal transitions remove the entry rather than
+    // flipping it to false; done tasks have no active lifetime in the map).
     // We re-insert as in_progress so mark_task_done can transition it.
     conn.execute(
         "UPDATE tasks SET status = 'in_progress' WHERE id = 'TASK-DONE'",
@@ -471,10 +473,9 @@ fn done_task_via_pipeline_sets_crash_flag_false() {
     .expect("reset to in_progress");
     run_pipeline_completion(&mut conn, &mut fx, "TASK-DONE", 2);
 
-    assert_eq!(
-        fx.ctx.crashed_last_iteration.get("TASK-DONE"),
-        Some(&false),
-        "completion must clear crash flag to false"
+    assert!(
+        !fx.ctx.crashed_last_iteration.contains_key("TASK-DONE"),
+        "completion must prune entry from crashed_last_iteration (CODE-FIX-003)"
     );
 
     // Re-picking TASK-DONE (e.g. hypothetically) must not escalate.
@@ -485,7 +486,7 @@ fn done_task_via_pipeline_sets_crash_flag_false() {
     );
     assert_eq!(
         escalated, None,
-        "after done, re-pick must not escalate (flag is false)"
+        "after done, re-pick must not escalate (entry absent)"
     );
 }
 
@@ -658,17 +659,16 @@ fn crash_done_crash_ladder_restarts_from_base() {
     );
     assert_eq!(escalated.as_deref(), Some(SONNET_MODEL));
 
-    // Completion: flag flips to false.
+    // Completion: entry is pruned (CODE-FIX-003).
     conn.execute(
         "UPDATE tasks SET status = 'in_progress' WHERE id = 'TASK-CDR'",
         [],
     )
     .ok();
     run_pipeline_completion(&mut conn, &mut fx, "TASK-CDR", 2);
-    assert_eq!(
-        fx.ctx.crashed_last_iteration.get("TASK-CDR"),
-        Some(&false),
-        "completion must clear crash flag"
+    assert!(
+        !fx.ctx.crashed_last_iteration.contains_key("TASK-CDR"),
+        "completion must prune crash entry (CODE-FIX-003)"
     );
 
     // Second crash sequence: escalation must restart from haiku, not from the

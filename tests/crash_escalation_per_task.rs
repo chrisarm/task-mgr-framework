@@ -365,9 +365,8 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
 
     // CODE-FIX-003: terminal transitions prune the entry entirely rather than
     // flipping to false. The task is done — it has no active lifetime in the map.
-    assert_eq!(
-        fx.ctx.crashed_last_iteration.contains_key("TASK-SUCC"),
-        false,
+    assert!(
+        !fx.ctx.crashed_last_iteration.contains_key("TASK-SUCC"),
         "done task must be pruned from crashed_last_iteration (entry must be absent)"
     );
 
@@ -488,7 +487,7 @@ fn discriminator_check_crash_escalation_returns_some_for_same_task_crash() {
 /// iteration N+1 — entry must be absent (contains_key == false).
 #[test]
 fn terminal_done_via_status_tag_prunes_crashed_last_iteration() {
-    let (db_temp, mut conn) = setup_migrated_db();
+    let (_db_temp, mut conn) = setup_migrated_db();
     // Insert task as in_progress so the Done dispatch succeeds.
     conn.execute(
         "INSERT INTO tasks (id, title, status, priority) VALUES ('FIX003-TASK', 't', 'in_progress', 50)",

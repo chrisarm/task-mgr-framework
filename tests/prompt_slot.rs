@@ -552,7 +552,7 @@ fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
     // The base prompt itself is one of the four critical sections; making it
     // fully consume its 16 KB cap is enough to leave a tight remainder when
     // combined with the inflated task JSON below.
-    fs::write(&base_prompt, &"B".repeat(60_000)).unwrap();
+    fs::write(&base_prompt, "B".repeat(60_000)).unwrap();
 
     // Inflate the task description so format_task_json produces a large
     // critical section that eats most of TOTAL_PROMPT_BUDGET. ~60 KB.
@@ -635,7 +635,7 @@ fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
 
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
-    fs::write(&base_prompt, &"B".repeat(20_000)).unwrap();
+    fs::write(&base_prompt, "B".repeat(20_000)).unwrap();
 
     // Force a tight remainder by oversizing the task JSON (critical section)
     // so the learnings block can't fit. The learnings block is ~3.5 KB after
