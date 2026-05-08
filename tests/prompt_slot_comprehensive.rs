@@ -65,11 +65,13 @@ fn project_with_files(touches: &[(&str, &str)]) -> TempDir {
     temp
 }
 
-fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptParams {
+fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptParams<'static> {
     SlotPromptParams {
         project_root,
         base_prompt_path,
         permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
     }
 }
 

@@ -1150,15 +1150,21 @@ fn claim_failed_slot_does_not_pollute_crash_map() {
          (slot 1 claim_succeeded=false must be absent)",
     );
     assert!(
-        fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-0-TASK"),
+        fx.ctx
+            .crashed_last_iteration
+            .contains_key("WAVE-SLOT-0-TASK"),
         "slot 0 crash must be recorded",
     );
     assert!(
-        fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-2-TASK"),
+        fx.ctx
+            .crashed_last_iteration
+            .contains_key("WAVE-SLOT-2-TASK"),
         "slot 2 crash must be recorded",
     );
     assert!(
-        !fx.ctx.crashed_last_iteration.contains_key("WAVE-SLOT-1-TASK"),
+        !fx.ctx
+            .crashed_last_iteration
+            .contains_key("WAVE-SLOT-1-TASK"),
         "slot 1 (claim_succeeded=false) must NOT appear in crashed_last_iteration",
     );
 }

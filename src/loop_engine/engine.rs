@@ -844,6 +844,13 @@ pub struct WaveIterationParams<'a> {
     pub external_repo_path: Option<&'a Path>,
     pub external_git_scan_depth: usize,
     pub inter_iteration_delay: Duration,
+    /// Project-wide `steering.md` path. `None` when the project has no
+    /// steering file. Threaded into per-slot `SlotPromptParams` so wave
+    /// prompts include the same project-wide steering as sequential prompts.
+    pub steering_path: Option<&'a Path>,
+    /// Operator pause feedback rendered as a `## Session Guidance` block in
+    /// each slot prompt. Empty string omits the section, matching sequential.
+    pub session_guidance: &'a str,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -1019,7 +1026,7 @@ fn build_slot_contexts(
     conn: &Connection,
     group: Vec<crate::commands::next::selection::ScoredTask>,
     slot_paths: &[PathBuf],
-    slot_prompt_params: &prompt::slot::SlotPromptParams,
+    slot_prompt_params: &prompt::slot::SlotPromptParams<'_>,
 ) -> Vec<SlotContext> {
     group
         .into_iter()
@@ -1069,11 +1076,15 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
 /// Pulled out of `build_slot_contexts` so the call site at
 /// `run_wave_iteration` can construct it once and pass by reference, which
 /// avoids cloning the `PathBuf` per slot.
-fn build_slot_prompt_params(params: &WaveIterationParams<'_>) -> prompt::slot::SlotPromptParams {
+fn build_slot_prompt_params<'a>(
+    params: &'a WaveIterationParams<'a>,
+) -> prompt::slot::SlotPromptParams<'a> {
     prompt::slot::SlotPromptParams {
         project_root: params.source_root.to_path_buf(),
         base_prompt_path: params.base_prompt_path.to_path_buf(),
         permission_mode: params.permission_mode.clone(),
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
     }
 }
 
@@ -3092,6 +3103,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 parallel_active = false;
                 continue;
             };
+            // Materialize wave-scope inputs that need stable lifetimes for the
+            // borrowed fields on `WaveIterationParams`.
+            let wave_session_guidance = ctx.session_guidance.format_for_prompt();
             let wave_params = WaveIterationParams {
                 conn: &mut conn,
                 db_dir: &run_config.db_dir,
@@ -3115,6 +3129,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 external_repo_path: external_repo_path.as_deref(),
                 external_git_scan_depth: run_config.config.external_git_scan_depth,
                 inter_iteration_delay,
+                steering_path: steering,
+                session_guidance: &wave_session_guidance,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
@@ -6297,11 +6313,16 @@ mod tests {
         }
 
         /// Build a SlotPromptParams pointing at a temp project root + base prompt.
-        fn make_prompt_params(project_root: &Path, base_prompt_path: PathBuf) -> SlotPromptParams {
+        fn make_prompt_params(
+            project_root: &Path,
+            base_prompt_path: PathBuf,
+        ) -> SlotPromptParams<'static> {
             SlotPromptParams {
                 project_root: project_root.to_path_buf(),
                 base_prompt_path,
                 permission_mode: PermissionMode::Dangerous,
+                steering_path: None,
+                session_guidance: "",
             }
         }
 
@@ -6638,6 +6659,8 @@ mod tests {
                 external_repo_path: None,
                 external_git_scan_depth: 50,
                 inter_iteration_delay: Duration::ZERO,
+                steering_path: None,
+                session_guidance: "",
             }
         }
 
@@ -6856,6 +6879,8 @@ mod tests {
                     external_repo_path: None,
                     external_git_scan_depth: 50,
                     inter_iteration_delay: Duration::from_millis(500),
+                    steering_path: None,
+                    session_guidance: "",
                 },
                 &mut ctx,
             );
@@ -6933,6 +6958,8 @@ mod tests {
                 project_root: tmp.path().to_path_buf(),
                 base_prompt_path: base_prompt,
                 permission_mode: PermissionMode::Dangerous,
+                steering_path: None,
+                session_guidance: "",
             };
             let slot_paths = vec![tmp.path().to_path_buf()];
             let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);
@@ -7071,6 +7098,8 @@ mod tests {
                     external_repo_path: None,
                     external_git_scan_depth: 50,
                     inter_iteration_delay: Duration::ZERO,
+                    steering_path: None,
+                    session_guidance: "",
                 }
             }
 

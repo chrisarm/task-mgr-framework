@@ -16,6 +16,7 @@
 //! - [`build_tool_awareness_block`] and [`build_key_decisions_block`] produce
 //!   non-empty content for valid inputs.
 
+use std::fs;
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -242,6 +243,32 @@ pub fn build_tool_awareness_block(permission_mode: &PermissionMode) -> String {
         PermissionMode::Scoped {
             allowed_tools: None,
         } => String::new(),
+    }
+}
+
+/// Build a steering section from a `steering.md` file path.
+///
+/// Returns `""` when the file is missing, unreadable, or contains only
+/// whitespace — sequential and slot prompt builders both treat absence as
+/// "no project-wide steering" rather than an error. Wrapping the content in
+/// a `## Steering` header keeps display order deterministic across builders.
+pub fn build_steering_block(steering_path: &Path) -> String {
+    match fs::read_to_string(steering_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            format!("## Steering\n\n{}\n\n", content.trim())
+        }
+        _ => String::new(),
+    }
+}
+
+/// Build a session-guidance section from operator pause feedback. Returns
+/// `""` when `guidance` is empty so callers can append unconditionally
+/// without rendering an empty header.
+pub fn build_session_guidance_block(guidance: &str) -> String {
+    if guidance.is_empty() {
+        String::new()
+    } else {
+        format!("## Session Guidance\n\n{guidance}\n\n")
     }
 }
 

@@ -16,7 +16,7 @@
 //!   was rendered (so `record_shown_learnings` gets fed by the wave path).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -40,9 +40,12 @@ const BASE_PROMPT_BUDGET: usize = 16_000;
 ///
 /// Everything in here is `Send` so the resulting `SlotPromptBundle` can cross
 /// the worker thread boundary without holding a `&Connection` (rusqlite is
-/// `!Send`, see learnings #1893 / #1852 / #1871).
+/// `!Send`, see learnings #1893 / #1852 / #1871). The borrowed fields
+/// (`steering_path`, `session_guidance`) are read on the main thread before
+/// `thread::spawn`; the rendered text is owned by `SlotPromptBundle.prompt`,
+/// so the borrow lifetime never crosses the worker boundary.
 #[derive(Clone, Debug)]
-pub struct SlotPromptParams {
+pub struct SlotPromptParams<'a> {
     /// Absolute path to the project root used to resolve `touches_files` for
     /// the source-context section.
     pub project_root: PathBuf,
@@ -50,6 +53,12 @@ pub struct SlotPromptParams {
     pub base_prompt_path: PathBuf,
     /// Permission mode that determines which tool-awareness block to render.
     pub permission_mode: PermissionMode,
+    /// Optional path to project-wide `steering.md`. `None` when the project
+    /// has no steering file; the steering section is omitted in that case.
+    pub steering_path: Option<&'a Path>,
+    /// Operator pause feedback rendered as a `## Session Guidance` block.
+    /// Empty string omits the section entirely (no header).
+    pub session_guidance: &'a str,
 }
 
 /// Send-safe bundle of everything a slot worker needs to invoke Claude and
@@ -130,11 +139,18 @@ fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 /// the DB; the resulting `SlotPromptBundle` is `Send` and is moved into the
 /// worker thread.
 ///
-/// Composes `prompt::core` helpers: learnings, source context, tool awareness,
-/// key decisions, and completed dependency summaries. Drops synergy cluster
-/// escalation, reorder instruction, and sibling-PRD context — wave slots are
-/// disjoint by design.
-pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -> SlotPromptBundle {
+/// Composes `prompt::core` helpers: steering, session guidance, learnings,
+/// source context, tool awareness, key decisions, and completed dependency
+/// summaries. Drops synergy cluster escalation, reorder instruction, and
+/// sibling-PRD context — wave slots are disjoint by design. Steering and
+/// session guidance are kept (vs the disjoint-task drops) because they are
+/// project-wide and operator-driven respectively, both of which apply to
+/// every slot in the wave.
+pub fn build_prompt(
+    conn: &Connection,
+    task: &Task,
+    params: &SlotPromptParams<'_>,
+) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
     // Task JSON header — the agent must see the task's description,
@@ -152,6 +168,13 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
     let source_section =
         core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
 
+    let steering_section = params
+        .steering_path
+        .map(core::build_steering_block)
+        .unwrap_or_default();
+
+    let guidance_section = core::build_session_guidance_block(params.session_guidance);
+
     let tool_section = core::build_tool_awareness_block(&params.permission_mode);
 
     let key_decisions_section = core::build_key_decisions_block(&task.id);
@@ -162,8 +185,10 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
 
     let base_prompt = load_base_prompt(&params.base_prompt_path);
 
+    // Display order matches sequential.rs: steering → guidance precede
+    // tool_awareness so project-wide guidance lands before per-task content.
     let prompt = format!(
-        "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
+        "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{steering_section}{guidance_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
     );
 
     let section_sizes: Vec<(&'static str, usize)> = vec![
@@ -172,6 +197,8 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
         ("learnings", learnings_section.len()),
         ("source", source_section.len()),
         ("dependencies", dep_section.len()),
+        ("steering", steering_section.len()),
+        ("session_guidance", guidance_section.len()),
         ("tool_awareness", tool_section.len()),
         ("key_decision", key_decisions_section.len()),
         ("completion", completion_section.len()),

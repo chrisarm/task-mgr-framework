@@ -477,6 +477,8 @@ fn slot_build_prompt_missing_base_prompt_path_degrades_gracefully() {
         project_root: PathBuf::from("/tmp/nonexistent-project-root-xyzzy"),
         base_prompt_path: PathBuf::from("/tmp/nonexistent-base-prompt-xyzzy.md"),
         permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
     };
 
     let bundle: SlotPromptBundle =
@@ -514,6 +516,8 @@ fn slot_build_prompt_with_real_base_prompt_file_includes_content() {
         project_root: PathBuf::from("/tmp/nonexistent-project-root-xyzzy"),
         base_prompt_path,
         permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);
@@ -539,6 +543,8 @@ fn slot_build_prompt_large_base_prompt_is_truncated() {
         project_root: PathBuf::from("/tmp/nonexistent-project-root-xyzzy"),
         base_prompt_path,
         permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
     };
 
     let bundle = task_mgr::loop_engine::prompt::slot::build_prompt(&conn, &task, &params);

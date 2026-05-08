@@ -71,11 +71,13 @@ fn project_with_files(touches: &[(&str, &str)]) -> TempDir {
     temp
 }
 
-fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptParams {
+fn make_params(project_root: PathBuf, base_prompt_path: PathBuf) -> SlotPromptParams<'static> {
     SlotPromptParams {
         project_root,
         base_prompt_path,
         permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
     }
 }
 
@@ -346,6 +348,104 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
         result.iteration_result.task_id.as_deref(),
         Some(expected_task_id.as_str()),
         "SlotResult.iteration_result.task_id must come from bundle.task_id"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC (FEAT-001 M3): steering + session_guidance threaded into slot prompts.
+//
+// Positive: steering_path=Some(fixture) and session_guidance=non-empty must
+// render both `## Steering` and `## Session Guidance` headers in the assembled
+// prompt with content from each input.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_prompt_renders_steering_and_session_guidance_when_set() {
+    let (_tmp, conn) = setup_migrated_db();
+    let project = project_with_files(&[]);
+    let base_prompt = project.path().join("prompt.md");
+    fs::write(&base_prompt, "# base\n").unwrap();
+
+    let steering_file = project.path().join("steering.md");
+    fs::write(&steering_file, "Project-wide guidance: prefer DI.").unwrap();
+
+    let task = sample_task();
+    let params = SlotPromptParams {
+        project_root: project.path().to_path_buf(),
+        base_prompt_path: base_prompt,
+        permission_mode: PermissionMode::Dangerous,
+        steering_path: Some(steering_file.as_path()),
+        session_guidance: "operator note: focus on edge cases",
+    };
+    let bundle = build_prompt(&conn, &task, &params);
+
+    assert!(
+        bundle.prompt.contains("## Steering"),
+        "prompt must contain `## Steering` header when steering_path is Some; got:\n{}",
+        bundle.prompt
+    );
+    assert!(
+        bundle.prompt.contains("Project-wide guidance: prefer DI."),
+        "prompt must contain steering file content; got:\n{}",
+        bundle.prompt
+    );
+    assert!(
+        bundle.prompt.contains("## Session Guidance"),
+        "prompt must contain `## Session Guidance` header when guidance is non-empty; got:\n{}",
+        bundle.prompt
+    );
+    assert!(
+        bundle.prompt.contains("operator note: focus on edge cases"),
+        "prompt must contain session guidance text; got:\n{}",
+        bundle.prompt
+    );
+
+    // Display order: steering and guidance must precede the tool-awareness
+    // block so project-wide instructions land before per-task content,
+    // matching sequential.rs.
+    let steering_pos = bundle.prompt.find("## Steering").expect("steering header");
+    let guidance_pos = bundle
+        .prompt
+        .find("## Session Guidance")
+        .expect("guidance header");
+    let tool_pos = bundle
+        .prompt
+        .find("## Available Tools")
+        .expect("tool-awareness header");
+    assert!(
+        steering_pos < tool_pos && guidance_pos < tool_pos,
+        "steering ({steering_pos}) and guidance ({guidance_pos}) must precede tool block ({tool_pos})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC (FEAT-001 M3, negative): steering_path=None + session_guidance=""
+// must produce a prompt with NEITHER section header present.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_prompt_omits_steering_and_guidance_when_unset() {
+    let (_tmp, conn) = setup_migrated_db();
+    let project = project_with_files(&[]);
+    let base_prompt = project.path().join("prompt.md");
+    fs::write(&base_prompt, "# base\n").unwrap();
+
+    let task = sample_task();
+    let bundle = build_prompt(
+        &conn,
+        &task,
+        &make_params(project.path().to_path_buf(), base_prompt),
+    );
+
+    assert!(
+        !bundle.prompt.contains("## Steering"),
+        "prompt must NOT contain `## Steering` header when steering_path is None; got:\n{}",
+        bundle.prompt
+    );
+    assert!(
+        !bundle.prompt.contains("## Session Guidance"),
+        "prompt must NOT contain `## Session Guidance` header when guidance is empty; got:\n{}",
+        bundle.prompt
     );
 }
 

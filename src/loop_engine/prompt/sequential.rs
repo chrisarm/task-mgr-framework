@@ -460,13 +460,11 @@ fn build_tool_awareness_section(permission_mode: &PermissionMode) -> String {
 }
 
 /// Build a steering section string from the steering.md file.
+///
+/// Thin delegate to [`core::build_steering_block`] — the slot builder shares
+/// the same helper so both paths render identical bytes for the same input.
 fn build_steering_section(steering_path: &Path) -> String {
-    match fs::read_to_string(steering_path) {
-        Ok(content) if !content.trim().is_empty() => {
-            format!("## Steering\n\n{}\n\n", content.trim())
-        }
-        _ => String::new(),
-    }
+    core::build_steering_block(steering_path)
 }
 
 /// Append steering.md content to the prompt if the file exists.
