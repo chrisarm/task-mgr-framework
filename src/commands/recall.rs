@@ -413,6 +413,7 @@ mod tests {
         let params = RecallCmdParams {
             query: Some("database".to_string()),
             limit: 10,
+            allow_degraded: true,
             ..Default::default()
         };
         let result = recall(&conn, params).unwrap();
@@ -1034,6 +1035,7 @@ mod tests {
             RecallCmdParams {
                 query: Some("database".to_string()),
                 limit: 5,
+                allow_degraded: true,
                 ..Default::default()
             },
         )
@@ -1113,6 +1115,7 @@ mod tests {
                 query: Some("unique-supersede-marker".to_string()),
                 limit: 10,
                 include_superseded: false,
+                allow_degraded: true,
                 ..Default::default()
             },
         )
@@ -1153,6 +1156,7 @@ mod tests {
                 query: Some("include-flag-marker".to_string()),
                 limit: 10,
                 include_superseded: true,
+                allow_degraded: true,
                 ..Default::default()
             },
         )

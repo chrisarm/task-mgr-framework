@@ -28,6 +28,7 @@
 
 use task_mgr::loop_engine::config::IterationOutcome;
 use task_mgr::loop_engine::engine::{IterationResult, SlotResult};
+use task_mgr::loop_engine::model::OPUS_MODEL;
 
 // ---------------------------------------------------------------------------
 // AC #1 + #2 (structural):
@@ -53,7 +54,7 @@ fn iteration_result_carries_optional_conversation_transcript() {
         files_modified: vec!["src/lib.rs".into()],
         should_stop: false,
         output: "raw stdout".into(),
-        effective_model: Some("claude-opus-4-7".into()),
+        effective_model: Some(OPUS_MODEL.into()),
         effective_effort: Some("high"),
         key_decisions_count: 0,
         conversation: Some("[user] go\n[assistant] done\n".into()),
