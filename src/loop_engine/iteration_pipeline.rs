@@ -1,34 +1,42 @@
 //! Shared post-Claude pipeline used by both the sequential `run_iteration`
 //! path and the parallel-slot `process_slot_result` path.
 //!
-//! TDD scaffolding for FEAT-003 (the pipeline unification). This module is a
-//! deliberate stub: [`process_iteration_output`] returns
-//! [`ProcessingOutcome::default()`] so callers compile while
-//! `tests/iteration_pipeline.rs` (TEST-INIT-003) drives the contract.
+//! `process_iteration_output` is the canonical home for the post-Claude
+//! behaviors that previously diverged between the two paths:
 //!
-//! Invariants the implementation MUST honor (validated by the test suite):
-//! - Calls `learnings::ingestion::extract_learnings_from_output` (governed by
-//!   the `TASK_MGR_NO_EXTRACT_LEARNINGS=1` opt-out).
-//! - Calls `feedback::record_iteration_feedback` for `shown_learning_ids`.
-//! - Honors `skip_git_completion_detection` for both wave (true) and
-//!   sequential (false) paths.
-//! - The "already complete" fallback fires in BOTH skip-git modes (this is
-//!   the wave-mode parity fix called out in the PRD).
-//! - `ProcessingOutcome.tasks_completed` dedups across the multiple
-//!   completion branches in a single call (matches today's
-//!   `process_slot_result` HashSet semantics).
-//! - On retroactive completion, mutates `params.outcome` to
-//!   `IterationOutcome::Completed` (matches sequential at engine.rs:3280,
-//!   3307, 3341, 3400, 3454).
-//! - NEVER invokes merge / external-git / wrapper-commit operations —
-//!   those stay at `run_loop` / `run_wave_iteration` call sites.
+//! - `progress::log_iteration` (degraded entry — files/model/effort/slot are
+//!   threaded through the existing call sites until FEAT-005/FEAT-006 widens
+//!   `ProcessingParams`).
+//! - `<key-decision>` extraction + `key_decisions_db::insert_key_decision`.
+//! - `<task-status>` dispatch via `engine::apply_status_updates`.
+//! - The full completion ladder: status-tag → completed-tag → git commit
+//!   detection (gated on `skip_git_completion_detection`) → output scan →
+//!   `is_task_reported_already_complete` fallback. The fallback fires in
+//!   BOTH skip-git modes (the wave-mode parity fix the PRD calls out).
+//! - `learnings::ingestion::extract_learnings_from_output` (governed by the
+//!   `TASK_MGR_NO_EXTRACT_LEARNINGS=1` opt-out).
+//! - `feedback::record_iteration_feedback` for shown bandit learnings.
+//! - Per-task crash-tracking writes onto the iteration context.
+//!
+//! Out of scope (those stay at the `run_loop` / `run_wave_iteration` call
+//! sites): wrapper-commit, external-git reconciliation, human-review trigger,
+//! rate-limit waits, pause-signal handling, merge resolution.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::Connection;
 
+use crate::commands::complete as complete_cmd;
+use crate::db::schema::key_decisions as key_decisions_db;
 use crate::loop_engine::config::IterationOutcome;
-use crate::loop_engine::engine::IterationContext;
+use crate::loop_engine::detection;
+use crate::loop_engine::engine::{IterationContext, apply_status_updates};
+use crate::loop_engine::feedback;
+use crate::loop_engine::git_reconcile::check_git_for_task_completion;
+use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
+use crate::loop_engine::prd_reconcile::{mark_task_done, update_prd_task_passes};
+use crate::loop_engine::progress;
 use crate::loop_engine::signals::SignalFlag;
 
 /// Aggregated results from one pass through the pipeline.
@@ -116,27 +124,311 @@ pub struct ProcessingParams<'a> {
     /// Signal flag, threaded through to `extract_learnings_from_output` so
     /// Ctrl-C aborts the extraction subprocess.
     pub signal_flag: &'a SignalFlag,
-    /// Iteration context. The pipeline updates `crash_tracker` and
-    /// `last_files` (matching the sequential post-Claude block).
+    /// Iteration context. The pipeline updates `crash_tracker` and the
+    /// per-task crash-tracking fields (`last_task_id`, `last_was_crash`).
     pub ctx: &'a mut IterationContext,
 }
 
-/// Stub: returns an empty [`ProcessingOutcome`]. Real implementation lands
-/// in FEAT-003 and will:
+/// Run the shared post-Claude pipeline.
 ///
-/// 1. Extract `<key-decision>` tags and persist them.
-/// 2. Apply `<task-status>` tags (dedup across status / completed paths).
-/// 3. Mark `<completed>` task IDs done.
-/// 4. (Sequential only — `skip_git_completion_detection == false`) attempt
-///    git-commit detection for the claimed task.
-/// 5. Fall back to output-scan for completed task IDs.
-/// 6. Always run the "already complete" fallback when no path marked done.
-/// 7. Mutate `params.outcome` to `Completed` if any path retroactively
-///    marked the claimed task done.
-/// 8. Extract learnings from `conversation` (preferred) or `output`.
-/// 9. Record bandit feedback for `shown_learning_ids`.
+/// See module docs for the full list of behaviors. Returns a
+/// [`ProcessingOutcome`] aggregating completion counts and side-effect
+/// metrics; mutates `params.outcome` and `params.ctx` in place.
 ///
-/// See `tests/iteration_pipeline.rs` for the contract.
-pub fn process_iteration_output(_params: ProcessingParams<'_>) -> ProcessingOutcome {
-    ProcessingOutcome::default()
+/// Intended for crate-internal use by `run_iteration` (sequential) and
+/// `process_slot_result` (wave) once FEAT-005 / FEAT-006 wire the call
+/// sites; surface is `pub` only so the integration test in
+/// `tests/iteration_pipeline.rs` can pin the contract.
+pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutcome {
+    let ProcessingParams {
+        conn,
+        run_id,
+        iteration,
+        task_id,
+        output,
+        conversation,
+        shown_learning_ids,
+        outcome,
+        working_root,
+        git_scan_depth,
+        skip_git_completion_detection,
+        prd_path,
+        task_prefix,
+        progress_path,
+        db_dir,
+        signal_flag,
+        ctx,
+    } = params;
+
+    let mut result = ProcessingOutcome::default();
+    // Dedup set: the same task ID may surface across multiple completion
+    // branches in one pass (status-tag, completed-tag, git, scan, fallback).
+    // Mirrors `counted_this_iteration` from engine.rs:3286 and the per-slot
+    // `counted` HashSet from process_slot_result (engine.rs:1136).
+    let mut completed_set: HashSet<String> = HashSet::new();
+
+    // Step 1: progress log entry.
+    // Sequential and wave call sites currently log_iteration directly with
+    // files/model/effort/slot threaded from the IterationResult; FEAT-005 /
+    // FEAT-006 widen ProcessingParams and remove the duplicate call. Until
+    // then we emit a degraded entry so the pipeline stays observable in
+    // tests that don't go through the call sites.
+    progress::log_iteration(
+        progress_path,
+        iteration,
+        task_id,
+        outcome,
+        &[],
+        None,
+        None,
+        None,
+    );
+
+    // Step 2: extract `<key-decision>` tags and persist.
+    let key_decisions = detection::extract_key_decisions(output);
+    for decision in &key_decisions {
+        match key_decisions_db::insert_key_decision(
+            conn,
+            run_id,
+            task_id,
+            i64::from(iteration),
+            decision,
+        ) {
+            Ok(_) => result.key_decisions_count += 1,
+            Err(e) => eprintln!(
+                "Warning: failed to store key decision '{}': {}",
+                decision.title, e
+            ),
+        }
+    }
+
+    // Step 3: side-band `<task-status>` dispatch.
+    let status_updates = detection::extract_status_updates(output);
+    let status_updates_applied = if status_updates.is_empty() {
+        0
+    } else {
+        apply_status_updates(
+            conn,
+            &status_updates,
+            Some(run_id),
+            Some(prd_path),
+            task_prefix,
+            Some(progress_path),
+            Some(db_dir),
+        )
+    };
+    result.status_updates_applied = status_updates_applied;
+
+    // Step 4: completion ladder for the claimed task.
+    //
+    // Unlike the legacy sequential gate (engine.rs:3279) which short-circuits
+    // when `outcome == Empty`, the pipeline always runs the ladder when a
+    // task_id is present — the test contract pins this so a `<completed>` tag
+    // can retroactively flip an Empty outcome to Completed.
+    if let Some(claimed_id) = task_id {
+        let mut task_marked_done = false;
+
+        // 4a: <task-status>...:done</task-status> matching the claimed task.
+        if status_updates_applied > 0
+            && status_updates.iter().any(|u| {
+                matches!(u.status, detection::TaskStatusChange::Done) && u.task_id == claimed_id
+            })
+        {
+            task_marked_done = true;
+            record_completion(claimed_id, &mut completed_set, &mut result, outcome, ctx);
+            eprintln!(
+                "Task {} completed (detected from <task-status> tag)",
+                claimed_id
+            );
+        }
+
+        // 4b: <completed> tags. Multiple tags may complete cross-task IDs
+        // (peer tasks Claude finished alongside the claimed one).
+        let completed_tags = parse_completed_tasks(output);
+        for completed_id in &completed_tags {
+            match mark_task_done(conn, completed_id, run_id, None, prd_path, task_prefix) {
+                Ok(()) => {
+                    if completed_id == claimed_id {
+                        task_marked_done = true;
+                    }
+                    record_completion(completed_id, &mut completed_set, &mut result, outcome, ctx);
+                    eprintln!(
+                        "Task {} completed (detected from <completed> tag)",
+                        completed_id
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal: a duplicate `<completed>` after a status-tag
+                    // dispatch already moved the row to `done` will fail
+                    // here (transition guard). The dedup set above keeps the
+                    // counters honest; the warning preserves visibility.
+                    eprintln!("Warning: mark_task_done({}) failed: {}", completed_id, e);
+                }
+            }
+        }
+
+        // 4c: git-commit + 4d: output-scan fallback (skip-git mode-aware).
+        //
+        // Sequential mode (skip_git=false): try git first; only scan output
+        // when git found nothing. Wave mode (skip_git=true): never touch git
+        // (the commit is on an unmerged ephemeral branch); always fall back
+        // to output scan so cross-task completions still register.
+        if completed_tags.is_empty() {
+            let mut completion_recorded = false;
+
+            if !skip_git_completion_detection
+                && let Some(commit_hash) =
+                    check_git_for_task_completion(working_root, claimed_id, git_scan_depth)
+            {
+                let task_ids = [claimed_id.to_string()];
+                match complete_cmd::complete(
+                    conn,
+                    &task_ids,
+                    Some(run_id),
+                    Some(&commit_hash),
+                    false,
+                ) {
+                    Ok(_) => {
+                        task_marked_done = true;
+                        completion_recorded = true;
+                        record_completion(
+                            claimed_id,
+                            &mut completed_set,
+                            &mut result,
+                            outcome,
+                            ctx,
+                        );
+                        if let Err(e) =
+                            update_prd_task_passes(prd_path, claimed_id, true, task_prefix)
+                        {
+                            eprintln!(
+                                "Warning: failed to update PRD for task {}: {}",
+                                claimed_id, e
+                            );
+                        } else {
+                            eprintln!(
+                                "Task {} completed (commit {})",
+                                claimed_id,
+                                &commit_hash[..7.min(commit_hash.len())]
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to mark task {} as done in DB: {}",
+                            claimed_id, e
+                        );
+                    }
+                }
+            }
+
+            if !completion_recorded {
+                let scanned = scan_output_for_completed_tasks(output, conn, task_prefix);
+                for completed_id in &scanned {
+                    let ids = [completed_id.clone()];
+                    match complete_cmd::complete(conn, &ids, Some(run_id), None, false) {
+                        Ok(_) => {
+                            if completed_id == claimed_id {
+                                task_marked_done = true;
+                            }
+                            record_completion(
+                                completed_id,
+                                &mut completed_set,
+                                &mut result,
+                                outcome,
+                                ctx,
+                            );
+                            if let Err(e) =
+                                update_prd_task_passes(prd_path, completed_id, true, task_prefix)
+                            {
+                                eprintln!(
+                                    "Warning: failed to update PRD for task {}: {}",
+                                    completed_id, e
+                                );
+                            } else {
+                                eprintln!("Task {} completed (detected from output)", completed_id);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to mark task {} as done: {}",
+                                completed_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4e: already-complete fallback. Fires in BOTH skip-git modes — the
+        // PRD parity fix that today's process_slot_result misses entirely.
+        if !task_marked_done
+            && detection::is_task_reported_already_complete(output, claimed_id, task_prefix)
+            && let Ok(()) = mark_task_done(conn, claimed_id, run_id, None, prd_path, task_prefix)
+        {
+            record_completion(claimed_id, &mut completed_set, &mut result, outcome, ctx);
+            eprintln!("Task {} completed (reported as already done)", claimed_id);
+        }
+    }
+
+    // Step 5: extract learnings from the iteration output. Prefer the
+    // structured stream-json conversation when present; fall back to the
+    // raw stdout. The env opt-out keeps tests hermetic.
+    let learning_source = conversation.unwrap_or(output);
+    if !crate::learnings::ingestion::is_extraction_disabled() && !learning_source.is_empty() {
+        match crate::learnings::ingestion::extract_learnings_from_output(
+            conn,
+            learning_source,
+            task_id,
+            Some(run_id),
+            Some(db_dir),
+            Some(signal_flag),
+        ) {
+            Ok(extraction) => {
+                result.learnings_extracted = extraction.learnings_extracted;
+                if extraction.learnings_extracted > 0 {
+                    eprintln!(
+                        "Extracted {} learning(s) from output",
+                        extraction.learnings_extracted
+                    );
+                }
+            }
+            Err(e) => eprintln!("Warning: learning extraction failed: {}", e),
+        }
+    }
+
+    // Step 6: bandit feedback for shown learnings (gates on Completed
+    // outcome internally, so we pass the post-mutation `outcome`).
+    if let Err(e) = feedback::record_iteration_feedback(conn, shown_learning_ids, outcome) {
+        eprintln!("Warning: failed to record iteration feedback: {}", e);
+    }
+
+    // Step 7: per-task crash-tracking write. Future PRD work replaces these
+    // scalar fields with a `crashed_last_iteration` map; the contract here
+    // covers both the legacy and the planned shapes via `IterationContext`'s
+    // current API.
+    if let Some(claimed_id) = task_id {
+        ctx.last_task_id = Some(claimed_id.to_string());
+    }
+    ctx.last_was_crash = matches!(outcome, IterationOutcome::Crash(_));
+
+    result
+}
+
+/// Apply the post-completion bookkeeping shared across every branch of the
+/// completion ladder: dedup the task ID, increment counters, mutate the
+/// outcome to `Completed`, and reset the crash-tracker streak.
+fn record_completion(
+    task_id: &str,
+    completed_set: &mut HashSet<String>,
+    result: &mut ProcessingOutcome,
+    outcome: &mut IterationOutcome,
+    ctx: &mut IterationContext,
+) {
+    if completed_set.insert(task_id.to_string()) {
+        result.tasks_completed += 1;
+        result.completed_task_ids.push(task_id.to_string());
+    }
+    *outcome = IterationOutcome::Completed;
+    ctx.crash_tracker.record_success();
 }

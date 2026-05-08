@@ -40,3 +40,11 @@ Learnings:
 - AC #5 (known-bad discriminator) anchors at the caller boundary, not inside the pipeline — `result.conversation.as_deref() != None` is observable today; the symmetric None case (early-exit) intentionally agrees with the broken-stub None to prevent false positives once FEAT-004 lands.
 - ProcessingParams.conversation type is already `Option<&'a str>`; the threading test pins the borrow shape (`as_deref()`) so a future widening to `Option<String>` (forced clone) breaks here before silently degrading wave perf.
 ---
+## [2026-05-08 01:30] - 5d1118de-FEAT-003
+Approach: Lifted run_loop's post-Claude block (engine.rs:3178-3530) and run_iteration's learnings/feedback section (engine.rs:2032-2113) into iteration_pipeline::process_iteration_output. Single HashSet<String> dedups completion across status-tag, completed-tag, git, output-scan, and already-complete branches. Already-complete fallback now fires in BOTH skip_git modes (the wave-mode parity fix). Made 9 contract tests un-ignored; 1 stays ignored (real-Claude extraction).
+Files: src/loop_engine/iteration_pipeline.rs, tests/iteration_pipeline.rs
+Learnings:
+- `process_iteration_output` had to drop the AC's `pub(crate)` to `pub` because integration tests in tests/ are a separate crate; documented this trade-off in the function's rustdoc.
+- The legacy `if !matches!(outcome, IterationOutcome::Empty)` gate on the completion ladder (engine.rs:3279) is intentionally relaxed in the pipeline so a `<completed>` tag retroactively flips Empty → Completed (mutate-empty-outcome contract).
+- `record_completion` helper consolidates the dedup + counter + outcome-mutate + crash_tracker.record_success() bookkeeping so each branch of the ladder stays a 4-line match arm rather than a 10-line boilerplate block.
+---

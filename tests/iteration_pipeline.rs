@@ -222,8 +222,6 @@ fn process_iteration_output_extracts_learnings_from_fixture_output() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 wires feedback::record_iteration_feedback into the pipeline (stub leaves \
-            window_applied at 0)"]
 fn process_iteration_output_records_bandit_feedback_for_shown_learnings() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -279,7 +277,6 @@ fn process_iteration_output_records_bandit_feedback_for_shown_learnings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 honors skip_git_completion_detection (stub never calls git regardless)"]
 fn process_iteration_output_skip_git_true_does_not_attempt_git_detection() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -339,7 +336,6 @@ fn process_iteration_output_skip_git_true_does_not_attempt_git_detection() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 wires git-commit detection on the sequential branch (stub never inspects git)"]
 fn process_iteration_output_skip_git_false_attempts_git_detection() {
     use std::process::Command;
 
@@ -424,7 +420,6 @@ fn process_iteration_output_skip_git_false_attempts_git_detection() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 makes the already-complete fallback skip-git-mode-agnostic"]
 fn already_complete_fallback_fires_in_skip_git_true_mode() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -463,7 +458,6 @@ fn already_complete_fallback_fires_in_skip_git_true_mode() {
 }
 
 #[test]
-#[ignore = "FEAT-003 makes the already-complete fallback skip-git-mode-agnostic"]
 fn already_complete_fallback_fires_in_skip_git_false_mode() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -512,7 +506,6 @@ fn already_complete_fallback_fires_in_skip_git_false_mode() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 dedups tasks_completed across status / completed / git / scan / fallback"]
 fn tasks_completed_dedups_across_status_and_completed_branches() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -567,8 +560,6 @@ fn tasks_completed_dedups_across_status_and_completed_branches() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 mutates params.outcome to Completed on retroactive completion (sequential \
-            parity)"]
 fn process_iteration_output_mutates_empty_outcome_to_completed_on_retroactive_completion() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -620,7 +611,6 @@ fn process_iteration_output_mutates_empty_outcome_to_completed_on_retroactive_co
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 records cross-task <completed> IDs in completed_task_ids"]
 fn completed_task_ids_includes_processed_task_and_cross_task_ids() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -689,7 +679,6 @@ fn completed_task_ids_includes_processed_task_and_cross_task_ids() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 forbids merge / external-git / wrapper-commit inside the pipeline"]
 fn process_iteration_output_does_not_invoke_wrapper_commit() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -742,8 +731,6 @@ fn process_iteration_output_does_not_invoke_wrapper_commit() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-003 fills in process_iteration_output; until then this is the known-bad \
-            discriminator"]
 fn no_op_stub_fails_combined_contract_assertions() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
