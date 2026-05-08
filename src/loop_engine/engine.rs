@@ -587,6 +587,13 @@ pub fn run_slot_iteration(
         &slot.working_root,
     );
 
+    // Thread the structured stream-json transcript through to the pipeline so
+    // wave-mode learning extraction reads the same conversation source the
+    // sequential path uses (engine.rs:2109). Dropping this here is the
+    // pre-FEAT-004 bug that makes the wave path silently fall back to
+    // `claude_result.output` (just the final result string).
+    let conversation = claude_result.conversation;
+
     Ok(SlotResult {
         slot_index: slot.slot_index,
         iteration_result: IterationResult {
@@ -598,8 +605,8 @@ pub fn run_slot_iteration(
             effective_model,
             effective_effort: effort,
             key_decisions_count: 0,
-            conversation: None,
-            shown_learning_ids: Vec::new(),
+            conversation,
+            shown_learning_ids: bundle.shown_learning_ids.clone(),
         },
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),

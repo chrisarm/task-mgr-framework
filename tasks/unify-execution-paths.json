@@ -880,7 +880,7 @@
       "id": "FEAT-008",
       "modifiesBehavior": true,
       "notes": "Audit confirmed safe (PRD Risks table item, architect review C3). Read learning #2031 (four-rung ladder contract) and CLAUDE.md § Overflow recovery before edits. Order of operations is contractual. After this task, supersede learning #2029 with the corrected fact.",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": [
         "Per-slot overflow isolation: PromptTooLong on slot 2 does not corrupt slots 0/1/3",

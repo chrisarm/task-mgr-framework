@@ -127,3 +127,14 @@ Learnings:
 - skip_serializing_if=Option::is_none on slot_index keeps sequential JSONL byte-identical to pre-FEAT-008 — backward compat for downstream consumers that don't know about the new field
 - Synthetic PromptResult is acceptable for wave-mode dump bodies: the slot worker already crashed on PromptTooLong, so we lack the original section_sizes; the dump still records prompt body, model, effort, iteration, slot index, and recovery action
 ---
+
+## [2026-05-08 04:00] - 5d1118de-CODE-REVIEW-1
+Approach: Reviewed Phase A-D (REFACTOR-001, FEAT-001..008) via rust-python-code-reviewer agent. Verified Send safety, snapshot byte-identity, crash-map main-thread serialization, no-unwrap, slot-keyed overflow.
+Files: src/loop_engine/engine.rs (CRITICAL fix absorbed: thread claude_result.conversation + bundle.shown_learning_ids into wave-mode IterationResult; was dropping stream-json transcript and breaking learning extraction).
+Findings:
+- CRITICAL: run_slot_iteration dropped claude_result.conversation -> None (engine.rs:601 pre-fix). Wave learning extraction silently fell back to result-string output. FIXED IN-PLACE (small, verified, learning #877 pattern).
+- HIGH#1: Wave-mode overflow dump has empty section_sizes/dropped_sections — wave dumps strictly less informative than sequential. Spawned WIRE-FIX-001.
+- HIGH#2: slot_early_exit IterationResult.shown_learning_ids = Vec::new() drifts from outer SlotResult — works today, footgun for future refactors. Spawned CODE-FIX-002.
+Verified clean: AC#1 no .unwrap(); AC#2 &Connection main-thread only; AC#3 assert_impl_all!(SlotPromptBundle: Send) at tests/prompt_slot.rs; AC#4 sequential snapshot byte-identical; AC#6 overflow keys on slot.task_id; AC#7 crash-map written from main thread; AC#8 prompt::build_prompt re-export resolvable, build_slot_prompt removed.
+Tests: prompt_slot (7), iteration_result_conversation (3), prompt_sequential_snapshot (6), overflow_per_slot (12) — all pass. cargo fmt/check/clippy clean.
+---
