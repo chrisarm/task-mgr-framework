@@ -325,11 +325,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    let guidance_section = if params.session_guidance.is_empty() {
-        String::new()
-    } else {
-        format!("## Session Guidance\n\n{}\n\n", params.session_guidance,)
-    };
+    let guidance_section = core::build_session_guidance_block(params.session_guidance);
     let guidance_section = try_fit_section(
         guidance_section,
         "Session Guidance",
