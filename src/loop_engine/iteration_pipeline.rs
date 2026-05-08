@@ -247,20 +247,23 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
 
     // Step 3: side-band `<task-status>` dispatch.
     let status_updates = detection::extract_status_updates(output);
-    let status_updates_applied = if status_updates.is_empty() {
-        0
-    } else {
-        apply_status_updates(
-            conn,
-            &status_updates,
-            Some(run_id),
-            Some(prd_path),
-            task_prefix,
-            Some(progress_path),
-            Some(db_dir),
-        )
-    };
-    result.status_updates_applied = status_updates_applied;
+    let status_results: Vec<(String, detection::TaskStatusChange, bool)> =
+        if status_updates.is_empty() {
+            Vec::new()
+        } else {
+            apply_status_updates(
+                conn,
+                &status_updates,
+                Some(run_id),
+                Some(prd_path),
+                task_prefix,
+                Some(progress_path),
+                Some(db_dir),
+            )
+        };
+    // ProcessingOutcome.status_updates_applied preserves its external semantics:
+    // count of dispatches that succeeded (applied=true).
+    result.status_updates_applied = status_results.iter().filter(|(_, _, ok)| *ok).count() as u32;
 
     // Step 4: completion ladder for the claimed task.
     //
@@ -271,18 +274,33 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     if let Some(claimed_id) = task_id {
         let mut task_marked_done = false;
 
-        // 4a: <task-status>...:done</task-status> matching the claimed task.
-        if status_updates_applied > 0
-            && status_updates.iter().any(|u| {
-                matches!(u.status, detection::TaskStatusChange::Done) && u.task_id == claimed_id
-            })
-        {
-            task_marked_done = true;
-            record_completion(claimed_id, &mut completed_set, &mut result, outcome);
-            eprintln!(
-                "Task {} completed (detected from <task-status> tag)",
-                claimed_id
-            );
+        // 4a: <task-status>...:done</task-status> per-entry success gate (M2 fix).
+        //
+        // The claimed task's specific (id, Done, true) tuple drives the outcome
+        // flip. A peer's failure no longer falsely marks the claimed task done
+        // (the global `applied > 0` flag was the bug — learning #2238).
+        // Peer Done successes are recorded in `completed_task_ids` (so the
+        // wave aggregator sees them) but do NOT flip outcome — the outcome
+        // describes whether THIS iteration's claimed work landed.
+        for (id, status, applied) in &status_results {
+            if !*applied || !matches!(status, detection::TaskStatusChange::Done) {
+                continue;
+            }
+            if id == claimed_id {
+                task_marked_done = true;
+                record_completion(claimed_id, &mut completed_set, &mut result, outcome);
+                eprintln!(
+                    "Task {} completed (detected from <task-status> tag)",
+                    claimed_id
+                );
+            } else if completed_set.insert(id.clone()) {
+                result.tasks_completed += 1;
+                result.completed_task_ids.push(id.clone());
+                eprintln!(
+                    "Peer task {} completed (detected from <task-status> tag)",
+                    id
+                );
+            }
         }
 
         // 4b: <completed> tags. Multiple tags may complete cross-task IDs
@@ -334,12 +352,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                     Ok(_) => {
                         task_marked_done = true;
                         completion_recorded = true;
-                        record_completion(
-                            claimed_id,
-                            &mut completed_set,
-                            &mut result,
-                            outcome,
-                        );
+                        record_completion(claimed_id, &mut completed_set, &mut result, outcome);
                         if let Err(e) =
                             update_prd_task_passes(prd_path, claimed_id, true, task_prefix)
                         {

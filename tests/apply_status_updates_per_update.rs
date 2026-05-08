@@ -87,14 +87,16 @@ fn apply_status_updates_return_type_is_per_update_vec() {
         apply_status_updates(&mut conn, &[], None, None, None, None, None);
 
     // Empty updates slice → empty result vec (not None, not 0, not a panic).
-    assert!(result.is_empty(), "empty updates must yield empty result vec");
+    assert!(
+        result.is_empty(),
+        "empty updates must yield empty result vec"
+    );
 }
 
 // ── Behavioral contract (body tests, #[ignore]'d until CODE-FIX-002) ─────────
 
 /// All updates that dispatch successfully must appear with `true` in the result
 /// vec, preserving (task_id, status) identity for each entry.
-#[ignore = "CODE-FIX-002: apply_status_updates still returns u32"]
 #[test]
 fn apply_status_updates_all_success_returns_all_true() {
     let (dir, mut conn) = setup_db();
@@ -130,18 +132,22 @@ fn apply_status_updates_all_success_returns_all_true() {
     assert!(b.2, "FEAT-B dispatch succeeded → true");
 }
 
-/// When one dispatch is rejected (e.g. task already done), that entry carries
+/// When one dispatch is rejected (e.g. task absent from DB), that entry carries
 /// `false`; peer entries whose dispatch succeeded carry `true`.
 ///
 /// This is the core M2 scenario: the old global `applied > 0` flag would be
 /// `true` (peer succeeded), silently marking the claimed task done even though
 /// its own dispatch failed.
-#[ignore = "CODE-FIX-002: apply_status_updates still returns u32"]
+///
+/// Failure trigger: a `Done` dispatch for a non-existent task ID raises
+/// "task not found" from `complete_single_task` (mirrors the existing
+/// `test_apply_status_update_continues_past_failed_dispatch` test in
+/// `src/loop_engine/engine.rs`). `complete()` is idempotent for already-done
+/// tasks, so "already done" is NOT a failure trigger.
 #[test]
 fn apply_status_updates_rejected_dispatch_returns_false_for_that_entry() {
     let (dir, mut conn) = setup_db();
-    // claimed task is already `done` — a second Done dispatch will fail.
-    insert_task(&conn, "CLAIMED", "done");
+    // CLAIMED is intentionally absent from the DB so its Done dispatch fails.
     insert_task(&conn, "PEER", "in_progress");
     let prd = write_minimal_prd(dir.path(), &["CLAIMED", "PEER"]);
 
@@ -166,7 +172,7 @@ fn apply_status_updates_rejected_dispatch_returns_false_for_that_entry() {
         .expect("CLAIMED must appear in result");
     assert!(
         !claimed.2,
-        "CLAIMED dispatch failed (already done) → false"
+        "CLAIMED dispatch failed (task absent from DB) → false"
     );
 
     let peer = result
@@ -178,7 +184,6 @@ fn apply_status_updates_rejected_dispatch_returns_false_for_that_entry() {
 
 /// Same-task-id appearing twice with different statuses: each entry is tracked
 /// independently. Edge case: the pipeline must not collapse them.
-#[ignore = "CODE-FIX-002: apply_status_updates still returns u32"]
 #[test]
 fn apply_status_updates_same_task_different_statuses_tracked_independently() {
     let (dir, mut conn) = setup_db();
@@ -228,7 +233,6 @@ fn apply_status_updates_same_task_different_statuses_tracked_independently() {
 ///
 /// This test drives `process_iteration_output` directly to verify end-to-end
 /// gate behavior.
-#[ignore = "CODE-FIX-002: pipeline gate still uses status_updates_applied > 0"]
 #[test]
 fn pipeline_gate_uses_per_entry_success_not_global_count() {
     use task_mgr::loop_engine::config::IterationOutcome;
@@ -242,8 +246,9 @@ fn pipeline_gate_uses_per_entry_success_not_global_count() {
 
     let (dir, mut conn) = setup_db();
 
-    // Claimed task already done → Done dispatch will fail.
-    insert_task(&conn, "CLAIMED-001", "done");
+    // CLAIMED-001 is intentionally absent from the DB so its Done dispatch fails
+    // (complete() is idempotent for already-done tasks; "task not found" is the
+    // failure trigger).
     insert_task(&conn, "PEER-001", "in_progress");
     let prd = write_minimal_prd(dir.path(), &["CLAIMED-001", "PEER-001"]);
 
@@ -298,10 +303,7 @@ fn pipeline_gate_uses_per_entry_success_not_global_count() {
 
     // PEER-001 succeeded → it IS marked done.
     assert!(
-        result
-            .completed_task_ids
-            .iter()
-            .any(|id| id == "PEER-001"),
+        result.completed_task_ids.iter().any(|id| id == "PEER-001"),
         "PEER-001 must be marked done (its dispatch succeeded)"
     );
 }

@@ -3903,7 +3903,11 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 /// learning [1475]) are logged to stderr with the task id + status and the
 /// loop continues to the next tag. Never silently swallow errors.
 ///
-/// Returns the number of updates that dispatched successfully.
+/// Returns one entry per input update preserving order: `(task_id, status,
+/// applied)`. `applied=true` iff the dispatcher reported success. Per-update
+/// granularity lets the iteration_pipeline gate test for the specific
+/// `(claimed_id, Done, true)` tuple instead of a global "any update
+/// succeeded" flag (M2 fix — learning #2238).
 pub fn apply_status_updates(
     conn: &mut Connection,
     updates: &[detection::TaskStatusUpdate],
@@ -3912,10 +3916,10 @@ pub fn apply_status_updates(
     task_prefix: Option<&str>,
     progress_path: Option<&Path>,
     db_dir: Option<&Path>,
-) -> u32 {
+) -> Vec<(String, detection::TaskStatusChange, bool)> {
     use detection::TaskStatusChange;
 
-    let mut applied: u32 = 0;
+    let mut results: Vec<(String, TaskStatusChange, bool)> = Vec::with_capacity(updates.len());
     for update in updates {
         let task_ids = [update.task_id.clone()];
         let dispatch: Result<(), TaskMgrError> = match update.status {
@@ -3977,9 +3981,9 @@ pub fn apply_status_updates(
             }
         };
 
+        let applied = dispatch.is_ok();
         match dispatch {
             Ok(()) => {
-                applied += 1;
                 // Only Done flips PRD JSON `passes` — other transitions leave
                 // `passes: false` unchanged.
                 if matches!(update.status, TaskStatusChange::Done) {
@@ -4017,8 +4021,9 @@ pub fn apply_status_updates(
                 );
             }
         }
+        results.push((update.task_id.clone(), update.status, applied));
     }
-    applied
+    results
 }
 
 /// Check whether crash recovery should escalate the model for this iteration.
@@ -5976,6 +5981,13 @@ mod tests {
     // file; here we cover the pure dispatcher contract: command dispatch,
     // PRD JSON sync, warning-on-state-violation.
 
+    /// Count entries in an `apply_status_updates` result whose dispatch
+    /// succeeded — preserves the legacy "applied" semantics for tests written
+    /// against the old `u32` return type.
+    fn applied_count(results: &[(String, detection::TaskStatusChange, bool)]) -> u32 {
+        results.iter().filter(|(_, _, ok)| *ok).count() as u32
+    }
+
     /// Seed a minimal task row. `status` is set verbatim so tests can simulate
     /// pre-claimed (in_progress) vs unclaimed (todo) state machines.
     fn seed_task_with_status(conn: &Connection, id: &str, status: &str) {
@@ -6012,9 +6024,9 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-001'", [], |r| {
@@ -6036,9 +6048,13 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1, "todo task must be auto-claimed then completed");
+        assert_eq!(
+            applied_count(&results),
+            1,
+            "todo task must be auto-claimed then completed"
+        );
 
         let (status, started_at): (String, Option<String>) = conn
             .query_row(
@@ -6068,7 +6084,7 @@ mod tests {
             task_id: "FEAT-010".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             Some("run-1"),
@@ -6077,7 +6093,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let linked: i64 = conn
             .query_row(
@@ -6102,9 +6118,9 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let prd: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&prd_path).unwrap()).unwrap();
@@ -6143,10 +6159,11 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
         assert_eq!(
-            applied, 1,
+            applied_count(&results),
+            1,
             "DB dispatch succeeded even though PRD sync failed",
         );
 
@@ -6175,9 +6192,9 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-004'", [], |r| {
@@ -6208,7 +6225,7 @@ mod tests {
             task_id: "MILESTONE-1".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             None,
@@ -6217,7 +6234,7 @@ mod tests {
             Some(&progress_path),
             None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let after = std::fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -6250,7 +6267,7 @@ mod tests {
             task_id: "FEAT-100".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             None,
@@ -6259,7 +6276,7 @@ mod tests {
             Some(&progress_path),
             None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let after = std::fs::read_to_string(&progress_path).unwrap();
         assert_eq!(
@@ -6287,9 +6304,13 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let applied =
+        let results =
             apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1, "one dispatch failed, one succeeded");
+        assert_eq!(
+            applied_count(&results),
+            1,
+            "one dispatch failed, one succeeded"
+        );
 
         let status_b: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-B'", [], |r| {
