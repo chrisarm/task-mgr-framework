@@ -21,7 +21,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use crate::commands::next::output::LearningSummaryOutput;
+use crate::commands::next::output::{LearningSummaryOutput, NextTaskOutput};
 use crate::learnings::recall::{RecallParams, recall_learnings};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context::scan_source_context;
@@ -41,32 +41,80 @@ use crate::models::Task;
 /// thread and pass the resulting JSON across thread boundaries without a
 /// `&Connection`.
 pub fn format_task_json(task: &Task, files: &[String]) -> String {
+    format_task_json_raw(
+        &task.id,
+        &task.title,
+        task.priority,
+        task.status.as_db_str(),
+        &task.acceptance_criteria,
+        files,
+        task.description.as_deref(),
+        task.notes.as_deref(),
+        task.model.as_deref(),
+        task.difficulty.as_deref(),
+        task.escalation_note.as_deref(),
+    )
+}
+
+/// Format a `NextTaskOutput` as a JSON string suitable for the prompt's task
+/// block. Delegates to [`format_task_json_raw`] so both sequential and slot
+/// builders share a single canonical implementation.
+pub fn format_next_task_json(task: &NextTaskOutput) -> String {
+    format_task_json_raw(
+        &task.id,
+        &task.title,
+        task.priority,
+        &task.status,
+        &task.acceptance_criteria,
+        &task.files,
+        task.description.as_deref(),
+        task.notes.as_deref(),
+        task.model.as_deref(),
+        task.difficulty.as_deref(),
+        task.escalation_note.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_task_json_raw(
+    id: &str,
+    title: &str,
+    priority: i32,
+    status: &str,
+    acceptance_criteria: &[String],
+    files: &[String],
+    description: Option<&str>,
+    notes: Option<&str>,
+    model: Option<&str>,
+    difficulty: Option<&str>,
+    escalation_note: Option<&str>,
+) -> String {
     let mut json = json!({
-        "id": task.id,
-        "title": task.title,
-        "priority": task.priority,
-        "status": task.status,
-        "acceptanceCriteria": task.acceptance_criteria,
+        "id": id,
+        "title": title,
+        "priority": priority,
+        "status": status,
+        "acceptanceCriteria": acceptance_criteria,
         "files": files,
     });
 
-    if let Some(ref desc) = task.description {
-        json["description"] = Value::String(desc.clone());
+    if let Some(desc) = description {
+        json["description"] = Value::String(desc.to_owned());
     }
-    if let Some(ref notes) = task.notes {
-        json["notes"] = Value::String(notes.clone());
+    if let Some(n) = notes {
+        json["notes"] = Value::String(n.to_owned());
     }
-    if let Some(ref model) = task.model {
-        json["model"] = Value::String(model.clone());
+    if let Some(m) = model {
+        json["model"] = Value::String(m.to_owned());
     }
-    if let Some(ref difficulty) = task.difficulty {
-        json["difficulty"] = Value::String(difficulty.clone());
+    if let Some(d) = difficulty {
+        json["difficulty"] = Value::String(d.to_owned());
     }
-    if let Some(ref escalation_note) = task.escalation_note {
-        json["escalationNote"] = Value::String(escalation_note.clone());
+    if let Some(e) = escalation_note {
+        json["escalationNote"] = Value::String(e.to_owned());
     }
 
-    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
+    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{id}\"}}"))
 }
 
 /// Build the completion-instruction section that tells the agent how to

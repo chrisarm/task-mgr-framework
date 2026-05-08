@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::commands::next;
-use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context;
@@ -183,7 +182,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // ============================================================
 
     // Critical: Task JSON
-    let task_json = build_task_json(task_output, &next_result);
+    let task_json = core::format_next_task_json(task_output);
     let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
     let task_section = format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json);
 
@@ -536,40 +535,6 @@ fn append_synergy_context(
     prompt.push_str(&build_synergy_section(conn, task_id, run_id));
 }
 
-/// Build a JSON representation of the task for inclusion in the prompt.
-fn build_task_json(
-    task: &crate::commands::next::output::NextTaskOutput,
-    _next_result: &NextResult,
-) -> String {
-    // Build a simplified JSON that includes what Claude needs
-    let mut json = serde_json::json!({
-        "id": task.id,
-        "title": task.title,
-        "priority": task.priority,
-        "status": task.status,
-        "acceptanceCriteria": task.acceptance_criteria,
-        "files": task.files,
-    });
-
-    if let Some(ref desc) = task.description {
-        json["description"] = serde_json::Value::String(desc.clone());
-    }
-    if let Some(ref notes) = task.notes {
-        json["notes"] = serde_json::Value::String(notes.clone());
-    }
-    if let Some(ref model) = task.model {
-        json["model"] = serde_json::Value::String(model.clone());
-    }
-    if let Some(ref difficulty) = task.difficulty {
-        json["difficulty"] = serde_json::Value::String(difficulty.clone());
-    }
-    if let Some(ref escalation_note) = task.escalation_note {
-        json["escalationNote"] = serde_json::Value::String(escalation_note.clone());
-    }
-
-    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
-}
-
 /// Build a base prompt section string from the template file.
 fn build_base_prompt_section(base_prompt_path: &Path) -> String {
     match fs::read_to_string(base_prompt_path) {
@@ -801,18 +766,7 @@ mod tests {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "test".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
         assert!(json.contains("FEAT-001"));
         assert!(json.contains("Test task"));
         assert!(json.contains("AC1"));
@@ -1587,18 +1541,7 @@ pub enum ApiError {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "highest score".to_string(),
-                eligible_count: 5,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
 
         assert!(json.contains("FEAT-042"), "Should contain task ID");
         assert!(json.contains("Complex feature"), "Should contain title");
@@ -1664,18 +1607,7 @@ pub enum ApiError {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "only task".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
 
         assert!(json.contains("FIX-001"), "Should contain task ID");
         assert!(json.contains("Quick fix"), "Should contain title");
@@ -1736,24 +1668,10 @@ pub enum ApiError {
         }
     }
 
-    fn empty_next_result(task: &NextTaskOutput) -> NextResult {
-        NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "test".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        }
-    }
-
     #[test]
     fn test_build_task_json_model_field_only() {
         let task = task_output_with_model_fields(Some(HAIKU_MODEL), None, None);
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             json.contains("\"model\""),
@@ -1776,8 +1694,7 @@ pub enum ApiError {
     #[test]
     fn test_build_task_json_difficulty_field_only() {
         let task = task_output_with_model_fields(None, Some("medium"), None);
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             !json.contains("\"model\""),
@@ -1801,8 +1718,7 @@ pub enum ApiError {
     fn test_build_task_json_escalation_note_field_only() {
         let task =
             task_output_with_model_fields(None, None, Some("Needs opus for complex reasoning"));
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             !json.contains("\"model\""),
