@@ -95,6 +95,10 @@ pub struct OverflowEvent {
     pub slot_index: Option<usize>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Task difficulty at the time the prompt was assembled. `None` when the
+    /// task had no difficulty set (or for legacy events that predate this field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_difficulty: Option<String>,
     pub prompt_bytes: usize,
     pub sections: Vec<(String, usize)>,
     pub dropped_sections: Vec<String>,
@@ -411,6 +415,7 @@ pub fn handle_prompt_too_long(
         slot_index,
         model: effective_model.map(String::from),
         effort: effort.map(String::from),
+        task_difficulty: prompt_result.task_difficulty.clone(),
         prompt_bytes: prompt_result.prompt.len(),
         sections: prompt_result
             .section_sizes
@@ -542,6 +547,7 @@ mod tests {
             slot_index: None,
             model: Some(model::SONNET_MODEL.to_string()),
             effort: Some("high".to_string()),
+            task_difficulty: Some("high".to_string()),
             prompt_bytes: 12345,
             sections: vec![
                 ("task".to_string(), 100),

@@ -890,3 +890,62 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
     expected.sort_unstable();
     assert_eq!(task_ids, expected);
 }
+
+// ---------- WIRE-FIX-001 L4: task_difficulty threads into JSONL event --------
+
+/// Wave overflow JSONL event carries `task_difficulty` = "high" when the slot
+/// had difficulty=Some("high") threaded through SlotResult.task_difficulty →
+/// synthetic PromptResult.task_difficulty → OverflowEvent.task_difficulty.
+///
+/// Before WIRE-FIX-001 the field was always None because `task_difficulty`
+/// was not part of `SlotResult`.
+#[test]
+fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
+    let tmp = TempDir::new().expect("tempdir");
+    let task_id = "WIRE-FIX-001-DIFF-TASK";
+    let conn = make_conn_with_tasks(&[task_id]);
+    let mut ctx = IterationContext::new(10);
+
+    let pr = PromptResult {
+        prompt: "TASK SECTION\n\nBASE\n".to_string(),
+        task_id: task_id.to_string(),
+        task_files: Vec::new(),
+        shown_learning_ids: Vec::new(),
+        resolved_model: None,
+        dropped_sections: Vec::new(),
+        task_difficulty: Some("high".to_string()),
+        cluster_effort: None,
+        section_sizes: vec![("task", 12), ("base_prompt", 5)],
+    };
+
+    let _ = overflow::handle_prompt_too_long(
+        &mut ctx,
+        &conn,
+        task_id,
+        Some("xhigh"),
+        Some(SONNET_MODEL),
+        &pr,
+        1,
+        Some("run-wave"),
+        tmp.path(),
+        Some(0),
+    );
+
+    // Verify typed struct has task_difficulty propagated.
+    let events = read_events(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].task_difficulty.as_deref(),
+        Some("high"),
+        "OverflowEvent.task_difficulty must be Some(\"high\") for a slot with difficulty=high",
+    );
+
+    // Verify raw JSON also carries the field (not skipped).
+    let raw = read_event_values(tmp.path());
+    assert_eq!(raw.len(), 1);
+    assert_eq!(
+        raw[0].get("task_difficulty"),
+        Some(&serde_json::Value::String("high".to_string())),
+        "JSONL event must serialize task_difficulty=\"high\" for a difficulty=high slot",
+    );
+}

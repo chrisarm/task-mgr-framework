@@ -124,6 +124,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         prompt_for_overflow: None,
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
+        task_difficulty: None,
     };
     // The exact borrow shape `process_slot_result` will use when it builds
     // `ProcessingParams { conversation: ..., .. }`. Type-checked here, not in
@@ -156,6 +157,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         prompt_for_overflow: None,
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
+        task_difficulty: None,
     };
     let param_none: Option<&str> = slot_none.iteration_result.conversation.as_deref();
     assert!(

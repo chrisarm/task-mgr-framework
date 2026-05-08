@@ -359,6 +359,11 @@ pub struct SlotResult {
     /// list that would be wrong post-WIRE-FIX-002). Empty for
     /// `slot_failure_result` entries.
     pub dropped_sections: Vec<String>,
+    /// Task difficulty at bundle-build time, threaded back so the synthetic
+    /// `PromptResult` in the per-slot overflow branch can populate
+    /// `task_difficulty` instead of hardcoding `None`. `None` when the task
+    /// has no difficulty set or for `slot_failure_result` entries.
+    pub task_difficulty: Option<String>,
 }
 
 /// Aggregate result of a parallel wave.
@@ -445,6 +450,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         prompt_for_overflow: None,
         section_sizes: slot.prompt_bundle.section_sizes.clone(),
         dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
+        task_difficulty: slot.prompt_bundle.difficulty.clone(),
     }
 }
 
@@ -634,6 +640,7 @@ pub fn run_slot_iteration(
         prompt_for_overflow: is_prompt_too_long.then(|| bundle.prompt.clone()),
         section_sizes: bundle.section_sizes.clone(),
         dropped_sections: bundle.dropped_sections.clone(),
+        task_difficulty: bundle.difficulty.clone(),
     })
 }
 
@@ -709,6 +716,7 @@ fn slot_failure_result(
         prompt_for_overflow: None,
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
+        task_difficulty: None,
     }
 }
 
@@ -1155,6 +1163,10 @@ fn process_slot_result(
         config::IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) && let Some(ref tid) = task_id
     {
+        debug_assert!(
+            slot_result.prompt_for_overflow.is_some(),
+            "PromptTooLong without prompt_for_overflow for task {tid}"
+        );
         let synthetic_prompt = crate::loop_engine::prompt::PromptResult {
             prompt: slot_result.prompt_for_overflow.clone().unwrap_or_default(),
             task_id: tid.clone(),
@@ -1166,7 +1178,7 @@ fn process_slot_result(
             // through from `SlotPromptBundle` so overflow dumps and JSONL
             // events match what the agent actually saw.
             dropped_sections: slot_result.dropped_sections.clone(),
-            task_difficulty: None,
+            task_difficulty: slot_result.task_difficulty.clone(),
             cluster_effort: slot_result.iteration_result.effective_effort,
             section_sizes: slot_result.section_sizes.clone(),
         };
@@ -6402,6 +6414,7 @@ mod tests {
                 prompt_for_overflow: None,
                 section_sizes: Vec::new(),
                 dropped_sections: Vec::new(),
+                task_difficulty: None,
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(
