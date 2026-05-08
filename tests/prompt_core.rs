@@ -299,7 +299,7 @@ fn build_tool_awareness_block_renders_for_auto_mode() {
 #[ignore = "FEAT-001 implements build_key_decisions_block (stub returns empty)"]
 fn build_key_decisions_block_includes_key_decision_marker() {
     let task = sample_task();
-    let block = build_key_decisions_block(&task);
+    let block = build_key_decisions_block(&task.id);
 
     assert!(
         !block.is_empty(),
@@ -317,8 +317,8 @@ fn build_key_decisions_block_emphasizes_review_tasks() {
     let mut task = sample_task();
     task.id = "TEST-REVIEW-001".to_string();
 
-    let review_block = build_key_decisions_block(&task);
-    let normal_block = build_key_decisions_block(&sample_task());
+    let review_block = build_key_decisions_block(&task.id);
+    let normal_block = build_key_decisions_block(&sample_task().id);
 
     assert!(!review_block.is_empty(), "review block must not be empty");
     assert!(

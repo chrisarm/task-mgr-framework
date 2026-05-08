@@ -148,7 +148,7 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
 
     let tool_section = core::build_tool_awareness_block(&params.permission_mode);
 
-    let key_decisions_section = core::build_key_decisions_block(task);
+    let key_decisions_section = core::build_key_decisions_block(&task.id);
 
     let dep_section = build_dependency_section(conn, &task.id);
 

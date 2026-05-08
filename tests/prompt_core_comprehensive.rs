@@ -421,7 +421,7 @@ fn build_tool_awareness_block_scoped_none_returns_empty_string() {
 #[test]
 fn build_key_decisions_block_contains_key_decision_tag_marker() {
     let task = sample_task();
-    let block = build_key_decisions_block(&task);
+    let block = build_key_decisions_block(&task.id);
 
     assert!(!block.is_empty(), "key-decisions block must not be empty");
     assert!(
@@ -435,8 +435,8 @@ fn build_key_decisions_block_review_task_id_adds_emphasis() {
     let mut review_task = sample_task();
     review_task.id = "PRJ-CODE-REVIEW-001".to_string();
 
-    let normal_block = build_key_decisions_block(&sample_task());
-    let review_block = build_key_decisions_block(&review_task);
+    let normal_block = build_key_decisions_block(&sample_task().id);
+    let review_block = build_key_decisions_block(&review_task.id);
 
     assert!(
         review_block.len() > normal_block.len(),
@@ -452,8 +452,8 @@ fn build_key_decisions_block_verify_task_id_adds_emphasis() {
     let mut verify_task = sample_task();
     verify_task.id = "PRJ-VERIFY-001".to_string();
 
-    let normal_block = build_key_decisions_block(&sample_task());
-    let verify_block = build_key_decisions_block(&verify_task);
+    let normal_block = build_key_decisions_block(&sample_task().id);
+    let verify_block = build_key_decisions_block(&verify_task.id);
 
     assert!(
         verify_block.len() > normal_block.len(),

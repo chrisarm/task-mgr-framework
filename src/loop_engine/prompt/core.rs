@@ -248,8 +248,8 @@ pub fn build_tool_awareness_block(permission_mode: &PermissionMode) -> String {
 /// Build the key-decision-points instruction block. For tasks whose ID
 /// contains `REVIEW` or `VERIFY`, an extra paragraph asks the agent to
 /// actively look for architectural alternatives.
-pub fn build_key_decisions_block(task: &Task) -> String {
-    let is_review = task.id.contains("REVIEW") || task.id.contains("VERIFY");
+pub fn build_key_decisions_block(task_id: &str) -> String {
+    let is_review = task_id.contains("REVIEW") || task_id.contains("VERIFY");
 
     let review_emphasis = if is_review {
         "\n\nFor this task (code review / verification), **actively look for architectural \
