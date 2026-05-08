@@ -485,12 +485,30 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
     // the FEAT-007 AC.
     //
     // Skip when the claimed task went terminal this iteration: the completion
-    // ladder already pruned the entry (CODE-FIX-003). Re-inserting here would
-    // undo that prune and keep a dead task's entry in the map past its
-    // active lifetime.
+    // ladder OR apply_status_updates already pruned the entry (CODE-FIX-003).
+    // Re-inserting here would undo that prune and keep a dead task's entry
+    // in the map past its active lifetime.
+    //
+    // `went_terminal_via_done` covers the Done branch (completion ladder
+    // populates `completed_task_ids`). `went_terminal_via_status` covers the
+    // sibling terminal status-tags (`:failed`, `:skipped`, `:irrelevant`)
+    // which `apply_status_updates` prunes but the completion ladder does not
+    // record. Without this second arm, Step 7 would re-insert the entry the
+    // status-tag dispatch just removed (Learning #2304).
     if let Some(claimed_id) = task_id {
-        let went_terminal = result.completed_task_ids.iter().any(|id| id == claimed_id);
-        if !went_terminal {
+        let went_terminal_via_done = result.completed_task_ids.iter().any(|id| id == claimed_id);
+        let went_terminal_via_status = status_results.iter().any(|(id, status, applied)| {
+            *applied
+                && id == claimed_id
+                && matches!(
+                    status,
+                    detection::TaskStatusChange::Done
+                        | detection::TaskStatusChange::Failed
+                        | detection::TaskStatusChange::Skipped
+                        | detection::TaskStatusChange::Irrelevant
+                )
+        });
+        if !went_terminal_via_done && !went_terminal_via_status {
             ctx.crashed_last_iteration.insert(
                 claimed_id.to_string(),
                 matches!(outcome, IterationOutcome::Crash(_)),

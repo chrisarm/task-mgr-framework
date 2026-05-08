@@ -380,6 +380,60 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
 }
 
 // ---------------------------------------------------------------------------
+// M-1 follow-up to CODE-FIX-003: terminal <task-status>:failed/skipped/
+// irrelevant claims must be pruned from crashed_last_iteration end-to-end via
+// process_iteration_output, NOT only via apply_status_updates.
+//
+// apply_status_updates correctly removes the entry on terminal dispatch, but
+// Step 7 of process_iteration_output would re-insert unless its went_terminal
+// predicate covers the non-Done terminal cases. This test pins the contract
+// (Learning #2304): the entry must be ABSENT after the full pipeline pass.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipeline_pass_with_terminal_failed_status_tag_prunes_crashed_last_iteration() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    insert_in_progress_task(&conn, "FAILTASK");
+
+    let mut fx = PipelineFixture::new(db_temp.path());
+    fx.ctx
+        .crashed_last_iteration
+        .insert("FAILTASK".to_string(), true);
+
+    let mut outcome = IterationOutcome::Empty;
+    let _ = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 3,
+        task_id: Some("FAILTASK"),
+        output: "<task-status>FAILTASK:failed</task-status>\n",
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: None,
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
+    });
+
+    assert!(
+        !fx.ctx.crashed_last_iteration.contains_key("FAILTASK"),
+        "<task-status>:failed must prune FAILTASK end-to-end through the pipeline; \
+         apply_status_updates removes it, Step 7 must NOT re-insert (Learning #2304)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC: ctx.crashed_last_iteration map size is bounded by active task count
 // (no leak after a 100-iteration loop) — pipeline-driven variant.
 //
