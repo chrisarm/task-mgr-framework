@@ -147,3 +147,19 @@ Learnings:
 - TEST-INIT-006 sequential prompt byte-identity snapshot passes (sequential_prompt_matches_v1_snapshot in tests/prompt_sequential_snapshot.rs).
 - Final tally: 3281 lib + integration tests, 0 failed, 7 ignored across 34 test binaries.
 ---
+## [2026-05-07 00:00] - 5d1118de-TEST-002
+Approach: Created tests/prompt_slot_comprehensive.rs covering all 7 ACs; interpreted dropped_sections/section_sizes ACs via prompt-content assertions since SlotPromptBundle has no those fields.
+Files: tests/prompt_slot_comprehensive.rs
+Learnings:
+- AC 4/5 (dropped_sections, section_sizes) don't map to SlotPromptBundle fields; tested equivalent via presence/absence of section headers and byte-count comparisons.
+- `assert_impl_all!(SlotPromptBundle: Send)` duplicated in comprehensive file per AC 6.
+- 12 tests, all green; clippy + fmt clean.
+---
+## [2026-05-07 00:00] - 5d1118de-TEST-003
+Approach: Created tests/iteration_pipeline_parity.rs with 13 tests pinning sequential ↔ wave equivalence by running the same fixture through two independent DBs (skip_git=false + slot_index=None vs skip_git=true + slot_index=Some(N)) and comparing DbSnapshot (tasks rows + bandit window stats) plus ProcessingOutcome.
+Files: tests/iteration_pipeline_parity.rs
+Learnings:
+- `key_decisions` has FK to `runs(run_id)` (migration v12) — tests writing key decisions must INSERT a runs row first; sequential pipeline tests in tests/iteration_pipeline.rs sidestep this by not exercising the key_decisions branch.
+- DbSnapshot intentionally excludes timestamps because `datetime('now')` differs across the two runs by milliseconds; status + bandit window stats are the stable parity signals.
+- assert_outcomes_equivalent compares completed_task_ids as a set + length so HashSet iteration order can't fool the parity check.
+---
