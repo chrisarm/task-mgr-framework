@@ -1296,40 +1296,6 @@
       "touchesFiles": [
         "docker/llama-box/Dockerfile"
       ]
-    },
-    {
-      "acceptanceCriteria": [
-        "SlotPromptBundle carries section_sizes and dropped_sections",
-        "process_slot_result builds synthetic PromptResult with populated section data on overflow path",
-        "New test asserts wave-mode overflow dump file contains per-section byte breakdown matching sequential mode",
-        "No new clippy/fmt warnings"
-      ],
-      "description": "From CODE-REVIEW-1 (HIGH#1): When per-slot PromptTooLong recovery fires in run_parallel_wave/process_slot_result, the synthetic PromptResult constructed for overflow::handle_prompt_too_long is built with empty section_sizes and dropped_sections vectors. The dump header in overflow.rs:159-166 iterates sections, so wave-mode overflow dumps show only total bytes with no per-section attribution. Sequential mode shows the full section breakdown. This silently makes wave-mode overflow diagnostics strictly worse than sequential, defeating part of the per-slot isolation work in FEAT-008.",
-      "estimatedEffort": "medium",
-      "id": "WIRE-FIX-001",
-      "passes": false,
-      "priority": 14,
-      "title": "Wave-mode overflow dump loses section breakdown diagnostics",
-      "touchesFiles": [
-        "src/loop_engine/prompt/slot.rs",
-        "src/loop_engine/engine.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "slot_early_exit IterationResult.shown_learning_ids matches bundle.shown_learning_ids",
-        "Test added or updated to assert that slot early-exit propagates shown_learning_ids through to bandit feedback",
-        "No new clippy/fmt warnings"
-      ],
-      "description": "From CODE-REVIEW-1 (HIGH#2): In slot_early_exit (engine.rs:413-431) the synthetic IterationResult sets shown_learning_ids: Vec::new(), while the outer SlotResult uses slot.prompt_bundle.shown_learning_ids.clone(). The pipeline currently reads from SlotResult.shown_learning_ids (engine.rs:1149) so it works today, but any future refactor that reads from IterationResult.shown_learning_ids (which the sequential path uses canonically) will silently lose bandit feedback for slot early-exit paths.",
-      "estimatedEffort": "easy",
-      "id": "CODE-FIX-002",
-      "passes": false,
-      "priority": 14,
-      "title": "Slot early-exit IterationResult.shown_learning_ids drifts from outer SlotResult",
-      "touchesFiles": [
-        "src/loop_engine/engine.rs"
-      ]
     }
   ],
   "version": "1.0"
