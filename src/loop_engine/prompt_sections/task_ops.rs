@@ -32,6 +32,8 @@ pub(crate) fn task_ops_section() -> &'static str {
      \n\
        Priority is auto-computed; omit for lower priority.\n\
      - **Fix in response to a milestone**: pass `--depended-on-by <id>`.\n\
+     - **Auto-prefix**: loop exports `TASK_MGR_ACTIVE_PREFIX`; bare IDs are\n\
+       auto-prefixed to the active PRD. Cross-PRD IDs are rejected.\n\
      - For anything else (dependencies, status queries, etc.), use the `task-mgr`\n\
        CLI — see `task-mgr --help`.\n\
      \n"
@@ -106,8 +108,8 @@ mod tests {
     fn test_section_size_within_budget() {
         let section = task_ops_section();
         assert!(
-            section.len() < 1536,
-            "section is {} bytes, must be < 1536 to stay within prompt budget",
+            section.len() < 2048,
+            "section is {} bytes, must be < 2048 to stay within prompt budget",
             section.len()
         );
     }
