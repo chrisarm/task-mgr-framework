@@ -459,10 +459,6 @@ fn build_tool_awareness_section(permission_mode: &PermissionMode) -> String {
     core::build_tool_awareness_block(permission_mode)
 }
 
-/// Record shown learnings via the UCB bandit system.
-///
-/// Returns the list of learning IDs that were shown (for feedback tracking).
-/// Errors are logged but don't prevent prompt building.
 /// Build a steering section string from the steering.md file.
 fn build_steering_section(steering_path: &Path) -> String {
     match fs::read_to_string(steering_path) {
