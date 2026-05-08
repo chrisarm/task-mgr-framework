@@ -1168,7 +1168,7 @@ fn process_slot_result(
             "PromptTooLong without prompt_for_overflow for task {tid}"
         );
         let synthetic_prompt = crate::loop_engine::prompt::PromptResult {
-            prompt: slot_result.prompt_for_overflow.clone().unwrap_or_default(),
+            prompt: slot_result.prompt_for_overflow.take().unwrap_or_default(),
             task_id: tid.clone(),
             task_files: slot_result.iteration_result.files_modified.clone(),
             shown_learning_ids: Vec::new(),
