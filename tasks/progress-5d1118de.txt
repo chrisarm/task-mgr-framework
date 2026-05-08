@@ -196,3 +196,19 @@ Learnings:
 - tasks_completed incremented at L3210: `tasks_completed += processing_outcome.tasks_completed`
 - Rate-limit (L1967), pause-signal (L1540), pre-iteration usage check (L1550) all fire in run_iteration at iteration boundary
 ---
+## [2026-05-07 00:00] - 5d1118de-INT-002
+Approach: Read-only trace of wave pipeline — no code changes needed.
+Files: src/loop_engine/engine.rs, src/loop_engine/iteration_pipeline.rs (read only)
+Learnings:
+- build_slot_contexts (engine.rs:1003) builds prompt on main thread before run_parallel_wave spawns workers; SlotContext moves into thread via run_parallel_wave:745
+- process_slot_result calls process_iteration_output (engine.rs:1148); all 6 pipeline steps (learnings, bandit, already-complete fallback, cross-task completion) fire for wave slots
+- is_task_reported_already_complete fallback (pipeline.rs:381) is gated only on !task_marked_done, independent of skip_git_completion_detection=true used in wave mode
+---
+## [2026-05-07 00:00] - 5d1118de-INT-003
+Approach: Read-only trace of cross-mode crash escalation path; no code changes needed.
+Files: src/loop_engine/engine.rs, src/loop_engine/iteration_pipeline.rs (read-only)
+Learnings:
+- Pipeline (iteration_pipeline.rs:426-430) writes `ctx.crashed_last_iteration.insert(claimed_id, matches!(outcome, IterationOutcome::Crash(_)))` — true on crash, false on success/completion
+- `check_crash_escalation` (engine.rs:1765) reads the map only inside `run_iteration` (sequential path); wave slots intentionally skip crash escalation per comment at line 475-477
+- `last_was_crash` field is completely absent from codebase; `last_task_id` survives in DB schema for general tracking only — no crash-path readers remain
+---
