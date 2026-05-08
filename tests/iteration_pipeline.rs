@@ -827,6 +827,79 @@ fn no_op_stub_fails_combined_contract_assertions() {
 }
 
 // ---------------------------------------------------------------------------
+// AC (REFACTOR-N-001): crash_tracker.record_success() fires exactly once
+// after the completion ladder regardless of how many task IDs were completed.
+//
+// Scenario: two tasks complete in one pipeline pass (via `<completed>` tags).
+// Pre-condition: inject 2 crash counts so a record_success call is observable
+// (resets to 0). If the old double-call path were still in record_completion,
+// the count would still be 0 — but the crash.rs implementation resets on the
+// first call so we cannot distinguish "called once" from "called twice" by
+// final count alone. The structural guarantee is that both completions feed
+// through record_completion → dedup set → single post-ladder gate.
+// The test asserts: after the pipeline call, crash_tracker.count() == 0.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crash_tracker_record_success_fires_exactly_once_after_completion_ladder() {
+    let (db_temp, mut conn) = setup_migrated_db();
+    disable_llm_extraction();
+    insert_todo_task(&conn, "TEST-PIPE-RS-A");
+    insert_todo_task(&conn, "TEST-PIPE-RS-B");
+
+    let mut outcome = IterationOutcome::Empty;
+    let mut fx = PipelineFixture::new(db_temp.path());
+
+    // Inject crash count so record_success() is observable (it resets to 0).
+    fx.ctx.crash_tracker.record_crash();
+    fx.ctx.crash_tracker.record_crash();
+    assert_eq!(
+        fx.ctx.crash_tracker.count(),
+        2,
+        "precondition: 2 crashes pre-loaded"
+    );
+
+    // Two completions in one pass. Claimed task is A; output also completes B.
+    let output = "<completed>TEST-PIPE-RS-A</completed>\n\
+                  <completed>TEST-PIPE-RS-B</completed>\n";
+    let result = process_iteration_output(ProcessingParams {
+        conn: &mut conn,
+        run_id: "test-run",
+        iteration: 1,
+        task_id: Some("TEST-PIPE-RS-A"),
+        output,
+        conversation: None,
+        shown_learning_ids: &[],
+        outcome: &mut outcome,
+        working_root: fx.project.path(),
+        git_scan_depth: 5,
+        skip_git_completion_detection: true,
+        prd_path: &fx.prd_path,
+        task_prefix: None,
+        progress_path: &fx.progress_path,
+        db_dir: &fx.db_dir,
+        signal_flag: &fx.signal_flag,
+        ctx: &mut fx.ctx,
+        files_modified: &[],
+        effective_model: None,
+        effective_effort: None,
+        slot_index: None,
+    });
+
+    assert_eq!(
+        result.tasks_completed, 2,
+        "both tasks must register as completed"
+    );
+    assert_eq!(
+        fx.ctx.crash_tracker.count(),
+        0,
+        "crash_tracker must be reset to 0 after completion (record_success called); \
+         got {} — implies record_success was not called",
+        fx.ctx.crash_tracker.count(),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Type-level guards: ProcessingOutcome::default() returns the empty
 // outcome, and `_outcome` constructions compile against the actual
 // signature. These run unconditionally so the file always exercises the

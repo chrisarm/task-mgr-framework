@@ -278,7 +278,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             })
         {
             task_marked_done = true;
-            record_completion(claimed_id, &mut completed_set, &mut result, outcome, ctx);
+            record_completion(claimed_id, &mut completed_set, &mut result, outcome);
             eprintln!(
                 "Task {} completed (detected from <task-status> tag)",
                 claimed_id
@@ -294,7 +294,7 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                     if completed_id == claimed_id {
                         task_marked_done = true;
                     }
-                    record_completion(completed_id, &mut completed_set, &mut result, outcome, ctx);
+                    record_completion(completed_id, &mut completed_set, &mut result, outcome);
                     eprintln!(
                         "Task {} completed (detected from <completed> tag)",
                         completed_id
@@ -339,7 +339,6 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                             &mut completed_set,
                             &mut result,
                             outcome,
-                            ctx,
                         );
                         if let Err(e) =
                             update_prd_task_passes(prd_path, claimed_id, true, task_prefix)
@@ -379,7 +378,6 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
                                 &mut completed_set,
                                 &mut result,
                                 outcome,
-                                ctx,
                             );
                             if let Err(e) =
                                 update_prd_task_passes(prd_path, completed_id, true, task_prefix)
@@ -409,9 +407,15 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
             && detection::is_task_reported_already_complete(output, claimed_id, task_prefix)
             && let Ok(()) = mark_task_done(conn, claimed_id, run_id, None, prd_path, task_prefix)
         {
-            record_completion(claimed_id, &mut completed_set, &mut result, outcome, ctx);
+            record_completion(claimed_id, &mut completed_set, &mut result, outcome);
             eprintln!("Task {} completed (reported as already done)", claimed_id);
         }
+    }
+
+    // Completion ladder is done. Record success once if any task completed this
+    // pass rather than once per completed task ID inside record_completion.
+    if result.tasks_completed > 0 {
+        ctx.crash_tracker.record_success();
     }
 
     // Step 5: extract learnings from the iteration output. Prefer the
@@ -460,19 +464,18 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
 }
 
 /// Apply the post-completion bookkeeping shared across every branch of the
-/// completion ladder: dedup the task ID, increment counters, mutate the
-/// outcome to `Completed`, and reset the crash-tracker streak.
+/// completion ladder: dedup the task ID, increment counters, and mutate the
+/// outcome to `Completed`. Crash-tracker reset happens once after the full
+/// ladder via the `tasks_completed > 0` gate in `process_iteration_output`.
 fn record_completion(
     task_id: &str,
     completed_set: &mut HashSet<String>,
     result: &mut ProcessingOutcome,
     outcome: &mut IterationOutcome,
-    ctx: &mut IterationContext,
 ) {
     if completed_set.insert(task_id.to_string()) {
         result.tasks_completed += 1;
         result.completed_task_ids.push(task_id.to_string());
     }
     *outcome = IterationOutcome::Completed;
-    ctx.crash_tracker.record_success();
 }

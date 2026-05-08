@@ -1377,16 +1377,6 @@ pub fn run_wave_iteration(
     let slot_contexts = build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     let slot_params = build_shared_slot_params(&params);
 
-    // Snapshot epoch for `trigger_human_reviews`-style timestamp gating
-    // (kept here for symmetry with sequential even though human reviews
-    // are deferred per design).
-    let _completion_epoch_start: i64 = params
-        .conn
-        .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-
     // Run wave (blocks until every spawned slot thread joins).
     let mut wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
 
