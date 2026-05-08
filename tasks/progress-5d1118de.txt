@@ -111,3 +111,19 @@ Learnings:
 - Crash policy invariant `!Crash || slot_marked_done` collapses naturally post-pipeline because record_completion flips outcome→Completed for the "crash but task done" case
 - Removed parse_completed_tasks/scan_output_for_completed_tasks/mark_task_done imports from engine.rs — they live entirely inside iteration_pipeline now
 ---
+## [2026-05-07 00:00] - 5d1118de-FEAT-007
+Approach: Replaced last_task_id/last_was_crash scalar fields with crashed_last_iteration: HashMap<String, bool>; pipeline writes once per iteration keyed by task_id; check_crash_escalation consults the map.
+Files: src/loop_engine/engine.rs, src/loop_engine/iteration_pipeline.rs, tests/crash_escalation_per_task.rs
+Learnings:
+- Removing the `last_task_id` reference from check_crash_escalation simplified it: no same-task comparison needed, just map lookup
+- All 4 formerly-#[ignore]-d tests in crash_escalation_per_task.rs pass immediately after the field swap
+- crash_map(&[...]) helper in tests makes the new signature readable without boilerplate
+---
+## [2026-05-08 03:45] - 5d1118de-FEAT-008
+Approach: Per-slot PromptTooLong dispatch added to process_slot_result, BEFORE the iteration_pipeline call so the DB row reset is durable before any crash-tracking write. Synthesized a PromptResult from SlotResult.prompt_for_overflow + iteration_result fields; passed Some(slot_idx) to handle_prompt_too_long. OverflowEvent gained slot_index: Option<usize> with skip_serializing_if=Option::is_none. handle_prompt_too_long signature gained the slot_index parameter; sequential call site at run_iteration passes None. Superseded learning #2029 with #2125 reflecting the new contract.
+Files: src/loop_engine/engine.rs, src/loop_engine/overflow.rs, tests/overflow_per_slot.rs, tests/overflow_recovery.rs, tests/overflow_filesystem.rs, tests/iteration_result_conversation.rs
+Learnings:
+- Per-slot recovery state (model_overrides, overflow_recovered, overflow_original_model) is naturally isolated because every map is keyed on task_id; sibling slots' task_ids never appear in the same recovery operation
+- skip_serializing_if=Option::is_none on slot_index keeps sequential JSONL byte-identical to pre-FEAT-008 — backward compat for downstream consumers that don't know about the new field
+- Synthetic PromptResult is acceptable for wave-mode dump bodies: the slot worker already crashed on PromptTooLong, so we lack the original section_sizes; the dump still records prompt body, model, effort, iteration, slot index, and recovery action
+---

@@ -336,6 +336,14 @@ pub struct SlotResult {
     /// worker. Empty for `slot_failure_result` entries (no bundle was ever
     /// built) and for early-exit paths that never assembled a prompt.
     pub shown_learning_ids: Vec<i64>,
+    /// The full assembled prompt text, carried back from the worker thread
+    /// exclusively for overflow diagnostics. `process_slot_result` uses this
+    /// to populate the `PromptResult` passed to `overflow::handle_prompt_too_long`
+    /// when the outcome is `Crash(PromptTooLong)`.
+    ///
+    /// Empty for `slot_failure_result` entries (prompt was never assembled or
+    /// the task claim failed before the worker spawned).
+    pub prompt_for_overflow: String,
 }
 
 /// Aggregate result of a parallel wave.
@@ -419,6 +427,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         // process_slot_result clears it.
         claim_succeeded: true,
         shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
+        prompt_for_overflow: slot.prompt_bundle.prompt.clone(),
     }
 }
 
@@ -594,6 +603,7 @@ pub fn run_slot_iteration(
         },
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),
+        prompt_for_overflow: bundle.prompt.clone(),
     })
 }
 
@@ -666,6 +676,7 @@ fn slot_failure_result(
         },
         claim_succeeded,
         shown_learning_ids: Vec::new(),
+        prompt_for_overflow: String::new(),
     }
 }
 
@@ -1080,6 +1091,41 @@ fn process_slot_result(
         && !ctx.pending_slot_tasks.contains(tid)
     {
         ctx.pending_slot_tasks.push(tid.clone());
+    }
+
+    // Per-slot PromptTooLong recovery — mirrors the sequential Step 8.5 in
+    // `run_iteration`. Must run BEFORE `process_iteration_output` so the
+    // task row is reset to `todo` (rungs 1-3) or `blocked` (rung 4) before
+    // the pipeline's crash-tracking write. Order of operations is
+    // contractual: ctx update → DB UPDATE → stderr → dump → JSONL → rotate.
+    if matches!(
+        slot_result.iteration_result.outcome,
+        config::IterationOutcome::Crash(config::CrashType::PromptTooLong)
+    ) && let Some(ref tid) = task_id
+    {
+        let synthetic_prompt = crate::loop_engine::prompt::PromptResult {
+            prompt: slot_result.prompt_for_overflow.clone(),
+            task_id: tid.clone(),
+            task_files: slot_result.iteration_result.files_modified.clone(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: slot_result.iteration_result.effective_model.clone(),
+            dropped_sections: Vec::new(),
+            task_difficulty: None,
+            cluster_effort: slot_result.iteration_result.effective_effort,
+            section_sizes: Vec::new(),
+        };
+        let _ = overflow::handle_prompt_too_long(
+            ctx,
+            params.conn,
+            tid,
+            slot_result.iteration_result.effective_effort,
+            slot_result.iteration_result.effective_model.as_deref(),
+            &synthetic_prompt,
+            params.iteration,
+            Some(params.run_id),
+            params.db_dir,
+            Some(slot_idx),
+        );
     }
 
     // Pipeline contract requires a `working_root` even when skip_git is on
@@ -2018,6 +2064,7 @@ pub fn run_iteration(
             params.iteration,
             Some(params.run_id),
             params.db_dir,
+            None,
         );
     }
 
@@ -6284,6 +6331,7 @@ mod tests {
                 },
                 claim_succeeded: true,
                 shown_learning_ids: vec![42, 77],
+                prompt_for_overflow: String::new(),
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(

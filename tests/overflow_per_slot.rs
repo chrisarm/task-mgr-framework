@@ -156,6 +156,7 @@ fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
                 1,
                 Some("run-wave"),
                 tmp.path(),
+                Some(slot_idx),
             );
             last_action = Some(action);
         }
@@ -213,6 +214,7 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
         1,
         Some("run-wave"),
         tmp.path(),
+        Some(2),
     );
     // Re-claim (production: task selection re-picks the row).
     conn.execute(
@@ -230,6 +232,7 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
         2,
         Some("run-wave"),
         tmp.path(),
+        Some(2),
     );
 
     // Only slot 2's task_id is present in the per-task state maps.
@@ -301,16 +304,7 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
 // ---------- AC #3: JSONL contains slot_index for the slot 2 event -----------
 
 /// Wave-mode JSONL: slot 2's overflow event has `"slot_index": 2`.
-///
-/// FEAT-008 will plumb the slot index into `OverflowEvent`. Until that lands,
-/// this test is `#[ignore]` per learning #862 — it documents the contract
-/// and unblocks once FEAT-008 implements:
-///   - `OverflowEvent { slot_index: Option<usize>, ... }` with
-///     `#[serde(skip_serializing_if = "Option::is_none")]`.
-///   - A wave-mode dispatch path that constructs the event with
-///     `slot_index: Some(slot_idx)`.
 #[test]
-#[ignore = "FEAT-008: requires OverflowEvent.slot_index field + wave-mode dispatcher"]
 fn slot_index_present_in_jsonl_for_wave_event() {
     let tmp = TempDir::new().expect("tempdir");
     let task_ids = four_slot_task_ids();
@@ -318,9 +312,6 @@ fn slot_index_present_in_jsonl_for_wave_event() {
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_ids[2]);
 
-    // FEAT-008 will accept slot_index either as a parameter on
-    // handle_prompt_too_long or via a thin wave-mode wrapper. Either way,
-    // the assertion below is on the JSONL shape — agnostic to the API.
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
         &conn,
@@ -331,6 +322,7 @@ fn slot_index_present_in_jsonl_for_wave_event() {
         1,
         Some("run-wave"),
         tmp.path(),
+        Some(2),
     );
 
     let raw_events = read_event_values(tmp.path());
@@ -340,7 +332,7 @@ fn slot_index_present_in_jsonl_for_wave_event() {
     // Field must be present and equal to 2 — NOT null, NOT omitted.
     let slot_idx = v
         .get("slot_index")
-        .expect("FEAT-008: slot_index field must be present in wave-mode JSONL");
+        .expect("slot_index field must be present in wave-mode JSONL");
     assert_eq!(
         slot_idx,
         &serde_json::Value::Number(serde_json::Number::from(2u64)),
@@ -350,11 +342,11 @@ fn slot_index_present_in_jsonl_for_wave_event() {
     // Round-trip via the typed struct also recovers the value.
     let typed = read_events(tmp.path());
     assert_eq!(typed.len(), 1);
-    // Once FEAT-008 lands, replace the access below with `typed[0].slot_index`:
-    let recovered_slot_index = typed[0]
-        .ts // placeholder to keep this compiling pre-FEAT-008
-        .as_str();
-    let _ = recovered_slot_index; // silence unused
+    assert_eq!(
+        typed[0].slot_index,
+        Some(2),
+        "typed OverflowEvent.slot_index must be Some(2) for slot 2's wave event",
+    );
 }
 
 // ---------- AC #4: slot_index omitted for sequential events -----------------
@@ -383,6 +375,7 @@ fn slot_index_omitted_for_sequential_jsonl_event() {
         1,
         Some("run-seq"),
         tmp.path(),
+        None,
     );
 
     let events = read_event_values(tmp.path());
@@ -422,6 +415,7 @@ fn sequential_prompt_too_long_unchanged() {
         1,
         Some("run-seq"),
         tmp.path(),
+        None,
     );
 
     // Rung 1 fired: effort downgrade.
@@ -438,11 +432,15 @@ fn sequential_prompt_too_long_unchanged() {
         ctx.overflow_original_model.get(task_id).map(String::as_str),
         Some(SONNET_MODEL),
     );
-    // JSONL: exactly one event line emitted.
+    // JSONL: exactly one event line emitted; slot_index must be absent.
     let events = read_events(tmp.path());
     assert_eq!(events.len(), 1, "sequential mode must emit one JSONL line");
     assert_eq!(events[0].task_id, task_id);
     assert_eq!(events[0].iteration, 1);
+    assert_eq!(
+        events[0].slot_index, None,
+        "sequential event must have no slot_index"
+    );
     assert!(matches!(
         events[0].recovery,
         RecoveryAction::DowngradeEffort { .. }

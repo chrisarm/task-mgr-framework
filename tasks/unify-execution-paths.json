@@ -755,7 +755,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": true,
       "notes": "This is the user-visible 'parity' fix: wave mode finally feeds the bandit/learnings system. Read engine.rs:1053-1246 for the current process_slot_result body. Preserve the orphan-reset semantics for tasks whose <completed> tags name unrelated IDs.",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": [
         "Wave mode learnings/feedback flow restored",
@@ -821,7 +821,7 @@
       "id": "FEAT-007",
       "modifiesBehavior": true,
       "notes": "Read learnings #106, #1813, #213 for the legacy field semantics. After this task, learnings #106/#1813/#213 should be SUPERSEDED (use task-mgr learn --supersedes). The new field replaces the brittle 'last_task_id == current_task_id && last_was_crash' predicate (PRD §2.5 'Crash escalation correctness').",
-      "passes": false,
+      "passes": true,
       "priority": 12,
       "qualityDimensions": [
         "Crash escalation correctness via per-task map",

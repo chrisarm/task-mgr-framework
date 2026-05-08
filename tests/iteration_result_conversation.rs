@@ -120,6 +120,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         },
         claim_succeeded: true,
         shown_learning_ids: Vec::new(),
+        prompt_for_overflow: String::new(),
     };
     // The exact borrow shape `process_slot_result` will use when it builds
     // `ProcessingParams { conversation: ..., .. }`. Type-checked here, not in
@@ -149,6 +150,7 @@ fn slot_result_conversation_borrows_into_processing_params_shape() {
         },
         claim_succeeded: true,
         shown_learning_ids: Vec::new(),
+        prompt_for_overflow: String::new(),
     };
     let param_none: Option<&str> = slot_none.iteration_result.conversation.as_deref();
     assert!(
