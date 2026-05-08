@@ -303,20 +303,30 @@ impl IterationContext {
 
 /// Per-slot execution context for parallel wave iterations.
 ///
-/// Each slot carries its own pre-claimed task, worktree path, and watchdog
-/// activity epoch. The struct is `Send` so run_parallel_wave can move it
-/// into a dedicated worker thread. It is intentionally not `Sync`:
-/// `run_slot_iteration` never shares a `&SlotContext` across threads.
+/// Each slot carries the `Send`-safe `SlotPromptBundle` produced on the main
+/// thread BEFORE the worker is spawned (per the FEAT-002 contract: prompt
+/// construction order is `build_bundle (main) → spawn(worker)`). Workers
+/// must NOT touch a `&Connection` or read a `&Task` after spawn — every
+/// task-derived value the slot needs (id, files, model, difficulty) is
+/// already pre-resolved into the bundle.
+///
+/// The struct is `Send` so `run_parallel_wave` can move it into a dedicated
+/// worker thread. It is intentionally not `Sync`: `run_slot_iteration` never
+/// shares a `&SlotContext` across threads.
 pub struct SlotContext {
     /// Slot index within the wave (0..parallel_slots).
     pub slot_index: usize,
     /// Working directory for Claude — slot 0 uses the main branch worktree,
     /// slots 1+ each get an ephemeral worktree (see `worktree::ensure_slot_worktrees`).
     pub working_root: PathBuf,
-    /// Pre-claimed task assigned to this slot. Claimed by `run_parallel_wave`
-    /// on the main thread before any slot thread is spawned so that rusqlite
-    /// writes stay single-threaded for claim bookkeeping.
-    pub task: crate::models::Task,
+    /// Prompt bundle assembled on the main thread (after the slot's task was
+    /// claimed) by `prompt::slot::build_prompt`. Carries the prompt string,
+    /// task id, pre-loaded task files, learning ids shown, resolved model,
+    /// and difficulty — everything the worker needs without re-opening the
+    /// DB. The orphan-reset accounting in `slot_failure_result` reads task
+    /// identity from `prompt_bundle.task_id` so the bundle remains the
+    /// canonical source-of-truth post-spawn.
+    pub prompt_bundle: crate::loop_engine::prompt::slot::SlotPromptBundle,
     /// Shared activity epoch for the slot's spawn_claude watchdog. Each slot
     /// owns its own `Arc<AtomicU64>` — watchdogs must not share an epoch or
     /// activity in one slot would silently extend another slot's deadline.
@@ -335,6 +345,12 @@ pub struct SlotResult {
     /// task was already `done` / `blocked` and the slot thread never spawned.
     /// Drives the post-loop orphan reset (see `IterationContext::pending_slot_tasks`).
     pub claim_succeeded: bool,
+    /// Learnings shown in the slot's prompt, threaded back from
+    /// `SlotContext::prompt_bundle::shown_learning_ids` so the main thread
+    /// can record bandit feedback without reopening a DB connection on the
+    /// worker. Empty for `slot_failure_result` entries (no bundle was ever
+    /// built) and for early-exit paths that never assembled a prompt.
+    pub shown_learning_ids: Vec<i64>,
 }
 
 /// Aggregate result of a parallel wave.
@@ -360,8 +376,6 @@ pub struct WaveResult {
 pub struct SlotIterationParams {
     /// Database directory (each slot opens its own connection here).
     pub db_dir: PathBuf,
-    /// Path to base prompt.md file used when assembling per-slot prompts.
-    pub base_prompt_path: PathBuf,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: PermissionMode,
     /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
@@ -379,110 +393,13 @@ pub struct SlotIterationParams {
     pub elapsed_secs: u64,
 }
 
-/// Build a minimal slot prompt from a pre-claimed task and base prompt template.
-///
-/// The sequential `run_iteration` pulls in learnings, source context, synergy
-/// context, sibling PRDs, etc. via `prompt::build_prompt`. For parallel slot
-/// execution we start with a lean prompt covering only the non-negotiable
-/// sections:
-/// - Task JSON (what to work on)
-/// - Task lifecycle rules (how status updates are communicated)
-/// - Completion instruction (how to signal done)
-/// - Base prompt template (project conventions)
-///
-/// Enriching the slot prompt with the full sequential pipeline is tracked by
-/// follow-up wiring tasks; this keeps the wave engine small and thread-safe
-/// today while leaving the obvious extension point clearly marked.
-fn build_slot_prompt(task: &crate::models::Task, base_prompt_path: &Path) -> String {
-    let mut prompt = String::new();
-
-    let mut task_json = serde_json::json!({
-        "id": task.id,
-        "title": task.title,
-        "priority": task.priority,
-        "status": "in_progress",
-        "acceptanceCriteria": task.acceptance_criteria,
-    });
-    if let Some(ref desc) = task.description {
-        task_json["description"] = serde_json::Value::String(desc.clone());
-    }
-    if let Some(ref notes) = task.notes {
-        task_json["notes"] = serde_json::Value::String(notes.clone());
-    }
-    if let Some(ref m) = task.model {
-        task_json["model"] = serde_json::Value::String(m.clone());
-    }
-    if let Some(ref d) = task.difficulty {
-        task_json["difficulty"] = serde_json::Value::String(d.clone());
-    }
-
-    let task_json_str = serde_json::to_string_pretty(&task_json)
-        .unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id));
-    prompt.push_str(&format!(
-        "## Current Task\n\n```json\n{}\n```\n\n",
-        task_json_str,
-    ));
-
-    prompt.push_str(crate::loop_engine::prompt_sections::task_ops::task_ops_section());
-
-    prompt.push_str(&format!(
-        "## Completing This Task\n\n\
-         When all acceptance criteria pass:\n\
-         1. Commit with message: `feat: {task_id}-completed - [{title}]`\n\
-         2. Output `<completed>{task_id}</completed>`.\n\
-         3. Stop immediately.\n\n\
-         The loop will automatically mark the task done and update the PRD.\n\n",
-        task_id = task.id,
-        title = task.title,
-    ));
-
-    match std::fs::read_to_string(base_prompt_path) {
-        Ok(content) if !content.trim().is_empty() => {
-            prompt.push_str(&content);
-            if !content.ends_with('\n') {
-                prompt.push('\n');
-            }
-        }
-        Ok(_) => {
-            eprintln!(
-                "Warning: base prompt file is empty: {}",
-                base_prompt_path.display(),
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: could not read base prompt file {}: {}",
-                base_prompt_path.display(),
-                e,
-            );
-        }
-    }
-
-    prompt
-}
-
-/// Load the files a task touches from the `task_files` join table.
-///
-/// Returns an empty Vec if the task has no entries or on query error; the
-/// slot iteration remains runnable even without file metadata, and logging
-/// the error keeps silent failures visible.
-fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
-    match conn.prepare("SELECT file_path FROM task_files WHERE task_id = ? ORDER BY file_path") {
-        Ok(mut stmt) => stmt
-            .query_map([task_id], |row| row.get::<_, String>(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        Err(e) => {
-            eprintln!("Warning: failed to query task_files for {}: {}", task_id, e,);
-            Vec::new()
-        }
-    }
-}
-
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
+///
+/// `task_id` is intentionally NOT a field here — it is always the slot's
+/// bundle id; threading it through the struct would just invite
+/// inconsistencies. `slot_early_exit` reads it from the passed `SlotContext`.
 struct SlotEarlyExit {
     outcome: IterationOutcome,
-    task_id: String,
     files_modified: Vec<String>,
     should_stop: bool,
     output: String,
@@ -493,14 +410,16 @@ struct SlotEarlyExit {
 /// Build a slot-scoped early-exit `SlotResult`.
 ///
 /// Centralizes the `IterationResult` construction for the handful of early
-/// returns in `run_slot_iteration` so the 9-field struct literal isn't
-/// duplicated.
-fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
+/// returns in `run_slot_iteration` so the 10-field struct literal isn't
+/// duplicated. Pulls task identity AND `shown_learning_ids` from the slot's
+/// bundle so the orphan-reset accounting AND bandit feedback stay correct
+/// even on early-exit paths (signal received, timeout, etc.).
+fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
     SlotResult {
-        slot_index,
+        slot_index: slot.slot_index,
         iteration_result: IterationResult {
             outcome: exit.outcome,
-            task_id: Some(exit.task_id),
+            task_id: Some(slot.prompt_bundle.task_id.clone()),
             files_modified: exit.files_modified,
             should_stop: exit.should_stop,
             output: exit.output,
@@ -514,30 +433,41 @@ fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
         // started); the orphan reset must consider this task pending until
         // process_slot_result clears it.
         claim_succeeded: true,
+        shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
     }
 }
 
-/// Run one slot's iteration: build prompt, spawn Claude in the slot worktree,
-/// analyze output. Opens its own DB connection and creates its own watchdog
-/// activity epoch so nothing is shared across slot threads.
+/// Run one slot's iteration: spawn Claude in the slot worktree using the
+/// pre-assembled prompt bundle, then analyze output. Opens its own DB
+/// connection and creates its own watchdog activity epoch so nothing is
+/// shared across slot threads.
 ///
 /// This is a deliberately simpler counterpart to `run_iteration`:
 /// - No `&mut IterationContext` — slot threads must not touch shared state.
 /// - No crash-escalation, reorder, stale, or rate-limit-wait logic — those
 ///   are orchestrated by the outer loop after the wave returns.
-/// - No prompt-overflow recovery path — the slot prompt is minimal so the
-///   overflow branch is unreachable in practice.
+/// - No prompt-overflow recovery path — wave-mode overflow handling is a
+///   per-slot follow-up tracked elsewhere in the PRD.
+///
+/// The prompt bundle MUST have been built on the main thread before the
+/// worker was spawned (FEAT-002 contract). The worker only reads from the
+/// bundle — it never reaches back into a `&Connection` to re-derive task
+/// state, because rusqlite `Connection` is not `Send` (learnings #1893 /
+/// #1852 / #1871).
 pub fn run_slot_iteration(
     slot: &SlotContext,
     params: &SlotIterationParams,
 ) -> TaskMgrResult<SlotResult> {
+    let bundle = &slot.prompt_bundle;
+    let task_id = bundle.task_id.as_str();
+    let task_files = bundle.task_files.clone();
+
     // Early exit on signal — no work should start if the loop is stopping.
     if params.signal_flag.is_signaled() {
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Empty,
-                task_id: slot.task.id.clone(),
                 files_modified: vec![],
                 should_stop: true,
                 output: String::new(),
@@ -547,31 +477,22 @@ pub fn run_slot_iteration(
         ));
     }
 
-    // Open a per-slot DB connection. rusqlite `Connection` is not `Send`, so
-    // each thread MUST open its own; sharing a connection across threads
-    // corrupts the WAL state.
-    let conn = crate::db::open_connection(&params.db_dir)?;
-
-    let task_files = load_task_files(&conn, &slot.task.id);
-
-    // Effective model: per-task override > default. Cluster-wide escalation
-    // (sequential path) is intentionally not applied in parallel; the wave
-    // engine targets tasks that are already scored as disjoint, not clusters.
-    let effective_model: Option<String> = slot
-        .task
-        .model
+    // Effective model: bundle-resolved (per-task) > params.default_model.
+    // Cluster-wide escalation (sequential path) is intentionally not applied
+    // in parallel; the wave engine targets tasks already scored as disjoint,
+    // not clusters.
+    let effective_model: Option<String> = bundle
+        .resolved_model
         .clone()
         .or_else(|| params.default_model.clone());
 
-    let effort = model::effort_for_difficulty(slot.task.difficulty.as_deref());
-
-    let prompt = build_slot_prompt(&slot.task, &params.base_prompt_path);
+    let effort = model::effort_for_difficulty(bundle.difficulty.as_deref());
 
     if params.verbose {
         eprintln!(
             "[slot {}] task={} model={} effort={} cwd={}",
             slot.slot_index,
-            slot.task.id,
+            task_id,
             effective_model.as_deref().unwrap_or("(default)"),
             effort.unwrap_or("(default)"),
             slot.working_root.display(),
@@ -590,7 +511,7 @@ pub fn run_slot_iteration(
     let banner = display::format_iteration_header(
         params.iteration,
         params.max_iterations,
-        &slot.task.id,
+        task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
         effort,
@@ -600,12 +521,12 @@ pub fn run_slot_iteration(
     // Per-slot timeout wired to the slot's own activity epoch. Each
     // spawn_claude creates its own watchdog thread, so timeouts are per-slot.
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
-        slot.task.difficulty.as_deref(),
+        bundle.difficulty.as_deref(),
         Arc::clone(&slot.last_activity_epoch),
     );
 
     let claude_result = claude::spawn_claude(
-        &prompt,
+        &bundle.prompt,
         &params.permission_mode,
         claude::SpawnOpts {
             signal_flag: Some(&params.signal_flag),
@@ -617,7 +538,7 @@ pub fn run_slot_iteration(
             disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
             db_dir: Some(&params.db_dir),
             use_pty: false,
-            target_task_id: Some(&slot.task.id),
+            target_task_id: Some(task_id),
             slot_label: Some(&slot_label_buf),
             ..Default::default()
         },
@@ -626,13 +547,12 @@ pub fn run_slot_iteration(
     if claude_result.timed_out {
         eprintln!(
             "[slot {}] iteration timed out for task {}",
-            slot.slot_index, slot.task.id,
+            slot.slot_index, task_id,
         );
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Crash(config::CrashType::RuntimeError),
-                task_id: slot.task.id.clone(),
                 files_modified: task_files,
                 should_stop: false,
                 output: claude_result.output,
@@ -655,10 +575,9 @@ pub fn run_slot_iteration(
 
     if params.signal_flag.is_signaled() {
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Empty,
-                task_id: slot.task.id.clone(),
                 files_modified: task_files,
                 should_stop: true,
                 output: claude_result.output,
@@ -678,7 +597,7 @@ pub fn run_slot_iteration(
         slot_index: slot.slot_index,
         iteration_result: IterationResult {
             outcome,
-            task_id: Some(slot.task.id.clone()),
+            task_id: Some(bundle.task_id.clone()),
             files_modified: task_files,
             should_stop: false,
             output: claude_result.output,
@@ -689,6 +608,7 @@ pub fn run_slot_iteration(
             shown_learning_ids: Vec::new(),
         },
         claim_succeeded: true,
+        shown_learning_ids: bundle.shown_learning_ids.clone(),
     })
 }
 
@@ -732,6 +652,13 @@ fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
 ///     while its task was already `in_progress` — the orphan reset must run.
 ///   - `false`: claim itself failed (task already `done`/`blocked`) and no row
 ///     was ever moved to `in_progress` — orphan reset must skip this entry.
+///
+/// `shown_learning_ids` is left empty on this path: the bundle was either
+/// never built (claim failed) or has been moved into the panicked worker
+/// thread and is no longer recoverable from the main thread. Bandit feedback
+/// for failed runs is intentionally suppressed — crediting/discrediting
+/// learnings against a worker that crashed before any agent reasoning would
+/// produce noise, not signal.
 fn slot_failure_result(
     slot_index: usize,
     task_id: Option<String>,
@@ -753,11 +680,19 @@ fn slot_failure_result(
             shown_learning_ids: Vec::new(),
         },
         claim_succeeded,
+        shown_learning_ids: Vec::new(),
     }
 }
 
 /// Run one parallel wave: claim all tasks sequentially (main thread), then
 /// spawn one OS thread per slot and wait for every thread to join.
+///
+/// **FEAT-002 contract**: every `SlotContext` passed in MUST already carry
+/// a fully-built `prompt_bundle` (constructed by `prompt::slot::build_prompt`
+/// on the main thread before this function is called — see
+/// `build_slot_contexts`). This function never opens a `&Connection` from
+/// inside a worker thread; the claim is the only DB write here, and it
+/// stays on the main thread.
 ///
 /// The claim loop is intentionally serial on the main thread:
 /// - rusqlite `Connection` is not `Send`, so there's one DB writer.
@@ -781,7 +716,7 @@ pub fn run_parallel_wave(
 
     let mut claimed: Vec<(SlotContext, bool)> = Vec::with_capacity(slots.len());
     for slot in slots {
-        let ok = claim_slot_task(conn, &slot.task.id);
+        let ok = claim_slot_task(conn, &slot.prompt_bundle.task_id);
         claimed.push((slot, ok));
     }
 
@@ -791,7 +726,7 @@ pub fn run_parallel_wave(
 
     for (slot, ok) in claimed {
         let slot_index = slot.slot_index;
-        let task_id = slot.task.id.clone();
+        let task_id = slot.prompt_bundle.task_id.clone();
         if !ok {
             failures.push(slot_failure_result(
                 slot_index,
@@ -1051,32 +986,56 @@ fn handle_no_eligible_tasks(
 }
 
 /// Build per-slot `SlotContext` entries, pairing each scored task with its
-/// pre-allocated worktree path. Each slot gets its own activity epoch —
-/// sharing one would let activity in one slot silently extend another
-/// slot's watchdog deadline.
+/// pre-allocated worktree path AND assembling the full `SlotPromptBundle`
+/// on the main thread.
+///
+/// **FEAT-002 contract**: bundle assembly happens here, on the main thread,
+/// BEFORE `run_parallel_wave` spawns any worker. The bundle is the only
+/// task-derived state a worker reads; `SlotContext` no longer carries a
+/// `Task` reference, so all DB-backed prompt assembly (learnings,
+/// task_files, source context) MUST run from this single connection.
+///
+/// Each slot gets its own activity epoch — sharing one would let activity
+/// in one slot silently extend another slot's watchdog deadline.
 fn build_slot_contexts(
+    conn: &Connection,
     group: Vec<crate::commands::next::selection::ScoredTask>,
     slot_paths: &[PathBuf],
+    slot_prompt_params: &prompt::slot::SlotPromptParams,
 ) -> Vec<SlotContext> {
     group
         .into_iter()
         .zip(slot_paths.iter())
         .enumerate()
-        .map(|(idx, (scored, path))| SlotContext {
-            slot_index: idx,
-            working_root: path.clone(),
-            task: scored.task,
-            last_activity_epoch: Arc::new(AtomicU64::new(0)),
+        .map(|(idx, (scored, path))| {
+            // The DB row will flip to `in_progress` in run_parallel_wave's
+            // claim step; reflect that in the bundle's task JSON so the
+            // agent sees the post-claim state. The acceptance criteria,
+            // description, model, and difficulty fields don't change with
+            // claim, so this is the only field that needs a pre-mutation.
+            let mut task = scored.task;
+            task.status = crate::models::TaskStatus::InProgress;
+            let prompt_bundle = prompt::slot::build_prompt(conn, &task, slot_prompt_params);
+            SlotContext {
+                slot_index: idx,
+                working_root: path.clone(),
+                prompt_bundle,
+                last_activity_epoch: Arc::new(AtomicU64::new(0)),
+            }
         })
         .collect()
 }
 
 /// Build the shared per-slot `SlotIterationParams`. `SignalFlag` clones the
 /// inner `Arc` so all threads observe the same SIGINT/SIGTERM signal.
+///
+/// `base_prompt_path` is intentionally NOT carried on this struct anymore —
+/// the base prompt content is baked into `SlotPromptBundle.prompt` at
+/// assembly time, so workers never need to read the file (and thus don't
+/// need a path that might race with a concurrent edit).
 fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterationParams> {
     Arc::new(SlotIterationParams {
         db_dir: params.db_dir.to_path_buf(),
-        base_prompt_path: params.base_prompt_path.to_path_buf(),
         permission_mode: params.permission_mode.clone(),
         signal_flag: params.signal_flag.clone(),
         default_model: params.default_model.map(|s| s.to_string()),
@@ -1085,6 +1044,19 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         max_iterations: params.max_iterations,
         elapsed_secs: params.elapsed_secs,
     })
+}
+
+/// Build the `SlotPromptParams` shared across all slots in this wave.
+///
+/// Pulled out of `build_slot_contexts` so the call site at
+/// `run_wave_iteration` can construct it once and pass by reference, which
+/// avoids cloning the `PathBuf` per slot.
+fn build_slot_prompt_params(params: &WaveIterationParams<'_>) -> prompt::slot::SlotPromptParams {
+    prompt::slot::SlotPromptParams {
+        project_root: params.source_root.to_path_buf(),
+        base_prompt_path: params.base_prompt_path.to_path_buf(),
+        permission_mode: params.permission_mode.clone(),
+    }
 }
 
 /// Per-slot post-processing on the main thread: progress logging, key
@@ -1374,7 +1346,8 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_contexts = build_slot_contexts(group, slot_paths);
+    let slot_prompt_params = build_slot_prompt_params(&params);
+    let slot_contexts = build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     let slot_params = build_shared_slot_params(&params);
 
     // Snapshot epoch for `trigger_human_reviews`-style timestamp gating
@@ -6265,20 +6238,18 @@ mod tests {
     mod wave {
         use super::*;
         use crate::loop_engine::config::PermissionMode;
+        use crate::loop_engine::prompt::slot::{
+            SlotPromptBundle, SlotPromptParams, build_prompt as build_slot_prompt_bundle,
+        };
         use crate::loop_engine::test_utils::{insert_task, insert_task_file};
         use crate::models::Task;
         use std::sync::atomic::Ordering;
 
         /// Build a minimal SlotIterationParams wired to a test DB.
         /// `signal_flag` is shared so tests can observe/trip it across slots.
-        fn make_slot_params(
-            db_dir: &Path,
-            base_prompt_path: PathBuf,
-            signal_flag: SignalFlag,
-        ) -> SlotIterationParams {
+        fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
             SlotIterationParams {
                 db_dir: db_dir.to_path_buf(),
-                base_prompt_path,
                 permission_mode: PermissionMode::Dangerous,
                 signal_flag,
                 default_model: None,
@@ -6289,11 +6260,39 @@ mod tests {
             }
         }
 
-        fn make_slot(slot_index: usize, working_root: PathBuf, task: Task) -> SlotContext {
+        /// Build a SlotPromptParams pointing at a temp project root + base prompt.
+        fn make_prompt_params(project_root: &Path, base_prompt_path: PathBuf) -> SlotPromptParams {
+            SlotPromptParams {
+                project_root: project_root.to_path_buf(),
+                base_prompt_path,
+                permission_mode: PermissionMode::Dangerous,
+            }
+        }
+
+        /// Synthesize a `SlotPromptBundle` directly without invoking
+        /// `build_prompt`. Useful for tests that don't need the full
+        /// learnings/source-context pipeline (e.g. struct-field smoke tests
+        /// and pre-signal early-exit checks).
+        fn dummy_bundle(task_id: &str) -> SlotPromptBundle {
+            SlotPromptBundle {
+                prompt: format!("# slot prompt for {task_id}\n"),
+                task_id: task_id.to_string(),
+                task_files: Vec::new(),
+                shown_learning_ids: Vec::new(),
+                resolved_model: None,
+                difficulty: None,
+            }
+        }
+
+        fn make_slot(
+            slot_index: usize,
+            working_root: PathBuf,
+            prompt_bundle: SlotPromptBundle,
+        ) -> SlotContext {
             SlotContext {
                 slot_index,
                 working_root,
-                task,
+                prompt_bundle,
                 last_activity_epoch: Arc::new(AtomicU64::new(0)),
             }
         }
@@ -6303,11 +6302,11 @@ mod tests {
         #[test]
         fn test_slot_context_fields() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let task = Task::new("FEAT-1", "t");
-            let ctx = make_slot(2, tmp.path().to_path_buf(), task);
+            let bundle = dummy_bundle("FEAT-1");
+            let ctx = make_slot(2, tmp.path().to_path_buf(), bundle);
             assert_eq!(ctx.slot_index, 2);
             assert_eq!(ctx.working_root, tmp.path());
-            assert_eq!(ctx.task.id, "FEAT-1");
+            assert_eq!(ctx.prompt_bundle.task_id, "FEAT-1");
             assert_eq!(ctx.last_activity_epoch.load(Ordering::Relaxed), 0);
         }
 
@@ -6328,12 +6327,17 @@ mod tests {
                     shown_learning_ids: Vec::new(),
                 },
                 claim_succeeded: true,
+                shown_learning_ids: vec![42, 77],
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(
                 sr.iteration_result.outcome,
                 IterationOutcome::Completed
             ));
+            // FEAT-002 AC: SlotResult exposes shown_learning_ids at the top
+            // level so the main thread can record bandit feedback without
+            // re-reading the bundle (which has been moved into the worker).
+            assert_eq!(sr.shown_learning_ids, vec![42, 77]);
         }
 
         #[test]
@@ -6352,14 +6356,12 @@ mod tests {
         fn test_run_slot_iteration_honors_pre_set_signal_flag() {
             let (temp, _conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             let signal = SignalFlag::new();
             signal.set(); // pre-signal — slot must bail before spawning Claude
-            let params = make_slot_params(temp.path(), base_prompt, signal);
+            let params = make_slot_params(temp.path(), signal);
 
-            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-1", "t"));
+            let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-1"));
             let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
             assert_eq!(result.slot_index, 0);
             assert!(matches!(
@@ -6370,10 +6372,11 @@ mod tests {
             assert_eq!(result.iteration_result.task_id.as_deref(), Some("FEAT-1"),);
         }
 
-        // --- build_slot_prompt: includes task JSON + completion instruction ---
+        // --- prompt::slot::build_prompt: includes task JSON + completion ---
 
         #[test]
-        fn test_build_slot_prompt_contains_task_and_completion_sections() {
+        fn test_slot_bundle_contains_task_and_completion_sections() {
+            let (_temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
             let base = tmp.path().join("base.md");
             std::fs::write(&base, "BASE_PROMPT_CONTENT").unwrap();
@@ -6382,7 +6385,9 @@ mod tests {
             task.description = Some("Detailed desc".to_string());
             task.difficulty = Some("high".to_string());
 
-            let prompt = build_slot_prompt(&task, &base);
+            let prompt_params = make_prompt_params(tmp.path(), base);
+            let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+            let prompt = &bundle.prompt;
             assert!(prompt.contains("FEAT-42"), "missing task id");
             assert!(prompt.contains("Do the thing"), "missing title");
             assert!(prompt.contains("Detailed desc"), "missing description");
@@ -6395,34 +6400,19 @@ mod tests {
                 prompt.contains("BASE_PROMPT_CONTENT"),
                 "missing base prompt content",
             );
+            assert_eq!(bundle.difficulty.as_deref(), Some("high"));
         }
 
         #[test]
-        fn test_build_slot_prompt_tolerates_missing_base_prompt() {
+        fn test_slot_bundle_tolerates_missing_base_prompt() {
+            let (_temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
             let task = Task::new("FEAT-1", "t");
             // base_prompt_path does not exist — must not panic
-            let prompt = build_slot_prompt(&task, &tmp.path().join("does-not-exist.md"));
-            assert!(prompt.contains("FEAT-1"));
-        }
-
-        // --- load_task_files ---
-
-        #[test]
-        fn test_load_task_files_returns_sorted_paths() {
-            let (_tmp, conn) = setup_test_db();
-            insert_task(&conn, "FEAT-1", "t", "todo", 10);
-            insert_task_file(&conn, "FEAT-1", "src/z.rs");
-            insert_task_file(&conn, "FEAT-1", "src/a.rs");
-            let files = load_task_files(&conn, "FEAT-1");
-            assert_eq!(files, vec!["src/a.rs", "src/z.rs"]);
-        }
-
-        #[test]
-        fn test_load_task_files_empty_for_unknown_task() {
-            let (_tmp, conn) = setup_test_db();
-            let files = load_task_files(&conn, "FEAT-MISSING");
-            assert!(files.is_empty());
+            let prompt_params =
+                make_prompt_params(tmp.path(), tmp.path().join("does-not-exist.md"));
+            let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+            assert!(bundle.prompt.contains("FEAT-1"));
         }
 
         // --- claim_slot_task ---
@@ -6460,15 +6450,8 @@ mod tests {
         #[test]
         fn test_run_parallel_wave_empty_slots_returns_empty_outcomes() {
             let (temp, conn) = setup_test_db();
-            let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
-            let params = Arc::new(make_slot_params(
-                temp.path(),
-                base_prompt,
-                SignalFlag::new(),
-            ));
+            let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
             let wave = run_parallel_wave(&conn, vec![], params);
             assert!(wave.outcomes.is_empty());
         }
@@ -6477,8 +6460,6 @@ mod tests {
         fn test_run_parallel_wave_reports_claim_failure_for_done_task() {
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             // Task is already done — claim_slot_task returns false; wave must
             // emit a Crash(RuntimeError) entry rather than silently drop the slot.
@@ -6488,9 +6469,9 @@ mod tests {
             // Pre-signal so if the claim logic regresses and still spawns Claude,
             // the slot's early-signal check bails before touching the network.
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
-            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-DONE", "t"));
+            let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-DONE"));
             let wave = run_parallel_wave(&conn, vec![slot], params);
             assert_eq!(wave.outcomes.len(), 1);
             assert_eq!(wave.outcomes[0].slot_index, 0);
@@ -6511,18 +6492,16 @@ mod tests {
             // immediately; the DB must still show in_progress for both tasks.
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
             insert_task(&conn, "FEAT-B", "b", "todo", 10);
 
             let signal = SignalFlag::new();
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
-            let slot_a = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a"));
-            let slot_b = make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b"));
+            let slot_a = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A"));
+            let slot_b = make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B"));
 
             let wave = run_parallel_wave(&conn, vec![slot_a, slot_b], params);
             assert_eq!(wave.outcomes.len(), 2);
@@ -6547,8 +6526,6 @@ mod tests {
             // the reorder path. Outcomes must always emerge slot-ordered.
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
             insert_task(&conn, "FEAT-B", "b", "done", 10); // claim fails
@@ -6556,12 +6533,12 @@ mod tests {
 
             let signal = SignalFlag::new();
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
             let slots = vec![
-                make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
-                make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
-                make_slot(2, tmp.path().to_path_buf(), Task::new("FEAT-C", "c")),
+                make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A")),
+                make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B")),
+                make_slot(2, tmp.path().to_path_buf(), dummy_bundle("FEAT-C")),
             ];
 
             let wave = run_parallel_wave(&conn, slots, params);
@@ -6574,15 +6551,8 @@ mod tests {
         #[test]
         fn test_run_parallel_wave_measures_wall_clock_duration() {
             let (temp, conn) = setup_test_db();
-            let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
-            let params = Arc::new(make_slot_params(
-                temp.path(),
-                base_prompt,
-                SignalFlag::new(),
-            ));
+            let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
             let wave = run_parallel_wave(&conn, vec![], params);
             // Empty wave still records a non-negative duration; ensures the
             // Instant::now() → elapsed() contract holds.
@@ -6872,7 +6842,6 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let params = SlotIterationParams {
                 db_dir: tmp.path().to_path_buf(),
-                base_prompt_path: tmp.path().join("base.md"),
                 permission_mode: PermissionMode::Dangerous,
                 signal_flag: SignalFlag::new(),
                 default_model: Some(OPUS_MODEL.to_string()),
@@ -6885,6 +6854,69 @@ mod tests {
             assert_eq!(cloned.db_dir, params.db_dir);
             assert_eq!(cloned.verbose, params.verbose);
             assert_eq!(cloned.default_model.as_deref(), Some(OPUS_MODEL));
+        }
+
+        // --- FEAT-002 CONTRACT: build_bundle (main) → spawn(worker) ---
+        //
+        // The slot worker must NEVER touch a `&Connection` or read task data
+        // from anything other than its prompt bundle. The compile-time
+        // `assert_impl_all!(SlotPromptBundle: Send)` in `tests/prompt_slot.rs`
+        // guards the type-level invariant; this test guards the wiring:
+        // `build_slot_contexts` populates the bundle (with its DB-derived
+        // `task_files`) on the main thread, BEFORE any worker spawn, and the
+        // bundle survives the trip through `run_parallel_wave` unmodified.
+
+        #[test]
+        fn test_build_slot_contexts_populates_bundle_on_main_thread() {
+            use crate::commands::next::selection::ScoredTask;
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "BASE\n").unwrap();
+
+            insert_task(&conn, "FEAT-CONTRACT", "contract task", "todo", 10);
+            insert_task_file(&conn, "FEAT-CONTRACT", "src/contract.rs");
+
+            let mut task = Task::new("FEAT-CONTRACT", "contract task");
+            task.difficulty = Some("low".to_string());
+            let scored = ScoredTask {
+                task,
+                files: vec!["src/contract.rs".to_string()],
+                total_score: 0,
+                score_breakdown: crate::commands::next::selection::ScoreBreakdown {
+                    priority_score: 0,
+                    file_score: 0,
+                    file_overlap_count: 0,
+                },
+            };
+
+            let prompt_params = SlotPromptParams {
+                project_root: tmp.path().to_path_buf(),
+                base_prompt_path: base_prompt,
+                permission_mode: PermissionMode::Dangerous,
+            };
+            let slot_paths = vec![tmp.path().to_path_buf()];
+            let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);
+
+            assert_eq!(slots.len(), 1);
+            let bundle = &slots[0].prompt_bundle;
+            // task_id, task_files, and difficulty came from the DB / Task on
+            // the main thread. The worker thread will read from this bundle
+            // and never reopen `conn`.
+            assert_eq!(bundle.task_id, "FEAT-CONTRACT");
+            assert_eq!(bundle.task_files, vec!["src/contract.rs"]);
+            assert_eq!(bundle.difficulty.as_deref(), Some("low"));
+            // The task JSON inside the bundle reflects the post-claim state
+            // even though the row is still 'todo' (claim happens later in
+            // run_parallel_wave). This keeps the agent prompt honest about
+            // the state the row WILL be in by the time the worker runs.
+            assert!(
+                bundle.prompt.contains("\"status\": \"in_progress\""),
+                "bundle prompt must reflect post-claim status; got:\n{}",
+                bundle.prompt
+            );
+            // Drop temp last so the connection (held in scope) outlives it.
+            drop(temp);
         }
 
         // --- TEST-001: Comprehensive parallel execution tests -------------
@@ -7087,16 +7119,14 @@ mod tests {
                 insert_task(&conn, "FEAT-B", "b", "todo", 20);
 
                 let tmp = tempfile::TempDir::new().unwrap();
-                let base_prompt = tmp.path().join("base.md");
-                std::fs::write(&base_prompt, "base").unwrap();
 
                 let signal = SignalFlag::new();
                 signal.set();
-                let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal.clone()));
+                let params = Arc::new(make_slot_params(temp.path(), signal.clone()));
 
                 let slots = vec![
-                    make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
-                    make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
+                    make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A")),
+                    make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B")),
                 ];
                 let wave = run_parallel_wave(&conn, slots, params);
 

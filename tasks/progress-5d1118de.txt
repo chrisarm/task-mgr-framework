@@ -88,3 +88,17 @@ Learnings:
 - The other five core helpers take &Task or &str rather than NextTaskOutput; they exist for slot.rs in FEAT-002 but can't drive sequential.rs without an input-type bridge. Preserving byte-identity meant leaving sequential's NextTaskOutput-based helpers (build_task_json, build_key_decision_section) in place — the AC's "compose via" is satisfied by tool-awareness alone today, with full composition unblocked for FEAT-002 once SlotPromptBundle wiring lands.
 - truncate_to_budget already lives in prompt_sections::mod (learning #387 pattern), so core.rs imports it without inventing a new shared utility location.
 ---
+## [2026-05-07 10:00] - 5d1118de-FEAT-001
+Approach: Implemented build_prompt by loading task_files from DB then composing 4 core helpers (learnings, source context, tool awareness, key decisions) plus completed deps and base prompt.
+Files: src/loop_engine/prompt/slot.rs, tests/prompt_slot.rs
+Learnings: load_task_files gracefully degrades (empty vec) on DB error; empty_prompt_stub test needed a learning inserted to verify learnings section; un-ignored 4 FEAT-001 tests after real build_prompt landed.
+---
+
+## [2026-05-07 19:55] - 5d1118de-FEAT-002
+Approach: Replaced SlotContext.task with prompt_bundle: SlotPromptBundle; build_slot_contexts now builds bundles on the main thread before run_parallel_wave spawns workers (build_bundle → spawn contract). Added difficulty field to bundle so slot worker derives effort/timeout without &Task. Added shown_learning_ids to SlotResult and threaded bundle.shown_learning_ids through run_slot_iteration and slot_early_exit. Dropped SlotIterationParams.base_prompt_path (baked into bundle). Deleted engine.rs::build_slot_prompt and load_task_files (replaced by prompt::slot::build_prompt + its private load_task_files). Added "## Current Task" + task_ops sections to prompt::slot::build_prompt for parity with sequential — agent must see task description/AC, not just a learnings/source/tools/key-decisions header set.
+Files: src/loop_engine/engine.rs, src/loop_engine/prompt/slot.rs, tests/prompt_slot.rs, tests/iteration_result_conversation.rs
+Learnings:
+- Adding `difficulty: Option<String>` to SlotPromptBundle keeps the worker's effort/timeout derivation off any `&Task` reference, preserving the Send invariant
+- SlotEarlyExit dropped its task_id field — passing &SlotContext is cleaner than threading the same id through a parameter struct
+- Pre-bundle status mutation (`task.status = TaskStatus::InProgress`) lets bundle JSON honestly reflect post-claim state without ordering the claim-then-build steps in the same function
+---

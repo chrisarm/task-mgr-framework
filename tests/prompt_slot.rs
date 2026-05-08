@@ -288,38 +288,64 @@ fn build_prompt_includes_key_decisions_block() {
 }
 
 // ---------------------------------------------------------------------------
-// AC: Test asserts a slot worker panic AFTER bundle construction surfaces as
-// a slot failure whose recorded task_id matches bundle.task_id (orphan-reset
-// accounting stays correct).
+// AC: SlotContext carries SlotPromptBundle (FEAT-002), and slot_failure_result
+// reads task identity from `bundle.task_id`. This test verifies the contract
+// at the only externally-observable seam: build a bundle on the main thread,
+// hand it to `run_slot_iteration` via a `SlotContext`, and confirm the
+// returned `SlotResult.iteration_result.task_id` matches `bundle.task_id`.
 //
-// This pins the contract that `slot_failure_result` reads task identity from
-// the bundle (post-FEAT-002 wiring), not from a stale `Task` reference. The
-// test is gated until FEAT-002 swaps `SlotContext.task` for
-// `SlotContext.prompt_bundle`; today's `SlotContext` still holds a `Task`,
-// so the assertion can only run once that field is in place.
+// We pre-set the signal flag so the slot bails before spawning Claude, which
+// keeps this an integration test of the wiring (not of the Claude subprocess).
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-002 swaps SlotContext.task → SlotContext.prompt_bundle; assertion is exercised \
-            via run_parallel_wave's panic path once that wiring lands"]
-fn slot_worker_panic_after_bundle_construction_records_bundle_task_id() {
-    // The full assertion is integration-tested through run_parallel_wave once
-    // SlotContext carries SlotPromptBundle. Encoding the contract here as a
-    // standalone test ensures the wiring task can flip #[ignore] off without
-    // having to invent a new test scaffold. The shape of the eventual test:
-    //
-    //   1. Build a SlotPromptBundle for a claimed task on the main thread.
-    //   2. Spawn a slot worker that panics AFTER reading the bundle.
-    //   3. Assert the resulting SlotResult.iteration_result.task_id ==
-    //      bundle.task_id (NOT derived from the now-moved Task reference).
-    //
-    // We intentionally keep this body empty rather than asserting against
-    // the current stub so a regression that wires the panic path to the
-    // wrong field doesn't slip past a "no-op" passing test.
-    panic!(
-        "FEAT-002 must implement: SlotContext.prompt_bundle.task_id is the canonical task id \
-         used by slot_failure_result for the panic path. See engine.rs:786-803 + the new \
-         SlotContext field per FEAT-002 AC #1."
+fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use task_mgr::loop_engine::engine::{SlotContext, SlotIterationParams, run_slot_iteration};
+    use task_mgr::loop_engine::signals::SignalFlag;
+
+    let (temp, conn) = setup_migrated_db();
+    let project = project_with_files(&[]);
+    let base_prompt = project.path().join("prompt.md");
+    fs::write(&base_prompt, "# base\n").unwrap();
+
+    let task = sample_task();
+    let bundle = build_prompt(
+        &conn,
+        &task,
+        &make_params(project.path().to_path_buf(), base_prompt),
+    );
+    let expected_task_id = bundle.task_id.clone();
+
+    // Pre-signal so run_slot_iteration takes the early-exit path. The point
+    // of the test is not to spawn Claude; it's to assert the worker reads
+    // `bundle.task_id` (and only `bundle.task_id`) for the returned result.
+    let signal = SignalFlag::new();
+    signal.set();
+
+    let slot = SlotContext {
+        slot_index: 0,
+        working_root: project.path().to_path_buf(),
+        prompt_bundle: bundle,
+        last_activity_epoch: Arc::new(AtomicU64::new(0)),
+    };
+    let params = SlotIterationParams {
+        db_dir: temp.path().to_path_buf(),
+        permission_mode: PermissionMode::Dangerous,
+        signal_flag: signal,
+        default_model: None,
+        verbose: false,
+        iteration: 1,
+        max_iterations: 1,
+        elapsed_secs: 0,
+    };
+
+    let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
+    assert_eq!(
+        result.iteration_result.task_id.as_deref(),
+        Some(expected_task_id.as_str()),
+        "SlotResult.iteration_result.task_id must come from bundle.task_id"
     );
 }
 

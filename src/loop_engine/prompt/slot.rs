@@ -23,6 +23,7 @@ use rusqlite::Connection;
 use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
+use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
 use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
 
@@ -74,6 +75,12 @@ pub struct SlotPromptBundle {
     /// Resolved model for the slot (mirrors `PromptResult::resolved_model`).
     /// `None` means "use CLI default"; `Some("")` is normalized to `None`.
     pub resolved_model: Option<String>,
+    /// Task difficulty at bundle-build time. The slot worker derives effort
+    /// (`model::effort_for_difficulty`) and watchdog timeout
+    /// (`watchdog::TimeoutConfig::from_difficulty`) from this without needing
+    /// the original `Task` reference. `None` when the task has no difficulty
+    /// set; downstream callers fall back to defaults.
+    pub difficulty: Option<String>,
 }
 
 /// Load file paths for a task from the `task_files` join table.
@@ -124,6 +131,15 @@ fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
+    // Task JSON header — the agent must see the task's description,
+    // acceptance criteria, and notes to do anything useful. Mirrors the
+    // sequential builder's `## Current Task` section so parallel slots have
+    // parity with the canonical single-task path.
+    let task_json = core::format_task_json(task, &task_files);
+    let task_section = format!("## Current Task\n\n```json\n{task_json}\n```\n\n");
+
+    let task_ops = task_ops_section();
+
     let (learnings_section, shown_learning_ids) =
         core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
 
@@ -141,7 +157,7 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
     let base_prompt = load_base_prompt(&params.base_prompt_path);
 
     let prompt = format!(
-        "{learnings_section}{source_section}{dep_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
+        "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
     );
 
     let resolved_model = task
@@ -156,5 +172,6 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
         task_files,
         shown_learning_ids,
         resolved_model,
+        difficulty: task.difficulty.clone(),
     }
 }
