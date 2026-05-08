@@ -341,9 +341,9 @@ pub struct SlotResult {
     /// to populate the `PromptResult` passed to `overflow::handle_prompt_too_long`
     /// when the outcome is `Crash(PromptTooLong)`.
     ///
-    /// Empty for `slot_failure_result` entries (prompt was never assembled or
-    /// the task claim failed before the worker spawned).
-    pub prompt_for_overflow: String,
+    /// `None` on all non-overflow paths; avoids cloning up to 80 KB per slot
+    /// on every successful wave just to discard it.
+    pub prompt_for_overflow: Option<String>,
     /// Per-section byte sizes from `SlotPromptBundle::section_sizes`, threaded
     /// back so `process_slot_result` can populate the synthetic `PromptResult`
     /// with a meaningful section breakdown on `PromptTooLong`. Empty for
@@ -432,7 +432,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         // process_slot_result clears it.
         claim_succeeded: true,
         shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
-        prompt_for_overflow: slot.prompt_bundle.prompt.clone(),
+        prompt_for_overflow: None,
         section_sizes: slot.prompt_bundle.section_sizes.clone(),
     }
 }
@@ -600,6 +600,10 @@ pub fn run_slot_iteration(
     // `claude_result.output` (just the final result string).
     let conversation = claude_result.conversation;
 
+    let is_prompt_too_long = matches!(
+        outcome,
+        config::IterationOutcome::Crash(config::CrashType::PromptTooLong)
+    );
     Ok(SlotResult {
         slot_index: slot.slot_index,
         iteration_result: IterationResult {
@@ -616,7 +620,7 @@ pub fn run_slot_iteration(
         },
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),
-        prompt_for_overflow: bundle.prompt.clone(),
+        prompt_for_overflow: is_prompt_too_long.then(|| bundle.prompt.clone()),
         section_sizes: bundle.section_sizes.clone(),
     })
 }
@@ -690,7 +694,7 @@ fn slot_failure_result(
         },
         claim_succeeded,
         shown_learning_ids: Vec::new(),
-        prompt_for_overflow: String::new(),
+        prompt_for_overflow: None,
         section_sizes: Vec::new(),
     }
 }
@@ -1119,7 +1123,7 @@ fn process_slot_result(
     ) && let Some(ref tid) = task_id
     {
         let synthetic_prompt = crate::loop_engine::prompt::PromptResult {
-            prompt: slot_result.prompt_for_overflow.clone(),
+            prompt: slot_result.prompt_for_overflow.clone().unwrap_or_default(),
             task_id: tid.clone(),
             task_files: slot_result.iteration_result.files_modified.clone(),
             shown_learning_ids: Vec::new(),
@@ -6349,7 +6353,7 @@ mod tests {
                 },
                 claim_succeeded: true,
                 shown_learning_ids: vec![42, 77],
-                prompt_for_overflow: String::new(),
+                prompt_for_overflow: None,
                 section_sizes: Vec::new(),
             };
             assert_eq!(sr.slot_index, 1);
