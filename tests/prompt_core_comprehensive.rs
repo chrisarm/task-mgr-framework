@@ -16,6 +16,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
+use task_mgr::loop_engine::model::OPUS_MODEL;
 use task_mgr::loop_engine::prompt::core::{
     build_key_decisions_block, build_learnings_block, build_source_context_block,
     build_tool_awareness_block, completion_instruction, format_task_json,
@@ -73,7 +74,7 @@ fn format_task_json_includes_all_optional_fields_when_set() {
     let mut task = Task::new("OPT-001", "Optional fields task");
     task.description = Some("A description".into());
     task.notes = Some("Some notes".into());
-    task.model = Some("claude-opus-4-5".into());
+    task.model = Some(OPUS_MODEL.into());
     task.difficulty = Some("high".into());
     task.escalation_note = Some("Escalation reason".into());
 
@@ -82,7 +83,7 @@ fn format_task_json_includes_all_optional_fields_when_set() {
 
     assert_eq!(value["description"].as_str(), Some("A description"));
     assert_eq!(value["notes"].as_str(), Some("Some notes"));
-    assert_eq!(value["model"].as_str(), Some("claude-opus-4-5"));
+    assert_eq!(value["model"].as_str(), Some(OPUS_MODEL));
     assert_eq!(value["difficulty"].as_str(), Some("high"));
     assert_eq!(value["escalationNote"].as_str(), Some("Escalation reason"));
 }

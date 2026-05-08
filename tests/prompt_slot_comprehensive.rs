@@ -19,6 +19,7 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
+use task_mgr::loop_engine::model::SONNET_MODEL;
 use task_mgr::loop_engine::prompt::slot::{SlotPromptBundle, SlotPromptParams, build_prompt};
 use task_mgr::models::{Confidence, LearningOutcome, Task};
 
@@ -499,7 +500,7 @@ fn build_prompt_propagates_model_and_difficulty_from_task() {
     fs::write(&base_prompt, "# base\n").unwrap();
 
     let mut task = sample_task("TEST-SLOT-MODEL-001");
-    task.model = Some("claude-sonnet-4-6".into());
+    task.model = Some(SONNET_MODEL.into());
     task.difficulty = Some("high".into());
 
     let bundle = build_prompt(
@@ -510,7 +511,7 @@ fn build_prompt_propagates_model_and_difficulty_from_task() {
 
     assert_eq!(
         bundle.resolved_model.as_deref(),
-        Some("claude-sonnet-4-6"),
+        Some(SONNET_MODEL),
         "resolved_model must mirror the task's model field"
     );
     assert_eq!(

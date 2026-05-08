@@ -91,10 +91,11 @@ fn reset_to_in_progress(conn: &Connection, task_id: &str) {
 /// Simulates the wave dispatcher: for each crashing slot, invoke
 /// `handle_prompt_too_long` with that slot's task_id. Returns `(slot, action)`
 /// pairs for the crashing slots only.
-fn dispatch_wave_overflows<'a>(
+#[allow(clippy::too_many_arguments)]
+fn dispatch_wave_overflows(
     ctx: &mut IterationContext,
     conn: &Connection,
-    all_task_ids: &[&'a str],
+    all_task_ids: &[&str],
     crashing_slots: &[usize],
     effort: Option<&str>,
     model: Option<&str>,
@@ -338,8 +339,8 @@ fn eight_slot_wave_four_overflows_even_slots_independent_recovery() {
     assert_eq!(ctx.overflow_original_model.len(), 4);
     assert_eq!(ctx.model_overrides.len(), 0);
 
-    for i in 0..8usize {
-        let tid = task_ids[i];
+    for (i, tid) in task_ids.iter().enumerate().take(8) {
+        let tid = *tid;
         if crashing.contains(&i) {
             assert!(
                 ctx.overflow_recovered.contains(tid),
