@@ -235,6 +235,7 @@ pub fn add_with_conn(
     let resolved_prefix = resolve_active_prefix(conn)?;
     let prefixed_depended_on_by: Vec<String>;
     let effective_depended_on_by: &[String] = if let Some(ref prefix) = resolved_prefix {
+        reject_foreign_prefix(conn, &input.id, &input.depends_on, depended_on_by, prefix)?;
         let original_id = input.id.clone();
         input.apply_prefix(prefix);
         if input.id != original_id {
@@ -445,6 +446,80 @@ fn resolve_active_prefix(conn: &Connection) -> TaskMgrResult<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+/// Reject task IDs that carry a known foreign PRD prefix before auto-prefixing
+/// runs. Called after `resolve_active_prefix` returns `Some(active)` and before
+/// `input.apply_prefix(active)`.
+///
+/// Foreign prefix = any `task_prefix` in `prd_metadata` that is NOT the active
+/// one. The check uses `format!("{foreign}-")` (trailing dash) to avoid the
+/// false-positive where prefix 'A' would match 'AB-FEAT-001' via a naive
+/// `starts_with("A")`.
+///
+/// Bare IDs (no recognizable prefix) and already-active-prefixed IDs pass
+/// through — `apply_prefix` handles both correctly.
+fn reject_foreign_prefix(
+    conn: &Connection,
+    id: &str,
+    depends_on: &[String],
+    depended_on_by: &[String],
+    active_prefix: &str,
+) -> TaskMgrResult<()> {
+    let mut stmt =
+        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
+    let foreign_prefixes: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .filter(|p: &String| p.as_str() != active_prefix)
+        .collect();
+
+    if foreign_prefixes.is_empty() {
+        return Ok(());
+    }
+
+    for foreign in &foreign_prefixes {
+        let fwd = format!("{foreign}-");
+        if id.starts_with(&fwd) {
+            return Err(TaskMgrError::invalid_state(
+                "add",
+                "id",
+                format!("an ID with the active prefix '{active_prefix}' or a bare ID"),
+                format!(
+                    "{id} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
+                     pass --from-json or correct the ID"
+                ),
+            ));
+        }
+        for dep in depends_on {
+            if dep.starts_with(&fwd) {
+                return Err(TaskMgrError::invalid_state(
+                    "add",
+                    "dependsOn",
+                    format!("IDs with the active prefix '{active_prefix}' or bare IDs"),
+                    format!(
+                        "{dep} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
+                         pass --from-json or correct the ID"
+                    ),
+                ));
+            }
+        }
+        for dep in depended_on_by {
+            if dep.starts_with(&fwd) {
+                return Err(TaskMgrError::invalid_state(
+                    "add",
+                    "depended-on-by",
+                    format!("IDs with the active prefix '{active_prefix}' or bare IDs"),
+                    format!(
+                        "{dep} carries foreign prefix '{foreign}' (active: '{active_prefix}'); \
+                         pass --from-json or correct the ID"
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Look up the PRD JSON file path for the currently-active PRD.
@@ -1219,5 +1294,165 @@ mod tests {
             resolve_active_prefix(&conn).is_err(),
             "must reject pinned prefix not present in prd_metadata"
         );
+    }
+
+    // --- FEAT-003: reject_foreign_prefix ---
+
+    #[test]
+    fn test_reject_foreign_prefix_idempotent_active_prefix_ok() {
+        // active='A', input already carries the active prefix → Ok (idempotent path).
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        reject_foreign_prefix(&conn, "A-FEAT-001", &[], &[], "A").unwrap();
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_bare_id_ok() {
+        // active='A', bare ID (no recognizable prefix) → Ok (apply_prefix will handle it).
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        reject_foreign_prefix(&conn, "FEAT-001", &[], &[], "A").unwrap();
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_known_foreign_id_errors_with_all_components() {
+        // active='A', input='B-FEAT-001' where B is in prd_metadata → Err with
+        // all 5 required message components: field name, offending ID, foreign
+        // prefix, active prefix, and actionable hint.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        let err = reject_foreign_prefix(&conn, "B-FEAT-001", &[], &[], "A").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("id"), "must name the field: {msg}");
+        assert!(
+            msg.contains("B-FEAT-001"),
+            "must name the offending ID: {msg}"
+        );
+        assert!(msg.contains("'B'"), "must name the foreign prefix: {msg}");
+        assert!(msg.contains("'A'"), "must name the active prefix: {msg}");
+        assert!(
+            msg.contains("--from-json") || msg.contains("correct the ID"),
+            "must include actionable hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_depends_on_foreign_errors_naming_field() {
+        // active='A', depends_on contains a foreign-prefix ID → Err naming 'dependsOn'.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        let err = reject_foreign_prefix(&conn, "FEAT-001", &["B-FEAT-1".to_string()], &[], "A")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dependsOn"),
+            "must name the 'dependsOn' field: {msg}"
+        );
+        assert!(
+            msg.contains("B-FEAT-1"),
+            "must name the offending ID: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_depended_on_by_foreign_errors_naming_field() {
+        // active='A', depended_on_by contains a foreign-prefix ID → Err naming 'depended-on-by'.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        seed_prefix(&conn, 2, "beta", "B");
+        let err = reject_foreign_prefix(&conn, "FEAT-001", &[], &["B-FEAT-1".to_string()], "A")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("depended-on-by"),
+            "must name the 'depended-on-by' field: {msg}"
+        );
+        assert!(
+            msg.contains("B-FEAT-1"),
+            "must name the offending ID: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_ab_active_a_input_errors() {
+        // active='AB', input='A-FEAT-001' (both AB and A in metadata) → Err.
+        // Foreign prefix 'A' matches 'A-FEAT-001' via trailing-dash check ('A-').
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "AB");
+        seed_prefix(&conn, 2, "beta", "A");
+        let err = reject_foreign_prefix(&conn, "A-FEAT-001", &[], &[], "AB").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'A'"), "must name foreign prefix 'A': {msg}");
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_trailing_dash_discriminator() {
+        // active='A', input='AB-FEAT-001' — only the active prefix 'A' is in
+        // prd_metadata (no 'AB'). Foreign set is empty → Ok.
+        //
+        // This is the trailing-dash discriminator: a naive starts_with("A") (no
+        // dash) on a hypothetical foreign check for 'A' would falsely match
+        // 'AB-FEAT-001'. With the trailing dash: starts_with("A-") = FALSE.
+        // The correct implementation avoids this by (a) excluding the active
+        // prefix from foreign candidates and (b) using the trailing-dash form.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        // No 'AB' in prd_metadata → foreign = [] → no checks → Ok.
+        reject_foreign_prefix(&conn, "AB-FEAT-001", &[], &[], "A").unwrap();
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_known_bad_no_trailing_dash_would_fail_discriminator() {
+        // Known-bad guard: a naive starts_with(foreign) WITHOUT trailing dash
+        // would false-positive on 'AB-FEAT-001' when foreign='A'.
+        // This test uses active='AB' and foreign=['A'], then checks 'AB-FEAT-001'
+        // (an active-prefixed ID) does NOT get rejected — a naive no-dash
+        // implementation would incorrectly reject it.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "AB");
+        seed_prefix(&conn, 2, "beta", "A");
+        // 'AB-FEAT-001' belongs to active 'AB'; foreign 'A' must NOT match it
+        // because 'AB-FEAT-001'.starts_with("A-") = FALSE (trailing dash saves us).
+        reject_foreign_prefix(&conn, "AB-FEAT-001", &[], &[], "AB").unwrap();
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_only_active_prefix_no_rejection() {
+        // prd_metadata has only the active prefix → foreign set empty → all inputs pass.
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+        // No foreign prefixes → Ok for any input.
+        reject_foreign_prefix(&conn, "B-FEAT-001", &[], &[], "A").unwrap();
+    }
+
+    #[test]
+    fn test_reject_foreign_prefix_integration_end_to_end() {
+        // Integration: bare ID + bare dependsOn under active env var produces
+        // correctly-prefixed row → verifies FEAT-002 + FEAT-003 + apply_prefix chain.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "A");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A");
+
+        let mut input = minimal_input("FIX-001");
+        input.depends_on = vec!["OTHER-1".to_string()];
+        let res = add_with_conn(&conn, input, None, &[]).unwrap();
+
+        assert_eq!(res.task_id, "A-FIX-001", "task ID must be auto-prefixed");
+
+        // Verify the relationship was recorded with the prefixed dep ID.
+        let rel_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_relationships \
+                 WHERE task_id = 'A-FIX-001' AND related_id = 'A-OTHER-1' AND rel_type = 'dependsOn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rel_count, 1, "dependsOn must be recorded with prefixed ID");
     }
 }
