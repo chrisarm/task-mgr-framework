@@ -43,6 +43,8 @@ JSON to `task-mgr add --stdin`. Example:
 
 Priority is auto-computed; omit for lower priority.
 - **Fix in response to a milestone**: pass `--depended-on-by <id>`.
+- **Auto-prefix**: loop exports `TASK_MGR_ACTIVE_PREFIX`; bare IDs are
+auto-prefixed to the active PRD. Cross-PRD IDs are rejected.
 - For anything else (dependencies, status queries, etc.), use the `task-mgr`
 CLI — see `task-mgr --help`.
 
