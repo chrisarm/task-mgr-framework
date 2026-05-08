@@ -212,3 +212,15 @@ Learnings:
 - `check_crash_escalation` (engine.rs:1765) reads the map only inside `run_iteration` (sequential path); wave slots intentionally skip crash escalation per comment at line 475-477
 - `last_was_crash` field is completely absent from codebase; `last_task_id` survives in DB schema for general tracking only — no crash-path readers remain
 ---
+
+## [2026-05-07 12:00] - 5d1118de-REFACTOR-REVIEW-FINAL
+Approach: rust-python-code-reviewer agent review of prompt/{core,sequential,slot,mod}.rs, iteration_pipeline.rs, engine.rs, overflow.rs. Spawned 6 REFACTOR-N tasks for findings.
+Files: (review only — no source modifications)
+Learnings:
+- Two real DRY leftovers in sequential.rs (build_task_json vs core::format_task_json; build_key_decision_section vs core::build_key_decisions_block). Slot builder uses core helpers; sequential is the holdout. Spawned as REFACTOR-N-001 / -002.
+- Slot overflow dumps lose section_sizes/dropped_sections — synthesized PromptResult uses Vec::new(). REFACTOR-N-003.
+- prompt_for_overflow String is eagerly cloned on every slot result but read only on PromptTooLong. REFACTOR-N-004.
+- IterationResult.key_decisions_count is dead-initialized in iteration runners and overwritten by the pipeline at call sites. REFACTOR-N-005.
+- Orphan record_shown_learnings docstring still attached to build_steering_section. REFACTOR-N-006.
+- AC 3 (legacy field cleanup), 4 (no TODO/FIXME), 5 (prompt::build_prompt re-export) all confirmed clean.
+---
