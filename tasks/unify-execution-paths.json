@@ -349,7 +349,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "This MUST be captured BEFORE Phase A begins (REFACTOR-001). The baseline snapshot is the regression guard. Use `cargo grep \"HashMap<.*Section\\|prompt\"` pre-merge to surface section-ordering nondeterminism.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Phase A regression freedom: byte-identical sequential prompt for the fixture",
@@ -702,7 +702,7 @@
       "id": "FEAT-005",
       "modifiesBehavior": true,
       "notes": "This is a BIG refactor of engine.rs. Read engine.rs:2032-2113 (run_iteration tail) and engine.rs:3178-3530 (run_loop body) carefully. Per FR-003 'Behaviors STAYING at the call site': wrapper commit, external-git, human review triggering, rate-limit, pause-signal, tool-denial hint re-prompts. Use the Phase A snapshot to verify no prompt-side regression.",
-      "passes": false,
+      "passes": true,
       "priority": 11,
       "qualityDimensions": [
         "run_iteration shrinks to 'select task → spawn Claude → return raw IterationResult'",

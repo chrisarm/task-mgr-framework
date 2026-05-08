@@ -1,36 +1,29 @@
-/// Prompt builder for the autonomous agent loop.
-///
-/// Calls `next::next()` to select a task, then builds an enriched prompt with:
-/// - Source context from touchesFiles (via `context::scan_source_context`)
-/// - Dependency completion summaries
-/// - Synergy task diffs
-/// - UCB-ranked learnings (with shown IDs tracked for feedback loop)
-/// - Steering.md content (if present)
-/// - Session guidance (from .pause interactions)
-/// - Base prompt template
-/// - Reorder instruction
-///
-/// The prompt builder is the integration point between task selection, learning
-/// recall, source scanning, and the Claude subprocess.
+//! Sequential prompt builder for the autonomous agent loop.
+//!
+//! Calls `next::next()` to select a task, then builds an enriched prompt with:
+//! - Source context from touchesFiles (via `context::scan_source_context`)
+//! - Dependency completion summaries
+//! - Synergy task diffs
+//! - UCB-ranked learnings (with shown IDs tracked for feedback loop)
+//! - Steering.md content (if present)
+//! - Session guidance (from .pause interactions)
+//! - Base prompt template
+//! - Reorder instruction
+//!
+//! The prompt builder is the integration point between task selection, learning
+//! recall, source scanning, and the Claude subprocess.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-/// Bedrock prompt section helpers shared by sequential and slot prompt builders.
-///
-/// See `tests/prompt_core.rs` for the contract these helpers must honor.
-/// Implementations land in FEAT-001; current contents are placeholders.
-pub mod core;
-
-/// Slot-mode prompt builder. See `tests/prompt_slot.rs` for the contract.
-/// Implementation lands in FEAT-001; current contents are placeholders.
-pub mod slot;
-
 use crate::commands::next;
 use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context;
+use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
 use crate::loop_engine::prompt_sections::escalation::build_escalation_section;
 use crate::loop_engine::prompt_sections::learnings::{
@@ -135,7 +128,7 @@ pub struct BuildPromptParams<'a> {
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
     pub batch_sibling_prds: &'a [PathBuf],
     /// Resolved permission mode (for tool-awareness prompt section).
-    pub permission_mode: &'a super::config::PermissionMode,
+    pub permission_mode: &'a PermissionMode,
 }
 
 /// Build a prompt for the current iteration.
@@ -459,60 +452,12 @@ fn try_fit_section(
 
 /// Build a tool-awareness section that tells the agent what tools it has.
 ///
-/// Prevents the "I need Bash access" behavioral pattern by explicitly informing
-/// the agent about its available tools based on the resolved permission mode.
-fn build_tool_awareness_section(permission_mode: &super::config::PermissionMode) -> String {
-    use super::config::PermissionMode;
-
-    match permission_mode {
-        PermissionMode::Scoped {
-            allowed_tools: Some(tools),
-        } => {
-            // Extract Bash command prefixes: "Bash(cargo:*)" → "cargo"
-            let bash_prefixes: Vec<&str> = tools
-                .split(',')
-                .filter_map(|t| {
-                    let t = t.trim();
-                    t.strip_prefix("Bash(").and_then(|s| s.strip_suffix(":*)"))
-                })
-                .collect();
-
-            let tool_count = tools.split(',').count();
-            let mut section = format!(
-                "## Available Tools\n\n\
-                 You have {tool_count} pre-approved tools. "
-            );
-
-            if !bash_prefixes.is_empty() {
-                section.push_str(&format!(
-                    "Bash commands are scoped to: `{}`.\n",
-                    bash_prefixes.join("`, `")
-                ));
-            }
-
-            section.push_str(
-                "\nDo NOT say \"I need Bash access\" or ask for permission. \
-                 You already have these permissions — just use the tools.\n\n\
-                 **Environment variables**: Commands like `VAR=val command` will be denied \
-                 because the shell sees `VAR=val` as the first token, not `command`. \
-                 Use `env VAR=val command` instead — `env` is an allowed prefix.\n\n",
-            );
-
-            section
-        }
-        PermissionMode::Dangerous => "## Available Tools\n\n\
-             You have unrestricted tool access. Just use any tool you need.\n\n"
-            .to_string(),
-        PermissionMode::Auto { .. } => "## Available Tools\n\n\
-             You have auto-approved tool access. Just use any tool you need.\n\n"
-            .to_string(),
-        PermissionMode::Scoped {
-            allowed_tools: None,
-        } => {
-            // Text-only mode — no tools section needed
-            String::new()
-        }
-    }
+/// Thin delegate to [`core::build_tool_awareness_block`] — kept here as the
+/// historical name used by sequential's assembly path. Consolidating the
+/// implementation in `prompt::core` lets the slot builder share the exact
+/// same byte output.
+fn build_tool_awareness_section(permission_mode: &PermissionMode) -> String {
+    core::build_tool_awareness_block(permission_mode)
 }
 
 /// Record shown learnings via the UCB bandit system.
@@ -673,8 +618,7 @@ mod tests {
         insert_task_full, insert_test_learning, setup_test_db,
     };
 
-    static DEFAULT_PERM: super::super::config::PermissionMode =
-        super::super::config::PermissionMode::Dangerous;
+    static DEFAULT_PERM: PermissionMode = PermissionMode::Dangerous;
 
     /// Create a base prompt file and return its path.
     fn create_base_prompt(dir: &Path) -> std::path::PathBuf {
@@ -784,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_scoped_with_bash_prefixes() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let mode = PermissionMode::Scoped {
             allowed_tools: Some("Read,Edit,Bash(cargo:*),Bash(git:*),Write".to_string()),
         };
@@ -802,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_scoped_no_bash() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let mode = PermissionMode::Scoped {
             allowed_tools: Some("Read,Edit,Write".to_string()),
         };
@@ -813,14 +757,14 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_dangerous() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::Dangerous);
         assert!(section.contains("unrestricted tool access"));
     }
 
     #[test]
     fn test_tool_awareness_auto() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::Auto {
             allowed_tools: None,
         });
@@ -829,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_text_only_empty() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::text_only());
         assert!(section.is_empty());
     }
