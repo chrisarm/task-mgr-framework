@@ -1,26 +1,28 @@
-/// Prompt builder for the autonomous agent loop.
-///
-/// Calls `next::next()` to select a task, then builds an enriched prompt with:
-/// - Source context from touchesFiles (via `context::scan_source_context`)
-/// - Dependency completion summaries
-/// - Synergy task diffs
-/// - UCB-ranked learnings (with shown IDs tracked for feedback loop)
-/// - Steering.md content (if present)
-/// - Session guidance (from .pause interactions)
-/// - Base prompt template
-/// - Reorder instruction
-///
-/// The prompt builder is the integration point between task selection, learning
-/// recall, source scanning, and the Claude subprocess.
+//! Sequential prompt builder for the autonomous agent loop.
+//!
+//! Calls `next::next()` to select a task, then builds an enriched prompt with:
+//! - Source context from touchesFiles (via `context::scan_source_context`)
+//! - Dependency completion summaries
+//! - Synergy task diffs
+//! - UCB-ranked learnings (with shown IDs tracked for feedback loop)
+//! - Steering.md content (if present)
+//! - Session guidance (from .pause interactions)
+//! - Base prompt template
+//! - Reorder instruction
+//!
+//! The prompt builder is the integration point between task selection, learning
+//! recall, source scanning, and the Claude subprocess.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 use crate::commands::next;
-use crate::commands::next::output::NextResult;
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::context;
+use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
 use crate::loop_engine::prompt_sections::escalation::build_escalation_section;
 use crate::loop_engine::prompt_sections::learnings::{
@@ -125,7 +127,7 @@ pub struct BuildPromptParams<'a> {
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
     pub batch_sibling_prds: &'a [PathBuf],
     /// Resolved permission mode (for tool-awareness prompt section).
-    pub permission_mode: &'a super::config::PermissionMode,
+    pub permission_mode: &'a PermissionMode,
 }
 
 /// Build a prompt for the current iteration.
@@ -180,7 +182,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
     // ============================================================
 
     // Critical: Task JSON
-    let task_json = build_task_json(task_output, &next_result);
+    let task_json = core::format_next_task_json(task_output);
     let truncated_json = truncate_to_budget(&task_json, TASK_CONTEXT_BUDGET);
     let task_section = format!("## Current Task\n\n```json\n{}\n```\n\n", truncated_json);
 
@@ -351,7 +353,7 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         &mut dropped_sections,
     );
 
-    let key_decision_section = build_key_decision_section(&task_output.id);
+    let key_decision_section = core::build_key_decisions_block(&task_output.id);
     let key_decision_section = try_fit_section(
         key_decision_section,
         "Key Decision Instructions",
@@ -449,66 +451,14 @@ fn try_fit_section(
 
 /// Build a tool-awareness section that tells the agent what tools it has.
 ///
-/// Prevents the "I need Bash access" behavioral pattern by explicitly informing
-/// the agent about its available tools based on the resolved permission mode.
-fn build_tool_awareness_section(permission_mode: &super::config::PermissionMode) -> String {
-    use super::config::PermissionMode;
-
-    match permission_mode {
-        PermissionMode::Scoped {
-            allowed_tools: Some(tools),
-        } => {
-            // Extract Bash command prefixes: "Bash(cargo:*)" → "cargo"
-            let bash_prefixes: Vec<&str> = tools
-                .split(',')
-                .filter_map(|t| {
-                    let t = t.trim();
-                    t.strip_prefix("Bash(").and_then(|s| s.strip_suffix(":*)"))
-                })
-                .collect();
-
-            let tool_count = tools.split(',').count();
-            let mut section = format!(
-                "## Available Tools\n\n\
-                 You have {tool_count} pre-approved tools. "
-            );
-
-            if !bash_prefixes.is_empty() {
-                section.push_str(&format!(
-                    "Bash commands are scoped to: `{}`.\n",
-                    bash_prefixes.join("`, `")
-                ));
-            }
-
-            section.push_str(
-                "\nDo NOT say \"I need Bash access\" or ask for permission. \
-                 You already have these permissions — just use the tools.\n\n\
-                 **Environment variables**: Commands like `VAR=val command` will be denied \
-                 because the shell sees `VAR=val` as the first token, not `command`. \
-                 Use `env VAR=val command` instead — `env` is an allowed prefix.\n\n",
-            );
-
-            section
-        }
-        PermissionMode::Dangerous => "## Available Tools\n\n\
-             You have unrestricted tool access. Just use any tool you need.\n\n"
-            .to_string(),
-        PermissionMode::Auto { .. } => "## Available Tools\n\n\
-             You have auto-approved tool access. Just use any tool you need.\n\n"
-            .to_string(),
-        PermissionMode::Scoped {
-            allowed_tools: None,
-        } => {
-            // Text-only mode — no tools section needed
-            String::new()
-        }
-    }
+/// Thin delegate to [`core::build_tool_awareness_block`] — kept here as the
+/// historical name used by sequential's assembly path. Consolidating the
+/// implementation in `prompt::core` lets the slot builder share the exact
+/// same byte output.
+fn build_tool_awareness_section(permission_mode: &PermissionMode) -> String {
+    core::build_tool_awareness_block(permission_mode)
 }
 
-/// Record shown learnings via the UCB bandit system.
-///
-/// Returns the list of learning IDs that were shown (for feedback tracking).
-/// Errors are logged but don't prevent prompt building.
 /// Build a steering section string from the steering.md file.
 fn build_steering_section(steering_path: &Path) -> String {
     match fs::read_to_string(steering_path) {
@@ -517,41 +467,6 @@ fn build_steering_section(steering_path: &Path) -> String {
         }
         _ => String::new(),
     }
-}
-
-/// Build the key-decision instruction section.
-///
-/// Explains the `<key-decision>` XML tag format to Claude. For tasks whose ID
-/// contains "REVIEW" or "VERIFY", adds extra emphasis on architectural alternatives.
-/// This is a trimmable (non-critical) section.
-fn build_key_decision_section(task_id: &str) -> String {
-    let is_review = task_id.contains("REVIEW") || task_id.contains("VERIFY");
-
-    let review_emphasis = if is_review {
-        "\n\nFor this task (code review / verification), **actively look for architectural \
-         alternatives** and flag any decision forks where a different approach would have \
-         significant long-term impact on maintainability, performance, or correctness.\n"
-    } else {
-        ""
-    };
-
-    format!(
-        "## Key Decision Points\n\n\
-         If you discover an important architectural decision during this task — a fork in \
-         the road where different choices have significant long-term consequences — emit a \
-         `<key-decision>` tag so it can be reviewed and stored for follow-up.\n\
-         {review_emphasis}\n\
-         **Format:**\n\
-         ```xml\n\
-         <key-decision>\n\
-           <title>Short descriptive title</title>\n\
-           <description>Why this decision matters and what the trade-offs are</description>\n\
-           <option label=\"Option A\">Trade-offs for A</option>\n\
-           <option label=\"Option B\">Trade-offs for B</option>\n\
-         </key-decision>\n\
-         ```\n\n\
-         Only emit this for genuine architectural forks. Skip trivial implementation details.\n\n"
-    )
 }
 
 /// Append steering.md content to the prompt if the file exists.
@@ -579,40 +494,6 @@ fn append_synergy_context(
     run_id: Option<&str>,
 ) {
     prompt.push_str(&build_synergy_section(conn, task_id, run_id));
-}
-
-/// Build a JSON representation of the task for inclusion in the prompt.
-fn build_task_json(
-    task: &crate::commands::next::output::NextTaskOutput,
-    _next_result: &NextResult,
-) -> String {
-    // Build a simplified JSON that includes what Claude needs
-    let mut json = serde_json::json!({
-        "id": task.id,
-        "title": task.title,
-        "priority": task.priority,
-        "status": task.status,
-        "acceptanceCriteria": task.acceptance_criteria,
-        "files": task.files,
-    });
-
-    if let Some(ref desc) = task.description {
-        json["description"] = serde_json::Value::String(desc.clone());
-    }
-    if let Some(ref notes) = task.notes {
-        json["notes"] = serde_json::Value::String(notes.clone());
-    }
-    if let Some(ref model) = task.model {
-        json["model"] = serde_json::Value::String(model.clone());
-    }
-    if let Some(ref difficulty) = task.difficulty {
-        json["difficulty"] = serde_json::Value::String(difficulty.clone());
-    }
-    if let Some(ref escalation_note) = task.escalation_note {
-        json["escalationNote"] = serde_json::Value::String(escalation_note.clone());
-    }
-
-    serde_json::to_string_pretty(&json).unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id))
 }
 
 /// Build a base prompt section string from the template file.
@@ -663,8 +544,7 @@ mod tests {
         insert_task_full, insert_test_learning, setup_test_db,
     };
 
-    static DEFAULT_PERM: super::super::config::PermissionMode =
-        super::super::config::PermissionMode::Dangerous;
+    static DEFAULT_PERM: PermissionMode = PermissionMode::Dangerous;
 
     /// Create a base prompt file and return its path.
     fn create_base_prompt(dir: &Path) -> std::path::PathBuf {
@@ -774,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_scoped_with_bash_prefixes() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let mode = PermissionMode::Scoped {
             allowed_tools: Some("Read,Edit,Bash(cargo:*),Bash(git:*),Write".to_string()),
         };
@@ -792,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_scoped_no_bash() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let mode = PermissionMode::Scoped {
             allowed_tools: Some("Read,Edit,Write".to_string()),
         };
@@ -803,14 +683,14 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_dangerous() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::Dangerous);
         assert!(section.contains("unrestricted tool access"));
     }
 
     #[test]
     fn test_tool_awareness_auto() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::Auto {
             allowed_tools: None,
         });
@@ -819,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_tool_awareness_text_only_empty() {
-        use super::super::config::PermissionMode;
+        use crate::loop_engine::config::PermissionMode;
         let section = build_tool_awareness_section(&PermissionMode::text_only());
         assert!(section.is_empty());
     }
@@ -847,18 +727,7 @@ mod tests {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "test".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
         assert!(json.contains("FEAT-001"));
         assert!(json.contains("Test task"));
         assert!(json.contains("AC1"));
@@ -1633,18 +1502,7 @@ pub enum ApiError {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "highest score".to_string(),
-                eligible_count: 5,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
 
         assert!(json.contains("FEAT-042"), "Should contain task ID");
         assert!(json.contains("Complex feature"), "Should contain title");
@@ -1710,18 +1568,7 @@ pub enum ApiError {
             },
         };
 
-        let next_result = NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "only task".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        };
-
-        let json = build_task_json(&task, &next_result);
+        let json = core::format_next_task_json(&task);
 
         assert!(json.contains("FIX-001"), "Should contain task ID");
         assert!(json.contains("Quick fix"), "Should contain title");
@@ -1782,24 +1629,10 @@ pub enum ApiError {
         }
     }
 
-    fn empty_next_result(task: &NextTaskOutput) -> NextResult {
-        NextResult {
-            task: Some(task.clone()),
-            learnings: vec![],
-            selection: SelectionMetadata {
-                reason: "test".to_string(),
-                eligible_count: 1,
-            },
-            claim: None,
-            top_candidates: vec![],
-        }
-    }
-
     #[test]
     fn test_build_task_json_model_field_only() {
         let task = task_output_with_model_fields(Some(HAIKU_MODEL), None, None);
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             json.contains("\"model\""),
@@ -1822,8 +1655,7 @@ pub enum ApiError {
     #[test]
     fn test_build_task_json_difficulty_field_only() {
         let task = task_output_with_model_fields(None, Some("medium"), None);
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             !json.contains("\"model\""),
@@ -1847,8 +1679,7 @@ pub enum ApiError {
     fn test_build_task_json_escalation_note_field_only() {
         let task =
             task_output_with_model_fields(None, None, Some("Needs opus for complex reasoning"));
-        let result = empty_next_result(&task);
-        let json = build_task_json(&task, &result);
+        let json = core::format_next_task_json(&task);
 
         assert!(
             !json.contains("\"model\""),

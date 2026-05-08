@@ -389,6 +389,38 @@ a fix in response to a milestone's AC. The selection-side guard is the catch;
 the prompt-side teaching is the cause-fix. Both layers ship together by design
 — neither is sufficient alone.
 
+## Iteration pipeline (shared)
+
+Sequential (`run_iteration`) and parallel-wave (`run_slot_iteration` +
+`process_slot_result`) execution paths share a single post-Claude pipeline:
+`process_iteration_output` in `src/loop_engine/iteration_pipeline.rs`. The
+module-level rustdoc lists the steps in order (progress logging,
+`<key-decision>` extraction, `<task-status>` dispatch, completion ladder
+including the `is_task_reported_already_complete` fallback, learning
+extraction, bandit feedback, per-task crash tracking) and the two engine.rs
+call sites (sequential at ~3204 in `run_loop`, wave at ~1166 in
+`process_slot_result`).
+
+**Why a shared pipeline**: before this unification, wave mode silently
+skipped behaviors the sequential path treated as core — slot output was
+never extracted for new learnings, bandit feedback never updated, and the
+completion fallback didn't fire. The single-pipeline contract makes
+parity-divergence a compile-time concern (any new step is added in one
+place; both call sites pick it up).
+
+**Prompt-builder companion**: `src/loop_engine/prompt/mod.rs` documents the
+three-builder layout (`core` / `sequential` / `slot`) plus the main-thread
+bundle rule — slot prompts must be built on the main thread before
+`thread::spawn` because `rusqlite::Connection` is `!Send`. A compile-time
+`Send` assertion on `SlotPromptBundle` enforces this; sections added to the
+sequential prompt MUST also be wired through the wave builder so the two
+paths cannot drift again.
+
+**Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
+external-git reconciliation, human-review trigger, rate-limit waits,
+pause-signal handling, slot merge resolution (see "Slot merge-back conflict
+resolution" below).
+
 ## Slot merge-back conflict resolution
 
 When parallel-slot waves finish, `merge_slot_branches_with_resolver` (in
@@ -402,3 +434,8 @@ rewrites. The resolver's `Resolved` claim is **never trusted**: the caller re-in
 MERGE_HEAD and HEAD post-spawn and downgrades a lying resolver to `failed_slots` with a
 forced `git reset --hard pre_merge_head`. `SlotFailureKind::ResolverAttempted` vs
 `PreResolver` lets engine.rs pick the right warning text without string-sniffing.
+
+Note: merge resolution is intentionally NOT part of the shared
+`iteration_pipeline` (see "Iteration pipeline (shared)" above) — it requires
+working-tree state owned by `run_wave_iteration`, not the per-slot
+post-Claude processing block.

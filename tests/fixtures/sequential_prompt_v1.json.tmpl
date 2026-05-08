@@ -1,0 +1,23 @@
+{
+  "branchName": "feature/sequential-snapshot",
+  "description": "Minimal PRD fixture for the prompt::sequential snapshot test. One task, no synergyWith / dependsOn / touchesFiles, deterministic content. The snapshot pins prompt::sequential::build_prompt output byte-for-byte across the Phase A refactor.",
+  "project": "sequential-snapshot-fixture",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Snapshot test asserts byte equality against tests/snapshots/prompt_sequential_v1.txt"
+      ],
+      "batchWith": [],
+      "conflictsWith": [],
+      "dependsOn": [],
+      "description": "Stable baseline task used only for the prompt-builder snapshot test. No touchesFiles ensures the source-context section is empty. No synergyWith / dependsOn ensures the synergy and dependency sections are empty. Keep title / description / acceptanceCriteria stable to preserve byte-identity across refactors.",
+      "id": "SEQ-SNAP-001",
+      "notes": "Stable fixture. Do not edit without intentionally regenerating the snapshot via INSTA_UPDATE=1.",
+      "passes": false,
+      "priority": 1,
+      "synergyWith": [],
+      "title": "Snapshot baseline task",
+      "touchesFiles": []
+    }
+  ]
+}
