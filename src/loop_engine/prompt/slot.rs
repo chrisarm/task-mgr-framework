@@ -1,11 +1,6 @@
 //! Slot-mode prompt builder: composes `prompt::core` helpers into a Send-safe
 //! bundle that wave workers consume after being spawned on a separate thread.
 //!
-//! These are placeholders (TDD scaffolding). The real implementations land in
-//! FEAT-001 alongside `prompt::core`. Each helper returns a trivial empty
-//! bundle so callers compile against the real signatures while
-//! `tests/prompt_slot.rs` (TEST-INIT-002) drives the contract.
-//!
 //! Invariants the implementation MUST honor (validated by the test suite):
 //! - `SlotPromptBundle: Send` — verified at compile time via
 //!   `static_assertions::assert_impl_all!` in the integration tests. Adding any
@@ -20,12 +15,25 @@
 //! - `bundle.shown_learning_ids` is non-empty whenever the learnings block
 //!   was rendered (so `record_shown_learnings` gets fed by the wave path).
 
+use std::fs;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
 
 use crate::loop_engine::config::PermissionMode;
+use crate::loop_engine::prompt::core;
+use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
+use crate::loop_engine::prompt_sections::truncate_to_budget;
 use crate::models::Task;
+
+/// Byte budget for the source-context section in slot prompts.
+const SOURCE_CONTEXT_BUDGET: usize = 2000;
+
+/// Byte budget for the learnings section in slot prompts.
+const LEARNINGS_BUDGET: usize = 4000;
+
+/// Byte budget for the base prompt template in slot prompts.
+const BASE_PROMPT_BUDGET: usize = 16_000;
 
 /// Parameters required to assemble a slot-mode prompt on the main thread.
 ///
@@ -68,25 +76,85 @@ pub struct SlotPromptBundle {
     pub resolved_model: Option<String>,
 }
 
+/// Load file paths for a task from the `task_files` join table.
+///
+/// Returns an empty vec on any DB error (graceful degradation — a missing
+/// source-context section is better than aborting prompt assembly).
+fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
+    let mut stmt = match conn
+        .prepare("SELECT file_path FROM task_files WHERE task_id = ?1 ORDER BY file_path")
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: failed to prepare task_files query: {e}");
+            return Vec::new();
+        }
+    };
+
+    stmt.query_map([task_id], |row| row.get(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: failed to query task_files for {task_id}: {e}");
+            Vec::new()
+        })
+}
+
+/// Read and truncate the base prompt template. Returns `""` on IO failure.
+fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
+    match fs::read_to_string(base_prompt_path) {
+        Ok(content) => truncate_to_budget(&content, BASE_PROMPT_BUDGET),
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to read base prompt {}: {e}",
+                base_prompt_path.display()
+            );
+            String::new()
+        }
+    }
+}
+
 /// Build a slot-mode prompt bundle. Runs on the main thread because it reads
 /// the DB; the resulting `SlotPromptBundle` is `Send` and is moved into the
 /// worker thread.
 ///
-/// Stub: returns an empty bundle with `task_id` populated. The empty `prompt`
-/// is the discriminator that the TEST-INIT-002 content assertions catch — a
-/// real implementation must compose `prompt::core::build_learnings_block` +
-/// `build_source_context_block` + `build_tool_awareness_block` +
-/// `build_key_decisions_block` and append the base prompt.
-pub fn build_prompt(
-    _conn: &Connection,
-    task: &Task,
-    _params: &SlotPromptParams,
-) -> SlotPromptBundle {
+/// Composes `prompt::core` helpers: learnings, source context, tool awareness,
+/// key decisions, and completed dependency summaries. Drops synergy cluster
+/// escalation, reorder instruction, and sibling-PRD context — wave slots are
+/// disjoint by design.
+pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -> SlotPromptBundle {
+    let task_files = load_task_files(conn, &task.id);
+
+    let (learnings_section, shown_learning_ids) =
+        core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
+
+    let source_section =
+        core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
+
+    let tool_section = core::build_tool_awareness_block(&params.permission_mode);
+
+    let key_decisions_section = core::build_key_decisions_block(task);
+
+    let dep_section = build_dependency_section(conn, &task.id);
+
+    let completion_section = core::completion_instruction(&task.id, &task.title);
+
+    let base_prompt = load_base_prompt(&params.base_prompt_path);
+
+    let prompt = format!(
+        "{learnings_section}{source_section}{dep_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
+    );
+
+    let resolved_model = task
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned);
+
     SlotPromptBundle {
-        prompt: String::new(),
+        prompt,
         task_id: task.id.clone(),
-        task_files: Vec::new(),
-        shown_learning_ids: Vec::new(),
-        resolved_model: None,
+        task_files,
+        shown_learning_ids,
+        resolved_model,
     }
 }

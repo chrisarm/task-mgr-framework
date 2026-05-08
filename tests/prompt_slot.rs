@@ -114,7 +114,6 @@ fn build_prompt_sets_task_id_to_input_task_id() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 wires build_prompt to compose learnings block (stub returns empty bundle)"]
 fn build_prompt_includes_learnings_section_and_ids_when_db_has_matches() {
     let (_tmp, conn) = setup_migrated_db();
 
@@ -177,7 +176,6 @@ fn build_prompt_includes_learnings_section_and_ids_when_db_has_matches() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 wires build_prompt to compose source-context block (stub returns empty)"]
 fn build_prompt_includes_source_context_when_touches_files_resolve() {
     let (_tmp, conn) = setup_migrated_db();
 
@@ -232,7 +230,6 @@ fn build_prompt_includes_source_context_when_touches_files_resolve() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 wires build_prompt to compose tool-awareness block (stub returns empty)"]
 fn build_prompt_includes_tool_awareness_block() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
@@ -265,7 +262,6 @@ fn build_prompt_includes_tool_awareness_block() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 wires build_prompt to compose key-decisions block (stub returns empty)"]
 fn build_prompt_includes_key_decisions_block() {
     let (_tmp, conn) = setup_migrated_db();
     let project = project_with_files(&[]);
@@ -335,9 +331,28 @@ fn slot_worker_panic_after_bundle_construction_records_bundle_task_id() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-001 fills in build_prompt; until then the bundle is the known-bad discriminator"]
-fn empty_prompt_stub_fails_section_assertions() {
+fn all_four_standard_sections_present_in_assembled_prompt() {
     let (_tmp, conn) = setup_migrated_db();
+
+    // Insert a learning so the learnings block is non-empty and the
+    // '## Relevant Learnings' header appears in the assembled prompt.
+    let params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "all four sections guard test".into(),
+        content: "contract: every build_prompt call must include all four standard sections."
+            .into(),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/loop_engine/prompt/slot.rs".into()]),
+        applies_to_task_types: Some(vec!["TEST-".into(), "FEAT-".into()]),
+        applies_to_errors: None,
+        tags: Some(vec!["prompt".into(), "slot".into()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, params).expect("record_learning");
+
     let project = project_with_files(&[]);
     let base_prompt = project.path().join("prompt.md");
     fs::write(&base_prompt, "# base\n").unwrap();
@@ -349,16 +364,12 @@ fn empty_prompt_stub_fails_section_assertions() {
         &make_params(project.path().to_path_buf(), base_prompt),
     );
 
-    // Once FEAT-001 lands, this assertion turns from "documents the
-    // discriminator" into "guards the contract": every section must be
-    // present in the assembled prompt.
     assert!(
         !bundle.prompt.is_empty()
             && bundle.prompt.contains("## Relevant Learnings")
             && bundle.prompt.to_ascii_lowercase().contains("tool")
             && bundle.prompt.contains("key-decision"),
-        "all four standard sections must appear in bundle.prompt; the empty-string stub is \
-         the known-bad discriminator. got:\n{}",
+        "all four standard sections must appear in bundle.prompt; got:\n{}",
         bundle.prompt
     );
 }
