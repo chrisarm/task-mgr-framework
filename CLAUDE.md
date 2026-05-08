@@ -71,6 +71,7 @@ hint and skip — no hang.
 - **Mark status**: emit `<task-status>TASK-ID:done</task-status>` (also: `failed`, `skipped`, `irrelevant`, `blocked`)
 - **Permission guard**: loop iterations deny Edit/Write on `tasks/*.json` via `--disallowedTools`
 - **Never edit** `.task-mgr/tasks/*.json` directly — use the CLI and tags above
+- **Spawn-fixup PRD targeting**: when a CODE-REVIEW or MILESTONE iteration spawns ad-hoc fixup tasks (`CODE-FIX-`, `WIRE-FIX-`, `IMPL-FIX-`, `REFACTOR-N-`), the `task-mgr add --stdin` invocation MUST disambiguate the destination PRD or the entry leaks into whatever PRD JSON the CLI defaults to. Two reliable forms: (a) pass `--from-json tasks/<correct-prd>.json`, or (b) pipe `--depended-on-by <milestone-of-correct-prd>` so the prefix is unambiguous from the dependency edge. Symptom of getting it wrong: orphan `passes: false` placeholders showing up in an unrelated PRD's JSON during merge-back review (real example: this PRD's CODE-REVIEW-1 spawned `WIRE-FIX-001`/`CODE-FIX-002` into `loop-reliability.json`; the actual fix landed correctly under REFACTOR-N tasks, but the misfiled placeholders persisted as cosmetic drift).
 
 ## Overflow recovery and diagnostics
 
