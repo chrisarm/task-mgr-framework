@@ -206,18 +206,6 @@ pub struct IterationContext {
     pub reorder_hint: Option<String>,
     /// Count of consecutive reorders
     pub reorder_count: u32,
-    /// Task ID from the previous iteration. Loop-thread-local — no concurrency concern.
-    /// Used by crash escalation logic (FEAT-007) to detect same-task consecutive crashes.
-    ///
-    /// SUPERSEDED by `crashed_last_iteration` — FEAT-007 will remove this field.
-    /// Currently retained so `process_iteration_output` keeps compiling until
-    /// FEAT-007 cuts the writers/readers over to the per-task map.
-    pub last_task_id: Option<String>,
-    /// Whether the previous iteration crashed. Loop-thread-local — no concurrency concern.
-    /// Used by crash escalation logic (FEAT-007) to trigger model escalation.
-    ///
-    /// SUPERSEDED by `crashed_last_iteration` — FEAT-007 will remove this field.
-    pub last_was_crash: bool,
     /// Per-task crash flag for the most recent iteration on each task. The
     /// pipeline writes one entry per iteration:
     /// `map[task_id] = matches!(outcome, IterationOutcome::Crash(_))`.
@@ -287,8 +275,6 @@ impl IterationContext {
             stale_tracker: StaleTracker::default(),
             reorder_hint: None,
             reorder_count: 0,
-            last_task_id: None,
-            last_was_crash: false,
             crashed_last_iteration: std::collections::HashMap::new(),
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
@@ -1722,19 +1708,15 @@ pub fn run_iteration(
     // Step 4.5: Apply crash escalation and PromptTooLong model overrides
     let effective_model = {
         let resolved = prompt_result.resolved_model.as_deref();
-        let after_crash_escalation = match check_crash_escalation(
-            ctx.last_task_id.as_deref(),
-            &task_id,
-            ctx.last_was_crash,
-            resolved,
-        ) {
-            Some(escalated) => {
-                let old = resolved.unwrap_or("(default)");
-                eprintln!("Crash escalation: {} → {}", old, escalated);
-                Some(escalated)
-            }
-            None => prompt_result.resolved_model.clone(),
-        };
+        let after_crash_escalation =
+            match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
+                Some(escalated) => {
+                    let old = resolved.unwrap_or("(default)");
+                    eprintln!("Crash escalation: {} → {}", old, escalated);
+                    Some(escalated)
+                }
+                None => prompt_result.resolved_model.clone(),
+            };
         // Apply per-task 1M model override from prior PromptTooLong recovery
         if let Some(override_model) = ctx.model_overrides.get(&task_id) {
             let old = after_crash_escalation.as_deref().unwrap_or("(default)");
@@ -2053,10 +2035,6 @@ pub fn run_iteration(
 
     // Step 11: Update last_files for next iteration scoring
     ctx.last_files = task_files.clone();
-
-    // Step 11.5: Update crash escalation context for next iteration
-    ctx.last_task_id = Some(task_id.clone());
-    ctx.last_was_crash = matches!(outcome, IterationOutcome::Crash(_));
 
     // Step 12: Inter-iteration delay (skip if stopping or signaled)
     if !should_stop && !params.inter_iteration_delay.is_zero() && !params.signal_flag.is_signaled()
@@ -3935,26 +3913,25 @@ pub fn apply_status_updates(
 
 /// Check whether crash recovery should escalate the model for this iteration.
 ///
-/// Returns `Some(escalated_model)` when BOTH conditions are met:
-/// 1. The current task is the same as the previous iteration's task
-/// 2. The previous iteration crashed (`last_was_crash`)
+/// Returns `Some(escalated_model)` when the previous iteration on
+/// `current_task_id` crashed (i.e. `crashed_last_iteration[current_task_id]
+/// == true`). Returns `None` when the task is absent from the map or its
+/// last outcome was not a crash.
 ///
 /// When `resolved_model` is `None`, assumes `SONNET_MODEL` baseline
 /// and escalates to `OPUS_MODEL` (architect decision: None crash → opus).
 ///
 /// Escalation is independent of `CrashTracker` backoff logic.
-// TODO(FEAT-007): Implement escalation logic
 pub fn check_crash_escalation(
-    last_task_id: Option<&str>,
+    crashed_last_iteration: &std::collections::HashMap<String, bool>,
     current_task_id: &str,
-    last_was_crash: bool,
     resolved_model: Option<&str>,
 ) -> Option<String> {
-    // Escalation requires BOTH same task AND previous crash
-    if !last_was_crash {
-        return None;
-    }
-    if last_task_id != Some(current_task_id) {
+    if !crashed_last_iteration
+        .get(current_task_id)
+        .copied()
+        .unwrap_or(false)
+    {
         return None;
     }
     // None / empty / whitespace model: assume sonnet baseline, escalate to opus
@@ -4323,8 +4300,6 @@ mod tests {
         assert!(ctx.session_guidance.is_empty());
         assert!(ctx.reorder_hint.is_none());
         assert_eq!(ctx.reorder_count, 0);
-        assert!(ctx.last_task_id.is_none());
-        assert!(!ctx.last_was_crash);
         assert!(
             ctx.crashed_last_iteration.is_empty(),
             "TEST-INIT-004 contract: per-task crash map starts empty"
@@ -4701,25 +4676,31 @@ mod tests {
     }
 
     // --- check_crash_escalation tests ---
-    //
-    // Active tests validate the no-escalation paths (pass against stub).
-    // Tests below verify FEAT-007 crash escalation behavior.
 
-    /// First iteration: no previous task context, no crash — no escalation.
+    /// Build a `crashed_last_iteration` map from a slice of `(task_id, is_crash)` pairs.
+    fn crash_map(entries: &[(&str, bool)]) -> std::collections::HashMap<String, bool> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// First iteration: empty map — no crash recorded yet.
     #[test]
     fn test_crash_escalation_first_iteration_no_crash() {
-        let result = check_crash_escalation(None, "FEAT-001", false, Some(SONNET_MODEL));
+        let result = check_crash_escalation(&crash_map(&[]), "FEAT-001", Some(SONNET_MODEL));
         assert_eq!(
             result, None,
             "first iteration without crash must not escalate"
         );
     }
 
-    /// First iteration with crash: no previous task to compare — no escalation.
-    /// Edge case: last_task_id=None means we can't determine same-task.
+    /// First iteration with crash: task absent from map — no escalation yet
+    /// (the pipeline writes to the map AFTER the iteration, so the first pick
+    /// of a new task always finds it absent).
     #[test]
     fn test_crash_escalation_first_iteration_with_crash() {
-        let result = check_crash_escalation(None, "FEAT-001", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(&crash_map(&[]), "FEAT-001", Some(SONNET_MODEL));
         assert_eq!(
             result, None,
             "first iteration crash has no previous task context, cannot escalate"
@@ -4729,8 +4710,11 @@ mod tests {
     /// Same task but no crash — no escalation.
     #[test]
     fn test_crash_escalation_same_task_no_crash() {
-        let result =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(result, None, "same task without crash must not escalate");
     }
 
@@ -4738,7 +4722,11 @@ mod tests {
     /// does not carry forward).
     #[test]
     fn test_crash_escalation_different_task_with_crash() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-002",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             result, None,
             "crash on different task must not escalate for new task"
@@ -4749,7 +4737,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_haiku_to_sonnet() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             result,
             Some(SONNET_MODEL.to_string()),
@@ -4761,7 +4753,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_sonnet_to_opus() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -4773,7 +4769,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_opus_ceiling() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(OPUS_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(OPUS_MODEL),
+        );
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -4787,7 +4787,7 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_none_model_to_opus() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, None);
+        let result = check_crash_escalation(&crash_map(&[("FEAT-001", true)]), "FEAT-001", None);
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -4801,7 +4801,8 @@ mod tests {
     #[test]
     fn test_crash_escalation_empty_and_whitespace_normalize_to_opus() {
         for bad in ["", "   ", "\t", " \n "] {
-            let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(bad));
+            let result =
+                check_crash_escalation(&crash_map(&[("FEAT-001", true)]), "FEAT-001", Some(bad));
             assert_eq!(
                 result,
                 Some(OPUS_MODEL.to_string()),
@@ -4817,17 +4818,27 @@ mod tests {
 
     fn test_crash_escalation_requires_both_conditions() {
         // Only same task (no crash) — must NOT escalate
-        let no_crash =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        let no_crash = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(no_crash, None, "same task without crash must NOT escalate");
 
         // Only crash (different task) — must NOT escalate
-        let diff_task =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        let diff_task = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-002",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(diff_task, None, "crash on different task must NOT escalate");
 
         // BOTH conditions — MUST escalate
-        let both = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        let both = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             both,
             Some(OPUS_MODEL.to_string()),
@@ -4838,26 +4849,35 @@ mod tests {
     // ===== TEST-004: Comprehensive crash recovery escalation tests =====
 
     /// AC: Crash on task A, success on task A, crash on task A again.
-    /// After success, last_was_crash is false, so the next crash escalates from
-    /// the base model (not from the previously escalated model).
+    /// After success the map entry flips to false, so the next crash escalates
+    /// from the base model (not the previously escalated model).
     #[test]
     fn test_crash_escalation_success_resets_escalation() {
         // First crash: haiku → sonnet
-        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let first = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(first, Some(SONNET_MODEL.to_string()));
 
-        // Success: last_was_crash becomes false. Simulating with false:
-        let after_success =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, first.as_deref());
+        // After success the pipeline writes false into the map.
+        let after_success = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            first.as_deref(),
+        );
         assert_eq!(
             after_success, None,
             "After success, no crash escalation should occur"
         );
 
-        // Crash again on same task with original base model:
-        // In real flow, resolved_model would come from build_prompt fresh (haiku again)
-        let second_crash =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        // Crash again on same task with original base model.
+        let second_crash = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             second_crash,
             Some(SONNET_MODEL.to_string()),
@@ -4865,17 +4885,18 @@ mod tests {
         );
     }
 
-    /// AC: Crash on task A, then crash on task B → no escalation for task B.
-    /// The crash escalation is task-scoped.
+    /// AC: Crash on task A, then task B is picked → no escalation for task B.
+    /// The crash flag is keyed by task_id; TASK-B is absent from the map.
     #[test]
     fn test_crash_escalation_task_boundary_isolation() {
         // Crash on task A: haiku → sonnet
-        let crash_a = check_crash_escalation(Some("TASK-A"), "TASK-A", true, Some(HAIKU_MODEL));
+        let crash_a =
+            check_crash_escalation(&crash_map(&[("TASK-A", true)]), "TASK-A", Some(HAIKU_MODEL));
         assert_eq!(crash_a, Some(SONNET_MODEL.to_string()));
 
-        // Now task B is selected. last_task_id is "TASK-A", current is "TASK-B".
-        // Even though last_was_crash is true, different task → no escalation.
-        let crash_b = check_crash_escalation(Some("TASK-A"), "TASK-B", true, Some(HAIKU_MODEL));
+        // Task B is selected next. TASK-A crashed but TASK-B is absent from map.
+        let crash_b =
+            check_crash_escalation(&crash_map(&[("TASK-A", true)]), "TASK-B", Some(HAIKU_MODEL));
         assert_eq!(
             crash_b, None,
             "Crash escalation must not carry across task boundaries"
@@ -4883,15 +4904,20 @@ mod tests {
     }
 
     /// AC: Crash escalation is independent of CrashTracker backoff count.
-    /// check_crash_escalation doesn't inspect CrashTracker — it only uses
-    /// last_task_id, current_task_id, last_was_crash, and resolved_model.
+    /// check_crash_escalation only consults the map and resolved_model.
     #[test]
     fn test_crash_escalation_independent_of_crash_tracker() {
-        // Regardless of how many times CrashTracker has recorded crashes,
-        // check_crash_escalation only cares about the 4 parameters.
-        // Same inputs produce same outputs — no hidden state.
-        let result1 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
-        let result2 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        // Same map + same task + same model → same result every time.
+        let result1 = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
+        let result2 = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             result1, result2,
             "Same inputs must produce same outputs — no hidden state"
@@ -4908,8 +4934,9 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_consecutive_ladder() {
+        let crashed = crash_map(&[("FEAT-001", true)]);
         // First crash: haiku → sonnet
-        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let first = check_crash_escalation(&crashed, "FEAT-001", Some(HAIKU_MODEL));
         assert_eq!(
             first,
             Some(SONNET_MODEL.to_string()),
@@ -4917,7 +4944,7 @@ mod tests {
         );
 
         // Second crash: feed escalated model back in (sonnet → opus)
-        let second = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, first.as_deref());
+        let second = check_crash_escalation(&crashed, "FEAT-001", first.as_deref());
         assert_eq!(
             second,
             Some(OPUS_MODEL.to_string()),
@@ -4925,7 +4952,7 @@ mod tests {
         );
 
         // Third crash: opus → opus (ceiling)
-        let third = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, second.as_deref());
+        let third = check_crash_escalation(&crashed, "FEAT-001", second.as_deref());
         assert_eq!(
             third,
             Some(OPUS_MODEL.to_string()),

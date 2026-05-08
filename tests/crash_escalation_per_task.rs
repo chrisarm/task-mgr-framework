@@ -231,7 +231,6 @@ fn check_crash_escalation_does_not_require_legacy_fields_on_ctx() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-007: pipeline must write ctx.crashed_last_iteration[task_id] = is_crash"]
 fn wave_crash_on_task_populates_crashed_last_iteration_true() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -286,7 +285,6 @@ fn wave_crash_on_task_populates_crashed_last_iteration_true() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-007: check_crash_escalation must consult ctx.crashed_last_iteration"]
 fn sequential_repick_after_wave_crash_escalates_per_ladder() {
     let mut ctx = IterationContext::new(5);
     // Wave path recorded a crash on TASK-X (simulated — FEAT-007 pipeline
@@ -322,7 +320,6 @@ fn sequential_repick_after_wave_crash_escalates_per_ladder() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-007: pipeline must write false on success; check_crash_escalation must honor it"]
 fn sequential_success_clears_crashed_last_iteration_for_task() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -389,7 +386,6 @@ fn sequential_success_clears_crashed_last_iteration_for_task() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "FEAT-007: pipeline must key writes by task_id, not iteration count"]
 fn pipeline_loop_keeps_crashed_last_iteration_bounded_by_task_count() {
     let (db_temp, mut conn) = setup_migrated_db();
     disable_llm_extraction();
@@ -446,15 +442,21 @@ fn pipeline_loop_keeps_crashed_last_iteration_bounded_by_task_count() {
 // fails the cross-mode test.
 //
 // Active assertion: same-task consecutive crash on a haiku-baseline task must
-// produce SONNET as the escalated model. A regression that returns None
-// (whether through the legacy scalars OR the post-FEAT-007 map read) is
-// caught here. The test uses the legacy 4-arg signature today; it will be
-// updated to the ctx-aware shape when FEAT-007 lands.
+// produce SONNET as the escalated model. A regression that returns None is
+// caught here.
 // ---------------------------------------------------------------------------
+
+fn crash_map(entries: &[(&str, bool)]) -> std::collections::HashMap<String, bool> {
+    entries
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
+}
 
 #[test]
 fn discriminator_check_crash_escalation_returns_some_for_same_task_crash() {
-    let escalated = check_crash_escalation(Some("TASK-X"), "TASK-X", true, Some(HAIKU_MODEL));
+    let escalated =
+        check_crash_escalation(&crash_map(&[("TASK-X", true)]), "TASK-X", Some(HAIKU_MODEL));
     assert_eq!(
         escalated.as_deref(),
         Some(SONNET_MODEL),
@@ -463,10 +465,9 @@ fn discriminator_check_crash_escalation_returns_some_for_same_task_crash() {
         escalated,
     );
 
-    // A second discriminator angle: cross-task (different last vs current
-    // task ID) must NOT escalate. A function that always returns Some would
-    // fail here.
-    let cross = check_crash_escalation(Some("TASK-A"), "TASK-B", true, Some(HAIKU_MODEL));
+    // Cross-task: TASK-A crashed but TASK-B is the current task — must NOT escalate.
+    let cross =
+        check_crash_escalation(&crash_map(&[("TASK-A", true)]), "TASK-B", Some(HAIKU_MODEL));
     assert!(
         cross.is_none(),
         "cross-task crash must NOT escalate — got {:?}",
@@ -478,35 +479,13 @@ fn discriminator_check_crash_escalation_returns_some_for_same_task_crash() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Adapter that lets the `#[ignore]`-d future-shape tests drive
-/// `check_crash_escalation` from a context object. FEAT-007 will collapse
-/// this into the function itself by giving it a `&IterationContext`
-/// parameter; until then this helper bridges the new contract (read map)
-/// to the legacy 4-arg signature.
-///
-/// Critical: this helper is the test's mental model of FEAT-007's reader,
-/// NOT the production reader. When FEAT-007 lands, replace its callers with
-/// the rewritten `check_crash_escalation(ctx, current_task_id, model)` and
-/// delete this helper.
+/// Thin adapter used by the per-task crash tracking tests: reads the map from
+/// `ctx` and delegates to `check_crash_escalation`. Replaces the pre-FEAT-007
+/// adapter that bridged the legacy 4-arg signature.
 fn check_crash_escalation_via_ctx(
     ctx: &IterationContext,
     current_task_id: &str,
     resolved_model: Option<&str>,
 ) -> Option<String> {
-    let last_was_crash = ctx
-        .crashed_last_iteration
-        .get(current_task_id)
-        .copied()
-        .unwrap_or(false);
-    let last_task_id = if last_was_crash {
-        Some(current_task_id)
-    } else {
-        None
-    };
-    check_crash_escalation(
-        last_task_id,
-        current_task_id,
-        last_was_crash,
-        resolved_model,
-    )
+    check_crash_escalation(&ctx.crashed_last_iteration, current_task_id, resolved_model)
 }

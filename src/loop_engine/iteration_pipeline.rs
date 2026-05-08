@@ -125,7 +125,7 @@ pub struct ProcessingParams<'a> {
     /// Ctrl-C aborts the extraction subprocess.
     pub signal_flag: &'a SignalFlag,
     /// Iteration context. The pipeline updates `crash_tracker` and the
-    /// per-task crash-tracking fields (`last_task_id`, `last_was_crash`).
+    /// `crashed_last_iteration` per-task crash map.
     pub ctx: &'a mut IterationContext,
     /// Files modified by the iteration's task (from task metadata). Used
     /// only by `progress::log_iteration` — the pipeline does not consult
@@ -419,14 +419,15 @@ pub fn process_iteration_output(params: ProcessingParams<'_>) -> ProcessingOutco
         eprintln!("Warning: failed to record iteration feedback: {}", e);
     }
 
-    // Step 7: per-task crash-tracking write. Future PRD work replaces these
-    // scalar fields with a `crashed_last_iteration` map; the contract here
-    // covers both the legacy and the planned shapes via `IterationContext`'s
-    // current API.
+    // Step 7: per-task crash-tracking write. Keys by task_id so the map size
+    // is bounded by active task count (not iteration count) — contract from
+    // the FEAT-007 AC.
     if let Some(claimed_id) = task_id {
-        ctx.last_task_id = Some(claimed_id.to_string());
+        ctx.crashed_last_iteration.insert(
+            claimed_id.to_string(),
+            matches!(outcome, IterationOutcome::Crash(_)),
+        );
     }
-    ctx.last_was_crash = matches!(outcome, IterationOutcome::Crash(_));
 
     result
 }
