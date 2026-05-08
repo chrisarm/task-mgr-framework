@@ -437,6 +437,40 @@
         "src/loop_engine/prd_reconcile.rs",
         ".task-mgr/tasks/loop-reliability.json"
       ]
+    },
+    {
+      "acceptanceCriteria": [
+        "sequential.rs:328-332 inline format!() replaced with core::build_session_guidance_block(params.session_guidance) (or via a thin delegate wrapper)",
+        "cargo test --test prompt_sequential_snapshot passes (snapshot bytes unchanged)",
+        "No new function added beyond optional thin delegate",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "description": "REFACTOR-001 review (MINOR) — sequential.rs:328-332 still inlines format!(\"## Session Guidance\n\n{}\n\n\", ...) instead of delegating to core::build_session_guidance_block, which slot.rs:299 already uses. The whole point of factoring the helper into core was to keep both paths byte-identical. Replace the inline block with the helper, mirroring the existing build_steering_section delegate pattern at sequential.rs:439-441.",
+      "estimatedEffort": "low",
+      "id": "1f995e19-REFACTOR-FIX-001",
+      "passes": false,
+      "priority": 55,
+      "title": "Adopt core::build_session_guidance_block in sequential.rs (parity)",
+      "touchesFiles": [
+        "src/loop_engine/prompt/sequential.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "engine.rs:1171 changed from slot_result.prompt_for_overflow.clone().unwrap_or_default() to slot_result.prompt_for_overflow.take().unwrap_or_default()",
+        "grep verification: no remaining read of slot_result.prompt_for_overflow after the take() site",
+        "cargo test --test overflow_per_slot and overflow_per_slot_comprehensive pass",
+        "cargo clippy -- -D warnings passes"
+      ],
+      "description": "REFACTOR-001 review (MINOR) — engine.rs:1171 reads slot_result.prompt_for_overflow via .clone().unwrap_or_default(), copying ~80KB per overflow event when wave-mode hits PromptTooLong. The field is read at exactly two sites, both inside the same conditional branch (engine.rs:1167 debug_assert and engine.rs:1171 clone). Since slot_result is &mut SlotResult and the field is not consulted afterward, .take().unwrap_or_default() avoids the clone entirely. Verify no other reader touches the field after this branch (process_slot_result subsequent steps use slot_result.iteration_result.* and slot_result.shown_learning_ids, not prompt_for_overflow).",
+      "estimatedEffort": "low",
+      "id": "1f995e19-REFACTOR-FIX-002",
+      "passes": false,
+      "priority": 54,
+      "title": "Avoid 80KB clone of prompt_for_overflow in process_slot_result",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
     }
   ],
   "version": "1.0"
