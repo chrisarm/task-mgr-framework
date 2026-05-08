@@ -187,3 +187,12 @@ Learnings:
 - TEST-006's wave_mode_learnings_and_bandit_feedback_sql_metrics gives the synthetic SQL count (>0) that satisfies the PRD success metric without needing a real wave run.
 - Final gate: cargo fmt clean, cargo check clean, cargo clippy --all-targets -- -D warnings clean, cargo test = 3692 passed / 0 failed / 20 ignored.
 ---
+## [2026-05-07 00:00] - 5d1118de-INT-001
+Approach: Read-only trace — no code written, verified all five ACs by reading engine.rs + iteration_pipeline.rs.
+Files: src/loop_engine/engine.rs, src/loop_engine/iteration_pipeline.rs (read only)
+Learnings:
+- Trace confirmed: run_loop (L3130) → run_iteration → IterationResult{conversation:Some(claude_conversation)} → process_iteration_output (L3186) → ProcessingOutcome
+- Wrapper-commit (L3231), external-git (L3249), human-review (L3287) all fire at run_loop AFTER pipeline call; explicitly documented as out-of-scope in pipeline module doc
+- tasks_completed incremented at L3210: `tasks_completed += processing_outcome.tasks_completed`
+- Rate-limit (L1967), pause-signal (L1540), pre-iteration usage check (L1550) all fire in run_iteration at iteration boundary
+---
