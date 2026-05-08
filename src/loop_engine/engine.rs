@@ -45,19 +45,18 @@ use crate::loop_engine::deadline;
 use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::env;
-use crate::loop_engine::feedback;
 use crate::loop_engine::git_reconcile::{
     check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
 };
 use crate::loop_engine::guidance::SessionGuidance;
+use crate::loop_engine::iteration_pipeline;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::monitor;
 use crate::loop_engine::oauth;
-use crate::loop_engine::output_parsing::{parse_completed_tasks, scan_output_for_completed_tasks};
 use crate::loop_engine::overflow;
 use crate::loop_engine::prd_reconcile::{
-    self as prd_reconcile, hash_file, mark_task_done, read_prd_metadata, reconcile_passes_with_db,
+    self as prd_reconcile, hash_file, read_prd_metadata, reconcile_passes_with_db,
     update_prd_task_passes,
 };
 use crate::loop_engine::progress;
@@ -173,7 +172,25 @@ pub struct IterationResult {
     /// None when difficulty is unset/unknown or for early exits.
     pub effective_effort: Option<&'static str>,
     /// Number of key decisions extracted and stored this iteration.
+    /// Always initialised to 0 by the iteration runners; filled in by the
+    /// caller (`run_loop` / `process_slot_result`) after
+    /// `iteration_pipeline::process_iteration_output` returns the real count.
     pub key_decisions_count: u32,
+    /// Structured stream-json conversation transcript (when stream-json mode is
+    /// active). Threaded from `claude_result.conversation` at the post-Claude
+    /// success site; `None` on every early-exit path (signal, rate-limit, pause,
+    /// pre-iteration error). The wave path mirrors this through
+    /// `SlotResult.iteration_result.conversation` so the shared
+    /// `iteration_pipeline::process_iteration_output` can prefer the transcript
+    /// over raw output for learning extraction.
+    pub conversation: Option<String>,
+    /// Learnings shown to Claude during prompt assembly this iteration.
+    /// Threaded from `prompt_result.shown_learning_ids` at the post-Claude
+    /// success site; empty on every early-exit path (signal, rate-limit, pause,
+    /// pre-iteration error). The shared
+    /// `iteration_pipeline::process_iteration_output` consumes this via
+    /// `ProcessingParams.shown_learning_ids` to record bandit feedback.
+    pub shown_learning_ids: Vec<i64>,
 }
 
 /// Mutable context carried between iterations.
@@ -192,12 +209,23 @@ pub struct IterationContext {
     pub reorder_hint: Option<String>,
     /// Count of consecutive reorders
     pub reorder_count: u32,
-    /// Task ID from the previous iteration. Loop-thread-local — no concurrency concern.
-    /// Used by crash escalation logic (FEAT-007) to detect same-task consecutive crashes.
-    pub last_task_id: Option<String>,
-    /// Whether the previous iteration crashed. Loop-thread-local — no concurrency concern.
-    /// Used by crash escalation logic (FEAT-007) to trigger model escalation.
-    pub last_was_crash: bool,
+    /// Per-task crash flag for the most recent iteration on each task. The
+    /// pipeline writes one entry per iteration:
+    /// `map[task_id] = matches!(outcome, IterationOutcome::Crash(_))`.
+    /// `check_crash_escalation` (post-FEAT-007) consults this map directly,
+    /// replacing the `(last_task_id == current) && last_was_crash` predicate
+    /// that today's two scalar fields encode.
+    ///
+    /// Sized by the number of distinct task IDs touched by the loop — bounded
+    /// by active task count, NOT iteration count, because each `insert` on the
+    /// same key overwrites in place. See `tests/crash_escalation_per_task.rs`
+    /// for the bounded-size invariant.
+    ///
+    /// Loop-thread-local: writes happen on the main thread inside
+    /// `process_iteration_output`. Wave-mode slot threads never touch this
+    /// map; the wave aggregator passes their outcomes through the pipeline on
+    /// the main thread, preserving the no-Mutex contract.
+    pub crashed_last_iteration: std::collections::HashMap<String, bool>,
     /// Per-task effort overrides set after `Crash(PromptTooLong)`. Keys are
     /// task IDs, values are the effort level to use on the next attempt in
     /// place of the difficulty-derived default.
@@ -250,8 +278,7 @@ impl IterationContext {
             stale_tracker: StaleTracker::default(),
             reorder_hint: None,
             reorder_count: 0,
-            last_task_id: None,
-            last_was_crash: false,
+            crashed_last_iteration: std::collections::HashMap::new(),
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
             overflow_recovered: std::collections::HashSet::new(),
@@ -264,20 +291,30 @@ impl IterationContext {
 
 /// Per-slot execution context for parallel wave iterations.
 ///
-/// Each slot carries its own pre-claimed task, worktree path, and watchdog
-/// activity epoch. The struct is `Send` so run_parallel_wave can move it
-/// into a dedicated worker thread. It is intentionally not `Sync`:
-/// `run_slot_iteration` never shares a `&SlotContext` across threads.
+/// Each slot carries the `Send`-safe `SlotPromptBundle` produced on the main
+/// thread BEFORE the worker is spawned (per the FEAT-002 contract: prompt
+/// construction order is `build_bundle (main) → spawn(worker)`). Workers
+/// must NOT touch a `&Connection` or read a `&Task` after spawn — every
+/// task-derived value the slot needs (id, files, model, difficulty) is
+/// already pre-resolved into the bundle.
+///
+/// The struct is `Send` so `run_parallel_wave` can move it into a dedicated
+/// worker thread. It is intentionally not `Sync`: `run_slot_iteration` never
+/// shares a `&SlotContext` across threads.
 pub struct SlotContext {
     /// Slot index within the wave (0..parallel_slots).
     pub slot_index: usize,
     /// Working directory for Claude — slot 0 uses the main branch worktree,
     /// slots 1+ each get an ephemeral worktree (see `worktree::ensure_slot_worktrees`).
     pub working_root: PathBuf,
-    /// Pre-claimed task assigned to this slot. Claimed by `run_parallel_wave`
-    /// on the main thread before any slot thread is spawned so that rusqlite
-    /// writes stay single-threaded for claim bookkeeping.
-    pub task: crate::models::Task,
+    /// Prompt bundle assembled on the main thread (after the slot's task was
+    /// claimed) by `prompt::slot::build_prompt`. Carries the prompt string,
+    /// task id, pre-loaded task files, learning ids shown, resolved model,
+    /// and difficulty — everything the worker needs without re-opening the
+    /// DB. The orphan-reset accounting in `slot_failure_result` reads task
+    /// identity from `prompt_bundle.task_id` so the bundle remains the
+    /// canonical source-of-truth post-spawn.
+    pub prompt_bundle: crate::loop_engine::prompt::slot::SlotPromptBundle,
     /// Shared activity epoch for the slot's spawn_claude watchdog. Each slot
     /// owns its own `Arc<AtomicU64>` — watchdogs must not share an epoch or
     /// activity in one slot would silently extend another slot's deadline.
@@ -296,6 +333,37 @@ pub struct SlotResult {
     /// task was already `done` / `blocked` and the slot thread never spawned.
     /// Drives the post-loop orphan reset (see `IterationContext::pending_slot_tasks`).
     pub claim_succeeded: bool,
+    /// Learnings shown in the slot's prompt, threaded back from
+    /// `SlotContext::prompt_bundle::shown_learning_ids` so the main thread
+    /// can record bandit feedback without reopening a DB connection on the
+    /// worker. Empty for `slot_failure_result` entries (no bundle was ever
+    /// built) and for early-exit paths that never assembled a prompt.
+    pub shown_learning_ids: Vec<i64>,
+    /// The full assembled prompt text, carried back from the worker thread
+    /// exclusively for overflow diagnostics. `process_slot_result` uses this
+    /// to populate the `PromptResult` passed to `overflow::handle_prompt_too_long`
+    /// when the outcome is `Crash(PromptTooLong)`.
+    ///
+    /// `None` on all non-overflow paths; avoids cloning up to 80 KB per slot
+    /// on every successful wave just to discard it.
+    pub prompt_for_overflow: Option<String>,
+    /// Per-section byte sizes from `SlotPromptBundle::section_sizes`, threaded
+    /// back so `process_slot_result` can populate the synthetic `PromptResult`
+    /// with a meaningful section breakdown on `PromptTooLong`. Empty for
+    /// `slot_failure_result` entries (no bundle was assembled).
+    pub section_sizes: Vec<(&'static str, usize)>,
+    /// Names of trimmable sections dropped at bundle-build time because they
+    /// didn't fit within `TOTAL_PROMPT_BUDGET`. Mirrors
+    /// `SlotPromptBundle::dropped_sections` so an overflow recovery still
+    /// reports the actual drops to the diagnostics dump (instead of an empty
+    /// list that would be wrong post-WIRE-FIX-002). Empty for
+    /// `slot_failure_result` entries.
+    pub dropped_sections: Vec<String>,
+    /// Task difficulty at bundle-build time, threaded back so the synthetic
+    /// `PromptResult` in the per-slot overflow branch can populate
+    /// `task_difficulty` instead of hardcoding `None`. `None` when the task
+    /// has no difficulty set or for `slot_failure_result` entries.
+    pub task_difficulty: Option<String>,
 }
 
 /// Aggregate result of a parallel wave.
@@ -321,8 +389,6 @@ pub struct WaveResult {
 pub struct SlotIterationParams {
     /// Database directory (each slot opens its own connection here).
     pub db_dir: PathBuf,
-    /// Path to base prompt.md file used when assembling per-slot prompts.
-    pub base_prompt_path: PathBuf,
     /// Permission mode for Claude subprocess invocation.
     pub permission_mode: PermissionMode,
     /// Shared signal flag (Arc-backed) for SIGINT/SIGTERM coordination.
@@ -340,110 +406,13 @@ pub struct SlotIterationParams {
     pub elapsed_secs: u64,
 }
 
-/// Build a minimal slot prompt from a pre-claimed task and base prompt template.
-///
-/// The sequential `run_iteration` pulls in learnings, source context, synergy
-/// context, sibling PRDs, etc. via `prompt::build_prompt`. For parallel slot
-/// execution we start with a lean prompt covering only the non-negotiable
-/// sections:
-/// - Task JSON (what to work on)
-/// - Task lifecycle rules (how status updates are communicated)
-/// - Completion instruction (how to signal done)
-/// - Base prompt template (project conventions)
-///
-/// Enriching the slot prompt with the full sequential pipeline is tracked by
-/// follow-up wiring tasks; this keeps the wave engine small and thread-safe
-/// today while leaving the obvious extension point clearly marked.
-fn build_slot_prompt(task: &crate::models::Task, base_prompt_path: &Path) -> String {
-    let mut prompt = String::new();
-
-    let mut task_json = serde_json::json!({
-        "id": task.id,
-        "title": task.title,
-        "priority": task.priority,
-        "status": "in_progress",
-        "acceptanceCriteria": task.acceptance_criteria,
-    });
-    if let Some(ref desc) = task.description {
-        task_json["description"] = serde_json::Value::String(desc.clone());
-    }
-    if let Some(ref notes) = task.notes {
-        task_json["notes"] = serde_json::Value::String(notes.clone());
-    }
-    if let Some(ref m) = task.model {
-        task_json["model"] = serde_json::Value::String(m.clone());
-    }
-    if let Some(ref d) = task.difficulty {
-        task_json["difficulty"] = serde_json::Value::String(d.clone());
-    }
-
-    let task_json_str = serde_json::to_string_pretty(&task_json)
-        .unwrap_or_else(|_| format!("{{\"id\":\"{}\"}}", task.id));
-    prompt.push_str(&format!(
-        "## Current Task\n\n```json\n{}\n```\n\n",
-        task_json_str,
-    ));
-
-    prompt.push_str(crate::loop_engine::prompt_sections::task_ops::task_ops_section());
-
-    prompt.push_str(&format!(
-        "## Completing This Task\n\n\
-         When all acceptance criteria pass:\n\
-         1. Commit with message: `feat: {task_id}-completed - [{title}]`\n\
-         2. Output `<completed>{task_id}</completed>`.\n\
-         3. Stop immediately.\n\n\
-         The loop will automatically mark the task done and update the PRD.\n\n",
-        task_id = task.id,
-        title = task.title,
-    ));
-
-    match std::fs::read_to_string(base_prompt_path) {
-        Ok(content) if !content.trim().is_empty() => {
-            prompt.push_str(&content);
-            if !content.ends_with('\n') {
-                prompt.push('\n');
-            }
-        }
-        Ok(_) => {
-            eprintln!(
-                "Warning: base prompt file is empty: {}",
-                base_prompt_path.display(),
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: could not read base prompt file {}: {}",
-                base_prompt_path.display(),
-                e,
-            );
-        }
-    }
-
-    prompt
-}
-
-/// Load the files a task touches from the `task_files` join table.
-///
-/// Returns an empty Vec if the task has no entries or on query error; the
-/// slot iteration remains runnable even without file metadata, and logging
-/// the error keeps silent failures visible.
-fn load_task_files(conn: &Connection, task_id: &str) -> Vec<String> {
-    match conn.prepare("SELECT file_path FROM task_files WHERE task_id = ? ORDER BY file_path") {
-        Ok(mut stmt) => stmt
-            .query_map([task_id], |row| row.get::<_, String>(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        Err(e) => {
-            eprintln!("Warning: failed to query task_files for {}: {}", task_id, e,);
-            Vec::new()
-        }
-    }
-}
-
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
+///
+/// `task_id` is intentionally NOT a field here — it is always the slot's
+/// bundle id; threading it through the struct would just invite
+/// inconsistencies. `slot_early_exit` reads it from the passed `SlotContext`.
 struct SlotEarlyExit {
     outcome: IterationOutcome,
-    task_id: String,
     files_modified: Vec<String>,
     should_stop: bool,
     output: String,
@@ -454,49 +423,68 @@ struct SlotEarlyExit {
 /// Build a slot-scoped early-exit `SlotResult`.
 ///
 /// Centralizes the `IterationResult` construction for the handful of early
-/// returns in `run_slot_iteration` so the 9-field struct literal isn't
-/// duplicated.
-fn slot_early_exit(slot_index: usize, exit: SlotEarlyExit) -> SlotResult {
+/// returns in `run_slot_iteration` so the 10-field struct literal isn't
+/// duplicated. Pulls task identity AND `shown_learning_ids` from the slot's
+/// bundle so the orphan-reset accounting AND bandit feedback stay correct
+/// even on early-exit paths (signal received, timeout, etc.).
+fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
     SlotResult {
-        slot_index,
+        slot_index: slot.slot_index,
         iteration_result: IterationResult {
             outcome: exit.outcome,
-            task_id: Some(exit.task_id),
+            task_id: Some(slot.prompt_bundle.task_id.clone()),
             files_modified: exit.files_modified,
             should_stop: exit.should_stop,
             output: exit.output,
             effective_model: exit.effective_model,
             effective_effort: exit.effective_effort,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         // Early exit always runs after a successful claim (the slot thread
         // started); the orphan reset must consider this task pending until
         // process_slot_result clears it.
         claim_succeeded: true,
+        shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
+        prompt_for_overflow: None,
+        section_sizes: slot.prompt_bundle.section_sizes.clone(),
+        dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
+        task_difficulty: slot.prompt_bundle.difficulty.clone(),
     }
 }
 
-/// Run one slot's iteration: build prompt, spawn Claude in the slot worktree,
-/// analyze output. Opens its own DB connection and creates its own watchdog
-/// activity epoch so nothing is shared across slot threads.
+/// Run one slot's iteration: spawn Claude in the slot worktree using the
+/// pre-assembled prompt bundle, then analyze output. Opens its own DB
+/// connection and creates its own watchdog activity epoch so nothing is
+/// shared across slot threads.
 ///
 /// This is a deliberately simpler counterpart to `run_iteration`:
 /// - No `&mut IterationContext` — slot threads must not touch shared state.
 /// - No crash-escalation, reorder, stale, or rate-limit-wait logic — those
 ///   are orchestrated by the outer loop after the wave returns.
-/// - No prompt-overflow recovery path — the slot prompt is minimal so the
-///   overflow branch is unreachable in practice.
+/// - No prompt-overflow recovery path — wave-mode overflow handling is a
+///   per-slot follow-up tracked elsewhere in the PRD.
+///
+/// The prompt bundle MUST have been built on the main thread before the
+/// worker was spawned (FEAT-002 contract). The worker only reads from the
+/// bundle — it never reaches back into a `&Connection` to re-derive task
+/// state, because rusqlite `Connection` is not `Send` (learnings #1893 /
+/// #1852 / #1871).
 pub fn run_slot_iteration(
     slot: &SlotContext,
     params: &SlotIterationParams,
 ) -> TaskMgrResult<SlotResult> {
+    let bundle = &slot.prompt_bundle;
+    let task_id = bundle.task_id.as_str();
+    let task_files = bundle.task_files.clone();
+
     // Early exit on signal — no work should start if the loop is stopping.
     if params.signal_flag.is_signaled() {
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Empty,
-                task_id: slot.task.id.clone(),
                 files_modified: vec![],
                 should_stop: true,
                 output: String::new(),
@@ -506,31 +494,22 @@ pub fn run_slot_iteration(
         ));
     }
 
-    // Open a per-slot DB connection. rusqlite `Connection` is not `Send`, so
-    // each thread MUST open its own; sharing a connection across threads
-    // corrupts the WAL state.
-    let conn = crate::db::open_connection(&params.db_dir)?;
-
-    let task_files = load_task_files(&conn, &slot.task.id);
-
-    // Effective model: per-task override > default. Cluster-wide escalation
-    // (sequential path) is intentionally not applied in parallel; the wave
-    // engine targets tasks that are already scored as disjoint, not clusters.
-    let effective_model: Option<String> = slot
-        .task
-        .model
+    // Effective model: bundle-resolved (per-task) > params.default_model.
+    // Cluster-wide escalation (sequential path) is intentionally not applied
+    // in parallel; the wave engine targets tasks already scored as disjoint,
+    // not clusters.
+    let effective_model: Option<String> = bundle
+        .resolved_model
         .clone()
         .or_else(|| params.default_model.clone());
 
-    let effort = model::effort_for_difficulty(slot.task.difficulty.as_deref());
-
-    let prompt = build_slot_prompt(&slot.task, &params.base_prompt_path);
+    let effort = model::effort_for_difficulty(bundle.difficulty.as_deref());
 
     if params.verbose {
         eprintln!(
             "[slot {}] task={} model={} effort={} cwd={}",
             slot.slot_index,
-            slot.task.id,
+            task_id,
             effective_model.as_deref().unwrap_or("(default)"),
             effort.unwrap_or("(default)"),
             slot.working_root.display(),
@@ -549,7 +528,7 @@ pub fn run_slot_iteration(
     let banner = display::format_iteration_header(
         params.iteration,
         params.max_iterations,
-        &slot.task.id,
+        task_id,
         params.elapsed_secs,
         effective_model.as_deref(),
         effort,
@@ -559,12 +538,12 @@ pub fn run_slot_iteration(
     // Per-slot timeout wired to the slot's own activity epoch. Each
     // spawn_claude creates its own watchdog thread, so timeouts are per-slot.
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
-        slot.task.difficulty.as_deref(),
+        bundle.difficulty.as_deref(),
         Arc::clone(&slot.last_activity_epoch),
     );
 
     let claude_result = claude::spawn_claude(
-        &prompt,
+        &bundle.prompt,
         &params.permission_mode,
         claude::SpawnOpts {
             signal_flag: Some(&params.signal_flag),
@@ -576,7 +555,7 @@ pub fn run_slot_iteration(
             disallowed_tools: Some(TASKS_JSON_DISALLOWED_TOOLS),
             db_dir: Some(&params.db_dir),
             use_pty: false,
-            target_task_id: Some(&slot.task.id),
+            target_task_id: Some(task_id),
             slot_label: Some(&slot_label_buf),
             ..Default::default()
         },
@@ -585,13 +564,12 @@ pub fn run_slot_iteration(
     if claude_result.timed_out {
         eprintln!(
             "[slot {}] iteration timed out for task {}",
-            slot.slot_index, slot.task.id,
+            slot.slot_index, task_id,
         );
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Crash(config::CrashType::RuntimeError),
-                task_id: slot.task.id.clone(),
                 files_modified: task_files,
                 should_stop: false,
                 output: claude_result.output,
@@ -614,10 +592,9 @@ pub fn run_slot_iteration(
 
     if params.signal_flag.is_signaled() {
         return Ok(slot_early_exit(
-            slot.slot_index,
+            slot,
             SlotEarlyExit {
                 outcome: IterationOutcome::Empty,
-                task_id: slot.task.id.clone(),
                 files_modified: task_files,
                 should_stop: true,
                 output: claude_result.output,
@@ -633,19 +610,37 @@ pub fn run_slot_iteration(
         &slot.working_root,
     );
 
+    // Thread the structured stream-json transcript through to the pipeline so
+    // wave-mode learning extraction reads the same conversation source the
+    // sequential path uses (engine.rs:2109). Dropping this here is the
+    // pre-FEAT-004 bug that makes the wave path silently fall back to
+    // `claude_result.output` (just the final result string).
+    let conversation = claude_result.conversation;
+
+    let is_prompt_too_long = matches!(
+        outcome,
+        config::IterationOutcome::Crash(config::CrashType::PromptTooLong)
+    );
     Ok(SlotResult {
         slot_index: slot.slot_index,
         iteration_result: IterationResult {
             outcome,
-            task_id: Some(slot.task.id.clone()),
+            task_id: Some(bundle.task_id.clone()),
             files_modified: task_files,
             should_stop: false,
             output: claude_result.output,
             effective_model,
             effective_effort: effort,
             key_decisions_count: 0,
+            conversation,
+            shown_learning_ids: bundle.shown_learning_ids.clone(),
         },
         claim_succeeded: true,
+        shown_learning_ids: bundle.shown_learning_ids.clone(),
+        prompt_for_overflow: is_prompt_too_long.then(|| bundle.prompt.clone()),
+        section_sizes: bundle.section_sizes.clone(),
+        dropped_sections: bundle.dropped_sections.clone(),
+        task_difficulty: bundle.difficulty.clone(),
     })
 }
 
@@ -689,6 +684,13 @@ fn claim_slot_task(conn: &Connection, task_id: &str) -> bool {
 ///     while its task was already `in_progress` — the orphan reset must run.
 ///   - `false`: claim itself failed (task already `done`/`blocked`) and no row
 ///     was ever moved to `in_progress` — orphan reset must skip this entry.
+///
+/// `shown_learning_ids` is left empty on this path: the bundle was either
+/// never built (claim failed) or has been moved into the panicked worker
+/// thread and is no longer recoverable from the main thread. Bandit feedback
+/// for failed runs is intentionally suppressed — crediting/discrediting
+/// learnings against a worker that crashed before any agent reasoning would
+/// produce noise, not signal.
 fn slot_failure_result(
     slot_index: usize,
     task_id: Option<String>,
@@ -706,13 +708,27 @@ fn slot_failure_result(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         },
         claim_succeeded,
+        shown_learning_ids: Vec::new(),
+        prompt_for_overflow: None,
+        section_sizes: Vec::new(),
+        dropped_sections: Vec::new(),
+        task_difficulty: None,
     }
 }
 
 /// Run one parallel wave: claim all tasks sequentially (main thread), then
 /// spawn one OS thread per slot and wait for every thread to join.
+///
+/// **FEAT-002 contract**: every `SlotContext` passed in MUST already carry
+/// a fully-built `prompt_bundle` (constructed by `prompt::slot::build_prompt`
+/// on the main thread before this function is called — see
+/// `build_slot_contexts`). This function never opens a `&Connection` from
+/// inside a worker thread; the claim is the only DB write here, and it
+/// stays on the main thread.
 ///
 /// The claim loop is intentionally serial on the main thread:
 /// - rusqlite `Connection` is not `Send`, so there's one DB writer.
@@ -736,7 +752,7 @@ pub fn run_parallel_wave(
 
     let mut claimed: Vec<(SlotContext, bool)> = Vec::with_capacity(slots.len());
     for slot in slots {
-        let ok = claim_slot_task(conn, &slot.task.id);
+        let ok = claim_slot_task(conn, &slot.prompt_bundle.task_id);
         claimed.push((slot, ok));
     }
 
@@ -746,7 +762,7 @@ pub fn run_parallel_wave(
 
     for (slot, ok) in claimed {
         let slot_index = slot.slot_index;
-        let task_id = slot.task.id.clone();
+        let task_id = slot.prompt_bundle.task_id.clone();
         if !ok {
             failures.push(slot_failure_result(
                 slot_index,
@@ -846,6 +862,13 @@ pub struct WaveIterationParams<'a> {
     pub external_repo_path: Option<&'a Path>,
     pub external_git_scan_depth: usize,
     pub inter_iteration_delay: Duration,
+    /// Project-wide `steering.md` path. `None` when the project has no
+    /// steering file. Threaded into per-slot `SlotPromptParams` so wave
+    /// prompts include the same project-wide steering as sequential prompts.
+    pub steering_path: Option<&'a Path>,
+    /// Operator pause feedback rendered as a `## Session Guidance` block in
+    /// each slot prompt. Empty string omits the section, matching sequential.
+    pub session_guidance: &'a str,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -1006,32 +1029,56 @@ fn handle_no_eligible_tasks(
 }
 
 /// Build per-slot `SlotContext` entries, pairing each scored task with its
-/// pre-allocated worktree path. Each slot gets its own activity epoch —
-/// sharing one would let activity in one slot silently extend another
-/// slot's watchdog deadline.
+/// pre-allocated worktree path AND assembling the full `SlotPromptBundle`
+/// on the main thread.
+///
+/// **FEAT-002 contract**: bundle assembly happens here, on the main thread,
+/// BEFORE `run_parallel_wave` spawns any worker. The bundle is the only
+/// task-derived state a worker reads; `SlotContext` no longer carries a
+/// `Task` reference, so all DB-backed prompt assembly (learnings,
+/// task_files, source context) MUST run from this single connection.
+///
+/// Each slot gets its own activity epoch — sharing one would let activity
+/// in one slot silently extend another slot's watchdog deadline.
 fn build_slot_contexts(
+    conn: &Connection,
     group: Vec<crate::commands::next::selection::ScoredTask>,
     slot_paths: &[PathBuf],
+    slot_prompt_params: &prompt::slot::SlotPromptParams<'_>,
 ) -> Vec<SlotContext> {
     group
         .into_iter()
         .zip(slot_paths.iter())
         .enumerate()
-        .map(|(idx, (scored, path))| SlotContext {
-            slot_index: idx,
-            working_root: path.clone(),
-            task: scored.task,
-            last_activity_epoch: Arc::new(AtomicU64::new(0)),
+        .map(|(idx, (scored, path))| {
+            // The DB row will flip to `in_progress` in run_parallel_wave's
+            // claim step; reflect that in the bundle's task JSON so the
+            // agent sees the post-claim state. The acceptance criteria,
+            // description, model, and difficulty fields don't change with
+            // claim, so this is the only field that needs a pre-mutation.
+            let mut task = scored.task;
+            task.status = crate::models::TaskStatus::InProgress;
+            let prompt_bundle = prompt::slot::build_prompt(conn, &task, slot_prompt_params);
+            SlotContext {
+                slot_index: idx,
+                working_root: path.clone(),
+                prompt_bundle,
+                last_activity_epoch: Arc::new(AtomicU64::new(0)),
+            }
         })
         .collect()
 }
 
 /// Build the shared per-slot `SlotIterationParams`. `SignalFlag` clones the
 /// inner `Arc` so all threads observe the same SIGINT/SIGTERM signal.
+///
+/// `base_prompt_path` is intentionally NOT carried on this struct anymore —
+/// the base prompt content is baked into `SlotPromptBundle.prompt` at
+/// assembly time, so workers never need to read the file (and thus don't
+/// need a path that might race with a concurrent edit).
 fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterationParams> {
     Arc::new(SlotIterationParams {
         db_dir: params.db_dir.to_path_buf(),
-        base_prompt_path: params.base_prompt_path.to_path_buf(),
         permission_mode: params.permission_mode.clone(),
         signal_flag: params.signal_flag.clone(),
         default_model: params.default_model.map(|s| s.to_string()),
@@ -1042,28 +1089,54 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
     })
 }
 
-/// Per-slot post-processing on the main thread: progress logging, key
-/// decision storage, `<task-status>` dispatch, `<completed>` tag handling
-/// (with a scan-output fallback when no tags are present), reorder-hint
-/// queueing, and file/stop-flag aggregation.
+/// Build the `SlotPromptParams` shared across all slots in this wave.
+///
+/// Pulled out of `build_slot_contexts` so the call site at
+/// `run_wave_iteration` can construct it once and pass by reference, which
+/// avoids cloning the `PathBuf` per slot.
+fn build_slot_prompt_params<'a>(
+    params: &'a WaveIterationParams<'a>,
+) -> prompt::slot::SlotPromptParams<'a> {
+    prompt::slot::SlotPromptParams {
+        project_root: params.source_root.to_path_buf(),
+        base_prompt_path: params.base_prompt_path.to_path_buf(),
+        permission_mode: params.permission_mode.clone(),
+        steering_path: params.steering_path,
+        session_guidance: params.session_guidance,
+    }
+}
+
+/// Per-slot post-processing on the main thread.
+///
+/// The post-Claude work shared with the sequential path — progress logging,
+/// `<key-decision>` extraction, `<task-status>` dispatch, the full completion
+/// ladder (status-tag → completed-tag → output-scan → already-complete
+/// fallback), learning extraction, and bandit feedback — runs inside
+/// `iteration_pipeline::process_iteration_output`. `skip_git_completion_detection`
+/// is `true` because slot commits live on an unmerged ephemeral branch; git
+/// reconciliation happens once at the `run_wave_iteration` boundary after the
+/// merge-back step.
+///
+/// Slot-specific bookkeeping stays here: pending-slot-task accounting, the
+/// `agg.all_crashed` invariant, reorder hint queueing (with `[slot N]` log
+/// prefix), file aggregation, and the wave-level stop flag.
 ///
 /// Updates `agg.all_crashed` only when the slot crashed AND its claimed
 /// task did not finish — any non-crash slot (or a crashed slot whose task
 /// was nonetheless marked done) breaks the all-crashed invariant.
 fn process_slot_result(
-    slot_result: &SlotResult,
+    slot_result: &mut SlotResult,
     params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
     agg: &mut WaveAggregator,
 ) {
     let slot_idx = slot_result.slot_index;
-    let result = &slot_result.iteration_result;
-    let task_id = result.task_id.clone();
+    let task_id = slot_result.iteration_result.task_id.clone();
 
     // Track every claimed slot task as pending until we observe a "done"
-    // signal in this slot's output. The post-loop cleanup uses this to reset
-    // any rows still in `in_progress` when the loop exits via deadline /
-    // max-iterations rather than waiting for the next process's step 6.6.
+    // signal for it. The post-loop cleanup uses this to reset rows still in
+    // `in_progress` when the loop exits via deadline / max-iterations rather
+    // than waiting for the next process's step 6.6 recovery.
     if slot_result.claim_succeeded
         && let Some(ref tid) = task_id
         && !ctx.pending_slot_tasks.contains(tid)
@@ -1071,156 +1144,127 @@ fn process_slot_result(
         ctx.pending_slot_tasks.push(tid.clone());
     }
 
-    progress::log_iteration(
-        params.progress_path,
-        params.iteration,
-        task_id.as_deref(),
-        &result.outcome,
-        &result.files_modified,
-        result.effective_model.as_deref(),
-        result.effective_effort,
-        Some(slot_idx),
-    );
-
-    // Best-effort key decisions extraction so wave slots match sequential
-    // behavior. Failures only print a warning; we do not derail the wave.
-    let key_decisions = detection::extract_key_decisions(&result.output);
-    for decision in &key_decisions {
-        if let Err(e) = key_decisions_db::insert_key_decision(
-            params.conn,
-            params.run_id,
-            task_id.as_deref(),
-            i64::from(params.iteration),
-            decision,
-        ) {
-            eprintln!(
-                "Warning: [slot {}] failed to store key decision '{}': {}",
-                slot_idx, decision.title, e
-            );
-        }
+    // Synthetic slot_failure_result entries with claim_succeeded=false represent
+    // tasks that were never moved to in_progress. Running the overflow handler or
+    // the pipeline for them would pollute ctx.crashed_last_iteration past its
+    // 'bounded by active task count' invariant (engine.rs:218-221) and emit
+    // spurious JSONL overflow events for tasks that never executed.
+    if !slot_result.claim_succeeded {
+        return;
     }
 
-    let status_updates = detection::extract_status_updates(&result.output);
-    let status_updates_applied = if !status_updates.is_empty() {
-        apply_status_updates(
-            params.conn,
-            &status_updates,
-            Some(params.run_id),
-            Some(params.prd_path),
-            params.task_prefix,
-            Some(params.progress_path),
-            Some(params.db_dir),
-        )
-    } else {
-        0
-    };
-
-    let mut slot_marked_done = false;
-
-    if let Some(ref tid) = task_id {
-        // Slot output may emit `<task-status>X:done</task-status>` AND
-        // `<completed>X</completed>` for the same task ID — count each
-        // task at most once per wave per slot, otherwise the wave summary
-        // overstates progress (telemetry skew, not correctness).
-        let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut count_once = |cid: &str, agg: &mut WaveAggregator| {
-            if counted.insert(cid.to_string()) {
-                agg.tasks_completed += 1;
-            }
-            agg.any_completed = true;
+    // Per-slot PromptTooLong recovery — mirrors the sequential Step 8.5 in
+    // `run_iteration`. Must run BEFORE `process_iteration_output` so the
+    // task row is reset to `todo` (rungs 1-3) or `blocked` (rung 4) before
+    // the pipeline's crash-tracking write. Order of operations is
+    // contractual: ctx update → DB UPDATE → stderr → dump → JSONL → rotate.
+    if matches!(
+        slot_result.iteration_result.outcome,
+        config::IterationOutcome::Crash(config::CrashType::PromptTooLong)
+    ) && let Some(ref tid) = task_id
+    {
+        debug_assert!(
+            slot_result.prompt_for_overflow.is_some(),
+            "PromptTooLong without prompt_for_overflow for task {tid}"
+        );
+        let synthetic_prompt = crate::loop_engine::prompt::PromptResult {
+            prompt: slot_result.prompt_for_overflow.take().unwrap_or_default(),
+            task_id: tid.clone(),
+            task_files: slot_result.iteration_result.files_modified.clone(),
+            shown_learning_ids: Vec::new(),
+            resolved_model: slot_result.iteration_result.effective_model.clone(),
+            // Wave-mode prompts now apply the same TOTAL_PROMPT_BUDGET cap as
+            // the sequential builder; surface any dropped sections threaded
+            // through from `SlotPromptBundle` so overflow dumps and JSONL
+            // events match what the agent actually saw.
+            dropped_sections: slot_result.dropped_sections.clone(),
+            task_difficulty: slot_result.task_difficulty.clone(),
+            cluster_effort: slot_result.iteration_result.effective_effort,
+            section_sizes: slot_result.section_sizes.clone(),
         };
-
-        if status_updates_applied > 0
-            && status_updates
-                .iter()
-                .any(|u| matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == tid)
-        {
-            slot_marked_done = true;
-            count_once(tid, agg);
-        }
-
-        // Primary completion path: <completed>TASK-ID</completed>.
-        let completed_tags = parse_completed_tasks(&result.output);
-        for cid in &completed_tags {
-            match mark_task_done(
-                params.conn,
-                cid,
-                params.run_id,
-                None,
-                params.prd_path,
-                params.task_prefix,
-            ) {
-                Ok(()) => {
-                    if cid == tid {
-                        slot_marked_done = true;
-                    }
-                    count_once(cid, agg);
-                    eprintln!(
-                        "[slot {}] Task {} completed (<completed> tag)",
-                        slot_idx, cid
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[slot {}] Warning: mark_task_done({}) failed: {}",
-                        slot_idx, cid, e
-                    );
-                }
-            }
-        }
-
-        // Fallback: scan output for completed task IDs. Slot execution
-        // intentionally skips git-commit detection because the commit lives
-        // on an ephemeral branch we have not yet merged.
-        if completed_tags.is_empty() {
-            let scanned =
-                scan_output_for_completed_tasks(&result.output, params.conn, params.task_prefix);
-            for cid in &scanned {
-                let ids = [cid.clone()];
-                match complete_cmd::complete(params.conn, &ids, Some(params.run_id), None, false) {
-                    Ok(_) => {
-                        if cid == tid {
-                            slot_marked_done = true;
-                        }
-                        count_once(cid, agg);
-                        if let Err(e) =
-                            update_prd_task_passes(params.prd_path, cid, true, params.task_prefix)
-                        {
-                            eprintln!(
-                                "[slot {}] Warning: PRD update for {} failed: {}",
-                                slot_idx, cid, e
-                            );
-                        } else {
-                            eprintln!("[slot {}] Task {} completed (output scan)", slot_idx, cid);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[slot {}] Warning: complete({}) failed: {}",
-                            slot_idx, cid, e
-                        );
-                    }
-                }
-            }
-        }
+        let _ = overflow::handle_prompt_too_long(
+            ctx,
+            params.conn,
+            tid,
+            slot_result.iteration_result.effective_effort,
+            slot_result.iteration_result.effective_model.as_deref(),
+            &synthetic_prompt,
+            params.iteration,
+            Some(params.run_id),
+            params.db_dir,
+            Some(slot_idx),
+        );
     }
 
-    if !matches!(result.outcome, IterationOutcome::Crash(_)) || slot_marked_done {
+    // Pipeline contract requires a `working_root` even when skip_git is on
+    // (the field is unused in that mode but still part of the struct). Use
+    // the slot's pre-allocated worktree path so a future change that begins
+    // honoring git history wouldn't silently fall back to the source tree.
+    let working_root = params
+        .slot_worktree_paths
+        .get(slot_idx)
+        .cloned()
+        .unwrap_or_else(|| params.source_root.to_path_buf());
+
+    let processing_outcome =
+        iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+            conn: params.conn,
+            run_id: params.run_id,
+            iteration: params.iteration,
+            task_id: task_id.as_deref(),
+            output: &slot_result.iteration_result.output,
+            conversation: slot_result.iteration_result.conversation.as_deref(),
+            shown_learning_ids: &slot_result.shown_learning_ids,
+            outcome: &mut slot_result.iteration_result.outcome,
+            working_root: &working_root,
+            git_scan_depth: 0,
+            skip_git_completion_detection: true,
+            prd_path: params.prd_path,
+            task_prefix: params.task_prefix,
+            progress_path: params.progress_path,
+            db_dir: params.db_dir,
+            signal_flag: params.signal_flag,
+            ctx,
+            files_modified: &slot_result.iteration_result.files_modified,
+            effective_model: slot_result.iteration_result.effective_model.as_deref(),
+            effective_effort: slot_result.iteration_result.effective_effort,
+            slot_index: Some(slot_idx),
+        });
+
+    slot_result.iteration_result.key_decisions_count = processing_outcome.key_decisions_count;
+
+    // The claimed task was completed in this pass iff its id appears in the
+    // pipeline's deduped completion list. Cross-task `<completed>Y</completed>`
+    // entries land in the list too but never satisfy this predicate — Y stays
+    // out of `pending_slot_tasks` (it was a peer slot's task or was already
+    // terminal), so the orphan-reset semantics are preserved.
+    let slot_marked_done = task_id
+        .as_ref()
+        .map(|tid| {
+            processing_outcome
+                .completed_task_ids
+                .iter()
+                .any(|c| c == tid)
+        })
+        .unwrap_or(false);
+
+    agg.tasks_completed += processing_outcome.tasks_completed;
+    if processing_outcome.tasks_completed > 0 {
+        agg.any_completed = true;
+    }
+
+    // Pipeline may have flipped the outcome from a non-Completed value to
+    // `Completed` via the completion ladder; checking `outcome` post-pipeline
+    // collapses the legacy "crash but task done" branch into the same arm as
+    // a clean success.
+    if !matches!(
+        slot_result.iteration_result.outcome,
+        IterationOutcome::Crash(_)
+    ) || slot_marked_done
+    {
         agg.all_crashed = false;
     }
 
-    // Slot's task transitioned to terminal state — drop from the pending set
-    // so the post-loop orphan reset doesn't bounce a `done` row back to
-    // `todo` on shutdown.
-    //
-    // Cross-task case: if this slot was assigned X but emitted
-    // `<completed>Y</completed>`, `mark_task_done(Y)` ran above and Y is now
-    // `done`. `slot_marked_done` is gated on `cid == tid`, so X stays in
-    // `pending_slot_tasks` and Y was never added (it was a peer slot's task
-    // or was already terminal). Both behaviors are correct: step 17.6's
-    // UPDATE is guarded by `AND status='in_progress'`, so the orphan reset
-    // is a no-op for Y (now `done`) and correctly resets X (genuinely still
-    // `in_progress` — the slot's actual task was never completed by any path).
     if slot_marked_done && let Some(ref tid) = task_id {
         ctx.pending_slot_tasks.retain(|t| t != tid);
     }
@@ -1229,18 +1273,18 @@ fn process_slot_result(
     // does not yet honor hints (it ranks by score), so this acts as a
     // preservation queue — operators see them in logs and a future selection
     // pass can drain them.
-    if let IterationOutcome::Reorder(ref rid) = result.outcome {
+    if let IterationOutcome::Reorder(ref rid) = slot_result.iteration_result.outcome {
         ctx.pending_reorder_hints.push(rid.clone());
         eprintln!("[slot {}] Queued reorder hint: {}", slot_idx, rid);
     }
 
-    for f in &result.files_modified {
+    for f in &slot_result.iteration_result.files_modified {
         if !agg.aggregated_files.contains(f) {
             agg.aggregated_files.push(f.clone());
         }
     }
 
-    if result.should_stop {
+    if slot_result.iteration_result.should_stop {
         agg.wave_should_stop = true;
     }
 }
@@ -1329,25 +1373,18 @@ pub fn run_wave_iteration(
 
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
-    let slot_contexts = build_slot_contexts(group, slot_paths);
+    let slot_prompt_params = build_slot_prompt_params(&params);
+    let slot_contexts = build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
     let slot_params = build_shared_slot_params(&params);
 
-    // Snapshot epoch for `trigger_human_reviews`-style timestamp gating
-    // (kept here for symmetry with sequential even though human reviews
-    // are deferred per design).
-    let _completion_epoch_start: i64 = params
-        .conn
-        .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-
     // Run wave (blocks until every spawned slot thread joins).
-    let wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
+    let mut wave_result = run_parallel_wave(params.conn, slot_contexts, slot_params);
 
-    // Per-slot post-processing on the main thread.
+    // Per-slot post-processing on the main thread. The pipeline mutates each
+    // slot's `IterationOutcome` in place when retroactive completion is
+    // detected, so the iteration borrows mutably.
     let mut agg = WaveAggregator::new(wave_result.outcomes.len());
-    for slot_result in &wave_result.outcomes {
+    for slot_result in &mut wave_result.outcomes {
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
     }
 
@@ -1529,6 +1566,8 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1544,6 +1583,8 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1575,6 +1616,8 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
             UsageCheckResult::ApiError(ref msg) => {
@@ -1605,6 +1648,8 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1669,6 +1714,8 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
 
@@ -1716,6 +1763,8 @@ pub fn run_iteration(
                             effective_model: None,
                             effective_effort: None,
                             key_decisions_count: 0,
+                            conversation: None,
+                            shown_learning_ids: Vec::new(),
                         });
                     }
                     Err(TaskMgrError::PromptOverflow {
@@ -1741,6 +1790,8 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
         }
@@ -1761,19 +1812,15 @@ pub fn run_iteration(
     // Step 4.5: Apply crash escalation and PromptTooLong model overrides
     let effective_model = {
         let resolved = prompt_result.resolved_model.as_deref();
-        let after_crash_escalation = match check_crash_escalation(
-            ctx.last_task_id.as_deref(),
-            &task_id,
-            ctx.last_was_crash,
-            resolved,
-        ) {
-            Some(escalated) => {
-                let old = resolved.unwrap_or("(default)");
-                eprintln!("Crash escalation: {} → {}", old, escalated);
-                Some(escalated)
-            }
-            None => prompt_result.resolved_model.clone(),
-        };
+        let after_crash_escalation =
+            match check_crash_escalation(&ctx.crashed_last_iteration, &task_id, resolved) {
+                Some(escalated) => {
+                    let old = resolved.unwrap_or("(default)");
+                    eprintln!("Crash escalation: {} → {}", old, escalated);
+                    Some(escalated)
+                }
+                None => prompt_result.resolved_model.clone(),
+            };
         // Apply per-task 1M model override from prior PromptTooLong recovery
         if let Some(override_model) = ctx.model_overrides.get(&task_id) {
             let old = after_crash_escalation.as_deref().unwrap_or("(default)");
@@ -1926,6 +1973,8 @@ pub fn run_iteration(
             effective_model,
             effective_effort: effort,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1954,6 +2003,8 @@ pub fn run_iteration(
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         });
     }
 
@@ -1987,6 +2038,8 @@ pub fn run_iteration(
                         effective_model: None,
                         effective_effort: None,
                         key_decisions_count: 0,
+                        conversation: None,
+                        shown_learning_ids: Vec::new(),
                     });
                 }
                 UsageCheckResult::WaitedAndReset => {
@@ -2024,39 +2077,18 @@ pub fn run_iteration(
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
                 });
             }
         }
     }
 
-    // Step 7.7: Extract learnings from output (best-effort, opt-out via env var)
-    // Prefer the structured conversation from stream-json mode; fall back to raw output.
-    let learning_source = claude_conversation.as_deref().unwrap_or(&claude_output);
-    if !crate::learnings::ingestion::is_extraction_disabled() && !learning_source.is_empty() {
-        match crate::learnings::ingestion::extract_learnings_from_output(
-            params.conn,
-            learning_source,
-            Some(&task_id),
-            Some(params.run_id),
-            Some(params.db_dir),
-            Some(params.signal_flag),
-        ) {
-            Ok(r) if r.learnings_extracted > 0 => {
-                eprintln!(
-                    "Extracted {} learning(s) from output",
-                    r.learnings_extracted
-                );
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("Warning: learning extraction failed: {}", e),
-        }
-    }
-
-    // Step 8: Record learning feedback
-    if let Err(e) = feedback::record_iteration_feedback(params.conn, &shown_learning_ids, &outcome)
-    {
-        eprintln!("Warning: failed to record iteration feedback: {}", e);
-    }
+    // Step 7.7 / Step 8 (extract_learnings_from_output, record_iteration_feedback)
+    // were lifted into `iteration_pipeline::process_iteration_output` (FEAT-005).
+    // The pipeline now runs from the call site (`run_loop`, `run_wave_iteration`)
+    // after `run_iteration` returns. `shown_learning_ids` rides on
+    // `IterationResult.shown_learning_ids` to reach the pipeline.
 
     // Step 8.5: Handle PromptTooLong — walk the four-state recovery ladder
     // and emit the diagnostics bundle (prompt dump + JSONL + rotation).
@@ -2090,6 +2122,7 @@ pub fn run_iteration(
             params.iteration,
             Some(params.run_id),
             params.db_dir,
+            None,
         );
     }
 
@@ -2107,10 +2140,6 @@ pub fn run_iteration(
 
     // Step 11: Update last_files for next iteration scoring
     ctx.last_files = task_files.clone();
-
-    // Step 11.5: Update crash escalation context for next iteration
-    ctx.last_task_id = Some(task_id.clone());
-    ctx.last_was_crash = matches!(outcome, IterationOutcome::Crash(_));
 
     // Step 12: Inter-iteration delay (skip if stopping or signaled)
     if !should_stop && !params.inter_iteration_delay.is_zero() && !params.signal_flag.is_signaled()
@@ -2135,6 +2164,8 @@ pub fn run_iteration(
         effective_model,
         effective_effort: effort,
         key_decisions_count: 0,
+        conversation: claude_conversation,
+        shown_learning_ids,
     })
 }
 
@@ -3086,6 +3117,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 parallel_active = false;
                 continue;
             };
+            // Materialize wave-scope inputs that need stable lifetimes for the
+            // borrowed fields on `WaveIterationParams`.
+            let wave_session_guidance = ctx.session_guidance.format_for_prompt();
             let wave_params = WaveIterationParams {
                 conn: &mut conn,
                 db_dir: &run_config.db_dir,
@@ -3109,6 +3143,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 external_repo_path: external_repo_path.as_deref(),
                 external_git_scan_depth: run_config.config.external_git_scan_depth,
                 inter_iteration_delay,
+                steering_path: steering,
+                session_guidance: &wave_session_guidance,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
@@ -3174,45 +3210,12 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             break;
         }
 
-        // Log progress (sequential path: slot=None)
-        progress::log_iteration(
-            &paths.progress_file,
-            iteration,
-            result.task_id.as_deref(),
-            &result.outcome,
-            &result.files_modified,
-            result.effective_model.as_deref(),
-            result.effective_effort,
-            None,
-        );
-
-        // Extract and store key decisions (non-fatal: DB errors are warnings only)
-        let key_decisions = detection::extract_key_decisions(&result.output);
-        let mut kd_count: u32 = 0;
-        for decision in &key_decisions {
-            match key_decisions_db::insert_key_decision(
-                &conn,
-                &run_id,
-                result.task_id.as_deref(),
-                i64::from(iteration),
-                decision,
-            ) {
-                Ok(_) => kd_count += 1,
-                Err(e) => eprintln!(
-                    "Warning: failed to store key decision '{}': {}",
-                    decision.title, e
-                ),
-            }
-        }
-        result.key_decisions_count = kd_count;
-
-        // Track last claimed task for cleanup on exit
+        // Track the claimed task before the pipeline runs. Cleared below if
+        // the pipeline reports the claimed task as completed.
         last_claimed_task = result.task_id.clone();
-        if matches!(result.outcome, IterationOutcome::Completed) {
-            last_claimed_task = None;
-        }
 
-        // Update run with last files
+        // Update run with last files (stays at the call site — pipeline only
+        // covers post-Claude completion / learning bookkeeping).
         if let Err(e) = run_cmd::update(
             &conn,
             &run_id,
@@ -3230,245 +3233,71 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             })
             .unwrap_or(0);
 
-        // Side-band `<task-status>` tag dispatch (FEAT-003).
-        // Parses every tag regardless of claimed task_id, dispatches through
-        // the existing command handlers, and (for Done) syncs PRD JSON.
-        // Runs BEFORE `<completed>` detection so a Done tag that maps to the
-        // claimed task sets task_marked_done_this_iteration below via outcome.
-        let status_updates = detection::extract_status_updates(&result.output);
-        let status_updates_applied = if !status_updates.is_empty() {
-            apply_status_updates(
-                &mut conn,
-                &status_updates,
-                Some(&run_id),
-                Some(&paths.prd_file),
-                task_prefix.as_deref(),
-                Some(&paths.progress_file),
-                Some(&run_config.db_dir),
+        // Run the shared post-Claude pipeline: progress logging, key-decision
+        // extraction, `<task-status>` dispatch, completion ladder
+        // (status-tag → completed-tag → git/scan → already-complete fallback),
+        // learning extraction, bandit feedback, and per-task crash-tracking.
+        // Wrapper-commit, external-git reconciliation, and human-review
+        // triggering stay at this call site (FEAT-005).
+        let processing_outcome =
+            iteration_pipeline::process_iteration_output(iteration_pipeline::ProcessingParams {
+                conn: &mut conn,
+                run_id: &run_id,
+                iteration,
+                task_id: result.task_id.as_deref(),
+                output: &result.output,
+                conversation: result.conversation.as_deref(),
+                shown_learning_ids: &result.shown_learning_ids,
+                outcome: &mut result.outcome,
+                working_root: &working_root,
+                git_scan_depth: run_config.config.git_scan_depth,
+                skip_git_completion_detection: false,
+                prd_path: &paths.prd_file,
+                task_prefix: task_prefix.as_deref(),
+                progress_path: &paths.progress_file,
+                db_dir: &run_config.db_dir,
+                signal_flag: &signal_flag,
+                ctx: &mut ctx,
+                files_modified: &result.files_modified,
+                effective_model: result.effective_model.as_deref(),
+                effective_effort: result.effective_effort,
+                slot_index: None,
+            });
+        tasks_completed += processing_outcome.tasks_completed;
+        result.key_decisions_count = processing_outcome.key_decisions_count;
+
+        // Clear `last_claimed_task` only if the pipeline marked the claimed
+        // task itself as completed (any branch of the completion ladder).
+        // Cross-task `<completed>Y</completed>` completions do NOT clear it —
+        // the claimed task may still be in flight.
+        let claimed_was_completed = result
+            .task_id
+            .as_ref()
+            .map(|tid| {
+                processing_outcome
+                    .completed_task_ids
+                    .iter()
+                    .any(|c| c == tid)
+            })
+            .unwrap_or(false);
+        if claimed_was_completed {
+            last_claimed_task = None;
+        }
+
+        // Wrapper commit: if the claimed task was completed but no git commit
+        // exists (Claude couldn't commit in scoped permission mode), commit on
+        // its behalf.
+        if claimed_was_completed
+            && let Some(ref task_id) = result.task_id
+            && check_git_for_task_completion(
+                &working_root,
+                task_id,
+                run_config.config.git_scan_depth,
             )
-        } else {
-            0
-        };
-
-        // Check for task completion via multiple detection paths.
-        // Priority: <completed> tags > git commit > output scan > already-complete
-        if let Some(ref task_id) = result.task_id
-            && !matches!(result.outcome, IterationOutcome::Empty)
+            .is_none()
+            && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
         {
-            let mut task_marked_done_this_iteration = false;
-            // Iteration output may emit `<task-status>:done`, `<completed>`,
-            // commit-detection, output-scan, and "already complete" for the
-            // same task ID — count each task at most once per iteration to
-            // keep the wave summary honest.
-            let mut counted_this_iteration: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            // If a <task-status>...:done</task-status> referenced the claimed
-            // task, treat it identically to a <completed> tag: mark the task
-            // as done for this iteration, clear claim tracking, and push the
-            // outcome to Completed so stale/crash trackers reset.
-            if status_updates_applied > 0
-                && status_updates.iter().any(|u| {
-                    matches!(u.status, detection::TaskStatusChange::Done) && &u.task_id == task_id
-                })
-            {
-                task_marked_done_this_iteration = true;
-                last_claimed_task = None;
-                if counted_this_iteration.insert(task_id.clone()) {
-                    tasks_completed += 1;
-                }
-                result.outcome = IterationOutcome::Completed;
-                ctx.crash_tracker.record_success();
-                eprintln!(
-                    "Task {} completed (detected from <task-status> tag)",
-                    task_id,
-                );
-            }
-
-            // Primary: parse <completed> tags from output
-            let completed_tags = parse_completed_tasks(&result.output);
-            if !completed_tags.is_empty() {
-                for completed_id in &completed_tags {
-                    if let Ok(()) = mark_task_done(
-                        &mut conn,
-                        completed_id,
-                        &run_id,
-                        None,
-                        &paths.prd_file,
-                        task_prefix.as_deref(),
-                    ) {
-                        if completed_id == task_id {
-                            last_claimed_task = None;
-                            task_marked_done_this_iteration = true;
-                        }
-                        if counted_this_iteration.insert(completed_id.clone()) {
-                            tasks_completed += 1;
-                        }
-                        result.outcome = IterationOutcome::Completed;
-                        ctx.crash_tracker.record_success();
-                        eprintln!(
-                            "Task {} completed (detected from <completed> tag)",
-                            completed_id
-                        );
-                    }
-                }
-            }
-
-            // Fallback 1: git commit detection (only if no <completed> tags found)
-            if completed_tags.is_empty() {
-                if let Some(commit_hash) = check_git_for_task_completion(
-                    &working_root,
-                    task_id,
-                    run_config.config.git_scan_depth,
-                ) {
-                    // Mark task done in DB
-                    let task_ids = [task_id.clone()];
-                    match complete_cmd::complete(
-                        &mut conn,
-                        &task_ids,
-                        Some(&run_id),
-                        Some(&commit_hash),
-                        false, // force
-                    ) {
-                        Ok(_) => {
-                            last_claimed_task = None;
-                            if counted_this_iteration.insert(task_id.clone()) {
-                                tasks_completed += 1;
-                            }
-                            task_marked_done_this_iteration = true;
-
-                            // Override outcome so stale/crash trackers reset — task was actually completed
-                            result.outcome = IterationOutcome::Completed;
-                            ctx.crash_tracker.record_success();
-
-                            // Update PRD JSON to set passes: true
-                            if let Err(e) = update_prd_task_passes(
-                                &paths.prd_file,
-                                task_id,
-                                true,
-                                task_prefix.as_deref(),
-                            ) {
-                                eprintln!(
-                                    "Warning: failed to update PRD for task {}: {}",
-                                    task_id, e
-                                );
-                            } else {
-                                eprintln!(
-                                    "Task {} completed (commit {})",
-                                    task_id,
-                                    &commit_hash[..7.min(commit_hash.len())]
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: failed to mark task {} as done in DB: {}",
-                                task_id, e
-                            );
-                        }
-                    }
-                } else {
-                    // Fallback: scan Claude's output for ANY completed task IDs.
-                    // Claude may complete the claimed task or others in a single iteration,
-                    // and commits happen in a different repo (e.g. restaurant_agent_ex/).
-                    let completed_ids = scan_output_for_completed_tasks(
-                        &result.output,
-                        &conn,
-                        task_prefix.as_deref(),
-                    );
-                    for completed_id in &completed_ids {
-                        let ids = [completed_id.clone()];
-                        match complete_cmd::complete(
-                            &mut conn,
-                            &ids,
-                            Some(&run_id),
-                            None, // no commit hash — different repo
-                            false,
-                        ) {
-                            Ok(_) => {
-                                // Clear tracker if the claimed task was completed via output scan
-                                if result.task_id.as_deref() == Some(completed_id.as_str()) {
-                                    last_claimed_task = None;
-                                    task_marked_done_this_iteration = true;
-                                }
-
-                                if counted_this_iteration.insert(completed_id.clone()) {
-                                    tasks_completed += 1;
-                                }
-
-                                // Override outcome so stale/crash trackers reset — task was actually completed
-                                result.outcome = IterationOutcome::Completed;
-                                ctx.crash_tracker.record_success();
-
-                                if let Err(e) = update_prd_task_passes(
-                                    &paths.prd_file,
-                                    completed_id,
-                                    true,
-                                    task_prefix.as_deref(),
-                                ) {
-                                    eprintln!(
-                                        "Warning: failed to update PRD for task {}: {}",
-                                        completed_id, e
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "Task {} completed (detected from output)",
-                                        completed_id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to mark task {} as done: {}",
-                                    completed_id, e
-                                );
-                            }
-                        }
-                    }
-                }
-            } // end: if completed_tags.is_empty()
-
-            // Final fallback: Claude reports the task as "already complete" without committing.
-            // This catches tasks completed in a prior run where the DB was never updated.
-            // Use task_marked_done_this_iteration (not outcome) to avoid skipping when
-            // <promise>COMPLETE</promise> set outcome to Completed but no prior path marked the task done.
-            if !task_marked_done_this_iteration
-                && detection::is_task_reported_already_complete(
-                    &result.output,
-                    task_id,
-                    task_prefix.as_deref(),
-                )
-                && let Ok(()) = mark_task_done(
-                    &mut conn,
-                    task_id,
-                    &run_id,
-                    None,
-                    &paths.prd_file,
-                    task_prefix.as_deref(),
-                )
-            {
-                last_claimed_task = None;
-                if counted_this_iteration.insert(task_id.clone()) {
-                    tasks_completed += 1;
-                }
-                result.outcome = IterationOutcome::Completed;
-                ctx.crash_tracker.record_success();
-                eprintln!("Task {} completed (reported as already done)", task_id);
-            }
-
-            // Wrapper commit: if task was completed but no git commit exists
-            // (Claude couldn't commit in scoped permission mode), commit on its behalf.
-            if task_marked_done_this_iteration
-                && check_git_for_task_completion(
-                    &working_root,
-                    task_id,
-                    run_config.config.git_scan_depth,
-                )
-                .is_none()
-                && let Some(hash) = wrapper_commit(&working_root, task_id, "loop wrapper commit")
-            {
-                ctx.last_commit = Some(hash);
-            }
+            ctx.last_commit = Some(hash);
         }
 
         // Post-iteration: reconcile external git completions
@@ -4074,7 +3903,12 @@ fn record_session_guidance(guidance: &SessionGuidance, progress_path: &Path, yes
 /// learning [1475]) are logged to stderr with the task id + status and the
 /// loop continues to the next tag. Never silently swallow errors.
 ///
-/// Returns the number of updates that dispatched successfully.
+/// Returns one entry per input update preserving order: `(task_id, status,
+/// applied)`. `applied=true` iff the dispatcher reported success. Per-update
+/// granularity lets the iteration_pipeline gate test for the specific
+/// `(claimed_id, Done, true)` tuple instead of a global "any update
+/// succeeded" flag (M2 fix — learning #2238).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_status_updates(
     conn: &mut Connection,
     updates: &[detection::TaskStatusUpdate],
@@ -4083,10 +3917,11 @@ pub fn apply_status_updates(
     task_prefix: Option<&str>,
     progress_path: Option<&Path>,
     db_dir: Option<&Path>,
-) -> u32 {
+    mut ctx: Option<&mut IterationContext>,
+) -> Vec<(String, detection::TaskStatusChange, bool)> {
     use detection::TaskStatusChange;
 
-    let mut applied: u32 = 0;
+    let mut results: Vec<(String, TaskStatusChange, bool)> = Vec::with_capacity(updates.len());
     for update in updates {
         let task_ids = [update.task_id.clone()];
         let dispatch: Result<(), TaskMgrError> = match update.status {
@@ -4148,9 +3983,9 @@ pub fn apply_status_updates(
             }
         };
 
+        let applied = dispatch.is_ok();
         match dispatch {
             Ok(()) => {
-                applied += 1;
                 // Only Done flips PRD JSON `passes` — other transitions leave
                 // `passes: false` unchanged.
                 if matches!(update.status, TaskStatusChange::Done) {
@@ -4180,6 +4015,21 @@ pub fn apply_status_updates(
                         progress::summarize_milestone(pp, &update.task_id, db_dir);
                     }
                 }
+                // Prune crashed_last_iteration for terminal transitions. A
+                // terminal row is no longer "active", so the map entry would
+                // accumulate past the "bounded by active task count" invariant
+                // documented on the field. Reset and Unblock are NOT terminal.
+                if let Some(ref mut c) = ctx
+                    && matches!(
+                        update.status,
+                        TaskStatusChange::Done
+                            | TaskStatusChange::Failed
+                            | TaskStatusChange::Skipped
+                            | TaskStatusChange::Irrelevant
+                    )
+                {
+                    c.crashed_last_iteration.remove(&update.task_id);
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -4188,32 +4038,32 @@ pub fn apply_status_updates(
                 );
             }
         }
+        results.push((update.task_id.clone(), update.status, applied));
     }
-    applied
+    results
 }
 
 /// Check whether crash recovery should escalate the model for this iteration.
 ///
-/// Returns `Some(escalated_model)` when BOTH conditions are met:
-/// 1. The current task is the same as the previous iteration's task
-/// 2. The previous iteration crashed (`last_was_crash`)
+/// Returns `Some(escalated_model)` when the previous iteration on
+/// `current_task_id` crashed (i.e. `crashed_last_iteration[current_task_id]
+/// == true`). Returns `None` when the task is absent from the map or its
+/// last outcome was not a crash.
 ///
 /// When `resolved_model` is `None`, assumes `SONNET_MODEL` baseline
 /// and escalates to `OPUS_MODEL` (architect decision: None crash → opus).
 ///
 /// Escalation is independent of `CrashTracker` backoff logic.
-// TODO(FEAT-007): Implement escalation logic
 pub fn check_crash_escalation(
-    last_task_id: Option<&str>,
+    crashed_last_iteration: &std::collections::HashMap<String, bool>,
     current_task_id: &str,
-    last_was_crash: bool,
     resolved_model: Option<&str>,
 ) -> Option<String> {
-    // Escalation requires BOTH same task AND previous crash
-    if !last_was_crash {
-        return None;
-    }
-    if last_task_id != Some(current_task_id) {
+    if !crashed_last_iteration
+        .get(current_task_id)
+        .copied()
+        .unwrap_or(false)
+    {
         return None;
     }
     // None / empty / whitespace model: assume sonnet baseline, escalate to opus
@@ -4400,6 +4250,8 @@ fn prompt_overflow_result(critical_size: usize, budget: usize, task_id: String) 
         effective_model: None,
         effective_effort: None,
         key_decisions_count: 0,
+        conversation: None,
+        shown_learning_ids: Vec::new(),
     }
 }
 
@@ -4580,8 +4432,10 @@ mod tests {
         assert!(ctx.session_guidance.is_empty());
         assert!(ctx.reorder_hint.is_none());
         assert_eq!(ctx.reorder_count, 0);
-        assert!(ctx.last_task_id.is_none());
-        assert!(!ctx.last_was_crash);
+        assert!(
+            ctx.crashed_last_iteration.is_empty(),
+            "TEST-INIT-004 contract: per-task crash map starts empty"
+        );
     }
 
     // --- IterationResult tests ---
@@ -4597,6 +4451,8 @@ mod tests {
             effective_model: None,
             effective_effort: None,
             key_decisions_count: 0,
+            conversation: None,
+            shown_learning_ids: Vec::new(),
         };
         assert_eq!(result.task_id, Some("FEAT-001".to_string()));
         assert!(!result.should_stop);
@@ -4952,25 +4808,31 @@ mod tests {
     }
 
     // --- check_crash_escalation tests ---
-    //
-    // Active tests validate the no-escalation paths (pass against stub).
-    // Tests below verify FEAT-007 crash escalation behavior.
 
-    /// First iteration: no previous task context, no crash — no escalation.
+    /// Build a `crashed_last_iteration` map from a slice of `(task_id, is_crash)` pairs.
+    fn crash_map(entries: &[(&str, bool)]) -> std::collections::HashMap<String, bool> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// First iteration: empty map — no crash recorded yet.
     #[test]
     fn test_crash_escalation_first_iteration_no_crash() {
-        let result = check_crash_escalation(None, "FEAT-001", false, Some(SONNET_MODEL));
+        let result = check_crash_escalation(&crash_map(&[]), "FEAT-001", Some(SONNET_MODEL));
         assert_eq!(
             result, None,
             "first iteration without crash must not escalate"
         );
     }
 
-    /// First iteration with crash: no previous task to compare — no escalation.
-    /// Edge case: last_task_id=None means we can't determine same-task.
+    /// First iteration with crash: task absent from map — no escalation yet
+    /// (the pipeline writes to the map AFTER the iteration, so the first pick
+    /// of a new task always finds it absent).
     #[test]
     fn test_crash_escalation_first_iteration_with_crash() {
-        let result = check_crash_escalation(None, "FEAT-001", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(&crash_map(&[]), "FEAT-001", Some(SONNET_MODEL));
         assert_eq!(
             result, None,
             "first iteration crash has no previous task context, cannot escalate"
@@ -4980,8 +4842,11 @@ mod tests {
     /// Same task but no crash — no escalation.
     #[test]
     fn test_crash_escalation_same_task_no_crash() {
-        let result =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(result, None, "same task without crash must not escalate");
     }
 
@@ -4989,7 +4854,11 @@ mod tests {
     /// does not carry forward).
     #[test]
     fn test_crash_escalation_different_task_with_crash() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-002",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             result, None,
             "crash on different task must not escalate for new task"
@@ -5000,7 +4869,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_haiku_to_sonnet() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             result,
             Some(SONNET_MODEL.to_string()),
@@ -5012,7 +4885,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_sonnet_to_opus() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -5024,7 +4901,11 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_opus_ceiling() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(OPUS_MODEL));
+        let result = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(OPUS_MODEL),
+        );
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -5038,7 +4919,7 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_none_model_to_opus() {
-        let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, None);
+        let result = check_crash_escalation(&crash_map(&[("FEAT-001", true)]), "FEAT-001", None);
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -5052,7 +4933,8 @@ mod tests {
     #[test]
     fn test_crash_escalation_empty_and_whitespace_normalize_to_opus() {
         for bad in ["", "   ", "\t", " \n "] {
-            let result = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(bad));
+            let result =
+                check_crash_escalation(&crash_map(&[("FEAT-001", true)]), "FEAT-001", Some(bad));
             assert_eq!(
                 result,
                 Some(OPUS_MODEL.to_string()),
@@ -5068,17 +4950,27 @@ mod tests {
 
     fn test_crash_escalation_requires_both_conditions() {
         // Only same task (no crash) — must NOT escalate
-        let no_crash =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, Some(SONNET_MODEL));
+        let no_crash = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(no_crash, None, "same task without crash must NOT escalate");
 
         // Only crash (different task) — must NOT escalate
-        let diff_task =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-002", true, Some(SONNET_MODEL));
+        let diff_task = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-002",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(diff_task, None, "crash on different task must NOT escalate");
 
         // BOTH conditions — MUST escalate
-        let both = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(SONNET_MODEL));
+        let both = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(SONNET_MODEL),
+        );
         assert_eq!(
             both,
             Some(OPUS_MODEL.to_string()),
@@ -5089,26 +4981,35 @@ mod tests {
     // ===== TEST-004: Comprehensive crash recovery escalation tests =====
 
     /// AC: Crash on task A, success on task A, crash on task A again.
-    /// After success, last_was_crash is false, so the next crash escalates from
-    /// the base model (not from the previously escalated model).
+    /// After success the map entry flips to false, so the next crash escalates
+    /// from the base model (not the previously escalated model).
     #[test]
     fn test_crash_escalation_success_resets_escalation() {
         // First crash: haiku → sonnet
-        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let first = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(first, Some(SONNET_MODEL.to_string()));
 
-        // Success: last_was_crash becomes false. Simulating with false:
-        let after_success =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", false, first.as_deref());
+        // After success the pipeline writes false into the map.
+        let after_success = check_crash_escalation(
+            &crash_map(&[("FEAT-001", false)]),
+            "FEAT-001",
+            first.as_deref(),
+        );
         assert_eq!(
             after_success, None,
             "After success, no crash escalation should occur"
         );
 
-        // Crash again on same task with original base model:
-        // In real flow, resolved_model would come from build_prompt fresh (haiku again)
-        let second_crash =
-            check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        // Crash again on same task with original base model.
+        let second_crash = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             second_crash,
             Some(SONNET_MODEL.to_string()),
@@ -5116,17 +5017,18 @@ mod tests {
         );
     }
 
-    /// AC: Crash on task A, then crash on task B → no escalation for task B.
-    /// The crash escalation is task-scoped.
+    /// AC: Crash on task A, then task B is picked → no escalation for task B.
+    /// The crash flag is keyed by task_id; TASK-B is absent from the map.
     #[test]
     fn test_crash_escalation_task_boundary_isolation() {
         // Crash on task A: haiku → sonnet
-        let crash_a = check_crash_escalation(Some("TASK-A"), "TASK-A", true, Some(HAIKU_MODEL));
+        let crash_a =
+            check_crash_escalation(&crash_map(&[("TASK-A", true)]), "TASK-A", Some(HAIKU_MODEL));
         assert_eq!(crash_a, Some(SONNET_MODEL.to_string()));
 
-        // Now task B is selected. last_task_id is "TASK-A", current is "TASK-B".
-        // Even though last_was_crash is true, different task → no escalation.
-        let crash_b = check_crash_escalation(Some("TASK-A"), "TASK-B", true, Some(HAIKU_MODEL));
+        // Task B is selected next. TASK-A crashed but TASK-B is absent from map.
+        let crash_b =
+            check_crash_escalation(&crash_map(&[("TASK-A", true)]), "TASK-B", Some(HAIKU_MODEL));
         assert_eq!(
             crash_b, None,
             "Crash escalation must not carry across task boundaries"
@@ -5134,15 +5036,20 @@ mod tests {
     }
 
     /// AC: Crash escalation is independent of CrashTracker backoff count.
-    /// check_crash_escalation doesn't inspect CrashTracker — it only uses
-    /// last_task_id, current_task_id, last_was_crash, and resolved_model.
+    /// check_crash_escalation only consults the map and resolved_model.
     #[test]
     fn test_crash_escalation_independent_of_crash_tracker() {
-        // Regardless of how many times CrashTracker has recorded crashes,
-        // check_crash_escalation only cares about the 4 parameters.
-        // Same inputs produce same outputs — no hidden state.
-        let result1 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
-        let result2 = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        // Same map + same task + same model → same result every time.
+        let result1 = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
+        let result2 = check_crash_escalation(
+            &crash_map(&[("FEAT-001", true)]),
+            "FEAT-001",
+            Some(HAIKU_MODEL),
+        );
         assert_eq!(
             result1, result2,
             "Same inputs must produce same outputs — no hidden state"
@@ -5159,8 +5066,9 @@ mod tests {
     #[test]
 
     fn test_crash_escalation_consecutive_ladder() {
+        let crashed = crash_map(&[("FEAT-001", true)]);
         // First crash: haiku → sonnet
-        let first = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, Some(HAIKU_MODEL));
+        let first = check_crash_escalation(&crashed, "FEAT-001", Some(HAIKU_MODEL));
         assert_eq!(
             first,
             Some(SONNET_MODEL.to_string()),
@@ -5168,7 +5076,7 @@ mod tests {
         );
 
         // Second crash: feed escalated model back in (sonnet → opus)
-        let second = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, first.as_deref());
+        let second = check_crash_escalation(&crashed, "FEAT-001", first.as_deref());
         assert_eq!(
             second,
             Some(OPUS_MODEL.to_string()),
@@ -5176,7 +5084,7 @@ mod tests {
         );
 
         // Third crash: opus → opus (ceiling)
-        let third = check_crash_escalation(Some("FEAT-001"), "FEAT-001", true, second.as_deref());
+        let third = check_crash_escalation(&crashed, "FEAT-001", second.as_deref());
         assert_eq!(
             third,
             Some(OPUS_MODEL.to_string()),
@@ -6090,6 +5998,13 @@ mod tests {
     // file; here we cover the pure dispatcher contract: command dispatch,
     // PRD JSON sync, warning-on-state-violation.
 
+    /// Count entries in an `apply_status_updates` result whose dispatch
+    /// succeeded — preserves the legacy "applied" semantics for tests written
+    /// against the old `u32` return type.
+    fn applied_count(results: &[(String, detection::TaskStatusChange, bool)]) -> u32 {
+        results.iter().filter(|(_, _, ok)| *ok).count() as u32
+    }
+
     /// Seed a minimal task row. `status` is set verbatim so tests can simulate
     /// pre-claimed (in_progress) vs unclaimed (todo) state machines.
     fn seed_task_with_status(conn: &Connection, id: &str, status: &str) {
@@ -6126,9 +6041,17 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-001'", [], |r| {
@@ -6150,9 +6073,21 @@ mod tests {
             task_id: "FEAT-002".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1, "todo task must be auto-claimed then completed");
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            applied_count(&results),
+            1,
+            "todo task must be auto-claimed then completed"
+        );
 
         let (status, started_at): (String, Option<String>) = conn
             .query_row(
@@ -6182,7 +6117,7 @@ mod tests {
             task_id: "FEAT-010".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             Some("run-1"),
@@ -6190,8 +6125,9 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let linked: i64 = conn
             .query_row(
@@ -6216,9 +6152,17 @@ mod tests {
             task_id: "FEAT-001".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(applied_count(&results), 1);
 
         let prd: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&prd_path).unwrap()).unwrap();
@@ -6257,10 +6201,19 @@ mod tests {
             task_id: "FEAT-003".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
-            applied, 1,
+            applied_count(&results),
+            1,
             "DB dispatch succeeded even though PRD sync failed",
         );
 
@@ -6289,9 +6242,17 @@ mod tests {
             task_id: "FEAT-004".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1);
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(applied_count(&results), 1);
 
         let status: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-004'", [], |r| {
@@ -6322,7 +6283,7 @@ mod tests {
             task_id: "MILESTONE-1".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             None,
@@ -6330,8 +6291,9 @@ mod tests {
             None,
             Some(&progress_path),
             None,
+            None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let after = std::fs::read_to_string(&progress_path).unwrap();
         assert!(
@@ -6364,7 +6326,7 @@ mod tests {
             task_id: "FEAT-100".to_string(),
             status: detection::TaskStatusChange::Done,
         }];
-        let applied = apply_status_updates(
+        let results = apply_status_updates(
             &mut conn,
             &updates,
             None,
@@ -6372,8 +6334,9 @@ mod tests {
             None,
             Some(&progress_path),
             None,
+            None,
         );
-        assert_eq!(applied, 1);
+        assert_eq!(applied_count(&results), 1);
 
         let after = std::fs::read_to_string(&progress_path).unwrap();
         assert_eq!(
@@ -6401,9 +6364,21 @@ mod tests {
                 status: detection::TaskStatusChange::Done,
             },
         ];
-        let applied =
-            apply_status_updates(&mut conn, &updates, None, Some(&prd_path), None, None, None);
-        assert_eq!(applied, 1, "one dispatch failed, one succeeded");
+        let results = apply_status_updates(
+            &mut conn,
+            &updates,
+            None,
+            Some(&prd_path),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            applied_count(&results),
+            1,
+            "one dispatch failed, one succeeded"
+        );
 
         let status_b: String = conn
             .query_row("SELECT status FROM tasks WHERE id = 'FEAT-B'", [], |r| {
@@ -6418,20 +6393,18 @@ mod tests {
     mod wave {
         use super::*;
         use crate::loop_engine::config::PermissionMode;
+        use crate::loop_engine::prompt::slot::{
+            SlotPromptBundle, SlotPromptParams, build_prompt as build_slot_prompt_bundle,
+        };
         use crate::loop_engine::test_utils::{insert_task, insert_task_file};
         use crate::models::Task;
         use std::sync::atomic::Ordering;
 
         /// Build a minimal SlotIterationParams wired to a test DB.
         /// `signal_flag` is shared so tests can observe/trip it across slots.
-        fn make_slot_params(
-            db_dir: &Path,
-            base_prompt_path: PathBuf,
-            signal_flag: SignalFlag,
-        ) -> SlotIterationParams {
+        fn make_slot_params(db_dir: &Path, signal_flag: SignalFlag) -> SlotIterationParams {
             SlotIterationParams {
                 db_dir: db_dir.to_path_buf(),
-                base_prompt_path,
                 permission_mode: PermissionMode::Dangerous,
                 signal_flag,
                 default_model: None,
@@ -6442,11 +6415,46 @@ mod tests {
             }
         }
 
-        fn make_slot(slot_index: usize, working_root: PathBuf, task: Task) -> SlotContext {
+        /// Build a SlotPromptParams pointing at a temp project root + base prompt.
+        fn make_prompt_params(
+            project_root: &Path,
+            base_prompt_path: PathBuf,
+        ) -> SlotPromptParams<'static> {
+            SlotPromptParams {
+                project_root: project_root.to_path_buf(),
+                base_prompt_path,
+                permission_mode: PermissionMode::Dangerous,
+                steering_path: None,
+                session_guidance: "",
+            }
+        }
+
+        /// Synthesize a `SlotPromptBundle` directly without invoking
+        /// `build_prompt`. Useful for tests that don't need the full
+        /// learnings/source-context pipeline (e.g. struct-field smoke tests
+        /// and pre-signal early-exit checks).
+        fn dummy_bundle(task_id: &str) -> SlotPromptBundle {
+            SlotPromptBundle {
+                prompt: format!("# slot prompt for {task_id}\n"),
+                task_id: task_id.to_string(),
+                task_files: Vec::new(),
+                shown_learning_ids: Vec::new(),
+                resolved_model: None,
+                difficulty: None,
+                section_sizes: Vec::new(),
+                dropped_sections: Vec::new(),
+            }
+        }
+
+        fn make_slot(
+            slot_index: usize,
+            working_root: PathBuf,
+            prompt_bundle: SlotPromptBundle,
+        ) -> SlotContext {
             SlotContext {
                 slot_index,
                 working_root,
-                task,
+                prompt_bundle,
                 last_activity_epoch: Arc::new(AtomicU64::new(0)),
             }
         }
@@ -6456,11 +6464,11 @@ mod tests {
         #[test]
         fn test_slot_context_fields() {
             let tmp = tempfile::TempDir::new().unwrap();
-            let task = Task::new("FEAT-1", "t");
-            let ctx = make_slot(2, tmp.path().to_path_buf(), task);
+            let bundle = dummy_bundle("FEAT-1");
+            let ctx = make_slot(2, tmp.path().to_path_buf(), bundle);
             assert_eq!(ctx.slot_index, 2);
             assert_eq!(ctx.working_root, tmp.path());
-            assert_eq!(ctx.task.id, "FEAT-1");
+            assert_eq!(ctx.prompt_bundle.task_id, "FEAT-1");
             assert_eq!(ctx.last_activity_epoch.load(Ordering::Relaxed), 0);
         }
 
@@ -6477,14 +6485,25 @@ mod tests {
                     effective_model: None,
                     effective_effort: None,
                     key_decisions_count: 0,
+                    conversation: None,
+                    shown_learning_ids: Vec::new(),
                 },
                 claim_succeeded: true,
+                shown_learning_ids: vec![42, 77],
+                prompt_for_overflow: None,
+                section_sizes: Vec::new(),
+                dropped_sections: Vec::new(),
+                task_difficulty: None,
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(
                 sr.iteration_result.outcome,
                 IterationOutcome::Completed
             ));
+            // FEAT-002 AC: SlotResult exposes shown_learning_ids at the top
+            // level so the main thread can record bandit feedback without
+            // re-reading the bundle (which has been moved into the worker).
+            assert_eq!(sr.shown_learning_ids, vec![42, 77]);
         }
 
         #[test]
@@ -6503,14 +6522,12 @@ mod tests {
         fn test_run_slot_iteration_honors_pre_set_signal_flag() {
             let (temp, _conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             let signal = SignalFlag::new();
             signal.set(); // pre-signal — slot must bail before spawning Claude
-            let params = make_slot_params(temp.path(), base_prompt, signal);
+            let params = make_slot_params(temp.path(), signal);
 
-            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-1", "t"));
+            let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-1"));
             let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");
             assert_eq!(result.slot_index, 0);
             assert!(matches!(
@@ -6521,10 +6538,11 @@ mod tests {
             assert_eq!(result.iteration_result.task_id.as_deref(), Some("FEAT-1"),);
         }
 
-        // --- build_slot_prompt: includes task JSON + completion instruction ---
+        // --- prompt::slot::build_prompt: includes task JSON + completion ---
 
         #[test]
-        fn test_build_slot_prompt_contains_task_and_completion_sections() {
+        fn test_slot_bundle_contains_task_and_completion_sections() {
+            let (_temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
             let base = tmp.path().join("base.md");
             std::fs::write(&base, "BASE_PROMPT_CONTENT").unwrap();
@@ -6533,7 +6551,9 @@ mod tests {
             task.description = Some("Detailed desc".to_string());
             task.difficulty = Some("high".to_string());
 
-            let prompt = build_slot_prompt(&task, &base);
+            let prompt_params = make_prompt_params(tmp.path(), base);
+            let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+            let prompt = &bundle.prompt;
             assert!(prompt.contains("FEAT-42"), "missing task id");
             assert!(prompt.contains("Do the thing"), "missing title");
             assert!(prompt.contains("Detailed desc"), "missing description");
@@ -6546,34 +6566,19 @@ mod tests {
                 prompt.contains("BASE_PROMPT_CONTENT"),
                 "missing base prompt content",
             );
+            assert_eq!(bundle.difficulty.as_deref(), Some("high"));
         }
 
         #[test]
-        fn test_build_slot_prompt_tolerates_missing_base_prompt() {
+        fn test_slot_bundle_tolerates_missing_base_prompt() {
+            let (_temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
             let task = Task::new("FEAT-1", "t");
             // base_prompt_path does not exist — must not panic
-            let prompt = build_slot_prompt(&task, &tmp.path().join("does-not-exist.md"));
-            assert!(prompt.contains("FEAT-1"));
-        }
-
-        // --- load_task_files ---
-
-        #[test]
-        fn test_load_task_files_returns_sorted_paths() {
-            let (_tmp, conn) = setup_test_db();
-            insert_task(&conn, "FEAT-1", "t", "todo", 10);
-            insert_task_file(&conn, "FEAT-1", "src/z.rs");
-            insert_task_file(&conn, "FEAT-1", "src/a.rs");
-            let files = load_task_files(&conn, "FEAT-1");
-            assert_eq!(files, vec!["src/a.rs", "src/z.rs"]);
-        }
-
-        #[test]
-        fn test_load_task_files_empty_for_unknown_task() {
-            let (_tmp, conn) = setup_test_db();
-            let files = load_task_files(&conn, "FEAT-MISSING");
-            assert!(files.is_empty());
+            let prompt_params =
+                make_prompt_params(tmp.path(), tmp.path().join("does-not-exist.md"));
+            let bundle = build_slot_prompt_bundle(&conn, &task, &prompt_params);
+            assert!(bundle.prompt.contains("FEAT-1"));
         }
 
         // --- claim_slot_task ---
@@ -6611,15 +6616,8 @@ mod tests {
         #[test]
         fn test_run_parallel_wave_empty_slots_returns_empty_outcomes() {
             let (temp, conn) = setup_test_db();
-            let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
-            let params = Arc::new(make_slot_params(
-                temp.path(),
-                base_prompt,
-                SignalFlag::new(),
-            ));
+            let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
             let wave = run_parallel_wave(&conn, vec![], params);
             assert!(wave.outcomes.is_empty());
         }
@@ -6628,8 +6626,6 @@ mod tests {
         fn test_run_parallel_wave_reports_claim_failure_for_done_task() {
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             // Task is already done — claim_slot_task returns false; wave must
             // emit a Crash(RuntimeError) entry rather than silently drop the slot.
@@ -6639,9 +6635,9 @@ mod tests {
             // Pre-signal so if the claim logic regresses and still spawns Claude,
             // the slot's early-signal check bails before touching the network.
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
-            let slot = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-DONE", "t"));
+            let slot = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-DONE"));
             let wave = run_parallel_wave(&conn, vec![slot], params);
             assert_eq!(wave.outcomes.len(), 1);
             assert_eq!(wave.outcomes[0].slot_index, 0);
@@ -6662,18 +6658,16 @@ mod tests {
             // immediately; the DB must still show in_progress for both tasks.
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
             insert_task(&conn, "FEAT-B", "b", "todo", 10);
 
             let signal = SignalFlag::new();
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
-            let slot_a = make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a"));
-            let slot_b = make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b"));
+            let slot_a = make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A"));
+            let slot_b = make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B"));
 
             let wave = run_parallel_wave(&conn, vec![slot_a, slot_b], params);
             assert_eq!(wave.outcomes.len(), 2);
@@ -6698,8 +6692,6 @@ mod tests {
             // the reorder path. Outcomes must always emerge slot-ordered.
             let (temp, conn) = setup_test_db();
             let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
             insert_task(&conn, "FEAT-A", "a", "todo", 10);
             insert_task(&conn, "FEAT-B", "b", "done", 10); // claim fails
@@ -6707,12 +6699,12 @@ mod tests {
 
             let signal = SignalFlag::new();
             signal.set();
-            let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal));
+            let params = Arc::new(make_slot_params(temp.path(), signal));
 
             let slots = vec![
-                make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
-                make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
-                make_slot(2, tmp.path().to_path_buf(), Task::new("FEAT-C", "c")),
+                make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A")),
+                make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B")),
+                make_slot(2, tmp.path().to_path_buf(), dummy_bundle("FEAT-C")),
             ];
 
             let wave = run_parallel_wave(&conn, slots, params);
@@ -6725,15 +6717,8 @@ mod tests {
         #[test]
         fn test_run_parallel_wave_measures_wall_clock_duration() {
             let (temp, conn) = setup_test_db();
-            let tmp = tempfile::TempDir::new().unwrap();
-            let base_prompt = tmp.path().join("base.md");
-            std::fs::write(&base_prompt, "base").unwrap();
 
-            let params = Arc::new(make_slot_params(
-                temp.path(),
-                base_prompt,
-                SignalFlag::new(),
-            ));
+            let params = Arc::new(make_slot_params(temp.path(), SignalFlag::new()));
             let wave = run_parallel_wave(&conn, vec![], params);
             // Empty wave still records a non-negative duration; ensures the
             // Instant::now() → elapsed() contract holds.
@@ -6780,6 +6765,8 @@ mod tests {
                 external_repo_path: None,
                 external_git_scan_depth: 50,
                 inter_iteration_delay: Duration::ZERO,
+                steering_path: None,
+                session_guidance: "",
             }
         }
 
@@ -6998,6 +6985,8 @@ mod tests {
                     external_repo_path: None,
                     external_git_scan_depth: 50,
                     inter_iteration_delay: Duration::from_millis(500),
+                    steering_path: None,
+                    session_guidance: "",
                 },
                 &mut ctx,
             );
@@ -7023,7 +7012,6 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let params = SlotIterationParams {
                 db_dir: tmp.path().to_path_buf(),
-                base_prompt_path: tmp.path().join("base.md"),
                 permission_mode: PermissionMode::Dangerous,
                 signal_flag: SignalFlag::new(),
                 default_model: Some(OPUS_MODEL.to_string()),
@@ -7036,6 +7024,71 @@ mod tests {
             assert_eq!(cloned.db_dir, params.db_dir);
             assert_eq!(cloned.verbose, params.verbose);
             assert_eq!(cloned.default_model.as_deref(), Some(OPUS_MODEL));
+        }
+
+        // --- FEAT-002 CONTRACT: build_bundle (main) → spawn(worker) ---
+        //
+        // The slot worker must NEVER touch a `&Connection` or read task data
+        // from anything other than its prompt bundle. The compile-time
+        // `assert_impl_all!(SlotPromptBundle: Send)` in `tests/prompt_slot.rs`
+        // guards the type-level invariant; this test guards the wiring:
+        // `build_slot_contexts` populates the bundle (with its DB-derived
+        // `task_files`) on the main thread, BEFORE any worker spawn, and the
+        // bundle survives the trip through `run_parallel_wave` unmodified.
+
+        #[test]
+        fn test_build_slot_contexts_populates_bundle_on_main_thread() {
+            use crate::commands::next::selection::ScoredTask;
+            let (temp, conn) = setup_test_db();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let base_prompt = tmp.path().join("base.md");
+            std::fs::write(&base_prompt, "BASE\n").unwrap();
+
+            insert_task(&conn, "FEAT-CONTRACT", "contract task", "todo", 10);
+            insert_task_file(&conn, "FEAT-CONTRACT", "src/contract.rs");
+
+            let mut task = Task::new("FEAT-CONTRACT", "contract task");
+            task.difficulty = Some("low".to_string());
+            let scored = ScoredTask {
+                task,
+                files: vec!["src/contract.rs".to_string()],
+                total_score: 0,
+                score_breakdown: crate::commands::next::selection::ScoreBreakdown {
+                    priority_score: 0,
+                    file_score: 0,
+                    file_overlap_count: 0,
+                },
+            };
+
+            let prompt_params = SlotPromptParams {
+                project_root: tmp.path().to_path_buf(),
+                base_prompt_path: base_prompt,
+                permission_mode: PermissionMode::Dangerous,
+                steering_path: None,
+                session_guidance: "",
+            };
+            let slot_paths = vec![tmp.path().to_path_buf()];
+            let slots = build_slot_contexts(&conn, vec![scored], &slot_paths, &prompt_params);
+
+            assert_eq!(slots.len(), 1);
+            let bundle = &slots[0].prompt_bundle;
+            // task_id, task_files, and difficulty came from the DB / Task on
+            // the main thread. The worker thread will read from this bundle
+            // and never reopen `conn`.
+            assert_eq!(bundle.task_id, "FEAT-CONTRACT");
+            assert_eq!(bundle.task_files, vec!["src/contract.rs"]);
+            assert_eq!(bundle.difficulty.as_deref(), Some("low"));
+            // The task JSON inside the bundle reflects the post-claim state
+            // even though the row is still 'todo' (claim happens later in
+            // run_parallel_wave). This keeps the agent prompt honest about
+            // the state the row WILL be in by the time the worker runs.
+            assert!(
+                bundle.prompt.contains("\"status\": \"in_progress\""),
+                "bundle prompt must reflect post-claim status; got:\n{}",
+                bundle.prompt
+            );
+            // Drop temp last so the connection (held in scope) outlives it.
+            drop(temp);
         }
 
         // --- TEST-001: Comprehensive parallel execution tests -------------
@@ -7151,6 +7204,8 @@ mod tests {
                     external_repo_path: None,
                     external_git_scan_depth: 50,
                     inter_iteration_delay: Duration::ZERO,
+                    steering_path: None,
+                    session_guidance: "",
                 }
             }
 
@@ -7238,16 +7293,14 @@ mod tests {
                 insert_task(&conn, "FEAT-B", "b", "todo", 20);
 
                 let tmp = tempfile::TempDir::new().unwrap();
-                let base_prompt = tmp.path().join("base.md");
-                std::fs::write(&base_prompt, "base").unwrap();
 
                 let signal = SignalFlag::new();
                 signal.set();
-                let params = Arc::new(make_slot_params(temp.path(), base_prompt, signal.clone()));
+                let params = Arc::new(make_slot_params(temp.path(), signal.clone()));
 
                 let slots = vec![
-                    make_slot(0, tmp.path().to_path_buf(), Task::new("FEAT-A", "a")),
-                    make_slot(1, tmp.path().to_path_buf(), Task::new("FEAT-B", "b")),
+                    make_slot(0, tmp.path().to_path_buf(), dummy_bundle("FEAT-A")),
+                    make_slot(1, tmp.path().to_path_buf(), dummy_bundle("FEAT-B")),
                 ];
                 let wave = run_parallel_wave(&conn, slots, params);
 

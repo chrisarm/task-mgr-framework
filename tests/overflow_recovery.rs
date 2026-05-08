@@ -153,6 +153,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         1,
         Some("run-test"),
         base,
+        None,
     );
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert!(
@@ -182,6 +183,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         2,
         Some("run-test"),
         base,
+        None,
     );
     assert_eq!(rung_label(&a2), "escalate_model");
     assert!(
@@ -210,6 +212,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         3,
         Some("run-test"),
         base,
+        None,
     );
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert!(
@@ -238,6 +241,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         4,
         Some("run-test"),
         base,
+        None,
     );
     assert_eq!(rung_label(&a4), "blocked");
     assert!(matches!(a4, RecoveryAction::Blocked));
@@ -271,6 +275,7 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
         1,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(
         rung_label(&action),
@@ -306,6 +311,7 @@ fn filename_sanitization_neutralizes_traversal() {
         1,
         None,
         tmp.path(),
+        None,
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -369,6 +375,7 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
         1,
         None,
         tmp.path(),
+        None,
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -435,6 +442,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
             (i as u32) + 1,
             None,
             tmp.path(),
+            None,
         );
         assert_eq!(rung_label(&action), *expected, "scenario {i} rung mismatch");
     }
@@ -487,6 +495,7 @@ fn rotation_keeps_only_newest_three_dumps() {
             i,
             None,
             tmp.path(),
+            None,
         );
         // Sleep enough for distinguishable mtimes on coarse filesystems —
         // resolution is at least 1s on common Linux setups (ext4 with
@@ -554,6 +563,7 @@ fn overflow_recovered_set_populated_after_first_overflow() {
         1,
         None,
         tmp.path(),
+        None,
     );
 
     assert!(
@@ -586,6 +596,7 @@ fn original_model_captured_on_first_overflow_only() {
         1,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -616,6 +627,7 @@ fn original_model_captured_on_first_overflow_only() {
             (i as u32) + 2,
             None,
             tmp.path(),
+            None,
         );
         assert_eq!(
             ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -649,6 +661,7 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
         1,
         Some("run-blk"),
         tmp.path(),
+        None,
     );
     assert!(matches!(action, RecoveryAction::Blocked));
     assert_eq!(task_status(&conn, task_id), "blocked");
@@ -693,6 +706,7 @@ fn no_pollution_outside_tempdir() {
         1,
         None,
         tmp.path(),
+        None,
     );
 
     let canon_root = tmp.path().canonicalize().expect("canonicalize root");
@@ -750,6 +764,7 @@ fn override_persists_across_iterations() {
         2,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(rung_label(&action), "escalate_model");
     assert_eq!(
@@ -796,6 +811,7 @@ fn original_model_captured_first_overflow_only() {
         1,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert_eq!(
@@ -821,6 +837,7 @@ fn original_model_captured_first_overflow_only() {
         2,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(rung_label(&a2), "escalate_model");
     assert_eq!(
@@ -847,6 +864,7 @@ fn original_model_captured_first_overflow_only() {
         3,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert_eq!(
@@ -879,6 +897,7 @@ fn run_id_none_serializes_correctly() {
         1,
         None, // <-- run_id is None
         tmp.path(),
+        None,
     );
 
     let events = read_events(tmp.path());
@@ -920,6 +939,7 @@ fn effective_model_none_dump_header() {
         1,
         None,
         tmp.path(),
+        None,
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -963,6 +983,7 @@ fn rung_4_writes_observability() {
         1,
         Some("run-r4obs"),
         tmp.path(),
+        None,
     );
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -1019,6 +1040,7 @@ fn dump_uses_sent_effort_not_resolved() {
         1,
         None,
         tmp.path(),
+        None,
     );
     assert_eq!(rung_label(&action), "downgrade_effort");
     assert!(

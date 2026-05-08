@@ -25,6 +25,41 @@ pub(crate) fn truncate_to_budget(text: &str, budget: usize) -> String {
     }
 }
 
+/// Try to fit a prompt section into the remaining byte budget.
+///
+/// Returns the section verbatim if it fits, or an empty string when it
+/// doesn't (with a stderr warning). Empty sections pass through unchanged
+/// without consuming budget. When a non-empty section is dropped, its
+/// `name` is appended to `dropped` so callers can report the drop to
+/// observability surfaces (overflow dumps, JSONL events).
+///
+/// Shared between the sequential and slot prompt builders so both paths
+/// account for budget consumption identically. See `prompt::sequential` and
+/// `prompt::slot` for usage.
+pub(crate) fn try_fit_section(
+    section: String,
+    name: &str,
+    remaining: &mut usize,
+    dropped: &mut Vec<String>,
+) -> String {
+    if section.is_empty() {
+        return section;
+    }
+    if section.len() <= *remaining {
+        *remaining -= section.len();
+        section
+    } else {
+        eprintln!(
+            "Warning: {} section ({} bytes) skipped — only {} bytes remaining in prompt budget",
+            name,
+            section.len(),
+            remaining,
+        );
+        dropped.push(name.to_string());
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

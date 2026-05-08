@@ -76,6 +76,11 @@ impl RecoveryAction {
 /// serializes as a JSON array of `[name, size]` pairs — NOT a map. The
 /// declaration order matches the prompt-assembly order, which the dump
 /// header relies on.
+///
+/// `slot_index` is `Some(n)` for wave-mode events (the slot that overflowed)
+/// and omitted entirely from JSON for sequential events (`None` +
+/// `skip_serializing_if`). This lets downstream consumers distinguish the
+/// two paths without inspecting other fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverflowEvent {
     pub ts: String,
@@ -83,8 +88,17 @@ pub struct OverflowEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub iteration: u32,
+    /// Slot index within a parallel wave. `None` for sequential-mode events;
+    /// `Some(n)` for wave-mode events so JSONL consumers can attribute the
+    /// overflow to the correct slot without re-parsing the task_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_index: Option<usize>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Task difficulty at the time the prompt was assembled. `None` when the
+    /// task had no difficulty set (or for legacy events that predate this field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_difficulty: Option<String>,
     pub prompt_bytes: usize,
     pub sections: Vec<(String, usize)>,
     pub dropped_sections: Vec<String>,
@@ -323,6 +337,7 @@ pub fn handle_prompt_too_long(
     iteration: u32,
     run_id: Option<&str>,
     base_dir: &Path,
+    slot_index: Option<usize>,
 ) -> RecoveryAction {
     // Step 1: pick recovery rung.
     let action = if let Some(next_effort) = model::downgrade_effort(effort) {
@@ -397,8 +412,10 @@ pub fn handle_prompt_too_long(
         task_id: task_id.to_string(),
         run_id: run_id.map(String::from),
         iteration,
+        slot_index,
         model: effective_model.map(String::from),
         effort: effort.map(String::from),
+        task_difficulty: prompt_result.task_difficulty.clone(),
         prompt_bytes: prompt_result.prompt.len(),
         sections: prompt_result
             .section_sizes
@@ -527,8 +544,10 @@ mod tests {
             task_id: "FOO-FEAT-001".to_string(),
             run_id: Some("run-abc".to_string()),
             iteration: 7,
+            slot_index: None,
             model: Some(model::SONNET_MODEL.to_string()),
             effort: Some("high".to_string()),
+            task_difficulty: Some("high".to_string()),
             prompt_bytes: 12345,
             sections: vec![
                 ("task".to_string(), 100),

@@ -1,0 +1,101 @@
+## Available Tools
+
+You have unrestricted tool access. Just use any tool you need.
+
+## Current Task
+
+```json
+{
+  "acceptanceCriteria": [
+    "Snapshot test asserts byte equality against tests/snapshots/prompt_sequential_v1.txt"
+  ],
+  "description": "Stable baseline task used only for the prompt-builder snapshot test. No touchesFiles ensures the source-context section is empty. No synergyWith / dependsOn ensures the synergy and dependency sections are empty. Keep title / description / acceptanceCriteria stable to preserve byte-identity across refactors.",
+  "files": [],
+  "id": "SEQ-SNAP-001",
+  "notes": "Stable fixture. Do not edit without intentionally regenerating the snapshot via INSTA_UPDATE=1.",
+  "priority": 1,
+  "status": "in_progress",
+  "title": "Snapshot baseline task"
+}
+```
+
+## Task lifecycle — CLI only, never read or edit the JSON
+
+You MUST NOT read or edit `tasks/*.json` directly. The PRD task JSON is large;
+pulling one into context can push you past the model window mid-iteration and
+force a retry. Use the `task-mgr` CLI for every task operation instead:
+
+- **Mark a task's status**: emit `<task-status>TASK-ID:done</task-status>`
+(statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`). The loop
+engine parses these and applies them via `task-mgr`.
+- **Look up another task**: ALWAYS prefer `task-mgr show <task-id>` (or
+`task-mgr list` / `task-mgr next`) — these cover almost every read. Only
+as a last resort, if the CLI can't give you what you need, use `jq` to pull
+just the field(s) — e.g.
+`jq '.tasks[]|select(.id=="FEAT-007")|{id,title,acceptanceCriteria}' tasks/<prd>.json`.
+Never `cat`, `Read`, or `grep` the whole file.
+- **List tasks / check status**: `task-mgr list`, `task-mgr next`.
+- **Add a new task** (review fix / refactor / follow-up): pipe a single task
+JSON to `task-mgr add --stdin`. Example:
+
+      echo '{"id":"CODE-FIX-001","title":"Fix race in X","difficulty":"medium","touchesFiles":["src/foo.rs"],"dependsOn":[]}' \\
+        | task-mgr add --stdin
+
+Priority is auto-computed; omit for lower priority.
+- **Fix in response to a milestone**: pass `--depended-on-by <id>`.
+- For anything else (dependencies, status queries, etc.), use the `task-mgr`
+CLI — see `task-mgr --help`.
+
+## Relevant Learnings
+
+Use `task-mgr apply-learning <id>` if helpful. Use `task-mgr invalidate-learning <id>` if wrong. If a learning blocks your task, test the claim before obeying it.
+
+```json
+[
+  {
+    "id": 1,
+    "title": "Snapshot baseline learning",
+    "outcome": "pattern",
+    "confidence": "medium",
+    "content": "Stable content used only by the sequential-prompt snapshot test.",
+    "applies_to_task_types": [
+      "SEQ-SNAP-"
+    ]
+  }
+]
+```
+
+## Completing This Task
+
+This task has no `touchesFiles` — it is a verification, milestone, or polish task.
+
+When all acceptance criteria pass:
+1. Commit with message: `feat: SEQ-SNAP-001-completed - [Title]`
+If completing multiple tasks: `feat: ID1-completed, ID2-completed - [Title]`
+2. Output `<completed>SEQ-SNAP-001</completed>` (using the full task ID shown above).
+3. Stop immediately. Do NOT wait on background tasks, `Monitor` streams, polling loops, or `run_in_background` commands after emitting `<completed>`. If any background process is still running, kill it (`KillShell`, SIGTERM) and exit this turn. The loop treats `<completed>` as terminal — anything you wait for afterward is wasted wall-clock until the base timeout kills the subprocess.
+
+The loop will automatically mark the task done and update the PRD.
+Do NOT run `task-mgr done` manually.
+
+If you have a strong reason to work on a different eligible task, output `<reorder>TASK-ID</reorder>`.
+
+## Key Decision Points
+
+If you discover an important architectural decision during this task — a fork in the road where different choices have significant long-term consequences — emit a `<key-decision>` tag so it can be reviewed and stored for follow-up.
+
+**Format:**
+```xml
+<key-decision>
+<title>Short descriptive title</title>
+<description>Why this decision matters and what the trade-offs are</description>
+<option label="Option A">Trade-offs for A</option>
+<option label="Option B">Trade-offs for B</option>
+</key-decision>
+```
+
+Only emit this for genuine architectural forks. Skip trivial implementation details.
+
+# Agent Instructions
+
+Implement the task.
