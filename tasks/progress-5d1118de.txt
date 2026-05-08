@@ -72,3 +72,11 @@ Learnings:
 - The pipeline's outcome mutation is observed correctly by downstream run_loop blocks (external-git reconciliation, human-review trigger, retry tracking) because those branches read result.outcome AFTER the pipeline call site.
 - Wrapper-commit precondition shifts from a local task_marked_done_this_iteration bool to claimed_was_completed (derived from completed_task_ids); same semantics, no string-sniffing.
 ---
+## [2026-05-08 03:00] - 5d1118de-TEST-INIT-006
+Approach: Captured the pre-Phase-A baseline by adding tests/prompt_sequential_snapshot.rs that exercises prompt::build_prompt against a minimal PRD fixture (sequential_prompt_v1.json.tmpl: one task, no synergyWith/dependsOn/touchesFiles) plus one controlled `record_learning` row, then byte-compares the assembled prompt against tests/snapshots/prompt_sequential_v1.txt. Snapshot bootstraps when missing or when INSTA_UPDATE=1 is set; otherwise mismatches panic with a unified-diff-style report locating the first divergent line. Companion test pins documented section assembly order so a silent reorder fails BOTH tests.
+Files: tests/prompt_sequential_snapshot.rs, tests/snapshots/prompt_sequential_v1.txt, tests/fixtures/sequential_prompt_v1.json.tmpl
+Learnings:
+- Determinism budget: with no synergy/deps/touchesFiles + steering=None + session_guidance=`""` + permission_mode=Dangerous + no escalation template + a single learning, every trimmable section either expands to a fixed string or stays empty — escalation never fires (model_tier on None tries the template path, which doesn't exist) and source-context returns empty without a single touchesFile.
+- Per learning #896, integration tests can't reach loop_engine::test_utils; setup_fixture goes through init::init + record_learning. PrefixMode::Disabled keeps the task ID literal so the snapshot text is stable.
+- Verified the discriminator: mutating ONE character ("Snapshot baseline task" → "Snapshot Baseline Task") in the snapshot caused sequential_prompt_matches_v1_snapshot to fail with a unified-diff message.
+---
