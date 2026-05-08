@@ -232,7 +232,7 @@ pub fn add_with_conn(
     // Auto-prefix: when exactly one active PRD prefix exists, prepend it to the
     // task ID and all cross-references. Idempotent — already-prefixed IDs are
     // left unchanged.
-    let resolved_prefix = resolve_active_prefix(conn);
+    let resolved_prefix = resolve_active_prefix(conn)?;
     let prefixed_depended_on_by: Vec<String>;
     let effective_depended_on_by: &[String] = if let Some(ref prefix) = resolved_prefix {
         let original_id = input.id.clone();
@@ -381,21 +381,69 @@ fn resolve_priority(
 
 /// Query `prd_metadata` for the active effort prefix.
 ///
-/// Returns `Some(prefix)` when exactly one non-NULL `task_prefix` exists.
-/// Returns `None` when zero or multiple prefixes exist (ambiguous).
-fn resolve_active_prefix(conn: &Connection) -> Option<String> {
-    let mut stmt = conn
-        .prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")
-        .ok()?;
+/// Resolution order:
+/// 1. If `TASK_MGR_ACTIVE_PREFIX` is set (non-empty), verify the value exists
+///    in `prd_metadata.task_prefix`. Return `Ok(Some(value))` on hit; return
+///    `Err(invalid_state)` when the env value is NOT registered (stale pin —
+///    surfaces typos / cross-PRD leakage immediately rather than silently
+///    falling through to fallback). Empty string is treated as unset.
+/// 2. Env unset/empty → existing single-prefix fallback. Returns
+///    `Ok(Some(prefix))` when exactly one non-NULL `task_prefix` exists in
+///    `prd_metadata`; `Ok(None)` when zero or multiple prefixes exist.
+///
+/// DB errors propagate via `?` rather than being coerced to `None` — an
+/// unexpected schema/I/O failure must not silently bypass auto-prefixing.
+///
+/// `std::env::var` is read exactly once at function entry.
+fn resolve_active_prefix(conn: &Connection) -> TaskMgrResult<Option<String>> {
+    let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
+    if let Some(env_prefix) = env_value.as_deref().filter(|v| !v.is_empty()) {
+        // Verify the pinned prefix is registered. A stale pin is a hard error
+        // so the operator notices the typo / cross-PRD pin instead of the
+        // loop silently writing un-prefixed task IDs.
+        let mut stmt = conn.prepare("SELECT 1 FROM prd_metadata WHERE task_prefix = ? LIMIT 1")?;
+        let found: Option<i64> = stmt
+            .query_row([env_prefix], |row| row.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if found.is_some() {
+            return Ok(Some(env_prefix.to_string()));
+        }
+        // Stale pin — collect known prefixes for the error message so the
+        // operator can immediately spot the mismatch.
+        let mut known_stmt =
+            conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
+        let known: Vec<String> = known_stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let known_display = if known.is_empty() {
+            "(none registered)".to_string()
+        } else {
+            known.join(", ")
+        };
+        return Err(TaskMgrError::invalid_state(
+            "add",
+            crate::loop_engine::claude::ACTIVE_PREFIX_ENV,
+            format!("a prefix registered in prd_metadata (known: {known_display})"),
+            format!("{env_prefix} (not found in prd_metadata)"),
+        ));
+    }
+
+    // Fallback: single-PRD auto-detect.
+    let mut stmt =
+        conn.prepare("SELECT task_prefix FROM prd_metadata WHERE task_prefix IS NOT NULL")?;
     let prefixes: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()?
+        .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
     if prefixes.len() == 1 {
-        Some(prefixes.into_iter().next().unwrap())
+        Ok(Some(prefixes.into_iter().next().unwrap()))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -628,6 +676,61 @@ mod tests {
         conn
     }
 
+    /// Process-wide serialization for tests that observe `TASK_MGR_ACTIVE_PREFIX`.
+    ///
+    /// `resolve_active_prefix` reads the env var, so any test that calls
+    /// `add_with_conn` (which calls `resolve_active_prefix`) is sensitive to
+    /// concurrent env-var-mutating tests. Every such test acquires this
+    /// mutex via `isolate_env()`. Mitigates Learning [1685].
+    static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const ACTIVE_PREFIX_ENV: &str = crate::loop_engine::claude::ACTIVE_PREFIX_ENV;
+
+    /// RAII guard: saves and restores `TASK_MGR_ACTIVE_PREFIX` (or removes it)
+    /// on drop. `set_var`/`remove_var` are unsafe in current Rust; scoping
+    /// them inside this guard keeps the unsafety auditable.
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            unsafe { std::env::set_var(name, value) };
+            Self { name, prior }
+        }
+        fn unset(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            unsafe { std::env::remove_var(name) };
+            Self { name, prior }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(self.name, v) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    /// Compound guard: holds the process-wide mutex AND clears the env var.
+    /// Tests that don't care about env-var state but call code that reads it
+    /// (e.g. `add_with_conn` → `resolve_active_prefix`) start with this so
+    /// they don't observe state from a concurrent env-setting test.
+    struct EnvIsolation {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _env: EnvVarGuard,
+    }
+    fn isolate_env() -> EnvIsolation {
+        let lock = ENV_PREFIX_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvVarGuard::unset(ACTIVE_PREFIX_ENV);
+        EnvIsolation {
+            _lock: lock,
+            _env: env,
+        }
+    }
+
     fn minimal_input(id: &str) -> AddTaskInput {
         AddTaskInput {
             id: id.to_string(),
@@ -723,6 +826,7 @@ mod tests {
 
     #[test]
     fn test_add_rejects_duplicate_id() {
+        let _iso = isolate_env();
         let conn = memory_db();
         conn.execute(
             "INSERT INTO tasks (id, title, priority, status) VALUES ('X-SEED-001', 't', 10, 'todo')",
@@ -764,6 +868,7 @@ mod tests {
 
     #[test]
     fn test_add_writes_task_into_database() {
+        let _iso = isolate_env();
         let conn = memory_db();
         let input = minimal_input("X-FEAT-001");
         let res = add_with_conn(&conn, input, None, &[]).unwrap();
@@ -784,6 +889,7 @@ mod tests {
 
     #[test]
     fn test_add_writes_relationships_and_files() {
+        let _iso = isolate_env();
         let conn = memory_db();
         // Seed the dependency so insert_task_relationships can reference it.
         // (The FK constraint on task_relationships doesn't validate target
@@ -924,6 +1030,7 @@ mod tests {
 
     #[test]
     fn test_depended_on_by_inserts_reverse_relationship() {
+        let _iso = isolate_env();
         let conn = memory_db();
         seed_task(&conn, "MILESTONE-1");
 
@@ -958,6 +1065,7 @@ mod tests {
 
     #[test]
     fn test_depended_on_by_invalid_id_rejects_before_insert() {
+        let _iso = isolate_env();
         let conn = memory_db();
         // Do NOT seed NONEXISTENT-ID.
         let input = minimal_input("NEW-002");
@@ -982,6 +1090,7 @@ mod tests {
 
     #[test]
     fn test_depended_on_by_multiple_targets_all_wired() {
+        let _iso = isolate_env();
         let conn = memory_db();
         seed_task(&conn, "TARGET-A");
         seed_task(&conn, "TARGET-B");
@@ -1006,5 +1115,109 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "{target} must dependOn NEW-003");
         }
+    }
+
+    // --- FEAT-002: resolve_active_prefix env-var awareness ---
+
+    fn seed_prefix(conn: &Connection, id: i64, project: &str, task_prefix: &str) {
+        conn.execute(
+            "INSERT INTO prd_metadata (id, project, task_prefix) VALUES (?, ?, ?)",
+            rusqlite::params![id, project, task_prefix],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_unset_single_prd_returns_some() {
+        // Regression: existing single-PRD fallback behavior preserved.
+        let _iso = isolate_env();
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        let resolved = resolve_active_prefix(&conn).unwrap();
+        assert_eq!(resolved, Some("A-".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_unset_multi_prd_returns_none() {
+        // Regression: ambiguous (multiple) prefixes return None — caller
+        // skips auto-prefixing and relies on caller-supplied IDs.
+        let _iso = isolate_env();
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        seed_prefix(&conn, 2, "beta", "B-");
+        let resolved = resolve_active_prefix(&conn).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_set_matching_multi_prd_returns_pinned() {
+        // Pinning resolves the multi-PRD ambiguity.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "A-");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        seed_prefix(&conn, 2, "beta", "B-");
+        let resolved = resolve_active_prefix(&conn).unwrap();
+        assert_eq!(resolved, Some("A-".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_set_stale_errors_with_known_prefixes() {
+        // Stale pin (set but not registered) must hard-error and the message
+        // must name BOTH the offending value and the registered prefixes
+        // so the operator can spot the typo.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "stale-");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        let err = resolve_active_prefix(&conn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("stale-"), "error must name stale value: {msg}");
+        assert!(msg.contains("A-"), "error must list known prefixes: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_empty_string_treated_as_unset() {
+        // Empty env var must NOT trigger the stale-prefix error path —
+        // shells often export blank values when a variable was deliberately
+        // cleared. Falls through to fallback (multi-PRD → None).
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        seed_prefix(&conn, 2, "beta", "B-");
+        let resolved = resolve_active_prefix(&conn).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_resolve_prefix_env_set_with_empty_metadata_errors() {
+        // No PRDs registered + env var set → still stale (no prefix is valid).
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "X-");
+        let conn = memory_db();
+        let err = resolve_active_prefix(&conn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("X-"), "error must name stale value: {msg}");
+        assert!(
+            msg.contains("none registered") || msg.contains("not found"),
+            "error must indicate empty/missing prefix set: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_prefix_naive_passthrough_would_fail_stale_check() {
+        // Known-bad guard: a naive `Ok(Some(env_value))` impl would pass
+        // through unverified. This test pins env to a value that is NOT in
+        // prd_metadata and asserts we get Err — defeating the safety check
+        // by skipping verification must fail this assertion.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "B-");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha", "A-");
+        assert!(
+            resolve_active_prefix(&conn).is_err(),
+            "must reject pinned prefix not present in prd_metadata"
+        );
     }
 }
