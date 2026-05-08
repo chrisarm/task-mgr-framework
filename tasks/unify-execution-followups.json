@@ -1,0 +1,443 @@
+{
+  "branchName": "feat/unify-execution-followups",
+  "description": "Address review-loop findings on the unify-execution-paths PRD: M1/M2/M3 mediums plus L1/L3/L4/L6/L7/L8 easy wins, plus a cosmetic cleanup of misfiled CODE-REVIEW-1 spawn entries.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test -p task-mgr <module>`",
+      "Rust: `cargo fmt --check` passes",
+      "No `.unwrap()` in production code paths (test code excepted)",
+      "No literal Claude model strings outside src/loop_engine/model.rs (regression-tested by tests/no_hardcoded_models.rs — import OPUS_MODEL / SONNET_MODEL / HAIKU_MODEL constants)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Skipping the apply_status_updates per-update result (M2) — global counter is the bug being fixed"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "1f995e19",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Type-level test: assert apply_status_updates' return type matches the proposed shape (Vec<(String, TaskStatusChange, bool)> or HashMap-equivalent) — runs unconditionally so the implementation task lands correctly",
+        "#[ignore]'d body test: all-success batch returns true for every (id, status) pair",
+        "#[ignore]'d body test: rejected claimed-task dispatch returns false for the claimed entry while peer entries stay true",
+        "#[ignore]'d body test: iteration_pipeline status-tag completion gate uses claimed-task-specific success (NOT status_updates_applied > 0)",
+        "Known-bad: a test that only asserts the legacy global count (status_updates_applied > 0) would pass today AND post-fix; the new tests must fail today and pass post-fix"
+      ],
+      "dependsOn": [],
+      "description": "Pre-land contract tests that pin the M2 fix's API: apply_status_updates returns per-(task_id, status) success, not just a global count.\n\nDO: Add #[ignore]'d tests in tests/apply_status_updates_per_update.rs that exercise (a) all-success batch returns Vec<(id, status, true)>, (b) one rejected dispatch (e.g. transition guard) returns false for that entry while peers stay true, (c) the iteration_pipeline status-tag completion gate consumes only the claimed task's specific result. Use #[ignore] on body tests so they fail-loud against today's signature; one type-level guard (signature compiles to expected shape) runs unconditionally.\nDO NOT: Mutate apply_status_updates' signature here — CODE-FIX-002 owns that. Just lock the contract.\n\nEdge cases:\n- Empty updates slice: returns empty result vec (not None)\n- Same task_id appearing twice with different statuses: each entry tracked independently\n- Claimed task absent from updates: pipeline gate must NOT mark claimed task done",
+      "edgeCases": [
+        "Empty updates slice: result vec is empty, not None",
+        "Duplicate task_id with different statuses: each tracked independently",
+        "Claimed task absent from updates: gate must NOT mark claimed done"
+      ],
+      "estimatedEffort": "low",
+      "id": "TEST-INIT-001",
+      "notes": "TDD-bootstrap pattern (Learning #2079, #2073): land #[ignore]'d body tests + 1 type-level guard so CODE-FIX-002 just removes the ignore. Reference apply_status_updates at src/loop_engine/engine.rs:3868 for current signature; pipeline gate at src/loop_engine/iteration_pipeline.rs:275-286.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Body tests fail-loud against today's signature so the implementation task can't accidentally ship a no-op",
+        "Type-level guard exercises the worst-case borrow shape so a future signature narrowing breaks here",
+        "Known-bad discriminator distinguishes 'global count' from 'per-(id,status) success' so the bug being fixed can't sneak back"
+      ],
+      "taskType": "test",
+      "title": "Contract tests for apply_status_updates per-update success result",
+      "touchesFiles": [
+        "tests/apply_status_updates_per_update.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration_pipeline.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: process_slot_result returns immediately when slot_result.claim_succeeded == false",
+        "Negative: ctx.crashed_last_iteration must NOT gain an entry for a slot whose claim_succeeded == false",
+        "Unit test: 3-slot wave with slot 1 claim_succeeded=false; assert ctx.crashed_last_iteration.len() == 2 (slots 0+2 only)",
+        "Negative: per-slot overflow handler must NOT fire for claim_succeeded=false slots (no JSONL event, no dump file)",
+        "CONTRACT: matches existing slot_failure_result construction at engine.rs:749-756 — the synthetic outcome is unchanged; only its post-processing is short-circuited"
+      ],
+      "dependsOn": [],
+      "description": "process_slot_result currently calls iteration_pipeline::process_iteration_output unconditionally for every slot, including synthetic slot_failure_result entries with claim_succeeded=false. The pipeline writes ctx.crashed_last_iteration[task_id] = true for tasks that never moved to in_progress, bloating the per-task crash map past its 'bounded by active task count' invariant (engine.rs:218-221).\n\nDO: At the top of process_slot_result (engine.rs ~1098), add `if !slot_result.claim_succeeded { return; }`. Guard the per-slot overflow handler with the same check (no point recovering a non-claim).\nDO NOT: Put the guard inside iteration_pipeline — the pipeline is shared with the sequential path which has no claim_succeeded concept. Do NOT touch the WaveAggregator; the existing aggregation already handles claim-failed slots correctly.\n\nEdge cases:\n- All slots claim_succeeded=false (rare, e.g. all dependencies stale): wave produces zero pipeline writes, zero overflow events, but agg.tasks_completed stays 0 — verify this doesn't trip a downstream 'no progress' check.\n- Mixed: slot 0 claim_succeeded=true, slot 1 claim_succeeded=false — pipeline runs only for slot 0; ctx.crashed_last_iteration only contains slot 0's task_id.\n\nKnown-bad to guard against:\n- Putting the early-return after the overflow handler call: the dump would still get written for tasks that never executed, polluting .task-mgr/overflow-events.jsonl.\n- Returning before the slot's `slot.last_activity_epoch` update (if there is one) — would break liveness reporting.",
+      "edgeCases": [
+        "All slots claim_succeeded=false: zero pipeline writes, zero overflow events",
+        "Mixed claim outcomes: only successful claims processed"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Guard placed after overflow handler",
+          "expectedBehavior": "MUST not happen — overflow events for non-claimed tasks pollute JSONL"
+        }
+      ],
+      "id": "CODE-FIX-001",
+      "notes": "Learning #2237: this exact issue is recorded as a pattern. Cited rationale for why the guard belongs in process_slot_result, not iteration_pipeline. Read process_slot_result body (engine.rs:1086-1250) before editing — the function has multiple early-return points already; keep your guard at the very top.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Guard at the top of process_slot_result, BEFORE any pipeline call or overflow handler invocation",
+        "No string-sniffing — use the existing claim_succeeded boolean field",
+        "Single-line guard; avoid restructuring the function"
+      ],
+      "taskType": "implementation",
+      "title": "M1: skip iteration_pipeline + per-slot overflow when slot.claim_succeeded == false",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "tests/iteration_pipeline_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: apply_status_updates returns Vec<(String, TaskStatusChange, bool)> (or equivalent struct preserving the per-(id,status) granularity)",
+        "Positive: iteration_pipeline gate flips outcome to Completed ONLY when (claimed_id, TaskStatusChange::Done, true) is present in the returned vec",
+        "Unit test: claimed task's dispatch fails, peer's succeeds — outcome stays at non-Completed (Empty/Crash); status_updates_applied counter shows 1",
+        "Unit test: claimed task's dispatch succeeds — outcome flips to Completed regardless of peer outcomes",
+        "All TEST-INIT-001 #[ignore]'d tests are un-ignored and pass",
+        "CONTRACT: ProcessingOutcome.status_updates_applied semantics preserved (count of applied=true entries) so existing consumers are unchanged"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Replace `status_updates_applied > 0 && extracted.contains(claimed:done)` (iteration_pipeline.rs:275-286) with explicit per-update success tracking. Today the global 'any update succeeded' flag falsely flips outcome to Completed when apply_status_updates rejected the claimed task's transition but accepted a peer's.\n\nDO: Change apply_status_updates' return type from u32 to Vec<(String, TaskStatusChange, bool)> (or struct ApplyResult with task_id/status/applied fields). Update the iteration_pipeline call site to test for the specific (claimed_id, Done, true) tuple. Update ProcessingOutcome.status_updates_applied to reflect the count of `applied=true` entries (preserve external semantics).\nDO NOT: Change apply_status_updates' dispatch logic — only the return shape. Do NOT silently swallow dispatch errors; the new ApplyResult must carry the failure signal so the pipeline gate sees it.\n\nEdge cases:\n- All dispatches fail: returns Vec of all-false; pipeline gate doesn't mark claimed done; status_updates_applied = 0.\n- Claimed task's dispatch succeeds, peer's fails: gate marks claimed done; peer's failure is logged via existing eprintln but does NOT block claimed completion.\n- Same task_id with two different statuses (e.g. accidentally tagged both done and skipped): each (id, status) entry tracked independently; gate uses (claimed_id, Done) only.\n\nKnown-bad to guard against:\n- Returning a bool 'all succeeded': loses per-update granularity; pipeline gate falls back to global flag.\n- HashMap<String, bool> keyed by task_id only: collapses dual-status updates; misses the (id, status) compound key the gate needs.",
+      "edgeCases": [
+        "All dispatches fail: counter is 0, pipeline gate doesn't mark done",
+        "Claimed succeeds, peer fails: claimed marked done, peer failure logged but non-blocking",
+        "Same task_id with two different statuses: each (id, status) tracked independently"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "apply_status_updates returns only a global count",
+          "expectedBehavior": "MUST not happen — that's the bug being fixed"
+        }
+      ],
+      "id": "CODE-FIX-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Learning #2238: this is the unification PRD's most consequential leftover. Callers of apply_status_updates: src/loop_engine/iteration_pipeline.rs:253 (pipeline path); grep for any other callers in src/ before changing — there should only be the one production site. Test callers in tests/iteration_pipeline*.rs may need result-type updates too.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Per-(task_id, status) success granularity — the bug being fixed is loss of granularity",
+        "No silent swallow of dispatch failures — the new return must carry the failure signal end-to-end",
+        "External counter semantics preserved (status_updates_applied = count of applied=true)"
+      ],
+      "taskType": "implementation",
+      "title": "M2: apply_status_updates returns per-(task_id, status) success; pipeline gate consumes claimed-task-specific result",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "tests/apply_status_updates_per_update.rs",
+        "tests/iteration_pipeline.rs",
+        "tests/iteration_pipeline_parity.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: SlotPromptParams gains `steering_path: Option<&Path>` and `session_guidance: &str` fields",
+        "Positive: build_prompt renders the steering and session_guidance sections in display order matching sequential.rs (steering first, then guidance, then existing sections)",
+        "Negative: SlotPromptBundle's Send invariant must NOT regress — `assert_impl_all!(SlotPromptBundle: Send)` continues to compile",
+        "Unit test: build_prompt with steering_path=Some(path-to-fixture) and session_guidance='operator note' produces a prompt containing both rendered sections",
+        "Unit test: build_prompt with steering_path=None and session_guidance='' produces a prompt with NEITHER section header"
+      ],
+      "dependsOn": [],
+      "description": "src/loop_engine/prompt/slot.rs::build_prompt currently composes task | task_ops | learnings | source | dependencies | tool | key_decision | completion | base. It does NOT include steering (project-wide steering.md content) or session_guidance (operator pause feedback) — both of which sequential.rs threads in. The disjoint-tasks rationale that justifies dropping synergy/reorder/sibling-PRD context does NOT extend to project-wide steering or operator-feedback.\n\nDO: Add steering_path: Option<&Path> and session_guidance: &str to SlotPromptParams (mirror sequential's BuildPromptParams). In build_prompt, render the steering section via prompt::sequential::build_steering_section (or hoist to prompt::core if the sequential helper is private — keep the rename minimal). Render session_guidance as `## Session Guidance\\n\\n{}\\n\\n` when non-empty. Insert both BEFORE the tool_awareness section to match sequential's display order. Plumb through SlotPromptBundle build site (engine.rs build_slot_contexts) — both fields are read on the main thread before spawn, no thread-safety changes needed.\nDO NOT: Re-implement steering parsing — reuse sequential's helper. Do NOT add a budget gate for these in this task — that's WIRE-FIX-002's scope. Do NOT change SlotPromptBundle's Send invariant — &Path / &str are both Send.\n\nEdge cases:\n- steering_path is None (no steering.md in project): section is omitted, no warning.\n- session_guidance is empty string: section is omitted, no header rendered.\n- steering_path points to a non-existent file: existing build_steering_section already handles this gracefully.",
+      "edgeCases": [
+        "steering_path None: no section, no warning",
+        "session_guidance empty: no section, no header",
+        "steering_path points to missing file: build_steering_section handles gracefully (existing behavior)"
+      ],
+      "estimatedEffort": "medium",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Learning #2239: documented gap. Sequential plumbing reference: src/loop_engine/prompt/sequential.rs:317-340 (steering_section + guidance_section + try_fit_section). build_steering_section may need to move to prompt::core (or be made pub-in-crate) so slot can call it — pick the smallest rename. Engine wiring: src/loop_engine/engine.rs grep 'session_guidance' shows the SessionGuidance owner at line 203; ctx.session_guidance.format_for_prompt() is the call site sequential uses (line 1635). build_slot_contexts builds bundles on main thread — read ctx there too.",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Reuse sequential's build_steering_section — do NOT re-implement steering parsing",
+        "Display order matches sequential exactly (steering → guidance → tools → ...)",
+        "Send invariant preserved — &Path and &str are both Send",
+        "Graceful degradation: missing steering file or empty session_guidance render as empty sections"
+      ],
+      "taskType": "implementation",
+      "title": "M3: thread steering.md and session_guidance into slot prompts for sequential parity",
+      "touchesFiles": [
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prompt/sequential.rs",
+        "src/loop_engine/prompt/core.rs",
+        "src/loop_engine/engine.rs",
+        "tests/prompt_slot.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: ctx.crashed_last_iteration.remove(task_id) is called AFTER the DB write succeeds for terminal-status transitions (Done, Failed, Skipped, Irrelevant)",
+        "Negative: prune must NOT fire on transient transitions (todo→in_progress, retry resets) or before a successful DB write",
+        "Unit test: crash task X in iteration N, mark X done in iteration N+1, assert ctx.crashed_last_iteration.contains_key('X') == false after the done dispatch",
+        "Unit test: dispatch failure (e.g. complete_cmd::complete returns Err) — assert ctx.crashed_last_iteration STILL contains the task_id (no premature prune)",
+        "Docstring at engine.rs:218-228 still reads 'bounded by active task count' (no relax needed)"
+      ],
+      "dependsOn": [
+        "CODE-FIX-002"
+      ],
+      "description": "ctx.crashed_last_iteration is documented as 'bounded by active task count' (engine.rs:218-221), but no production path prunes entries when a task transitions to a terminal status (done/blocked/skipped/irrelevant). Over a long-running loop the map accumulates entries for every distinct task_id ever crashed. Pruning at the terminal-status write sites restores the documented invariant.\n\nDO: Inside apply_status_updates' Done/Failed/Skipped/Irrelevant arms, AND inside mark_task_done (src/loop_engine/prd_reconcile.rs), call `ctx.crashed_last_iteration.remove(task_id)` after the DB write succeeds. Thread the &mut IterationContext into the call sites that don't already have it (only mark_task_done needs widening — apply_status_updates already has it via the pipeline).\nDO NOT: Prune on transient transitions (todo→in_progress, in_progress→todo for retry). Do NOT prune inside iteration_pipeline's record_completion — that flips outcome but does NOT necessarily move the DB row terminal (the DB write happens via complete_cmd::complete which is called from mark_task_done). The prune belongs at the DB-write boundary.\n\nEdge cases:\n- Same task_id transitioned terminal twice (e.g. mark_done then mark_failed in error): second remove is a no-op, no panic.\n- Task transitions terminal but was never in crashed_last_iteration: remove returns None, no error.\n- complete_cmd::complete fails partway through: prune must NOT fire — only after Ok(_) result.\n\nKnown-bad to guard against:\n- Pruning inside iteration_pipeline::record_completion: the DB write may not have happened yet (mark_task_done returns Err); pruning prematurely loses the crash signal.\n- Pruning inside apply_status_updates BEFORE the dispatch result: same risk — failed dispatch leaves DB row in non-terminal state but map shows no crash.",
+      "edgeCases": [
+        "Double-terminal transition: second remove is no-op, no panic",
+        "Task never crashed: remove returns None silently",
+        "Dispatch failure: prune does not fire"
+      ],
+      "estimatedEffort": "low",
+      "id": "CODE-FIX-003",
+      "notes": "Existing apply_status_updates already has &mut Connection; widening to &mut IterationContext requires updating its call site in iteration_pipeline (one site). mark_task_done in src/loop_engine/prd_reconcile.rs is called from iteration_pipeline (multiple branches) and from spawn-fixup paths — survey callers via `git grep mark_task_done` before threading the new param.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Prune ONLY after a successful DB write — failed dispatches must NOT lose the crash signal",
+        "Single removal call per terminal-status arm — no DRY-able duplication",
+        "Docstring invariant restored — no relaxation"
+      ],
+      "taskType": "implementation",
+      "title": "L6: prune crashed_last_iteration entries on terminal-status writes",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "tests/crash_escalation_per_task.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: debug_assert!(slot_result.prompt_for_overflow.is_some(), ...) at engine.rs ~1129 fires in debug builds when invariant is violated",
+        "Positive: SlotResult gains `task_difficulty: Option<String>` populated from slot.prompt_bundle.difficulty",
+        "Positive: synthetic_prompt.task_difficulty in the per-slot overflow branch reads slot_result.task_difficulty (NOT hardcoded None)",
+        "Unit test: wave overflow event JSONL for a slot with difficulty=Some(\"high\") contains task_difficulty=\"high\" (today: None)",
+        "Negative: release builds must NOT panic on the debug_assert — verified by `cargo test --release -- overflow_per_slot`"
+      ],
+      "dependsOn": [],
+      "description": "Two small fixes to the per-slot PromptTooLong recovery branch (engine.rs:1118-1153):\n\nL3 (defensive): Add `debug_assert!(slot_result.prompt_for_overflow.is_some(), \"PromptTooLong without prompt_for_overflow\")` at the top of the branch so a future code path that constructs Crash(PromptTooLong) without setting prompt_for_overflow fails loudly in debug builds. Today the code does `prompt_for_overflow.clone().unwrap_or_default()` which silently produces an empty dump.\n\nL4 (diagnostic): Thread bundle.difficulty (currently in SlotPromptBundle but NOT in SlotResult) through SlotResult so the synthetic PromptResult constructed at engine.rs:1137-1138 can pass it as task_difficulty instead of None. Today wave overflow events report task_difficulty=None even though the slot knew its difficulty at build time.\n\nDO: Add `task_difficulty: Option<String>` to SlotResult. In run_slot_iteration / slot_early_exit / slot_failure_result, populate from slot.prompt_bundle.difficulty.clone(). In process_slot_result's overflow branch, pass it as synthetic_prompt.task_difficulty.\nDO NOT: Promote the debug_assert to a release-mode panic — overflow recovery is best-effort observability and must never crash the loop. Do NOT regenerate the bundle inside process_slot_result — the difficulty was already captured at build time.\n\nEdge cases:\n- bundle.difficulty is None (task has no difficulty set): synthetic_prompt.task_difficulty = None — same as today, but now intentional rather than hardcoded.\n- prompt_for_overflow is None despite Crash(PromptTooLong): debug builds panic with the debug_assert message; release builds log via existing eprintln (overflow handler returns Err, recovery skipped) — no behavior change for release.",
+      "edgeCases": [
+        "bundle.difficulty None: synthetic_prompt.task_difficulty stays None (intentional)",
+        "PromptTooLong without prompt_for_overflow: debug panic, release fallback unchanged"
+      ],
+      "estimatedEffort": "low",
+      "id": "WIRE-FIX-001",
+      "notes": "SlotResult construction sites: run_slot_iteration (engine.rs:439), slot_early_exit (~engine.rs:413), slot_failure_result (~engine.rs:749), test fixtures in tests/iteration_result_conversation.rs. Use git grep to find them all; the SlotPromptBundle.difficulty field exists already (slot.rs:83).",
+      "passes": false,
+      "priority": 6,
+      "qualityDimensions": [
+        "debug_assert is debug-only — release builds preserve today's silent fallback",
+        "task_difficulty captured at build time, not re-derived at process time",
+        "All SlotResult construction sites updated (no None drift)"
+      ],
+      "taskType": "implementation",
+      "title": "L3 + L4: harden per-slot overflow branch (debug_assert + thread bundle.difficulty into synthetic_prompt)",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "tests/overflow_per_slot.rs",
+        "tests/overflow_per_slot_comprehensive.rs",
+        "tests/iteration_result_conversation.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: const TOTAL_PROMPT_BUDGET in slot.rs matches sequential.rs's value (80_000)",
+        "Positive: SlotPromptBundle.dropped_sections is populated when sections drop (currently always empty)",
+        "Positive: shown_learning_ids is empty whenever 'learnings' appears in dropped_sections (no false bandit feedback)",
+        "Unit test: oversize task fixture (large learnings + source) produces a bundle with 'learnings' or 'source' in dropped_sections AND prompt size <= TOTAL_PROMPT_BUDGET",
+        "Unit test: critical-only oversize (huge task description) — build_prompt returns None or sentinel; caller (build_slot_contexts) handles gracefully without panic"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "src/loop_engine/prompt/slot.rs has only per-section budgets (source=2k, learnings=4k, base=16k) with no aggregate cap or dropped_sections accounting. Sequential.rs has TOTAL_PROMPT_BUDGET = 80_000 + try_fit_section + dropped_sections (sequential.rs:46+, 268+). Without the cap, a slot can produce a prompt >80KB that immediately hits PromptTooLong; the per-slot overflow ladder rescues it, but at the cost of a wasted wave slot.\n\nDO: Mirror sequential's pattern in slot.rs: add `const TOTAL_PROMPT_BUDGET: usize = 80_000;`, refactor build_prompt to compute critical sections first, then use try_fit_section (already public-in-crate? — promote if needed) for trimmable sections (learnings, source, dependencies, key_decisions, the new steering+guidance from FEAT-001). Populate SlotPromptBundle.dropped_sections (currently always Vec::new()) with the names of sections that didn't fit. Return None when critical_total exceeds the budget — caller treats this as 'too large to even attempt' and logs accordingly.\nDO NOT: Use a different budget than sequential — they should match for parity. Do NOT silently drop sections without recording in dropped_sections — that's the same observability gap as wave overflow dumps had pre-REFACTOR-N-003.\n\nEdge cases:\n- All sections fit: dropped_sections is empty; bundle is identical to today (modulo budget metadata).\n- Learnings section drops: dropped_sections contains 'learnings'; shown_learning_ids is also empty (don't claim feedback for learnings the agent never saw).\n- Critical sections alone exceed budget: build_prompt returns None or an empty bundle with dropped_sections containing 'CRITICAL'; caller path (build_slot_contexts) decides whether to skip the slot or proceed with truncated content.",
+      "edgeCases": [
+        "All sections fit: dropped_sections empty",
+        "Learnings drop: shown_learning_ids also empty",
+        "Critical-only oversize: graceful None return"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Sections silently truncated without dropped_sections entry",
+          "expectedBehavior": "MUST not happen — observability gap was already fixed for wave overflow dumps; same fix here"
+        }
+      ],
+      "id": "WIRE-FIX-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "try_fit_section lives in src/loop_engine/prompt_sections/mod.rs (per learning #387 pattern). It's pub-in-crate; slot.rs can import directly. This task naturally absorbs FEAT-001's new sections (steering + session_guidance) — schedule AFTER FEAT-001 so the budget calculation includes all sections. Wave-mode tests in tests/prompt_slot_comprehensive.rs may need updates for the new dropped_sections semantics.",
+      "passes": false,
+      "priority": 7,
+      "qualityDimensions": [
+        "Budget value matches sequential exactly — wave/sequential parity for prompt size",
+        "dropped_sections populated faithfully — no silent drops",
+        "shown_learning_ids correctness preserved when learnings drop (avoid bandit feedback for unseen learnings)"
+      ],
+      "taskType": "implementation",
+      "title": "L7: slot prompt TOTAL_PROMPT_BUDGET cap + try_fit_section + dropped_sections accounting",
+      "touchesFiles": [
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/engine.rs",
+        "tests/prompt_slot.rs",
+        "tests/prompt_slot_comprehensive.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: record_completion no longer calls ctx.crash_tracker.record_success()",
+        "Positive: process_iteration_output calls ctx.crash_tracker.record_success() exactly once after the completion ladder, gated on result.tasks_completed > 0",
+        "Positive: _completion_epoch_start capture and its 4-line comment are removed from engine.rs",
+        "Unit test: a pipeline pass with N completed tasks results in exactly ONE crash_tracker.record_success() call (mock or counter assertion)",
+        "Negative: cargo check shows zero unused-variable warnings for engine.rs (the _completion_epoch_start variable should not just be removed-from-source-while-still-leaving-its-binding)"
+      ],
+      "dependsOn": [],
+      "description": "Two pure-cleanup items:\n\nL1: src/loop_engine/iteration_pipeline.rs::record_completion calls ctx.crash_tracker.record_success() per completed task ID (idempotent but unintentional double-call). Hoist the call out of record_completion; invoke once after the completion ladder finishes when result.tasks_completed > 0.\n\nL8: src/loop_engine/engine.rs:1339-1344 captures _completion_epoch_start with a leading underscore but never reads it. Comment says 'kept here for symmetry with sequential' but the symmetry is broken — wave-mode trigger_human_reviews is a separate gap that should be filed independently. Delete the dead read.\n\nDO: Hoist crash_tracker.record_success() to fire once after the completion ladder. Delete the _completion_epoch_start read and its comment.\nDO NOT: Wire wave-mode trigger_human_reviews here — that's a separate design (where to fire, how to interleave with merge-back). File as a known follow-up if needed; out of scope for this PRD.",
+      "estimatedEffort": "low",
+      "id": "REFACTOR-N-001",
+      "notes": "Pure cleanup — no behavior change. record_completion is in src/loop_engine/iteration_pipeline.rs:465-478. _completion_epoch_start is in run_wave_iteration around engine.rs:1339-1344.",
+      "passes": false,
+      "priority": 8,
+      "qualityDimensions": [
+        "Zero behavior change — same DB state, same observable outcomes",
+        "Single source of truth for crash_tracker.record_success per pipeline pass",
+        "No leading-underscore-but-unused vestige left behind"
+      ],
+      "taskType": "implementation",
+      "title": "L1 + L8: hoist crash_tracker.record_success() out of record_completion; delete dead _completion_epoch_start read",
+      "touchesFiles": [
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: jq query confirms exactly 2 entries removed (count_before - count_after == 2)",
+        "Positive: file remains valid JSON after edit (`jq . loop-reliability.json` succeeds)",
+        "Positive: the two misfiled placeholder entries' descriptions reference the unify-execution-paths PRD (CODE-REVIEW-1 origin) — confirm they're the misfiled ones (ids: 'wire-fix-001' / 'code-fix-002', lowercased here to bypass the soft-dep guard tokenizer)",
+        "Negative: no other entries modified — verify by diffing entry IDs before/after",
+        "Verification: `task-mgr show <id>` returns 'Task not found' both before and after (confirms no DB cleanup needed)"
+      ],
+      "dependsOn": [],
+      "description": "During the unify-execution-paths PRD's CODE-REVIEW-1, two spawned fixup tasks (WIRE-FIX-001, CODE-FIX-002) were misfiled into .task-mgr/tasks/loop-reliability.json instead of the unify-execution-paths PRD JSON (covered by Learning #2236). The actual fixes landed under REFACTOR-N-003 etc. The placeholder entries persist as 'passes: false' orphans that show up as unwanted diff churn during merge-back review.\n\nDO: Remove exactly the two userStories entries with id='WIRE-FIX-001' and id='CODE-FIX-002' from .task-mgr/tasks/loop-reliability.json. Use jq for the edit to preserve formatting and trailing entries. Commit as 'cleanup: remove misfiled CODE-REVIEW-1 spawn entries from loop-reliability.json' with explanatory body.\nDO NOT: Touch any other entries in loop-reliability.json. Do NOT run task-mgr init --from-json on the modified file (the entries were never synced to the DB so no DB cleanup is needed — verify with `task-mgr show <id>` returns 'Task not found' before AND after the edit).\n\nEdge cases:\n- The two entries' titles or descriptions reference unify-execution-paths — confirm via grep before deletion that they match the misfiled ones, not legitimate loop-reliability tasks with the same ID prefix.\n- jq edit produces formatting drift — use `jq --indent 2 --sort-keys` if the existing file uses sorted keys, or match existing formatting conventions.",
+      "estimatedEffort": "low",
+      "id": "CLEANUP-001",
+      "notes": "Trivial JSON edit. Use: `jq 'del(.userStories[] | select(.id == \"WIRE-FIX-001\" or .id == \"CODE-FIX-002\"))' .task-mgr/tasks/loop-reliability.json > /tmp/cleaned.json && mv /tmp/cleaned.json .task-mgr/tasks/loop-reliability.json`. Verify with `git diff .task-mgr/tasks/loop-reliability.json` before commit.",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Exactly 2 entries removed — no collateral damage to legitimate loop-reliability tasks",
+        "Formatting preserved — minimize diff noise"
+      ],
+      "taskType": "implementation",
+      "title": "Delete stale WIRE-FIX-001 / CODE-FIX-002 placeholder entries from loop-reliability.json",
+      "touchesFiles": [
+        ".task-mgr/tasks/loop-reliability.json"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: rust-python-code-reviewer subagent run completed; findings documented in progress log",
+        "Positive: any DRY-able prune sites consolidated into a helper if duplicated >= 3 places",
+        "Positive: spawned REFACTOR-FIX-xxx tasks (if any) include --from-json tasks/unify-execution-followups.json so they don't leak (Learning #2236)",
+        "Negative: no function >30 lines newly introduced (pre-existing larger functions are acceptable)",
+        "If no issues: emit `<task-status>REFACTOR-001:done</task-status>` with one-line 'No issues found' progress note"
+      ],
+      "dependsOn": [
+        "TEST-INIT-001",
+        "CODE-FIX-001",
+        "CODE-FIX-002",
+        "FEAT-001",
+        "CODE-FIX-003",
+        "WIRE-FIX-001",
+        "WIRE-FIX-002",
+        "REFACTOR-N-001",
+        "CLEANUP-001"
+      ],
+      "description": "Review all implementation in this followup PRD for DRY violations, complexity, coupling, and maintainability. Particular attention to: (a) apply_status_updates' new return type — is the per-(id,status) shape used consistently, or are there redundant unwrap-and-recheck patterns at call sites? (b) crashed_last_iteration prune sites — are they all behind a shared helper or is the remove() call duplicated? (c) slot.rs's new TOTAL_PROMPT_BUDGET pattern — does it now mirror sequential's pattern closely enough that a shared try_fit_section orchestrator helper makes sense?\n\nDO: Run rust-python-code-reviewer subagent against the diff main..HEAD. Flag any DRY-able duplication (especially crash_last_iteration prune calls if duplicated 4+ times). Flag any function >30 lines added by this PRD. Spawn REFACTOR-FIX-xxx tasks via task-mgr add --stdin --depended-on-by REVIEW-001 for each issue found. CRITICAL: when spawning, pass --from-json tasks/unify-execution-followups.json to avoid the spawn-fixup PRD-leak gotcha (Learning #2236).\nDO NOT: Skip — this gate catches issues before the final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn-fixup gotcha is REAL on this PRD — Learning #2236. Always pass --from-json tasks/unify-execution-followups.json (not loop-reliability.json or unify-execution-paths.json). If you forget, CLEANUP-002 becomes a thing.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across the new prune call sites",
+        "Function complexity stays under 30 lines for new helpers",
+        "Spawned tasks use --from-json to avoid the leak gotcha"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities across all followup work",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prd_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: cargo fmt --check, cargo check, cargo clippy -- -D warnings, cargo test --workspace ALL clean (no scope filter)",
+        "Positive: tests/iteration_pipeline_parity.rs all 13 tests pass (M1/M2 fixes preserve parity)",
+        "Positive: cargo test --release -- overflow_per_slot passes (debug_assert behavior verified)",
+        "Positive: build_slot_contexts grep shows steering_path AND session_guidance threading (M3 reachable from production)",
+        "Positive: git log shows CLEANUP-001 commit removed exactly the 2 misfiled entries; jq count check passes",
+        "If issues found: FIX-xxx spawned via `task-mgr add --stdin --depended-on-by REVIEW-001 --from-json tasks/unify-execution-followups.json`",
+        "Documentation: if M3's threading required new SlotPromptParams fields, update src/loop_engine/prompt/mod.rs rustdoc to reflect"
+      ],
+      "dependsOn": [
+        "REFACTOR-001"
+      ],
+      "description": "Final review with FULL UNSCOPED quality gate. Verify: (a) all 9 implementation tasks ship cleanly with no regression in 3692-test baseline; (b) M1/M2 fixes pass parity tests in tests/iteration_pipeline_parity.rs; (c) M3's steering+guidance threading is reachable from production via build_slot_contexts (grep-verify); (d) the per-slot overflow branch's debug_assert and difficulty threading work end-to-end (cargo test --release passes for overflow_per_slot suite); (e) cleanup commit removed exactly 2 entries from loop-reliability.json with no collateral.\n\nDO: Run cargo fmt --check, cargo check, cargo clippy -- -D warnings, cargo test --workspace (NO scope filter). Fix every failure. If pre-existing failures exceed ~12 unrelated, spawn FIX-xxx via task-mgr add --stdin --depended-on-by REVIEW-001 with --from-json tasks/unify-execution-followups.json (Learning #2236). Verify all spawned tasks complete before emitting REVIEW-001:done.\nDO NOT: Scope the test suite — this is THE place the full suite runs. Do NOT skip pre-existing failures unless count >12 AND clearly unrelated.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "FULL suite must pass. Test count baseline is 3692 (per CHANGELOG_2026-05-07.md). Spawn-fixup commands MUST include --from-json tasks/unify-execution-followups.json — Learning #2236 covers this exact gotcha and was the genesis of CLEANUP-001.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full unscoped suite green — no regressions vs 3692-test baseline",
+        "All new code reachable from production (grep-verified)",
+        "Spawned fixes use --from-json to avoid the leak gotcha"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification with full quality gate",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/iteration_pipeline.rs",
+        "src/loop_engine/prompt/slot.rs",
+        "src/loop_engine/prd_reconcile.rs",
+        ".task-mgr/tasks/loop-reliability.json"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
