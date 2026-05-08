@@ -100,6 +100,12 @@ pub fn fix_install_skills(
 /// If `db_dir/config.json` already exists, returns `success: true` without
 /// touching the file. This protects existing project-specific configuration.
 ///
+/// The seeded config also pins `ollamaUrl` to the bundled docker-compose
+/// stack's host port (`localhost:11435`, NOT upstream Ollama's 11434) so the
+/// recall path resolves to the same endpoint `docker/docker-compose.yml`
+/// publishes. This matches `DEFAULT_OLLAMA_URL` but materializes the value in
+/// the file so users can see and edit it.
+///
 /// # Arguments
 /// * `db_dir` — path to the `.task-mgr/` directory (must already exist)
 /// * `detected_tools` — tool strings like `"Bash(docker:*)"` for
@@ -131,6 +137,7 @@ pub fn fix_generate_project_config(db_dir: &Path, detected_tools: &[String]) -> 
 
     let config = serde_json::json!({
         "version": 1,
+        "ollamaUrl": crate::learnings::embeddings::DEFAULT_OLLAMA_URL,
         "additionalAllowedTools": tools_json
     });
 
@@ -485,6 +492,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["additionalAllowedTools"][0], "Bash(docker:*)");
+        assert_eq!(
+            v["ollamaUrl"],
+            crate::learnings::embeddings::DEFAULT_OLLAMA_URL,
+            "seeded config must pin ollamaUrl to the bundled-stack port (11435)",
+        );
     }
 
     #[test]

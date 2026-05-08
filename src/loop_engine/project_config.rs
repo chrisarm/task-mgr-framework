@@ -28,7 +28,8 @@ pub struct ProjectConfig {
     pub permission_mode: Option<String>,
 
     /// Ollama server URL for embedding generation.
-    /// Defaults to `http://localhost:11434`.
+    /// Defaults to `http://localhost:11435` (the bundled docker-compose stack
+    /// uses 11435 to avoid clashing with a host-installed `ollama serve`).
     #[serde(default)]
     pub ollama_url: Option<String>,
 

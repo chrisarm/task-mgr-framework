@@ -210,12 +210,14 @@ existing CLI formatters.
 
 ```json
 {
-  "ollamaUrl": "http://localhost:11434",
+  "ollamaUrl": "http://localhost:11435",
   "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0"
 }
 ```
 
-- **Default URL**: `http://localhost:11434`
+- **Default URL**: `http://localhost:11435` (the bundled docker-compose stack
+  remaps to 11435 to avoid clashing with a host-installed `ollama serve` on the
+  upstream-default 11434)
 - **Default model**: `hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0` (1024 dimensions)
 - **Schema**: Migration v15 adds `learning_embeddings` table (BLOB storage, little-endian f32)
 

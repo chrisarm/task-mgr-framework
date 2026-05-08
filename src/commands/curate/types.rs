@@ -287,7 +287,7 @@ pub struct EmbedParams {
     pub force: bool,
     /// If true, only print status counts and model name; skip embedding.
     pub status: bool,
-    /// Ollama server base URL (e.g. `http://localhost:11434`).
+    /// Ollama server base URL (e.g. `http://localhost:11435`).
     pub ollama_url: String,
     /// Embedding model name as known to Ollama.
     pub model: String,

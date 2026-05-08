@@ -8,7 +8,10 @@ use rusqlite::Connection;
 use crate::TaskMgrResult;
 
 /// Default Ollama server URL.
-pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+///
+/// Port 11435 (not the upstream Ollama default 11434) so the bundled
+/// docker-compose stack doesn't clash with a host-installed `ollama serve`.
+pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11435";
 
 /// Default embedding model.
 pub const DEFAULT_EMBEDDING_MODEL: &str =
