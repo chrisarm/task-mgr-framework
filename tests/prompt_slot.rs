@@ -340,6 +340,7 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
         iteration: 1,
         max_iterations: 1,
         elapsed_secs: 0,
+        task_prefix: None,
     };
 
     let result = run_slot_iteration(&slot, &params).expect("run_slot_iteration");

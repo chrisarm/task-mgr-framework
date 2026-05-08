@@ -413,6 +413,9 @@ pub struct SlotIterationParams {
     pub max_iterations: u32,
     /// Wall-clock seconds since loop start (snapshot at wave dispatch time).
     pub elapsed_secs: u64,
+    /// Active PRD task prefix forwarded to every slot's `spawn_claude` call
+    /// via `TASK_MGR_ACTIVE_PREFIX`. Mirrors `WaveIterationParams::task_prefix`.
+    pub task_prefix: Option<String>,
 }
 
 /// Fields that vary between early-exit paths in `run_slot_iteration`.
@@ -570,6 +573,7 @@ pub fn run_slot_iteration(
             use_pty: false,
             target_task_id: Some(task_id),
             slot_label: Some(&slot_label_buf),
+            active_prefix: params.task_prefix.as_deref(),
             ..Default::default()
         },
     );
@@ -1248,6 +1252,7 @@ fn build_shared_slot_params(params: &WaveIterationParams<'_>) -> Arc<SlotIterati
         iteration: params.iteration,
         max_iterations: params.max_iterations,
         elapsed_secs: params.elapsed_secs,
+        task_prefix: params.task_prefix.map(|s| s.to_string()),
     })
 }
 
@@ -2287,6 +2292,7 @@ pub fn run_iteration(
             // still getting per-line flushing.
             use_pty: false,
             target_task_id: Some(&task_id),
+            active_prefix: params.task_prefix,
             ..Default::default()
         },
     );
@@ -6856,6 +6862,7 @@ mod tests {
                 iteration: 1,
                 max_iterations: 1,
                 elapsed_secs: 0,
+                task_prefix: None,
             }
         }
 
@@ -7485,6 +7492,7 @@ mod tests {
                 iteration: 7,
                 max_iterations: 100,
                 elapsed_secs: 42,
+                task_prefix: None,
             };
             let cloned = params.clone();
             assert_eq!(cloned.db_dir, params.db_dir);

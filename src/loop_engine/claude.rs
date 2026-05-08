@@ -29,6 +29,12 @@ const MAX_TOOL_USE_BYTES: usize = 500;
 /// Maximum bytes for a single tool_result content block.
 const MAX_TOOL_RESULT_BYTES: usize = 1_000;
 
+/// Env var name written to the spawned subprocess to communicate the active PRD prefix.
+/// Consumed by `resolve_active_prefix` in `src/commands/add.rs` so that
+/// `task-mgr add --stdin` calls from inside a loop iteration auto-prefix IDs to the
+/// correct PRD without requiring `--from-json` or `--depended-on-by`.
+pub(crate) const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
+
 /// Compute the directory Claude Code uses for a given working directory.
 ///
 /// Claude encodes the cwd into a flat directory name under
@@ -136,6 +142,12 @@ pub(crate) struct SpawnOpts<'a> {
     /// Note: child stderr is inherited (not piped) and therefore cannot be
     /// prefixed — only output that flows through our tee paths is tagged.
     pub slot_label: Option<&'a str>,
+    /// Active PRD prefix to forward to the child via `TASK_MGR_ACTIVE_PREFIX`.
+    /// The loop engine sets this to the iteration's `task_prefix` so that
+    /// `task-mgr add --stdin` calls from inside the subprocess auto-prefix IDs
+    /// to the correct PRD. All non-loop callers (curate, learnings, merge
+    /// resolver, etc.) pass `None`, leaving the variable unset in the child.
+    pub active_prefix: Option<&'a str>,
 }
 
 /// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
@@ -268,6 +280,7 @@ pub(crate) fn spawn_claude(
         use_pty,
         target_task_id,
         slot_label,
+        active_prefix,
     } = opts;
     let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
     let mut args: Vec<String> = if stream_json {
@@ -390,6 +403,14 @@ pub(crate) fn spawn_claude(
     if let Some(dir) = db_dir {
         let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         cmd.env("TASK_MGR_DIR", canonical);
+    }
+
+    // Pin the active PRD prefix so subprocess calls to `task-mgr add --stdin`
+    // auto-prefix IDs to the correct PRD. Set only when Some and non-empty —
+    // when None (or empty), leave the variable unset so manual `task-mgr`
+    // invocations from inside a worktree inherit the parent env unchanged.
+    if let Some(p) = active_prefix.filter(|p| !p.is_empty()) {
+        cmd.env(ACTIVE_PREFIX_ENV, p);
     }
 
     if let Some(dir) = working_dir {
@@ -3583,6 +3604,176 @@ mod tests {
         assert_eq!(
             write_to_string(Some("[slot 0]"), "a\r\nb"),
             "[slot 0] a\n[slot 0] b\n"
+        );
+    }
+
+    // --- FEAT-001: ACTIVE_PREFIX_ENV constant and active_prefix env-var pinning ---
+
+    /// RAII guard: saves and restores (or removes) an environment variable on drop.
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            unsafe { std::env::remove_var(name) };
+            Self { name, prior }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(self.name, v) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    /// Create a wrapper script that dumps `env | grep TASK_MGR` to a file path
+    /// supplied via `CLAUDE_WRAPPER_OUTPUT`, then exits 0.
+    fn make_env_capture_script(name: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("task_mgr_test_{name}_env_capture.sh"));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, r#"env | grep '^TASK_MGR_' > "$CLAUDE_WRAPPER_OUTPUT""#).unwrap();
+            writeln!(f, "exit 0").unwrap();
+        }
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_active_prefix_env_const_value() {
+        assert_eq!(ACTIVE_PREFIX_ENV, "TASK_MGR_ACTIVE_PREFIX");
+    }
+
+    #[test]
+    fn test_active_prefix_set_on_child_when_some() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let output_file = std::env::temp_dir().join("task_mgr_test_active_prefix_some.txt");
+        let _ = std::fs::remove_file(&output_file);
+
+        let script = make_env_capture_script("active_prefix_some");
+        unsafe {
+            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            std::env::set_var("CLAUDE_WRAPPER_OUTPUT", output_file.to_str().unwrap());
+        }
+
+        let result = spawn_claude(
+            "ignored",
+            &PermissionMode::Dangerous,
+            SpawnOpts {
+                active_prefix: Some("abc-"),
+                ..SpawnOpts::default()
+            },
+        );
+
+        unsafe {
+            std::env::remove_var("CLAUDE_BINARY");
+            std::env::remove_var("CLAUDE_WRAPPER_OUTPUT");
+        }
+        let _ = std::fs::remove_file(&script);
+
+        assert!(result.is_ok(), "spawn_claude failed: {:?}", result.err());
+
+        let env_output = std::fs::read_to_string(&output_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&output_file);
+
+        assert!(
+            env_output.contains("TASK_MGR_ACTIVE_PREFIX=abc-"),
+            "expected TASK_MGR_ACTIVE_PREFIX=abc- in child env, got: {env_output:?}"
+        );
+    }
+
+    #[test]
+    fn test_active_prefix_not_set_on_child_when_none() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Ensure the env var is not set in the parent so it can't be inherited.
+        let _env_guard = EnvVarGuard::unset("TASK_MGR_ACTIVE_PREFIX");
+
+        let output_file = std::env::temp_dir().join("task_mgr_test_active_prefix_none.txt");
+        let _ = std::fs::remove_file(&output_file);
+
+        let script = make_env_capture_script("active_prefix_none");
+        unsafe {
+            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            std::env::set_var("CLAUDE_WRAPPER_OUTPUT", output_file.to_str().unwrap());
+        }
+
+        let result = spawn_claude(
+            "ignored",
+            &PermissionMode::Dangerous,
+            SpawnOpts {
+                active_prefix: None,
+                ..SpawnOpts::default()
+            },
+        );
+
+        unsafe {
+            std::env::remove_var("CLAUDE_BINARY");
+            std::env::remove_var("CLAUDE_WRAPPER_OUTPUT");
+        }
+        let _ = std::fs::remove_file(&script);
+
+        assert!(result.is_ok(), "spawn_claude failed: {:?}", result.err());
+
+        let env_output = std::fs::read_to_string(&output_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&output_file);
+
+        assert!(
+            !env_output.contains("TASK_MGR_ACTIVE_PREFIX"),
+            "TASK_MGR_ACTIVE_PREFIX must not appear in child env when active_prefix is None, got: {env_output:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_spawn_opts_no_active_prefix_on_child() {
+        let _guard = CLAUDE_BINARY_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_guard = EnvVarGuard::unset("TASK_MGR_ACTIVE_PREFIX");
+
+        let output_file = std::env::temp_dir().join("task_mgr_test_active_prefix_default.txt");
+        let _ = std::fs::remove_file(&output_file);
+
+        let script = make_env_capture_script("active_prefix_default");
+        unsafe {
+            std::env::set_var("CLAUDE_BINARY", script.to_str().unwrap());
+            std::env::set_var("CLAUDE_WRAPPER_OUTPUT", output_file.to_str().unwrap());
+        }
+
+        // Construct SpawnOpts entirely via ..SpawnOpts::default() — no explicit active_prefix.
+        let result = spawn_claude(
+            "ignored",
+            &PermissionMode::Dangerous,
+            SpawnOpts {
+                ..SpawnOpts::default()
+            },
+        );
+
+        unsafe {
+            std::env::remove_var("CLAUDE_BINARY");
+            std::env::remove_var("CLAUDE_WRAPPER_OUTPUT");
+        }
+        let _ = std::fs::remove_file(&script);
+
+        assert!(result.is_ok(), "spawn_claude failed: {:?}", result.err());
+
+        let env_output = std::fs::read_to_string(&output_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&output_file);
+
+        assert!(
+            !env_output.contains("TASK_MGR_ACTIVE_PREFIX"),
+            "TASK_MGR_ACTIVE_PREFIX must not appear when using default SpawnOpts, got: {env_output:?}"
         );
     }
 }
