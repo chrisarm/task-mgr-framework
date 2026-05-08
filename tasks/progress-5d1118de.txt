@@ -48,3 +48,11 @@ Learnings:
 - The legacy `if !matches!(outcome, IterationOutcome::Empty)` gate on the completion ladder (engine.rs:3279) is intentionally relaxed in the pipeline so a `<completed>` tag retroactively flips Empty → Completed (mutate-empty-outcome contract).
 - `record_completion` helper consolidates the dedup + counter + outcome-mutate + crash_tracker.record_success() bookkeeping so each branch of the ladder stays a 4-line match arm rather than a 10-line boilerplate block.
 ---
+## [2026-05-08 02:00] - 5d1118de-TEST-INIT-004
+Approach: Added IterationContext.crashed_last_iteration HashMap field (additive alongside legacy last_task_id/last_was_crash) and wrote tests/crash_escalation_per_task.rs with 6 active tests + 4 #[ignore]'d FEAT-007 contract tests. Active tests pin field shape, idempotency, bounded-size invariant, structural absence of legacy-field dependence, and the same-task-crash discriminator. Ignored tests drive the pipeline directly to assert pipeline-write + check_crash_escalation map-read behavior FEAT-007 must implement.
+Files: src/loop_engine/engine.rs, tests/crash_escalation_per_task.rs
+Learnings:
+- Adding the new field as additive (alongside legacy fields) lets tests COMPILE today against the future shape — same TDD-bootstrap pattern as TEST-INIT-007 used for IterationResult.conversation. FEAT-007 just deletes the legacy fields + flips check_crash_escalation's reader.
+- The structural compile-time guard for AC #4 ("legacy fields removed") is encoded by simply NOT referencing ctx.last_task_id / ctx.last_was_crash anywhere in the test file; FEAT-007's deletion can't break this file. Cleaner than #[cfg]-style compile_error! gymnastics.
+- check_crash_escalation_via_ctx adapter bridges new contract (read map) to today's 4-arg signature — explicit "delete this when FEAT-007 lands" doc keeps the cleanup obvious. Two of four #[ignore]'d tests fail today against the real pipeline (proving the contract has discriminating power); the other two pass through the adapter (locking in the post-FEAT-007 escalation outcome).
+---

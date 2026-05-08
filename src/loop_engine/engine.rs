@@ -202,10 +202,33 @@ pub struct IterationContext {
     pub reorder_count: u32,
     /// Task ID from the previous iteration. Loop-thread-local — no concurrency concern.
     /// Used by crash escalation logic (FEAT-007) to detect same-task consecutive crashes.
+    ///
+    /// SUPERSEDED by `crashed_last_iteration` — FEAT-007 will remove this field.
+    /// Currently retained so `process_iteration_output` keeps compiling until
+    /// FEAT-007 cuts the writers/readers over to the per-task map.
     pub last_task_id: Option<String>,
     /// Whether the previous iteration crashed. Loop-thread-local — no concurrency concern.
     /// Used by crash escalation logic (FEAT-007) to trigger model escalation.
+    ///
+    /// SUPERSEDED by `crashed_last_iteration` — FEAT-007 will remove this field.
     pub last_was_crash: bool,
+    /// Per-task crash flag for the most recent iteration on each task. The
+    /// pipeline writes one entry per iteration:
+    /// `map[task_id] = matches!(outcome, IterationOutcome::Crash(_))`.
+    /// `check_crash_escalation` (post-FEAT-007) consults this map directly,
+    /// replacing the `(last_task_id == current) && last_was_crash` predicate
+    /// that today's two scalar fields encode.
+    ///
+    /// Sized by the number of distinct task IDs touched by the loop — bounded
+    /// by active task count, NOT iteration count, because each `insert` on the
+    /// same key overwrites in place. See `tests/crash_escalation_per_task.rs`
+    /// for the bounded-size invariant.
+    ///
+    /// Loop-thread-local: writes happen on the main thread inside
+    /// `process_iteration_output`. Wave-mode slot threads never touch this
+    /// map; the wave aggregator passes their outcomes through the pipeline on
+    /// the main thread, preserving the no-Mutex contract.
+    pub crashed_last_iteration: std::collections::HashMap<String, bool>,
     /// Per-task effort overrides set after `Crash(PromptTooLong)`. Keys are
     /// task IDs, values are the effort level to use on the next attempt in
     /// place of the difficulty-derived default.
@@ -260,6 +283,7 @@ impl IterationContext {
             reorder_count: 0,
             last_task_id: None,
             last_was_crash: false,
+            crashed_last_iteration: std::collections::HashMap::new(),
             effort_overrides: std::collections::HashMap::new(),
             model_overrides: std::collections::HashMap::new(),
             overflow_recovered: std::collections::HashSet::new(),
@@ -4606,6 +4630,10 @@ mod tests {
         assert_eq!(ctx.reorder_count, 0);
         assert!(ctx.last_task_id.is_none());
         assert!(!ctx.last_was_crash);
+        assert!(
+            ctx.crashed_last_iteration.is_empty(),
+            "TEST-INIT-004 contract: per-task crash map starts empty"
+        );
     }
 
     // --- IterationResult tests ---
