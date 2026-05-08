@@ -172,6 +172,9 @@ pub struct IterationResult {
     /// None when difficulty is unset/unknown or for early exits.
     pub effective_effort: Option<&'static str>,
     /// Number of key decisions extracted and stored this iteration.
+    /// Always initialised to 0 by the iteration runners; filled in by the
+    /// caller (`run_loop` / `process_slot_result`) after
+    /// `iteration_pipeline::process_iteration_output` returns the real count.
     pub key_decisions_count: u32,
     /// Structured stream-json conversation transcript (when stream-json mode is
     /// active). Threaded from `claude_result.conversation` at the post-Claude
