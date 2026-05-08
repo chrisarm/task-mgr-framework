@@ -81,6 +81,12 @@ pub struct SlotPromptBundle {
     /// the original `Task` reference. `None` when the task has no difficulty
     /// set; downstream callers fall back to defaults.
     pub difficulty: Option<String>,
+    /// Per-section byte sizes in prompt-assembly order. Mirrors
+    /// `PromptResult::section_sizes` so overflow dumps include a meaningful
+    /// section breakdown (instead of an empty `[]`) when a slot hits
+    /// `PromptTooLong`. Static string names match the section identifiers
+    /// used in the sequential builder.
+    pub section_sizes: Vec<(&'static str, usize)>,
 }
 
 /// Load file paths for a task from the `task_files` join table.
@@ -160,6 +166,18 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
         "{task_section}{task_ops}{learnings_section}{source_section}{dep_section}{tool_section}{key_decisions_section}{completion_section}{base_prompt}"
     );
 
+    let section_sizes: Vec<(&'static str, usize)> = vec![
+        ("task", task_section.len()),
+        ("task_ops", task_ops.len()),
+        ("learnings", learnings_section.len()),
+        ("source", source_section.len()),
+        ("dependencies", dep_section.len()),
+        ("tool_awareness", tool_section.len()),
+        ("key_decision", key_decisions_section.len()),
+        ("completion", completion_section.len()),
+        ("base_prompt", base_prompt.len()),
+    ];
+
     let resolved_model = task
         .model
         .as_deref()
@@ -173,5 +191,6 @@ pub fn build_prompt(conn: &Connection, task: &Task, params: &SlotPromptParams) -
         shown_learning_ids,
         resolved_model,
         difficulty: task.difficulty.clone(),
+        section_sizes,
     }
 }

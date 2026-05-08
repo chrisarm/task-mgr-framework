@@ -344,6 +344,11 @@ pub struct SlotResult {
     /// Empty for `slot_failure_result` entries (prompt was never assembled or
     /// the task claim failed before the worker spawned).
     pub prompt_for_overflow: String,
+    /// Per-section byte sizes from `SlotPromptBundle::section_sizes`, threaded
+    /// back so `process_slot_result` can populate the synthetic `PromptResult`
+    /// with a meaningful section breakdown on `PromptTooLong`. Empty for
+    /// `slot_failure_result` entries (no bundle was assembled).
+    pub section_sizes: Vec<(&'static str, usize)>,
 }
 
 /// Aggregate result of a parallel wave.
@@ -428,6 +433,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         claim_succeeded: true,
         shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
         prompt_for_overflow: slot.prompt_bundle.prompt.clone(),
+        section_sizes: slot.prompt_bundle.section_sizes.clone(),
     }
 }
 
@@ -611,6 +617,7 @@ pub fn run_slot_iteration(
         claim_succeeded: true,
         shown_learning_ids: bundle.shown_learning_ids.clone(),
         prompt_for_overflow: bundle.prompt.clone(),
+        section_sizes: bundle.section_sizes.clone(),
     })
 }
 
@@ -684,6 +691,7 @@ fn slot_failure_result(
         claim_succeeded,
         shown_learning_ids: Vec::new(),
         prompt_for_overflow: String::new(),
+        section_sizes: Vec::new(),
     }
 }
 
@@ -1116,10 +1124,12 @@ fn process_slot_result(
             task_files: slot_result.iteration_result.files_modified.clone(),
             shown_learning_ids: Vec::new(),
             resolved_model: slot_result.iteration_result.effective_model.clone(),
+            // Wave-mode prompts don't budget-drop whole sections, so there are
+            // no dropped sections to report.
             dropped_sections: Vec::new(),
             task_difficulty: None,
             cluster_effort: slot_result.iteration_result.effective_effort,
-            section_sizes: Vec::new(),
+            section_sizes: slot_result.section_sizes.clone(),
         };
         let _ = overflow::handle_prompt_too_long(
             ctx,
@@ -6291,6 +6301,7 @@ mod tests {
                 shown_learning_ids: Vec::new(),
                 resolved_model: None,
                 difficulty: None,
+                section_sizes: Vec::new(),
             }
         }
 
@@ -6339,6 +6350,7 @@ mod tests {
                 claim_succeeded: true,
                 shown_learning_ids: vec![42, 77],
                 prompt_for_overflow: String::new(),
+                section_sizes: Vec::new(),
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(
