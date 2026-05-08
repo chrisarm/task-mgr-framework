@@ -27,7 +27,9 @@ use task_mgr::db::migrations::run_migrations;
 use task_mgr::db::{create_schema, open_connection};
 use task_mgr::learnings::crud::{RecordLearningParams, record_learning};
 use task_mgr::loop_engine::config::PermissionMode;
-use task_mgr::loop_engine::prompt::slot::{SlotPromptBundle, SlotPromptParams, build_prompt};
+use task_mgr::loop_engine::prompt::slot::{
+    CRITICAL_OVERFLOW_SENTINEL, SlotPromptBundle, SlotPromptParams, build_prompt,
+};
 use task_mgr::models::{Confidence, LearningOutcome, Task};
 
 // Compile-time invariant: SlotPromptBundle must cross thread boundaries.
@@ -497,5 +499,237 @@ fn all_four_standard_sections_present_in_assembled_prompt() {
             && bundle.prompt.contains("key-decision"),
         "all four standard sections must appear in bundle.prompt; got:\n{}",
         bundle.prompt
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WIRE-FIX-002 AC (positive): TOTAL_PROMPT_BUDGET cap holds and dropped_sections
+// records the names of trimmable sections that didn't fit.
+//
+// We force overflow by inflating the base prompt template (a critical section)
+// to consume nearly the whole 80 KB budget; the trimmable sections (learnings,
+// source) are then forced to drop because the remainder cannot accommodate
+// them. The bundle's prompt MUST stay <= TOTAL_PROMPT_BUDGET (80 KB) and at
+// least one of "learnings" / "source" MUST appear in dropped_sections.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_prompt_oversize_drops_trimmable_sections_and_caps_total_budget() {
+    let (_tmp, conn) = setup_migrated_db();
+
+    // Insert a recall-matching learning whose content alone is ~6 KB so the
+    // learnings block, if it weren't capped, would still need ~4 KB after
+    // truncate-to-budget. With <4 KB remaining, it should drop.
+    let learn_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "oversize learning for budget-cap test".into(),
+        content: "L".repeat(6_000),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/loop_engine/prompt/slot.rs".into()]),
+        applies_to_task_types: Some(vec!["TEST-".into()]),
+        applies_to_errors: None,
+        tags: Some(vec!["budget".into()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, learn_params).expect("record_learning");
+
+    // Inflate base prompt to ~74 KB (under BASE_PROMPT_BUDGET=16 KB after
+    // truncation but the post-truncation value is still 16 KB; we instead
+    // need the COMPOSITE critical total to consume most of TOTAL_PROMPT_BUDGET).
+    // BASE_PROMPT_BUDGET clips this to 16 KB; couple that with a large source
+    // file to push the trimmable budget below the section size threshold.
+    let project = project_with_files(&[(
+        "src/big.rs",
+        &format!(
+            "// large source file for budget cap test\n{}\n",
+            "x".repeat(60_000)
+        ),
+    )]);
+    let base_prompt = project.path().join("prompt.md");
+    // The base prompt itself is one of the four critical sections; making it
+    // fully consume its 16 KB cap is enough to leave a tight remainder when
+    // combined with the inflated task JSON below.
+    fs::write(&base_prompt, &"B".repeat(60_000)).unwrap();
+
+    // Inflate the task description so format_task_json produces a large
+    // critical section that eats most of TOTAL_PROMPT_BUDGET. ~60 KB.
+    let mut task = sample_task();
+    task.description = Some("D".repeat(60_000));
+    conn.execute(
+        "INSERT OR IGNORE INTO tasks (id, title, status, priority) VALUES (?1, ?2, 'in_progress', 50)",
+        ["TEST-SLOT-001", "task"],
+    )
+    .expect("insert task row");
+    conn.execute(
+        "INSERT INTO task_files (task_id, file_path) VALUES (?1, ?2)",
+        ["TEST-SLOT-001", "src/big.rs"],
+    )
+    .expect("insert task_files row");
+
+    let params = SlotPromptParams {
+        project_root: project.path().to_path_buf(),
+        base_prompt_path: base_prompt,
+        permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
+    };
+    let bundle = build_prompt(&conn, &task, &params);
+
+    // The cap MUST hold even with oversized content.
+    assert!(
+        bundle.prompt.len() <= 80_000,
+        "bundle.prompt ({} bytes) must stay within TOTAL_PROMPT_BUDGET (80_000)",
+        bundle.prompt.len()
+    );
+
+    // At least one trimmable section should have been dropped — and the
+    // CRITICAL sentinel MUST NOT appear (we wrote the test to keep critical
+    // total under 80 KB).
+    assert!(
+        !bundle
+            .dropped_sections
+            .contains(&CRITICAL_OVERFLOW_SENTINEL.to_string()),
+        "CRITICAL sentinel should not fire in this scenario; got dropped_sections: {:?}",
+        bundle.dropped_sections,
+    );
+    let dropped_trimmable: bool = bundle
+        .dropped_sections
+        .iter()
+        .any(|s| s == "learnings" || s == "source");
+    assert!(
+        dropped_trimmable,
+        "at least one of 'learnings' / 'source' must appear in dropped_sections \
+         for this oversize fixture; got: {:?}",
+        bundle.dropped_sections,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WIRE-FIX-002 AC: shown_learning_ids MUST be empty whenever 'learnings'
+// appears in dropped_sections — feeding the bandit with learnings the agent
+// never saw skews UCB scoring.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_prompt_clears_shown_learning_ids_when_learnings_dropped() {
+    let (_tmp, conn) = setup_migrated_db();
+
+    let learn_params = RecordLearningParams {
+        outcome: LearningOutcome::Pattern,
+        title: "learning that should drop under budget pressure".into(),
+        content: "X".repeat(3_500),
+        task_id: None,
+        run_id: None,
+        root_cause: None,
+        solution: None,
+        applies_to_files: Some(vec!["src/loop_engine/prompt/slot.rs".into()]),
+        applies_to_task_types: Some(vec!["TEST-".into()]),
+        applies_to_errors: None,
+        tags: Some(vec!["bandit".into()]),
+        confidence: Confidence::High,
+    };
+    record_learning(&conn, learn_params).expect("record_learning");
+
+    let project = project_with_files(&[]);
+    let base_prompt = project.path().join("prompt.md");
+    fs::write(&base_prompt, &"B".repeat(20_000)).unwrap();
+
+    // Force a tight remainder by oversizing the task JSON (critical section)
+    // so the learnings block can't fit. The learnings block is ~3.5 KB after
+    // recall + truncate; we leave a few bytes of remainder for it.
+    //
+    // Critical budget math (must stay under TOTAL_PROMPT_BUDGET=80_000 to avoid
+    // tripping the CRITICAL sentinel):
+    //   task_section ≈ 58_000 (60_000 description + JSON overhead)
+    //   task_ops     ≈ 3_000  (static string, see prompt_sections::task_ops)
+    //   completion   ≈ 1_500
+    //   base_prompt  ≤ 16_000 (BASE_PROMPT_BUDGET cap on truncate_to_budget)
+    //   total        ≈ 78_500 → remainder ≈ 1_500 — too tight for the ~3.5 KB
+    //                                          learnings block.
+    let mut task = sample_task();
+    task.description = Some("D".repeat(58_000));
+    let params = SlotPromptParams {
+        project_root: project.path().to_path_buf(),
+        base_prompt_path: base_prompt,
+        permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
+    };
+    let bundle = build_prompt(&conn, &task, &params);
+
+    if bundle.dropped_sections.iter().any(|s| s == "learnings") {
+        assert!(
+            bundle.shown_learning_ids.is_empty(),
+            "shown_learning_ids must be empty when 'learnings' is dropped; got {:?}",
+            bundle.shown_learning_ids,
+        );
+    } else {
+        // Defensive: if the fixture didn't actually push learnings out,
+        // surface that — the test premise needs a tighter knob, not a silent pass.
+        panic!(
+            "fixture failed to drop 'learnings'; dropped_sections = {:?}",
+            bundle.dropped_sections
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WIRE-FIX-002 AC: critical-only oversize — when the four critical sections
+// alone exceed TOTAL_PROMPT_BUDGET, build_prompt MUST return a sentinel
+// bundle (empty prompt, dropped_sections = ["CRITICAL"]) and the caller
+// (build_slot_contexts) handles it gracefully without panic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn build_prompt_critical_only_oversize_returns_sentinel_bundle() {
+    let (_tmp, conn) = setup_migrated_db();
+
+    let project = project_with_files(&[]);
+    let base_prompt = project.path().join("prompt.md");
+    // The base prompt is truncated to BASE_PROMPT_BUDGET (16 KB) — large
+    // input is fine; we instead push the task JSON over the 80 KB cap.
+    fs::write(&base_prompt, "# base\n").unwrap();
+
+    // 200 KB description guarantees the task JSON section alone exceeds
+    // TOTAL_PROMPT_BUDGET (80 KB) — there is no per-section truncation for
+    // the task JSON in slot.rs, so this is the cheapest knob.
+    let mut task = sample_task();
+    task.description = Some("D".repeat(200_000));
+
+    let params = SlotPromptParams {
+        project_root: project.path().to_path_buf(),
+        base_prompt_path: base_prompt,
+        permission_mode: PermissionMode::Dangerous,
+        steering_path: None,
+        session_guidance: "",
+    };
+    let bundle = build_prompt(&conn, &task, &params);
+
+    assert!(
+        bundle
+            .dropped_sections
+            .contains(&CRITICAL_OVERFLOW_SENTINEL.to_string()),
+        "dropped_sections must contain the CRITICAL sentinel when critical sections \
+         exceed TOTAL_PROMPT_BUDGET; got: {:?}",
+        bundle.dropped_sections,
+    );
+    assert!(
+        bundle.prompt.is_empty(),
+        "bundle.prompt must be empty when CRITICAL sentinel fires (caller skips slot); \
+         got {} bytes",
+        bundle.prompt.len(),
+    );
+    assert_eq!(
+        bundle.task_id, task.id,
+        "bundle.task_id must still mirror task.id even on the sentinel path \
+         so caller logging identifies the offending task",
+    );
+    assert!(
+        bundle.shown_learning_ids.is_empty(),
+        "shown_learning_ids must be empty on the sentinel path — no recall results \
+         were ever surfaced",
     );
 }

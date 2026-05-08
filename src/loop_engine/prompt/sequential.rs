@@ -33,7 +33,7 @@ use crate::loop_engine::prompt_sections::synergy::{
     build_synergy_section, resolve_synergy_cluster,
 };
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
-use crate::loop_engine::prompt_sections::truncate_to_budget;
+use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
 
 /// Byte budget for enriched task context in the prompt.
 const TASK_CONTEXT_BUDGET: usize = 4000;
@@ -420,33 +420,6 @@ pub fn build_prompt(params: &BuildPromptParams<'_>) -> TaskMgrResult<Option<Prom
         cluster_effort,
         section_sizes,
     }))
-}
-
-/// Try to fit a section into the remaining budget.
-/// Returns the section string if it fits, empty string otherwise (with a warning).
-/// When a non-empty section is dropped, its name is appended to `dropped`.
-fn try_fit_section(
-    section: String,
-    name: &str,
-    remaining: &mut usize,
-    dropped: &mut Vec<String>,
-) -> String {
-    if section.is_empty() {
-        return section;
-    }
-    if section.len() <= *remaining {
-        *remaining -= section.len();
-        section
-    } else {
-        eprintln!(
-            "Warning: {} section ({} bytes) skipped — only {} bytes remaining in prompt budget",
-            name,
-            section.len(),
-            remaining,
-        );
-        dropped.push(name.to_string());
-        String::new()
-    }
 }
 
 /// Build a tool-awareness section that tells the agent what tools it has.

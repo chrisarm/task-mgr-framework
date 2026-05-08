@@ -14,6 +14,9 @@
 //!   and the key-decisions block.
 //! - `bundle.shown_learning_ids` is non-empty whenever the learnings block
 //!   was rendered (so `record_shown_learnings` gets fed by the wave path).
+//!   Conversely, `shown_learning_ids` MUST be empty when "learnings" appears
+//!   in `dropped_sections` — feeding the bandit with learnings the agent
+//!   never saw skews UCB scoring.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +27,7 @@ use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::prompt::core;
 use crate::loop_engine::prompt_sections::dependencies::build_dependency_section;
 use crate::loop_engine::prompt_sections::task_ops::task_ops_section;
-use crate::loop_engine::prompt_sections::truncate_to_budget;
+use crate::loop_engine::prompt_sections::{truncate_to_budget, try_fit_section};
 use crate::models::Task;
 
 /// Byte budget for the source-context section in slot prompts.
@@ -35,6 +38,21 @@ const LEARNINGS_BUDGET: usize = 4000;
 
 /// Byte budget for the base prompt template in slot prompts.
 const BASE_PROMPT_BUDGET: usize = 16_000;
+
+/// Total byte budget for the entire assembled slot prompt.
+///
+/// Mirrors `prompt::sequential::TOTAL_PROMPT_BUDGET` so wave slots and the
+/// sequential path enforce the same aggregate cap. Without this cap, a slot
+/// could hand Claude a prompt >80KB that immediately trips `PromptTooLong`
+/// and consumes a wasted wave slot before the per-slot overflow ladder
+/// rescues it.
+const TOTAL_PROMPT_BUDGET: usize = 80_000;
+
+/// Sentinel name pushed into `SlotPromptBundle.dropped_sections` when the
+/// critical-section total alone exceeds `TOTAL_PROMPT_BUDGET`. Callers
+/// should treat a bundle with this entry as too large to attempt and skip
+/// the slot rather than dispatch a malformed prompt.
+pub const CRITICAL_OVERFLOW_SENTINEL: &str = "CRITICAL";
 
 /// Parameters required to assemble a slot-mode prompt on the main thread.
 ///
@@ -80,6 +98,8 @@ pub struct SlotPromptBundle {
     pub task_files: Vec<String>,
     /// Learning ids surfaced in the prompt's learnings block. Threaded back
     /// to the main thread so `record_shown_learnings` can update the bandit.
+    /// Empty whenever `dropped_sections` contains `"learnings"` so the
+    /// bandit isn't credited with learnings that never reached the agent.
     pub shown_learning_ids: Vec<i64>,
     /// Resolved model for the slot (mirrors `PromptResult::resolved_model`).
     /// `None` means "use CLI default"; `Some("")` is normalized to `None`.
@@ -96,6 +116,12 @@ pub struct SlotPromptBundle {
     /// `PromptTooLong`. Static string names match the section identifiers
     /// used in the sequential builder.
     pub section_sizes: Vec<(&'static str, usize)>,
+    /// Names of trimmable sections that didn't fit within
+    /// `TOTAL_PROMPT_BUDGET`. Empty when every section fit. Contains the
+    /// [`CRITICAL_OVERFLOW_SENTINEL`] when the critical sections alone
+    /// exceed the budget; the bundle's `prompt` is empty in that case and
+    /// the slot should be skipped.
+    pub dropped_sections: Vec<String>,
 }
 
 /// Load file paths for a task from the `task_files` join table.
@@ -146,6 +172,17 @@ fn load_base_prompt(base_prompt_path: &std::path::Path) -> String {
 /// session guidance are kept (vs the disjoint-task drops) because they are
 /// project-wide and operator-driven respectively, both of which apply to
 /// every slot in the wave.
+///
+/// Two-phase assembly mirrors `prompt::sequential::build_prompt`:
+/// - **Phase 1**: assemble the critical sections (task JSON, task ops,
+///   completion instruction, base prompt template). If they alone exceed
+///   `TOTAL_PROMPT_BUDGET`, return a sentinel bundle with empty `prompt`
+///   and [`CRITICAL_OVERFLOW_SENTINEL`] in `dropped_sections`.
+/// - **Phase 2**: fill the remaining budget with trimmable sections in
+///   priority order via [`try_fit_section`]; record any drops in
+///   `dropped_sections`. When `"learnings"` is dropped, `shown_learning_ids`
+///   is cleared so the UCB bandit isn't credited with learnings the agent
+///   never saw.
 pub fn build_prompt(
     conn: &Connection,
     task: &Task,
@@ -153,38 +190,139 @@ pub fn build_prompt(
 ) -> SlotPromptBundle {
     let task_files = load_task_files(conn, &task.id);
 
-    // Task JSON header — the agent must see the task's description,
-    // acceptance criteria, and notes to do anything useful. Mirrors the
-    // sequential builder's `## Current Task` section so parallel slots have
-    // parity with the canonical single-task path.
+    let resolved_model = task
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned);
+
+    // ============================================================
+    // Phase 1: critical sections — must always be present.
+    // ============================================================
+
     let task_json = core::format_task_json(task, &task_files);
     let task_section = format!("## Current Task\n\n```json\n{task_json}\n```\n\n");
 
-    let task_ops = task_ops_section();
-
-    let (learnings_section, shown_learning_ids) =
-        core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
-
-    let source_section =
-        core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
-
-    let steering_section = params
-        .steering_path
-        .map(core::build_steering_block)
-        .unwrap_or_default();
-
-    let guidance_section = core::build_session_guidance_block(params.session_guidance);
-
-    let tool_section = core::build_tool_awareness_block(&params.permission_mode);
-
-    let key_decisions_section = core::build_key_decisions_block(&task.id);
-
-    let dep_section = build_dependency_section(conn, &task.id);
+    let task_ops = task_ops_section().to_string();
 
     let completion_section = core::completion_instruction(&task.id, &task.title);
 
     let base_prompt = load_base_prompt(&params.base_prompt_path);
 
+    let critical_total =
+        task_section.len() + task_ops.len() + completion_section.len() + base_prompt.len();
+
+    if critical_total > TOTAL_PROMPT_BUDGET {
+        eprintln!(
+            "Warning: slot prompt critical sections ({} bytes) exceed TOTAL_PROMPT_BUDGET ({}) \
+             for task {} — slot should be skipped",
+            critical_total, TOTAL_PROMPT_BUDGET, task.id,
+        );
+        return SlotPromptBundle {
+            prompt: String::new(),
+            task_id: task.id.clone(),
+            task_files,
+            shown_learning_ids: Vec::new(),
+            resolved_model,
+            difficulty: task.difficulty.clone(),
+            section_sizes: vec![
+                ("task", task_section.len()),
+                ("task_ops", task_ops.len()),
+                ("completion", completion_section.len()),
+                ("base_prompt", base_prompt.len()),
+            ],
+            dropped_sections: vec![CRITICAL_OVERFLOW_SENTINEL.to_string()],
+        };
+    }
+
+    // ============================================================
+    // Phase 2: trimmable sections — fit into the remaining budget.
+    // ============================================================
+
+    let mut remaining = TOTAL_PROMPT_BUDGET - critical_total;
+    let mut dropped_sections: Vec<String> = Vec::new();
+
+    // Priority order (highest first):
+    //   1. learnings, 2. source, 3. dependencies, 4. steering,
+    //   5. session_guidance, 6. tool_awareness, 7. key_decision
+    //
+    // Learnings sit at the top because the bandit feedback gating
+    // (`shown_learning_ids` cleared when "learnings" drops) only fires when
+    // the section actually didn't fit; keeping it first maximizes the
+    // chance the agent sees recalled context.
+
+    let (learnings_section_raw, mut shown_learning_ids) =
+        core::build_learnings_block(conn, task, LEARNINGS_BUDGET);
+    let learnings_section = try_fit_section(
+        learnings_section_raw,
+        "learnings",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+    if learnings_section.is_empty() && dropped_sections.last().is_some_and(|s| s == "learnings") {
+        // Drop bandit feedback when the learnings block didn't fit — the
+        // agent never saw these recall results, so crediting them would
+        // skew UCB scoring. Empty-input case (no recall results) leaves
+        // shown_learning_ids untouched (already empty) since try_fit_section
+        // does not push the section name on empty input.
+        shown_learning_ids.clear();
+    }
+
+    let source_section_raw =
+        core::build_source_context_block(&task_files, SOURCE_CONTEXT_BUDGET, &params.project_root);
+    let source_section = try_fit_section(
+        source_section_raw,
+        "source",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    let dep_section_raw = build_dependency_section(conn, &task.id);
+    let dep_section = try_fit_section(
+        dep_section_raw,
+        "dependencies",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    let steering_section_raw = params
+        .steering_path
+        .map(core::build_steering_block)
+        .unwrap_or_default();
+    let steering_section = try_fit_section(
+        steering_section_raw,
+        "steering",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    let guidance_section_raw = core::build_session_guidance_block(params.session_guidance);
+    let guidance_section = try_fit_section(
+        guidance_section_raw,
+        "session_guidance",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    let tool_section_raw = core::build_tool_awareness_block(&params.permission_mode);
+    let tool_section = try_fit_section(
+        tool_section_raw,
+        "tool_awareness",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    let key_decisions_section_raw = core::build_key_decisions_block(&task.id);
+    let key_decisions_section = try_fit_section(
+        key_decisions_section_raw,
+        "key_decision",
+        &mut remaining,
+        &mut dropped_sections,
+    );
+
+    // ============================================================
+    // Assembly
+    // ============================================================
     // Display order matches sequential.rs: steering → guidance precede
     // tool_awareness so project-wide guidance lands before per-task content.
     let prompt = format!(
@@ -205,12 +343,6 @@ pub fn build_prompt(
         ("base_prompt", base_prompt.len()),
     ];
 
-    let resolved_model = task
-        .model
-        .as_deref()
-        .filter(|m| !m.is_empty())
-        .map(str::to_owned);
-
     SlotPromptBundle {
         prompt,
         task_id: task.id.clone(),
@@ -219,5 +351,6 @@ pub fn build_prompt(
         resolved_model,
         difficulty: task.difficulty.clone(),
         section_sizes,
+        dropped_sections,
     }
 }

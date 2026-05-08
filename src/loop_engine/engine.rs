@@ -352,6 +352,13 @@ pub struct SlotResult {
     /// with a meaningful section breakdown on `PromptTooLong`. Empty for
     /// `slot_failure_result` entries (no bundle was assembled).
     pub section_sizes: Vec<(&'static str, usize)>,
+    /// Names of trimmable sections dropped at bundle-build time because they
+    /// didn't fit within `TOTAL_PROMPT_BUDGET`. Mirrors
+    /// `SlotPromptBundle::dropped_sections` so an overflow recovery still
+    /// reports the actual drops to the diagnostics dump (instead of an empty
+    /// list that would be wrong post-WIRE-FIX-002). Empty for
+    /// `slot_failure_result` entries.
+    pub dropped_sections: Vec<String>,
 }
 
 /// Aggregate result of a parallel wave.
@@ -437,6 +444,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         shown_learning_ids: slot.prompt_bundle.shown_learning_ids.clone(),
         prompt_for_overflow: None,
         section_sizes: slot.prompt_bundle.section_sizes.clone(),
+        dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
     }
 }
 
@@ -625,6 +633,7 @@ pub fn run_slot_iteration(
         shown_learning_ids: bundle.shown_learning_ids.clone(),
         prompt_for_overflow: is_prompt_too_long.then(|| bundle.prompt.clone()),
         section_sizes: bundle.section_sizes.clone(),
+        dropped_sections: bundle.dropped_sections.clone(),
     })
 }
 
@@ -699,6 +708,7 @@ fn slot_failure_result(
         shown_learning_ids: Vec::new(),
         prompt_for_overflow: None,
         section_sizes: Vec::new(),
+        dropped_sections: Vec::new(),
     }
 }
 
@@ -1151,9 +1161,11 @@ fn process_slot_result(
             task_files: slot_result.iteration_result.files_modified.clone(),
             shown_learning_ids: Vec::new(),
             resolved_model: slot_result.iteration_result.effective_model.clone(),
-            // Wave-mode prompts don't budget-drop whole sections, so there are
-            // no dropped sections to report.
-            dropped_sections: Vec::new(),
+            // Wave-mode prompts now apply the same TOTAL_PROMPT_BUDGET cap as
+            // the sequential builder; surface any dropped sections threaded
+            // through from `SlotPromptBundle` so overflow dumps and JSONL
+            // events match what the agent actually saw.
+            dropped_sections: slot_result.dropped_sections.clone(),
             task_difficulty: None,
             cluster_effort: slot_result.iteration_result.effective_effort,
             section_sizes: slot_result.section_sizes.clone(),
@@ -6339,6 +6351,7 @@ mod tests {
                 resolved_model: None,
                 difficulty: None,
                 section_sizes: Vec::new(),
+                dropped_sections: Vec::new(),
             }
         }
 
@@ -6388,6 +6401,7 @@ mod tests {
                 shown_learning_ids: vec![42, 77],
                 prompt_for_overflow: None,
                 section_sizes: Vec::new(),
+                dropped_sections: Vec::new(),
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(
