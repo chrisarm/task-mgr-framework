@@ -613,6 +613,349 @@ pub(crate) fn ensure_slot_worktrees(
     Ok(paths)
 }
 
+/// Classification for one stale ephemeral slot branch found at startup.
+///
+/// `OrphanBranch` — branch ref exists, worktree directory is gone (e.g. user
+/// removed it manually). Safe to delete the branch.
+///
+/// `CleanMerged` — clean worktree whose tip is an ancestor of the base branch.
+/// All work has already merged forward; both branch and worktree can be
+/// removed.
+///
+/// `CleanUnmerged` — clean worktree with commits NOT in the base branch.
+/// Operator must decide; we never auto-delete.
+///
+/// `Dirty` — uncommitted changes or untracked files in the worktree.
+/// Always blocks startup; never auto-cleaned.
+#[derive(Debug)]
+enum EphemeralCase {
+    OrphanBranch,
+    CleanMerged { worktree_path: PathBuf },
+    CleanUnmerged { commits: Vec<String> },
+    Dirty { worktree_path: PathBuf },
+}
+
+/// Reconcile stale `{branch_name}-slot-N` ephemeral branches/worktrees left
+/// over from a prior loop crash.
+///
+/// Called from engine.rs **before** `ensure_slot_worktrees`. If a previous
+/// run died after `ensure_slot_worktrees` but before `cleanup_slot_worktrees`,
+/// stale ephemeral state can collide with the next run or silently keep
+/// un-merged work invisible. This function classifies each stale branch into
+/// one of four cases and either auto-cleans (cases 1, 2), warns (case 3), or
+/// aborts startup (case 4 always; case 3 when `halt_threshold > 0`).
+///
+/// `halt_threshold` mirrors `ProjectConfig::merge_fail_halt_threshold`: a
+/// non-zero value means "strict mode — block on any anomaly". Zero preserves
+/// the legacy permissive posture for case 3 (warn but proceed); case 4
+/// (dirty) always aborts because silently dropping uncommitted work is never
+/// safe.
+///
+/// Idempotent: running twice in succession produces identical state on the
+/// second pass — auto-deletions remove the only branches the second pass
+/// would have considered, and case 3 / case 4 outcomes are pure observation.
+///
+/// Errors propagate only for the abort cases; per-branch classification or
+/// deletion failures are logged via `eprintln!` and the pass continues with
+/// the remaining branches so a single corrupt branch can never block all
+/// hygiene.
+pub(crate) fn reconcile_stale_ephemeral_slots(
+    project_root: &Path,
+    branch_name: &str,
+    halt_threshold: u32,
+) -> TaskMgrResult<()> {
+    // Cheap up-front prune: if a worktree directory was deleted out-of-band,
+    // git's internal registry may still hold a stale entry that prevents
+    // `git branch -D` from succeeding. Pruning is best-effort.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(project_root)
+        .output();
+
+    let pattern = format!("{}-slot-*", branch_name);
+    // `--format='%(refname:short)'` returns bare branch names. Without it,
+    // `git branch --list` prefixes lines with `* ` (current branch) or
+    // `+ ` (branch checked out in another worktree) — those markers would
+    // corrupt downstream classification.
+    let output = Command::new("git")
+        .args(["branch", "--list", "--format=%(refname:short)", &pattern])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| {
+            TaskMgrError::io_error(
+                project_root.display().to_string(),
+                "running git branch --list",
+                e,
+            )
+        })?;
+
+    if !output.status.success() {
+        eprintln!(
+            "warning: git branch --list failed during stale-ephemeral reconcile (continuing): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let branches: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if branches.is_empty() {
+        return Ok(());
+    }
+
+    let mut unmerged: Vec<(String, Vec<String>)> = Vec::new();
+    let mut dirty_paths: Vec<PathBuf> = Vec::new();
+
+    for ephemeral in &branches {
+        match classify_ephemeral_branch(project_root, branch_name, ephemeral) {
+            Ok(EphemeralCase::OrphanBranch) => {
+                if let Err(e) = delete_branch_force(project_root, ephemeral) {
+                    eprintln!(
+                        "warning: failed to delete orphan ephemeral branch {} (continuing): {}",
+                        ephemeral, e
+                    );
+                } else {
+                    eprintln!("Deleted orphan ephemeral branch {}", ephemeral);
+                }
+            }
+            Ok(EphemeralCase::CleanMerged { worktree_path }) => {
+                if let Err(e) = delete_merged_ephemeral(project_root, &worktree_path, ephemeral) {
+                    eprintln!(
+                        "warning: failed to clean already-merged ephemeral {} (continuing): {}",
+                        ephemeral, e
+                    );
+                } else {
+                    eprintln!(
+                        "Cleaned already-merged ephemeral branch {} and its worktree",
+                        ephemeral
+                    );
+                }
+            }
+            Ok(EphemeralCase::CleanUnmerged { commits }) => {
+                unmerged.push((ephemeral.clone(), commits));
+            }
+            Ok(EphemeralCase::Dirty { worktree_path }) => {
+                dirty_paths.push(worktree_path);
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to classify ephemeral branch {} during reconcile (continuing): {}",
+                    ephemeral, e
+                );
+            }
+        }
+    }
+
+    // Emit warnings for un-merged branches whether or not we're going to
+    // abort — the operator needs to see the commit subjects either way.
+    for (ephemeral, commits) in &unmerged {
+        eprintln!(
+            "warning: stale ephemeral branch {} has {} un-merged commit(s):",
+            ephemeral,
+            commits.len()
+        );
+        for subject in commits {
+            eprintln!("    {}", subject);
+        }
+    }
+
+    // Case 4: dirty worktrees always abort. They take precedence over
+    // case 3 because the operator needs to inspect uncommitted work first.
+    if !dirty_paths.is_empty() {
+        let paths_str: Vec<String> = dirty_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "Stale ephemeral slot worktree".to_string(),
+            id: paths_str.join(", "),
+            expected: "clean state at startup".to_string(),
+            actual: format!(
+                "dirty worktree(s) detected: {}. \
+                 Inspect manually, commit or discard changes, then `git worktree remove <path>` \
+                 and `git branch -D <branch>` before re-running the loop.",
+                paths_str.join(", ")
+            ),
+        });
+    }
+
+    // Case 3: un-merged ephemeral aborts only when halt_threshold > 0.
+    // halt_threshold == 0 preserves the legacy permissive posture (warn-only).
+    if halt_threshold > 0 && !unmerged.is_empty() {
+        let names: Vec<String> = unmerged.iter().map(|(n, _)| n.clone()).collect();
+        return Err(TaskMgrError::InvalidState {
+            resource_type: "Stale ephemeral slot branch".to_string(),
+            id: names.join(", "),
+            expected: "no un-merged stale ephemeral branches at startup".to_string(),
+            actual: format!(
+                "un-merged ephemeral branch(es): {}. \
+                 Inspect with `git log {base}..<branch>`, then either merge into {base} \
+                 or `git branch -D <branch>` if the work should be discarded.",
+                names.join(", "),
+                base = branch_name
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Classify a single ephemeral slot branch into one of the four cases.
+///
+/// Returns `Err` when classification itself failed (git spawn / non-zero
+/// exit). The caller logs and skips so a single sick branch cannot block
+/// hygiene for the rest.
+///
+/// **Ancestor primitive**: uses `git merge-base --is-ancestor`, NOT
+/// `git diff` — the latter compares trees and produces a false "un-merged"
+/// classification once the base branch advances past a previously-merged
+/// ephemeral.
+fn classify_ephemeral_branch(
+    project_root: &Path,
+    base_branch: &str,
+    ephemeral: &str,
+) -> Result<EphemeralCase, String> {
+    // Recover the slot index from the branch name to find its expected
+    // worktree path. This is contract-bound to `ephemeral_slot_branch`'s
+    // shape (worktree.rs:540) — anything that doesn't parse is treated as
+    // a classification error so the caller skips it.
+    let suffix = ephemeral
+        .strip_prefix(&format!("{}-slot-", base_branch))
+        .ok_or_else(|| "branch name does not match {base}-slot-N shape".to_string())?;
+    let slot: usize = suffix
+        .parse()
+        .map_err(|e| format!("non-numeric slot suffix '{}': {}", suffix, e))?;
+
+    let worktree_path = compute_slot_worktree_path(project_root, base_branch, slot);
+
+    if !worktree_path.exists() {
+        return Ok(EphemeralCase::OrphanBranch);
+    }
+
+    if is_worktree_dirty(&worktree_path)? {
+        return Ok(EphemeralCase::Dirty { worktree_path });
+    }
+
+    if is_ancestor_of(project_root, ephemeral, base_branch)? {
+        return Ok(EphemeralCase::CleanMerged { worktree_path });
+    }
+
+    let commits = list_commit_subjects_not_in_base(project_root, base_branch, ephemeral)?;
+    Ok(EphemeralCase::CleanUnmerged { commits })
+}
+
+/// True iff `git status --porcelain` reports any modified, staged, or
+/// untracked entries in `worktree_path`.
+fn is_worktree_dirty(worktree_path: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|e| format!("git status spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// True iff `ancestor` is an ancestor of `descendant` per
+/// `git merge-base --is-ancestor`.
+///
+/// Exit code 0 → ancestor; 1 → not ancestor; anything else → error. We
+/// MUST NOT substitute `git diff` — it reports tree differences and would
+/// false-positive on un-merged after the base branch advances past a
+/// previously-merged ephemeral.
+fn is_ancestor_of(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(repo)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("git merge-base spawn: {}", e))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(c) => Err(format!("git merge-base --is-ancestor exit {}", c)),
+        None => Err("git merge-base --is-ancestor terminated by signal".to_string()),
+    }
+}
+
+/// Subjects of commits reachable from `ephemeral` but not from `base`.
+fn list_commit_subjects_not_in_base(
+    repo: &Path,
+    base: &str,
+    ephemeral: &str,
+) -> Result<Vec<String>, String> {
+    let range = format!("{}..{}", base, ephemeral);
+    let output = Command::new("git")
+        .args(["log", "--pretty=format:%s", &range])
+        .current_dir(repo)
+        .output()
+        .map_err(|e| format!("git log spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Force-delete a branch from `project_root`. Tolerates "not found" so a
+/// concurrent deletion (e.g. another reconcile pass mid-flight) does not
+/// abort the outer loop.
+fn delete_branch_force(project_root: &Path, branch: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["branch", "-D", branch])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("git branch -D spawn: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not found") {
+            return Ok(());
+        }
+        return Err(format!("git branch -D failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Remove the worktree at `worktree_path` and then delete `ephemeral`.
+///
+/// Caller has already verified the worktree is clean; treat a dirty result
+/// from `remove_worktree` as a defensive error rather than silently
+/// swallowing because it would mean the dirty check raced.
+fn delete_merged_ephemeral(
+    project_root: &Path,
+    worktree_path: &Path,
+    ephemeral: &str,
+) -> Result<(), String> {
+    match remove_worktree(project_root, worktree_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "worktree {} unexpectedly dirty during merged-cleanup",
+                worktree_path.display()
+            ));
+        }
+        Err(e) => return Err(format!("remove_worktree: {}", e)),
+    }
+    delete_branch_force(project_root, ephemeral)
+}
+
 /// Classifies why a slot's merge-back failed.
 ///
 /// Carried on each `failed_slots` entry so engine.rs can choose appropriate
@@ -3063,5 +3406,264 @@ detached
         let merged_body = fs::read_to_string(&progress_path).unwrap();
         assert!(merged_body.contains("line-a"));
         assert!(merged_body.contains("line-b"));
+    }
+
+    // ===== reconcile_stale_ephemeral_slots tests (FEAT-005) =====
+
+    /// Returns true iff `branch` exists in `project_root`.
+    fn branch_exists(project_root: &Path, branch: &str) -> bool {
+        let out = Command::new("git")
+            .args(["rev-parse", "--verify", &format!("refs/heads/{}", branch)])
+            .current_dir(project_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git rev-parse spawn");
+        out.success()
+    }
+
+    /// Set up a 2-slot worktree topology on `branch`. Returns
+    /// `(tmp, project_root, slot_paths)`. `slot_paths[1]` is the slot 1
+    /// ephemeral worktree path under test.
+    fn setup_ephemeral_slot_for_recon(branch: &str) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path().to_path_buf();
+        let paths = ensure_slot_worktrees(&project_root, branch, 2)
+            .expect("ensure_slot_worktrees in test setup");
+        (tmp, project_root, paths)
+    }
+
+    /// Make a single commit on the given slot worktree by writing a sentinel
+    /// file. Used to push the ephemeral past the base branch's tip.
+    fn commit_on_slot(slot_path: &Path, fname: &str, msg: &str) {
+        fs::write(slot_path.join(fname), "slot-content").expect("write slot file");
+        let add = Command::new("git")
+            .args(["add", "."])
+            .current_dir(slot_path)
+            .output()
+            .expect("git add");
+        assert!(add.status.success());
+        let commit = Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(slot_path)
+            .output()
+            .expect("git commit");
+        assert!(
+            commit.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_deletes_orphan_branch() {
+        let branch = "feat/recon-orphan";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Forcibly remove the slot 1 worktree directory (simulating an
+        // out-of-band deletion / abrupt loss). The branch ref remains.
+        let _ = Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                slot1_path.to_str().unwrap(),
+            ])
+            .current_dir(&project_root)
+            .output();
+        // Belt-and-braces: ensure dir is really gone.
+        let _ = std::fs::remove_dir_all(&slot1_path);
+        assert!(!slot1_path.exists(), "slot 1 dir should be gone");
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch should still exist before reconcile"
+        );
+
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("reconcile should succeed for orphan-branch case");
+
+        assert!(
+            !branch_exists(&project_root, &ephemeral),
+            "orphan ephemeral branch should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_deletes_clean_merged() {
+        let branch = "feat/recon-merged";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Slot 1 was forked from `branch` and has no extra commits → its
+        // tip is identical to `branch`'s tip → ancestor check returns true.
+        // Topology stress: advance the base branch past the ephemeral so a
+        // tree-diff implementation would falsely report "un-merged". The
+        // ancestor primitive must still classify this as merged.
+        commit_on_slot(&slot_paths[0], "advance.txt", "advance base past ephemeral");
+
+        assert!(slot1_path.exists());
+        assert!(branch_exists(&project_root, &ephemeral));
+
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("reconcile should succeed for clean-merged case");
+
+        assert!(
+            !branch_exists(&project_root, &ephemeral),
+            "merged ephemeral branch should be deleted"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "merged ephemeral worktree should be removed"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_aborts_on_unmerged_when_halt_enabled() {
+        let branch = "feat/recon-unmerged-halt";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Push slot 1 past base with a commit so it is no longer an ancestor.
+        commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
+
+        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2);
+        assert!(
+            result.is_err(),
+            "reconcile must abort when halt_threshold > 0 and un-merged ephemeral exists: {:?}",
+            result
+        );
+
+        // Branch and worktree must be preserved on abort.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch must be preserved on abort"
+        );
+        assert!(
+            slot1_path.exists(),
+            "ephemeral worktree must be preserved on abort"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_warns_on_unmerged_when_halt_disabled() {
+        let branch = "feat/recon-unmerged-warn";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
+
+        // halt_threshold = 0 → legacy permissive: warn but proceed.
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("reconcile should return Ok when halt_threshold == 0");
+
+        // Critical AC: must NOT delete in case 3 even with halt disabled.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "un-merged ephemeral branch must be preserved (never auto-deleted)"
+        );
+        assert!(
+            slot1_path.exists(),
+            "un-merged ephemeral worktree must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_aborts_on_dirty_worktree() {
+        let branch = "feat/recon-dirty";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Introduce uncommitted change in slot 1 worktree.
+        fs::write(slot1_path.join("dirty.txt"), "uncommitted").expect("write dirty file");
+
+        // Dirty must abort regardless of halt_threshold.
+        for halt in [0u32, 2u32] {
+            let result = reconcile_stale_ephemeral_slots(&project_root, branch, halt);
+            assert!(
+                result.is_err(),
+                "dirty worktree must abort regardless of halt_threshold (halt={}): {:?}",
+                halt,
+                result
+            );
+            assert!(
+                branch_exists(&project_root, &ephemeral),
+                "ephemeral branch must be preserved on dirty-abort (halt={})",
+                halt
+            );
+            assert!(
+                slot1_path.exists(),
+                "ephemeral worktree must be preserved on dirty-abort (halt={})",
+                halt
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_no_branches_returns_ok() {
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path().to_path_buf();
+
+        // No slot branches exist; pattern matches nothing → early Ok.
+        reconcile_stale_ephemeral_slots(&project_root, "feat/no-such-branch", 2)
+            .expect("empty branch list should produce Ok with no work");
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_skips_malformed_branch_and_continues() {
+        let branch = "feat/recon-malformed";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Inject a malformed sibling matching the glob but with a non-numeric
+        // suffix. classify_ephemeral_branch returns Err for this; the
+        // orchestrator logs and proceeds to clean the legitimate slot 1.
+        let malformed = format!("{}-slot-foo", branch);
+        let out = Command::new("git")
+            .args(["branch", &malformed, branch])
+            .current_dir(&project_root)
+            .output()
+            .expect("create malformed branch");
+        assert!(out.status.success());
+
+        // Slot 1 is at base's tip → clean-merged → should be cleaned up.
+        // Advance base past the ephemeral so the test exercises the
+        // ancestor-vs-tree-diff distinction at the same time.
+        commit_on_slot(&slot_paths[0], "advance.txt", "advance base");
+
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("reconcile should not abort because of malformed sibling");
+
+        assert!(
+            !branch_exists(&project_root, &ephemeral),
+            "legitimate clean-merged ephemeral should still be cleaned up despite malformed sibling"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "legitimate clean-merged worktree should be removed"
+        );
+        // The malformed branch is left in place — operator-actionable.
+        assert!(
+            branch_exists(&project_root, &malformed),
+            "malformed sibling branch is preserved (logged + skipped, never auto-deleted)"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_is_idempotent() {
+        let branch = "feat/recon-idempotent";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let _ = slot_paths;
+
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0).expect("first pass");
+        // Second pass: nothing left matching the pattern → fast Ok.
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("second pass should be a no-op Ok");
     }
 }

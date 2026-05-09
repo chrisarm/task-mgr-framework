@@ -3012,27 +3012,52 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let parallel_requested = run_config.config.parallel_slots > 1;
     let (mut parallel_active, slot_worktree_paths) = if parallel_requested {
         match (branch_name.as_ref(), run_config.config.use_worktrees) {
-            (Some(branch), true) => match worktree::ensure_slot_worktrees(
-                &run_config.source_root,
-                branch,
-                run_config.config.parallel_slots,
-            ) {
-                Ok(paths) => {
+            (Some(branch), true) => {
+                // FEAT-005: clean up any `{branch}-slot-N` left over from a
+                // prior loop crash before we try to (re)create slot worktrees.
+                // Aborts startup on dirty / un-merged anomalies; otherwise
+                // returns Ok and leaves the path clear for `ensure_slot_worktrees`.
+                let halt_threshold =
+                    crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
+                        .merge_fail_halt_threshold;
+                if let Err(e) = worktree::reconcile_stale_ephemeral_slots(
+                    &run_config.source_root,
+                    branch,
+                    halt_threshold,
+                ) {
                     eprintln!(
-                        "Parallel mode active: {} slots ({} ephemeral branches)",
-                        run_config.config.parallel_slots,
-                        run_config.config.parallel_slots.saturating_sub(1)
-                    );
-                    (true, paths)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to set up slot worktrees: {} — falling back to sequential",
+                        "Error: stale ephemeral-slot reconcile aborted startup: {}",
                         e
                     );
-                    (false, Vec::new())
+                    return LoopResult {
+                        exit_code: 1,
+                        worktree_path: actual_worktree_path,
+                        branch_name: None,
+                        was_stopped: false,
+                    };
                 }
-            },
+                match worktree::ensure_slot_worktrees(
+                    &run_config.source_root,
+                    branch,
+                    run_config.config.parallel_slots,
+                ) {
+                    Ok(paths) => {
+                        eprintln!(
+                            "Parallel mode active: {} slots ({} ephemeral branches)",
+                            run_config.config.parallel_slots,
+                            run_config.config.parallel_slots.saturating_sub(1)
+                        );
+                        (true, paths)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to set up slot worktrees: {} — falling back to sequential",
+                            e
+                        );
+                        (false, Vec::new())
+                    }
+                }
+            }
             (None, _) => {
                 eprintln!(
                     "Warning: --parallel {} requires a branchName in the PRD; falling back to sequential",
