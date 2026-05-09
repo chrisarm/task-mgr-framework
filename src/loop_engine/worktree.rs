@@ -776,17 +776,33 @@ impl MergeResolver for NoOpResolver {
 /// their fast-forward fails the slot is demoted from `merged_slots` to
 /// `failed_slots`.
 pub(crate) fn merge_slot_branches_with_resolver(
-    project_root: &Path,
+    _project_root: &Path,
     branch_name: &str,
     num_slots: usize,
     resolver: &dyn MergeResolver,
+    slot_paths: &[PathBuf],
 ) -> MergeOutcomes {
     let mut outcomes = MergeOutcomes::default();
     if num_slots <= 1 {
         return outcomes;
     }
+    if slot_paths.len() < num_slots {
+        for slot in 1..num_slots {
+            outcomes.failed_slots.push((
+                slot,
+                format!(
+                    "slot_paths has {} entries but num_slots is {}; cannot merge slot {}",
+                    slot_paths.len(),
+                    num_slots,
+                    slot
+                ),
+                SlotFailureKind::PreResolver,
+            ));
+        }
+        return outcomes;
+    }
 
-    let slot0_path = compute_slot_worktree_path(project_root, branch_name, 0);
+    let slot0_path = &slot_paths[0];
 
     // Slot-0 poisoning marker. Set when a `hard_reset` cleanup fails — at
     // that point HEAD may have drifted from any sensible base, so subsequent
@@ -809,7 +825,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
             continue;
         }
         let ephemeral = ephemeral_slot_branch(branch_name, slot);
-        let pre_merge_head = match rev_parse_head(&slot0_path) {
+        let pre_merge_head = match rev_parse_head(slot0_path) {
             Ok(h) => h,
             Err(e) => {
                 outcomes.failed_slots.push((
@@ -822,7 +838,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
         };
         let merge_result = Command::new("git")
             .args(["merge", "--no-edit", &ephemeral])
-            .current_dir(&slot0_path)
+            .current_dir(slot0_path)
             .output();
         match merge_result {
             Ok(output) if output.status.success() => outcomes.merged_slots.push(slot),
@@ -830,7 +846,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
                 let detail = format_git_failure(&output.stdout, &output.stderr);
                 match handle_conflict_for_slot(
                     slot,
-                    &slot0_path,
+                    slot0_path,
                     &ephemeral,
                     &pre_merge_head,
                     &detail,
@@ -857,7 +873,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
         }
     }
 
-    fast_forward_merged_slots(&mut outcomes, project_root, branch_name);
+    fast_forward_merged_slots(&mut outcomes, slot_paths, branch_name);
     outcomes
 }
 
@@ -1041,13 +1057,17 @@ fn handle_conflict_for_slot(
 
 /// Fast-forward each successfully-merged slot worktree to the updated main
 /// branch head. Slots whose `--ff-only` fails are demoted to `failed_slots`.
-fn fast_forward_merged_slots(outcomes: &mut MergeOutcomes, project_root: &Path, branch_name: &str) {
+fn fast_forward_merged_slots(
+    outcomes: &mut MergeOutcomes,
+    slot_paths: &[PathBuf],
+    branch_name: &str,
+) {
     let merged: Vec<usize> = outcomes.merged_slots.clone();
     for slot in merged {
-        let slot_path = compute_slot_worktree_path(project_root, branch_name, slot);
+        let slot_path = &slot_paths[slot];
         let ff_result = Command::new("git")
             .args(["merge", "--ff-only", branch_name])
-            .current_dir(&slot_path)
+            .current_dir(slot_path)
             .output();
         match ff_result {
             Ok(output) if output.status.success() => {}
@@ -2147,7 +2167,8 @@ detached
                 .expect("git commit in slot");
         }
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
         assert!(
             outcomes.failed_slots.is_empty(),
             "disjoint changes must merge cleanly: {:?}",
@@ -2231,7 +2252,8 @@ detached
 
         let pre_merge_head = rev_parse(&slot0, "HEAD");
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
 
         assert_eq!(
             outcomes.merged_slots,
@@ -2286,6 +2308,68 @@ detached
             contended.trim(),
             "main version",
             "slot 2's failed merge must not have leaked into slot 0"
+        );
+    }
+
+    /// Regression: merge-back must use the actual slot 0 path from `slot_paths`,
+    /// not recompute it via `compute_slot_worktree_path`.
+    ///
+    /// When `project_root` is slot 0's worktree path (as happens when the loop
+    /// runs from inside the matching worktree), `compute_slot_worktree_path`
+    /// derives a sibling-of-slot0 directory that does not exist, causing ENOENT
+    /// on the first `rev_parse_head` call. This test creates that exact topology
+    /// and verifies the fix holds.
+    #[test]
+    fn test_merge_slot_branches_succeeds_when_invoked_from_inside_slot0_worktree() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/inside-slot0";
+
+        // Set up slot worktrees from the main repo (tmp.path()). slot_paths[0]
+        // is at compute_worktree_path(tmp.path(), branch) — a sibling directory,
+        // NOT tmp.path() itself.
+        let slot_paths =
+            ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Make a disjoint commit on slot 1 so the merge has work to do.
+        fs::write(slot_paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot_paths[1])
+            .output()
+            .expect("git add slot 1");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint change"])
+            .current_dir(&slot_paths[1])
+            .output()
+            .expect("git commit slot 1");
+
+        // Pass slot_paths[0] as project_root — simulating the loop being
+        // invoked from inside slot 0's worktree. The OLD code called
+        // compute_slot_worktree_path(slot_paths[0], branch, 0), which computes
+        // "{parent(slot_paths[0])}/{slot0_name}-worktrees/feat-inside-slot0"
+        // — a path that does not exist — and failed with "rev-parse spawn:
+        // No such file or directory". The NEW code uses slot_paths[0] directly.
+        let outcomes = merge_slot_branches_with_resolver(
+            &slot_paths[0],
+            branch,
+            2,
+            &NoOpResolver,
+            &slot_paths,
+        );
+
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "merge-back must not ENOENT when project_root is the slot-0 worktree path: {:?}",
+            outcomes.failed_slots
+        );
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot 1 should merge cleanly into slot 0"
+        );
+        assert!(
+            slot_paths[0].join("slot-1-file.txt").exists(),
+            "slot 1's file must appear in slot 0 after merge"
         );
     }
 
@@ -2523,6 +2607,10 @@ detached
     fn test_resolver_resolved_with_real_commit_lands_in_merged_slots() {
         let branch = "feat/resolver-resolved";
         let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
 
         let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
             // Pretend to resolve by overwriting the file and committing.
@@ -2540,7 +2628,8 @@ detached
             );
         });
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
 
         assert_eq!(*resolver.invocations.borrow(), 1, "resolver called once");
         assert!(
@@ -2579,6 +2668,10 @@ detached
     fn test_resolver_aborted_lands_in_failed_slots_with_declined() {
         let branch = "feat/resolver-aborted";
         let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
 
         let resolver = MockResolver::new(MergeResolverOutcome::Aborted, |slot0_path| {
             let out = Command::new("git")
@@ -2589,7 +2682,8 @@ detached
             assert!(out.status.success(), "merge --abort should succeed");
         });
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -2622,11 +2716,16 @@ detached
     fn test_resolver_failed_resets_head_and_records_message() {
         let branch = "feat/resolver-failed";
         let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
 
         // Resolver does nothing (simulating a hard error before any cleanup).
         let resolver = MockResolver::new(MergeResolverOutcome::Failed("timed out".into()), |_| {});
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -2657,12 +2756,17 @@ detached
     fn test_resolver_lying_resolved_is_downgraded_to_failed() {
         let branch = "feat/resolver-lying";
         let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
 
         // Lying resolver: claims Resolved but does NOT commit. MERGE_HEAD
         // should still be set after this no-op runs.
         let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |_| {});
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -2696,6 +2800,10 @@ detached
     fn test_resolver_resolved_without_head_advance_is_failed() {
         let branch = "feat/resolver-no-advance";
         let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
 
         let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
             // Clear MERGE_HEAD without committing — this is what `git merge
@@ -2708,7 +2816,8 @@ detached
             assert!(out.status.success());
         });
 
-        let outcomes = merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver);
+        let outcomes =
+            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -2727,9 +2836,17 @@ detached
     #[test]
     fn test_slot_failure_kind_pre_resolver_on_missing_worktree() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        // slot_paths[0] points to tmp.path() (exists but is not a git repo),
+        // so rev_parse_head fails before the resolver is ever invoked.
+        let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().join("slot-1")];
         // NoOpResolver must not be called — slot fails at rev_parse_head.
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), "test-branch", 2, &NoOpResolver);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            "test-branch",
+            2,
+            &NoOpResolver,
+            &slot_paths,
+        );
         assert_eq!(outcomes.failed_slots.len(), 1);
         let (_, _, kind) = &outcomes.failed_slots[0];
         assert_eq!(
