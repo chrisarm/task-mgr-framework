@@ -350,6 +350,7 @@ pub fn init(
                 prd_file: prd.prd_file.clone(),
                 model: prd.model.clone(),
                 default_max_retries: prd.default_max_retries,
+                implicit_overlap_files: prd.implicit_overlap_files.clone(),
             });
         }
 
@@ -369,6 +370,7 @@ pub fn init(
                 prd_file: prd.prd_file.clone(),
                 model: None,
                 default_max_retries: None,
+                implicit_overlap_files: None,
             },
         ));
 

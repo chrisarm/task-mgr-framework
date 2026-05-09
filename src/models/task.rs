@@ -253,6 +253,16 @@ pub struct Task {
     /// Stored as INTEGER or NULL in the DB; maps from `human_review_timeout` column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub human_review_timeout: Option<u32>,
+
+    /// Per-task override for the parallel-slot shared-infra claim (FEAT-003).
+    /// `Some(true)` forces the synthetic `__shared_infra__` claim regardless of
+    /// `touchesFiles` content or task-id prefix; `Some(false)` opts the task OUT
+    /// of the buildy-prefix heuristic AND any path-based detection; `None`
+    /// (default) falls through to the implicit detection in
+    /// `select_parallel_group`. Stored as INTEGER or NULL in the DB; maps from
+    /// `claims_shared_infra` column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_shared_infra: Option<bool>,
 }
 
 fn default_max_retries() -> i32 {
@@ -291,6 +301,7 @@ impl Task {
             consecutive_failures: 0,
             requires_human: false,
             human_review_timeout: None,
+            claims_shared_infra: None,
         }
     }
 
@@ -383,6 +394,12 @@ impl TryFrom<&Row<'_>> for Task {
                 .ok()
                 .flatten()
                 .and_then(|v| u32::try_from(v).ok()),
+            // Graceful fallback: column doesn't exist until v19 migration runs (FEAT-003)
+            claims_shared_infra: row
+                .get::<_, Option<i64>>("claims_shared_infra")
+                .ok()
+                .flatten()
+                .map(|v| v != 0),
         })
     }
 }
@@ -812,6 +829,72 @@ mod tests {
         assert_eq!(
             task.human_review_timeout, None,
             "missing human_review_timeout must deserialize to None"
+        );
+    }
+
+    // ============ claims_shared_infra (FEAT-003) tests ============
+
+    #[test]
+    fn test_task_new_claims_shared_infra_defaults_to_none() {
+        let task = Task::new("US-001", "Test Task");
+        assert_eq!(
+            task.claims_shared_infra, None,
+            "Task::new() must default claims_shared_infra to None"
+        );
+    }
+
+    #[test]
+    fn test_task_claims_shared_infra_round_trips_some_true() {
+        let mut task = Task::new("US-001", "Test Task");
+        task.claims_shared_infra = Some(true);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            json.contains("\"claims_shared_infra\":true"),
+            "Some(true) must serialize, got: {json}"
+        );
+        let parsed: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.claims_shared_infra, Some(true));
+    }
+
+    #[test]
+    fn test_task_claims_shared_infra_round_trips_some_false() {
+        let mut task = Task::new("US-001", "Test Task");
+        task.claims_shared_infra = Some(false);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            json.contains("\"claims_shared_infra\":false"),
+            "Some(false) must serialize, got: {json}"
+        );
+        let parsed: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.claims_shared_infra, Some(false));
+    }
+
+    #[test]
+    fn test_task_claims_shared_infra_absent_when_none() {
+        let task = Task::new("US-001", "Test Task");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("claims_shared_infra"),
+            "None must skip serialization (skip_serializing_if), got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_task_claims_shared_infra_deserialize_with_default_when_absent() {
+        // A JSON payload with no claims_shared_infra field must deserialize to None.
+        let json = r#"{
+            "id": "US-001",
+            "title": "Test Task",
+            "priority": 1,
+            "status": "todo",
+            "created_at": "2026-01-18T12:00:00Z",
+            "updated_at": "2026-01-18T12:00:00Z",
+            "error_count": 0
+        }"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            task.claims_shared_infra, None,
+            "missing field must deserialize to None via #[serde(default)]"
         );
     }
 
