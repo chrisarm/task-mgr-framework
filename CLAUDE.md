@@ -542,12 +542,70 @@ Branch-name shape uses `ephemeral_slot_branch(branch, slot)` (slot 0 is
 the loop's base branch; slots 1+ are `{branch}-slot-{N}`). Idempotent —
 running twice produces identical state on the second pass.
 
+**Slot-0 SAFETY GUARD (load-bearing)**: `classify_ephemeral_branch`
+returns `Err` when the parsed slot suffix is `0`, and
+`list_ephemeral_slot_branches` filters `slot > 0`. Production code never
+creates a `{branch}-slot-0` ref (slot 0 reuses the base branch directly
+in `ensure_slot_worktrees`), but a stray ref from a buggy past version,
+manual operator action, or recovery artifact would otherwise classify
+as `CleanMerged` with `worktree_path` pointing at the **loop's main
+worktree** — `compute_slot_worktree_path(_, branch, 0)` short-circuits
+to `compute_worktree_path(_, branch)`. The downstream
+`delete_merged_ephemeral` would then `git worktree remove` the loop's
+running worktree. Guard MUST hold; never broaden the glob without
+adding the slot==0 rejection at the same boundary.
+
+### 6. Run-level config caching (restart required for mid-loop edits)
+
+`ProjectConfig` and the PRD-side `implicit_overlap_files` override are
+loaded ONCE at `run_loop` startup and threaded through
+`WaveIterationParams` (`prd_implicit_overlap_files`, `project_config`).
+`run_wave_iteration`, `apply_merge_fail_reset_and_halt_check`, and the
+merge-back resolver setup all read from the cached references — never
+call `read_project_config` or `read_prd_implicit_overlap_files` from
+inside a wave hot path.
+
+**Mid-loop edits to `.task-mgr/config.json` or the PRD JSON do NOT take
+effect** — operators must restart the loop to apply config changes.
+Same restart-required semantics every other run-scoped knob already
+has (`parallel_slots`, `default_model`, `merge_resolver_*`).
+Documenting this here so the next "I changed config and nothing
+happened" question has a quick answer.
+
+### 7. Failed-merge accounting: `Vec<FailedMerge>`, not parallel arrays
+
+`WaveOutcome.failed_merges: Vec<FailedMerge>` carries `(slot, task_id)`
+as a single struct so the slot/task pairing is a type-level invariant.
+The earlier shape (parallel `Vec<usize>` + `Vec<Option<String>>` held
+lockstep by rustdoc) was correct but implicit; mismatched lengths would
+have silently truncated under `zip`. Don't reintroduce parallel arrays
+here, and apply the same shape preference for any future
+"slot + per-slot data" aggregation.
+
+**Synthetic-deadlock sentinel (`SYNTHETIC_DEADLOCK_SLOT = usize::MAX`)**:
+`handle_ephemeral_deadlock` inserts one entry with this slot index when
+every blocking ephemeral branch had a malformed suffix
+(`synth_slots.is_empty() && !diagnostics.is_empty()`). Without it,
+`failed_merges` would be empty, `apply_merge_fail_reset_and_halt_check`
+would reset `consecutive_merge_fail_waves` to 0, and the deadlock
+guard would silently spin until the stale-iteration tracker aborted —
+defeating the FEAT-002 cascade halt. The diagnostic step special-cases
+the sentinel to print `<malformed deadlock blocker>` instead of
+synthesizing `{branch}-slot-18446744073709551615`.
+
+General pattern: **any synthesis that translates "we observed a
+problem" into "produce a failure record" must always emit at least
+one record, even if the upstream parsers all rejected the input** —
+otherwise downstream "is_empty" checks invert the safety guarantee.
+
 ### Touchpoints
 
 | Concern | File | Symbol |
 | --- | --- | --- |
 | Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
 | Halt threshold contract | `src/loop_engine/engine.rs` | `apply_merge_fail_reset_and_halt_check` |
+| Failed-merge struct | `src/loop_engine/engine.rs` | `FailedMerge`, `SYNTHETIC_DEADLOCK_SLOT` |
 | Implicit overlap baseline | `src/commands/next/selection.rs` | `IMPLICIT_OVERLAP_FILES`, `BUILDY_TASK_PREFIXES` |
 | Cross-wave overlay | `src/loop_engine/worktree.rs` + `src/commands/next/selection.rs` | `list_unmerged_branch_files`, `ephemeral_overlay` parameter |
-| Startup hygiene | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots` |
+| Startup hygiene + slot-0 guard | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots`, `classify_ephemeral_branch` |
+| Run-level config caching | `src/loop_engine/engine.rs` | `WaveIterationParams::project_config`, `prd_implicit_overlap_files` |
