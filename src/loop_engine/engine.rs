@@ -1144,6 +1144,23 @@ fn handle_ephemeral_deadlock(
         }
     }
     synth_slots.sort();
+    // If every blocking branch had an unparseable slot suffix, `synth_slots`
+    // is empty and `WaveOutcome.failed_merges` would be empty too — at which
+    // point `apply_merge_fail_reset_and_halt_check` would reset the
+    // consecutive counter to 0 and the deadlock would silently spin forever
+    // until the stale-iteration tracker aborts. Insert a single
+    // `SYNTHETIC_DEADLOCK_SLOT` entry so the threshold counter still
+    // increments. The diagnostic step in
+    // `apply_merge_fail_reset_and_halt_check` special-cases this slot index
+    // to print a `<malformed deadlock blocker>` placeholder instead of
+    // synthesizing a `{branch}-slot-18446744073709551615` name.
+    if synth_slots.is_empty() && !diagnostics.is_empty() {
+        eprintln!(
+            "warning: deadlock guard fired with no parseable ephemeral slot indices \
+             — inserting synthetic halt slot so the threshold counter still increments"
+        );
+        synth_slots.push(SYNTHETIC_DEADLOCK_SLOT);
+    }
     let failed_merges: Vec<FailedMerge> = synth_slots
         .into_iter()
         .map(|slot| FailedMerge {
@@ -1482,6 +1499,15 @@ fn reset_task_to_todo(conn: &Connection, task_id: &str, kind_label: &str) {
     }
 }
 
+/// Sentinel slot index for deadlock-guard waves where every blocking
+/// `{branch}-slot-N` ephemeral had a non-numeric / zero suffix and the
+/// guard had nothing parseable to enumerate. `handle_ephemeral_deadlock`
+/// inserts one `FailedMerge { slot: SYNTHETIC_DEADLOCK_SLOT, .. }` so the
+/// FEAT-002 threshold counter still increments. `apply_merge_fail_reset_and_halt_check`
+/// special-cases this slot index in its diagnostic step to avoid
+/// synthesizing the meaningless `{branch}-slot-18446744073709551615` name.
+pub(crate) const SYNTHETIC_DEADLOCK_SLOT: usize = usize::MAX;
+
 /// Decision returned by the wave-loop FEAT-002 reset/halt-check contract.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MergeFailHaltDecision {
@@ -1544,9 +1570,17 @@ fn apply_merge_fail_reset_and_halt_check(
 
     // (4) Per-slot diagnostic. `ephemeral_slot_branch` is the canonical name
     //     source — never construct `{branch}-slot-{N}` inline (learning [1870]).
+    //     The `SYNTHETIC_DEADLOCK_SLOT` sentinel renders as a placeholder
+    //     instead of `{branch}-slot-18446744073709551615`.
     let names: Vec<String> = failed_merges
         .iter()
-        .map(|fm| worktree::ephemeral_slot_branch(branch, fm.slot))
+        .map(|fm| {
+            if fm.slot == SYNTHETIC_DEADLOCK_SLOT {
+                "<malformed deadlock blocker>".to_string()
+            } else {
+                worktree::ephemeral_slot_branch(branch, fm.slot)
+            }
+        })
         .collect();
     eprintln!(
         "Aborting: {} consecutive merge-back failure wave(s) (threshold={}). \
@@ -8421,6 +8455,81 @@ mod tests {
         // fastest regression catch is auditing this single call site.
         let name = crate::loop_engine::worktree::ephemeral_slot_branch("feat/test", 1);
         assert_eq!(name, "feat/test-slot-1");
+    }
+
+    /// AC (Fix 3): when the deadlock guard fires but every blocking branch
+    /// has an unparseable slot suffix, `handle_ephemeral_deadlock` MUST
+    /// still produce at least one `FailedMerge` so
+    /// `apply_merge_fail_reset_and_halt_check` increments the counter
+    /// instead of resetting it. The sentinel index is `SYNTHETIC_DEADLOCK_SLOT`
+    /// so the diagnostic step can recognize it and avoid synthesizing a
+    /// `{branch}-slot-18446744073709551615` name.
+    #[test]
+    fn test_synthetic_deadlock_slot_sentinel_increments_counter() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // Sentinel-only failed_merges (simulates the all-malformed deadlock
+        // path). Generous threshold so we observe the increment without halt.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: SYNTHETIC_DEADLOCK_SLOT,
+                task_id: None,
+            }],
+            5,
+        );
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(
+            ctx.consecutive_merge_fail_waves, 1,
+            "synthetic-deadlock sentinel must still increment the counter"
+        );
+    }
+
+    /// AC (Fix 3): when the threshold is reached on a sentinel-only failure
+    /// wave, the halt diagnostic must NOT synthesize a meaningless
+    /// `{branch}-slot-18446744073709551615` name. The reason field surfaces
+    /// the counter/threshold; the `<malformed deadlock blocker>` placeholder
+    /// flows to stderr (verified indirectly by ensuring no `usize::MAX`
+    /// appears in the rendered exit_reason on this halt).
+    #[test]
+    fn test_synthetic_deadlock_slot_diagnostic_does_not_render_huge_name() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // threshold=1 → halt on this very wave; sentinel-only failed_merges.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: SYNTHETIC_DEADLOCK_SLOT,
+                task_id: None,
+            }],
+            1,
+        );
+        match decision {
+            MergeFailHaltDecision::Halt {
+                exit_code: _,
+                exit_reason,
+            } => {
+                // The exit_reason itself is just the counter/threshold
+                // summary, but the full diagnostic flowed to stderr. Assert
+                // the reason does not contain the sentinel-rendered name
+                // shape (defensive — catches an accidental future change
+                // that puts the slot list back into exit_reason).
+                assert!(
+                    !exit_reason.contains(&usize::MAX.to_string()),
+                    "exit_reason must not include usize::MAX-rendered name; got: {exit_reason}"
+                );
+            }
+            _ => panic!("expected Halt, got {decision:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
     }
 
     /// AC: counter is reset back to 0 by a successful wave AFTER a series
