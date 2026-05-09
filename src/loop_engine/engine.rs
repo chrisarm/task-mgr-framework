@@ -883,6 +883,18 @@ pub struct WaveIterationParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block in
     /// each slot prompt. Empty string omits the section, matching sequential.
     pub session_guidance: &'a str,
+    /// PRD-side `implicit_overlap_files` override, parsed once per run at
+    /// `run_loop` startup and threaded through each wave instead of being
+    /// re-parsed from disk per-wave (Fix 2 from /review-loop).
+    /// Empty when the PRD JSON does not set the field. Mid-run edits to the
+    /// PRD JSON are NOT picked up — operators must restart the loop, matching
+    /// how every other config knob (model, parallel_slots, default_model)
+    /// already behaves.
+    pub prd_implicit_overlap_files: &'a [String],
+    /// Project-level config loaded once per run from `.task-mgr/config.json`
+    /// and shared across the wave loop instead of being re-read per call site.
+    /// Same restart-required semantics as `prd_implicit_overlap_files`.
+    pub project_config: &'a project_config::ProjectConfig,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -1644,14 +1656,16 @@ pub fn run_wave_iteration(
     //
     // FEAT-003: merge project-config and PRD-level implicit-overlap extensions
     // into the slate so `select_parallel_group` can detect shared-infra files
-    // beyond the baseline `IMPLICIT_OVERLAP_FILES` list.
-    let project_cfg = project_config::read_project_config(params.db_dir);
-    let prd_implicit = read_prd_implicit_overlap_files(params.prd_path);
-    let extra_implicit: Vec<String> = project_cfg
+    // beyond the baseline `IMPLICIT_OVERLAP_FILES` list. Both lists were
+    // loaded once at run-loop startup and threaded through `WaveParams`
+    // (Fix 2 from /review-loop) so the wave hot path no longer re-parses
+    // disk every iteration.
+    let extra_implicit: Vec<String> = params
+        .project_config
         .implicit_overlap_files
         .iter()
         .cloned()
-        .chain(prd_implicit)
+        .chain(params.prd_implicit_overlap_files.iter().cloned())
         .collect();
 
     // FEAT-004: cross-wave file affinity. Enumerate `{branch}-slot-N` ephemeral
@@ -1767,11 +1781,17 @@ pub fn run_wave_iteration(
             .to_string();
         // Per-project overrides for the merge-conflict resolver. Both fall
         // back to safe defaults so projects without a config.json keep the
-        // pre-existing behavior (600s / "medium").
-        let project_cfg = crate::loop_engine::project_config::read_project_config(params.db_dir);
-        let claude_timeout =
-            Duration::from_secs(project_cfg.merge_resolver_timeout_secs.unwrap_or(600));
-        let effort = project_cfg
+        // pre-existing behavior (600s / "medium"). The shared `project_config`
+        // was loaded once at run-loop startup and threaded through
+        // `WaveParams` (Fix 2 from /review-loop).
+        let claude_timeout = Duration::from_secs(
+            params
+                .project_config
+                .merge_resolver_timeout_secs
+                .unwrap_or(600),
+        );
+        let effort = params
+            .project_config
             .merge_resolver_effort
             .clone()
             .unwrap_or_else(|| "medium".to_string());
@@ -2983,9 +3003,22 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // The loop engine never prompts — it runs non-interactively — so these
     // are pure reads. Users pin a default via `task-mgr init` or
     // `task-mgr models set-default`.
-    let project_default_model =
-        crate::loop_engine::project_config::read_project_config(&run_config.db_dir).default_model;
+    //
+    // Fix 2 from /review-loop: load the full `ProjectConfig` once at the
+    // start of the run and thread it through `WaveParams` instead of
+    // re-reading + re-parsing `.task-mgr/config.json` from every wave
+    // (FEAT-003 implicit-overlap pull, FEAT-002 halt-threshold check, the
+    // merge-resolver settings, the FEAT-005 reconcile threshold). Mid-loop
+    // edits to the file are NOT picked up; operators restart the loop to
+    // apply config changes — matching every other run-scoped knob.
+    let project_config =
+        crate::loop_engine::project_config::read_project_config(&run_config.db_dir);
+    let project_default_model = project_config.default_model.clone();
     let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
+    // Same caching rationale for the PRD-side `implicit_overlap_files`
+    // override. Field is rare and small (a list of file basenames), so
+    // an empty Vec when the PRD JSON is absent / malformed is safe.
+    let prd_implicit_overlap_files = read_prd_implicit_overlap_files(paths.prd_file.as_path());
 
     // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
     if let Some(ref pfx) = task_prefix {
@@ -3215,9 +3248,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 // prior loop crash before we try to (re)create slot worktrees.
                 // Aborts startup on dirty / un-merged anomalies; otherwise
                 // returns Ok and leaves the path clear for `ensure_slot_worktrees`.
-                let halt_threshold =
-                    crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
-                        .merge_fail_halt_threshold;
+                let halt_threshold = project_config.merge_fail_halt_threshold;
                 if let Err(e) = worktree::reconcile_stale_ephemeral_slots(
                     &run_config.source_root,
                     branch,
@@ -3543,6 +3574,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 inter_iteration_delay,
                 steering_path: steering,
                 session_guidance: &wave_session_guidance,
+                prd_implicit_overlap_files: &prd_implicit_overlap_files,
+                project_config: &project_config,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
@@ -3556,9 +3589,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             // FEAT-002: reset/halt contract on parallel-slot merge-back
             // failures. Logic lives in `apply_merge_fail_reset_and_halt_check`
             // so it can be unit-tested in isolation.
-            let halt_threshold =
-                crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
-                    .merge_fail_halt_threshold;
+            let halt_threshold = project_config.merge_fail_halt_threshold;
             if let MergeFailHaltDecision::Halt {
                 exit_code: halt_code,
                 exit_reason: halt_reason,
@@ -7155,6 +7186,8 @@ mod tests {
             prd_path: &'a Path,
             progress_path: &'a Path,
             parallel_slots: usize,
+            project_config: &'a project_config::ProjectConfig,
+            prd_implicit_overlap_files: &'a [String],
         ) -> WaveIterationParams<'a> {
             WaveIterationParams {
                 conn,
@@ -7181,6 +7214,8 @@ mod tests {
                 inter_iteration_delay: Duration::ZERO,
                 steering_path: None,
                 session_guidance: "",
+                prd_implicit_overlap_files,
+                project_config,
             }
         }
 
@@ -7196,6 +7231,8 @@ mod tests {
             let signal = SignalFlag::new();
             signal.set();
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -7210,6 +7247,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -7232,6 +7271,8 @@ mod tests {
             let mode = PermissionMode::Dangerous;
             let signal = SignalFlag::new();
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -7246,6 +7287,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -7273,6 +7316,8 @@ mod tests {
             // Pre-stale twice so the next NoEligibleTasks wave hits threshold=3.
             ctx.stale_tracker.check("x", "x");
             ctx.stale_tracker.check("x", "x");
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -7287,6 +7332,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -7309,6 +7356,8 @@ mod tests {
             let mut ctx = IterationContext::new(1); // first crash aborts
             ctx.crash_tracker.record_crash();
             assert!(ctx.crash_tracker.should_abort());
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -7323,6 +7372,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -7375,6 +7426,8 @@ mod tests {
             });
 
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 WaveIterationParams {
                     conn: &mut conn,
@@ -7401,6 +7454,8 @@ mod tests {
                     inter_iteration_delay: Duration::from_millis(500),
                     steering_path: None,
                     session_guidance: "",
+                    prd_implicit_overlap_files: &prd_implicit,
+                    project_config: &project_cfg,
                 },
                 &mut ctx,
             );
@@ -7594,6 +7649,8 @@ mod tests {
                 progress_path: &'a Path,
                 parallel_slots: usize,
                 run_id: &'a str,
+                project_config: &'a project_config::ProjectConfig,
+                prd_implicit_overlap_files: &'a [String],
             ) -> WaveIterationParams<'a> {
                 WaveIterationParams {
                     conn,
@@ -7620,6 +7677,8 @@ mod tests {
                     inter_iteration_delay: Duration::ZERO,
                     steering_path: None,
                     session_guidance: "",
+                    prd_implicit_overlap_files,
+                    project_config,
                 }
             }
 
@@ -7656,6 +7715,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7672,6 +7733,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7769,6 +7832,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7785,6 +7850,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7836,6 +7903,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7852,6 +7921,8 @@ mod tests {
                         &progress,
                         1,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7909,6 +7980,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![
                     tmp.path().to_path_buf(),
                     tmp.path().to_path_buf(),
@@ -7929,6 +8002,8 @@ mod tests {
                         &progress,
                         3,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7974,6 +8049,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(10);
@@ -7992,6 +8069,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -8034,6 +8113,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(10);
@@ -8054,6 +8135,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -8097,6 +8180,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -8113,6 +8198,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -8195,9 +8282,15 @@ mod tests {
         };
         assert_eq!(outcome.failed_merges.len(), 2);
         assert_eq!(outcome.failed_merges[0].slot, 1);
-        assert_eq!(outcome.failed_merges[0].task_id.as_deref(), Some("FEAT-001"));
+        assert_eq!(
+            outcome.failed_merges[0].task_id.as_deref(),
+            Some("FEAT-001")
+        );
         assert_eq!(outcome.failed_merges[1].slot, 2);
-        assert_eq!(outcome.failed_merges[1].task_id.as_deref(), Some("FEAT-002"));
+        assert_eq!(
+            outcome.failed_merges[1].task_id.as_deref(),
+            Some("FEAT-002")
+        );
     }
 
     /// AC: ctx.consecutive_merge_fail_waves increments on a failed wave.

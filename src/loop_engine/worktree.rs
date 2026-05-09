@@ -3996,8 +3996,12 @@ detached
         // version or manual operator action could. The filter must drop it
         // — including it would treat the loop's own work as "un-merged
         // against itself" and spuriously block every cross-wave candidate.
+        // Use a path INSIDE the tempdir's parent so it gets cleaned up with
+        // `tmp` (an absolute /tmp/<static-name> would persist between test
+        // runs and ECCONFLICT on the second invocation).
+        let stray_tmp = tempfile::TempDir::new().expect("stray slot-0 tempdir");
         let stray_branch = ephemeral_slot_branch(branch, 0);
-        let stray_path = tmp.path().parent().unwrap().join("ephem-list-stray-0");
+        let stray_path = stray_tmp.path().join("ephem-list-stray-0");
         let add = Command::new("git")
             .args([
                 "worktree",
