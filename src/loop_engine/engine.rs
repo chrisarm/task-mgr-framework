@@ -60,6 +60,7 @@ use crate::loop_engine::prd_reconcile::{
     update_prd_task_passes,
 };
 use crate::loop_engine::progress;
+use crate::loop_engine::project_config;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::stale::StaleTracker;
@@ -1476,6 +1477,24 @@ fn apply_merge_fail_reset_and_halt_check(
     }
 }
 
+/// Read the PRD JSON at `prd_path` and return its `implicitOverlapFiles`
+/// list (FEAT-003). Returns an empty Vec on any error (file missing,
+/// invalid JSON, field absent) — implicit-overlap detection still works
+/// from the baseline list and ProjectConfig extension.
+///
+/// Best-effort I/O on the wave-loop hot path: a parse failure should NOT
+/// abort the wave, so all error paths swallow with a Vec::new() default.
+fn read_prd_implicit_overlap_files(prd_path: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(prd_path) else {
+        return Vec::new();
+    };
+    let Ok(prd): Result<crate::commands::init::parse::PrdFile, _> = serde_json::from_str(&contents)
+    else {
+        return Vec::new();
+    };
+    prd.implicit_overlap_files.unwrap_or_default()
+}
+
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
 ///
 /// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
@@ -1499,11 +1518,25 @@ pub fn run_wave_iteration(
 
     // Parallel group selection. Reuses the same scoring + greedy
     // file-overlap walk as `task-mgr next`, capped at `parallel_slots`.
+    //
+    // FEAT-003: merge project-config and PRD-level implicit-overlap extensions
+    // into the slate so `select_parallel_group` can detect shared-infra files
+    // beyond the baseline `IMPLICIT_OVERLAP_FILES` list.
+    let project_cfg = project_config::read_project_config(params.db_dir);
+    let prd_implicit = read_prd_implicit_overlap_files(params.prd_path);
+    let extra_implicit: Vec<String> = project_cfg
+        .implicit_overlap_files
+        .iter()
+        .cloned()
+        .chain(prd_implicit)
+        .collect();
+
     let group = match select_parallel_group(
         params.conn,
         &ctx.last_files,
         params.task_prefix,
         params.parallel_slots,
+        &extra_implicit,
     ) {
         Ok(g) => g,
         Err(e) => {
@@ -6604,7 +6637,18 @@ mod tests {
         };
         use crate::loop_engine::test_utils::{insert_task, insert_task_file};
         use crate::models::Task;
+        use rusqlite::Connection;
         use std::sync::atomic::Ordering;
+
+        /// Opt every task out of the FEAT-003 buildy shared-infra heuristic.
+        /// Used by wave-infrastructure tests whose `FEAT-*` task ids are
+        /// generic placeholders, not real FEAT-class work — they predate
+        /// FEAT-003 and assert wave merge/crash semantics rather than
+        /// parallel-slot heuristics.
+        fn opt_out_buildy(conn: &Connection) {
+            conn.execute("UPDATE tasks SET claims_shared_infra = 0", [])
+                .unwrap();
+        }
 
         /// Build a minimal SlotIterationParams wired to a test DB.
         /// `signal_flag` is shared so tests can observe/trip it across slots.
@@ -7436,6 +7480,10 @@ mod tests {
                 insert_task(&conn, "FEAT-B", "Task B", "todo", 20);
                 insert_task_file(&conn, "FEAT-A", "src/a.rs");
                 insert_task_file(&conn, "FEAT-B", "src/b.rs");
+                // FEAT-003: opt out of the buildy shared-infra heuristic so this
+                // wave-infrastructure test isolates merge-back semantics from
+                // implicit-overlap detection (the test's intent predates FEAT-003).
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7548,6 +7596,7 @@ mod tests {
                 insert_task(&conn, "FEAT-OK", "passing slot", "todo", 20);
                 insert_task_file(&conn, "FEAT-CRASH", "src/crash.rs");
                 insert_task_file(&conn, "FEAT-OK", "src/ok.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7812,6 +7861,7 @@ mod tests {
                 insert_task(&conn, "FEAT-OK2", "ok", "todo", 20);
                 insert_task_file(&conn, "FEAT-CRASH", "src/crash2.rs");
                 insert_task_file(&conn, "FEAT-OK2", "src/ok2.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7874,6 +7924,7 @@ mod tests {
                 insert_task(&conn, "FEAT-P2", "p2", "todo", 20);
                 insert_task_file(&conn, "FEAT-P1", "src/p1.rs");
                 insert_task_file(&conn, "FEAT-P2", "src/p2.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");

@@ -1969,6 +1969,7 @@ mod scoped_import_tests {
             prd_file: None,
             model: None,
             default_max_retries: None,
+            implicit_overlap_files: None,
         }
     }
 
