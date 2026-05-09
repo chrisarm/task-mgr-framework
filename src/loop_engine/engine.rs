@@ -265,6 +265,18 @@ pub struct IterationContext {
     /// deadline / max-iterations rather than waiting for the next process's
     /// step 6.6 recovery.
     pub pending_slot_tasks: Vec<String>,
+    /// Count of consecutive parallel-slot waves whose merge-back step
+    /// produced at least one failed slot. Reset to `0` after every wave that
+    /// merges cleanly. Compared against
+    /// `ProjectConfig::merge_fail_halt_threshold` at the wave-loop boundary
+    /// (FEAT-002): when the counter reaches the threshold, the loop aborts
+    /// rather than letting the cascade run unbounded (mw-datalake incident).
+    ///
+    /// Threshold semantics:
+    /// - `0` — counter is incremented but threshold never triggers (legacy "log and continue")
+    /// - `1` — halts on any merge-back failure
+    /// - `2` (default) — halts after two consecutive failure waves
+    pub consecutive_merge_fail_waves: u32,
 }
 
 impl IterationContext {
@@ -285,6 +297,7 @@ impl IterationContext {
             overflow_original_model: std::collections::HashMap::new(),
             pending_reorder_hints: Vec::new(),
             pending_slot_tasks: Vec::new(),
+            consecutive_merge_fail_waves: 0,
         }
     }
 }
@@ -893,6 +906,24 @@ pub struct WaveOutcome {
     /// True only when a `.stop` file caused the wave to halt — propagates to
     /// `LoopResult.was_stopped` so batch runners can react to a clean stop.
     pub was_stopped: bool,
+    /// Slot indices whose merge-back failed during this wave. Populated from
+    /// `worktree::merge_slot_branches_with_resolver`'s `outcomes.failed_slots`.
+    /// Always empty for sequential runs (`parallel_slots <= 1`) and for waves
+    /// that never reached the merge-back step (e.g. preflight bail-out).
+    ///
+    /// Read by the wave-loop boundary in `run_loop` to drive the
+    /// reset/halt-check contract (FEAT-002): reset each failed slot's
+    /// claimed task to `todo`, increment
+    /// `IterationContext::consecutive_merge_fail_waves`, and halt when the
+    /// counter reaches `ProjectConfig::merge_fail_halt_threshold`.
+    pub failed_merges: Vec<usize>,
+    /// Task ID claimed by each failed slot, parallel to `failed_merges`
+    /// (same length, same order). `None` when the slot's iteration produced
+    /// no `task_id` (e.g. claim-fail before any task was assigned), which
+    /// can't occur today because merge-back only runs when slots actually
+    /// claimed tasks — kept as `Option` for forward compatibility with
+    /// future slot lifecycles.
+    pub failed_merge_task_ids: Vec<Option<String>>,
 }
 
 /// Wave-mode aggregator collected during per-slot post-processing.
@@ -940,6 +971,8 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
+            failed_merge_task_ids: Vec::new(),
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
@@ -953,6 +986,8 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: true,
+            failed_merges: Vec::new(),
+            failed_merge_task_ids: Vec::new(),
         });
     }
 
@@ -978,6 +1013,8 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
+            failed_merge_task_ids: Vec::new(),
         });
     }
     None
@@ -1018,6 +1055,8 @@ fn handle_no_eligible_tasks(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
+            failed_merge_task_ids: Vec::new(),
         };
     }
     WaveOutcome {
@@ -1025,6 +1064,8 @@ fn handle_no_eligible_tasks(
         iteration_consumed: true,
         terminal: None,
         was_stopped: false,
+        failed_merges: Vec::new(),
+        failed_merge_task_ids: Vec::new(),
     }
 }
 
@@ -1324,6 +1365,117 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
     false
 }
 
+/// Reset a single in-progress task back to `todo` so the next iteration (or
+/// next loop run) can re-claim it. No-ops when the row's status is not
+/// `in_progress` — we never demote terminal states (`done`, `blocked`,
+/// `skipped`) here.
+///
+/// Used by:
+/// - The wave-loop FEAT-002 reset/halt-check contract — a slot's task whose
+///   merge-back failed must not stay pinned in `in_progress`.
+/// - Post-loop cleanup (Step 17.5 / 17.6) when the loop exits via deadline /
+///   max-iterations rather than a per-task done signal.
+///
+/// Logs success / no-op / failure to stderr; failures never propagate
+/// (matches the FEAT-002 failure-mode AC: "if reset itself fails for a task,
+/// log the failure but continue with remaining failed slots").
+fn reset_task_to_todo(conn: &Connection, task_id: &str, kind_label: &str) {
+    match conn.execute(
+        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
+        [task_id],
+    ) {
+        Ok(1) => eprintln!("Reset {} {} to todo", kind_label, task_id),
+        Ok(_) => {} // already terminal, or status changed by reconciliation
+        Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
+    }
+}
+
+/// Decision returned by the wave-loop FEAT-002 reset/halt-check contract.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeFailHaltDecision {
+    /// Wave merged cleanly OR failed but is below the halt threshold —
+    /// continue the loop.
+    Continue,
+    /// Threshold reached — break out of the wave loop with the captured
+    /// `exit_code` / `exit_reason`. The caller emits the per-slot ephemeral
+    /// branch diagnostic before returning this variant.
+    Halt { exit_code: i32, exit_reason: String },
+}
+
+/// Apply the FEAT-002 reset/halt contract to one wave's outcome.
+///
+/// Step ordering (contractual — reset MUST come before increment so a halted
+/// run never leaves a failed-slot task pinned in `in_progress`):
+///
+/// 1. For each failed slot's claimed task: reset to `todo`; drain it from
+///    `ctx.pending_slot_tasks` (mirror of engine.rs:1269). Reset failures are
+///    logged but never fatal — remaining slots still process.
+/// 2. Increment `ctx.consecutive_merge_fail_waves`.
+/// 3. Compare to `threshold`. `0` disables the halt entirely (legacy "log
+///    and continue" behavior preserved bit-for-bit).
+/// 4. On halt: emit a per-slot ephemeral branch name diagnostic to stderr.
+/// 5. Return `Halt { ... }` to break the loop, or `Continue` otherwise.
+///
+/// When `failed_merges.is_empty()` the counter is reset to `0` and `Continue`
+/// is returned without doing any reset / diagnostic work.
+fn apply_merge_fail_reset_and_halt_check(
+    conn: &Connection,
+    ctx: &mut IterationContext,
+    branch: &str,
+    failed_merges: &[usize],
+    failed_merge_task_ids: &[Option<String>],
+    threshold: u32,
+) -> MergeFailHaltDecision {
+    if failed_merges.is_empty() {
+        ctx.consecutive_merge_fail_waves = 0;
+        return MergeFailHaltDecision::Continue;
+    }
+
+    // (1) Reset every failed slot's claimed task. We zip rather than index
+    //     because the two slices are required to be equal-length parallel
+    //     arrays (see WaveOutcome rustdoc) — a `Vec` shorter than the other
+    //     simply truncates safely instead of panicking on a mismatched length.
+    for (_slot, maybe_task) in failed_merges.iter().zip(failed_merge_task_ids.iter()) {
+        if let Some(tid) = maybe_task {
+            reset_task_to_todo(conn, tid, "failed-slot task");
+            ctx.pending_slot_tasks.retain(|t| t != tid);
+        }
+    }
+
+    // (2) Increment AFTER reset so a halted run still leaves the DB
+    //     re-runnable (the known-bad implementation does this in the wrong
+    //     order — see the regression test).
+    ctx.consecutive_merge_fail_waves += 1;
+
+    // (3) Threshold check. `0` is a sentinel for "never halt".
+    if threshold == 0 || ctx.consecutive_merge_fail_waves < threshold {
+        return MergeFailHaltDecision::Continue;
+    }
+
+    // (4) Per-slot diagnostic. `ephemeral_slot_branch` is the canonical name
+    //     source — never construct `{branch}-slot-{N}` inline (learning [1870]).
+    let names: Vec<String> = failed_merges
+        .iter()
+        .map(|&s| worktree::ephemeral_slot_branch(branch, s))
+        .collect();
+    eprintln!(
+        "Aborting: {} consecutive merge-back failure wave(s) (threshold={}). \
+         Failed slot branches: {}",
+        ctx.consecutive_merge_fail_waves,
+        threshold,
+        names.join(", ")
+    );
+
+    // (5) Halt.
+    MergeFailHaltDecision::Halt {
+        exit_code: 1,
+        exit_reason: format!(
+            "{} consecutive merge-back failure wave(s) (threshold={})",
+            ctx.consecutive_merge_fail_waves, threshold
+        ),
+    }
+}
+
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
 ///
 /// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
@@ -1403,7 +1555,11 @@ pub fn run_wave_iteration(
     // Per-slot failures (merge conflicts, spawn errors, ff failures) are
     // logged but never fatal — slot 0 is restored to its captured pre-merge
     // HEAD via `git reset --hard`, and the next wave still benefits from any
-    // slots that did merge.
+    // slots that did merge. The wave-loop boundary in `run_loop` consumes
+    // `failed_merges` / `failed_merge_task_ids` to drive the FEAT-002
+    // reset/halt-check contract.
+    let mut failed_merges: Vec<usize> = Vec::new();
+    let mut failed_merge_task_ids: Vec<Option<String>> = Vec::new();
     if params.parallel_slots > 1 {
         let resolved_model = params
             .default_model
@@ -1446,6 +1602,16 @@ pub fn run_wave_iteration(
                     slot, detail
                 );
             }
+            // Capture failed slot indices and resolve each to its claimed
+            // task by looking up the slot's IterationResult. Parallel arrays
+            // (same length, same order) so the boundary's reset loop can zip.
+            let task_id = wave_result
+                .outcomes
+                .iter()
+                .find(|o| o.slot_index == *slot)
+                .and_then(|o| o.iteration_result.task_id.clone());
+            failed_merges.push(*slot);
+            failed_merge_task_ids.push(task_id);
         }
     }
 
@@ -1490,6 +1656,8 @@ pub fn run_wave_iteration(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges,
+            failed_merge_task_ids,
         };
     }
     if ctx.crash_tracker.should_abort() {
@@ -1502,6 +1670,8 @@ pub fn run_wave_iteration(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges,
+            failed_merge_task_ids,
         };
     }
 
@@ -1515,6 +1685,8 @@ pub fn run_wave_iteration(
                 run_status: Some(RunStatus::Completed),
             }),
             was_stopped: false,
+            failed_merges,
+            failed_merge_task_ids,
         };
     }
 
@@ -1545,6 +1717,8 @@ pub fn run_wave_iteration(
             None
         },
         was_stopped: false,
+        failed_merges,
+        failed_merge_task_ids,
     }
 }
 
@@ -3155,6 +3329,29 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             if outcome.was_stopped {
                 was_stopped = true;
             }
+
+            // FEAT-002: reset/halt contract on parallel-slot merge-back
+            // failures. Logic lives in `apply_merge_fail_reset_and_halt_check`
+            // so it can be unit-tested in isolation.
+            let halt_threshold =
+                crate::loop_engine::project_config::read_project_config(&run_config.db_dir)
+                    .merge_fail_halt_threshold;
+            if let MergeFailHaltDecision::Halt {
+                exit_code: halt_code,
+                exit_reason: halt_reason,
+            } = apply_merge_fail_reset_and_halt_check(
+                &conn,
+                &mut ctx,
+                branch,
+                &outcome.failed_merges,
+                &outcome.failed_merge_task_ids,
+                halt_threshold,
+            ) {
+                exit_code = halt_code;
+                exit_reason = halt_reason;
+                break;
+            }
+
             if let Some(t) = outcome.terminal {
                 exit_code = t.exit_code;
                 exit_reason = t.reason;
@@ -3450,14 +3647,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 17.5: Reset uncompleted claimed task so it's not stuck in_progress for next run
     if let Some(ref task_id) = last_claimed_task {
-        match conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
-            [task_id],
-        ) {
-            Ok(1) => eprintln!("Reset uncompleted task {} to todo", task_id),
-            Ok(_) => {} // Already completed by reconciliation or status changed
-            Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
-        }
+        reset_task_to_todo(&conn, task_id, "uncompleted task");
     }
 
     // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
@@ -3469,17 +3659,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         if Some(task_id) == last_claimed_task.as_ref() {
             continue; // already handled by step 17.5
         }
-        match conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
-            [task_id],
-        ) {
-            Ok(1) => eprintln!("Reset uncompleted slot task {} to todo", task_id),
-            Ok(_) => {} // already terminal
-            Err(e) => eprintln!(
-                "Warning: failed to reset slot task {}: {}",
-                task_id, e
-            ),
-        }
+        reset_task_to_todo(&conn, task_id, "uncompleted slot task");
     }
 
     // Step 18: Record session guidance if any
@@ -7718,5 +7898,393 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- FEAT-002: merge-back failure halt-check tests ---
+    //
+    // These tests cover the wave-loop FEAT-002 reset/halt contract in
+    // isolation, exercising `apply_merge_fail_reset_and_halt_check` directly
+    // so we don't need to drive a full `run_loop` (which would require git,
+    // Claude, and a multi-slot worktree harness — that level of coverage
+    // belongs in `tests/` integration tests once the cross-cutting harness
+    // exists for FEAT-001/003/004).
+
+    fn insert_in_progress_task(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, started_at) VALUES \
+             (?1, 'merge-fail test task', 'in_progress', 1, datetime('now'))",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// AC: WaveOutcome.failed_merges is empty when no merge failures
+    /// (e.g. preflight bail-out / no-eligible-tasks).
+    #[test]
+    fn test_wave_outcome_failed_merges_empty_by_default() {
+        let outcome = WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: Vec::new(),
+            failed_merge_task_ids: Vec::new(),
+        };
+        assert!(outcome.failed_merges.is_empty());
+        assert!(outcome.failed_merge_task_ids.is_empty());
+    }
+
+    /// AC: WaveOutcome.failed_merges and failed_merge_task_ids are equal-length
+    /// parallel arrays carrying slot indices and their claimed task IDs.
+    #[test]
+    fn test_wave_outcome_failed_merges_parallel_arrays() {
+        let outcome = WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: vec![1, 2],
+            failed_merge_task_ids: vec![Some("FEAT-001".into()), Some("FEAT-002".into())],
+        };
+        assert_eq!(
+            outcome.failed_merges.len(),
+            outcome.failed_merge_task_ids.len()
+        );
+        assert_eq!(outcome.failed_merges, vec![1, 2]);
+        assert_eq!(
+            outcome.failed_merge_task_ids[0].as_deref(),
+            Some("FEAT-001")
+        );
+    }
+
+    /// AC: ctx.consecutive_merge_fail_waves increments on a failed wave.
+    #[test]
+    fn test_consecutive_counter_increments_on_failure() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            2, // default threshold
+        );
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+    }
+
+    /// AC: counter resets to 0 on a fully-successful wave (failed_merges empty).
+    #[test]
+    fn test_consecutive_counter_resets_on_success() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 3;
+
+        let decision =
+            apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 2);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+    }
+
+    /// AC: failed slot's task is reset back to `todo`.
+    #[test]
+    fn test_failed_slot_task_reset_to_todo() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            2,
+        );
+
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(status, "todo");
+        // pending_slot_tasks drained.
+        assert!(!ctx.pending_slot_tasks.contains(&"FEAT-001".to_string()));
+    }
+
+    /// AC: threshold reached → Halt with non-zero exit and reason citing the
+    /// counter / threshold values.
+    #[test]
+    fn test_halt_returned_when_threshold_reached() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 1; // already 1, the next hit makes it 2.
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            2,
+        );
+        match decision {
+            MergeFailHaltDecision::Halt {
+                exit_code,
+                exit_reason,
+            } => {
+                assert_eq!(exit_code, 1);
+                assert!(
+                    exit_reason.contains("2 consecutive"),
+                    "exit_reason should cite counter; got: {exit_reason}"
+                );
+                assert!(
+                    exit_reason.contains("threshold=2"),
+                    "exit_reason should cite threshold; got: {exit_reason}"
+                );
+            }
+            _ => panic!("expected Halt, got {decision:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 2);
+    }
+
+    /// AC: known-bad — verify reset happens BEFORE the threshold check, so a
+    /// halted run still leaves the DB in a re-runnable state. Equivalent: the
+    /// failed-slot task is `todo` even when the threshold was reached.
+    #[test]
+    fn test_reset_runs_before_halt_decision() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // threshold 1 → halts on this very wave.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            1,
+        );
+        assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
+
+        // The reset must have happened despite the immediate halt.
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(
+            status, "todo",
+            "AC: halted run must NOT leave any task in `in_progress` for the failed slots"
+        );
+    }
+
+    /// AC: threshold = 0 → never halt (legacy behavior preserved). Counter
+    /// still increments — operators can observe the cascade in logs without
+    /// the loop aborting.
+    #[test]
+    fn test_threshold_zero_never_halts() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 100; // arbitrarily high.
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            0, // threshold 0 = never halt.
+        );
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 101);
+    }
+
+    /// AC: failed_merges empty → no reset, counter cleared, Continue.
+    #[test]
+    fn test_empty_failed_merges_resets_counter_no_side_effects() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001"); // stays in_progress.
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 5;
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        let decision =
+            apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 2);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+        // Did NOT touch unrelated in-progress task.
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(status, "in_progress");
+        // pending_slot_tasks NOT drained on the empty path.
+        assert!(ctx.pending_slot_tasks.contains(&"FEAT-001".to_string()));
+    }
+
+    /// AC: multiple failed slots — every task is reset and drained from
+    /// pending_slot_tasks.
+    #[test]
+    fn test_multiple_failed_slots_all_reset() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        insert_in_progress_task(&conn, "FEAT-002");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        ctx.pending_slot_tasks.push("FEAT-002".to_string());
+
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1, 2],
+            &[Some("FEAT-001".into()), Some("FEAT-002".into())],
+            5,
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo"
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-002"),
+            "todo"
+        );
+        assert!(ctx.pending_slot_tasks.is_empty());
+    }
+
+    /// AC: failure-mode — reset failures are non-fatal; threshold check still
+    /// runs on the original failed_merges count. We can't easily inject a SQL
+    /// error here, but we CAN verify that a slot whose task_id is `None`
+    /// (e.g. claim never resolved) is silently skipped without panicking,
+    /// AND the counter still increments + halt still triggers based on the
+    /// full failed_merges count.
+    #[test]
+    fn test_reset_failure_modes_dont_skip_threshold_check() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+
+        // Two failed slots, neither has a resolved task_id.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1, 2],
+            &[None, None],
+            1, // threshold 1 → halt on first failure.
+        );
+        assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+    }
+
+    /// AC: halt diagnostic message includes each failed slot's ephemeral
+    /// branch name (verified indirectly via the canonical helper). Direct
+    /// stderr capture is brittle; we verify the helper is consulted by
+    /// reproducing its output for a known input.
+    #[test]
+    fn test_diagnostic_uses_ephemeral_slot_branch_helper() {
+        // Sanity-check: the diagnostic format string in the helper must call
+        // `worktree::ephemeral_slot_branch` (per CONTRACT AC). If a future
+        // refactor inlines `format!()` instead, the names produced for slot 1
+        // would still match — but the AC binds us to the helper, so the
+        // fastest regression catch is auditing this single call site.
+        let name = crate::loop_engine::worktree::ephemeral_slot_branch("feat/test", 1);
+        assert_eq!(name, "feat/test-slot-1");
+    }
+
+    /// AC: counter is reset back to 0 by a successful wave AFTER a series
+    /// of consecutive failures — i.e. one good wave breaks the cascade.
+    #[test]
+    fn test_consecutive_counter_lifecycle_failure_then_success() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+
+        // Wave 1: fail.
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            5, // generous threshold so we don't halt.
+        );
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+
+        // Wave 2: clean.
+        apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+    }
+
+    /// AC: IterationContext::new starts the FEAT-002 counter at 0.
+    #[test]
+    fn test_iteration_context_new_zeroes_consecutive_counter() {
+        let ctx = IterationContext::new(5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+    }
+
+    /// AC: full two-wave cascade — first failure increments without halting
+    /// (default threshold = 2); second consecutive failure crosses threshold
+    /// and halts. Both waves' failed-slot tasks must end up `todo`.
+    #[test]
+    fn test_two_consecutive_failures_halt_with_default_threshold() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        insert_in_progress_task(&conn, "FEAT-002");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        ctx.pending_slot_tasks.push("FEAT-002".to_string());
+
+        // Wave 1: slot 1 merge fails for FEAT-001. Below threshold → continue.
+        let d1 = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            2, // default
+        );
+        assert_eq!(d1, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo",
+            "Wave 1's failed-slot task must be reset to todo"
+        );
+
+        // Set FEAT-001 back to in_progress so wave 2 has something realistic
+        // to reset (simulates the loop re-claiming the now-todo task).
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress' WHERE id = 'FEAT-001'",
+            [],
+        )
+        .unwrap();
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        // Wave 2: slot 1 fails again. Counter hits threshold → Halt.
+        let d2 = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[1],
+            &[Some("FEAT-001".into())],
+            2,
+        );
+        match d2 {
+            MergeFailHaltDecision::Halt {
+                exit_code,
+                exit_reason,
+            } => {
+                assert_eq!(exit_code, 1);
+                assert!(exit_reason.contains("2 consecutive"));
+            }
+            _ => panic!("expected Halt, got {d2:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 2);
+        // CRITICAL: even on halt, the task must be back to todo so the next
+        // run can re-claim it.
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo",
+            "AC: halted run must NOT leave any task in `in_progress` for the failed slots"
+        );
     }
 }

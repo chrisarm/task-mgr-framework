@@ -536,7 +536,10 @@ pub(crate) fn ensure_progress_union_merge(project_root: &Path) -> Result<(), Str
 
 /// Name of the ephemeral branch used by slot `N` (N > 0) for a loop running
 /// on `branch_name`. Slot 0 uses the loop's own branch directly.
-fn ephemeral_slot_branch(branch_name: &str, slot: usize) -> String {
+///
+/// Single source of truth for ephemeral slot branch names — never construct
+/// `{branch}-slot-{N}` inline (learning [1870]).
+pub(crate) fn ephemeral_slot_branch(branch_name: &str, slot: usize) -> String {
     format!("{}-slot-{}", branch_name, slot)
 }
 

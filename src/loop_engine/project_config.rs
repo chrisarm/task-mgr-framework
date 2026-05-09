@@ -74,6 +74,19 @@ pub struct ProjectConfig {
     /// refactors that conflict on semantic logic.
     #[serde(default)]
     pub merge_resolver_effort: Option<String>,
+
+    /// Halt the loop after this many *consecutive* parallel-slot merge-back
+    /// failure waves. Default: `2` — a single failed merge is recoverable
+    /// (next wave gets a clean slate from the resolver), but two in a row
+    /// indicate a cascading state where letting more waves run risks the
+    /// kind of branch divergence the mw-datalake incident produced.
+    ///
+    /// Threshold semantics:
+    /// - `0` — never halt (legacy "log and continue" behavior preserved bit-for-bit)
+    /// - `1` — halt on any merge-back failure
+    /// - `2` (default) — halt after two consecutive merge-back failure waves
+    #[serde(default = "default_merge_fail_halt_threshold")]
+    pub merge_fail_halt_threshold: u32,
 }
 
 impl Default for ProjectConfig {
@@ -91,6 +104,7 @@ impl Default for ProjectConfig {
             reranker_over_fetch: None,
             merge_resolver_timeout_secs: None,
             merge_resolver_effort: None,
+            merge_fail_halt_threshold: default_merge_fail_halt_threshold(),
         }
     }
 }
@@ -125,6 +139,12 @@ impl ProjectConfig {
 
 fn default_version() -> u32 {
     1
+}
+
+/// Default consecutive-merge-fail threshold (2). Single failures are recoverable;
+/// two-in-a-row indicate a cascade.
+fn default_merge_fail_halt_threshold() -> u32 {
+    2
 }
 
 /// Read project config from `<db_dir>/config.json`.
@@ -458,6 +478,51 @@ mod tests {
             config.resolved_reranker_config(),
             Some(("http://x".to_string(), "m".to_string(), 5))
         );
+    }
+
+    #[test]
+    fn test_merge_fail_halt_threshold_default_is_two() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.merge_fail_halt_threshold, 2);
+    }
+
+    #[test]
+    fn test_merge_fail_halt_threshold_default_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.merge_fail_halt_threshold, 2);
+    }
+
+    #[test]
+    fn test_merge_fail_halt_threshold_can_be_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"mergeFailHaltThreshold": 0}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.merge_fail_halt_threshold, 0);
+    }
+
+    #[test]
+    fn test_merge_fail_halt_threshold_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"mergeFailHaltThreshold": 5}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.merge_fail_halt_threshold, 5);
+    }
+
+    #[test]
+    fn test_default_struct_has_threshold_two() {
+        let config = ProjectConfig::default();
+        assert_eq!(config.merge_fail_halt_threshold, 2);
     }
 
     #[test]
