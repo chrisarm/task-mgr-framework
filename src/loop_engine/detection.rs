@@ -121,6 +121,20 @@ pub(crate) fn is_prompt_too_long(output: &str) -> bool {
 }
 
 /// Check if output contains rate-limit error patterns.
+///
+/// Recognizes both the classic API error (`rate_limit_error`, HTTP 429) and the
+/// Claude CLI session/usage-limit messages. The CLI phrasing has drifted — in
+/// addition to the original "You've hit your limit · resets ..." message, it
+/// now emits variants like:
+///
+///   - "You've hit your org's monthly usage limit"
+///   - "You've hit your org's weekly usage limit"
+///   - "You've hit your session limit"
+///
+/// When the session limit is reached, the org's monthly/weekly limit is often
+/// the cascading symptom; both must route through the usage-wait path (not
+/// the crash-backoff retry path), otherwise the loop burns crash budget and
+/// resets tasks instead of sleeping until the window reopens.
 pub(crate) fn is_rate_limited(output: &str) -> bool {
     let output_lower = output.to_lowercase();
     output_lower.contains("rate_limit_error")
@@ -129,7 +143,13 @@ pub(crate) fn is_rate_limited(output: &str) -> bool {
         || output_lower.contains("usage")
             && output_lower.contains("limit")
             && output_lower.contains("reached")
-        || output_lower.contains("hit your limit")
+        // Contiguous "usage limit" phrase — catches "monthly usage limit",
+        // "weekly usage limit", "org's usage limit", etc. Won't fire on
+        // "Usage statistics show the limit was high" (non-adjacent).
+        || output_lower.contains("usage limit")
+        // Broader "hit your ... limit" — catches the original "hit your limit"
+        // and the newer "hit your org's ... limit" / "hit your session limit".
+        || output_lower.contains("hit your") && output_lower.contains("limit")
 }
 
 // --- Key Decision Extraction ---
@@ -677,6 +697,42 @@ mod tests {
     }
 
     #[test]
+    fn test_monthly_usage_limit_detected_as_rate_limit() {
+        // Exact cascading message observed when session limit is exhausted and
+        // the org's monthly budget is also maxed. Previously mis-classified as
+        // Crash(RuntimeError), which burned crash-tracker budget and reset tasks.
+        let output = "You've hit your org's monthly usage limit\nYou've hit your org's monthly usage limit\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Monthly usage limit message must route to RateLimit (usage-wait), not Crash"
+        );
+    }
+
+    #[test]
+    fn test_weekly_usage_limit_detected_as_rate_limit() {
+        let output = "You've hit your org's weekly usage limit · resets Monday\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Weekly usage limit message must route to RateLimit"
+        );
+    }
+
+    #[test]
+    fn test_session_limit_detected_as_rate_limit() {
+        let output = "You've hit your session limit · resets 11pm\n";
+        let result = analyze_output(output, 1, &test_dir());
+        assert_eq!(
+            result,
+            IterationOutcome::RateLimit,
+            "Session limit message must route to RateLimit"
+        );
+    }
+
+    #[test]
     fn test_complete_takes_priority_over_rate_limit() {
         let output = "rate_limit_error earlier\nRecovered\n<promise>COMPLETE</promise>\n";
         let result = analyze_output(output, 0, &test_dir());
@@ -923,11 +979,23 @@ mod tests {
 
     #[test]
     fn test_usage_limit_partial_match_not_triggered() {
-        // Need all three: "usage" + "limit" + "reached"
+        // Non-adjacent "usage" and "limit" with no "hit your" / "reached" / 429 /
+        // rate_limit_error markers must not trigger. The broader "usage limit"
+        // contiguous check requires the two words to be adjacent.
         let output = "Usage statistics show the limit was high";
         assert!(
             !is_rate_limited(output),
-            "Need all three words: usage, limit, reached"
+            "'usage' and 'limit' non-adjacent without other markers must not trigger"
+        );
+    }
+
+    #[test]
+    fn test_hit_your_without_limit_not_triggered() {
+        // "hit your" alone (e.g. narrative text) must not trigger without "limit".
+        let output = "You've hit your stride on this refactor";
+        assert!(
+            !is_rate_limited(output),
+            "'hit your' without 'limit' must not trigger"
         );
     }
 

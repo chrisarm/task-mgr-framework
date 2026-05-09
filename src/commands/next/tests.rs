@@ -352,7 +352,8 @@ mod selection_tests {
     // file still compiles because the stub exists.
     //
     // Contract:
-    //   select_parallel_group(conn, after_files, task_prefix, max_slots) -> Vec<ScoredTask>
+    //   select_parallel_group(conn, after_files, task_prefix, max_slots,
+    //                         extra_implicit_overlap_files) -> Vec<ScoredTask>
     //   - Greedy selection by descending score
     //   - Two tasks never appear together if their touchesFiles overlap
     //   - Tasks with NO touchesFiles entries have no conflicts → always eligible
@@ -369,7 +370,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/shared.rs");
         insert_test_task_file(&conn, "US-002", "src/shared.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -387,7 +390,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/a.rs");
         insert_test_task_file(&conn, "US-002", "src/b.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 2, "disjoint files must parallelize");
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(ids.contains(&"US-001"));
@@ -403,7 +408,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/a.rs");
         // US-002 and US-003 have zero task_files rows — no conflicts possible.
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             3,
@@ -427,7 +434,9 @@ mod selection_tests {
             insert_test_task_file(&conn, &id, &file);
         }
 
-        let group = select_parallel_group(&conn, &[], None, 3).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 3, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 3, "group size is capped by max_slots");
     }
 
@@ -442,7 +451,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-002", "src/b.rs");
         insert_test_task_file(&conn, "US-003", "src/c.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 3).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 3, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 3);
         // Descending total_score (highest first)
         assert!(
@@ -464,7 +475,9 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Only Task", "todo", 10);
         insert_test_task_file(&conn, "US-001", "src/a.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 1);
         assert_eq!(group[0].task.id, "US-001");
     }
@@ -480,7 +493,9 @@ mod selection_tests {
             insert_test_task_file(&conn, &id, "src/hot_spot.rs");
         }
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -506,7 +521,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-002", "src/shared.rs");
         insert_test_task_file(&conn, "US-003", "src/other.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
 
         assert_eq!(
@@ -1918,7 +1935,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             !ids.contains(&"MILESTONE-FINAL"),
@@ -1933,7 +1952,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "done", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -1948,7 +1969,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "in_progress", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             !ids.contains(&"MILESTONE-FINAL"),
@@ -1964,7 +1987,9 @@ mod soft_dep_tests {
         // Only an unrelated task is active.
         insert_test_task(&conn, "OTHER-001", "Unrelated", "todo", 50);
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -1996,6 +2021,9 @@ mod soft_dep_tests {
     }
 
     /// Two REFACTOR-N siblings with non-overlapping files are co-schedulable.
+    /// REFACTOR-N is a buildy prefix under FEAT-003 (so siblings normally
+    /// contend for the shared-infra slot); the explicit `claims_shared_infra=0`
+    /// opt-out isolates this test to soft-dep semantics only.
     #[test]
     fn test_soft_dep_two_sibling_fixups_co_schedulable() {
         let (_tmp, conn) = setup_test_db();
@@ -2017,8 +2045,18 @@ mod soft_dep_tests {
             11,
             &["address REFACTOR-N-xxx feedback"],
         );
+        // Opt out of the FEAT-003 buildy heuristic so this test continues to
+        // assert what it actually intends: soft-dep doesn't block siblings.
+        conn.execute(
+            "UPDATE tasks SET claims_shared_infra = 0 \
+             WHERE id IN ('REFACTOR-N-001', 'REFACTOR-N-002')",
+            [],
+        )
+        .unwrap();
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"REFACTOR-N-001") && ids.contains(&"REFACTOR-N-002"),
@@ -2041,7 +2079,9 @@ mod soft_dep_tests {
         );
         insert_test_task(&conn, "CODE-FIXTURE-1", "Test fixture work", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -2067,7 +2107,9 @@ mod soft_dep_tests {
         // The doc task's AC tokenizes to "CODE-FIX" (no trailing dash) — must
         // not trigger the filter. Both should be eligible (different files,
         // no conflict).
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"DOC-001"),
@@ -2084,7 +2126,9 @@ mod soft_dep_tests {
         // PRD-B's active fixup must NOT block PRD-A's milestone.
         insert_test_task(&conn, "PRD-B-REFACTOR-N-001", "Other PRD fixup", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], Some("PRD-A"), 2).unwrap();
+        let group = select_parallel_group(&conn, &[], Some("PRD-A"), 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"PRD-A-MILESTONE"),
@@ -2106,11 +2150,700 @@ mod soft_dep_tests {
         )
         .unwrap();
 
-        let group = select_parallel_group(&conn, &[], None, 2).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
             "archived REFACTOR-N-001 must NOT block the milestone, got: {ids:?}"
+        );
+    }
+}
+
+/// Tests for FEAT-003: implicit-overlap shared-infra files + buildy heuristic.
+///
+/// All tests exercise the public `select_parallel_group` entry point. Tasks
+/// are inserted with realistic UUID-prefixed ids (e.g. `cbd7d081-FEAT-001`)
+/// to prove the buildy-prefix matcher reuses `id_body_matches_prefix` and
+/// handles real-world PRD-imported task ids.
+#[cfg(test)]
+mod feat_003_shared_infra_tests {
+    use super::test_helpers::setup_test_db;
+    use crate::commands::next::selection::{id_has_buildy_prefix, select_parallel_group};
+    use rusqlite::{Connection, params};
+
+    /// PRD-prefix used throughout these tests so every fixture id matches the
+    /// real-world `<8-char-uuid>-<TYPE>-<NNN>` shape produced by `task-mgr init`.
+    const PRD_PFX: &str = "deb07ed8";
+
+    fn ins_task(
+        conn: &Connection,
+        id: &str,
+        title: &str,
+        priority: i32,
+        claims_shared_infra: Option<bool>,
+    ) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, claims_shared_infra) \
+             VALUES (?, ?, 'todo', ?, ?)",
+            params![id, title, priority, claims_shared_infra.map(|b| b as i32)],
+        )
+        .unwrap();
+    }
+
+    fn ins_file(conn: &Connection, task_id: &str, path: &str) {
+        conn.execute(
+            "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
+            params![task_id, path],
+        )
+        .unwrap();
+    }
+
+    fn id(prefix: &str, kind: &str, n: u32) -> String {
+        format!("{prefix}-{kind}-{n:03}")
+    }
+
+    // -------------------------------------------------------------------------
+    // id_has_buildy_prefix() — token-aware matcher reuses id_body_matches_prefix.
+    // -------------------------------------------------------------------------
+
+    /// AC: `cbd7d081-FEAT-001` matches; `cbd7d081-TEST-001` does NOT;
+    /// `cbd7d081-FEATURE-001` does NOT (trailing-dash boundary enforced).
+    /// A naive `id.starts_with("FEAT")` against UUID-prefixed ids would miss.
+    #[test]
+    fn test_id_has_buildy_prefix_matches_uuid_prefixed_ids() {
+        // Bare ids
+        assert!(id_has_buildy_prefix("FEAT-001"));
+        assert!(id_has_buildy_prefix("REFACTOR-007"));
+        assert!(id_has_buildy_prefix("REFACTOR-N-001"));
+        assert!(id_has_buildy_prefix("CODE-FIX-002"));
+        assert!(id_has_buildy_prefix("WIRE-FIX-001"));
+        assert!(id_has_buildy_prefix("IMPL-FIX-009"));
+
+        // UUID-prefixed (the case the FEAT-003 PRD calls out specifically)
+        assert!(
+            id_has_buildy_prefix("cbd7d081-FEAT-001"),
+            "UUID-prefixed FEAT must match"
+        );
+        assert!(
+            id_has_buildy_prefix("cbd7d081-REFACTOR-N-002"),
+            "UUID-prefixed REFACTOR-N must match"
+        );
+
+        // Negative — non-buildy prefixes never match.
+        assert!(!id_has_buildy_prefix("cbd7d081-TEST-001"));
+        assert!(!id_has_buildy_prefix("cbd7d081-CLARIFY-001"));
+        assert!(!id_has_buildy_prefix("cbd7d081-DOCS-001"));
+        assert!(!id_has_buildy_prefix("cbd7d081-MILESTONE-FINAL"));
+        assert!(!id_has_buildy_prefix("cbd7d081-CODE-REVIEW-001"));
+        assert!(!id_has_buildy_prefix("cbd7d081-HUMAN-REVIEW-001"));
+
+        // Negative — trailing-dash boundary prevents `FEATURE` from matching `FEAT`.
+        assert!(
+            !id_has_buildy_prefix("cbd7d081-FEATURE-001"),
+            "FEATURE must NOT collide with the FEAT prefix (boundary check)"
+        );
+        assert!(
+            !id_has_buildy_prefix("FEATURE-001"),
+            "bare FEATURE must NOT match FEAT either"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Buildy heuristic: two FEATs compete for one shared-infra slot per wave.
+    // -------------------------------------------------------------------------
+
+    /// AC: Two FEAT tasks with disjoint `touchesFiles` still serialize because
+    /// both implicitly claim the synthetic shared-infra slot via the buildy-id
+    /// heuristic. This is the mw-datalake incident in test form.
+    #[test]
+    fn test_parallel_group_two_feats_compete_for_infra_slot() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "FEAT", 1);
+        let b = id(PRD_PFX, "FEAT", 2);
+        ins_task(&conn, &a, "Feat A", 10, None);
+        ins_task(&conn, &b, "Feat B", 20, None);
+        ins_file(&conn, &a, "src/feat_a.rs");
+        ins_file(&conn, &b, "src/feat_b.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        assert!(
+            group.len() <= 1,
+            "two FEATs must contend for one shared-infra slot, got {} tasks: {:?}",
+            group.len(),
+            group.iter().map(|s| &s.task.id).collect::<Vec<_>>()
+        );
+        // Higher priority (lower number) wins the slot.
+        assert_eq!(group[0].task.id, a);
+    }
+
+    // -------------------------------------------------------------------------
+    // Buildy heuristic does NOT apply to TEST/CLARIFY etc — they parallelize.
+    // -------------------------------------------------------------------------
+
+    /// FEAT and TEST run together because TEST is non-buildy.
+    #[test]
+    fn test_parallel_group_feat_plus_test_both_parallelize() {
+        let (_tmp, conn) = setup_test_db();
+        let f = id(PRD_PFX, "FEAT", 1);
+        let t = id(PRD_PFX, "TEST", 1);
+        ins_task(&conn, &f, "Feat", 10, None);
+        ins_task(&conn, &t, "Test", 20, None);
+        ins_file(&conn, &f, "src/feat.rs");
+        ins_file(&conn, &t, "src/test.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert_eq!(group.len(), 2, "FEAT + TEST must co-schedule, got: {ids:?}");
+        assert!(ids.contains(&f.as_str()));
+        assert!(ids.contains(&t.as_str()));
+    }
+
+    /// FEAT and CLARIFY run together because CLARIFY is non-buildy.
+    #[test]
+    fn test_parallel_group_feat_plus_clarify_both_parallelize() {
+        let (_tmp, conn) = setup_test_db();
+        let f = id(PRD_PFX, "FEAT", 1);
+        let c = id(PRD_PFX, "CLARIFY", 1);
+        ins_task(&conn, &f, "Feat", 10, None);
+        ins_task(&conn, &c, "Clarify", 20, None);
+        ins_file(&conn, &f, "src/feat.rs");
+        ins_file(&conn, &c, "docs/clarify.md");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert_eq!(
+            group.len(),
+            2,
+            "FEAT + CLARIFY must co-schedule, got: {ids:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Path-based detection (a): explicit Cargo.lock listing claims the slot.
+    // -------------------------------------------------------------------------
+
+    /// A non-buildy TEST task that explicitly lists `Cargo.lock` claims the
+    /// shared-infra slot via path detection (a), serializing it against any
+    /// other shared-infra claimer in the same wave.
+    #[test]
+    fn test_parallel_group_explicit_cargo_lock_listed_takes_slot() {
+        let (_tmp, conn) = setup_test_db();
+        let t = id(PRD_PFX, "TEST", 1);
+        let f = id(PRD_PFX, "FEAT", 1);
+        ins_task(&conn, &t, "Test that bumps lockfile", 10, None);
+        ins_task(&conn, &f, "Feat with no listed lockfile", 20, None);
+        ins_file(&conn, &t, "Cargo.lock");
+        ins_file(&conn, &f, "src/feat.rs");
+
+        // Expectation: TEST claims via path (a), FEAT claims via prefix (b);
+        // both want __shared_infra__, so only the higher-priority one wins.
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert_eq!(
+            group.len(),
+            1,
+            "TEST(Cargo.lock) must contend with FEAT for the infra slot, got: {ids:?}"
+        );
+        assert_eq!(group[0].task.id, t, "higher priority TEST wins the slot");
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-task overrides via claims_shared_infra column.
+    // -------------------------------------------------------------------------
+
+    /// `claimsSharedInfra: true` forces a non-buildy TEST to claim the slot.
+    #[test]
+    fn test_parallel_group_claims_shared_infra_true_forces_claim() {
+        let (_tmp, conn) = setup_test_db();
+        let t = id(PRD_PFX, "TEST", 1);
+        let f = id(PRD_PFX, "FEAT", 1);
+        ins_task(&conn, &t, "Test that explicitly claims", 10, Some(true));
+        ins_task(&conn, &f, "Feat", 20, None);
+        ins_file(&conn, &t, "src/test.rs");
+        ins_file(&conn, &f, "src/feat.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+        assert_eq!(
+            group.len(),
+            1,
+            "claimsSharedInfra=true on TEST must contend with FEAT, got: {ids:?}"
+        );
+        assert_eq!(group[0].task.id, t);
+    }
+
+    /// `claimsSharedInfra: false` opts a FEAT OUT of the buildy heuristic
+    /// even though it would normally claim the slot via (b).
+    #[test]
+    fn test_parallel_group_claims_shared_infra_false_skips_buildy_heuristic() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "FEAT", 1);
+        let b = id(PRD_PFX, "FEAT", 2);
+        // Both FEATs would normally claim infra; opting OUT lets them parallelize.
+        ins_task(&conn, &a, "Feat A (opted out)", 10, Some(false));
+        ins_task(&conn, &b, "Feat B (opted out)", 20, Some(false));
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            group.len(),
+            2,
+            "claimsSharedInfra=false on both FEATs must let them parallelize"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Path-based detection works for non-Rust ecosystems (basename match).
+    // -------------------------------------------------------------------------
+
+    /// Two FEATs both touching `uv.lock` (Python lockfile) serialize via the
+    /// implicit-overlap baseline list — proves basename matching covers Python.
+    #[test]
+    fn test_parallel_group_python_uv_lock_serializes_two_feats() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "FEAT", 1);
+        let b = id(PRD_PFX, "FEAT", 2);
+        ins_task(&conn, &a, "Feat A", 10, None);
+        ins_task(&conn, &b, "Feat B", 20, None);
+        // Different real paths, same basename — basename match must fire.
+        ins_file(&conn, &a, "services/api/uv.lock");
+        ins_file(&conn, &b, "services/worker/uv.lock");
+
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            group.len(),
+            1,
+            "two FEATs touching uv.lock (different paths) must serialize"
+        );
+        assert_eq!(group[0].task.id, a);
+    }
+
+    // -------------------------------------------------------------------------
+    // ProjectConfig.implicit_overlap_files extension takes effect.
+    // -------------------------------------------------------------------------
+
+    /// A project-level extra basename (`gradle-wrapper.lock`) makes two
+    /// non-buildy TEST tasks serialize even though the basename isn't in the
+    /// baseline list. The two task paths share only the basename — different
+    /// directories — so the only thing forcing serialization is the implicit
+    /// shared-infra detection (not the existing path-overlap check).
+    #[test]
+    fn test_parallel_group_project_config_extends_implicit_list() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "Test A", 10, None);
+        ins_task(&conn, &b, "Test B", 20, None);
+        ins_file(&conn, &a, "android/app/gradle-wrapper.lock");
+        ins_file(&conn, &b, "android/lib/gradle-wrapper.lock");
+
+        // Without the extra: tasks touch DIFFERENT paths and the basename isn't
+        // in the baseline list → both can parallelize.
+        let baseline_group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            baseline_group.len(),
+            2,
+            "without the extra, TESTs sharing only a non-baseline basename parallelize"
+        );
+
+        // With the extra: basename match fires on both → one synthetic claim → serialize.
+        let extra = ["gradle-wrapper.lock".to_string()];
+        let extended_group = select_parallel_group(&conn, &[], None, 4, &extra, &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            extended_group.len(),
+            1,
+            "ProjectConfig extension must serialize them on shared-infra"
+        );
+    }
+
+    /// PRD-level override extends the project-level list (both contribute).
+    /// Test passes both lists merged into the `extra` slice — matches how
+    /// the engine call site computes the union.
+    #[test]
+    fn test_parallel_group_prd_override_extends_project_implicit_list() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "Test A", 10, None);
+        ins_task(&conn, &b, "Test B", 20, None);
+        // Different paths, same basename — proves it's the basename match
+        // (not raw path-overlap) doing the serialization.
+        ins_file(&conn, &a, "infra/main/tofu.lock.hcl");
+        ins_file(&conn, &b, "infra/staging/tofu.lock.hcl");
+
+        // Without the merge, the basename isn't recognized → both parallelize.
+        let baseline = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            baseline.len(),
+            2,
+            "non-baseline basename with disjoint paths must parallelize without an extension"
+        );
+
+        let project_extra = ["custom-project.lock".to_string()];
+        let prd_extra = ["tofu.lock.hcl".to_string()];
+        let merged: Vec<String> = project_extra
+            .iter()
+            .cloned()
+            .chain(prd_extra.iter().cloned())
+            .collect();
+
+        let group = select_parallel_group(&conn, &[], None, 4, &merged, &[])
+            .unwrap()
+            .group;
+        assert_eq!(
+            group.len(),
+            1,
+            "PRD-level entry must extend the project list"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Negative AC: persisted touchesFiles must not be mutated.
+    // -------------------------------------------------------------------------
+
+    /// After `select_parallel_group` runs with the buildy heuristic firing,
+    /// the `task_files` rows in the DB must remain unchanged — the synthetic
+    /// `__shared_infra__` claim lives only in the in-memory `used_files` set.
+    #[test]
+    fn test_parallel_group_does_not_mutate_persisted_touches_files() {
+        let (_tmp, conn) = setup_test_db();
+        let f = id(PRD_PFX, "FEAT", 1);
+        ins_task(&conn, &f, "Feat", 10, None);
+        ins_file(&conn, &f, "src/feat.rs");
+
+        let _ = select_parallel_group(&conn, &[], None, 4, &[], &[]).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_files WHERE task_id = ?",
+                [&f],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "task_files must still have only the real entry");
+
+        let path: String = conn
+            .query_row(
+                "SELECT file_path FROM task_files WHERE task_id = ?",
+                [&f],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            path, "src/feat.rs",
+            "task_files entry must not be mutated to __shared_infra__"
+        );
+    }
+}
+
+/// Tests for FEAT-004: cross-wave file affinity from un-merged ephemeral
+/// branches with deadlock guard.
+///
+/// All assertions go through `select_parallel_group`'s public surface — these
+/// tests treat the function as a black box and verify the new
+/// `ephemeral_overlay` parameter / `ParallelGroupResult` semantics.
+#[cfg(test)]
+mod feat_004_cross_wave_overlay_tests {
+    use super::test_helpers::setup_test_db;
+    use crate::commands::next::selection::select_parallel_group;
+    use rusqlite::{Connection, params};
+
+    const PRD_PFX: &str = "deb07ed8";
+
+    fn ins_task(conn: &Connection, id: &str, title: &str, priority: i32) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, 'todo', ?)",
+            params![id, title, priority],
+        )
+        .unwrap();
+    }
+
+    fn ins_file(conn: &Connection, task_id: &str, path: &str) {
+        conn.execute(
+            "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
+            params![task_id, path],
+        )
+        .unwrap();
+    }
+
+    fn id(prefix: &str, kind: &str, n: u32) -> String {
+        format!("{prefix}-{kind}-{n:03}")
+    }
+
+    /// AC: a candidate whose `touchesFiles` includes a file modified on an
+    /// un-merged ephemeral branch is deferred — even though no other accepted
+    /// task in the same wave has claimed that file. With the only candidate
+    /// blocked by the overlay, the result has an empty group AND a
+    /// non-empty `ephemeral_block_diagnostics` naming the blocking branch.
+    #[test]
+    fn test_parallel_group_defers_when_ephemeral_branch_has_unmerged_file() {
+        let (_tmp, conn) = setup_test_db();
+        let t = id(PRD_PFX, "TEST", 1); // non-buildy so the buildy heuristic doesn't interfere
+        ins_task(&conn, &t, "Test A", 10);
+        ins_file(&conn, &t, "src/foo.rs");
+
+        let overlay = vec![(
+            "feat/parallel-slot-1".to_string(),
+            vec!["src/foo.rs".to_string()],
+        )];
+        let result = select_parallel_group(&conn, &[], None, 2, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "candidate touching un-merged ephemeral file must be deferred, got: {:?}",
+            result.group.iter().map(|s| &s.task.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![(t, vec!["feat/parallel-slot-1".to_string()])],
+            "deadlock diagnostic must name the candidate AND the blocking branch"
+        );
+    }
+
+    /// AC: when the cross-wave overlay is empty (cleanly-recovered loop), the
+    /// result is identical to the pre-FEAT-004 implementation — diagnostics
+    /// are never populated.
+    #[test]
+    fn test_parallel_group_no_overlay_behaves_like_baseline() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &[]).unwrap();
+        let ids: Vec<&str> = result.group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "empty overlay must produce empty diagnostics"
+        );
+    }
+
+    /// AC + known-bad: every eligible candidate is blocked SOLELY by ephemeral
+    /// overlap. The diagnostic must be non-empty and the group empty —
+    /// otherwise a fix that silently returned an empty group would pass.
+    #[test]
+    fn test_parallel_group_deadlock_guard_reports_when_all_candidates_blocked_by_ephemeral() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let overlay = vec![
+            ("feat/x-slot-1".to_string(), vec!["src/a.rs".to_string()]),
+            ("feat/x-slot-2".to_string(), vec!["src/b.rs".to_string()]),
+        ];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "every candidate is ephemeral-blocked"
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![
+                (a, vec!["feat/x-slot-1".to_string()]),
+                (b, vec!["feat/x-slot-2".to_string()]),
+            ],
+            "diagnostic must list every blocked candidate, sorted by id"
+        );
+    }
+
+    /// AC: a candidate filtered out by REAL task overlap (not ephemeral) must
+    /// NOT appear in the diagnostic. Otherwise the deadlock guard would
+    /// misfire on routine within-wave conflicts and mislead the operator.
+    #[test]
+    fn test_parallel_group_diagnostic_excludes_real_task_overlaps() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        // Both touch src/shared.rs — B will be skipped due to A's claim.
+        ins_file(&conn, &a, "src/shared.rs");
+        ins_file(&conn, &b, "src/shared.rs");
+
+        // Provide a non-empty overlay that does NOT touch src/shared.rs so
+        // the overlay does not contribute to B's deferral.
+        let overlay = vec![(
+            "feat/x-slot-1".to_string(),
+            vec!["src/unrelated.rs".to_string()],
+        )];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert_eq!(result.group.len(), 1);
+        assert_eq!(result.group[0].task.id, a);
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "B was deferred by A's claim, NOT by ephemeral — diagnostic must stay empty, got: {:?}",
+            result.ephemeral_block_diagnostics
+        );
+    }
+
+    /// AC: when the group is non-empty, diagnostics MUST be empty even if
+    /// some other candidate was ephemeral-blocked. Mid-wave progress takes
+    /// precedence — the engine only halts on full deadlock.
+    #[test]
+    fn test_parallel_group_diagnostic_empty_when_group_nonempty() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A free", 10);
+        ins_task(&conn, &b, "B blocked", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let overlay = vec![("feat/x-slot-1".to_string(), vec!["src/b.rs".to_string()])];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert_eq!(result.group.len(), 1, "A is free, B is blocked");
+        assert_eq!(result.group[0].task.id, a);
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "non-empty group → no deadlock-guard diagnostics"
+        );
+    }
+
+    /// Integration test: end-to-end exercise of the worktree helpers + the
+    /// selection-layer overlay.
+    ///
+    /// Sets up a real 2-slot worktree topology with a manually-injected
+    /// un-merged commit on slot 1's ephemeral branch. Builds the cross-wave
+    /// overlay the way engine.rs does (enumerate via
+    /// `list_ephemeral_slot_branches`, diff via `list_unmerged_branch_files`),
+    /// then calls `select_parallel_group` with the overlay and asserts the
+    /// candidate sharing the un-merged file is deferred AND the deadlock
+    /// guard surfaces the blocking branch by name.
+    #[test]
+    fn test_2_slot_loop_cross_wave_overlay_blocks_candidate_and_emits_diagnostic() {
+        use crate::loop_engine::worktree::{
+            ensure_slot_worktrees, ensure_worktree, ephemeral_slot_branch,
+            list_ephemeral_slot_branches, list_unmerged_branch_files,
+        };
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let branch = "feat/feat-004-integration";
+        let tmp = TempDir::new().expect("tempdir");
+        // Inline-init a real git repo so the worktree helpers operate against
+        // genuine refs (mirrors test_utils::setup_git_repo_with_file but lives
+        // here to avoid cross-module test plumbing).
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git config name");
+        std::fs::write(tmp.path().join("file.txt"), "init").expect("write init file");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git add init");
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git commit init");
+
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("slot worktrees");
+
+        // Inject an un-merged commit on slot 1's ephemeral branch touching
+        // src/foo.rs. This simulates a slot whose merge-back failed — the
+        // commit is on the ephemeral but not the loop branch.
+        std::fs::create_dir_all(paths[1].join("src")).expect("mkdir src");
+        std::fs::write(paths[1].join("src/foo.rs"), "fn foo() {}").expect("write foo.rs");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add slot 1");
+        let out = Command::new("git")
+            .args(["commit", "-m", "slot 1: add foo.rs"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit slot 1");
+        assert!(out.status.success(), "slot 1 commit");
+
+        // Engine.rs-style overlay assembly: enumerate ephemeral branches, then
+        // diff each against base. This exact sequence runs in production.
+        let ephemeral_branches = list_ephemeral_slot_branches(tmp.path(), branch);
+        assert_eq!(
+            ephemeral_branches,
+            vec![ephemeral_slot_branch(branch, 1)],
+            "exactly one un-merged ephemeral expected"
+        );
+        let overlay: Vec<(String, Vec<String>)> = ephemeral_branches
+            .iter()
+            .map(|eph| {
+                let files = list_unmerged_branch_files(tmp.path(), branch, eph)
+                    .expect("list_unmerged_branch_files");
+                (eph.clone(), files)
+            })
+            .collect();
+        assert_eq!(
+            overlay,
+            vec![(
+                ephemeral_slot_branch(branch, 1),
+                vec!["src/foo.rs".to_string()],
+            )],
+            "overlay must reflect the slot 1 commit's file list"
+        );
+
+        // Build a DB with one candidate that touches the un-merged file. The
+        // candidate is `TEST-` (non-buildy) so the buildy-prefix heuristic
+        // doesn't independently defer it — the only blocking signal is the
+        // cross-wave overlay.
+        let (_db_tmp, conn) = setup_test_db();
+        let cand = id(PRD_PFX, "TEST", 1);
+        ins_task(&conn, &cand, "Touches un-merged file", 10);
+        ins_file(&conn, &cand, "src/foo.rs");
+
+        let result = select_parallel_group(&conn, &[], None, 2, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "candidate must be deferred by cross-wave overlay, got: {:?}",
+            result.group.iter().map(|s| &s.task.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![(cand, vec![ephemeral_slot_branch(branch, 1)])],
+            "deadlock diagnostic must name the candidate AND the slot 1 branch"
         );
     }
 }

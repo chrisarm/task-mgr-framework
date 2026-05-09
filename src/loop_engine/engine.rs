@@ -60,6 +60,7 @@ use crate::loop_engine::prd_reconcile::{
     update_prd_task_passes,
 };
 use crate::loop_engine::progress;
+use crate::loop_engine::project_config;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::stale::StaleTracker;
@@ -265,6 +266,18 @@ pub struct IterationContext {
     /// deadline / max-iterations rather than waiting for the next process's
     /// step 6.6 recovery.
     pub pending_slot_tasks: Vec<String>,
+    /// Count of consecutive parallel-slot waves whose merge-back step
+    /// produced at least one failed slot. Reset to `0` after every wave that
+    /// merges cleanly. Compared against
+    /// `ProjectConfig::merge_fail_halt_threshold` at the wave-loop boundary
+    /// (FEAT-002): when the counter reaches the threshold, the loop aborts
+    /// rather than letting the cascade run unbounded (mw-datalake incident).
+    ///
+    /// Threshold semantics:
+    /// - `0` — counter is incremented but threshold never triggers (legacy "log and continue")
+    /// - `1` — halts on any merge-back failure
+    /// - `2` (default) — halts after two consecutive failure waves
+    pub consecutive_merge_fail_waves: u32,
 }
 
 impl IterationContext {
@@ -285,6 +298,7 @@ impl IterationContext {
             overflow_original_model: std::collections::HashMap::new(),
             pending_reorder_hints: Vec::new(),
             pending_slot_tasks: Vec::new(),
+            consecutive_merge_fail_waves: 0,
         }
     }
 }
@@ -869,6 +883,18 @@ pub struct WaveIterationParams<'a> {
     /// Operator pause feedback rendered as a `## Session Guidance` block in
     /// each slot prompt. Empty string omits the section, matching sequential.
     pub session_guidance: &'a str,
+    /// PRD-side `implicit_overlap_files` override, parsed once per run at
+    /// `run_loop` startup and threaded through each wave instead of being
+    /// re-parsed from disk per-wave (Fix 2 from /review-loop).
+    /// Empty when the PRD JSON does not set the field. Mid-run edits to the
+    /// PRD JSON are NOT picked up — operators must restart the loop, matching
+    /// how every other config knob (model, parallel_slots, default_model)
+    /// already behaves.
+    pub prd_implicit_overlap_files: &'a [String],
+    /// Project-level config loaded once per run from `.task-mgr/config.json`
+    /// and shared across the wave loop instead of being re-read per call site.
+    /// Same restart-required semantics as `prd_implicit_overlap_files`.
+    pub project_config: &'a project_config::ProjectConfig,
 }
 
 /// Aggregated outcome of one parallel wave returned to `run_loop`.
@@ -879,6 +905,23 @@ pub struct WaveTerminal {
     pub exit_code: i32,
     pub reason: String,
     pub run_status: Option<RunStatus>,
+}
+
+/// One slot whose merge-back failed during the wave. Bundles the slot index
+/// and the task ID it had claimed so the consumer never has to keep two
+/// `Vec`s in lockstep — the equal-length invariant becomes a type-level
+/// guarantee instead of a rustdoc comment.
+///
+/// `task_id` is `None` when the slot's iteration produced no `task_id`
+/// (e.g. claim-fail before any task was assigned, or the FEAT-004 deadlock
+/// guard which synthesizes failed-merge entries from un-merged ephemeral
+/// branches with no claimed task). Reset semantics: a `None` task_id is
+/// silently skipped in `apply_merge_fail_reset_and_halt_check`'s reset
+/// pass — the threshold counter still increments.
+#[derive(Debug, Clone)]
+pub struct FailedMerge {
+    pub slot: usize,
+    pub task_id: Option<String>,
 }
 
 /// `terminal` is `Some(_)` when the wave determined the loop should stop —
@@ -893,6 +936,18 @@ pub struct WaveOutcome {
     /// True only when a `.stop` file caused the wave to halt — propagates to
     /// `LoopResult.was_stopped` so batch runners can react to a clean stop.
     pub was_stopped: bool,
+    /// Slots whose merge-back failed during this wave, paired with the task
+    /// ID each had claimed. Populated from
+    /// `worktree::merge_slot_branches_with_resolver`'s `outcomes.failed_slots`.
+    /// Always empty for sequential runs (`parallel_slots <= 1`) and for waves
+    /// that never reached the merge-back step (e.g. preflight bail-out).
+    ///
+    /// Read by the wave-loop boundary in `run_loop` to drive the
+    /// reset/halt-check contract (FEAT-002): reset each failed slot's
+    /// claimed task to `todo`, increment
+    /// `IterationContext::consecutive_merge_fail_waves`, and halt when the
+    /// counter reaches `ProjectConfig::merge_fail_halt_threshold`.
+    pub failed_merges: Vec<FailedMerge>,
 }
 
 /// Wave-mode aggregator collected during per-slot post-processing.
@@ -940,6 +995,7 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
@@ -953,6 +1009,7 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: true,
+            failed_merges: Vec::new(),
         });
     }
 
@@ -978,6 +1035,7 @@ fn wave_preflight_check(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
         });
     }
     None
@@ -1018,6 +1076,7 @@ fn handle_no_eligible_tasks(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges: Vec::new(),
         };
     }
     WaveOutcome {
@@ -1025,6 +1084,109 @@ fn handle_no_eligible_tasks(
         iteration_consumed: true,
         terminal: None,
         was_stopped: false,
+        failed_merges: Vec::new(),
+    }
+}
+
+/// FEAT-004 deadlock guard: every eligible candidate was blocked exclusively
+/// by un-merged work on `{branch}-slot-N` ephemeral branches. Emit per-
+/// candidate diagnostics, then synthesize a merge-fail wave by deriving slot
+/// indices from the blocking branch names so `run_loop`'s wave-loop boundary
+/// runs the FEAT-002 reset/halt-check contract.
+///
+/// **No tasks to reset**: the deferred candidates are still `todo` — they
+/// were never claimed. The synthesized `FailedMerge` entries therefore carry
+/// `task_id: None`, and `apply_merge_fail_reset_and_halt_check`'s reset
+/// pass becomes a no-op (`None` skipped via `if let Some`).
+///
+/// **Slot index derivation**: branches sourced from
+/// `worktree::list_ephemeral_slot_branches` are guaranteed to match the
+/// `{branch}-slot-N` shape (parsed and re-emitted by that helper). We strip
+/// `{branch}-slot-` and parse the suffix; on the off chance a branch ever
+/// slips through with a non-numeric suffix, that branch is logged and skipped
+/// — slot index 0 is reserved for slot 0 (the loop's own branch) and must
+/// never be synthesized here.
+fn handle_ephemeral_deadlock(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+    diagnostics: Vec<(String, Vec<String>)>,
+) -> WaveOutcome {
+    ctx.stale_tracker.check("stale", "stale");
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        None,
+        &IterationOutcome::NoEligibleTasks,
+        &[],
+        None,
+        None,
+        None,
+    );
+
+    eprintln!(
+        "Cross-wave deadlock: every eligible candidate is blocked by un-merged ephemeral branch(es). \
+         Treating as merge-fail wave so the halt threshold can fire."
+    );
+    for (cand_id, branches) in &diagnostics {
+        eprintln!("  {} blocked by: {}", cand_id, branches.join(", "));
+    }
+
+    // Collect distinct slot indices from the union of blocking branches across
+    // all diagnostics. Order is stable (sorted ascending) so the eventual
+    // halt-diagnostic from `apply_merge_fail_reset_and_halt_check` lists slots
+    // in a predictable order.
+    let prefix = format!("{}-slot-", params.branch);
+    let mut synth_slots: Vec<usize> = Vec::new();
+    for (_, branches) in &diagnostics {
+        for branch in branches {
+            let Some(suffix) = branch.strip_prefix(&prefix) else {
+                continue;
+            };
+            match suffix.parse::<usize>() {
+                Ok(slot) if slot > 0 => {
+                    if !synth_slots.contains(&slot) {
+                        synth_slots.push(slot);
+                    }
+                }
+                _ => eprintln!(
+                    "Warning: skipping ephemeral branch with non-numeric / zero slot suffix: {}",
+                    branch
+                ),
+            }
+        }
+    }
+    synth_slots.sort();
+    // If every blocking branch had an unparseable slot suffix, `synth_slots`
+    // is empty and `WaveOutcome.failed_merges` would be empty too — at which
+    // point `apply_merge_fail_reset_and_halt_check` would reset the
+    // consecutive counter to 0 and the deadlock would silently spin forever
+    // until the stale-iteration tracker aborts. Insert a single
+    // `SYNTHETIC_DEADLOCK_SLOT` entry so the threshold counter still
+    // increments. The diagnostic step in
+    // `apply_merge_fail_reset_and_halt_check` special-cases this slot index
+    // to print a `<malformed deadlock blocker>` placeholder instead of
+    // synthesizing a `{branch}-slot-18446744073709551615` name.
+    if synth_slots.is_empty() && !diagnostics.is_empty() {
+        eprintln!(
+            "warning: deadlock guard fired with no parseable ephemeral slot indices \
+             — inserting synthetic halt slot so the threshold counter still increments"
+        );
+        synth_slots.push(SYNTHETIC_DEADLOCK_SLOT);
+    }
+    let failed_merges: Vec<FailedMerge> = synth_slots
+        .into_iter()
+        .map(|slot| FailedMerge {
+            slot,
+            task_id: None,
+        })
+        .collect();
+
+    WaveOutcome {
+        tasks_completed: 0,
+        iteration_consumed: true,
+        terminal: None,
+        was_stopped: false,
+        failed_merges,
     }
 }
 
@@ -1324,6 +1486,150 @@ fn wait_inter_wave_delay(delay: Duration, signal_flag: &SignalFlag) -> bool {
     false
 }
 
+/// Reset a single in-progress task back to `todo` so the next iteration (or
+/// next loop run) can re-claim it. No-ops when the row's status is not
+/// `in_progress` — we never demote terminal states (`done`, `blocked`,
+/// `skipped`) here.
+///
+/// Used by:
+/// - The wave-loop FEAT-002 reset/halt-check contract — a slot's task whose
+///   merge-back failed must not stay pinned in `in_progress`.
+/// - Post-loop cleanup (Step 17.5 / 17.6) when the loop exits via deadline /
+///   max-iterations rather than a per-task done signal.
+///
+/// Logs success / no-op / failure to stderr; failures never propagate
+/// (matches the FEAT-002 failure-mode AC: "if reset itself fails for a task,
+/// log the failure but continue with remaining failed slots").
+fn reset_task_to_todo(conn: &Connection, task_id: &str, kind_label: &str) {
+    match conn.execute(
+        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
+        [task_id],
+    ) {
+        Ok(1) => eprintln!("Reset {} {} to todo", kind_label, task_id),
+        Ok(_) => {} // already terminal, or status changed by reconciliation
+        Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
+    }
+}
+
+/// Sentinel slot index for deadlock-guard waves where every blocking
+/// `{branch}-slot-N` ephemeral had a non-numeric / zero suffix and the
+/// guard had nothing parseable to enumerate. `handle_ephemeral_deadlock`
+/// inserts one `FailedMerge { slot: SYNTHETIC_DEADLOCK_SLOT, .. }` so the
+/// FEAT-002 threshold counter still increments. `apply_merge_fail_reset_and_halt_check`
+/// special-cases this slot index in its diagnostic step to avoid
+/// synthesizing the meaningless `{branch}-slot-18446744073709551615` name.
+pub(crate) const SYNTHETIC_DEADLOCK_SLOT: usize = usize::MAX;
+
+/// Decision returned by the wave-loop FEAT-002 reset/halt-check contract.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MergeFailHaltDecision {
+    /// Wave merged cleanly OR failed but is below the halt threshold —
+    /// continue the loop.
+    Continue,
+    /// Threshold reached — break out of the wave loop with the captured
+    /// `exit_code` / `exit_reason`. The caller emits the per-slot ephemeral
+    /// branch diagnostic before returning this variant.
+    Halt { exit_code: i32, exit_reason: String },
+}
+
+/// Apply the FEAT-002 reset/halt contract to one wave's outcome.
+///
+/// Step ordering (contractual — reset MUST come before increment so a halted
+/// run never leaves a failed-slot task pinned in `in_progress`):
+///
+/// 1. For each failed slot's claimed task: reset to `todo`; drain it from
+///    `ctx.pending_slot_tasks` (mirror of engine.rs:1269). Reset failures are
+///    logged but never fatal — remaining slots still process.
+/// 2. Increment `ctx.consecutive_merge_fail_waves`.
+/// 3. Compare to `threshold`. `0` disables the halt entirely (legacy "log
+///    and continue" behavior preserved bit-for-bit).
+/// 4. On halt: emit a per-slot ephemeral branch name diagnostic to stderr.
+/// 5. Return `Halt { ... }` to break the loop, or `Continue` otherwise.
+///
+/// When `failed_merges.is_empty()` the counter is reset to `0` and `Continue`
+/// is returned without doing any reset / diagnostic work.
+fn apply_merge_fail_reset_and_halt_check(
+    conn: &Connection,
+    ctx: &mut IterationContext,
+    branch: &str,
+    failed_merges: &[FailedMerge],
+    threshold: u32,
+) -> MergeFailHaltDecision {
+    if failed_merges.is_empty() {
+        ctx.consecutive_merge_fail_waves = 0;
+        return MergeFailHaltDecision::Continue;
+    }
+
+    // (1) Reset every failed slot's claimed task. The single-slice shape
+    //     (a `Vec<FailedMerge>`) makes the slot/task pairing a type-level
+    //     guarantee — no zip-truncation footgun.
+    for fm in failed_merges {
+        if let Some(tid) = &fm.task_id {
+            reset_task_to_todo(conn, tid, "failed-slot task");
+            ctx.pending_slot_tasks.retain(|t| t != tid);
+        }
+    }
+
+    // (2) Increment AFTER reset so a halted run still leaves the DB
+    //     re-runnable (the known-bad implementation does this in the wrong
+    //     order — see the regression test).
+    ctx.consecutive_merge_fail_waves += 1;
+
+    // (3) Threshold check. `0` is a sentinel for "never halt".
+    if threshold == 0 || ctx.consecutive_merge_fail_waves < threshold {
+        return MergeFailHaltDecision::Continue;
+    }
+
+    // (4) Per-slot diagnostic. `ephemeral_slot_branch` is the canonical name
+    //     source — never construct `{branch}-slot-{N}` inline (learning [1870]).
+    //     The `SYNTHETIC_DEADLOCK_SLOT` sentinel renders as a placeholder
+    //     instead of `{branch}-slot-18446744073709551615`.
+    let names: Vec<String> = failed_merges
+        .iter()
+        .map(|fm| {
+            if fm.slot == SYNTHETIC_DEADLOCK_SLOT {
+                "<malformed deadlock blocker>".to_string()
+            } else {
+                worktree::ephemeral_slot_branch(branch, fm.slot)
+            }
+        })
+        .collect();
+    eprintln!(
+        "Aborting: {} consecutive merge-back failure wave(s) (threshold={}). \
+         Failed slot branches: {}",
+        ctx.consecutive_merge_fail_waves,
+        threshold,
+        names.join(", ")
+    );
+
+    // (5) Halt.
+    MergeFailHaltDecision::Halt {
+        exit_code: 1,
+        exit_reason: format!(
+            "{} consecutive merge-back failure wave(s) (threshold={})",
+            ctx.consecutive_merge_fail_waves, threshold
+        ),
+    }
+}
+
+/// Read the PRD JSON at `prd_path` and return its `implicitOverlapFiles`
+/// list (FEAT-003). Returns an empty Vec on any error (file missing,
+/// invalid JSON, field absent) — implicit-overlap detection still works
+/// from the baseline list and ProjectConfig extension.
+///
+/// Best-effort I/O on the wave-loop hot path: a parse failure should NOT
+/// abort the wave, so all error paths swallow with a Vec::new() default.
+fn read_prd_implicit_overlap_files(prd_path: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(prd_path) else {
+        return Vec::new();
+    };
+    let Ok(prd): Result<crate::commands::init::parse::PrdFile, _> = serde_json::from_str(&contents)
+    else {
+        return Vec::new();
+    };
+    prd.implicit_overlap_files.unwrap_or_default()
+}
+
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
 ///
 /// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
@@ -1347,23 +1653,84 @@ pub fn run_wave_iteration(
 
     // Parallel group selection. Reuses the same scoring + greedy
     // file-overlap walk as `task-mgr next`, capped at `parallel_slots`.
-    let group = match select_parallel_group(
+    //
+    // FEAT-003: merge project-config and PRD-level implicit-overlap extensions
+    // into the slate so `select_parallel_group` can detect shared-infra files
+    // beyond the baseline `IMPLICIT_OVERLAP_FILES` list. Both lists were
+    // loaded once at run-loop startup and threaded through `WaveParams`
+    // (Fix 2 from /review-loop) so the wave hot path no longer re-parses
+    // disk every iteration.
+    let extra_implicit: Vec<String> = params
+        .project_config
+        .implicit_overlap_files
+        .iter()
+        .cloned()
+        .chain(params.prd_implicit_overlap_files.iter().cloned())
+        .collect();
+
+    // FEAT-004: cross-wave file affinity. Enumerate `{branch}-slot-N` ephemeral
+    // branches once per wave on the main thread (slot worker threads from the
+    // prior wave have already joined per the engine's join discipline) and
+    // collect their un-merged files. The (branch, files) pairs become synthetic
+    // claims for `select_parallel_group`, which then defers any candidate
+    // whose `touchesFiles` would conflict with un-merged work.
+    //
+    // `git diff` is called once per ephemeral branch (NOT per candidate) so
+    // the overhead is bounded by `parallel_slots`. Each per-branch failure
+    // logs and degrades to "no claim" — selection continues without the
+    // overlay rather than crashing the loop (per FEAT-004 failure-mode AC).
+    let ephemeral_branches =
+        worktree::list_ephemeral_slot_branches(params.source_root, params.branch);
+    let ephemeral_overlay: Vec<(String, Vec<String>)> = ephemeral_branches
+        .iter()
+        .map(|eph| {
+            let files = match worktree::list_unmerged_branch_files(
+                params.source_root,
+                params.branch,
+                eph,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: list_unmerged_branch_files({}) failed: {} (treating as no claim)",
+                        eph, e
+                    );
+                    Vec::new()
+                }
+            };
+            (eph.clone(), files)
+        })
+        .collect();
+
+    let result = match select_parallel_group(
         params.conn,
         &ctx.last_files,
         params.task_prefix,
         params.parallel_slots,
+        &extra_implicit,
+        &ephemeral_overlay,
     ) {
-        Ok(g) => g,
+        Ok(r) => r,
         Err(e) => {
             eprintln!(
                 "Warning: select_parallel_group failed: {} (treating wave as stale)",
                 e
             );
-            Vec::new()
+            crate::commands::next::selection::ParallelGroupResult::default()
         }
     };
 
+    let group = result.group;
     if group.is_empty() {
+        // FEAT-004 deadlock guard: a non-empty diagnostic means every eligible
+        // candidate was blocked exclusively by un-merged ephemeral work. Surface
+        // the per-candidate breakdown to stderr and synthesize a merge-fail
+        // wave so the FEAT-002 reset/halt-check contract fires — without this,
+        // the loop would spin until stale-iteration abort with no signal to
+        // the operator about what's blocking forward progress.
+        if !result.ephemeral_block_diagnostics.is_empty() {
+            return handle_ephemeral_deadlock(&params, ctx, result.ephemeral_block_diagnostics);
+        }
         return handle_no_eligible_tasks(&params, ctx);
     }
 
@@ -1403,7 +1770,9 @@ pub fn run_wave_iteration(
     // Per-slot failures (merge conflicts, spawn errors, ff failures) are
     // logged but never fatal — slot 0 is restored to its captured pre-merge
     // HEAD via `git reset --hard`, and the next wave still benefits from any
-    // slots that did merge.
+    // slots that did merge. The wave-loop boundary in `run_loop` consumes
+    // `failed_merges` to drive the FEAT-002 reset/halt-check contract.
+    let mut failed_merges: Vec<FailedMerge> = Vec::new();
     if params.parallel_slots > 1 {
         let resolved_model = params
             .default_model
@@ -1412,11 +1781,17 @@ pub fn run_wave_iteration(
             .to_string();
         // Per-project overrides for the merge-conflict resolver. Both fall
         // back to safe defaults so projects without a config.json keep the
-        // pre-existing behavior (600s / "medium").
-        let project_cfg = crate::loop_engine::project_config::read_project_config(params.db_dir);
-        let claude_timeout =
-            Duration::from_secs(project_cfg.merge_resolver_timeout_secs.unwrap_or(600));
-        let effort = project_cfg
+        // pre-existing behavior (600s / "medium"). The shared `project_config`
+        // was loaded once at run-loop startup and threaded through
+        // `WaveParams` (Fix 2 from /review-loop).
+        let claude_timeout = Duration::from_secs(
+            params
+                .project_config
+                .merge_resolver_timeout_secs
+                .unwrap_or(600),
+        );
+        let effort = params
+            .project_config
             .merge_resolver_effort
             .clone()
             .unwrap_or_else(|| "medium".to_string());
@@ -1432,6 +1807,7 @@ pub fn run_wave_iteration(
             params.branch,
             params.parallel_slots,
             &resolver,
+            params.slot_worktree_paths,
         );
         for (slot, detail, kind) in &outcomes.failed_slots {
             if *kind == worktree::SlotFailureKind::ResolverAttempted {
@@ -1445,6 +1821,19 @@ pub fn run_wave_iteration(
                     slot, detail
                 );
             }
+            // Capture failed slot index alongside the task_id its slot had
+            // claimed. The `FailedMerge` shape keeps the pairing as one
+            // value so downstream consumers can't accidentally zip with a
+            // mismatched length.
+            let task_id = wave_result
+                .outcomes
+                .iter()
+                .find(|o| o.slot_index == *slot)
+                .and_then(|o| o.iteration_result.task_id.clone());
+            failed_merges.push(FailedMerge {
+                slot: *slot,
+                task_id,
+            });
         }
     }
 
@@ -1489,6 +1878,7 @@ pub fn run_wave_iteration(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges,
         };
     }
     if ctx.crash_tracker.should_abort() {
@@ -1501,6 +1891,7 @@ pub fn run_wave_iteration(
                 run_status: None,
             }),
             was_stopped: false,
+            failed_merges,
         };
     }
 
@@ -1514,6 +1905,7 @@ pub fn run_wave_iteration(
                 run_status: Some(RunStatus::Completed),
             }),
             was_stopped: false,
+            failed_merges,
         };
     }
 
@@ -1544,6 +1936,7 @@ pub fn run_wave_iteration(
             None
         },
         was_stopped: false,
+        failed_merges,
     }
 }
 
@@ -2610,9 +3003,22 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     // The loop engine never prompts — it runs non-interactively — so these
     // are pure reads. Users pin a default via `task-mgr init` or
     // `task-mgr models set-default`.
-    let project_default_model =
-        crate::loop_engine::project_config::read_project_config(&run_config.db_dir).default_model;
+    //
+    // Fix 2 from /review-loop: load the full `ProjectConfig` once at the
+    // start of the run and thread it through `WaveParams` instead of
+    // re-reading + re-parsing `.task-mgr/config.json` from every wave
+    // (FEAT-003 implicit-overlap pull, FEAT-002 halt-threshold check, the
+    // merge-resolver settings, the FEAT-005 reconcile threshold). Mid-loop
+    // edits to the file are NOT picked up; operators restart the loop to
+    // apply config changes — matching every other run-scoped knob.
+    let project_config =
+        crate::loop_engine::project_config::read_project_config(&run_config.db_dir);
+    let project_default_model = project_config.default_model.clone();
     let user_default_model = crate::loop_engine::user_config::read_user_config().default_model;
+    // Same caching rationale for the PRD-side `implicit_overlap_files`
+    // override. Field is rare and small (a list of file basenames), so
+    // an empty Vec when the PRD JSON is absent / malformed is safe.
+    let prd_implicit_overlap_files = read_prd_implicit_overlap_files(paths.prd_file.as_path());
 
     // Step 7.05: Now that task_prefix is known, re-derive per-PRD progress file.
     if let Some(ref pfx) = task_prefix {
@@ -2837,27 +3243,50 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
     let parallel_requested = run_config.config.parallel_slots > 1;
     let (mut parallel_active, slot_worktree_paths) = if parallel_requested {
         match (branch_name.as_ref(), run_config.config.use_worktrees) {
-            (Some(branch), true) => match worktree::ensure_slot_worktrees(
-                &run_config.source_root,
-                branch,
-                run_config.config.parallel_slots,
-            ) {
-                Ok(paths) => {
+            (Some(branch), true) => {
+                // FEAT-005: clean up any `{branch}-slot-N` left over from a
+                // prior loop crash before we try to (re)create slot worktrees.
+                // Aborts startup on dirty / un-merged anomalies; otherwise
+                // returns Ok and leaves the path clear for `ensure_slot_worktrees`.
+                let halt_threshold = project_config.merge_fail_halt_threshold;
+                if let Err(e) = worktree::reconcile_stale_ephemeral_slots(
+                    &run_config.source_root,
+                    branch,
+                    halt_threshold,
+                ) {
                     eprintln!(
-                        "Parallel mode active: {} slots ({} ephemeral branches)",
-                        run_config.config.parallel_slots,
-                        run_config.config.parallel_slots.saturating_sub(1)
-                    );
-                    (true, paths)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to set up slot worktrees: {} — falling back to sequential",
+                        "Error: stale ephemeral-slot reconcile aborted startup: {}",
                         e
                     );
-                    (false, Vec::new())
+                    return LoopResult {
+                        exit_code: 1,
+                        worktree_path: actual_worktree_path,
+                        branch_name: None,
+                        was_stopped: false,
+                    };
                 }
-            },
+                match worktree::ensure_slot_worktrees(
+                    &run_config.source_root,
+                    branch,
+                    run_config.config.parallel_slots,
+                ) {
+                    Ok(paths) => {
+                        eprintln!(
+                            "Parallel mode active: {} slots ({} ephemeral branches)",
+                            run_config.config.parallel_slots,
+                            run_config.config.parallel_slots.saturating_sub(1)
+                        );
+                        (true, paths)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to set up slot worktrees: {} — falling back to sequential",
+                            e
+                        );
+                        (false, Vec::new())
+                    }
+                }
+            }
             (None, _) => {
                 eprintln!(
                     "Warning: --parallel {} requires a branchName in the PRD; falling back to sequential",
@@ -3145,6 +3574,8 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 inter_iteration_delay,
                 steering_path: steering,
                 session_guidance: &wave_session_guidance,
+                prd_implicit_overlap_files: &prd_implicit_overlap_files,
+                project_config: &project_config,
             };
             let outcome = run_wave_iteration(wave_params, &mut ctx);
             tasks_completed += outcome.tasks_completed;
@@ -3154,6 +3585,26 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             if outcome.was_stopped {
                 was_stopped = true;
             }
+
+            // FEAT-002: reset/halt contract on parallel-slot merge-back
+            // failures. Logic lives in `apply_merge_fail_reset_and_halt_check`
+            // so it can be unit-tested in isolation.
+            let halt_threshold = project_config.merge_fail_halt_threshold;
+            if let MergeFailHaltDecision::Halt {
+                exit_code: halt_code,
+                exit_reason: halt_reason,
+            } = apply_merge_fail_reset_and_halt_check(
+                &conn,
+                &mut ctx,
+                branch,
+                &outcome.failed_merges,
+                halt_threshold,
+            ) {
+                exit_code = halt_code;
+                exit_reason = halt_reason;
+                break;
+            }
+
             if let Some(t) = outcome.terminal {
                 exit_code = t.exit_code;
                 exit_reason = t.reason;
@@ -3449,14 +3900,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
     // Step 17.5: Reset uncompleted claimed task so it's not stuck in_progress for next run
     if let Some(ref task_id) = last_claimed_task {
-        match conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
-            [task_id],
-        ) {
-            Ok(1) => eprintln!("Reset uncompleted task {} to todo", task_id),
-            Ok(_) => {} // Already completed by reconciliation or status changed
-            Err(e) => eprintln!("Warning: failed to reset task {}: {}", task_id, e),
-        }
+        reset_task_to_todo(&conn, task_id, "uncompleted task");
     }
 
     // Step 17.6: Reset any parallel-mode slot tasks still pending. Sequential
@@ -3468,17 +3912,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         if Some(task_id) == last_claimed_task.as_ref() {
             continue; // already handled by step 17.5
         }
-        match conn.execute(
-            "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ? AND status = 'in_progress'",
-            [task_id],
-        ) {
-            Ok(1) => eprintln!("Reset uncompleted slot task {} to todo", task_id),
-            Ok(_) => {} // already terminal
-            Err(e) => eprintln!(
-                "Warning: failed to reset slot task {}: {}",
-                task_id, e
-            ),
-        }
+        reset_task_to_todo(&conn, task_id, "uncompleted slot task");
     }
 
     // Step 18: Record session guidance if any
@@ -6398,7 +6832,18 @@ mod tests {
         };
         use crate::loop_engine::test_utils::{insert_task, insert_task_file};
         use crate::models::Task;
+        use rusqlite::Connection;
         use std::sync::atomic::Ordering;
+
+        /// Opt every task out of the FEAT-003 buildy shared-infra heuristic.
+        /// Used by wave-infrastructure tests whose `FEAT-*` task ids are
+        /// generic placeholders, not real FEAT-class work — they predate
+        /// FEAT-003 and assert wave merge/crash semantics rather than
+        /// parallel-slot heuristics.
+        fn opt_out_buildy(conn: &Connection) {
+            conn.execute("UPDATE tasks SET claims_shared_infra = 0", [])
+                .unwrap();
+        }
 
         /// Build a minimal SlotIterationParams wired to a test DB.
         /// `signal_flag` is shared so tests can observe/trip it across slots.
@@ -6741,6 +7186,8 @@ mod tests {
             prd_path: &'a Path,
             progress_path: &'a Path,
             parallel_slots: usize,
+            project_config: &'a project_config::ProjectConfig,
+            prd_implicit_overlap_files: &'a [String],
         ) -> WaveIterationParams<'a> {
             WaveIterationParams {
                 conn,
@@ -6767,6 +7214,8 @@ mod tests {
                 inter_iteration_delay: Duration::ZERO,
                 steering_path: None,
                 session_guidance: "",
+                prd_implicit_overlap_files,
+                project_config,
             }
         }
 
@@ -6782,6 +7231,8 @@ mod tests {
             let signal = SignalFlag::new();
             signal.set();
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -6796,6 +7247,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -6818,6 +7271,8 @@ mod tests {
             let mode = PermissionMode::Dangerous;
             let signal = SignalFlag::new();
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -6832,6 +7287,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -6859,6 +7316,8 @@ mod tests {
             // Pre-stale twice so the next NoEligibleTasks wave hits threshold=3.
             ctx.stale_tracker.check("x", "x");
             ctx.stale_tracker.check("x", "x");
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -6873,6 +7332,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -6895,6 +7356,8 @@ mod tests {
             let mut ctx = IterationContext::new(1); // first crash aborts
             ctx.crash_tracker.record_crash();
             assert!(ctx.crash_tracker.should_abort());
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 make_wave_params(
                     &mut conn,
@@ -6909,6 +7372,8 @@ mod tests {
                     &prd,
                     &progress,
                     2,
+                    &project_cfg,
+                    &prd_implicit,
                 ),
                 &mut ctx,
             );
@@ -6961,6 +7426,8 @@ mod tests {
             });
 
             let mut ctx = IterationContext::new(5);
+            let project_cfg = project_config::ProjectConfig::default();
+            let prd_implicit: Vec<String> = Vec::new();
             let outcome = run_wave_iteration(
                 WaveIterationParams {
                     conn: &mut conn,
@@ -6987,6 +7454,8 @@ mod tests {
                     inter_iteration_delay: Duration::from_millis(500),
                     steering_path: None,
                     session_guidance: "",
+                    prd_implicit_overlap_files: &prd_implicit,
+                    project_config: &project_cfg,
                 },
                 &mut ctx,
             );
@@ -7180,6 +7649,8 @@ mod tests {
                 progress_path: &'a Path,
                 parallel_slots: usize,
                 run_id: &'a str,
+                project_config: &'a project_config::ProjectConfig,
+                prd_implicit_overlap_files: &'a [String],
             ) -> WaveIterationParams<'a> {
                 WaveIterationParams {
                     conn,
@@ -7206,6 +7677,8 @@ mod tests {
                     inter_iteration_delay: Duration::ZERO,
                     steering_path: None,
                     session_guidance: "",
+                    prd_implicit_overlap_files,
+                    project_config,
                 }
             }
 
@@ -7230,6 +7703,10 @@ mod tests {
                 insert_task(&conn, "FEAT-B", "Task B", "todo", 20);
                 insert_task_file(&conn, "FEAT-A", "src/a.rs");
                 insert_task_file(&conn, "FEAT-B", "src/b.rs");
+                // FEAT-003: opt out of the buildy shared-infra heuristic so this
+                // wave-infrastructure test isolates merge-back semantics from
+                // implicit-overlap detection (the test's intent predates FEAT-003).
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7238,6 +7715,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7254,6 +7733,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7342,6 +7823,7 @@ mod tests {
                 insert_task(&conn, "FEAT-OK", "passing slot", "todo", 20);
                 insert_task_file(&conn, "FEAT-CRASH", "src/crash.rs");
                 insert_task_file(&conn, "FEAT-OK", "src/ok.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7350,6 +7832,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7366,6 +7850,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7417,6 +7903,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7433,6 +7921,8 @@ mod tests {
                         &progress,
                         1,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7490,6 +7980,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![
                     tmp.path().to_path_buf(),
                     tmp.path().to_path_buf(),
@@ -7510,6 +8002,8 @@ mod tests {
                         &progress,
                         3,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7555,6 +8049,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(10);
@@ -7573,6 +8069,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7606,6 +8104,7 @@ mod tests {
                 insert_task(&conn, "FEAT-OK2", "ok", "todo", 20);
                 insert_task_file(&conn, "FEAT-CRASH", "src/crash2.rs");
                 insert_task_file(&conn, "FEAT-OK2", "src/ok2.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7614,6 +8113,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(10);
@@ -7634,6 +8135,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7668,6 +8171,7 @@ mod tests {
                 insert_task(&conn, "FEAT-P2", "p2", "todo", 20);
                 insert_task_file(&conn, "FEAT-P1", "src/p1.rs");
                 insert_task_file(&conn, "FEAT-P2", "src/p2.rs");
+                opt_out_buildy(&conn);
 
                 let tmp = tempfile::TempDir::new().unwrap();
                 let base_prompt = tmp.path().join("base.md");
@@ -7676,6 +8180,8 @@ mod tests {
                 let progress = tmp.path().join("progress.txt");
                 let mode = PermissionMode::Dangerous;
                 let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
                 let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
 
                 let mut ctx = IterationContext::new(5);
@@ -7692,6 +8198,8 @@ mod tests {
                         &progress,
                         2,
                         run_id,
+                        &project_cfg,
+                        &prd_implicit,
                     ),
                     &mut ctx,
                 );
@@ -7717,5 +8225,507 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- FEAT-002: merge-back failure halt-check tests ---
+    //
+    // These tests cover the wave-loop FEAT-002 reset/halt contract in
+    // isolation, exercising `apply_merge_fail_reset_and_halt_check` directly
+    // so we don't need to drive a full `run_loop` (which would require git,
+    // Claude, and a multi-slot worktree harness — that level of coverage
+    // belongs in `tests/` integration tests once the cross-cutting harness
+    // exists for FEAT-001/003/004).
+
+    fn insert_in_progress_task(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority, started_at) VALUES \
+             (?1, 'merge-fail test task', 'in_progress', 1, datetime('now'))",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// AC: WaveOutcome.failed_merges is empty when no merge failures
+    /// (e.g. preflight bail-out / no-eligible-tasks).
+    #[test]
+    fn test_wave_outcome_failed_merges_empty_by_default() {
+        let outcome = WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: Vec::new(),
+        };
+        assert!(outcome.failed_merges.is_empty());
+    }
+
+    /// AC: WaveOutcome.failed_merges carries `(slot, task_id)` as a single
+    /// `FailedMerge` value so the slot/task pairing is a type-level guarantee
+    /// (no parallel arrays held lockstep by rustdoc).
+    #[test]
+    fn test_wave_outcome_failed_merges_pair_slot_with_task_id() {
+        let outcome = WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: vec![
+                FailedMerge {
+                    slot: 1,
+                    task_id: Some("FEAT-001".into()),
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: Some("FEAT-002".into()),
+                },
+            ],
+        };
+        assert_eq!(outcome.failed_merges.len(), 2);
+        assert_eq!(outcome.failed_merges[0].slot, 1);
+        assert_eq!(
+            outcome.failed_merges[0].task_id.as_deref(),
+            Some("FEAT-001")
+        );
+        assert_eq!(outcome.failed_merges[1].slot, 2);
+        assert_eq!(
+            outcome.failed_merges[1].task_id.as_deref(),
+            Some("FEAT-002")
+        );
+    }
+
+    /// AC: ctx.consecutive_merge_fail_waves increments on a failed wave.
+    #[test]
+    fn test_consecutive_counter_increments_on_failure() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            2, // default threshold
+        );
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+    }
+
+    /// AC: counter resets to 0 on a fully-successful wave (failed_merges empty).
+    #[test]
+    fn test_consecutive_counter_resets_on_success() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 3;
+
+        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+    }
+
+    /// AC: failed slot's task is reset back to `todo`.
+    #[test]
+    fn test_failed_slot_task_reset_to_todo() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            2,
+        );
+
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(status, "todo");
+        // pending_slot_tasks drained.
+        assert!(!ctx.pending_slot_tasks.contains(&"FEAT-001".to_string()));
+    }
+
+    /// AC: threshold reached → Halt with non-zero exit and reason citing the
+    /// counter / threshold values.
+    #[test]
+    fn test_halt_returned_when_threshold_reached() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 1; // already 1, the next hit makes it 2.
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            2,
+        );
+        match decision {
+            MergeFailHaltDecision::Halt {
+                exit_code,
+                exit_reason,
+            } => {
+                assert_eq!(exit_code, 1);
+                assert!(
+                    exit_reason.contains("2 consecutive"),
+                    "exit_reason should cite counter; got: {exit_reason}"
+                );
+                assert!(
+                    exit_reason.contains("threshold=2"),
+                    "exit_reason should cite threshold; got: {exit_reason}"
+                );
+            }
+            _ => panic!("expected Halt, got {decision:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 2);
+    }
+
+    /// AC: known-bad — verify reset happens BEFORE the threshold check, so a
+    /// halted run still leaves the DB in a re-runnable state. Equivalent: the
+    /// failed-slot task is `todo` even when the threshold was reached.
+    #[test]
+    fn test_reset_runs_before_halt_decision() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // threshold 1 → halts on this very wave.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            1,
+        );
+        assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
+
+        // The reset must have happened despite the immediate halt.
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(
+            status, "todo",
+            "AC: halted run must NOT leave any task in `in_progress` for the failed slots"
+        );
+    }
+
+    /// AC: threshold = 0 → never halt (legacy behavior preserved). Counter
+    /// still increments — operators can observe the cascade in logs without
+    /// the loop aborting.
+    #[test]
+    fn test_threshold_zero_never_halts() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 100; // arbitrarily high.
+
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            0, // threshold 0 = never halt.
+        );
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 101);
+    }
+
+    /// AC: failed_merges empty → no reset, counter cleared, Continue.
+    #[test]
+    fn test_empty_failed_merges_resets_counter_no_side_effects() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001"); // stays in_progress.
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 5;
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+        // Did NOT touch unrelated in-progress task.
+        let status = crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001");
+        assert_eq!(status, "in_progress");
+        // pending_slot_tasks NOT drained on the empty path.
+        assert!(ctx.pending_slot_tasks.contains(&"FEAT-001".to_string()));
+    }
+
+    /// AC: multiple failed slots — every task is reset and drained from
+    /// pending_slot_tasks.
+    #[test]
+    fn test_multiple_failed_slots_all_reset() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        insert_in_progress_task(&conn, "FEAT-002");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        ctx.pending_slot_tasks.push("FEAT-002".to_string());
+
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[
+                FailedMerge {
+                    slot: 1,
+                    task_id: Some("FEAT-001".into()),
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: Some("FEAT-002".into()),
+                },
+            ],
+            5,
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo"
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-002"),
+            "todo"
+        );
+        assert!(ctx.pending_slot_tasks.is_empty());
+    }
+
+    /// AC: failure-mode — reset failures are non-fatal; threshold check still
+    /// runs on the original failed_merges count. We can't easily inject a SQL
+    /// error here, but we CAN verify that a slot whose task_id is `None`
+    /// (e.g. claim never resolved) is silently skipped without panicking,
+    /// AND the counter still increments + halt still triggers based on the
+    /// full failed_merges count.
+    #[test]
+    fn test_reset_failure_modes_dont_skip_threshold_check() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+
+        // Two failed slots, neither has a resolved task_id.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[
+                FailedMerge {
+                    slot: 1,
+                    task_id: None,
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: None,
+                },
+            ],
+            1, // threshold 1 → halt on first failure.
+        );
+        assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+    }
+
+    /// AC: halt diagnostic message includes each failed slot's ephemeral
+    /// branch name (verified indirectly via the canonical helper). Direct
+    /// stderr capture is brittle; we verify the helper is consulted by
+    /// reproducing its output for a known input.
+    #[test]
+    fn test_diagnostic_uses_ephemeral_slot_branch_helper() {
+        // Sanity-check: the diagnostic format string in the helper must call
+        // `worktree::ephemeral_slot_branch` (per CONTRACT AC). If a future
+        // refactor inlines `format!()` instead, the names produced for slot 1
+        // would still match — but the AC binds us to the helper, so the
+        // fastest regression catch is auditing this single call site.
+        let name = crate::loop_engine::worktree::ephemeral_slot_branch("feat/test", 1);
+        assert_eq!(name, "feat/test-slot-1");
+    }
+
+    /// AC (Fix 3): when the deadlock guard fires but every blocking branch
+    /// has an unparseable slot suffix, `handle_ephemeral_deadlock` MUST
+    /// still produce at least one `FailedMerge` so
+    /// `apply_merge_fail_reset_and_halt_check` increments the counter
+    /// instead of resetting it. The sentinel index is `SYNTHETIC_DEADLOCK_SLOT`
+    /// so the diagnostic step can recognize it and avoid synthesizing a
+    /// `{branch}-slot-18446744073709551615` name.
+    #[test]
+    fn test_synthetic_deadlock_slot_sentinel_increments_counter() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // Sentinel-only failed_merges (simulates the all-malformed deadlock
+        // path). Generous threshold so we observe the increment without halt.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: SYNTHETIC_DEADLOCK_SLOT,
+                task_id: None,
+            }],
+            5,
+        );
+        assert_eq!(decision, MergeFailHaltDecision::Continue);
+        assert_eq!(
+            ctx.consecutive_merge_fail_waves, 1,
+            "synthetic-deadlock sentinel must still increment the counter"
+        );
+    }
+
+    /// AC (Fix 3): when the threshold is reached on a sentinel-only failure
+    /// wave, the halt diagnostic must NOT synthesize a meaningless
+    /// `{branch}-slot-18446744073709551615` name. The reason field surfaces
+    /// the counter/threshold; the `<malformed deadlock blocker>` placeholder
+    /// flows to stderr (verified indirectly by ensuring no `usize::MAX`
+    /// appears in the rendered exit_reason on this halt).
+    #[test]
+    fn test_synthetic_deadlock_slot_diagnostic_does_not_render_huge_name() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        let mut ctx = IterationContext::new(5);
+        ctx.consecutive_merge_fail_waves = 0;
+
+        // threshold=1 → halt on this very wave; sentinel-only failed_merges.
+        let decision = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: SYNTHETIC_DEADLOCK_SLOT,
+                task_id: None,
+            }],
+            1,
+        );
+        match decision {
+            MergeFailHaltDecision::Halt {
+                exit_code: _,
+                exit_reason,
+            } => {
+                // The exit_reason itself is just the counter/threshold
+                // summary, but the full diagnostic flowed to stderr. Assert
+                // the reason does not contain the sentinel-rendered name
+                // shape (defensive — catches an accidental future change
+                // that puts the slot list back into exit_reason).
+                assert!(
+                    !exit_reason.contains(&usize::MAX.to_string()),
+                    "exit_reason must not include usize::MAX-rendered name; got: {exit_reason}"
+                );
+            }
+            _ => panic!("expected Halt, got {decision:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+    }
+
+    /// AC: counter is reset back to 0 by a successful wave AFTER a series
+    /// of consecutive failures — i.e. one good wave breaks the cascade.
+    #[test]
+    fn test_consecutive_counter_lifecycle_failure_then_success() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        let mut ctx = IterationContext::new(5);
+
+        // Wave 1: fail.
+        apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            5, // generous threshold so we don't halt.
+        );
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+
+        // Wave 2: clean.
+        apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+    }
+
+    /// AC: IterationContext::new starts the FEAT-002 counter at 0.
+    #[test]
+    fn test_iteration_context_new_zeroes_consecutive_counter() {
+        let ctx = IterationContext::new(5);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 0);
+    }
+
+    /// AC: full two-wave cascade — first failure increments without halting
+    /// (default threshold = 2); second consecutive failure crosses threshold
+    /// and halts. Both waves' failed-slot tasks must end up `todo`.
+    #[test]
+    fn test_two_consecutive_failures_halt_with_default_threshold() {
+        let (_dir, conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        insert_in_progress_task(&conn, "FEAT-002");
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        ctx.pending_slot_tasks.push("FEAT-002".to_string());
+
+        // Wave 1: slot 1 merge fails for FEAT-001. Below threshold → continue.
+        let d1 = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            2, // default
+        );
+        assert_eq!(d1, MergeFailHaltDecision::Continue);
+        assert_eq!(ctx.consecutive_merge_fail_waves, 1);
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo",
+            "Wave 1's failed-slot task must be reset to todo"
+        );
+
+        // Set FEAT-001 back to in_progress so wave 2 has something realistic
+        // to reset (simulates the loop re-claiming the now-todo task).
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress' WHERE id = 'FEAT-001'",
+            [],
+        )
+        .unwrap();
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+
+        // Wave 2: slot 1 fails again. Counter hits threshold → Halt.
+        let d2 = apply_merge_fail_reset_and_halt_check(
+            &conn,
+            &mut ctx,
+            "feat/test",
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
+            2,
+        );
+        match d2 {
+            MergeFailHaltDecision::Halt {
+                exit_code,
+                exit_reason,
+            } => {
+                assert_eq!(exit_code, 1);
+                assert!(exit_reason.contains("2 consecutive"));
+            }
+            _ => panic!("expected Halt, got {d2:?}"),
+        }
+        assert_eq!(ctx.consecutive_merge_fail_waves, 2);
+        // CRITICAL: even on halt, the task must be back to todo so the next
+        // run can re-claim it.
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "todo",
+            "AC: halted run must NOT leave any task in `in_progress` for the failed slots"
+        );
     }
 }

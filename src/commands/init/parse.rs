@@ -67,6 +67,14 @@ pub struct PrdUserStory {
     /// Maps to `tasks.human_review_timeout` (INTEGER DEFAULT NULL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_review_timeout: Option<u32>,
+    /// Per-task override for parallel-slot shared-infra slot claiming (FEAT-003).
+    /// `Some(true)` forces the claim regardless of file paths or task-id prefix;
+    /// `Some(false)` opts the task OUT of the buildy-prefix heuristic AND any
+    /// implicit path-based detection; `None` (default) falls through to the
+    /// implicit detection logic in `select_parallel_group`.
+    /// Maps to `tasks.claims_shared_infra` (INTEGER DEFAULT NULL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_shared_infra: Option<bool>,
 }
 
 #[cfg(test)]
@@ -135,6 +143,71 @@ mod tests {
         assert_eq!(story.human_review_timeout, None);
     }
 
+    // ---- claimsSharedInfra (FEAT-003) deserialization ----
+
+    #[test]
+    fn test_prd_story_deserializes_claims_shared_infra_true() {
+        let json = minimal_story(r#","claimsSharedInfra": true"#);
+        let story = parse_story(&json);
+        assert_eq!(story.claims_shared_infra, Some(true));
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_claims_shared_infra_false() {
+        let json = minimal_story(r#","claimsSharedInfra": false"#);
+        let story = parse_story(&json);
+        assert_eq!(story.claims_shared_infra, Some(false));
+    }
+
+    #[test]
+    fn test_prd_story_deserializes_claims_shared_infra_absent() {
+        let json = minimal_story("");
+        let story = parse_story(&json);
+        assert_eq!(story.claims_shared_infra, None);
+    }
+
+    #[test]
+    fn test_prd_file_implicit_overlap_files_absent_is_none() {
+        let json = r#"{
+            "project": "Test",
+            "userStories": []
+        }"#;
+        let prd: PrdFile = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(prd.implicit_overlap_files, None);
+    }
+
+    #[test]
+    fn test_prd_file_implicit_overlap_files_round_trips() {
+        let json = r#"{
+            "project": "Test",
+            "userStories": [],
+            "implicitOverlapFiles": ["custom.lock", "tofu.lock.hcl"]
+        }"#;
+        let prd: PrdFile = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(
+            prd.implicit_overlap_files.as_deref(),
+            Some(&["custom.lock".to_string(), "tofu.lock.hcl".to_string()][..]),
+        );
+    }
+
+    /// Defense-in-depth: malformed `implicit_overlap_files` (non-string entries)
+    /// is rejected at parse time with a clear serde error rather than silently
+    /// degrading. The baseline + project-config still apply via the call-site
+    /// merge, but this PRD's contribution is explicitly invalid.
+    #[test]
+    fn test_prd_file_implicit_overlap_files_malformed_entries_fail_parse() {
+        let json = r#"{
+            "project": "Test",
+            "userStories": [],
+            "implicitOverlapFiles": [42, true]
+        }"#;
+        let result: Result<PrdFile, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "non-string entries in implicitOverlapFiles must be rejected"
+        );
+    }
+
     // ---- combined: both fields ----
 
     #[test]
@@ -181,4 +254,10 @@ pub struct PrdFile {
     /// Maps to `prd_metadata.default_max_retries` in the database after import.
     #[serde(default)]
     pub default_max_retries: Option<i32>,
+    /// PRD-level override for the implicit shared-infra basename list (FEAT-003).
+    /// Extends (does not replace) the baseline `IMPLICIT_OVERLAP_FILES` plus
+    /// `ProjectConfig::implicit_overlap_files`. Match is by basename across
+    /// any path in a task's `touchesFiles`.
+    #[serde(default)]
+    pub implicit_overlap_files: Option<Vec<String>>,
 }

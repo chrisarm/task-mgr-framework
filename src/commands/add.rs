@@ -76,6 +76,8 @@ pub struct AddTaskInput {
     pub requires_human: Option<bool>,
     #[serde(default)]
     pub human_review_timeout: Option<u32>,
+    #[serde(default)]
+    pub claims_shared_infra: Option<bool>,
 }
 
 impl AddTaskInput {
@@ -129,6 +131,7 @@ impl AddTaskInput {
             max_retries: self.max_retries,
             requires_human: self.requires_human,
             human_review_timeout: self.human_review_timeout,
+            claims_shared_infra: self.claims_shared_infra,
         }
     }
 }
@@ -649,6 +652,7 @@ mod tests {
             max_retries: None,
             requires_human: None,
             human_review_timeout: None,
+            claims_shared_infra: None,
         }
     }
 
@@ -854,6 +858,7 @@ mod tests {
             max_retries: None,
             requires_human: None,
             human_review_timeout: None,
+            claims_shared_infra: None,
         };
 
         append_task_to_prd_json(tmp.path(), &story, &[]).unwrap();
@@ -903,6 +908,7 @@ mod tests {
             max_retries: None,
             requires_human: None,
             human_review_timeout: None,
+            claims_shared_infra: None,
         };
         let err = append_task_to_prd_json(tmp.path(), &story, &[]).unwrap_err();
         assert!(format!("{err}").contains("DUP-001"));

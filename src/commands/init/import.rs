@@ -323,8 +323,9 @@ pub fn insert_task(
         r#"INSERT INTO tasks
            (id, title, description, priority, status, notes, acceptance_criteria,
             review_scope, severity, source_review, model, difficulty, escalation_note,
-            required_tests, max_retries, requires_human, human_review_timeout)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            required_tests, max_retries, requires_human, human_review_timeout,
+            claims_shared_infra)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             story.id,
             story.title,
@@ -343,6 +344,7 @@ pub fn insert_task(
             max_retries,
             story.requires_human.unwrap_or(false) as i32,
             story.human_review_timeout,
+            story.claims_shared_infra.map(|b| b as i32),
         ],
     )?;
 
@@ -442,6 +444,7 @@ pub fn update_task(
            source_review = ?, model = ?, difficulty = ?, escalation_note = ?,
            required_tests = ?, max_retries = ?,
            requires_human = ?, human_review_timeout = ?,
+           claims_shared_infra = ?,
            archived_at = NULL,
            updated_at = datetime('now')
            WHERE id = ?"#,
@@ -461,6 +464,7 @@ pub fn update_task(
             max_retries,
             story.requires_human.unwrap_or(false) as i32,
             story.human_review_timeout,
+            story.claims_shared_infra.map(|b| b as i32),
             story.id,
         ],
     )?;
@@ -579,6 +583,7 @@ mod tests {
             max_retries: None,
             requires_human,
             human_review_timeout: None,
+            claims_shared_infra: None,
         }
     }
 

@@ -10,6 +10,7 @@
 //! performance through separate simple queries and in-memory scoring.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -41,6 +42,71 @@ pub const PRIORITY_BASE: i32 = 1000;
 /// that should defer a milestone, use the bare prefix.
 const SPAWNED_FIXUP_PREFIXES: &[&str] = &["REFACTOR-N", "CODE-FIX", "WIRE-FIX", "IMPL-FIX"];
 
+/// Task-ID prefixes that are treated as "buildy" — they touch shared build
+/// infrastructure (Cargo.lock, lockfiles, generated config) and so must
+/// contend for a single synthetic shared-infra slot per parallel wave (FEAT-003).
+///
+/// **Superset relationship**: This list is a strict superset of
+/// `SPAWNED_FIXUP_PREFIXES`. The fixup prefixes are buildy because they
+/// originate from CODE-REVIEW spawns that often touch lockfiles or shared
+/// build state; raw `FEAT` and `REFACTOR` (without `-N`) are buildy because
+/// new feature work typically pulls dependencies. If you add a new ad-hoc
+/// spawn prefix to `SPAWNED_FIXUP_PREFIXES`, also add it here so the
+/// shared-infra slot semantics stay consistent.
+///
+/// Tasks whose id does NOT match a buildy prefix (TEST, CLARIFY, DOCS,
+/// MILESTONE, CODE-REVIEW, HUMAN-REVIEW, etc.) parallelize freely — they
+/// only contend on real path overlap.
+pub(crate) const BUILDY_TASK_PREFIXES: &[&str] = &[
+    "FEAT",
+    "REFACTOR",
+    "REFACTOR-N",
+    "CODE-FIX",
+    "WIRE-FIX",
+    "IMPL-FIX",
+];
+
+/// Baseline list of build-system files that act as a single shared-infra slot
+/// in `select_parallel_group` (FEAT-003). Match is by basename across ANY
+/// path in a task's `touchesFiles` (so `examples/foo/Cargo.lock` matches as
+/// readily as `Cargo.lock`).
+///
+/// Covers Rust / Python / JavaScript / Go ecosystems out-of-the-box.
+/// Per-project (`ProjectConfig::implicit_overlap_files`) and per-PRD
+/// (`PrdFile::implicit_overlap_files`) entries EXTEND this baseline rather
+/// than replacing it, so users opt IN to extra shared-infra files without
+/// losing the language defaults.
+pub(crate) const IMPLICIT_OVERLAP_FILES: &[&str] = &[
+    // Rust
+    "Cargo.lock",
+    "Cargo.toml",
+    // Python
+    "uv.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "requirements.lock",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    // JavaScript / TypeScript
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "npm-shrinkwrap.json",
+    "bun.lockb",
+    // Go
+    "go.mod",
+    "go.sum",
+    "go.work",
+    "go.work.sum",
+];
+
+/// Synthetic claim token added to `used_files` in `select_parallel_group`
+/// when a task is recognized as a shared-infra-claimer. NOT a real path —
+/// the leading underscores guarantee no real `touchesFiles` entry collides.
+const SHARED_INFRA_TOKEN: &str = "__shared_infra__";
+
 /// True iff `id` contains the literal `{prefix}-` token at a `-`-bounded
 /// position (start-of-id OR following a `-`).
 ///
@@ -51,6 +117,47 @@ const SPAWNED_FIXUP_PREFIXES: &[&str] = &["REFACTOR-N", "CODE-FIX", "WIRE-FIX", 
 fn id_body_matches_prefix(id: &str, prefix: &str) -> bool {
     let needle = format!("{prefix}-");
     id.starts_with(&needle) || id.contains(&format!("-{needle}"))
+}
+
+/// True iff `id` matches any [`BUILDY_TASK_PREFIXES`] entry via the same
+/// token-aware boundary check used by the soft-dep guard. Reuses
+/// [`id_body_matches_prefix`] verbatim — no parallel matcher.
+///
+/// Critically handles UUID-prefixed task ids like `cbd7d081-FEAT-001` (a
+/// naive `id.starts_with("FEAT")` check would silently miss them).
+pub(crate) fn id_has_buildy_prefix(id: &str) -> bool {
+    BUILDY_TASK_PREFIXES
+        .iter()
+        .any(|p| id_body_matches_prefix(id, p))
+}
+
+/// True iff any path in `files` has a basename that appears in `implicit_set`.
+/// Falls back to the full path string when `Path::file_name()` returns None
+/// (e.g. inputs like `"."` or `""`); the implicit set never contains those
+/// sentinels so the lookup is harmless and saves a None-branch in callers.
+fn has_implicit_overlap(files: &[String], implicit_set: &HashSet<&str>) -> bool {
+    files.iter().any(|f| {
+        let basename = Path::new(f.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(f.as_str());
+        implicit_set.contains(basename)
+    })
+}
+
+/// Apply `claims_shared_infra` precedence to the implicit-detection result.
+/// `Some(true)` forces the claim; `Some(false)` opts out completely; `None`
+/// falls through to `via_path || via_prefix`.
+fn resolve_shared_infra_claim(
+    explicit_override: Option<bool>,
+    via_path: bool,
+    via_prefix: bool,
+) -> bool {
+    match explicit_override {
+        Some(true) => true,
+        Some(false) => false,
+        None => via_path || via_prefix,
+    }
 }
 
 /// True iff `task.id` itself matches any fixup prefix (sibling fixups are
@@ -150,6 +257,27 @@ pub struct SelectionResult {
     /// Top 5 candidates with scoring (for verbose output)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_candidates: Vec<ScoredTask>,
+}
+
+/// Result returned by `select_parallel_group` (FEAT-004).
+///
+/// Carries both the chosen group AND a deadlock diagnostic. The diagnostic
+/// is non-empty ONLY when `group` is empty AND at least one eligible
+/// candidate was rejected exclusively because of the cross-wave ephemeral
+/// overlay (i.e. its files overlap an un-merged `{branch}-slot-N` branch).
+///
+/// The engine treats `group.is_empty() && !ephemeral_block_diagnostics.is_empty()`
+/// as equivalent to a wave with `failed_merges` non-empty so the FEAT-002
+/// reset/halt-check contract fires and the loop halts cleanly with named
+/// blocking branches instead of spinning until stale-iteration abort.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ParallelGroupResult {
+    /// Selected tasks (greedy, sorted by total_score DESC).
+    pub group: Vec<ScoredTask>,
+    /// `(candidate_id, sorted_blocking_branch_names)` for each candidate that
+    /// was filtered out exclusively because of cross-wave ephemeral overlap.
+    /// Entries are sorted by `candidate_id` for stable diagnostics output.
+    pub ephemeral_block_diagnostics: Vec<(String, Vec<String>)>,
 }
 
 /// Score, filter, and sort all eligible todo tasks.
@@ -339,7 +467,8 @@ fn get_todo_tasks(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult
          last_error, error_count, \
          blocked_at_iteration, skipped_at_iteration, \
          model, difficulty, escalation_note, \
-         requires_human, human_review_timeout \
+         requires_human, human_review_timeout, \
+         claims_shared_infra \
          FROM tasks WHERE status = 'todo' AND archived_at IS NULL {prefix_clause} ORDER BY priority ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -426,11 +555,61 @@ fn get_all_task_files(
 ///
 /// 1. Score all eligible tasks identically to `select_next_task`.
 /// 2. Sort by total_score DESC, priority ASC.
-/// 3. Greedy pass: accept each candidate unless any of its files appear in the
-///    set of files already claimed by an accepted task.
-/// 4. Tasks with zero `touchesFiles` entries have no conflicts and are always
-///    eligible.
+/// 3. Greedy pass: accept each candidate unless any file it claims appears in
+///    the set of files already claimed by an accepted task.
+/// 4. Tasks with zero `touchesFiles` entries AND no synthetic shared-infra
+///    claim have no conflicts and are always eligible.
 /// 5. Stop once `max_slots` tasks are accepted.
+///
+/// # Implicit shared-infra detection (FEAT-003)
+///
+/// In addition to a candidate's `touchesFiles`, a synthetic
+/// [`SHARED_INFRA_TOKEN`] is added to the claim set when ANY of:
+///
+/// - **(a)** a file in `candidate.files` has a basename in
+///   [`IMPLICIT_OVERLAP_FILES`] ∪ `extra_implicit_overlap_files` (both are
+///   matched by basename — full paths like `examples/foo/Cargo.lock` count).
+/// - **(b)** the candidate's id matches a [`BUILDY_TASK_PREFIXES`] entry via
+///   [`id_has_buildy_prefix`].
+/// - **(c)** the candidate's `claims_shared_infra` field is `Some(true)`.
+///
+/// `claims_shared_infra: Some(false)` overrides BOTH (a) and (b) — explicit
+/// opt-out for tasks the operator knows are safe to parallelize.
+/// `claims_shared_infra: None` falls through to (a) ∨ (b).
+///
+/// The synthetic claim lives ONLY in the in-memory `used_files` set; a task's
+/// persisted `touchesFiles` is never mutated.
+///
+/// # Cross-wave ephemeral-branch overlay (FEAT-004)
+///
+/// `ephemeral_overlay` is a list of `(branch_name, files)` pairs representing
+/// un-merged work on `{branch}-slot-N` ephemeral branches from prior waves.
+/// Caller (engine.rs) computes this ONCE per wave via
+/// [`crate::loop_engine::worktree::list_unmerged_branch_files`] for each
+/// branch returned by
+/// [`crate::loop_engine::worktree::list_ephemeral_slot_branches`].
+///
+/// Each file from the overlay is added to `used_files` BEFORE the greedy pass
+/// runs, so a candidate whose `touchesFiles` intersects an un-merged
+/// ephemeral file is filtered out the same way it would be by an
+/// already-accepted task in the same wave. This serializes work across waves
+/// even when DB state alone says nothing is contended.
+///
+/// **Deadlock guard**: when the greedy pass produces an empty group AND at
+/// least one candidate was skipped EXCLUSIVELY because of the overlay (i.e.
+/// every overlapping file belongs to an ephemeral branch — never to an
+/// already-accepted task in the same wave), the result's
+/// [`ParallelGroupResult::ephemeral_block_diagnostics`] is populated so the
+/// engine layer can halt cleanly with named blocking branches instead of
+/// spinning until stale-iteration abort.
+///
+/// # Arguments
+///
+/// * `extra_implicit_overlap_files` — Project- and PRD-level extensions to the
+///   baseline implicit list. Pass `&[]` when no extensions apply.
+/// * `ephemeral_overlay` — Cross-wave file claims; pass `&[]` when no
+///   ephemeral branches exist (cleanly-recovered loop). With an empty
+///   overlay, behavior is identical to the pre-FEAT-004 implementation.
 ///
 /// The returned group is ordered by total_score descending.
 pub fn select_parallel_group(
@@ -438,37 +617,115 @@ pub fn select_parallel_group(
     after_files: &[String],
     task_prefix: Option<&str>,
     max_slots: usize,
-) -> TaskMgrResult<Vec<ScoredTask>> {
+    extra_implicit_overlap_files: &[String],
+    ephemeral_overlay: &[(String, Vec<String>)],
+) -> TaskMgrResult<ParallelGroupResult> {
     if max_slots == 0 {
-        return Ok(Vec::new());
+        return Ok(ParallelGroupResult::default());
     }
 
     let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
 
     if scored_tasks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParallelGroupResult::default());
     }
+
+    // Union of baseline + project-config + PRD extensions, computed once per call.
+    let implicit_set: HashSet<&str> = IMPLICIT_OVERLAP_FILES
+        .iter()
+        .copied()
+        .chain(extra_implicit_overlap_files.iter().map(String::as_str))
+        .collect();
+
+    // FEAT-004: file → list of ephemeral branches claiming it (cross-wave overlay).
+    // Built once per call so overlap probes are O(1) per candidate file.
+    let mut ephemeral_file_to_branches: HashMap<String, Vec<String>> = HashMap::new();
+    for (branch, files) in ephemeral_overlay {
+        for f in files {
+            let entry = ephemeral_file_to_branches.entry(f.clone()).or_default();
+            if !entry.contains(branch) {
+                entry.push(branch.clone());
+            }
+        }
+    }
+    let has_ephemeral_overlay = !ephemeral_file_to_branches.is_empty();
 
     let mut group: Vec<ScoredTask> = Vec::new();
     let mut used_files: HashSet<String> = HashSet::new();
+    // Track per-candidate ephemeral-only blockers so the deadlock guard can
+    // surface them when the greedy pass yields an empty group.
+    let mut exclusive_ephemeral_blocks: Vec<(String, Vec<String>)> = Vec::new();
 
     for candidate in scored_tasks {
         if group.len() >= max_slots {
             break;
         }
-        if !candidate.files.is_empty()
-            && candidate
-                .files
-                .iter()
-                .any(|f| used_files.contains(f.as_str()))
-        {
+
+        // Compute the candidate's full claim set: real files + (optionally) the
+        // synthetic shared-infra token. `via_path` is computed before `via_prefix`
+        // so an opt-out (`Some(false)`) costs only the path check.
+        let via_path = has_implicit_overlap(&candidate.files, &implicit_set);
+        let via_prefix = id_has_buildy_prefix(&candidate.task.id);
+        let claims_infra =
+            resolve_shared_infra_claim(candidate.task.claims_shared_infra, via_path, via_prefix);
+
+        // Conflict check on the COMBINED claim set so the synthetic token
+        // serializes buildy tasks with otherwise-disjoint files.
+        let real_overlap = candidate
+            .files
+            .iter()
+            .any(|f| used_files.contains(f.as_str()));
+        let infra_overlap = claims_infra && used_files.contains(SHARED_INFRA_TOKEN);
+
+        // Cross-wave ephemeral overlap. Computed independently of `real_overlap`
+        // so the deadlock-guard accounting can distinguish ephemeral-only blocks
+        // from real-task blocks (only the former is "exclusively blocked").
+        let mut ephemeral_blockers: Vec<String> = Vec::new();
+        if has_ephemeral_overlay {
+            for f in &candidate.files {
+                if let Some(branches) = ephemeral_file_to_branches.get(f) {
+                    for b in branches {
+                        if !ephemeral_blockers.contains(b) {
+                            ephemeral_blockers.push(b.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let has_ephemeral_overlap = !ephemeral_blockers.is_empty();
+
+        if real_overlap || infra_overlap || has_ephemeral_overlap {
+            // Record only when ephemeral was the SOLE reason for skipping —
+            // otherwise the candidate would have been deferred regardless of
+            // the cross-wave overlay and the diagnostic would be misleading.
+            if has_ephemeral_overlap && !real_overlap && !infra_overlap {
+                ephemeral_blockers.sort();
+                exclusive_ephemeral_blocks.push((candidate.task.id.clone(), ephemeral_blockers));
+            }
             continue;
         }
+
         used_files.extend(candidate.files.iter().cloned());
+        if claims_infra {
+            used_files.insert(SHARED_INFRA_TOKEN.to_string());
+        }
         group.push(candidate);
     }
 
-    Ok(group)
+    // Deadlock guard: only populate diagnostics when the wave produced no
+    // group at all. A non-empty group means SOME progress is possible, even
+    // if other candidates were ephemeral-blocked — and surfacing diagnostics
+    // there would spuriously trip the engine's merge-fail wave handling.
+    let mut ephemeral_block_diagnostics = Vec::new();
+    if group.is_empty() && !exclusive_ephemeral_blocks.is_empty() {
+        exclusive_ephemeral_blocks.sort_by(|a, b| a.0.cmp(&b.0));
+        ephemeral_block_diagnostics = exclusive_ephemeral_blocks;
+    }
+
+    Ok(ParallelGroupResult {
+        group,
+        ephemeral_block_diagnostics,
+    })
 }
 
 /// Format selection result as human-readable text.
