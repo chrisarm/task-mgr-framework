@@ -664,92 +664,12 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
     branch_name: &str,
     halt_threshold: u32,
 ) -> TaskMgrResult<()> {
-    // Cheap up-front prune: if a worktree directory was deleted out-of-band,
-    // git's internal registry may still hold a stale entry that prevents
-    // `git branch -D` from succeeding. Pruning is best-effort.
-    let _ = Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(project_root)
-        .output();
-
-    let pattern = format!("{}-slot-*", branch_name);
-    // `--format='%(refname:short)'` returns bare branch names. Without it,
-    // `git branch --list` prefixes lines with `* ` (current branch) or
-    // `+ ` (branch checked out in another worktree) — those markers would
-    // corrupt downstream classification.
-    let output = Command::new("git")
-        .args(["branch", "--list", "--format=%(refname:short)", &pattern])
-        .current_dir(project_root)
-        .output()
-        .map_err(|e| {
-            TaskMgrError::io_error(
-                project_root.display().to_string(),
-                "running git branch --list",
-                e,
-            )
-        })?;
-
-    if !output.status.success() {
-        eprintln!(
-            "warning: git branch --list failed during stale-ephemeral reconcile (continuing): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let branches: Vec<String> = stdout
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
+    let branches = enumerate_stale_ephemeral_branches(project_root, branch_name)?;
     if branches.is_empty() {
         return Ok(());
     }
 
-    let mut unmerged: Vec<(String, Vec<String>)> = Vec::new();
-    let mut dirty_paths: Vec<PathBuf> = Vec::new();
-
-    for ephemeral in &branches {
-        match classify_ephemeral_branch(project_root, branch_name, ephemeral) {
-            Ok(EphemeralCase::OrphanBranch) => {
-                if let Err(e) = delete_branch_force(project_root, ephemeral) {
-                    eprintln!(
-                        "warning: failed to delete orphan ephemeral branch {} (continuing): {}",
-                        ephemeral, e
-                    );
-                } else {
-                    eprintln!("Deleted orphan ephemeral branch {}", ephemeral);
-                }
-            }
-            Ok(EphemeralCase::CleanMerged { worktree_path }) => {
-                if let Err(e) = delete_merged_ephemeral(project_root, &worktree_path, ephemeral) {
-                    eprintln!(
-                        "warning: failed to clean already-merged ephemeral {} (continuing): {}",
-                        ephemeral, e
-                    );
-                } else {
-                    eprintln!(
-                        "Cleaned already-merged ephemeral branch {} and its worktree",
-                        ephemeral
-                    );
-                }
-            }
-            Ok(EphemeralCase::CleanUnmerged { commits }) => {
-                unmerged.push((ephemeral.clone(), commits));
-            }
-            Ok(EphemeralCase::Dirty { worktree_path }) => {
-                dirty_paths.push(worktree_path);
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to classify ephemeral branch {} during reconcile (continuing): {}",
-                    ephemeral, e
-                );
-            }
-        }
-    }
+    let (unmerged, dirty_paths) = classify_stale_branches(project_root, branch_name, &branches);
 
     // Emit warnings for un-merged branches whether or not we're going to
     // abort — the operator needs to see the commit subjects either way.
@@ -803,6 +723,104 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
     }
 
     Ok(())
+}
+
+/// Prune stale worktree registry entries and return all `{branch}-slot-N`
+/// branch names. Returns an empty vec (with a warning) if git fails.
+fn enumerate_stale_ephemeral_branches(
+    project_root: &Path,
+    branch_name: &str,
+) -> TaskMgrResult<Vec<String>> {
+    // Cheap up-front prune: if a worktree directory was deleted out-of-band,
+    // git's internal registry may still hold a stale entry that prevents
+    // `git branch -D` from succeeding. Pruning is best-effort.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(project_root)
+        .output();
+
+    let pattern = format!("{}-slot-*", branch_name);
+    // `--format=%(refname:short)` returns bare branch names, avoiding the
+    // `* ` / `+ ` markers `git branch --list` emits for checked-out branches.
+    let output = Command::new("git")
+        .args(["branch", "--list", "--format=%(refname:short)", &pattern])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| {
+            TaskMgrError::io_error(
+                project_root.display().to_string(),
+                "running git branch --list",
+                e,
+            )
+        })?;
+
+    if !output.status.success() {
+        eprintln!(
+            "warning: git branch --list failed during stale-ephemeral reconcile (continuing): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(Vec::new());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Classify each ephemeral branch, immediately cleaning orphans and merged
+/// branches. Returns accumulated `(unmerged, dirty_paths)` for the caller
+/// to act on.
+fn classify_stale_branches(
+    project_root: &Path,
+    branch_name: &str,
+    branches: &[String],
+) -> (Vec<(String, Vec<String>)>, Vec<PathBuf>) {
+    let mut unmerged: Vec<(String, Vec<String>)> = Vec::new();
+    let mut dirty_paths: Vec<PathBuf> = Vec::new();
+
+    for ephemeral in branches {
+        match classify_ephemeral_branch(project_root, branch_name, ephemeral) {
+            Ok(EphemeralCase::OrphanBranch) => {
+                if let Err(e) = delete_branch_force(project_root, ephemeral) {
+                    eprintln!(
+                        "warning: failed to delete orphan ephemeral branch {} (continuing): {}",
+                        ephemeral, e
+                    );
+                } else {
+                    eprintln!("Deleted orphan ephemeral branch {}", ephemeral);
+                }
+            }
+            Ok(EphemeralCase::CleanMerged { worktree_path }) => {
+                if let Err(e) = delete_merged_ephemeral(project_root, &worktree_path, ephemeral) {
+                    eprintln!(
+                        "warning: failed to clean already-merged ephemeral {} (continuing): {}",
+                        ephemeral, e
+                    );
+                } else {
+                    eprintln!(
+                        "Cleaned already-merged ephemeral branch {} and its worktree",
+                        ephemeral
+                    );
+                }
+            }
+            Ok(EphemeralCase::CleanUnmerged { commits }) => {
+                unmerged.push((ephemeral.clone(), commits));
+            }
+            Ok(EphemeralCase::Dirty { worktree_path }) => {
+                dirty_paths.push(worktree_path);
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to classify ephemeral branch {} during reconcile (continuing): {}",
+                    ephemeral, e
+                );
+            }
+        }
+    }
+
+    (unmerged, dirty_paths)
 }
 
 /// Classify a single ephemeral slot branch into one of the four cases.
