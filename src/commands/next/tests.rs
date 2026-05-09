@@ -370,7 +370,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/shared.rs");
         insert_test_task_file(&conn, "US-002", "src/shared.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -388,7 +390,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/a.rs");
         insert_test_task_file(&conn, "US-002", "src/b.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 2, "disjoint files must parallelize");
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(ids.contains(&"US-001"));
@@ -404,7 +408,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-001", "src/a.rs");
         // US-002 and US-003 have zero task_files rows — no conflicts possible.
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             3,
@@ -428,7 +434,9 @@ mod selection_tests {
             insert_test_task_file(&conn, &id, &file);
         }
 
-        let group = select_parallel_group(&conn, &[], None, 3, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 3, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 3, "group size is capped by max_slots");
     }
 
@@ -443,7 +451,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-002", "src/b.rs");
         insert_test_task_file(&conn, "US-003", "src/c.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 3, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 3, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 3);
         // Descending total_score (highest first)
         assert!(
@@ -465,7 +475,9 @@ mod selection_tests {
         insert_test_task(&conn, "US-001", "Only Task", "todo", 10);
         insert_test_task_file(&conn, "US-001", "src/a.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(group.len(), 1);
         assert_eq!(group[0].task.id, "US-001");
     }
@@ -481,7 +493,9 @@ mod selection_tests {
             insert_test_task_file(&conn, &id, "src/hot_spot.rs");
         }
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -507,7 +521,9 @@ mod selection_tests {
         insert_test_task_file(&conn, "US-002", "src/shared.rs");
         insert_test_task_file(&conn, "US-003", "src/other.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
 
         assert_eq!(
@@ -1919,7 +1935,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             !ids.contains(&"MILESTONE-FINAL"),
@@ -1934,7 +1952,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "done", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -1949,7 +1969,9 @@ mod soft_dep_tests {
         insert_test_task_with_criteria(&conn, "MILESTONE-FINAL", "Final", "todo", 10, MILESTONE_AC);
         insert_test_task(&conn, "REFACTOR-N-001", "Spawned fixup", "in_progress", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             !ids.contains(&"MILESTONE-FINAL"),
@@ -1965,7 +1987,9 @@ mod soft_dep_tests {
         // Only an unrelated task is active.
         insert_test_task(&conn, "OTHER-001", "Unrelated", "todo", 50);
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -2030,7 +2054,9 @@ mod soft_dep_tests {
         )
         .unwrap();
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"REFACTOR-N-001") && ids.contains(&"REFACTOR-N-002"),
@@ -2053,7 +2079,9 @@ mod soft_dep_tests {
         );
         insert_test_task(&conn, "CODE-FIXTURE-1", "Test fixture work", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -2079,7 +2107,9 @@ mod soft_dep_tests {
         // The doc task's AC tokenizes to "CODE-FIX" (no trailing dash) — must
         // not trigger the filter. Both should be eligible (different files,
         // no conflict).
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"DOC-001"),
@@ -2096,7 +2126,9 @@ mod soft_dep_tests {
         // PRD-B's active fixup must NOT block PRD-A's milestone.
         insert_test_task(&conn, "PRD-B-REFACTOR-N-001", "Other PRD fixup", "todo", 5);
 
-        let group = select_parallel_group(&conn, &[], Some("PRD-A"), 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], Some("PRD-A"), 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"PRD-A-MILESTONE"),
@@ -2118,7 +2150,9 @@ mod soft_dep_tests {
         )
         .unwrap();
 
-        let group = select_parallel_group(&conn, &[], None, 2, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 2, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert!(
             ids.contains(&"MILESTONE-FINAL"),
@@ -2233,7 +2267,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &a, "src/feat_a.rs");
         ins_file(&conn, &b, "src/feat_b.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert!(
             group.len() <= 1,
             "two FEATs must contend for one shared-infra slot, got {} tasks: {:?}",
@@ -2259,7 +2295,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &f, "src/feat.rs");
         ins_file(&conn, &t, "src/test.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert_eq!(group.len(), 2, "FEAT + TEST must co-schedule, got: {ids:?}");
         assert!(ids.contains(&f.as_str()));
@@ -2277,7 +2315,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &f, "src/feat.rs");
         ins_file(&conn, &c, "docs/clarify.md");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert_eq!(
             group.len(),
@@ -2305,7 +2345,9 @@ mod feat_003_shared_infra_tests {
 
         // Expectation: TEST claims via path (a), FEAT claims via prefix (b);
         // both want __shared_infra__, so only the higher-priority one wins.
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert_eq!(
             group.len(),
@@ -2330,7 +2372,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &t, "src/test.rs");
         ins_file(&conn, &f, "src/feat.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
         assert_eq!(
             group.len(),
@@ -2353,7 +2397,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &a, "src/a.rs");
         ins_file(&conn, &b, "src/b.rs");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             2,
@@ -2378,7 +2424,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &a, "services/api/uv.lock");
         ins_file(&conn, &b, "services/worker/uv.lock");
 
-        let group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -2408,7 +2456,9 @@ mod feat_003_shared_infra_tests {
 
         // Without the extra: tasks touch DIFFERENT paths and the basename isn't
         // in the baseline list → both can parallelize.
-        let baseline_group = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let baseline_group = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             baseline_group.len(),
             2,
@@ -2417,7 +2467,9 @@ mod feat_003_shared_infra_tests {
 
         // With the extra: basename match fires on both → one synthetic claim → serialize.
         let extra = ["gradle-wrapper.lock".to_string()];
-        let extended_group = select_parallel_group(&conn, &[], None, 4, &extra).unwrap();
+        let extended_group = select_parallel_group(&conn, &[], None, 4, &extra, &[])
+            .unwrap()
+            .group;
         assert_eq!(
             extended_group.len(),
             1,
@@ -2441,7 +2493,9 @@ mod feat_003_shared_infra_tests {
         ins_file(&conn, &b, "infra/staging/tofu.lock.hcl");
 
         // Without the merge, the basename isn't recognized → both parallelize.
-        let baseline = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let baseline = select_parallel_group(&conn, &[], None, 4, &[], &[])
+            .unwrap()
+            .group;
         assert_eq!(
             baseline.len(),
             2,
@@ -2456,7 +2510,9 @@ mod feat_003_shared_infra_tests {
             .chain(prd_extra.iter().cloned())
             .collect();
 
-        let group = select_parallel_group(&conn, &[], None, 4, &merged).unwrap();
+        let group = select_parallel_group(&conn, &[], None, 4, &merged, &[])
+            .unwrap()
+            .group;
         assert_eq!(
             group.len(),
             1,
@@ -2478,7 +2534,7 @@ mod feat_003_shared_infra_tests {
         ins_task(&conn, &f, "Feat", 10, None);
         ins_file(&conn, &f, "src/feat.rs");
 
-        let _ = select_parallel_group(&conn, &[], None, 4, &[]).unwrap();
+        let _ = select_parallel_group(&conn, &[], None, 4, &[], &[]).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -2499,6 +2555,295 @@ mod feat_003_shared_infra_tests {
         assert_eq!(
             path, "src/feat.rs",
             "task_files entry must not be mutated to __shared_infra__"
+        );
+    }
+}
+
+/// Tests for FEAT-004: cross-wave file affinity from un-merged ephemeral
+/// branches with deadlock guard.
+///
+/// All assertions go through `select_parallel_group`'s public surface — these
+/// tests treat the function as a black box and verify the new
+/// `ephemeral_overlay` parameter / `ParallelGroupResult` semantics.
+#[cfg(test)]
+mod feat_004_cross_wave_overlay_tests {
+    use super::test_helpers::setup_test_db;
+    use crate::commands::next::selection::select_parallel_group;
+    use rusqlite::{Connection, params};
+
+    const PRD_PFX: &str = "deb07ed8";
+
+    fn ins_task(conn: &Connection, id: &str, title: &str, priority: i32) {
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, priority) VALUES (?, ?, 'todo', ?)",
+            params![id, title, priority],
+        )
+        .unwrap();
+    }
+
+    fn ins_file(conn: &Connection, task_id: &str, path: &str) {
+        conn.execute(
+            "INSERT INTO task_files (task_id, file_path) VALUES (?, ?)",
+            params![task_id, path],
+        )
+        .unwrap();
+    }
+
+    fn id(prefix: &str, kind: &str, n: u32) -> String {
+        format!("{prefix}-{kind}-{n:03}")
+    }
+
+    /// AC: a candidate whose `touchesFiles` includes a file modified on an
+    /// un-merged ephemeral branch is deferred — even though no other accepted
+    /// task in the same wave has claimed that file. With the only candidate
+    /// blocked by the overlay, the result has an empty group AND a
+    /// non-empty `ephemeral_block_diagnostics` naming the blocking branch.
+    #[test]
+    fn test_parallel_group_defers_when_ephemeral_branch_has_unmerged_file() {
+        let (_tmp, conn) = setup_test_db();
+        let t = id(PRD_PFX, "TEST", 1); // non-buildy so the buildy heuristic doesn't interfere
+        ins_task(&conn, &t, "Test A", 10);
+        ins_file(&conn, &t, "src/foo.rs");
+
+        let overlay = vec![(
+            "feat/parallel-slot-1".to_string(),
+            vec!["src/foo.rs".to_string()],
+        )];
+        let result = select_parallel_group(&conn, &[], None, 2, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "candidate touching un-merged ephemeral file must be deferred, got: {:?}",
+            result.group.iter().map(|s| &s.task.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![(t, vec!["feat/parallel-slot-1".to_string()])],
+            "deadlock diagnostic must name the candidate AND the blocking branch"
+        );
+    }
+
+    /// AC: when the cross-wave overlay is empty (cleanly-recovered loop), the
+    /// result is identical to the pre-FEAT-004 implementation — diagnostics
+    /// are never populated.
+    #[test]
+    fn test_parallel_group_no_overlay_behaves_like_baseline() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &[]).unwrap();
+        let ids: Vec<&str> = result.group.iter().map(|s| s.task.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "empty overlay must produce empty diagnostics"
+        );
+    }
+
+    /// AC + known-bad: every eligible candidate is blocked SOLELY by ephemeral
+    /// overlap. The diagnostic must be non-empty and the group empty —
+    /// otherwise a fix that silently returned an empty group would pass.
+    #[test]
+    fn test_parallel_group_deadlock_guard_reports_when_all_candidates_blocked_by_ephemeral() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let overlay = vec![
+            ("feat/x-slot-1".to_string(), vec!["src/a.rs".to_string()]),
+            ("feat/x-slot-2".to_string(), vec!["src/b.rs".to_string()]),
+        ];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "every candidate is ephemeral-blocked"
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![
+                (a, vec!["feat/x-slot-1".to_string()]),
+                (b, vec!["feat/x-slot-2".to_string()]),
+            ],
+            "diagnostic must list every blocked candidate, sorted by id"
+        );
+    }
+
+    /// AC: a candidate filtered out by REAL task overlap (not ephemeral) must
+    /// NOT appear in the diagnostic. Otherwise the deadlock guard would
+    /// misfire on routine within-wave conflicts and mislead the operator.
+    #[test]
+    fn test_parallel_group_diagnostic_excludes_real_task_overlaps() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A", 10);
+        ins_task(&conn, &b, "B", 20);
+        // Both touch src/shared.rs — B will be skipped due to A's claim.
+        ins_file(&conn, &a, "src/shared.rs");
+        ins_file(&conn, &b, "src/shared.rs");
+
+        // Provide a non-empty overlay that does NOT touch src/shared.rs so
+        // the overlay does not contribute to B's deferral.
+        let overlay = vec![(
+            "feat/x-slot-1".to_string(),
+            vec!["src/unrelated.rs".to_string()],
+        )];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert_eq!(result.group.len(), 1);
+        assert_eq!(result.group[0].task.id, a);
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "B was deferred by A's claim, NOT by ephemeral — diagnostic must stay empty, got: {:?}",
+            result.ephemeral_block_diagnostics
+        );
+    }
+
+    /// AC: when the group is non-empty, diagnostics MUST be empty even if
+    /// some other candidate was ephemeral-blocked. Mid-wave progress takes
+    /// precedence — the engine only halts on full deadlock.
+    #[test]
+    fn test_parallel_group_diagnostic_empty_when_group_nonempty() {
+        let (_tmp, conn) = setup_test_db();
+        let a = id(PRD_PFX, "TEST", 1);
+        let b = id(PRD_PFX, "TEST", 2);
+        ins_task(&conn, &a, "A free", 10);
+        ins_task(&conn, &b, "B blocked", 20);
+        ins_file(&conn, &a, "src/a.rs");
+        ins_file(&conn, &b, "src/b.rs");
+
+        let overlay = vec![("feat/x-slot-1".to_string(), vec!["src/b.rs".to_string()])];
+        let result = select_parallel_group(&conn, &[], None, 4, &[], &overlay).unwrap();
+        assert_eq!(result.group.len(), 1, "A is free, B is blocked");
+        assert_eq!(result.group[0].task.id, a);
+        assert!(
+            result.ephemeral_block_diagnostics.is_empty(),
+            "non-empty group → no deadlock-guard diagnostics"
+        );
+    }
+
+    /// Integration test: end-to-end exercise of the worktree helpers + the
+    /// selection-layer overlay.
+    ///
+    /// Sets up a real 2-slot worktree topology with a manually-injected
+    /// un-merged commit on slot 1's ephemeral branch. Builds the cross-wave
+    /// overlay the way engine.rs does (enumerate via
+    /// `list_ephemeral_slot_branches`, diff via `list_unmerged_branch_files`),
+    /// then calls `select_parallel_group` with the overlay and asserts the
+    /// candidate sharing the un-merged file is deferred AND the deadlock
+    /// guard surfaces the blocking branch by name.
+    #[test]
+    fn test_2_slot_loop_cross_wave_overlay_blocks_candidate_and_emits_diagnostic() {
+        use crate::loop_engine::worktree::{
+            ensure_slot_worktrees, ensure_worktree, ephemeral_slot_branch,
+            list_ephemeral_slot_branches, list_unmerged_branch_files,
+        };
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let branch = "feat/feat-004-integration";
+        let tmp = TempDir::new().expect("tempdir");
+        // Inline-init a real git repo so the worktree helpers operate against
+        // genuine refs (mirrors test_utils::setup_git_repo_with_file but lives
+        // here to avoid cross-module test plumbing).
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git config email");
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git config name");
+        std::fs::write(tmp.path().join("file.txt"), "init").expect("write init file");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git add init");
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git commit init");
+
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("slot worktrees");
+
+        // Inject an un-merged commit on slot 1's ephemeral branch touching
+        // src/foo.rs. This simulates a slot whose merge-back failed — the
+        // commit is on the ephemeral but not the loop branch.
+        std::fs::create_dir_all(paths[1].join("src")).expect("mkdir src");
+        std::fs::write(paths[1].join("src/foo.rs"), "fn foo() {}").expect("write foo.rs");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add slot 1");
+        let out = Command::new("git")
+            .args(["commit", "-m", "slot 1: add foo.rs"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit slot 1");
+        assert!(out.status.success(), "slot 1 commit");
+
+        // Engine.rs-style overlay assembly: enumerate ephemeral branches, then
+        // diff each against base. This exact sequence runs in production.
+        let ephemeral_branches = list_ephemeral_slot_branches(tmp.path(), branch);
+        assert_eq!(
+            ephemeral_branches,
+            vec![ephemeral_slot_branch(branch, 1)],
+            "exactly one un-merged ephemeral expected"
+        );
+        let overlay: Vec<(String, Vec<String>)> = ephemeral_branches
+            .iter()
+            .map(|eph| {
+                let files = list_unmerged_branch_files(tmp.path(), branch, eph)
+                    .expect("list_unmerged_branch_files");
+                (eph.clone(), files)
+            })
+            .collect();
+        assert_eq!(
+            overlay,
+            vec![(
+                ephemeral_slot_branch(branch, 1),
+                vec!["src/foo.rs".to_string()],
+            )],
+            "overlay must reflect the slot 1 commit's file list"
+        );
+
+        // Build a DB with one candidate that touches the un-merged file. The
+        // candidate is `TEST-` (non-buildy) so the buildy-prefix heuristic
+        // doesn't independently defer it — the only blocking signal is the
+        // cross-wave overlay.
+        let (_db_tmp, conn) = setup_test_db();
+        let cand = id(PRD_PFX, "TEST", 1);
+        ins_task(&conn, &cand, "Touches un-merged file", 10);
+        ins_file(&conn, &cand, "src/foo.rs");
+
+        let result = select_parallel_group(&conn, &[], None, 2, &[], &overlay).unwrap();
+        assert!(
+            result.group.is_empty(),
+            "candidate must be deferred by cross-wave overlay, got: {:?}",
+            result.group.iter().map(|s| &s.task.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.ephemeral_block_diagnostics,
+            vec![(cand, vec![ephemeral_slot_branch(branch, 1)])],
+            "deadlock diagnostic must name the candidate AND the slot 1 branch"
         );
     }
 }

@@ -259,6 +259,27 @@ pub struct SelectionResult {
     pub top_candidates: Vec<ScoredTask>,
 }
 
+/// Result returned by `select_parallel_group` (FEAT-004).
+///
+/// Carries both the chosen group AND a deadlock diagnostic. The diagnostic
+/// is non-empty ONLY when `group` is empty AND at least one eligible
+/// candidate was rejected exclusively because of the cross-wave ephemeral
+/// overlay (i.e. its files overlap an un-merged `{branch}-slot-N` branch).
+///
+/// The engine treats `group.is_empty() && !ephemeral_block_diagnostics.is_empty()`
+/// as equivalent to a wave with `failed_merges` non-empty so the FEAT-002
+/// reset/halt-check contract fires and the loop halts cleanly with named
+/// blocking branches instead of spinning until stale-iteration abort.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ParallelGroupResult {
+    /// Selected tasks (greedy, sorted by total_score DESC).
+    pub group: Vec<ScoredTask>,
+    /// `(candidate_id, sorted_blocking_branch_names)` for each candidate that
+    /// was filtered out exclusively because of cross-wave ephemeral overlap.
+    /// Entries are sorted by `candidate_id` for stable diagnostics output.
+    pub ephemeral_block_diagnostics: Vec<(String, Vec<String>)>,
+}
+
 /// Score, filter, and sort all eligible todo tasks.
 ///
 /// Shared by `select_next_task` and `select_parallel_group`. Returns tasks
@@ -559,10 +580,36 @@ fn get_all_task_files(
 /// The synthetic claim lives ONLY in the in-memory `used_files` set; a task's
 /// persisted `touchesFiles` is never mutated.
 ///
+/// # Cross-wave ephemeral-branch overlay (FEAT-004)
+///
+/// `ephemeral_overlay` is a list of `(branch_name, files)` pairs representing
+/// un-merged work on `{branch}-slot-N` ephemeral branches from prior waves.
+/// Caller (engine.rs) computes this ONCE per wave via
+/// [`crate::loop_engine::worktree::list_unmerged_branch_files`] for each
+/// branch returned by
+/// [`crate::loop_engine::worktree::list_ephemeral_slot_branches`].
+///
+/// Each file from the overlay is added to `used_files` BEFORE the greedy pass
+/// runs, so a candidate whose `touchesFiles` intersects an un-merged
+/// ephemeral file is filtered out the same way it would be by an
+/// already-accepted task in the same wave. This serializes work across waves
+/// even when DB state alone says nothing is contended.
+///
+/// **Deadlock guard**: when the greedy pass produces an empty group AND at
+/// least one candidate was skipped EXCLUSIVELY because of the overlay (i.e.
+/// every overlapping file belongs to an ephemeral branch — never to an
+/// already-accepted task in the same wave), the result's
+/// [`ParallelGroupResult::ephemeral_block_diagnostics`] is populated so the
+/// engine layer can halt cleanly with named blocking branches instead of
+/// spinning until stale-iteration abort.
+///
 /// # Arguments
 ///
 /// * `extra_implicit_overlap_files` — Project- and PRD-level extensions to the
 ///   baseline implicit list. Pass `&[]` when no extensions apply.
+/// * `ephemeral_overlay` — Cross-wave file claims; pass `&[]` when no
+///   ephemeral branches exist (cleanly-recovered loop). With an empty
+///   overlay, behavior is identical to the pre-FEAT-004 implementation.
 ///
 /// The returned group is ordered by total_score descending.
 pub fn select_parallel_group(
@@ -571,15 +618,16 @@ pub fn select_parallel_group(
     task_prefix: Option<&str>,
     max_slots: usize,
     extra_implicit_overlap_files: &[String],
-) -> TaskMgrResult<Vec<ScoredTask>> {
+    ephemeral_overlay: &[(String, Vec<String>)],
+) -> TaskMgrResult<ParallelGroupResult> {
     if max_slots == 0 {
-        return Ok(Vec::new());
+        return Ok(ParallelGroupResult::default());
     }
 
     let scored_tasks = build_scored_candidates(conn, after_files, task_prefix)?;
 
     if scored_tasks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParallelGroupResult::default());
     }
 
     // Union of baseline + project-config + PRD extensions, computed once per call.
@@ -589,8 +637,24 @@ pub fn select_parallel_group(
         .chain(extra_implicit_overlap_files.iter().map(String::as_str))
         .collect();
 
+    // FEAT-004: file → list of ephemeral branches claiming it (cross-wave overlay).
+    // Built once per call so overlap probes are O(1) per candidate file.
+    let mut ephemeral_file_to_branches: HashMap<String, Vec<String>> = HashMap::new();
+    for (branch, files) in ephemeral_overlay {
+        for f in files {
+            let entry = ephemeral_file_to_branches.entry(f.clone()).or_default();
+            if !entry.contains(branch) {
+                entry.push(branch.clone());
+            }
+        }
+    }
+    let has_ephemeral_overlay = !ephemeral_file_to_branches.is_empty();
+
     let mut group: Vec<ScoredTask> = Vec::new();
     let mut used_files: HashSet<String> = HashSet::new();
+    // Track per-candidate ephemeral-only blockers so the deadlock guard can
+    // surface them when the greedy pass yields an empty group.
+    let mut exclusive_ephemeral_blocks: Vec<(String, Vec<String>)> = Vec::new();
 
     for candidate in scored_tasks {
         if group.len() >= max_slots {
@@ -612,7 +676,32 @@ pub fn select_parallel_group(
             .iter()
             .any(|f| used_files.contains(f.as_str()));
         let infra_overlap = claims_infra && used_files.contains(SHARED_INFRA_TOKEN);
-        if real_overlap || infra_overlap {
+
+        // Cross-wave ephemeral overlap. Computed independently of `real_overlap`
+        // so the deadlock-guard accounting can distinguish ephemeral-only blocks
+        // from real-task blocks (only the former is "exclusively blocked").
+        let mut ephemeral_blockers: Vec<String> = Vec::new();
+        if has_ephemeral_overlay {
+            for f in &candidate.files {
+                if let Some(branches) = ephemeral_file_to_branches.get(f) {
+                    for b in branches {
+                        if !ephemeral_blockers.contains(b) {
+                            ephemeral_blockers.push(b.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let has_ephemeral_overlap = !ephemeral_blockers.is_empty();
+
+        if real_overlap || infra_overlap || has_ephemeral_overlap {
+            // Record only when ephemeral was the SOLE reason for skipping —
+            // otherwise the candidate would have been deferred regardless of
+            // the cross-wave overlay and the diagnostic would be misleading.
+            if has_ephemeral_overlap && !real_overlap && !infra_overlap {
+                ephemeral_blockers.sort();
+                exclusive_ephemeral_blocks.push((candidate.task.id.clone(), ephemeral_blockers));
+            }
             continue;
         }
 
@@ -623,7 +712,20 @@ pub fn select_parallel_group(
         group.push(candidate);
     }
 
-    Ok(group)
+    // Deadlock guard: only populate diagnostics when the wave produced no
+    // group at all. A non-empty group means SOME progress is possible, even
+    // if other candidates were ephemeral-blocked — and surfacing diagnostics
+    // there would spuriously trip the engine's merge-fail wave handling.
+    let mut ephemeral_block_diagnostics = Vec::new();
+    if group.is_empty() && !exclusive_ephemeral_blocks.is_empty() {
+        exclusive_ephemeral_blocks.sort_by(|a, b| a.0.cmp(&b.0));
+        ephemeral_block_diagnostics = exclusive_ephemeral_blocks;
+    }
+
+    Ok(ParallelGroupResult {
+        group,
+        ephemeral_block_diagnostics,
+    })
 }
 
 /// Format selection result as human-readable text.

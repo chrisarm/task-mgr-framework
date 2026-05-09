@@ -1030,6 +1030,98 @@ pub(crate) fn list_conflicted_files(slot0_path: &Path) -> Result<Vec<String>, St
         .collect())
 }
 
+/// Files differing between `base_branch` and `ephemeral_branch` per
+/// `git diff --name-only {base}...{ephemeral}` (FEAT-004).
+///
+/// The triple-dot range diffs the merge-base of the two refs against the
+/// `ephemeral` tip — i.e. the files changed on `ephemeral` since it forked
+/// from `base`. When `ephemeral` has already been merged forward into `base`,
+/// the merge-base IS the ephemeral tip and the diff is empty (no claim).
+///
+/// **Empty Vec is the cleanly-recovered signal**: when the ephemeral branch
+/// does not exist, `git diff` exits non-zero with "unknown revision" — the
+/// helper reports `Ok(vec![])` rather than `Err` so the cross-wave overlay
+/// (selection.rs) treats it as "no claim" instead of crashing the loop.
+/// **Any other** non-zero exit (corrupt ref, IO failure) is surfaced as
+/// `Err(String)` so the caller can choose to log and proceed without the
+/// overlay (per the FEAT-004 failure-mode AC).
+///
+/// **Concurrency**: this spawns `git diff` and is therefore intentionally
+/// scoped to between-waves invocation on the main thread. Slot worker threads
+/// from the prior wave must have joined before this is called — concurrent
+/// git commands against the same repo are not strictly invalid, but mixing
+/// them with merge-back operations would race on `.git/index` locks.
+pub(crate) fn list_unmerged_branch_files(
+    repo_path: &Path,
+    base_branch: &str,
+    ephemeral_branch: &str,
+) -> Result<Vec<String>, String> {
+    let range = format!("{}...{}", base_branch, ephemeral_branch);
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &range])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("git diff spawn: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Missing-branch is the cleanly-recovered case: empty Vec, not error.
+        // Match git's exact wording variants ("unknown revision",
+        // "bad revision", "ambiguous argument") to avoid suppressing real
+        // errors like a corrupted refs/ database.
+        let lower = stderr.to_lowercase();
+        if lower.contains("unknown revision")
+            || lower.contains("bad revision")
+            || lower.contains("ambiguous argument")
+        {
+            return Ok(Vec::new());
+        }
+        return Err(format!("git diff failed: {}", stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Enumerate every `{base_branch}-slot-N` ephemeral branch reachable from
+/// `repo_path`'s worktree list (FEAT-004). Empty Vec when `git worktree list`
+/// fails — the cross-wave overlay then degrades to "no claims" rather than
+/// crashing the loop.
+///
+/// Filters [`parse_worktree_list`]'s output to only those branches whose name
+/// matches the canonical `ephemeral_slot_branch` shape (`{base}-slot-{N}`),
+/// so a stray worktree on an unrelated branch never contributes a claim.
+/// Returned branches are de-duplicated and sorted by slot index for stable
+/// diagnostics.
+pub(crate) fn list_ephemeral_slot_branches(repo_path: &Path, base_branch: &str) -> Vec<String> {
+    let output = match Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_path)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{}-slot-", base_branch);
+
+    let mut pairs: Vec<(usize, String)> = Vec::new();
+    for (_path, branch) in parse_worktree_list(&raw) {
+        let Some(name) = branch else { continue };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Ok(slot) = suffix.parse::<usize>()
+            && !pairs.iter().any(|(_, n)| n == &name)
+        {
+            pairs.push((slot, name));
+        }
+    }
+    pairs.sort_by_key(|(slot, _)| *slot);
+    pairs.into_iter().map(|(_, name)| name).collect()
+}
+
 /// Whether `slot0_path` is currently in the middle of a merge (MERGE_HEAD set).
 ///
 /// Returns `Ok(true)` while a merge is in progress, `Ok(false)` once it's
@@ -3665,5 +3757,138 @@ detached
         // Second pass: nothing left matching the pattern → fast Ok.
         reconcile_stale_ephemeral_slots(&project_root, branch, 0)
             .expect("second pass should be a no-op Ok");
+    }
+
+    // -------------------------------------------------------------------------
+    // FEAT-004: list_unmerged_branch_files + list_ephemeral_slot_branches
+    // -------------------------------------------------------------------------
+
+    /// AC: empty Vec (not error) when the ephemeral branch does not exist.
+    /// Models a cleanly-recovered loop where stale-ephemeral hygiene already
+    /// removed the branches.
+    #[test]
+    fn test_list_unmerged_branch_files_returns_empty_for_missing_branch() {
+        let tmp = setup_git_repo_with_file();
+        let result = list_unmerged_branch_files(tmp.path(), "main", "feat/does-not-exist-slot-1");
+        assert_eq!(
+            result.expect("missing branch must yield Ok(empty), not Err"),
+            Vec::<String>::new(),
+        );
+    }
+
+    /// AC: real diff returned when an ephemeral branch has commits not in base.
+    /// Two commits on slot 1 touching `src/foo.rs` and `src/bar.rs` — the
+    /// helper must list both relative paths.
+    #[test]
+    fn test_list_unmerged_branch_files_returns_diff_for_real_branch() {
+        let branch = "feat/diff-real";
+        let tmp = setup_git_repo_with_file();
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Two commits on slot 1, touching different files in a subdir.
+        fs::create_dir_all(paths[1].join("src")).expect("mkdir src");
+        fs::write(paths[1].join("src/foo.rs"), "fn foo() {}").expect("write foo.rs");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add foo");
+        Command::new("git")
+            .args(["commit", "-m", "add foo"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit foo");
+        fs::write(paths[1].join("src/bar.rs"), "fn bar() {}").expect("write bar.rs");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add bar");
+        Command::new("git")
+            .args(["commit", "-m", "add bar"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit bar");
+
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+        let mut result =
+            list_unmerged_branch_files(tmp.path(), branch, &ephemeral).expect("real diff");
+        result.sort();
+        assert_eq!(
+            result,
+            vec!["src/bar.rs".to_string(), "src/foo.rs".to_string()]
+        );
+    }
+
+    /// AC: when an ephemeral branch is already merged (its tip is an ancestor
+    /// of base), the diff is empty — no synthetic claim, the candidate touching
+    /// those files can still be scheduled.
+    #[test]
+    fn test_list_unmerged_branch_files_empty_when_already_merged() {
+        let branch = "feat/diff-already-merged";
+        let tmp = setup_git_repo_with_file();
+        let slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+
+        // Create an ephemeral branch at the same tip as `branch` (no commits
+        // ahead of base). git diff base...ephemeral is empty in this case.
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+        let out = Command::new("git")
+            .args(["branch", &ephemeral])
+            .current_dir(&slot0)
+            .output()
+            .expect("git branch");
+        assert!(out.status.success(), "create ephemeral");
+
+        let result =
+            list_unmerged_branch_files(tmp.path(), branch, &ephemeral).expect("diff at-base");
+        assert!(
+            result.is_empty(),
+            "branch at base tip should have empty diff, got {:?}",
+            result
+        );
+    }
+
+    /// AC + CONTRACT: `list_ephemeral_slot_branches` returns ONLY branches
+    /// matching the canonical `{branch}-slot-N` shape, derived from the
+    /// `git worktree list` output. Other worktrees on unrelated branches are
+    /// filtered out so they never contribute to the cross-wave overlay.
+    #[test]
+    fn test_list_ephemeral_slot_branches_filters_to_slot_n_shape() {
+        let branch = "feat/ephem-list";
+        let tmp = setup_git_repo_with_file();
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let _slots = ensure_slot_worktrees(tmp.path(), branch, 3).expect("ensure_slot_worktrees");
+
+        // Add an unrelated worktree that should NOT be reported.
+        let unrelated =
+            ensure_worktree(tmp.path(), "feat/unrelated", true, None).expect("unrelated worktree");
+        assert!(unrelated.exists());
+
+        let result = list_ephemeral_slot_branches(tmp.path(), branch);
+        assert_eq!(
+            result,
+            vec![
+                ephemeral_slot_branch(branch, 1),
+                ephemeral_slot_branch(branch, 2),
+            ],
+            "only {{branch}}-slot-N entries, sorted by slot index, no unrelated branches"
+        );
+    }
+
+    /// AC: zero ephemeral branches → empty Vec, no spurious entries from
+    /// other worktrees on the host.
+    #[test]
+    fn test_list_ephemeral_slot_branches_empty_when_no_slots() {
+        let branch = "feat/no-slots";
+        let tmp = setup_git_repo_with_file();
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+
+        let result = list_ephemeral_slot_branches(tmp.path(), branch);
+        assert!(
+            result.is_empty(),
+            "no slot-N worktrees should yield empty Vec, got {:?}",
+            result
+        );
     }
 }

@@ -1070,6 +1070,86 @@ fn handle_no_eligible_tasks(
     }
 }
 
+/// FEAT-004 deadlock guard: every eligible candidate was blocked exclusively
+/// by un-merged work on `{branch}-slot-N` ephemeral branches. Emit per-
+/// candidate diagnostics, then synthesize a merge-fail wave by deriving slot
+/// indices from the blocking branch names so `run_loop`'s wave-loop boundary
+/// runs the FEAT-002 reset/halt-check contract.
+///
+/// **No tasks to reset**: the deferred candidates are still `todo` — they
+/// were never claimed. `failed_merge_task_ids` is therefore all-`None`, and
+/// `apply_merge_fail_reset_and_halt_check`'s reset pass becomes a no-op
+/// (`None` skipped via `if let Some`).
+///
+/// **Slot index derivation**: branches sourced from
+/// `worktree::list_ephemeral_slot_branches` are guaranteed to match the
+/// `{branch}-slot-N` shape (parsed and re-emitted by that helper). We strip
+/// `{branch}-slot-` and parse the suffix; on the off chance a branch ever
+/// slips through with a non-numeric suffix, that branch is logged and skipped
+/// — slot index 0 is reserved for slot 0 (the loop's own branch) and must
+/// never be synthesized here.
+fn handle_ephemeral_deadlock(
+    params: &WaveIterationParams<'_>,
+    ctx: &mut IterationContext,
+    diagnostics: Vec<(String, Vec<String>)>,
+) -> WaveOutcome {
+    ctx.stale_tracker.check("stale", "stale");
+    progress::log_iteration(
+        params.progress_path,
+        params.iteration,
+        None,
+        &IterationOutcome::NoEligibleTasks,
+        &[],
+        None,
+        None,
+        None,
+    );
+
+    eprintln!(
+        "Cross-wave deadlock: every eligible candidate is blocked by un-merged ephemeral branch(es). \
+         Treating as merge-fail wave so the halt threshold can fire."
+    );
+    for (cand_id, branches) in &diagnostics {
+        eprintln!("  {} blocked by: {}", cand_id, branches.join(", "));
+    }
+
+    // Collect distinct slot indices from the union of blocking branches across
+    // all diagnostics. Order is stable (sorted ascending) so the eventual
+    // halt-diagnostic from `apply_merge_fail_reset_and_halt_check` lists slots
+    // in a predictable order.
+    let prefix = format!("{}-slot-", params.branch);
+    let mut synth_slots: Vec<usize> = Vec::new();
+    for (_, branches) in &diagnostics {
+        for branch in branches {
+            let Some(suffix) = branch.strip_prefix(&prefix) else {
+                continue;
+            };
+            match suffix.parse::<usize>() {
+                Ok(slot) if slot > 0 => {
+                    if !synth_slots.contains(&slot) {
+                        synth_slots.push(slot);
+                    }
+                }
+                _ => eprintln!(
+                    "Warning: skipping ephemeral branch with non-numeric / zero slot suffix: {}",
+                    branch
+                ),
+            }
+        }
+    }
+    synth_slots.sort();
+    let failed_merge_task_ids: Vec<Option<String>> = vec![None; synth_slots.len()];
+
+    WaveOutcome {
+        tasks_completed: 0,
+        iteration_consumed: true,
+        terminal: None,
+        was_stopped: false,
+        failed_merges: synth_slots,
+        failed_merge_task_ids,
+    }
+}
+
 /// Build per-slot `SlotContext` entries, pairing each scored task with its
 /// pre-allocated worktree path AND assembling the full `SlotPromptBundle`
 /// on the main thread.
@@ -1531,24 +1611,69 @@ pub fn run_wave_iteration(
         .chain(prd_implicit)
         .collect();
 
-    let group = match select_parallel_group(
+    // FEAT-004: cross-wave file affinity. Enumerate `{branch}-slot-N` ephemeral
+    // branches once per wave on the main thread (slot worker threads from the
+    // prior wave have already joined per the engine's join discipline) and
+    // collect their un-merged files. The (branch, files) pairs become synthetic
+    // claims for `select_parallel_group`, which then defers any candidate
+    // whose `touchesFiles` would conflict with un-merged work.
+    //
+    // `git diff` is called once per ephemeral branch (NOT per candidate) so
+    // the overhead is bounded by `parallel_slots`. Each per-branch failure
+    // logs and degrades to "no claim" — selection continues without the
+    // overlay rather than crashing the loop (per FEAT-004 failure-mode AC).
+    let ephemeral_branches =
+        worktree::list_ephemeral_slot_branches(params.source_root, params.branch);
+    let ephemeral_overlay: Vec<(String, Vec<String>)> = ephemeral_branches
+        .iter()
+        .map(|eph| {
+            let files = match worktree::list_unmerged_branch_files(
+                params.source_root,
+                params.branch,
+                eph,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: list_unmerged_branch_files({}) failed: {} (treating as no claim)",
+                        eph, e
+                    );
+                    Vec::new()
+                }
+            };
+            (eph.clone(), files)
+        })
+        .collect();
+
+    let result = match select_parallel_group(
         params.conn,
         &ctx.last_files,
         params.task_prefix,
         params.parallel_slots,
         &extra_implicit,
+        &ephemeral_overlay,
     ) {
-        Ok(g) => g,
+        Ok(r) => r,
         Err(e) => {
             eprintln!(
                 "Warning: select_parallel_group failed: {} (treating wave as stale)",
                 e
             );
-            Vec::new()
+            crate::commands::next::selection::ParallelGroupResult::default()
         }
     };
 
+    let group = result.group;
     if group.is_empty() {
+        // FEAT-004 deadlock guard: a non-empty diagnostic means every eligible
+        // candidate was blocked exclusively by un-merged ephemeral work. Surface
+        // the per-candidate breakdown to stderr and synthesize a merge-fail
+        // wave so the FEAT-002 reset/halt-check contract fires — without this,
+        // the loop would spin until stale-iteration abort with no signal to
+        // the operator about what's blocking forward progress.
+        if !result.ephemeral_block_diagnostics.is_empty() {
+            return handle_ephemeral_deadlock(&params, ctx, result.ephemeral_block_diagnostics);
+        }
         return handle_no_eligible_tasks(&params, ctx);
     }
 
