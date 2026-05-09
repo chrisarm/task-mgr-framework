@@ -849,6 +849,17 @@ fn classify_ephemeral_branch(
         .parse()
         .map_err(|e| format!("non-numeric slot suffix '{}': {}", suffix, e))?;
 
+    // `ensure_slot_worktrees` only ever creates ephemerals for slot >= 1; slot 0
+    // reuses the base branch directly. A `{base}-slot-0` ref therefore cannot
+    // come from production code — only from manual creation, recovery
+    // artifacts, or a buggy past version. Reject it here: `compute_slot_worktree_path`
+    // would short-circuit to the loop's main worktree path, which `delete_merged_ephemeral`
+    // could then `git worktree remove`. The caller logs and skips on Err so a
+    // stray slot-0 ref is preserved on disk for operator review.
+    if slot == 0 {
+        return Err("slot index must be >= 1; slot-0 is not a valid ephemeral".to_string());
+    }
+
     let worktree_path = compute_slot_worktree_path(project_root, base_branch, slot);
 
     if !worktree_path.exists() {
@@ -1131,6 +1142,7 @@ pub(crate) fn list_ephemeral_slot_branches(repo_path: &Path, base_branch: &str) 
             continue;
         };
         if let Ok(slot) = suffix.parse::<usize>()
+            && slot > 0
             && !pairs.iter().any(|(_, n)| n == &name)
         {
             pairs.push((slot, name));
@@ -3777,6 +3789,101 @@ detached
             .expect("second pass should be a no-op Ok");
     }
 
+    /// AC: `classify_ephemeral_branch` rejects `{base}-slot-0` outright. Without
+    /// this guard, `compute_slot_worktree_path(_, base, 0)` short-circuits to
+    /// the loop's main worktree path and the orchestrator can `git worktree
+    /// remove` it — a silent-mutation violation of the reconcile contract.
+    /// Production code never produces a slot-0 ephemeral (slot 0 reuses the
+    /// base branch), so any `{base}-slot-0` ref is a manual artifact and must
+    /// be preserved for operator review.
+    #[test]
+    fn test_classify_ephemeral_branch_rejects_slot_zero() {
+        let branch = "feat/classify-slot-zero";
+        let (_tmp, project_root, _slot_paths) = setup_ephemeral_slot_for_recon(branch);
+
+        // Create a stray `{branch}-slot-0` ref pointing at the same tip as
+        // `branch`. classify must Err so the orchestrator logs and skips it.
+        let stray = format!("{}-slot-0", branch);
+        let out = Command::new("git")
+            .args(["branch", &stray, branch])
+            .current_dir(&project_root)
+            .output()
+            .expect("create slot-0 branch");
+        assert!(out.status.success(), "git branch failed: {:?}", out);
+
+        let result = classify_ephemeral_branch(&project_root, branch, &stray);
+        assert!(
+            result.is_err(),
+            "slot-0 must be rejected at classify, got {:?}",
+            result
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("slot-0") || err_msg.contains(">= 1"),
+            "error message should explain the slot-0 rejection, got: {}",
+            err_msg
+        );
+    }
+
+    /// AC: a stray `{branch}-slot-0` ref is preserved across reconcile and the
+    /// loop's main worktree is NOT removed. This is the regression for the
+    /// review's High finding — without the slot-0 guard, the orchestrator
+    /// would have classified the ref as `CleanMerged{worktree_path: <main>}`
+    /// and called `git worktree remove` on the loop's running worktree.
+    #[test]
+    fn test_reconcile_stale_ephemeral_slots_preserves_slot_zero_branch_and_main_worktree() {
+        let branch = "feat/recon-slot-zero";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let main_worktree = slot_paths[0].clone();
+        let slot1_path = slot_paths[1].clone();
+        let slot1_ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Create a stray slot-0 ref. Production code never makes one, but a
+        // prior buggy version or operator could. The reconcile pass must skip
+        // it instead of treating it as a merged ephemeral pointing at the
+        // main worktree.
+        let stray = format!("{}-slot-0", branch);
+        let out = Command::new("git")
+            .args(["branch", &stray, branch])
+            .current_dir(&project_root)
+            .output()
+            .expect("create slot-0 branch");
+        assert!(out.status.success());
+
+        // Run reconcile with halt_threshold=0 (most permissive — verifies the
+        // slot-0 skip is a hard guard, not just a halt-threshold artifact).
+        // Slot 1 is at base's tip → classifies CleanMerged → cleaned up
+        // normally so we also verify the slot-0 guard does not break the
+        // legitimate-cleanup path.
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+            .expect("reconcile should succeed despite slot-0 stray branch");
+
+        // Critical AC: main worktree must still exist.
+        assert!(
+            main_worktree.exists(),
+            "loop's main worktree at {} must NOT be removed by reconcile",
+            main_worktree.display()
+        );
+
+        // Slot-0 stray branch must be preserved (operator-actionable; never
+        // auto-deleted because we cannot safely interpret it).
+        assert!(
+            branch_exists(&project_root, &stray),
+            "stray slot-0 branch must be preserved (logged + skipped)"
+        );
+
+        // Slot 1 (legitimate clean-merged) was cleaned up normally — proves
+        // the guard scopes to slot-0 only and doesn't poison the rest.
+        assert!(
+            !branch_exists(&project_root, &slot1_ephemeral),
+            "legitimate slot 1 ephemeral should still be cleaned up"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "legitimate slot 1 worktree should still be removed"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // FEAT-004: list_unmerged_branch_files + list_ephemeral_slot_branches
     // -------------------------------------------------------------------------
@@ -3868,9 +3975,10 @@ detached
     }
 
     /// AC + CONTRACT: `list_ephemeral_slot_branches` returns ONLY branches
-    /// matching the canonical `{branch}-slot-N` shape, derived from the
-    /// `git worktree list` output. Other worktrees on unrelated branches are
-    /// filtered out so they never contribute to the cross-wave overlay.
+    /// matching the canonical `{branch}-slot-N` shape (with `N >= 1`), derived
+    /// from the `git worktree list` output. Other worktrees on unrelated
+    /// branches AND any stray `{branch}-slot-0` worktree are filtered out so
+    /// they never contribute to the cross-wave overlay.
     #[test]
     fn test_list_ephemeral_slot_branches_filters_to_slot_n_shape() {
         let branch = "feat/ephem-list";
@@ -3883,6 +3991,31 @@ detached
             ensure_worktree(tmp.path(), "feat/unrelated", true, None).expect("unrelated worktree");
         assert!(unrelated.exists());
 
+        // Inject a stray `{branch}-slot-0` worktree. Production code never
+        // creates one (slot 0 reuses the base branch), but a buggy past
+        // version or manual operator action could. The filter must drop it
+        // — including it would treat the loop's own work as "un-merged
+        // against itself" and spuriously block every cross-wave candidate.
+        let stray_branch = ephemeral_slot_branch(branch, 0);
+        let stray_path = tmp.path().parent().unwrap().join("ephem-list-stray-0");
+        let add = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &stray_branch,
+                stray_path.to_str().unwrap(),
+                branch,
+            ])
+            .current_dir(tmp.path())
+            .output()
+            .expect("git worktree add stray slot-0");
+        assert!(
+            add.status.success(),
+            "stray slot-0 worktree creation failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
         let result = list_ephemeral_slot_branches(tmp.path(), branch);
         assert_eq!(
             result,
@@ -3890,7 +4023,8 @@ detached
                 ephemeral_slot_branch(branch, 1),
                 ephemeral_slot_branch(branch, 2),
             ],
-            "only {{branch}}-slot-N entries, sorted by slot index, no unrelated branches"
+            "only {{branch}}-slot-N entries with N >= 1, sorted by slot index, \
+             no unrelated branches and no slot-0 strays"
         );
     }
 
