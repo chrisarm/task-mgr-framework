@@ -895,6 +895,23 @@ pub struct WaveTerminal {
     pub run_status: Option<RunStatus>,
 }
 
+/// One slot whose merge-back failed during the wave. Bundles the slot index
+/// and the task ID it had claimed so the consumer never has to keep two
+/// `Vec`s in lockstep — the equal-length invariant becomes a type-level
+/// guarantee instead of a rustdoc comment.
+///
+/// `task_id` is `None` when the slot's iteration produced no `task_id`
+/// (e.g. claim-fail before any task was assigned, or the FEAT-004 deadlock
+/// guard which synthesizes failed-merge entries from un-merged ephemeral
+/// branches with no claimed task). Reset semantics: a `None` task_id is
+/// silently skipped in `apply_merge_fail_reset_and_halt_check`'s reset
+/// pass — the threshold counter still increments.
+#[derive(Debug, Clone)]
+pub struct FailedMerge {
+    pub slot: usize,
+    pub task_id: Option<String>,
+}
+
 /// `terminal` is `Some(_)` when the wave determined the loop should stop —
 /// the outer loop applies the exit code and breaks. `iteration_consumed`
 /// matches the AC: every wave (eligible or NoEligibleTasks) burns one
@@ -907,7 +924,8 @@ pub struct WaveOutcome {
     /// True only when a `.stop` file caused the wave to halt — propagates to
     /// `LoopResult.was_stopped` so batch runners can react to a clean stop.
     pub was_stopped: bool,
-    /// Slot indices whose merge-back failed during this wave. Populated from
+    /// Slots whose merge-back failed during this wave, paired with the task
+    /// ID each had claimed. Populated from
     /// `worktree::merge_slot_branches_with_resolver`'s `outcomes.failed_slots`.
     /// Always empty for sequential runs (`parallel_slots <= 1`) and for waves
     /// that never reached the merge-back step (e.g. preflight bail-out).
@@ -917,14 +935,7 @@ pub struct WaveOutcome {
     /// claimed task to `todo`, increment
     /// `IterationContext::consecutive_merge_fail_waves`, and halt when the
     /// counter reaches `ProjectConfig::merge_fail_halt_threshold`.
-    pub failed_merges: Vec<usize>,
-    /// Task ID claimed by each failed slot, parallel to `failed_merges`
-    /// (same length, same order). `None` when the slot's iteration produced
-    /// no `task_id` (e.g. claim-fail before any task was assigned), which
-    /// can't occur today because merge-back only runs when slots actually
-    /// claimed tasks — kept as `Option` for forward compatibility with
-    /// future slot lifecycles.
-    pub failed_merge_task_ids: Vec<Option<String>>,
+    pub failed_merges: Vec<FailedMerge>,
 }
 
 /// Wave-mode aggregator collected during per-slot post-processing.
@@ -973,7 +984,6 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
-            failed_merge_task_ids: Vec::new(),
         });
     }
     if signals::check_stop_signal(params.tasks_dir, params.task_prefix) {
@@ -988,7 +998,6 @@ fn wave_preflight_check(
             }),
             was_stopped: true,
             failed_merges: Vec::new(),
-            failed_merge_task_ids: Vec::new(),
         });
     }
 
@@ -1015,7 +1024,6 @@ fn wave_preflight_check(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
-            failed_merge_task_ids: Vec::new(),
         });
     }
     None
@@ -1057,7 +1065,6 @@ fn handle_no_eligible_tasks(
             }),
             was_stopped: false,
             failed_merges: Vec::new(),
-            failed_merge_task_ids: Vec::new(),
         };
     }
     WaveOutcome {
@@ -1066,7 +1073,6 @@ fn handle_no_eligible_tasks(
         terminal: None,
         was_stopped: false,
         failed_merges: Vec::new(),
-        failed_merge_task_ids: Vec::new(),
     }
 }
 
@@ -1077,9 +1083,9 @@ fn handle_no_eligible_tasks(
 /// runs the FEAT-002 reset/halt-check contract.
 ///
 /// **No tasks to reset**: the deferred candidates are still `todo` — they
-/// were never claimed. `failed_merge_task_ids` is therefore all-`None`, and
-/// `apply_merge_fail_reset_and_halt_check`'s reset pass becomes a no-op
-/// (`None` skipped via `if let Some`).
+/// were never claimed. The synthesized `FailedMerge` entries therefore carry
+/// `task_id: None`, and `apply_merge_fail_reset_and_halt_check`'s reset
+/// pass becomes a no-op (`None` skipped via `if let Some`).
 ///
 /// **Slot index derivation**: branches sourced from
 /// `worktree::list_ephemeral_slot_branches` are guaranteed to match the
@@ -1138,15 +1144,20 @@ fn handle_ephemeral_deadlock(
         }
     }
     synth_slots.sort();
-    let failed_merge_task_ids: Vec<Option<String>> = vec![None; synth_slots.len()];
+    let failed_merges: Vec<FailedMerge> = synth_slots
+        .into_iter()
+        .map(|slot| FailedMerge {
+            slot,
+            task_id: None,
+        })
+        .collect();
 
     WaveOutcome {
         tasks_completed: 0,
         iteration_consumed: true,
         terminal: None,
         was_stopped: false,
-        failed_merges: synth_slots,
-        failed_merge_task_ids,
+        failed_merges,
     }
 }
 
@@ -1503,8 +1514,7 @@ fn apply_merge_fail_reset_and_halt_check(
     conn: &Connection,
     ctx: &mut IterationContext,
     branch: &str,
-    failed_merges: &[usize],
-    failed_merge_task_ids: &[Option<String>],
+    failed_merges: &[FailedMerge],
     threshold: u32,
 ) -> MergeFailHaltDecision {
     if failed_merges.is_empty() {
@@ -1512,12 +1522,11 @@ fn apply_merge_fail_reset_and_halt_check(
         return MergeFailHaltDecision::Continue;
     }
 
-    // (1) Reset every failed slot's claimed task. We zip rather than index
-    //     because the two slices are required to be equal-length parallel
-    //     arrays (see WaveOutcome rustdoc) — a `Vec` shorter than the other
-    //     simply truncates safely instead of panicking on a mismatched length.
-    for (_slot, maybe_task) in failed_merges.iter().zip(failed_merge_task_ids.iter()) {
-        if let Some(tid) = maybe_task {
+    // (1) Reset every failed slot's claimed task. The single-slice shape
+    //     (a `Vec<FailedMerge>`) makes the slot/task pairing a type-level
+    //     guarantee — no zip-truncation footgun.
+    for fm in failed_merges {
+        if let Some(tid) = &fm.task_id {
             reset_task_to_todo(conn, tid, "failed-slot task");
             ctx.pending_slot_tasks.retain(|t| t != tid);
         }
@@ -1537,7 +1546,7 @@ fn apply_merge_fail_reset_and_halt_check(
     //     source — never construct `{branch}-slot-{N}` inline (learning [1870]).
     let names: Vec<String> = failed_merges
         .iter()
-        .map(|&s| worktree::ephemeral_slot_branch(branch, s))
+        .map(|fm| worktree::ephemeral_slot_branch(branch, fm.slot))
         .collect();
     eprintln!(
         "Aborting: {} consecutive merge-back failure wave(s) (threshold={}). \
@@ -1714,10 +1723,8 @@ pub fn run_wave_iteration(
     // logged but never fatal — slot 0 is restored to its captured pre-merge
     // HEAD via `git reset --hard`, and the next wave still benefits from any
     // slots that did merge. The wave-loop boundary in `run_loop` consumes
-    // `failed_merges` / `failed_merge_task_ids` to drive the FEAT-002
-    // reset/halt-check contract.
-    let mut failed_merges: Vec<usize> = Vec::new();
-    let mut failed_merge_task_ids: Vec<Option<String>> = Vec::new();
+    // `failed_merges` to drive the FEAT-002 reset/halt-check contract.
+    let mut failed_merges: Vec<FailedMerge> = Vec::new();
     if params.parallel_slots > 1 {
         let resolved_model = params
             .default_model
@@ -1760,16 +1767,19 @@ pub fn run_wave_iteration(
                     slot, detail
                 );
             }
-            // Capture failed slot indices and resolve each to its claimed
-            // task by looking up the slot's IterationResult. Parallel arrays
-            // (same length, same order) so the boundary's reset loop can zip.
+            // Capture failed slot index alongside the task_id its slot had
+            // claimed. The `FailedMerge` shape keeps the pairing as one
+            // value so downstream consumers can't accidentally zip with a
+            // mismatched length.
             let task_id = wave_result
                 .outcomes
                 .iter()
                 .find(|o| o.slot_index == *slot)
                 .and_then(|o| o.iteration_result.task_id.clone());
-            failed_merges.push(*slot);
-            failed_merge_task_ids.push(task_id);
+            failed_merges.push(FailedMerge {
+                slot: *slot,
+                task_id,
+            });
         }
     }
 
@@ -1815,7 +1825,6 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
-            failed_merge_task_ids,
         };
     }
     if ctx.crash_tracker.should_abort() {
@@ -1829,7 +1838,6 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
-            failed_merge_task_ids,
         };
     }
 
@@ -1844,7 +1852,6 @@ pub fn run_wave_iteration(
             }),
             was_stopped: false,
             failed_merges,
-            failed_merge_task_ids,
         };
     }
 
@@ -1876,7 +1883,6 @@ pub fn run_wave_iteration(
         },
         was_stopped: false,
         failed_merges,
-        failed_merge_task_ids,
     }
 }
 
@@ -3527,7 +3533,6 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 &mut ctx,
                 branch,
                 &outcome.failed_merges,
-                &outcome.failed_merge_task_ids,
                 halt_threshold,
             ) {
                 exit_code = halt_code;
@@ -8129,33 +8134,36 @@ mod tests {
             terminal: None,
             was_stopped: false,
             failed_merges: Vec::new(),
-            failed_merge_task_ids: Vec::new(),
         };
         assert!(outcome.failed_merges.is_empty());
-        assert!(outcome.failed_merge_task_ids.is_empty());
     }
 
-    /// AC: WaveOutcome.failed_merges and failed_merge_task_ids are equal-length
-    /// parallel arrays carrying slot indices and their claimed task IDs.
+    /// AC: WaveOutcome.failed_merges carries `(slot, task_id)` as a single
+    /// `FailedMerge` value so the slot/task pairing is a type-level guarantee
+    /// (no parallel arrays held lockstep by rustdoc).
     #[test]
-    fn test_wave_outcome_failed_merges_parallel_arrays() {
+    fn test_wave_outcome_failed_merges_pair_slot_with_task_id() {
         let outcome = WaveOutcome {
             tasks_completed: 0,
             iteration_consumed: true,
             terminal: None,
             was_stopped: false,
-            failed_merges: vec![1, 2],
-            failed_merge_task_ids: vec![Some("FEAT-001".into()), Some("FEAT-002".into())],
+            failed_merges: vec![
+                FailedMerge {
+                    slot: 1,
+                    task_id: Some("FEAT-001".into()),
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: Some("FEAT-002".into()),
+                },
+            ],
         };
-        assert_eq!(
-            outcome.failed_merges.len(),
-            outcome.failed_merge_task_ids.len()
-        );
-        assert_eq!(outcome.failed_merges, vec![1, 2]);
-        assert_eq!(
-            outcome.failed_merge_task_ids[0].as_deref(),
-            Some("FEAT-001")
-        );
+        assert_eq!(outcome.failed_merges.len(), 2);
+        assert_eq!(outcome.failed_merges[0].slot, 1);
+        assert_eq!(outcome.failed_merges[0].task_id.as_deref(), Some("FEAT-001"));
+        assert_eq!(outcome.failed_merges[1].slot, 2);
+        assert_eq!(outcome.failed_merges[1].task_id.as_deref(), Some("FEAT-002"));
     }
 
     /// AC: ctx.consecutive_merge_fail_waves increments on a failed wave.
@@ -8170,8 +8178,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             2, // default threshold
         );
         assert_eq!(ctx.consecutive_merge_fail_waves, 1);
@@ -8185,8 +8195,7 @@ mod tests {
         let mut ctx = IterationContext::new(5);
         ctx.consecutive_merge_fail_waves = 3;
 
-        let decision =
-            apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 2);
+        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
         assert_eq!(decision, MergeFailHaltDecision::Continue);
     }
@@ -8203,8 +8212,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             2,
         );
 
@@ -8227,8 +8238,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             2,
         );
         match decision {
@@ -8266,8 +8279,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             1,
         );
         assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
@@ -8294,8 +8309,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             0, // threshold 0 = never halt.
         );
         assert_eq!(decision, MergeFailHaltDecision::Continue);
@@ -8311,8 +8328,7 @@ mod tests {
         ctx.consecutive_merge_fail_waves = 5;
         ctx.pending_slot_tasks.push("FEAT-001".to_string());
 
-        let decision =
-            apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 2);
+        let decision = apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 2);
         assert_eq!(decision, MergeFailHaltDecision::Continue);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
         // Did NOT touch unrelated in-progress task.
@@ -8337,8 +8353,16 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1, 2],
-            &[Some("FEAT-001".into()), Some("FEAT-002".into())],
+            &[
+                FailedMerge {
+                    slot: 1,
+                    task_id: Some("FEAT-001".into()),
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: Some("FEAT-002".into()),
+                },
+            ],
             5,
         );
         assert_eq!(
@@ -8368,8 +8392,16 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1, 2],
-            &[None, None],
+            &[
+                FailedMerge {
+                    slot: 1,
+                    task_id: None,
+                },
+                FailedMerge {
+                    slot: 2,
+                    task_id: None,
+                },
+            ],
             1, // threshold 1 → halt on first failure.
         );
         assert!(matches!(decision, MergeFailHaltDecision::Halt { .. }));
@@ -8404,14 +8436,16 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             5, // generous threshold so we don't halt.
         );
         assert_eq!(ctx.consecutive_merge_fail_waves, 1);
 
         // Wave 2: clean.
-        apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], &[], 5);
+        apply_merge_fail_reset_and_halt_check(&conn, &mut ctx, "feat/test", &[], 5);
         assert_eq!(ctx.consecutive_merge_fail_waves, 0);
     }
 
@@ -8439,8 +8473,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             2, // default
         );
         assert_eq!(d1, MergeFailHaltDecision::Continue);
@@ -8465,8 +8501,10 @@ mod tests {
             &conn,
             &mut ctx,
             "feat/test",
-            &[1],
-            &[Some("FEAT-001".into())],
+            &[FailedMerge {
+                slot: 1,
+                task_id: Some("FEAT-001".into()),
+            }],
             2,
         );
         match d2 {
