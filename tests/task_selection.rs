@@ -1032,9 +1032,9 @@ fn test_milestone_soft_dep_cbd7d081_scenario() {
     .unwrap();
 
     // Phase 1 — milestone must be excluded while active fixup siblings exist.
-    let group =
-        select_parallel_group(&conn, &[], Some("cbd7d081"), 2, &[]).expect("select_parallel_group");
-    let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+    let group = select_parallel_group(&conn, &[], Some("cbd7d081"), 2, &[], &[])
+        .expect("select_parallel_group");
+    let ids: Vec<&str> = group.group.iter().map(|s| s.task.id.as_str()).collect();
 
     assert!(
         !ids.contains(&"cbd7d081-MILESTONE-FINAL"),
@@ -1054,9 +1054,9 @@ fn test_milestone_soft_dep_cbd7d081_scenario() {
     )
     .unwrap();
 
-    let group =
-        select_parallel_group(&conn, &[], Some("cbd7d081"), 2, &[]).expect("select_parallel_group");
-    let ids: Vec<&str> = group.iter().map(|s| s.task.id.as_str()).collect();
+    let group = select_parallel_group(&conn, &[], Some("cbd7d081"), 2, &[], &[])
+        .expect("select_parallel_group");
+    let ids: Vec<&str> = group.group.iter().map(|s| s.task.id.as_str()).collect();
 
     assert!(
         ids.contains(&"cbd7d081-MILESTONE-FINAL"),

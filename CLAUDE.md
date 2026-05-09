@@ -441,3 +441,113 @@ Note: merge resolution is intentionally NOT part of the shared
 `iteration_pipeline` (see "Iteration pipeline (shared)" above) — it requires
 working-tree state owned by `run_wave_iteration`, not the per-slot
 post-Claude processing block.
+
+## Parallel-slot scheduling
+
+Five layered defenses harden parallel-slot execution against the cascade
+that produced the mw-datalake incident (a 2-slot loop whose slot-1
+merge-back failed on iteration 1 with a recomputed-slot-path ENOENT,
+silently kept launching new waves, and eventually diverged 22-vs-18
+commits with un-merged `Cargo.lock` modifications on each side).
+
+### 1. Slot path threading (cause-fix)
+
+`merge_slot_branches_with_resolver` (`src/loop_engine/worktree.rs`) takes
+`slot_paths: &[PathBuf]` and uses `slot_paths[0]` as slot 0's path, never
+recomputing it via `compute_slot_worktree_path(project_root, branch, 0)`.
+The recomputation diverges when the loop runs from inside the matching
+worktree — `compute_slot_worktree_path` re-derives a path under
+`{parent(project_root)}/{slot0_name}-worktrees/...` while the actual slot 0
+worktree IS the project root. Engine threads the paths returned by
+`ensure_slot_worktrees` through `WaveParams::slot_worktree_paths`.
+
+`compute_slot_worktree_path` is still correct for slots 1+ inside
+`merge_slot_branches_with_resolver` and for `cleanup_slot_worktrees` — only
+the slot 0 lookup was wrong.
+
+### 2. Consecutive-merge-fail halt threshold
+
+`ProjectConfig::merge_fail_halt_threshold` (default `2`) caps consecutive
+parallel-slot merge-back failure waves before the engine halts. Single
+failures are recoverable (next wave gets a clean slate from the
+resolver); two-in-a-row indicate a cascading state. The reset/halt
+contract is implemented once in
+`apply_merge_fail_reset_and_halt_check` (`src/loop_engine/engine.rs`)
+and called from the wave-loop boundary — sequential-loop and wave-loop
+paths must not re-implement it.
+
+Threshold semantics:
+- `0` — never halt (legacy "log and continue" behavior, preserved
+  bit-for-bit on the same forced-fail input)
+- `1` — halt on any merge-back failure
+- `2` (default) — halt after two consecutive merge-back failure waves
+
+### 3. Implicit-overlap baseline + buildy heuristic
+
+`select_parallel_group` in `src/commands/next/selection.rs` serializes
+shared-infra contention through a single synthetic `__shared_infra__`
+slot per wave. A candidate "claims" the synthetic slot when ANY of:
+
+- (a) some `touchesFiles` entry's basename matches the union of
+  `IMPLICIT_OVERLAP_FILES` (Cargo.lock, uv.lock, package-lock.json,
+  go.sum, etc. — Rust/Python/JS/Go ecosystems out-of-the-box) ∪
+  `ProjectConfig::implicit_overlap_files` ∪
+  `PrdFile::implicit_overlap_files` (project + PRD lists EXTEND, do not
+  replace, the baseline);
+- (b) the task id matches `BUILDY_TASK_PREFIXES` (`FEAT`, `REFACTOR`,
+  `REFACTOR-N`, `CODE-FIX`, `WIRE-FIX`, `IMPL-FIX` — superset of
+  `SPAWNED_FIXUP_PREFIXES`) via the same token-aware
+  `id_body_matches_prefix` matcher used by the soft-dep guard (no
+  parallel matcher);
+- (c) the task's `claims_shared_infra` field (Option<bool>, migration
+  v19) is `Some(true)` — explicit override.
+
+`Some(false)` overrides BOTH (a) and (b); `None` falls through to (a) ∨
+(b). This deliberately changes the empty-`touchesFiles` parallelism
+baseline — buildy-prefix tasks claim infra even with no listed files.
+
+### 4. Cross-wave file affinity (un-merged ephemeral branches)
+
+`select_parallel_group` accepts `ephemeral_overlay: &[(branch, files)]`
+listing files claimed by un-merged ephemeral slot branches from prior
+waves. A candidate is deferred when its `touchesFiles` overlap with any
+ephemeral branch's claimed set — preventing the same file from being
+modified on two divergent branches across waves.
+
+Engine builds the overlay via `worktree::list_unmerged_branch_files`
+(`git diff --name-only {base}...{ephemeral}`) for each `{branch}-slot-N`
+ephemeral that hasn't merged back. Empty overlay → identical results to
+the pre-FEAT-004 implementation (strict superset filter).
+
+**Deadlock guard**: when the greedy pass yields an empty group AND every
+candidate's only overlap was ephemeral, `ParallelGroupResult::ephemeral_block_diagnostics`
+is populated with named blocking branches. Engine treats this as
+equivalent to `failed_merges` non-empty so the FEAT-002 reset/halt
+contract fires and the loop halts cleanly with named branches instead
+of spinning until stale-iteration abort.
+
+### 5. Stale ephemeral branch hygiene at startup
+
+`reconcile_stale_ephemeral_slots` (`src/loop_engine/worktree.rs`) runs
+once at loop startup BEFORE `ensure_slot_worktrees`. For each
+`{branch}-slot-N` left over from a prior crash:
+- Clean (worktree dir gone, no un-merged commits) → branch deleted, no
+  abort.
+- Un-merged commits exist AND `halt_threshold > 0` → abort startup
+  (the operator must reconcile before the new loop can run).
+- Dirty working tree (uncommitted changes) → abort regardless of
+  `halt_threshold` (no automated cleanup of unsaved work).
+
+Branch-name shape uses `ephemeral_slot_branch(branch, slot)` (slot 0 is
+the loop's base branch; slots 1+ are `{branch}-slot-{N}`). Idempotent —
+running twice produces identical state on the second pass.
+
+### Touchpoints
+
+| Concern | File | Symbol |
+| --- | --- | --- |
+| Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
+| Halt threshold contract | `src/loop_engine/engine.rs` | `apply_merge_fail_reset_and_halt_check` |
+| Implicit overlap baseline | `src/commands/next/selection.rs` | `IMPLICIT_OVERLAP_FILES`, `BUILDY_TASK_PREFIXES` |
+| Cross-wave overlay | `src/loop_engine/worktree.rs` + `src/commands/next/selection.rs` | `list_unmerged_branch_files`, `ephemeral_overlay` parameter |
+| Startup hygiene | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots` |
