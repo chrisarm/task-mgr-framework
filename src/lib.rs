@@ -9,6 +9,7 @@ pub mod loop_engine;
 pub mod models;
 pub mod output;
 pub mod paths;
+pub mod util;
 
 // Re-export commonly used error types
 pub use error::{TaskMgrError, TaskMgrResult, validate_safe_path};
