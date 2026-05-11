@@ -6,8 +6,15 @@ use std::path::Path;
 /// `replacement`. When no valid marker pair is found, the block is appended so
 /// the function is safe to call on files that do not yet contain the markers.
 ///
-/// Only the first occurrence of `marker_begin` is used; content after
-/// `marker_end` (on that same pass) is preserved verbatim.
+/// Only the first occurrence of `marker_begin` is used; content before
+/// `marker_begin` and content after `marker_end` (on that same pass) are
+/// preserved byte-for-byte.
+///
+/// **Layout**: the splice always emits the replacement on its own lines, i.e.
+/// `marker_begin\n<replacement>\nmarker_end`. An inline `BEGIN content END`
+/// on one line is therefore expanded to multi-line form on the first call;
+/// subsequent calls are idempotent because the markers are already on their
+/// own lines. Content outside the markers is still byte-preserved.
 pub fn splice_block(
     current: &str,
     marker_begin: &str,

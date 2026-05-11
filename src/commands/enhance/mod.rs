@@ -240,48 +240,63 @@ fn detect_unbalanced(content: &str) -> Option<String> {
     None
 }
 
-/// Apply the splice for `enhance agents`, handling the create / append /
-/// replace / dry-run / no-op variants.
-fn agents_one(target: &Path, body: &str, create: bool, dry_run: bool) -> TargetOutcome {
+/// Loaded state for `enhance agents`: the current file contents (empty when
+/// the file did not exist) plus the existence flag the writer needs.
+struct AgentsLoaded {
+    current: String,
+    existed: bool,
+}
+
+/// Read-and-validate phase: symlink check, existence + `--create` check,
+/// file read, balanced-markers check. Returns `Ok(loaded)` on proceed or
+/// `Err(outcome)` for any early-return state (skipped / errored).
+fn agents_load(target: &Path, create: bool) -> Result<AgentsLoaded, TargetOutcome> {
     let target_pb = target.to_path_buf();
 
     if is_symlink(target) {
-        return TargetOutcome::errored(
+        return Err(TargetOutcome::errored(
             target_pb,
             format!("{} is a symlink — refusing to write", target.display()),
-        );
+        ));
     }
 
     let existed = target.exists();
     if !existed && !create {
-        return TargetOutcome::ok(target_pb, ActionTaken::Skipped);
+        return Err(TargetOutcome::ok(target_pb, ActionTaken::Skipped));
     }
 
     let current = if existed {
-        match fs::read_to_string(target) {
-            Ok(s) => s,
-            Err(e) => {
-                return TargetOutcome::errored(
-                    target_pb,
-                    format!("reading {} failed: {e}", target.display()),
-                );
-            }
-        }
+        fs::read_to_string(target).map_err(|e| {
+            TargetOutcome::errored(
+                target_pb.clone(),
+                format!("reading {} failed: {e}", target.display()),
+            )
+        })?
     } else {
         String::new()
     };
 
     if let Some(msg) = detect_unbalanced(&current) {
-        return TargetOutcome::errored(target_pb, format!("{}: {msg}", target.display()));
+        return Err(TargetOutcome::errored(
+            target_pb,
+            format!("{}: {msg}", target.display()),
+        ));
     }
 
-    let had_block = current.contains(MARKER_BEGIN) && current.contains(MARKER_END);
-    let new_content = splice_block(&current, MARKER_BEGIN, MARKER_END, body);
+    Ok(AgentsLoaded { current, existed })
+}
 
-    let planned_action = if !existed {
+/// Compute-and-write phase: splice the new body in, classify the action,
+/// honor `dry_run` / no-op, and write atomically when work is needed.
+fn agents_apply(target: &Path, loaded: &AgentsLoaded, body: &str, dry_run: bool) -> TargetOutcome {
+    let target_pb = target.to_path_buf();
+    let had_block = loaded.current.contains(MARKER_BEGIN) && loaded.current.contains(MARKER_END);
+    let new_content = splice_block(&loaded.current, MARKER_BEGIN, MARKER_END, body);
+
+    let planned_action = if !loaded.existed {
         ActionTaken::Created
     } else if had_block {
-        if new_content == current {
+        if new_content == loaded.current {
             ActionTaken::NoOp
         } else {
             ActionTaken::Replaced
@@ -304,7 +319,7 @@ fn agents_one(target: &Path, body: &str, create: bool, dry_run: bool) -> TargetO
         return TargetOutcome::ok(target_pb, ActionTaken::NoOp);
     }
 
-    if !existed
+    if !loaded.existed
         && let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -321,6 +336,15 @@ fn agents_one(target: &Path, body: &str, create: bool, dry_run: bool) -> TargetO
             target_pb,
             format!("writing {} failed: {e}", target.display()),
         ),
+    }
+}
+
+/// Apply the splice for `enhance agents`, handling the create / append /
+/// replace / dry-run / no-op variants.
+fn agents_one(target: &Path, body: &str, create: bool, dry_run: bool) -> TargetOutcome {
+    match agents_load(target, create) {
+        Ok(loaded) => agents_apply(target, &loaded, body, dry_run),
+        Err(outcome) => outcome,
     }
 }
 
