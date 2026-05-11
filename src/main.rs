@@ -182,13 +182,7 @@ fn dispatch_init(
         init_project(&project_root)?;
     }
 
-    let prefix_mode = if no_prefix {
-        task_mgr::commands::init::PrefixMode::Disabled
-    } else if let Some(p) = prefix {
-        task_mgr::commands::init::PrefixMode::Explicit(p)
-    } else {
-        task_mgr::commands::init::PrefixMode::Auto
-    };
+    let prefix_mode = task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
 
     // The canonical PRD-import call: identical shape to the LoopCommand::Init
     // and BatchCommand::Init dispatch arms. Single source of truth for what
@@ -1002,13 +996,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     prefix,
                     no_prefix,
                 } => {
-                    let prefix_mode = if no_prefix {
-                        task_mgr::commands::init::PrefixMode::Disabled
-                    } else if let Some(p) = prefix {
-                        task_mgr::commands::init::PrefixMode::Explicit(p)
-                    } else {
-                        task_mgr::commands::init::PrefixMode::Auto
-                    };
+                    let prefix_mode =
+                        task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
                     let _lock = LockGuard::acquire(&cli.dir)?;
                     let result = init(
                         &cli.dir,
@@ -1141,13 +1130,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     prefix,
                     no_prefix,
                 } => {
-                    let prefix_mode = if no_prefix {
-                        task_mgr::commands::init::PrefixMode::Disabled
-                    } else if let Some(p) = prefix {
-                        task_mgr::commands::init::PrefixMode::Explicit(p)
-                    } else {
-                        task_mgr::commands::init::PrefixMode::Auto
-                    };
+                    let prefix_mode =
+                        task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
                     // Expand glob patterns to concrete PRD file paths.
                     // `expand_patterns` already errors when no files match, so
                     // an empty result is unreachable here. Keeping this arm a

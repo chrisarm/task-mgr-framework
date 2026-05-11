@@ -63,6 +63,19 @@ pub enum PrefixMode {
     Disabled,
 }
 
+impl PrefixMode {
+    /// Resolve from the `--no-prefix` / `--prefix <val>` CLI flags.
+    pub fn from_cli_flags(no_prefix: bool, prefix: Option<String>) -> Self {
+        if no_prefix {
+            Self::Disabled
+        } else if let Some(p) = prefix {
+            Self::Explicit(p)
+        } else {
+            Self::Auto
+        }
+    }
+}
+
 /// Apply a prefix to a single task ID.
 ///
 /// Idempotent: if the ID already starts with `{prefix}-`, returns it unchanged.
