@@ -2536,3 +2536,172 @@ mod multi_prd_import_tests {
         );
     }
 }
+
+// ============================================================================
+// init_project tests
+// ============================================================================
+
+#[test]
+fn test_init_project_fresh_creates_db_and_config() {
+    let project_dir = TempDir::new().unwrap();
+    let result = super::init_project(project_dir.path()).unwrap();
+
+    assert!(
+        result.created_dirs,
+        "should report dir creation on first call"
+    );
+    assert!(
+        result.created_config,
+        "should report config creation on first call"
+    );
+    assert!(result.fresh_import, "fresh_import mirrors created_dirs");
+
+    let db_path = project_dir.path().join(".task-mgr").join("tasks.db");
+    assert!(db_path.exists(), ".task-mgr/tasks.db must exist");
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    assert!(config_path.exists(), ".task-mgr/config.json must exist");
+
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert_eq!(
+        config.get("version").and_then(|v| v.as_u64()),
+        Some(1),
+        "config must have version >= 1"
+    );
+}
+
+#[test]
+fn test_init_project_preserves_existing_config_fields() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = project_dir.path().join(".task-mgr");
+    fs::create_dir_all(&db_dir).unwrap();
+    fs::write(db_dir.join("config.json"), r#"{"customField": "keepme"}"#).unwrap();
+
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_str = fs::read_to_string(db_dir.join("config.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert_eq!(
+        config.get("customField").and_then(|v| v.as_str()),
+        Some("keepme"),
+        "existing customField must be preserved"
+    );
+    assert_eq!(
+        config.get("version").and_then(|v| v.as_u64()),
+        Some(1),
+        "version default must be filled in for missing key"
+    );
+}
+
+#[test]
+fn test_init_project_idempotent() {
+    let project_dir = TempDir::new().unwrap();
+
+    // First call — creates everything
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    let content_after_first = fs::read(&config_path).unwrap();
+
+    // Second call — should be a no-op as far as created_* flags go
+    let result2 = super::init_project(project_dir.path()).unwrap();
+    assert!(
+        !result2.created_dirs,
+        "created_dirs must be false on second call"
+    );
+    assert!(
+        !result2.created_config,
+        "created_config must be false on second call"
+    );
+
+    let content_after_second = fs::read(&config_path).unwrap();
+    assert_eq!(
+        content_after_first, content_after_second,
+        "config.json contents must be byte-identical between calls"
+    );
+}
+
+#[test]
+fn test_init_project_leaves_tasks_json_untouched() {
+    let project_dir = TempDir::new().unwrap();
+    let tasks_dir = project_dir.path().join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    let foo_path = tasks_dir.join("foo.json");
+    let foo_content = br#"{"id":"SOME-001","title":"stub"}"#;
+    fs::write(&foo_path, foo_content).unwrap();
+
+    let before = fs::read(&foo_path).unwrap();
+    super::init_project(project_dir.path()).unwrap();
+    let after = fs::read(&foo_path).unwrap();
+
+    assert_eq!(
+        before, after,
+        "tasks/foo.json must be byte-identical before and after init_project"
+    );
+}
+
+#[test]
+fn test_init_project_empty_task_mgr_dir() {
+    let project_dir = TempDir::new().unwrap();
+    // Pre-create empty .task-mgr/ (no DB, no config)
+    fs::create_dir_all(project_dir.path().join(".task-mgr")).unwrap();
+
+    let result1 = super::init_project(project_dir.path()).unwrap();
+    // Dir existed already, so created_dirs is false; but config is new
+    assert!(
+        !result1.created_dirs,
+        "dir existed — created_dirs must be false"
+    );
+    assert!(
+        result1.created_config,
+        "config didn't exist — created_config must be true"
+    );
+
+    assert!(
+        project_dir
+            .path()
+            .join(".task-mgr")
+            .join("tasks.db")
+            .exists()
+    );
+    assert!(
+        project_dir
+            .path()
+            .join(".task-mgr")
+            .join("config.json")
+            .exists()
+    );
+
+    // Second call: no-op
+    let result2 = super::init_project(project_dir.path()).unwrap();
+    assert!(!result2.created_dirs);
+    assert!(!result2.created_config);
+}
+
+#[test]
+fn test_init_project_non_tty_no_default_model() {
+    // In test environments stdin/stderr are not TTYs, so the picker must be skipped.
+    let project_dir = TempDir::new().unwrap();
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert!(
+        config.get("defaultModel").is_none(),
+        "picker must not fire in non-TTY environment; defaultModel must be absent"
+    );
+}
+
+#[test]
+fn test_init_project_does_not_create_tasks_subdir() {
+    let project_dir = TempDir::new().unwrap();
+    super::init_project(project_dir.path()).unwrap();
+
+    let tasks_subdir = project_dir.path().join(".task-mgr").join("tasks");
+    assert!(
+        !tasks_subdir.exists(),
+        "init_project must NOT create .task-mgr/tasks/ — that belongs to loop/batch init"
+    );
+}

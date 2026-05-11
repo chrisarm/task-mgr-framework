@@ -31,6 +31,12 @@ pub struct InitResult {
     /// The prefix that was applied to task IDs, if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_applied: Option<String>,
+    /// Whether the `.task-mgr/` directory was newly created by `init_project`
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_dirs: bool,
+    /// Whether `config.json` was newly created by `init_project`
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_config: bool,
 }
 
 /// Preview of what would be deleted in dry-run mode.
@@ -70,6 +76,12 @@ pub fn format_text(result: &InitResult) -> String {
             result.tasks_imported, result.files_imported, result.relationships_imported
         ));
     } else {
+        if result.created_dirs {
+            output.push_str("Created: .task-mgr/\n");
+        }
+        if result.created_config {
+            output.push_str("Created: .task-mgr/config.json\n");
+        }
         if let Some(ref prefix) = result.prefix_applied {
             output.push_str(&format!("Prefix: {}-\n", prefix));
         }
