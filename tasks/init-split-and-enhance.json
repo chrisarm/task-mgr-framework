@@ -423,7 +423,7 @@
       "id": "REFACTOR-001",
       "model": "claude-opus-4-7",
       "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on the ugliest touchpoint (typically the dispatch logic in src/main.rs after FEAT-004 and FEAT-005 land), then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
-      "passes": false,
+      "passes": true,
       "priority": 98,
       "qualityDimensions": [
         "DRY across enhance/, init/, and main.rs dispatch",
@@ -476,7 +476,7 @@
       "id": "REVIEW-001",
       "model": "claude-opus-4-7",
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + PRD JSON synced atomically. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.\n\nLearning invalidation: `task-mgr learn --invalidate 1424` after this PR merges. The learning text was 'task-mgr init requires --from-json' which is no longer true. Verify via `task-mgr recall --query 'init requires from-json'` returning zero or only superseded hits.\n\nManual smoke checklist:\n1. mkdir /tmp/tm-test && cd /tmp/tm-test\n2. target/debug/task-mgr init                                          # scaffolds + enhance hint\n3. target/debug/task-mgr init                                          # idempotent\n4. target/debug/task-mgr enhance show --profile workflow               # prints workflow block\n5. target/debug/task-mgr enhance agents --create                       # creates CLAUDE.md + AGENTS.md\n6. target/debug/task-mgr enhance agents --create                       # idempotent (no diff)\n7. target/debug/task-mgr enhance strip                                 # removes blocks\n8. echo '{\"tasks\":[{\"id\":\"X-001\",\"title\":\"t\",\"difficulty\":\"low\"}]}' > p.json\n9. target/debug/task-mgr init --from-json p.json                       # stderr DEPRECATED; row inserted\n10. target/debug/task-mgr loop init p.json --append --update-existing  # no diff\n11. target/debug/task-mgr loop p.json --yes --hours 0                  # flat-form deprecation + run\n\nLearning [1093]: file-writing fix functions are idempotent — confirm in enhance tests.\nLearning [1075]: SetupFix struct shape — confirm EnhanceResult matches.\nLearning [1505]: FK delete order — relevant to `loop init --force` and `batch init --force` paths; verify they still work post-refactor.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unwrap in production paths in new code",
@@ -514,7 +514,7 @@
       "description": "PrefixMode resolution from (no_prefix, prefix) CLI flags is duplicated 3x in src/main.rs: lines 185-191 (dispatch_init mode 3), lines 1005-1011 (LoopCommand::Init), lines 1144-1150 (BatchCommand::Init). All three blocks are byte-identical. DRY violation introduced by FEAT-004/005.",
       "estimatedEffort": "low",
       "id": "b848fe20-REFACTOR-FIX-001",
-      "passes": false,
+      "passes": true,
       "priority": 88,
       "title": "Extract PrefixMode CLI resolution helper",
       "touchesFiles": [
