@@ -786,29 +786,46 @@ INSTALLATION:
     },
 
     /// Run autonomous agent loop
-    #[command(after_help = "\
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        after_help = "\
 EXAMPLES:
-    # Run loop with a PRD file (will prompt for confirmation)
-    task-mgr loop tasks/my-prd.json
+    # Canonical forms (preferred)
+    task-mgr loop init tasks/my-prd.json --append --update-existing
+    task-mgr loop run  tasks/my-prd.json --yes
 
-    # Run loop with auto-confirmation
+    # Flat form (deprecated, still parses): equivalent to `loop run ...`
     task-mgr loop tasks/my-prd.json --yes
 
     # Run loop with time budget
-    task-mgr loop tasks/my-prd.json --yes --hours 4.5
+    task-mgr loop run tasks/my-prd.json --yes --hours 4.5
 
     # Run loop with custom prompt file
-    task-mgr loop tasks/my-prd.json --prompt-file tasks/custom-prompt.md --yes
+    task-mgr loop run tasks/my-prd.json --prompt-file tasks/custom-prompt.md --yes
 
     # Run loop with verbose output
-    task-mgr loop tasks/my-prd.json --yes --verbose
+    task-mgr loop run tasks/my-prd.json --yes --verbose
 
     # Run without git worktrees (use branch checkout instead)
-    task-mgr loop tasks/my-prd.json --no-worktree
-")]
+    task-mgr loop run tasks/my-prd.json --no-worktree
+
+NOTE: a positional named `init` or `run` collides with the subcommand. Pass an
+absolute or `./`-prefixed path (e.g. `task-mgr loop run ./init`) if your PRD
+file is literally called `init` or `run`.
+"
+    )]
     Loop {
-        /// Path to PRD JSON file
-        prd_file: PathBuf,
+        /// Optional nested subcommand: `init` (import PRD) or `run` (loop).
+        ///
+        /// When omitted, the flat positional+flags form is parsed and
+        /// dispatch synthesizes `LoopCommand::Run` with a stderr deprecation
+        /// notice. See the `loop init` / `loop run` help for canonical forms.
+        #[command(subcommand)]
+        cmd: Option<LoopCommand>,
+
+        /// (Deprecated flat form) Path to PRD JSON file. Prefer `task-mgr loop run <PRD>`.
+        prd_file: Option<PathBuf>,
 
         /// Path to prompt file (default: <base>-prompt.md)
         #[arg(long)]
@@ -875,26 +892,46 @@ EXAMPLES:
     },
 
     /// Run multiple PRDs in sequence
-    #[command(after_help = "\
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        after_help = "\
 EXAMPLES:
-    # Run all PRD files matching a pattern
+    # Canonical forms (preferred)
+    task-mgr batch init 'tasks/*.json' --append --update-existing
+    task-mgr batch run  'tasks/*.json' --yes
+
+    # Flat form (deprecated, still parses): equivalent to `batch run ...`
     task-mgr batch 'tasks/*.json' --yes
 
     # Run with max iterations per PRD
-    task-mgr batch 'tasks/*.json' -n 10 --yes
+    task-mgr batch run 'tasks/*.json' -n 10 --yes
 
     # Run multiple patterns (or shell-expanded files)
-    task-mgr batch tasks/rag-01.json tasks/rag-02.json --yes
+    task-mgr batch run tasks/rag-01.json tasks/rag-02.json --yes
 
     # Keep worktrees after each PRD (default: auto-remove on success)
-    task-mgr batch 'tasks/*.json' --yes --keep-worktrees
+    task-mgr batch run 'tasks/*.json' --yes --keep-worktrees
 
     # Chain PRDs so each builds on the previous PRD's branch
-    task-mgr batch 'tasks/stage-*.json' --chain --yes
-")]
+    task-mgr batch run 'tasks/stage-*.json' --chain --yes
+
+NOTE: a positional pattern named `init` or `run` collides with the subcommand.
+Pass an absolute or `./`-prefixed path (e.g. `task-mgr batch run ./init`) if
+your PRD file is literally called `init` or `run`.
+"
+    )]
     Batch {
-        /// Glob patterns or file paths to match PRD files
-        #[arg(required = true)]
+        /// Optional nested subcommand: `init` (import PRDs) or `run` (loop each).
+        ///
+        /// When omitted, the flat positional+flags form is parsed and
+        /// dispatch synthesizes `BatchCommand::Run` with a stderr deprecation
+        /// notice. See the `batch init` / `batch run` help for canonical forms.
+        #[command(subcommand)]
+        cmd: Option<BatchCommand>,
+
+        /// (Deprecated flat form) Glob patterns or paths matching PRD files.
+        /// Prefer `task-mgr batch run <patterns...>`.
         patterns: Vec<String>,
 
         /// Maximum iterations per PRD
@@ -1148,6 +1185,259 @@ pub enum EnhanceCommand {
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
     },
+}
+
+/// Subcommands under `task-mgr loop`.
+///
+/// `Init` imports one PRD JSON via `commands::init::init`. `Run` invokes the
+/// autonomous loop runner on a PRD. The parent `Commands::Loop` also accepts
+/// the flat positional form (`task-mgr loop <PRD> ...`) as a deprecated shim
+/// that dispatch synthesizes into `LoopCommand::Run { ... }`.
+#[derive(Subcommand, Debug)]
+pub enum LoopCommand {
+    /// Initialize a database from a single PRD JSON file.
+    ///
+    /// Mirrors top-level `task-mgr init --from-json <prd>`; called from the
+    /// `LoopCommand::Init` dispatch arm with `&[prd_file]`.
+    Init {
+        /// Path to the JSON PRD file to import
+        prd_file: PathBuf,
+
+        /// Force re-initialization, dropping existing data
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Append to existing database (preserves existing tasks, learnings, runs)
+        #[arg(long, default_value_t = false)]
+        append: bool,
+
+        /// Update existing tasks when appending (requires --append)
+        #[arg(long = "update-existing", default_value_t = false)]
+        update_existing: bool,
+
+        /// Preview what would be changed without making modifications
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Prefix to prepend to all task IDs (e.g., "P3" becomes "P3-FEAT-001").
+        #[arg(long, conflicts_with = "no_prefix")]
+        prefix: Option<String>,
+
+        /// Disable task ID prefixing entirely (import IDs as-is from JSON).
+        #[arg(long = "no-prefix", default_value_t = false, conflicts_with = "prefix")]
+        no_prefix: bool,
+    },
+
+    /// Run the autonomous agent loop against a PRD.
+    Run {
+        /// Path to PRD JSON file
+        prd_file: PathBuf,
+
+        /// Path to prompt file (default: <base>-prompt.md)
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+
+        /// Auto-confirm all prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Time budget in hours (max 168)
+        #[arg(long)]
+        hours: Option<f64>,
+
+        /// Verbose output
+        #[arg(long)]
+        verbose: bool,
+
+        /// Disable git worktrees (use branch checkout instead)
+        #[arg(long, default_value_t = false)]
+        no_worktree: bool,
+
+        /// Path to external git repo for commit scanning (overrides PRD value)
+        #[arg(long = "external-repo")]
+        external_repo: Option<PathBuf>,
+
+        /// Remove the git worktree on loop exit (requires worktree mode)
+        #[arg(long = "cleanup-worktree", default_value_t = false)]
+        cleanup_worktree: bool,
+
+        /// Number of tasks to run in parallel per wave (1-3, default 2)
+        #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
+        parallel: usize,
+    },
+}
+
+/// Subcommands under `task-mgr batch`.
+///
+/// `Init` imports many PRDs (one per glob match). `Run` invokes the batch
+/// runner across PRDs. The parent `Commands::Batch` also accepts the flat
+/// positional form (`task-mgr batch <pattern>...`) as a deprecated shim that
+/// dispatch synthesizes into `BatchCommand::Run { ... }`.
+#[derive(Subcommand, Debug)]
+pub enum BatchCommand {
+    /// Initialize a database from multiple PRD JSON files (one per glob match).
+    Init {
+        /// Glob patterns or file paths to match PRD files
+        #[arg(required = true)]
+        patterns: Vec<String>,
+
+        /// Force re-initialization, dropping existing data
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Append to existing database (preserves existing tasks, learnings, runs)
+        #[arg(long, default_value_t = false)]
+        append: bool,
+
+        /// Update existing tasks when appending (requires --append)
+        #[arg(long = "update-existing", default_value_t = false)]
+        update_existing: bool,
+
+        /// Preview what would be changed without making modifications
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Prefix to prepend to all task IDs.
+        #[arg(long, conflicts_with = "no_prefix")]
+        prefix: Option<String>,
+
+        /// Disable task ID prefixing entirely (import IDs as-is from JSON).
+        #[arg(long = "no-prefix", default_value_t = false, conflicts_with = "prefix")]
+        no_prefix: bool,
+    },
+
+    /// Run the autonomous agent loop across multiple PRDs.
+    Run {
+        /// Glob patterns or file paths to match PRD files
+        #[arg(required = true)]
+        patterns: Vec<String>,
+
+        /// Maximum iterations per PRD
+        #[arg(short = 'n', long = "max-iterations")]
+        max_iterations: Option<usize>,
+
+        /// Auto-confirm all prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Keep worktrees after each PRD completes (never auto-remove)
+        #[arg(long = "keep-worktrees", default_value_t = false)]
+        keep_worktrees: bool,
+
+        /// Chain PRDs so each builds on the previous PRD's branch
+        #[arg(long, default_value_t = false)]
+        chain: bool,
+
+        /// Number of tasks to run in parallel per wave (1-3, default 2)
+        #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
+        parallel: usize,
+    },
+}
+
+/// Outcome of resolving a `Commands::Loop` parent into a canonical action.
+///
+/// The dispatch layer in `main.rs` calls [`resolve_loop_command`] to fold the
+/// flat-form positional+flag bag and the optional nested subcommand into a
+/// single canonical [`LoopCommand`]. Three outcomes:
+///
+/// * `Nested(child)` — user supplied a subcommand (`loop init` / `loop run`).
+///   No deprecation notice; dispatch handles `child` directly.
+/// * `Flat(child)` — deprecated flat form (e.g. `task-mgr loop tasks/foo.json
+///   --yes`). The flat fields are synthesized into a `LoopCommand::Run`.
+///   Dispatch MUST print the one-line `DEPRECATED:` stderr notice before
+///   executing.
+/// * `PrintHelp` — neither subcommand nor positional was supplied. Dispatch
+///   prints the parent's `--help` and exits with code 2.
+#[derive(Debug)]
+pub enum LoopResolve {
+    /// User supplied a nested subcommand directly.
+    Nested(LoopCommand),
+    /// Flat-form fallback synthesized from the parent's positional+flags.
+    /// Dispatch MUST emit the `DEPRECATED:` stderr notice before running.
+    Flat(LoopCommand),
+    /// No subcommand and no positional — caller should print help, exit 2.
+    PrintHelp,
+}
+
+/// Outcome of resolving a `Commands::Batch` parent into a canonical action.
+///
+/// Mirrors [`LoopResolve`] for the batch parent. See its docs.
+#[derive(Debug)]
+pub enum BatchResolve {
+    Nested(BatchCommand),
+    Flat(BatchCommand),
+    PrintHelp,
+}
+
+/// Fold the `Commands::Loop` parent fields into a canonical [`LoopResolve`].
+///
+/// Precedence:
+/// 1. `cmd: Some(child)` — return `Nested(child)`. Flat fields are ignored
+///    by clap at parse time via `args_conflicts_with_subcommands = true`, so
+///    they're always defaults when this arm fires.
+/// 2. `cmd: None && prd_file: Some(_)` — synthesize `LoopCommand::Run`
+///    populated from the flat fields, return `Flat(...)`.
+/// 3. `cmd: None && prd_file: None` — return `PrintHelp`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_loop_command(
+    cmd: Option<LoopCommand>,
+    prd_file: Option<PathBuf>,
+    prompt_file: Option<PathBuf>,
+    yes: bool,
+    hours: Option<f64>,
+    verbose: bool,
+    no_worktree: bool,
+    external_repo: Option<PathBuf>,
+    cleanup_worktree: bool,
+    parallel: usize,
+) -> LoopResolve {
+    if let Some(child) = cmd {
+        return LoopResolve::Nested(child);
+    }
+    if let Some(prd) = prd_file {
+        return LoopResolve::Flat(LoopCommand::Run {
+            prd_file: prd,
+            prompt_file,
+            yes,
+            hours,
+            verbose,
+            no_worktree,
+            external_repo,
+            cleanup_worktree,
+            parallel,
+        });
+    }
+    LoopResolve::PrintHelp
+}
+
+/// Fold the `Commands::Batch` parent fields into a canonical [`BatchResolve`].
+///
+/// Mirrors [`resolve_loop_command`]; "positional present" for batch means
+/// `!patterns.is_empty()`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_batch_command(
+    cmd: Option<BatchCommand>,
+    patterns: Vec<String>,
+    max_iterations: Option<usize>,
+    yes: bool,
+    keep_worktrees: bool,
+    chain: bool,
+    parallel: usize,
+) -> BatchResolve {
+    if let Some(child) = cmd {
+        return BatchResolve::Nested(child);
+    }
+    if !patterns.is_empty() {
+        return BatchResolve::Flat(BatchCommand::Run {
+            patterns,
+            max_iterations,
+            yes,
+            keep_worktrees,
+            chain,
+            parallel,
+        });
+    }
+    BatchResolve::PrintHelp
 }
 
 /// `task-mgr models` subcommand actions.

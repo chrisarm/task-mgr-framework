@@ -84,6 +84,28 @@ fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[')
 }
 
+/// Expand glob patterns into a sorted, deduplicated list of PRD file paths.
+///
+/// Thin wrapper over `expand_glob` for callers (currently `batch init`) that
+/// only need plain glob expansion without the sibling-worktree fallback that
+/// `run_batch` uses via `collect_prd_files`. Returns an error if any single
+/// pattern matched nothing; callers downstream can decide what to do with the
+/// resulting `Vec<PathBuf>`.
+pub fn expand_patterns(patterns: &[String]) -> TaskMgrResult<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pattern in patterns {
+        for file in expand_glob(pattern)? {
+            let canonical = std::fs::canonicalize(&file).unwrap_or(file);
+            if seen.insert(canonical.clone()) {
+                out.push(canonical);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Resolve a pattern relative to `base`, returning matched file paths.
 ///
 /// For literal paths (no glob metacharacters), checks existence directly.
