@@ -3,7 +3,7 @@
 //! This module handles argument parsing and command dispatch.
 //! Output formatting and helper functions are in the `handlers` module.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
@@ -52,6 +52,163 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(PathBuf::from(root))
+}
+
+/// Args passed to [`dispatch_init`] — fields mirror `Commands::Init`'s clap
+/// args one-for-one so the call site stays a straight `Args { … }` shuffle.
+struct DispatchInitArgs {
+    from_json: Vec<PathBuf>,
+    enhance: bool,
+    force: bool,
+    append: bool,
+    update_existing: bool,
+    dry_run: bool,
+    prefix: Option<String>,
+    no_prefix: bool,
+}
+
+/// Resolve the project root for `init_project`.
+///
+/// `init_project(dir)` appends `.task-mgr/`, so we need the *parent* of the
+/// resolved DB dir. `resolve_db_dir` guarantees `cli.dir` is absolute, so
+/// `.parent()` returns `Some(_)` except in the pathological case of `/`.
+fn project_root_for_init(cli_dir: &Path) -> PathBuf {
+    cli_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| cli_dir.to_path_buf())
+}
+
+/// Dispatch the top-level `task-mgr init` command into its three modes:
+///
+/// 1. `from_json` empty, `force` set → reject with exit 2 (project-level
+///    init has no destructive form).
+/// 2. `from_json` empty → project-level scaffolding via
+///    [`task_mgr::commands::init::init_project`]. If `--enhance`, also run
+///    `enhance agents --create --profile full`. Emit a stderr hint pointing
+///    at `task-mgr enhance agents`.
+/// 3. `from_json` non-empty → deprecated top-level shim. Emit a stderr
+///    deprecation notice, run `init_project` first (so the model picker
+///    fires for operators who don't yet have a default model resolved),
+///    then dispatch the PRD payload through `LoopCommand::Init` (N==1) or
+///    `BatchCommand::Init` (N>1). The `--enhance` flag is silently
+///    ignored on this path; a stderr note explains.
+///
+/// The shim and the canonical `loop init` / `batch init` arms call
+/// [`task_mgr::commands::init`] with the same `&[PathBuf]` shape — the
+/// PRD-import code path is single-rooted regardless of how the user
+/// reached it.
+fn dispatch_init(
+    db_dir: &Path,
+    verbose: bool,
+    format: OutputFormat,
+    args: DispatchInitArgs,
+) -> Result<(), TaskMgrError> {
+    use task_mgr::commands::init::init_project;
+
+    let DispatchInitArgs {
+        from_json,
+        enhance,
+        force,
+        append,
+        update_existing,
+        dry_run,
+        prefix,
+        no_prefix,
+    } = args;
+
+    // Mode 1: project-level reject. Fail BEFORE any DB / config write so
+    // mis-typed invocations leave the directory untouched.
+    if from_json.is_empty() && force {
+        eprintln!(
+            "error: `task-mgr init --force` is not supported. Project-level init has no \
+             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`."
+        );
+        process::exit(2);
+    }
+
+    // Mode 2: project-level scaffold.
+    if from_json.is_empty() {
+        let project_root = project_root_for_init(db_dir);
+        let _lock = LockGuard::acquire(db_dir)?;
+        let result = init_project(&project_root)?;
+
+        if enhance {
+            use task_mgr::commands::enhance::templates::EnhanceProfile;
+            use task_mgr::commands::{AgentsParams, enhance_agents};
+            let enhance_result = enhance_agents(AgentsParams {
+                targets: Vec::new(),
+                dry_run: false,
+                create: true,
+                profile: EnhanceProfile::Full,
+                cwd: project_root.clone(),
+            })?;
+            if !enhance_result.no_errors() {
+                eprintln!(
+                    "warning: `task-mgr init --enhance` completed with one or more file \
+                     errors; see messages above"
+                );
+            }
+        } else {
+            eprintln!(
+                "Initialized .task-mgr/. Run `task-mgr enhance agents` to add task-mgr \
+                 workflow guidance to CLAUDE.md / AGENTS.md (or rerun with `--enhance`)."
+            );
+        }
+
+        output_result(&result, format);
+        return Ok(());
+    }
+
+    // Mode 3: deprecated top-level shim.
+    eprintln!(
+        "DEPRECATED: `task-mgr init --from-json X` keeps working indefinitely but the \
+         canonical form is `task-mgr loop init X` (single PRD) or `task-mgr batch init \
+         <glob>...` (multi)."
+    );
+    if enhance {
+        eprintln!(
+            "note: --enhance is ignored on the deprecated --from-json path; run \
+             `task-mgr init --enhance` separately to update CLAUDE.md / AGENTS.md."
+        );
+    }
+
+    // Run project-level scaffolding FIRST so the model picker fires before
+    // any PRD-import work begins. If this step fails, the PRD import is
+    // skipped (FAILURE-MODE contract).
+    let project_root = project_root_for_init(db_dir);
+    {
+        let _lock = LockGuard::acquire(db_dir)?;
+        init_project(&project_root)?;
+    }
+
+    let prefix_mode = if no_prefix {
+        task_mgr::commands::init::PrefixMode::Disabled
+    } else if let Some(p) = prefix {
+        task_mgr::commands::init::PrefixMode::Explicit(p)
+    } else {
+        task_mgr::commands::init::PrefixMode::Auto
+    };
+
+    // The canonical PRD-import call: identical shape to the LoopCommand::Init
+    // and BatchCommand::Init dispatch arms. Single source of truth for what
+    // happens once the PRD payload is in hand.
+    let _lock = LockGuard::acquire(db_dir)?;
+    let result = init(
+        db_dir,
+        &from_json,
+        force,
+        append,
+        update_existing,
+        dry_run,
+        prefix_mode,
+    )?;
+
+    if verbose {
+        eprint!("{}", format_init_verbose(&result));
+    }
+    output_result(&result, format);
+    Ok(())
 }
 
 fn main() {
@@ -116,37 +273,28 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
     match cli.command {
         Commands::Init {
             from_json,
+            enhance,
             force,
             append,
             update_existing,
             dry_run,
             prefix,
             no_prefix,
-        } => {
-            let prefix_mode = if no_prefix {
-                task_mgr::commands::init::PrefixMode::Disabled
-            } else if let Some(p) = prefix {
-                task_mgr::commands::init::PrefixMode::Explicit(p)
-            } else {
-                task_mgr::commands::init::PrefixMode::Auto
-            };
-            let _lock = LockGuard::acquire(&cli.dir)?;
-            let result = init(
-                &cli.dir,
-                &from_json,
+        } => dispatch_init(
+            &cli.dir,
+            cli.verbose,
+            cli.format,
+            DispatchInitArgs {
+                from_json,
+                enhance,
                 force,
                 append,
                 update_existing,
                 dry_run,
-                prefix_mode,
-            )?;
-
-            if cli.verbose {
-                eprint!("{}", format_init_verbose(&result));
-            }
-            output_result(&result, cli.format);
-            Ok(())
-        }
+                prefix,
+                no_prefix,
+            },
+        ),
 
         Commands::List {
             status,

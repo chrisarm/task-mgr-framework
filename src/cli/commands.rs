@@ -28,32 +28,33 @@ pub(crate) fn parse_parallel_slots(s: &str) -> Result<usize, String> {
 /// Available commands for task-mgr
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize database from a JSON PRD file
+    /// Initialize project (`.task-mgr/`) and/or import PRD JSON files
     #[command(after_help = "\
 EXAMPLES:
-    # Initialize from a single PRD file
+    # Project-level scaffold (no PRD): creates .task-mgr/, runs migrations,
+    # writes default config, fires the model picker if both stdin/stderr are TTYs
+    task-mgr init
+
+    # Same, plus write the task-mgr workflow + LLM-coding guidelines block
+    # into CLAUDE.md and AGENTS.md (creating them if absent)
+    task-mgr init --enhance
+
+    # DEPRECATED but supported indefinitely: import a PRD via the top-level shim.
+    # Prefer `task-mgr loop init <prd>` (single) or `task-mgr batch init <glob>` (multi).
     task-mgr init --from-json tasks/my-prd.json
-
-    # Initialize from multiple PRD files
     task-mgr init --from-json phase1.json --from-json phase2.json
+    task-mgr init --from-json prd.json --append --update-existing --dry-run
 
-    # Re-initialize, dropping existing data
-    task-mgr init --from-json prd.json --force
+PROJECT-LEVEL vs PRD-IMPORT:
+    `task-mgr init` (no --from-json) is project-level: it scaffolds `.task-mgr/`
+    and is idempotent. There is no `--force` for project-level init — to reset,
+    `rm -rf .task-mgr/` and re-run.
 
-    # Add new tasks to existing database
-    task-mgr init --from-json new-tasks.json --append
-
-    # Update existing tasks when IDs match
-    task-mgr init --from-json prd.json --append --update-existing
-
-    # Preview changes without modifying database
-    task-mgr init --from-json prd.json --dry-run
-
-    # Use explicit prefix for task IDs
-    task-mgr init --from-json prd.json --prefix P3
-
-    # Disable auto-prefixing (use raw IDs from JSON)
-    task-mgr init --from-json prd.json --no-prefix
+    `task-mgr init --from-json X` (deprecated shim) runs project-level scaffolding
+    first (so the model picker fires), then dispatches to `loop init` (when N=1)
+    or `batch init` (when N>1). The companion flags below (--force, --append,
+    --update-existing, --dry-run, --prefix, --no-prefix) are honored on the shim
+    path only; they are ignored when --from-json is empty.
 
 TASK ID PREFIXING:
     By default, all task IDs are prefixed to prevent cross-phase collisions.
@@ -64,11 +65,28 @@ TASK ID PREFIXING:
     Use --no-prefix to import task IDs exactly as they appear in the JSON.
 ")]
     Init {
-        /// Path to the JSON PRD file(s) to import
-        #[arg(long = "from-json", required = true)]
+        /// Path to the JSON PRD file(s) to import.
+        ///
+        /// When empty, `task-mgr init` runs project-level scaffolding only.
+        /// When non-empty, prints a deprecation notice and dispatches through
+        /// the canonical `loop init` (N=1) or `batch init` (N>1) path.
+        #[arg(long = "from-json")]
         from_json: Vec<PathBuf>,
 
-        /// Force re-initialization, dropping existing data
+        /// Also write the task-mgr workflow + LLM-coding guidelines block into
+        /// CLAUDE.md and AGENTS.md (creating them if absent). Convenience for
+        /// `task-mgr init && task-mgr enhance agents --create --profile full`.
+        ///
+        /// Silently ignored when `--from-json` is non-empty (the deprecated shim
+        /// path doesn't auto-enhance — run `task-mgr init --enhance` separately).
+        #[arg(long, default_value_t = false)]
+        enhance: bool,
+
+        /// Force re-initialization, dropping existing data.
+        ///
+        /// Honored only on the deprecated `--from-json` shim path. Project-level
+        /// init has no destructive form — `task-mgr init --force` (no
+        /// from_json) is rejected with an explanatory error.
         #[arg(long, default_value_t = false)]
         force: bool,
 

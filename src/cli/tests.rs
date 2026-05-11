@@ -48,12 +48,67 @@ fn test_json_format() {
 }
 
 // Init command tests
+//
+// Two parsing groups (FEAT-005):
+//   1. NEW NO-ARG FORM: `task-mgr init` parses with empty `from_json` and
+//      default `enhance: false`. The dispatch in main.rs treats this as
+//      project-level scaffolding (init_project + optional enhance hint).
+//   2. DEPRECATED SHIM FORM: `task-mgr init --from-json X.json [...]` keeps
+//      parsing exactly as it did before — the deprecation lives in main.rs
+//      dispatch, not in the parser, so historic invocations still parse green.
+
+// --- Group 1: new no-arg form ---
+
+#[test]
+fn test_init_no_args_parses_with_empty_from_json() {
+    let cli = Cli::parse_from(["task-mgr", "init"]);
+    match cli.command {
+        Commands::Init {
+            from_json,
+            enhance,
+            force,
+            append,
+            update_existing,
+            dry_run,
+            prefix,
+            no_prefix,
+        } => {
+            assert!(from_json.is_empty(), "from_json must default to empty");
+            assert!(!enhance, "--enhance defaults to false");
+            assert!(!force);
+            assert!(!append);
+            assert!(!update_existing);
+            assert!(!dry_run);
+            assert!(prefix.is_none());
+            assert!(!no_prefix);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+#[test]
+fn test_init_with_enhance_flag() {
+    let cli = Cli::parse_from(["task-mgr", "init", "--enhance"]);
+    match cli.command {
+        Commands::Init {
+            from_json, enhance, ..
+        } => {
+            assert!(from_json.is_empty());
+            assert!(enhance);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+// --- Group 2: deprecated --from-json shim form ---
+
 #[test]
 fn test_init_with_from_json() {
     let cli = Cli::parse_from(["task-mgr", "init", "--from-json", "prd.json"]);
     match cli.command {
         Commands::Init {
             from_json,
+            enhance,
             force,
             append,
             update_existing,
@@ -61,6 +116,7 @@ fn test_init_with_from_json() {
             ..
         } => {
             assert_eq!(from_json, vec![PathBuf::from("prd.json")]);
+            assert!(!enhance);
             assert!(!force);
             assert!(!append);
             assert!(!update_existing);
@@ -199,6 +255,24 @@ fn test_init_with_dry_run() {
             assert!(!append);
             assert!(!update_existing);
             assert!(dry_run);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+#[test]
+fn test_init_shim_with_enhance_parses() {
+    // `--enhance` and `--from-json` are not mutually exclusive at the parser
+    // level — the dispatch in main.rs prints a stderr note and ignores
+    // --enhance on the shim path. Validating that both can co-exist on the
+    // command line keeps that runtime contract honest at parse time.
+    let cli = Cli::parse_from(["task-mgr", "init", "--enhance", "--from-json", "prd.json"]);
+    match cli.command {
+        Commands::Init {
+            from_json, enhance, ..
+        } => {
+            assert_eq!(from_json, vec![PathBuf::from("prd.json")]);
+            assert!(enhance);
         }
         _ => panic!("Expected Init command"),
     }

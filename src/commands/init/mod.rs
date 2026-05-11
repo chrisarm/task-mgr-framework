@@ -524,13 +524,12 @@ pub fn init(
         eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
     }
 
-    // Offer an interactive default-model picker on fresh (non-dry-run) imports.
-    // No-ops when a default already resolves, in auto-mode, or when stdin/stderr
-    // aren't TTYs. `init` passes `auto_mode=false` because this is always a
-    // human-initiated command (loop/batch paths pass `true`).
-    if !dry_run {
-        let _ = crate::commands::models::ensure_default::ensure_default_model(dir, false);
-    }
+    // Note: the model picker is intentionally NOT invoked here. Per the
+    // Init-split contract (FEAT-005), project-scoped picker firing lives in
+    // [`init_project`]. The deprecated `task-mgr init --from-json X` shim
+    // calls `init_project` before dispatching here, so the picker still
+    // fires for that path. Direct `task-mgr loop init` / `task-mgr batch
+    // init` invocations are PRD-scoped and must not fire the picker.
 
     Ok(InitResult {
         tasks_imported,
