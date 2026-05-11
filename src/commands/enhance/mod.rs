@@ -231,12 +231,11 @@ fn detect_unbalanced(content: &str) -> Option<String> {
             "unbalanced markers: found {begin_count} BEGIN and {end_count} END"
         ));
     }
-    if begin_count == 1 {
-        let bi = content.find(MARKER_BEGIN).unwrap();
-        let ei = content.find(MARKER_END).unwrap();
-        if ei <= bi {
-            return Some("unbalanced markers: END appears before BEGIN".to_string());
-        }
+    if begin_count == 1
+        && let (Some(bi), Some(ei)) = (content.find(MARKER_BEGIN), content.find(MARKER_END))
+        && ei <= bi
+    {
+        return Some("unbalanced markers: END appears before BEGIN".to_string());
     }
     None
 }
