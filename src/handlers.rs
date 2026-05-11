@@ -27,20 +27,21 @@ use crate::commands::curate::{
 };
 use crate::commands::{
     ApplyLearningResult, BeginResult, CompleteResult, DecisionDeclineResult, DecisionResolveResult,
-    DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult, ExportResult, FailResult,
-    HistoryResult, ImportLearningsResult, InitResult, InvalidateLearningResult, IrrelevantResult,
-    LearnResult, LearningsListResult, ListResult, MigrateResult, NextResult, RecallCmdResult,
-    ResetResult, ReviewResult, RunDetailResult, SetupAuditResult, ShowResult, SkipResult,
-    StatsResult, StatusResult, UnblockResult, UnskipResult, UpdateResult, WorktreesResult,
-    format_apply_learning_text, format_begin_text, format_complete_text,
-    format_decisions_list_text, format_decline_text, format_doctor_text, format_end_text,
-    format_export_text, format_fail_text, format_history_detail_text, format_history_text,
-    format_import_learnings_text, format_init_text, format_invalidate_learning_text,
-    format_irrelevant_text, format_learn_text, format_learnings_text, format_list_text,
-    format_migrate_text, format_next_text, format_recall_text, format_reset_text,
-    format_resolve_text, format_revert_text, format_review_text, format_setup_text,
-    format_show_text, format_skip_text, format_stats_text, format_status_text, format_unblock_text,
-    format_unskip_text, format_update_text, format_worktrees_text,
+    DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult, EnhanceResult,
+    ExportResult, FailResult, HistoryResult, ImportLearningsResult, InitResult,
+    InvalidateLearningResult, IrrelevantResult, LearnResult, LearningsListResult, ListResult,
+    MigrateResult, NextResult, RecallCmdResult, ResetResult, ReviewResult, RunDetailResult,
+    SetupAuditResult, ShowResult, SkipResult, StatsResult, StatusResult, UnblockResult,
+    UnskipResult, UpdateResult, WorktreesResult, format_apply_learning_text, format_begin_text,
+    format_complete_text, format_decisions_list_text, format_decline_text, format_doctor_text,
+    format_end_text, format_enhance_text, format_export_text, format_fail_text,
+    format_history_detail_text, format_history_text, format_import_learnings_text,
+    format_init_text, format_invalidate_learning_text, format_irrelevant_text, format_learn_text,
+    format_learnings_text, format_list_text, format_migrate_text, format_next_text,
+    format_recall_text, format_reset_text, format_resolve_text, format_revert_text,
+    format_review_text, format_setup_text, format_show_text, format_skip_text, format_stats_text,
+    format_status_text, format_unblock_text, format_unskip_text, format_update_text,
+    format_worktrees_text,
 };
 use crate::learnings::{
     DeleteLearningResult, EditLearningResult, format_delete_text, format_edit_text,
@@ -83,6 +84,7 @@ impl_text_formattable!(UpdateResult, format_update_text);
 impl_text_formattable!(EndResult, format_end_text);
 impl_text_formattable!(ExportResult, format_export_text);
 impl_text_formattable!(DoctorResult, format_doctor_text);
+impl_text_formattable!(EnhanceResult, format_enhance_text);
 impl_text_formattable!(SetupAuditResult, format_setup_text);
 impl_text_formattable!(SkipResult, format_skip_text);
 impl_text_formattable!(IrrelevantResult, format_irrelevant_text);

@@ -1079,6 +1079,75 @@ GENERATED MAN PAGES:
         #[command(subcommand)]
         action: ModelsAction,
     },
+
+    /// Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md
+    #[command(after_help = "\
+EXAMPLES:
+    # Write the workflow block into CLAUDE.md / AGENTS.md (whichever exist)
+    task-mgr enhance agents
+
+    # Create CLAUDE.md if it does not yet exist
+    task-mgr enhance agents --create
+
+    # Render to stdout without writing
+    task-mgr enhance agents --dry-run
+    task-mgr enhance show --profile full
+
+    # Remove the marker block from a custom file
+    task-mgr enhance strip --target docs/agent.md
+")]
+    Enhance {
+        #[command(subcommand)]
+        cmd: EnhanceCommand,
+    },
+}
+
+/// Subcommands for `task-mgr enhance`.
+///
+/// All three variants use a marker-fenced (`<!-- TASK_MGR:BEGIN -->` /
+/// `<!-- TASK_MGR:END -->`) block that the command rewrites in place.
+/// Content outside the markers is preserved byte-for-byte.
+#[derive(Subcommand, Debug)]
+pub enum EnhanceCommand {
+    /// Write or update the marker-fenced workflow block in target files.
+    Agents {
+        /// Files to update. When empty, defaults to `./CLAUDE.md` and
+        /// `./AGENTS.md` (each touched only if it exists or `--create` is
+        /// passed).
+        #[arg(long = "target")]
+        target: Vec<PathBuf>,
+
+        /// Render the result without writing to disk.
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+
+        /// Create the target file if it doesn't already exist.
+        #[arg(long, default_value_t = false)]
+        create: bool,
+
+        /// Which template to render into the block.
+        #[arg(long, value_enum, default_value_t = crate::commands::enhance::templates::EnhanceProfile::Workflow)]
+        profile: crate::commands::enhance::templates::EnhanceProfile,
+    },
+
+    /// Render the chosen profile to stdout. Never writes to disk.
+    Show {
+        /// Which template to render.
+        #[arg(long, value_enum, default_value_t = crate::commands::enhance::templates::EnhanceProfile::Workflow)]
+        profile: crate::commands::enhance::templates::EnhanceProfile,
+    },
+
+    /// Remove the marker block (and its markers) from target files.
+    Strip {
+        /// Files to update. When empty, defaults to `./CLAUDE.md` and
+        /// `./AGENTS.md`.
+        #[arg(long = "target")]
+        target: Vec<PathBuf>,
+
+        /// Render the result without writing to disk.
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 /// `task-mgr models` subcommand actions.

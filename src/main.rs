@@ -10,8 +10,8 @@ use clap::Parser;
 
 use task_mgr::TaskMgrError;
 use task_mgr::cli::{
-    Cli, Commands, CurateAction, DecisionAction, MigrateAction, ModelsAction, OutputFormat,
-    RunAction, WorktreesAction,
+    Cli, Commands, CurateAction, DecisionAction, EnhanceCommand, MigrateAction, ModelsAction,
+    OutputFormat, RunAction, WorktreesAction,
 };
 use task_mgr::commands::{
     LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
@@ -934,6 +934,40 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 branch_filter.as_deref(),
             )?;
             output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Enhance { cmd } => {
+            use task_mgr::commands::{
+                AgentsParams, ShowParams, StripParams, enhance_agents, enhance_show, enhance_strip,
+            };
+            let cwd = std::env::current_dir().map_err(|e| {
+                TaskMgrError::io_error(".", "resolving current working directory", e)
+            })?;
+            let result = match cmd {
+                EnhanceCommand::Agents {
+                    target,
+                    dry_run,
+                    create,
+                    profile,
+                } => enhance_agents(AgentsParams {
+                    targets: target,
+                    dry_run,
+                    create,
+                    profile,
+                    cwd,
+                })?,
+                EnhanceCommand::Show { profile } => enhance_show(ShowParams { profile })?,
+                EnhanceCommand::Strip { target, dry_run } => enhance_strip(StripParams {
+                    targets: target,
+                    dry_run,
+                    cwd,
+                })?,
+            };
+            output_result(&result, cli.format);
+            if !result.dry_run && !result.any_success() {
+                process::exit(2);
+            }
             Ok(())
         }
 
