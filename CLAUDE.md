@@ -91,6 +91,36 @@ Canonical forms for new scripts and docs:
 
 See PRD §11 (shim permanence) for the rationale.
 
+## Auto-launch /review-loop after loop end
+
+After a clean loop exit (all tasks complete), `task-mgr` can spawn an interactive
+`claude "/review-loop tasks/<prd>.md"` session automatically. The user lands directly
+in the review without a manual hand-off step.
+
+**Default behavior**: fires when `autoReview: true` (default) AND `tasks_completed >= autoReviewMinTasks`
+(default 3). Both live in `.task-mgr/config.json`. An empty config means both defaults apply.
+
+**CLI overrides** (clap-enforced mutual exclusion):
+- `--auto-review` — force on; treats the task-count threshold as 1
+- `--no-auto-review` — force off unconditionally
+
+**Batch mode**: ONE review fires at end-of-batch for the LAST successful PRD that met the
+threshold — never per-PRD. Earlier PRDs in the batch are skipped even if they individually
+qualified.
+
+**Suppression cases** (prints a recovery hint, continues, exit code unchanged):
+- Non-TTY stdout (CI, pipes) — hint: re-run interactively to get the review
+- `tasks/<prd>.md` not found AND `tasks/prd-<stem>.md` not found — hint: name the markdown file to match
+- Worktree path missing or cleaned up — hint: re-run `claude "/review-loop tasks/<prd>.md"` manually
+
+**Process model**: `Command::status()` — blocking spawn, stdin/stdout/stderr inherit so the
+review session is fully interactive. `ANTHROPIC_API_KEY` and other env vars inherit automatically.
+
+**Module**: `src/loop_engine/auto_review.rs` — `Decision`, `resolve_decision`, `should_fire`,
+`ReviewLauncher` trait, `maybe_fire`.
+
+**Invariant**: auto-review failure NEVER changes the loop or batch exit code.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
