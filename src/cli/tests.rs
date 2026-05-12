@@ -2276,6 +2276,8 @@ fn test_loop_with_prd_file_and_yes() {
             external_repo,
             cleanup_worktree,
             parallel,
+            no_auto_review,
+            auto_review,
         } => {
             // Flat-form deprecated shim: cmd is None, fields populate the parent
             assert!(cmd.is_none(), "flat form should not produce a nested cmd");
@@ -2288,6 +2290,8 @@ fn test_loop_with_prd_file_and_yes() {
             assert!(external_repo.is_none());
             assert!(!cleanup_worktree);
             assert_eq!(parallel, 2, "loop --parallel should default to 2");
+            assert!(!no_auto_review, "no_auto_review should default to false");
+            assert!(!auto_review, "auto_review should default to false");
         }
         _ => panic!("Expected Loop command"),
     }
@@ -2704,6 +2708,8 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2719,6 +2725,8 @@ fn test_loop_flat_form_dispatch_synthesizes_run() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     match resolved {
         LoopResolve::Flat(LoopCommand::Run {
@@ -2752,6 +2760,8 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2767,6 +2777,8 @@ fn test_loop_run_canonical_no_deprecation_marker() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     assert!(
         matches!(resolved, LoopResolve::Nested(LoopCommand::Run { .. })),
@@ -2789,6 +2801,8 @@ fn test_loop_no_args_resolves_to_print_help() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Loop command");
@@ -2804,6 +2818,8 @@ fn test_loop_no_args_resolves_to_print_help() {
         external_repo,
         cleanup_worktree,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     assert!(matches!(resolved, LoopResolve::PrintHelp));
 }
@@ -2926,6 +2942,8 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -2938,6 +2956,8 @@ fn test_batch_flat_form_dispatch_synthesizes_run() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     match resolved {
         BatchResolve::Flat(BatchCommand::Run {
@@ -2967,6 +2987,8 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -2979,6 +3001,8 @@ fn test_batch_run_canonical_no_deprecation_marker() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     assert!(
         matches!(resolved, BatchResolve::Nested(BatchCommand::Run { .. })),
@@ -2997,6 +3021,8 @@ fn test_batch_no_args_resolves_to_print_help() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     } = cli.command
     else {
         panic!("Expected Batch command");
@@ -3009,6 +3035,8 @@ fn test_batch_no_args_resolves_to_print_help() {
         keep_worktrees,
         chain,
         parallel,
+        no_auto_review,
+        auto_review,
     );
     assert!(matches!(resolved, BatchResolve::PrintHelp));
 }
@@ -3486,5 +3514,198 @@ fn test_status_verbose_does_not_conflict_with_global() {
             assert!(verbose);
         }
         _ => panic!("Expected Status command"),
+    }
+}
+
+// ── --auto-review / --no-auto-review flag tests ──────────────────────────────
+
+#[test]
+fn test_loop_run_auto_review_flag_parses() {
+    let result = Cli::try_parse_from(["task-mgr", "loop", "run", "x", "--auto-review"]);
+    assert!(result.is_ok(), "loop run --auto-review must parse cleanly");
+    match result.unwrap().command {
+        Commands::Loop { cmd, .. } => match cmd {
+            Some(LoopCommand::Run {
+                auto_review,
+                no_auto_review,
+                ..
+            }) => {
+                assert!(auto_review);
+                assert!(!no_auto_review);
+            }
+            other => panic!("expected LoopCommand::Run, got {:?}", other),
+        },
+        _ => panic!("Expected Loop command"),
+    }
+}
+
+#[test]
+fn test_loop_run_no_auto_review_flag_parses() {
+    let result = Cli::try_parse_from(["task-mgr", "loop", "run", "x", "--no-auto-review"]);
+    assert!(
+        result.is_ok(),
+        "loop run --no-auto-review must parse cleanly"
+    );
+    match result.unwrap().command {
+        Commands::Loop { cmd, .. } => match cmd {
+            Some(LoopCommand::Run {
+                auto_review,
+                no_auto_review,
+                ..
+            }) => {
+                assert!(!auto_review);
+                assert!(no_auto_review);
+            }
+            other => panic!("expected LoopCommand::Run, got {:?}", other),
+        },
+        _ => panic!("Expected Loop command"),
+    }
+}
+
+#[test]
+fn test_loop_run_both_auto_review_flags_rejected() {
+    // clap must reject when both are supplied (both flag orders)
+    let r1 = Cli::try_parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "x",
+        "--auto-review",
+        "--no-auto-review",
+    ]);
+    assert!(
+        r1.is_err(),
+        "--auto-review --no-auto-review must be rejected"
+    );
+    let r2 = Cli::try_parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "x",
+        "--no-auto-review",
+        "--auto-review",
+    ]);
+    assert!(
+        r2.is_err(),
+        "--no-auto-review --auto-review must be rejected"
+    );
+}
+
+#[test]
+fn test_batch_run_auto_review_flag_parses() {
+    let result = Cli::try_parse_from(["task-mgr", "batch", "run", "x", "--auto-review"]);
+    assert!(result.is_ok(), "batch run --auto-review must parse cleanly");
+    match result.unwrap().command {
+        Commands::Batch { cmd, .. } => match cmd {
+            Some(BatchCommand::Run {
+                auto_review,
+                no_auto_review,
+                ..
+            }) => {
+                assert!(auto_review);
+                assert!(!no_auto_review);
+            }
+            other => panic!("expected BatchCommand::Run, got {:?}", other),
+        },
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_run_no_auto_review_flag_parses() {
+    let result = Cli::try_parse_from(["task-mgr", "batch", "run", "x", "--no-auto-review"]);
+    assert!(
+        result.is_ok(),
+        "batch run --no-auto-review must parse cleanly"
+    );
+    match result.unwrap().command {
+        Commands::Batch { cmd, .. } => match cmd {
+            Some(BatchCommand::Run {
+                auto_review,
+                no_auto_review,
+                ..
+            }) => {
+                assert!(!auto_review);
+                assert!(no_auto_review);
+            }
+            other => panic!("expected BatchCommand::Run, got {:?}", other),
+        },
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_run_both_auto_review_flags_rejected() {
+    let r1 = Cli::try_parse_from([
+        "task-mgr",
+        "batch",
+        "run",
+        "x",
+        "--auto-review",
+        "--no-auto-review",
+    ]);
+    assert!(
+        r1.is_err(),
+        "--auto-review --no-auto-review must be rejected"
+    );
+    let r2 = Cli::try_parse_from([
+        "task-mgr",
+        "batch",
+        "run",
+        "x",
+        "--no-auto-review",
+        "--auto-review",
+    ]);
+    assert!(
+        r2.is_err(),
+        "--no-auto-review --auto-review must be rejected"
+    );
+}
+
+#[test]
+fn test_loop_flat_form_auto_review_threaded() {
+    // Flat-form `task-mgr loop x --auto-review` → synthesized Run has auto_review: true
+    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/foo.json", "--auto-review"]);
+    let Commands::Loop {
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+        no_auto_review,
+        auto_review,
+    } = cli.command
+    else {
+        panic!("Expected Loop command");
+    };
+    let resolved = resolve_loop_command(
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+        no_auto_review,
+        auto_review,
+    );
+    match resolved {
+        LoopResolve::Flat(LoopCommand::Run {
+            auto_review,
+            no_auto_review,
+            ..
+        }) => {
+            assert!(auto_review, "flat-form auto_review must thread through");
+            assert!(!no_auto_review);
+        }
+        other => panic!("expected LoopResolve::Flat(Run), got {:?}", other),
     }
 }

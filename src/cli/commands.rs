@@ -893,6 +893,23 @@ file is literally called `init` or `run`.
         /// to force sequential execution.
         #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
         parallel: usize,
+
+        /// Skip the auto-launched `/review-loop` Claude session after a clean run
+        /// (default: auto-launch when the loop completed >=3 tasks).
+        #[arg(
+            long = "no-auto-review",
+            conflicts_with = "auto_review",
+            default_value_t = false
+        )]
+        no_auto_review: bool,
+
+        /// Force-launch `/review-loop` even on small (<3-task) runs.
+        #[arg(
+            long = "auto-review",
+            conflicts_with = "no_auto_review",
+            default_value_t = false
+        )]
+        auto_review: bool,
     },
 
     /// Show status dashboard for PRD projects
@@ -988,6 +1005,23 @@ your PRD file is literally called `init` or `run`.
         /// `LOOP_PARALLEL` env var (matching loop's behavior).
         #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
         parallel: usize,
+
+        /// Skip the auto-launched `/review-loop` Claude session after a clean run
+        /// (default: auto-launch when the loop completed >=3 tasks).
+        #[arg(
+            long = "no-auto-review",
+            conflicts_with = "auto_review",
+            default_value_t = false
+        )]
+        no_auto_review: bool,
+
+        /// Force-launch `/review-loop` even on small (<3-task) runs.
+        #[arg(
+            long = "auto-review",
+            conflicts_with = "no_auto_review",
+            default_value_t = false
+        )]
+        auto_review: bool,
     },
 
     /// Import learnings from a progress.json or learnings JSON file
@@ -1282,6 +1316,23 @@ pub enum LoopCommand {
         /// Number of tasks to run in parallel per wave (1-3, default 2)
         #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
         parallel: usize,
+
+        /// Skip the auto-launched `/review-loop` Claude session after a clean run
+        /// (default: auto-launch when the loop completed >=3 tasks).
+        #[arg(
+            long = "no-auto-review",
+            conflicts_with = "auto_review",
+            default_value_t = false
+        )]
+        no_auto_review: bool,
+
+        /// Force-launch `/review-loop` even on small (<3-task) runs.
+        #[arg(
+            long = "auto-review",
+            conflicts_with = "no_auto_review",
+            default_value_t = false
+        )]
+        auto_review: bool,
     },
 }
 
@@ -1349,6 +1400,23 @@ pub enum BatchCommand {
         /// Number of tasks to run in parallel per wave (1-3, default 2)
         #[arg(long, default_value_t = 2, value_parser = parse_parallel_slots)]
         parallel: usize,
+
+        /// Skip the auto-launched `/review-loop` Claude session after a clean run
+        /// (default: auto-launch when the loop completed >=3 tasks).
+        #[arg(
+            long = "no-auto-review",
+            conflicts_with = "auto_review",
+            default_value_t = false
+        )]
+        no_auto_review: bool,
+
+        /// Force-launch `/review-loop` even on small (<3-task) runs.
+        #[arg(
+            long = "auto-review",
+            conflicts_with = "no_auto_review",
+            default_value_t = false
+        )]
+        auto_review: bool,
     },
 }
 
@@ -1408,6 +1476,8 @@ pub fn resolve_loop_command(
     external_repo: Option<PathBuf>,
     cleanup_worktree: bool,
     parallel: usize,
+    no_auto_review: bool,
+    auto_review: bool,
 ) -> LoopResolve {
     if let Some(child) = cmd {
         return LoopResolve::Nested(child);
@@ -1423,6 +1493,8 @@ pub fn resolve_loop_command(
             external_repo,
             cleanup_worktree,
             parallel,
+            no_auto_review,
+            auto_review,
         });
     }
     LoopResolve::PrintHelp
@@ -1441,6 +1513,8 @@ pub fn resolve_batch_command(
     keep_worktrees: bool,
     chain: bool,
     parallel: usize,
+    no_auto_review: bool,
+    auto_review: bool,
 ) -> BatchResolve {
     if let Some(child) = cmd {
         return BatchResolve::Nested(child);
@@ -1453,6 +1527,8 @@ pub fn resolve_batch_command(
             keep_worktrees,
             chain,
             parallel,
+            no_auto_review,
+            auto_review,
         });
     }
     BatchResolve::PrintHelp

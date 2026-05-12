@@ -960,6 +960,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             external_repo,
             cleanup_worktree,
             parallel,
+            no_auto_review,
+            auto_review,
         } => {
             // Resolve nested-vs-flat into a canonical LoopCommand via the
             // shared helper. Flat-form synthesizes Run and emits a one-line
@@ -975,6 +977,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 external_repo,
                 cleanup_worktree,
                 parallel,
+                no_auto_review,
+                auto_review,
             ) {
                 LoopResolve::Nested(child) => child,
                 LoopResolve::Flat(child) => {
@@ -1030,6 +1034,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     external_repo,
                     cleanup_worktree,
                     parallel,
+                    no_auto_review: _,
+                    auto_review: _,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1097,6 +1103,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             keep_worktrees,
             chain,
             parallel,
+            no_auto_review,
+            auto_review,
         } => {
             // Resolve nested-vs-flat into a canonical BatchCommand via the
             // shared helper. Flat-form (cmd: None, !patterns.is_empty()) is
@@ -1109,6 +1117,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 keep_worktrees,
                 chain,
                 parallel,
+                no_auto_review,
+                auto_review,
             ) {
                 BatchResolve::Nested(child) => child,
                 BatchResolve::Flat(child) => {
@@ -1167,6 +1177,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     keep_worktrees,
                     chain,
                     parallel,
+                    no_auto_review: _,
+                    auto_review: _,
                 } => {
                     let project_root = get_project_root()?;
 
