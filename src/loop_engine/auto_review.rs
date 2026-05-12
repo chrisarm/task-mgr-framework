@@ -121,8 +121,6 @@ pub trait ReviewLauncher {
 }
 
 /// Production launcher — spawns an interactive `claude` process.
-// FEAT-005 instantiates this from main.rs and batch.rs.
-#[allow(dead_code)]
 pub struct ProcessLauncher;
 
 impl ReviewLauncher for ProcessLauncher {

@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::init::PrefixMode;
 use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::loop_engine::auto_review::{self, Decision};
 use crate::loop_engine::config::LoopConfig;
-use crate::loop_engine::engine::{self, LoopRunConfig};
+use crate::loop_engine::engine::{self, LoopResult, LoopRunConfig};
+use crate::loop_engine::project_config::read_project_config;
 use crate::loop_engine::signals;
 use crate::loop_engine::status_queries;
 use crate::loop_engine::worktree;
@@ -475,6 +477,8 @@ fn print_batch_summary(
 /// * `keep_worktrees` - Never remove worktrees after PRD completion
 /// * `chain` - Chain PRDs so each builds on the previous PRD's branch
 /// * `parallel_slots` - Number of slots per wave (1-3). Overrides `LOOP_PARALLEL`.
+/// * `cli_force_on` - `--auto-review` flag (overrides config, forces enable + min_tasks=1)
+/// * `cli_force_off` - `--no-auto-review` flag (overrides config, forces disable)
 #[allow(clippy::too_many_arguments)]
 pub async fn run_batch(
     patterns: &[String],
@@ -486,7 +490,14 @@ pub async fn run_batch(
     keep_worktrees: bool,
     chain: bool,
     parallel_slots: usize,
+    cli_force_on: bool,
+    cli_force_off: bool,
 ) -> BatchResult {
+    // Cached once at the top of run_batch — matches the run-level config caching
+    // convention (CLAUDE.md): mid-loop edits to .task-mgr/config.json do NOT take
+    // effect; operators must restart to apply config changes.
+    let project_config = read_project_config(dir);
+    let decision = auto_review::resolve_decision(&project_config, cli_force_on, cli_force_off);
     // Step 1: Expand all patterns, deduplicate, and sort
     let prd_files = match collect_prd_files(patterns, project_root) {
         Ok(files) => files,
@@ -720,6 +731,31 @@ pub async fn run_batch(
         chain,
     );
 
+    // Step 6: Auto-review hook — fires ONCE for the LAST successful PRD that
+    // meets the task-count threshold. Must run AFTER the per-PRD worktree
+    // cleanup loop so the suppress-on-missing-worktree gate sees final state.
+    // Goes through `auto_review::maybe_fire` (not `launcher.launch` directly)
+    // so single-loop and batch share the same suppression gates (TTY,
+    // worktree-existence, missing markdown, decision-disabled).
+    if let Some(target) = pick_review_target(&results, &decision) {
+        let synthetic = LoopResult {
+            exit_code: 0,
+            was_stopped: false,
+            worktree_path: target.worktree_path.clone(),
+            branch_name: target.branch_name.clone(),
+            tasks_completed: target.tasks_completed,
+        };
+        let launcher = auto_review::ProcessLauncher;
+        auto_review::maybe_fire(
+            &project_config,
+            cli_force_on,
+            cli_force_off,
+            &synthetic,
+            &target.prd_file,
+            &launcher,
+        );
+    }
+
     BatchResult {
         succeeded,
         failed,
@@ -727,6 +763,30 @@ pub async fn run_batch(
         stopped,
         results,
     }
+}
+
+/// Pick the last batch result eligible for auto-review.
+///
+/// Returns the LAST `PrdRunResult` in iteration order that:
+/// - exited cleanly (`exit_code == 0`)
+/// - was not skipped before it ran
+/// - was not stopped mid-run by a `.stop` signal
+/// - meets the `Decision`'s threshold (via [`auto_review::should_fire`])
+///
+/// "Last meeting threshold" — not "last successful" — is intentional. A trailing
+/// 1-task PRD must not displace an earlier 5-task PRD when the threshold is 3.
+/// `should_fire` also short-circuits to `false` when `decision.enabled == false`,
+/// so a disabled decision returns `None` regardless of results.
+pub(crate) fn pick_review_target<'a>(
+    results: &'a [PrdRunResult],
+    decision: &Decision,
+) -> Option<&'a PrdRunResult> {
+    results.iter().rev().find(|r| {
+        r.exit_code == 0
+            && !r.skipped
+            && !r.stopped
+            && auto_review::should_fire(decision, r.exit_code, false, r.tasks_completed)
+    })
 }
 
 #[cfg(test)]
@@ -1238,6 +1298,100 @@ mod tests {
             results[0].branch_name.as_deref(),
             "chain_base must equal previous PRD's branch_name"
         );
+    }
+
+    // --- pick_review_target tests ---
+
+    fn mk_result(tasks: u32, exit: i32, skipped: bool, stopped: bool) -> PrdRunResult {
+        PrdRunResult {
+            prd_file: PathBuf::from(format!("p-{}.json", tasks)),
+            exit_code: exit,
+            skipped,
+            stopped,
+            tasks_completed: tasks,
+            ..Default::default()
+        }
+    }
+
+    fn enabled(min: u32) -> Decision {
+        Decision {
+            enabled: true,
+            min_tasks: min,
+        }
+    }
+
+    #[test]
+    fn pick_review_target_returns_last_meeting_threshold_when_all_succeed() {
+        // [5-task succ, 1-task succ, 4-task succ], min=3 → third (last meeting threshold)
+        let results = vec![
+            mk_result(5, 0, false, false),
+            mk_result(1, 0, false, false),
+            mk_result(4, 0, false, false),
+        ];
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_some());
+        assert_eq!(picked.unwrap().tasks_completed, 4);
+    }
+
+    #[test]
+    fn pick_review_target_skips_failure_and_picks_earlier_meeting_threshold() {
+        // [5-task succ, 1-task succ, fail], min=3 → first (last is below; second is sub-threshold; failure skipped)
+        let results = vec![
+            mk_result(5, 0, false, false),
+            mk_result(1, 0, false, false),
+            mk_result(99, 1, false, false), // fail — must be skipped despite high task count
+        ];
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_some());
+        assert_eq!(picked.unwrap().tasks_completed, 5);
+    }
+
+    #[test]
+    fn pick_review_target_none_when_all_sub_threshold() {
+        // [1, 2, 1] tasks, min=3 → None
+        let results = vec![
+            mk_result(1, 0, false, false),
+            mk_result(2, 0, false, false),
+            mk_result(1, 0, false, false),
+        ];
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_review_target_skips_stopped_result() {
+        let results = vec![mk_result(10, 0, false, true)];
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_review_target_skips_skipped_result() {
+        let results = vec![mk_result(10, 0, true, false)];
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_review_target_none_when_decision_disabled() {
+        // decision.enabled=false → None regardless of results
+        let disabled = Decision {
+            enabled: false,
+            min_tasks: 1,
+        };
+        let results = vec![
+            mk_result(5, 0, false, false),
+            mk_result(10, 0, false, false),
+        ];
+        let picked = pick_review_target(&results, &disabled);
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_review_target_empty_results_returns_none() {
+        let results: Vec<PrdRunResult> = Vec::new();
+        let picked = pick_review_target(&results, &enabled(3));
+        assert!(picked.is_none());
     }
 
     // --- worktree fallback tests ---

@@ -1034,8 +1034,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     external_repo,
                     cleanup_worktree,
                     parallel,
-                    no_auto_review: _,
-                    auto_review: _,
+                    no_auto_review,
+                    auto_review,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1046,6 +1046,10 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     config.use_worktrees = !no_worktree;
                     config.cleanup_worktree = cleanup_worktree;
                     config.parallel_slots = parallel;
+
+                    // Auto-review hook needs the PRD path after run_loop consumes
+                    // run_config; clone before the move.
+                    let prd_file_for_review = prd_file.clone();
 
                     // `cli.dir` is already absolute (resolved in `main()` via
                     // `resolve_db_dir`, which anchors a relative default against
@@ -1071,11 +1075,28 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
                         })?;
 
-                    let result = rt.block_on(async {
+                    let loop_result = rt.block_on(async {
                         task_mgr::loop_engine::engine::run_loop(run_config).await
                     });
 
-                    process::exit(result.exit_code);
+                    // Auto-review hook — must run AFTER run_loop returns so that
+                    // any worktree-cleanup the engine did is reflected in
+                    // `loop_result.worktree_path` when `maybe_fire` checks it.
+                    // Errors are swallowed inside `maybe_fire`; this can never
+                    // change the loop's exit code.
+                    let project_config =
+                        task_mgr::loop_engine::project_config::read_project_config(&cli.dir);
+                    let launcher = task_mgr::loop_engine::auto_review::ProcessLauncher;
+                    task_mgr::loop_engine::auto_review::maybe_fire(
+                        &project_config,
+                        auto_review,
+                        no_auto_review,
+                        &loop_result,
+                        &prd_file_for_review,
+                        &launcher,
+                    );
+
+                    process::exit(loop_result.exit_code);
                 }
             }
         }
@@ -1177,8 +1198,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     keep_worktrees,
                     chain,
                     parallel,
-                    no_auto_review: _,
-                    auto_review: _,
+                    no_auto_review,
+                    auto_review,
                 } => {
                     let project_root = get_project_root()?;
 
@@ -1203,6 +1224,8 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                             keep_worktrees,
                             chain,
                             parallel,
+                            auto_review,
+                            no_auto_review,
                         )
                         .await
                     });
