@@ -1,0 +1,301 @@
+{
+  "branchName": "feat/milestone-soft-dep-guard",
+  "description": "Block selection of milestone tasks whose acceptance criteria reference active spawned-fixup tasks (REFACTOR-N/CODE-FIX/WIRE-FIX/IMPL-FIX) — defends against forgotten --depended-on-by edges that wasted ~75 min on cbd7d081-MILESTONE-FINAL. Two-layer fix: (A) prompt-side guidance to spawn with --depended-on-by, (B-narrow) selection-side soft-dep filter that defers milestones (only) when token-aware prefix match fires.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "`cargo fmt --check` passes",
+      "`cargo check` clean (no warnings)",
+      "`cargo clippy -- -D warnings` clean",
+      "Scoped tests for touched files pass (full suite is REVIEW-001's job)",
+      "No new unwrap()/expect() in production code paths — use map_err with TaskMgrError",
+      "No breaking changes to public APIs of selection.rs (signatures unchanged)"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Loose substring matching (`task.id.contains(\"CODE-FIX\")`) that false-positives on `CODE-FIXTURE-1` — match must require the trailing `-` boundary",
+    "Self-blocking sibling fixups (REFACTOR-N-001 deferring REFACTOR-N-002) — milestones only",
+    "Cross-PRD blocking (PRD-A's milestone blocked by PRD-B's active fixup) — `task_prefix` MUST be threaded through `get_active_task_ids`",
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Catch-all error handlers that swallow context",
+    "Tests that mirror implementation internals (break when refactoring)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "ad97843a",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `select_parallel_group` excludes a milestone candidate whose AC contains `REFACTOR-N-xxx` while a `todo` `<prefix>-REFACTOR-N-001` exists",
+        "Positive: `select_parallel_group` includes the same milestone after `REFACTOR-N-001` is set to `done`",
+        "Positive: A candidate whose own ID body matches a fixup prefix (e.g. `REFACTOR-N-001`) is NEVER deferred by this filter, even when its AC mentions the prefix",
+        "Positive: Two `todo` REFACTOR-N siblings (001 + 002) with non-overlapping `touchesFiles` are BOTH returned by `select_parallel_group(.., 2)`",
+        "Positive: `get_active_task_ids` SQL includes `archived_at IS NULL` AND threads `task_prefix` via `prefix_and`",
+        "Negative: A milestone in PRD-A is NOT blocked by an active REFACTOR-N task in PRD-B (prefix scoping holds)",
+        "Negative: Archived REFACTOR-N task does NOT block a milestone",
+        "Negative: AC text `\"document the CODE-FIX convention\"` (no trailing dash) does NOT trigger the filter",
+        "Negative: A task whose ID is `CODE-FIXTURE-1` does NOT count as a CODE-FIX active sibling (prefix-with-dash boundary)",
+        "Negative: No new `unwrap()` / `expect()` in production paths; SQL errors propagate as `TaskMgrError`",
+        "Unit test: test_soft_dep_blocks_milestone_with_active_refactor_n",
+        "Unit test: test_soft_dep_releases_when_refactor_n_done",
+        "Unit test: test_soft_dep_in_progress_dep_blocks",
+        "Unit test: test_soft_dep_no_match_unchanged (AC mentions but no matching active task)",
+        "Unit test: test_soft_dep_self_reference_does_not_block (REFACTOR-N-001 candidate isn't self-blocked)",
+        "Unit test: test_soft_dep_two_sibling_fixups_co_schedulable",
+        "Unit test: test_soft_dep_prefix_collision_does_not_block (CODE-FIXTURE doesn't match CODE-FIX)",
+        "Unit test: test_soft_dep_false_positive_prose_does_not_block (no trailing dash)",
+        "Unit test: test_soft_dep_other_prd_prefix_does_not_block (task_prefix scoping)",
+        "Unit test: test_soft_dep_archived_task_does_not_block",
+        "Failure mode: if `get_active_task_ids` SQL fails, the error propagates from `build_scored_candidates` (not silently swallowed)",
+        "CONTRACT: `Task.acceptance_criteria` is `Vec<String>` per `src/models/task.rs:180` — iterate, don't try to parse JSON",
+        "CONTRACT: `prefix_and(task_prefix)` returns `(clause, param)` per `src/db/prefix.rs` convention; mirror existing `get_completed_task_ids` query exactly"
+      ],
+      "dependsOn": [],
+      "description": "Extend `build_scored_candidates` in `src/commands/next/selection.rs` to defer milestone-class candidates whose acceptance_criteria text mentions a known spawned-fixup prefix while a same-prefix active sibling task exists. Token-aware exact-prefix matching (no regex). Includes the new helper, the constant, the filter integration, telemetry, AND all 8 unit tests.\n\nDO:\n- Add `const SPAWNED_FIXUP_PREFIXES: &[&str] = &[\"REFACTOR-N\", \"CODE-FIX\", \"WIRE-FIX\", \"IMPL-FIX\"];`\n- Add `fn get_active_task_ids(conn: &Connection, task_prefix: Option<&str>) -> TaskMgrResult<HashSet<String>>` mirroring `get_completed_task_ids` (use `prefix_and` from `crate::db::prefix`, include `archived_at IS NULL`, status IN ('todo','in_progress')).\n- Add `fn is_blocked_by_active_fixups(task: &Task, active_ids: &HashSet<String>) -> bool` with the three-condition logic (1: candidate-is-NOT-fixup short-circuit, 2: token-aware AC mention, 3: active-sibling-exists), skipping `task.id` itself in step 3.\n- Wire a second `.filter()` after the existing dependsOn check in `build_scored_candidates`.\n- On deferral, emit ONE `eprintln!(\"Deferring {}: AC references active fixup task(s): {}\", task.id, csv)` line — matches engine.rs convention (no tracing/log imports in selection.rs).\n- Tokenization: split each AC string on any character NOT in `[A-Z0-9-]` (e.g., `s.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'))`), check `token.starts_with(&format!(\"{prefix}-\"))`. Same boundary check for active IDs (strip task_prefix first if needed, or compare suffix).\n- Self-fixup short-circuit: if any `prefix` in `SPAWNED_FIXUP_PREFIXES` satisfies `task_id_body.starts_with(&format!(\"{prefix}-\"))` for the candidate, return `false` immediately (sibling fixups co-schedulable).\n\nDO NOT:\n- Use loose substring matching (`task.id.contains(prefix)`) — `CODE-FIXTURE-1` would falsely match `CODE-FIX`. The trailing `-` is mandatory.\n- Block sibling fixups (REFACTOR-N-001 must NOT defer REFACTOR-N-002 just because both ACs mention REFACTOR-N).\n- Introduce regex / wildcard parsing — this is hard-coded prefixes only.\n- Modify the public signatures of `select_next_task` or `select_parallel_group`.\n- Change `selection_reason` strings (existing wording stays — soft-dep is just another reason to be ineligible).\n\nEdge cases:\n- Candidate with no acceptance_criteria → not blocked.\n- Candidate AC mentions REFACTOR-N but no `REFACTOR-N-*` task exists → not blocked.\n- Active sibling is `in_progress` (not `todo`) → still blocks.\n- Candidate's own ID matches a fixup prefix → never blocked (self-fixup short-circuit).\n- Two sibling fixups (REFACTOR-N-001 + REFACTOR-N-002) both with AC mentioning prefix → both selectable (co-schedulable).\n- AC contains prose `\"document the CODE-FIX convention\"` (no trailing dash) → tokenizes to `CODE-FIX` (no trailing-`-` match) → not blocked.\n- Active task is in another PRD's prefix → not blocked (prefix scoping in get_active_task_ids).\n- Active task is archived → not blocked (archived_at IS NULL filter).\n\nKnown-bad to guard against:\n- `task.id.contains(\"CODE-FIX\")` returns true for `CODE-FIXTURE-1` — the test `test_soft_dep_prefix_collision_does_not_block` MUST FAIL this naive impl.\n- A `is_blocked_by_active_fixups` that doesn't exclude `task.id` from `active_ids` would self-block any task whose own ID matches the prefix.\n- An implementation that scans active_ids for full match on the token rather than prefix-with-dash would miss `REFACTOR-N-xxx → REFACTOR-N-001` correspondence.",
+      "edgeCases": [
+        "Empty acceptance_criteria → never blocked",
+        "AC with trailing-dash prose vs no-trailing-dash prose → only with-dash triggers",
+        "Self-reference (candidate ID body matches a fixup prefix) → short-circuit to not-blocked",
+        "Sibling fixups with same prefix → both selectable in same wave",
+        "Cross-PRD active fixups → not visible (prefix scoping)",
+        "Archived active-status tasks → not visible (archived_at filter)",
+        "Active task is `in_progress` not `todo` → still blocks",
+        "Prefix collision (`CODE-FIXTURE-1` vs `CODE-FIX-`) → boundary holds"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "SQL error in get_active_task_ids",
+          "expectedBehavior": "Error propagates via TaskMgrResult — not silently swallowed; build_scored_candidates returns Err"
+        },
+        {
+          "cause": "Candidate has malformed acceptance_criteria (parse failure upstream)",
+          "expectedBehavior": "Task struct already defaults to Vec::new() per src/models/task.rs:320 — filter sees empty AC and is a no-op"
+        },
+        {
+          "cause": "active_ids contains task.id itself",
+          "expectedBehavior": "Skip task.id when scanning — prevents self-block"
+        }
+      ],
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reuse: `get_completed_task_ids` (existing in selection.rs:188) as the template for `get_active_task_ids` — same prefix_and helper, same query_map shape. Reuse: `Task` struct from `crate::models::Task`, already imported. Test helpers: `setup_test_db()` + `insert_task_full(conn, id, title, status, priority, description, criteria)` from `src/loop_engine/test_utils.rs:138` accept criteria as `&[&str]` — perfect for AC text. For archived tests: insert_task_full doesn't set archived_at, so use raw SQL in the archived test (`UPDATE tasks SET archived_at = datetime('now') WHERE id = ?`). For task_prefix tests: pass `task_prefix=Some(\"PRD-A-\")` to select_parallel_group; insert tasks with both prefixes. Learning [1855]: select_parallel_group already documented as the parallel selection entry point. Learning [1789]: prior selection.rs work used borrowed-not-moved file references — preserve. Learning [538]: prefix-scoped queries need archived_at IS NULL too (mirror `get_completed_task_ids`). Performance: O(candidates × AC_lines × tokens × 4 prefixes) — sub-ms for documented 100-200 task PRDs.",
+      "passes": false,
+      "priority": 1,
+      "qualityDimensions": [
+        "Token-aware exact-prefix matching with mandatory trailing dash — never loose substring",
+        "Self-fixup short-circuit prevents sibling co-blocking",
+        "task_prefix threaded so cross-PRD bleed is impossible",
+        "archived_at IS NULL mirrored from get_completed_task_ids — archived tasks never block",
+        "Single eprintln per deferral (not per candidate) — operator visibility without spam",
+        "No public signature changes to select_next_task / select_parallel_group",
+        "No new dependencies (no regex crate, no log/tracing) — fits existing selection.rs imports"
+      ],
+      "taskType": "implementation",
+      "title": "Add soft-dep filter to select_parallel_group / select_next_task",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/commands/next/tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: Integration test reproduces the scenario — MILESTONE-FINAL excluded while REFACTOR-N-001/002 active",
+        "Positive: Same test confirms re-eligibility once both REFACTOR-N tasks are `done`",
+        "Positive: Test uses `select_parallel_group` directly (no mocking) against an in-memory or TempDir SQLite",
+        "Positive: Test uses real-world AC text verbatim (string match against committed PRD text)",
+        "Negative: Test does NOT depend on internal helpers (`is_blocked_by_active_fixups`, `get_active_task_ids` are pub(crate) — only the public function is exercised here)",
+        "Negative: Test does NOT use `task.id.contains(...)` shortcuts that bypass production filter",
+        "CONTRACT: `select_parallel_group` signature is `(conn, after_files: &[String], task_prefix: Option<&str>, max_slots: usize)` per `src/commands/next/selection.rs:309`"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add an end-to-end integration test in `tests/task_selection.rs` that reproduces the production bug from `cbd7d081-MILESTONE-FINAL` to lock in the fix.\n\nDO:\n- Insert MILESTONE-FINAL with the real-world acceptance_criteria text including 'REFACTOR-N-xxx if any' and 'Any spawned CODE-FIX/WIRE-FIX/IMPL-FIX/REFACTOR-N tasks have passes=true'.\n- Insert active siblings: `<prefix>-REFACTOR-N-001` (in_progress) and `<prefix>-REFACTOR-N-002` (todo), both with distinct `touchesFiles` so they're co-schedulable in a parallel group.\n- Call `select_parallel_group(&conn, &[], Some(\"<prefix>-\"), 2)`.\n- Assert MILESTONE-FINAL is NOT in the returned group.\n- Assert REFACTOR-N-002 IS in the returned group (REFACTOR-N-001 is in_progress, so it's not a `todo` candidate at all — that's expected).\n- After marking both REFACTOR-N tasks `done`, re-run select and assert MILESTONE-FINAL IS now returned.\n\nDO NOT:\n- Re-test unit-level behavior already covered by FEAT-001's unit tests (this is the integration check, not a substitute).\n- Mock `select_parallel_group` — exercise the real function against a real SQLite connection.",
+      "edgeCases": [
+        "REFACTOR-N-001 is in_progress → not even a todo candidate, MILESTONE deferred via REFACTOR-N-002",
+        "Both REFACTOR-N tasks done → MILESTONE eligible"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Test asserts MILESTONE-FINAL appears even though it shouldn't",
+          "expectedBehavior": "Test fails — caught by CI before regression ships"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Reuse: existing patterns in `tests/task_selection.rs` (already 938 lines, has `make_task` builder per learning [1203]). Use the same prefix scheme (e.g. `PRD-` or `cbd7d081-`) the existing tests use — grep for `select_parallel_group` to find a near-identical test to clone. The AC strings to embed are: `\"All tasks (... REFACTOR-N-xxx if any, ...) have passes=true\"` and `\"Any spawned CODE-FIX/WIRE-FIX/IMPL-FIX/REFACTOR-N tasks have passes=true\"`. Touches `src/loop_engine/test_utils.rs` ONLY if a new helper is needed (e.g. `insert_task_with_archive_at`); otherwise reuse `insert_task_full`.",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Single coherent integration test — not a battery of unit-test reruns",
+        "Real-world AC text (verbatim) — locks in the production scenario",
+        "Asserts both directions: blocked when active, eligible when done",
+        "No mocking of selection internals — exercises the public path"
+      ],
+      "taskType": "test",
+      "title": "Integration test: reproduce cbd7d081 milestone-soft-dep scenario",
+      "touchesFiles": [
+        "tests/task_selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task_ops_section()` contains the substring `--depended-on-by`",
+        "Positive: `task_ops_section()` contains the phrase `in response to a milestone` (or equivalent) — the test asserts a specific phrase the agent will see",
+        "Positive: `test_section_contains_critical_phrases` updated to assert both new substrings",
+        "Positive: `test_section_size_within_budget` still passes (< 1536 bytes)",
+        "Negative: existing bullets (`<task-status>`, `task-mgr show`, `jq` fallback, `task-mgr add --stdin`) remain unchanged",
+        "Negative: no other prompt-section files modified (this is a self-contained section)",
+        "CONTRACT: `task_ops_section()` returns `&'static str` per `src/loop_engine/prompt_sections/task_ops.rs:10` — addition uses the same `\\n\\` line continuation style as existing content"
+      ],
+      "dependsOn": [],
+      "description": "Update `src/loop_engine/prompt_sections/task_ops.rs` so the loop agent learns to pass `--depended-on-by <milestone-id>` whenever it spawns a fix in response to a milestone task's acceptance criteria — the durable root-cause fix.\n\nDO:\n- Insert a new bullet immediately after the existing `task-mgr add --stdin` example, with this content (rendered) ≈300 bytes:\n\n  > - **Spawning a fix in response to a milestone's AC**: if you're creating\n  >   this fix because some milestone task's acceptance criteria called for\n  >   spawned `CODE-FIX-…`/`WIRE-FIX-…`/`IMPL-FIX-…`/`REFACTOR-N-…` tasks,\n  >   pass `--depended-on-by <that-milestone-id>` so the loop won't dispatch\n  >   the milestone before your fix lands:\n  >\n  >       echo '{\"id\":\"REFACTOR-N-001\",...}' | task-mgr add --stdin \\\n  >         --depended-on-by MILESTONE-FINAL\n\n- Update the unit test `test_section_contains_critical_phrases` to assert the new content is present.\n- Verify `test_section_size_within_budget` (asserts < 1536 bytes) still passes — measure post-change with a `dbg!()` or `println!()` in a one-shot test run, then remove.\n\nDO NOT:\n- Reflow or reword the existing bullets — surgical addition only.\n- Bloat the section beyond ~300 bytes net add (current section is well under budget; ~300 bytes leaves ample headroom).\n- Add a new test file — extend the existing tests in `task_ops.rs`.\n- Add references to the soft-dep filter (FEAT-001) — the prompt should stand on its own as the root-cause guidance; the filter is defense-in-depth, not the contract.",
+      "edgeCases": [
+        "Section size approaches 1536 bytes → fail fast in the existing test"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Section size exceeds 1536-byte budget",
+          "expectedBehavior": "test_section_size_within_budget fails — must trim wording before merging"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "File is `src/loop_engine/prompt_sections/task_ops.rs` (107 lines, single function returning a static str). Existing example at lines 28-35 — append new bullet right after it, before the trailing `\\n` that closes the section. Existing tests are at lines 41-105; extend `test_section_contains_critical_phrases` (line 44). The 1536-byte budget is asserted by `test_section_size_within_budget` (line 98).",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Single focused addition — no incidental edits",
+        "Stays under 1536-byte section budget",
+        "Existing test coverage extended, not replaced",
+        "Phrasing is action-triggered (\"if you're creating this fix because...\") so the agent knows when the rule fires"
+      ],
+      "taskType": "implementation",
+      "title": "Prompt section: teach the loop agent --depended-on-by for milestone-spawned fixes",
+      "touchesFiles": [
+        "src/loop_engine/prompt_sections/task_ops.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication beyond the unavoidable SQL shape similarity between `get_active_task_ids` and `get_completed_task_ids` (one helper or two near-identical functions both acceptable; flag if more)",
+        "`is_blocked_by_active_fixups` and tokenization helper functions under 30 lines",
+        "Test names in `next/tests.rs` follow existing naming convention",
+        "Code follows patterns elsewhere in `selection.rs` (HashSet for membership, `prefix_and` for SQL scoping)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review FEAT-001/002/003 implementation for DRY violations, complexity, and pattern adherence.\n\nDO: Check that `get_active_task_ids` doesn't duplicate logic from `get_completed_task_ids` more than necessary (one shared helper acceptable, but don't force premature abstraction). Check `is_blocked_by_active_fixups` is < 30 lines. Verify the tokenization closure isn't reinvented per-iteration (factor if reused). Confirm test names follow the existing `test_*` convention in `next/tests.rs`.\n\nDO NOT: Skip — this is the gate that catches duplicated SQL or overly-clever closures before REVIEW-001.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97). If clean, optionally invoke `/simplify` on any rough edges, then emit `<task-status>REFACTOR-001:done</task-status>`.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY: SQL helper sharing without forced abstraction",
+        "Single-responsibility functions (< 30 lines)",
+        "Pattern consistency with existing selection.rs code"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/commands/next/tests.rs",
+        "tests/task_selection.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test` all clean (no scope filter)",
+        "Positive: `select_parallel_group` and `select_next_task` callers (engine.rs:1289, commands/next/mod.rs, anywhere else grep -rn finds them) still compile and behave correctly",
+        "Positive: New code reachable from production — `select_parallel_group` is called by `run_wave_iteration` and the path has not regressed",
+        "Negative: No `unwrap()` / `expect()` introduced in production paths",
+        "Negative: No dead code warnings on new helpers",
+        "Documentation: Decide whether CLAUDE.md needs a `--depended-on-by` quick-ref for milestone-spawning. If yes, update it; if no, document the decision in the progress file.",
+        "Documentation: Decide whether `src/commands/next/selection.rs` doc comment for `build_scored_candidates` should mention the soft-dep filter. Update if user-facing.",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation. RUN THE FULL QUALITY GATE (unscoped suite).\n\nDO: Run `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test` (no scope). Verify `eprintln!` deferral message fires in a manual smoke (or log-asserted in a new test). Confirm `select_parallel_group` callers in `src/loop_engine/engine.rs` (line 1289) still compile and behave correctly when the group is empty (existing `handle_no_eligible_tasks` path). Check whether CLAUDE.md needs a quick-reference for SPAWNED_FIXUP_PREFIXES / `--depended-on-by` for milestone-spawning workflows.\n\nDO NOT: Skip the full suite — this is THE place it runs. Do NOT scope tests by file.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — atomic DB+JSON sync. Full-suite command per CLAUDE.md test/build rule (one-shot tee+grep): `cargo fmt --check 2>&1 | tee /tmp/fmt.txt | tail -3 && cargo clippy -- -D warnings 2>&1 | tee /tmp/clippy.txt | tail -3 && grep \"^error\" /tmp/clippy.txt | head -10 && cargo test 2>&1 | tee /tmp/test.txt | tail -5 && grep \"FAILED\\|error\\[\" /tmp/test.txt | head -10`. If clean: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "Full unscoped test suite green",
+        "No unwrap/expect in production",
+        "All callers of selection functions verified",
+        "Documentation decision recorded (yes/no with reason)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/commands/next/tests.rs",
+        "tests/task_selection.rs",
+        "src/loop_engine/prompt_sections/task_ops.rs",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each helper that replaces find_blocking_active_fixups is under 30 body lines",
+        "is_blocked_by_active_fixups removed; no other callers exist (grep -rn confirms)",
+        "build_scored_candidates filter calls find_blocking_active_fixups exactly once per task (no double invocation on blocked items)",
+        "format! needle strings computed once per tokenization call, not per token",
+        "All 11 soft_dep_tests still pass; no public API change to selection.rs",
+        "cargo fmt --check, cargo clippy -- -D warnings, cargo test --lib selection all clean"
+      ],
+      "description": "From REFACTOR-001: src/commands/next/selection.rs:57-103 + 168-185. Three coupled smells fixed in one refactor.\n\n1) find_blocking_active_fixups body is ~37 lines doing three distinct phases: self-fixup short-circuit, AC tokenization, active-sibling match. Borderline against the explicit 'under 30 lines' AC. Split into smaller helpers, e.g. task_id_is_self_fixup(task) -> bool, mentioned_fixup_prefixes(task) -> Vec<&'static str>, and find_active_blockers_for_prefixes(prefixes, active_ids, task_id) -> Vec<String>. The orchestrator becomes ~10 lines.\n\n2) is_blocked_by_active_fixups (selection.rs:101-103) is a thin wrapper used only by the filter at selection.rs:172. The filter calls the wrapper to check if blocked, then calls find_blocking_active_fixups AGAIN at line 178 to get blockers for the eprintln — wasted double-call on blocked items. Drop the wrapper and use the result of one call: let blockers = find_blocking_active_fixups(task, &active_ids); if blockers.is_empty() { return true; } eprintln!(...); false.\n\n3) Inside the tokenizer (selection.rs:69) format!(\"{prefix}-\") is rebuilt for every (AC × token × prefix). Pre-compute the needles once at the start of mentioned_fixup_prefixes (e.g. let needles: Vec<String> = SPAWNED_FIXUP_PREFIXES.iter().map(|p| format!(\"{p}-\")).collect()). Naturally falls out of the split.",
+      "estimatedEffort": "medium",
+      "id": "ad97843a-REFACTOR-FIX-001",
+      "notes": "Bundled because all three smells live in the same ~50-line region and one coherent split addresses all of them.",
+      "passes": false,
+      "priority": 80,
+      "title": "Split find_blocking_active_fixups; drop wrapper; pre-compute needles",
+      "touchesFiles": [
+        "src/commands/next/selection.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

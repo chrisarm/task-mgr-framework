@@ -1,66 +1,3 @@
-# PRD: Prompt-Overflow Recovery Escalation + Diagnostics — progress log
-
-## [2026-05-04 18:00] - cbd7d081-ANALYSIS-001
-Approach: grep-verified the PRD Section 6 Consumer Impact Table against current main.
-Files: (read-only verification)
-Findings:
-- ctx.model_overrides readers in src/loop_engine/engine.rs:
-  - Definition: 208 (HashMap<String, String>); init: 241
-  - Reader: 1761 (effective_model derivation) — MATCHES PRD
-  - Writer: 2069 (PromptTooLong arm, Opus→Opus[1M] rung) — MATCHES PRD
-  - No other readers/writers in src/. No callers outside engine.rs.
-- ctx.effort_overrides readers in src/loop_engine/engine.rs:
-  - Definition: 203 (HashMap<String, &'static str>); init: 240
-  - Reader: 1778 (cluster_effort override) — MATCHES PRD
-  - Writer: 2056 (PromptTooLong arm, downgrade rung) — MATCHES PRD
-  - No other readers/writers in src/.
-- effective_model usages confirmed at 1745 (compute), 1793 (banner), 1811 (spawn_claude),
-  2061 (PromptTooLong to_1m_model lookup), 2154 (IterationResult). Plus IterationResult
-  field at 170 and many None-initializers on early-exit paths. All uses align with PRD.
-- Banner construction at engine.rs:1788-1795 (call to display::print_iteration_header
-  with effective_model.as_deref() at 1793) — MATCHES PRD's "~1793" expectation.
-- Crash escalation channels:
-  - check_crash_escalation defined at 4225, called at 1747 (transient per-iteration).
-  - escalate_task_model_if_needed defined at 4276, called at 4385 (DB-level consecutive
-    failures). Module-level doc at 4246 explicitly documents the two paths.
-  - Neither writes to ctx.model_overrides — confirmed via grep (only writer is line 2069).
-  - Confirms learning #893 invariant: crash escalation is separate from PromptTooLong
-    retry escalation. Banner gating must use a NEW dedicated set (overflow_recovered),
-    not infer from model_overrides (which check_crash_escalation legitimately doesn't
-    populate, and which crash escalation could also populate in the future).
-- Drift from PRD Consumer Impact Table: NONE. Line numbers match (1761, 1778, ~1793,
-  2044-2113). No new readers/writers added since 2026-05-04 PRD draft.
-Conclusion: PRD Section 6 Consumer Impact Table is accurate. FEAT-005 is safe to
-implement against the documented seams; no consumer-analysis refresh needed for
-downstream tasks.
-Learnings:
-- ctx.model_overrides has exactly one reader (1761) and one writer (2069) — narrow seam.
-- Crash escalation paths are DB/return-value based, never touching ctx maps; the
-  overflow_recovered HashSet for banner gating must remain its own channel.
----
-## [2026-05-04 14:45] - cbd7d081-TEST-INIT-001
-Approach: Added escalate_below_opus helper plus six tier-by-tier tests, mirroring style of to_1m_model/downgrade_effort.
-Files: src/loop_engine/model.rs
-Learnings:
-- Followed #851: signature mirrors to_1m_model — `Option<&str> → Option<&'static str>`, no allocations.
-- Opus and Opus[1M] both classified Opus-tier via existing model_tier substring match, so a single `Opus | Default => None` arm covers AC3+AC4.
-- Tests use HAIKU_MODEL/SONNET_MODEL/OPUS_MODEL/OPUS_MODEL_1M constants — no literals (no_hardcoded_models.rs safe).
----
-## [2026-05-04 22:00] - cbd7d081-TEST-INIT-004
-Approach: Wrote the integration test scaffold AND added the minimum scaffolding to make it executable: handle_prompt_too_long in overflow.rs (the linear pipeline per PRD §7), section_sizes on PromptResult, overflow_recovered+overflow_original_model on IterationContext. Engine.rs PromptTooLong arm UNCHANGED — FEAT-005 will rewire it. Helper marked #[allow(dead_code)] until then.
-Files: tests/overflow_recovery.rs, src/loop_engine/overflow.rs, src/loop_engine/engine.rs, src/loop_engine/prompt.rs
-Learnings:
-- Integration tests can only see `pub` items, not `pub(crate)` — PRD §7 said `pub(crate)` for handle_prompt_too_long but I had to relax to `pub` to be callable from tests/overflow_recovery.rs.
-- The helper's UPDATE uses WHERE status='in_progress' so multi-iteration tests must re-claim (UPDATE → in_progress) between calls; mirrors what the production task selector does.
-- Rotation test sleeps 1100ms between iterations so mtime resolution (1s on common ext4) can distinguish "newest 3" reliably — without the sleep, rotation can keep arbitrary 3-of-5.
-## [2026-05-04 22:00] - cbd7d081-TEST-INIT-005
-Approach: Added overflow_recovered/overflow_original_model fields to IterationContext + format_iteration_banner_with_recovery in display.rs, then 4 tests (positive, BLOCKER-1 negative, no-op, defensive missing-original).
-Files: src/loop_engine/engine.rs, src/loop_engine/display.rs
-Learnings:
-- BLOCKER-1 negative test asserts !contains("overflow recovery") when only model_overrides has the task — locks in learning #893's separation invariant for any future model_overrides writers.
-- `#[allow(clippy::too_many_arguments)]` on the 8-arg banner fn — signature is fixed by FEAT-006 AC1, no_args reduction would conflict with the contract.
-- No-op test asserts byte-equality with format_iteration_header output — guarantees zero behavioral drift in the common (non-recovery) path.
----
 ## [2026-05-04 22:30] - cbd7d081-FEAT-005
 Approach: Wired overflow::handle_prompt_too_long into engine.rs PromptTooLong arm (replaces ~75 lines of inline rung 1+3 logic with a 12-line call), restored overflow_recovered/overflow_original_model fields lost in the c51ce51 slot merge, removed dead_code allowance.
 Files: src/loop_engine/engine.rs, src/loop_engine/overflow.rs, tests/overflow_recovery.rs
@@ -132,4 +69,28 @@ Learnings:
 - Reachability check via grep showed escalate_below_opus / OverflowEvent / handle_prompt_too_long / format_iteration_banner_with_recovery / sanitize_id_for_filename all wired into production call sites.
 - All overflow.rs `.unwrap()` calls live under `#[cfg(test)]`; production paths log via eprintln!.
 - Full quality gate green: fmt, check, clippy -D warnings, cargo test (3208 + 7 + 4 + 4 + ... all 0 failed), gen-docs --check.
+---
+
+## 2026-05-07 05:24:14 UTC - Iteration 1
+- Task: (none)
+- Model: (default)
+- Effort: (default)
+- Outcome: NoEligibleTasks
+- Files: (none)
+---
+
+## 2026-05-07 05:24:14 UTC - Iteration 2
+- Task: (none)
+- Model: (default)
+- Effort: (default)
+- Outcome: NoEligibleTasks
+- Files: (none)
+---
+
+## 2026-05-07 05:24:14 UTC - Iteration 3
+- Task: (none)
+- Model: (default)
+- Effort: (default)
+- Outcome: NoEligibleTasks
+- Files: (none)
 ---
