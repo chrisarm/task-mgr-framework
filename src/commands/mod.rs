@@ -29,6 +29,7 @@ pub mod curate;
 pub mod decisions;
 pub mod dependency_checker;
 pub mod doctor;
+pub mod enhance;
 pub mod export;
 pub mod fail;
 pub mod history;
@@ -68,6 +69,11 @@ pub use decisions::{
 pub use doctor::{
     DoctorResult, DoctorSummary, Fix, Issue, IssueType, SetupAuditResult, audit_setup, doctor,
     format_doctor_verbose, format_setup_text, format_text as format_doctor_text,
+};
+pub use enhance::{
+    ActionTaken, AgentsParams, EnhanceKind, EnhanceResult, ShowParams, StripParams, TargetOutcome,
+    enhance_agents, enhance_show, enhance_strip, format_text as format_enhance_text,
+    templates::EnhanceProfile,
 };
 pub use export::{ExportResult, export, format_text as format_export_text};
 pub use fail::{FailResult, TaskFailResult, fail, format_text as format_fail_text};

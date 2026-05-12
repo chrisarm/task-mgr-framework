@@ -9,9 +9,9 @@
 
 use regex::Regex;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use task_mgr::util::marker_splice;
 
 const MODELS_BEGIN: &str = "<!-- MODELS:BEGIN -->";
 const MODELS_END: &str = "<!-- MODELS:END -->";
@@ -52,13 +52,26 @@ fn main() -> ExitCode {
         }
     };
 
-    let new_contents = match splice_block(&current, &block) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("gen-docs: {e} (in {})", tasks_md.display());
-            return ExitCode::from(2);
-        }
-    };
+    // gen-docs requires exactly one marker pair — validate before splicing.
+    let begin_count = current.matches(MODELS_BEGIN).count();
+    let end_count = current.matches(MODELS_END).count();
+    if begin_count == 0 || end_count == 0 {
+        eprintln!(
+            "gen-docs: expected {MODELS_BEGIN} and {MODELS_END} markers in {}; \
+             found {begin_count} begin / {end_count} end",
+            tasks_md.display()
+        );
+        return ExitCode::from(2);
+    }
+    if begin_count > 1 || end_count > 1 {
+        eprintln!(
+            "gen-docs: ambiguous markers in {}: expected exactly one pair, \
+             found {begin_count} begin / {end_count} end",
+            tasks_md.display()
+        );
+        return ExitCode::from(2);
+    }
+    let new_contents = marker_splice::splice_block(&current, MODELS_BEGIN, MODELS_END, &block);
 
     if new_contents == current {
         if !check_mode {
@@ -76,7 +89,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if let Err(e) = write_atomic(&tasks_md, &new_contents) {
+    if let Err(e) = marker_splice::write_atomic(&tasks_md, &new_contents) {
         eprintln!("gen-docs: failed to write {}: {e}", tasks_md.display());
         return ExitCode::from(2);
     }
@@ -172,55 +185,15 @@ fn render_block(model_rs: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-/// Replace the content between BEGIN/END markers. Fails if markers are
-/// missing or appear more than once.
-fn splice_block(current: &str, block: &str) -> Result<String, String> {
-    let begin_count = current.matches(MODELS_BEGIN).count();
-    let end_count = current.matches(MODELS_END).count();
-    if begin_count == 0 || end_count == 0 {
-        return Err(format!(
-            "expected {MODELS_BEGIN} and {MODELS_END} markers; found {begin_count} begin / {end_count} end"
-        ));
-    }
-    if begin_count > 1 || end_count > 1 {
-        return Err(format!(
-            "ambiguous markers: expected exactly one pair, found {begin_count} begin / {end_count} end"
-        ));
-    }
-    let begin_idx = current.find(MODELS_BEGIN).unwrap();
-    let end_idx = current.find(MODELS_END).unwrap();
-    if end_idx < begin_idx {
-        return Err("END marker appears before BEGIN marker".into());
-    }
-    let after_begin = begin_idx + MODELS_BEGIN.len();
-    let mut result = String::with_capacity(current.len() + block.len());
-    result.push_str(&current[..after_begin]);
-    result.push('\n');
-    result.push_str(block);
-    if !block.ends_with('\n') {
-        result.push('\n');
-    }
-    result.push_str(&current[end_idx..]);
-    Ok(result)
-}
-
-/// Write atomically via tempfile + rename in the same directory.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use task_mgr::util::marker_splice;
 
     #[test]
     fn splice_replaces_between_markers() {
         let input = "head\n<!-- MODELS:BEGIN -->\nOLD\n<!-- MODELS:END -->\ntail\n";
-        let out = splice_block(input, "NEW\n").unwrap();
+        let out = marker_splice::splice_block(input, MODELS_BEGIN, MODELS_END, "NEW\n");
         assert!(out.contains("NEW"));
         assert!(!out.contains("OLD"));
         assert!(out.contains("head"));
@@ -228,23 +201,10 @@ mod tests {
     }
 
     #[test]
-    fn splice_missing_markers_errors() {
-        let err = splice_block("no markers here", "X").unwrap_err();
-        assert!(err.contains("MODELS:BEGIN"));
-    }
-
-    #[test]
-    fn splice_duplicate_markers_errors() {
-        let input = "<!-- MODELS:BEGIN -->\nA\n<!-- MODELS:END -->\n<!-- MODELS:BEGIN -->\nB\n<!-- MODELS:END -->\n";
-        let err = splice_block(input, "X").unwrap_err();
-        assert!(err.contains("ambiguous"));
-    }
-
-    #[test]
     fn splice_is_idempotent() {
         let input = "head\n<!-- MODELS:BEGIN -->\nBLOCK\n<!-- MODELS:END -->\ntail\n";
-        let once = splice_block(input, "BLOCK\n").unwrap();
-        let twice = splice_block(&once, "BLOCK\n").unwrap();
+        let once = marker_splice::splice_block(input, MODELS_BEGIN, MODELS_END, "BLOCK\n");
+        let twice = marker_splice::splice_block(&once, MODELS_BEGIN, MODELS_END, "BLOCK\n");
         assert_eq!(once, twice);
     }
 }

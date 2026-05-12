@@ -2536,3 +2536,428 @@ mod multi_prd_import_tests {
         );
     }
 }
+
+// ============================================================================
+// init_project tests
+// ============================================================================
+
+#[test]
+fn test_init_project_fresh_creates_db_and_config() {
+    let project_dir = TempDir::new().unwrap();
+    let result = super::init_project(project_dir.path()).unwrap();
+
+    assert!(
+        result.created_dirs,
+        "should report dir creation on first call"
+    );
+    assert!(
+        result.created_config,
+        "should report config creation on first call"
+    );
+    assert!(result.fresh_import, "fresh_import mirrors created_dirs");
+
+    let db_path = project_dir.path().join(".task-mgr").join("tasks.db");
+    assert!(db_path.exists(), ".task-mgr/tasks.db must exist");
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    assert!(config_path.exists(), ".task-mgr/config.json must exist");
+
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert_eq!(
+        config.get("version").and_then(|v| v.as_u64()),
+        Some(1),
+        "config must have version >= 1"
+    );
+}
+
+#[test]
+fn test_init_project_preserves_existing_config_fields() {
+    let project_dir = TempDir::new().unwrap();
+    let db_dir = project_dir.path().join(".task-mgr");
+    fs::create_dir_all(&db_dir).unwrap();
+    fs::write(db_dir.join("config.json"), r#"{"customField": "keepme"}"#).unwrap();
+
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_str = fs::read_to_string(db_dir.join("config.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert_eq!(
+        config.get("customField").and_then(|v| v.as_str()),
+        Some("keepme"),
+        "existing customField must be preserved"
+    );
+    assert_eq!(
+        config.get("version").and_then(|v| v.as_u64()),
+        Some(1),
+        "version default must be filled in for missing key"
+    );
+}
+
+#[test]
+fn test_init_project_idempotent() {
+    let project_dir = TempDir::new().unwrap();
+
+    // First call — creates everything
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    let content_after_first = fs::read(&config_path).unwrap();
+
+    // Second call — should be a no-op as far as created_* flags go
+    let result2 = super::init_project(project_dir.path()).unwrap();
+    assert!(
+        !result2.created_dirs,
+        "created_dirs must be false on second call"
+    );
+    assert!(
+        !result2.created_config,
+        "created_config must be false on second call"
+    );
+
+    let content_after_second = fs::read(&config_path).unwrap();
+    assert_eq!(
+        content_after_first, content_after_second,
+        "config.json contents must be byte-identical between calls"
+    );
+}
+
+#[test]
+fn test_init_project_leaves_tasks_json_untouched() {
+    let project_dir = TempDir::new().unwrap();
+    let tasks_dir = project_dir.path().join("tasks");
+    fs::create_dir_all(&tasks_dir).unwrap();
+    let foo_path = tasks_dir.join("foo.json");
+    let foo_content = br#"{"id":"SOME-001","title":"stub"}"#;
+    fs::write(&foo_path, foo_content).unwrap();
+
+    let before = fs::read(&foo_path).unwrap();
+    super::init_project(project_dir.path()).unwrap();
+    let after = fs::read(&foo_path).unwrap();
+
+    assert_eq!(
+        before, after,
+        "tasks/foo.json must be byte-identical before and after init_project"
+    );
+}
+
+#[test]
+fn test_init_project_empty_task_mgr_dir() {
+    let project_dir = TempDir::new().unwrap();
+    // Pre-create empty .task-mgr/ (no DB, no config)
+    fs::create_dir_all(project_dir.path().join(".task-mgr")).unwrap();
+
+    let result1 = super::init_project(project_dir.path()).unwrap();
+    // Dir existed already, so created_dirs is false; but config is new
+    assert!(
+        !result1.created_dirs,
+        "dir existed — created_dirs must be false"
+    );
+    assert!(
+        result1.created_config,
+        "config didn't exist — created_config must be true"
+    );
+
+    assert!(
+        project_dir
+            .path()
+            .join(".task-mgr")
+            .join("tasks.db")
+            .exists()
+    );
+    assert!(
+        project_dir
+            .path()
+            .join(".task-mgr")
+            .join("config.json")
+            .exists()
+    );
+
+    // Second call: no-op
+    let result2 = super::init_project(project_dir.path()).unwrap();
+    assert!(!result2.created_dirs);
+    assert!(!result2.created_config);
+}
+
+#[test]
+fn test_init_project_non_tty_no_default_model() {
+    // In test environments stdin/stderr are not TTYs, so the picker must be skipped.
+    let project_dir = TempDir::new().unwrap();
+    super::init_project(project_dir.path()).unwrap();
+
+    let config_path = project_dir.path().join(".task-mgr").join("config.json");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    assert!(
+        config.get("defaultModel").is_none(),
+        "picker must not fire in non-TTY environment; defaultModel must be absent"
+    );
+}
+
+#[test]
+fn test_init_project_does_not_create_tasks_subdir() {
+    let project_dir = TempDir::new().unwrap();
+    super::init_project(project_dir.path()).unwrap();
+
+    let tasks_subdir = project_dir.path().join(".task-mgr").join("tasks");
+    assert!(
+        !tasks_subdir.exists(),
+        "init_project must NOT create .task-mgr/tasks/ — that belongs to loop/batch init"
+    );
+}
+
+// ============================================================================
+// FEAT-005: Init split — shim/canonical PRD-import equivalence
+// ============================================================================
+//
+// The top-level `task-mgr init --from-json X` shim and the canonical
+// `task-mgr loop init X` path both terminate in the same
+// `commands::init::init(db_dir, &[prd], force, append, update_existing,
+// dry_run, prefix_mode)` call. Verifying byte-identical DB row state after
+// both paths is the strongest cross-route guarantee we can express without
+// shelling out to the binary — it locks in the CONTRACT acceptance criterion
+// ("shim dispatch passes the same `&[PathBuf]` to `init()` that
+// LoopCommand::Init / BatchCommand::Init dispatch does").
+
+/// Snapshot of the rows produced by an `init()` invocation. Sorted in canonical
+/// order so two tmpdirs that ran identical PRD imports compare equal regardless
+/// of insertion order. Includes the dependsOn graph and touchesFiles list — the
+/// only data that varies between equivalent PRD-import paths in this codebase.
+fn snapshot_init_state(db_dir: &std::path::Path) -> serde_json::Value {
+    let conn = open_connection(db_dir).unwrap();
+
+    let mut task_rows: Vec<serde_json::Value> = conn
+        .prepare(
+            "SELECT id, title, description, priority, status, acceptance_criteria \
+             FROM tasks ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0).unwrap(),
+                "title": r.get::<_, String>(1).unwrap(),
+                "description": r.get::<_, Option<String>>(2).unwrap(),
+                "priority": r.get::<_, i64>(3).unwrap(),
+                "status": r.get::<_, String>(4).unwrap(),
+                "acceptance_criteria": r.get::<_, Option<String>>(5).unwrap(),
+            }))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    task_rows.sort_by(|a, b| a["id"].as_str().unwrap().cmp(b["id"].as_str().unwrap()));
+
+    let mut rel_rows: Vec<serde_json::Value> = conn
+        .prepare(
+            "SELECT task_id, related_id, rel_type FROM task_relationships \
+             ORDER BY task_id, related_id, rel_type",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "task_id": r.get::<_, String>(0).unwrap(),
+                "related_id": r.get::<_, String>(1).unwrap(),
+                "rel_type": r.get::<_, String>(2).unwrap(),
+            }))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    rel_rows.sort_by(|a, b| {
+        a["task_id"]
+            .as_str()
+            .unwrap()
+            .cmp(b["task_id"].as_str().unwrap())
+            .then_with(|| {
+                a["related_id"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(b["related_id"].as_str().unwrap())
+            })
+            .then_with(|| {
+                a["rel_type"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(b["rel_type"].as_str().unwrap())
+            })
+    });
+
+    let mut file_rows: Vec<serde_json::Value> = conn
+        .prepare("SELECT task_id, file_path FROM task_files ORDER BY task_id, file_path")
+        .unwrap()
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "task_id": r.get::<_, String>(0).unwrap(),
+                "file_path": r.get::<_, String>(1).unwrap(),
+            }))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    file_rows.sort_by(|a, b| {
+        a["task_id"]
+            .as_str()
+            .unwrap()
+            .cmp(b["task_id"].as_str().unwrap())
+            .then_with(|| {
+                a["file_path"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(b["file_path"].as_str().unwrap())
+            })
+    });
+
+    serde_json::json!({
+        "tasks": task_rows,
+        "relationships": rel_rows,
+        "files": file_rows,
+    })
+}
+
+#[test]
+fn test_shim_and_canonical_paths_produce_identical_db_state() {
+    // Two project roots — A simulates `task-mgr init --from-json X` (shim
+    // path: init_project then init), B simulates `task-mgr loop init X`
+    // (canonical: init directly). Both must produce byte-identical rows.
+    let project_a = TempDir::new().unwrap();
+    let project_b = TempDir::new().unwrap();
+
+    let prd_body = create_test_prd();
+
+    let prd_a = project_a.path().join("prd.json");
+    let prd_b = project_b.path().join("prd.json");
+    fs::write(&prd_a, &prd_body).unwrap();
+    fs::write(&prd_b, &prd_body).unwrap();
+
+    // Path A — shim path: init_project first, then init() with --append
+    // --update-existing on top of the same fresh DB. Mirrors dispatch_init's
+    // mode-3 ordering exactly.
+    super::init_project(project_a.path()).unwrap();
+    let db_a = project_a.path().join(".task-mgr");
+    let result_a = init(
+        &db_a,
+        &[&prd_a],
+        false, // force
+        true,  // append (canonical mid-effort sync flag pair)
+        true,  // update_existing
+        false, // dry_run
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Path B — canonical `loop init`: init_project is NOT run; init() takes
+    // care of dir creation via open_connection. Must produce the same rows.
+    let db_b = project_b.path().join(".task-mgr");
+    let result_b = init(
+        &db_b,
+        &[&prd_b],
+        false,
+        true,
+        true,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    // Tasks-imported / tasks-updated parity. The shim path's prior
+    // init_project run doesn't insert any rows in `tasks`, so both paths
+    // should report identical counts.
+    assert_eq!(
+        result_a.tasks_imported, result_b.tasks_imported,
+        "tasks_imported must match between shim and canonical paths"
+    );
+    assert_eq!(result_a.tasks_updated, result_b.tasks_updated);
+    assert_eq!(result_a.tasks_skipped, result_b.tasks_skipped);
+    assert_eq!(result_a.files_imported, result_b.files_imported);
+    assert_eq!(
+        result_a.relationships_imported,
+        result_b.relationships_imported
+    );
+
+    // Sorted-row equivalence — the strongest contract the test can express.
+    let snapshot_a = snapshot_init_state(&db_a);
+    let snapshot_b = snapshot_init_state(&db_b);
+    assert_eq!(
+        snapshot_a, snapshot_b,
+        "shim and canonical PRD-import paths must produce byte-identical DB rows \
+         (tasks + dependencies + files)"
+    );
+}
+
+#[test]
+fn test_init_project_skipped_does_not_change_init_outputs() {
+    // Counterpart to the equivalence test: when --from-json is non-empty, the
+    // shim runs init_project FIRST. Verify that running init_project before
+    // init() does not change the row-level result vs. running init() alone.
+    // This guards against init_project drifting into PRD-import territory.
+    let project_a = TempDir::new().unwrap();
+    let project_b = TempDir::new().unwrap();
+
+    let prd_body = create_test_prd();
+    let prd_a = project_a.path().join("prd.json");
+    let prd_b = project_b.path().join("prd.json");
+    fs::write(&prd_a, &prd_body).unwrap();
+    fs::write(&prd_b, &prd_body).unwrap();
+
+    super::init_project(project_a.path()).unwrap();
+    let db_a = project_a.path().join(".task-mgr");
+    init(
+        &db_a,
+        &[&prd_a],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let db_b = project_b.path().join(".task-mgr");
+    init(
+        &db_b,
+        &[&prd_b],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    assert_eq!(
+        snapshot_init_state(&db_a),
+        snapshot_init_state(&db_b),
+        "init_project before init() must not alter row-level PRD-import semantics"
+    );
+}
+
+#[test]
+fn test_init_does_not_fire_picker_no_default_model_written() {
+    // Negative AC: direct `loop init` / `batch init` invocations must NOT
+    // fire the model picker. In non-TTY tests the picker is a no-op
+    // regardless, so this test verifies the *absence* of project-config
+    // side effects — `init()` alone must NOT write `.task-mgr/config.json`.
+    // Project-config writing is exclusive to `init_project`.
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = temp_dir.path().join("prd.json");
+    fs::write(&prd_path, create_test_prd()).unwrap();
+
+    let db_dir = temp_dir.path().join(".task-mgr");
+    init(
+        &db_dir,
+        &[&prd_path],
+        false,
+        false,
+        false,
+        false,
+        PrefixMode::Disabled,
+    )
+    .unwrap();
+
+    let config_path = db_dir.join("config.json");
+    assert!(
+        !config_path.exists(),
+        "init() (canonical loop/batch path) must NOT write .task-mgr/config.json — \
+         that is the exclusive responsibility of init_project"
+    );
+}

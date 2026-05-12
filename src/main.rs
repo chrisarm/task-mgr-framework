@@ -3,15 +3,16 @@
 //! This module handles argument parsing and command dispatch.
 //! Output formatting and helper functions are in the `handlers` module.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
 
 use task_mgr::TaskMgrError;
 use task_mgr::cli::{
-    Cli, Commands, CurateAction, DecisionAction, MigrateAction, ModelsAction, OutputFormat,
-    RunAction, WorktreesAction,
+    BatchCommand, BatchResolve, Cli, Commands, CurateAction, DecisionAction, EnhanceCommand,
+    LoopCommand, LoopResolve, MigrateAction, ModelsAction, OutputFormat, RunAction,
+    WorktreesAction, resolve_batch_command, resolve_loop_command,
 };
 use task_mgr::commands::{
     LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
@@ -51,6 +52,163 @@ fn get_project_root() -> Result<PathBuf, TaskMgrError> {
 
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(PathBuf::from(root))
+}
+
+/// Args passed to [`dispatch_init`] — fields mirror `Commands::Init`'s clap
+/// args one-for-one so the call site stays a straight `Args { … }` shuffle.
+struct DispatchInitArgs {
+    from_json: Vec<PathBuf>,
+    enhance: bool,
+    force: bool,
+    append: bool,
+    update_existing: bool,
+    dry_run: bool,
+    prefix: Option<String>,
+    no_prefix: bool,
+}
+
+/// Resolve the project root for `init_project`.
+///
+/// `init_project(dir)` appends `.task-mgr/`, so we need the *parent* of the
+/// resolved DB dir. `resolve_db_dir` guarantees `cli.dir` is absolute, so
+/// `.parent()` returns `Some(_)` except in the pathological case of `/`.
+fn project_root_for_init(cli_dir: &Path) -> PathBuf {
+    cli_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| cli_dir.to_path_buf())
+}
+
+/// Dispatch the top-level `task-mgr init` command into its three modes:
+///
+/// 1. `from_json` empty, `force` set → reject with exit 2 (project-level
+///    init has no destructive form).
+/// 2. `from_json` empty → project-level scaffolding via
+///    [`task_mgr::commands::init::init_project`]. If `--enhance`, also run
+///    `enhance agents --create --profile full`. Emit a stderr hint pointing
+///    at `task-mgr enhance agents`.
+/// 3. `from_json` non-empty → deprecated top-level shim. Emit a stderr
+///    deprecation notice, run `init_project` first (so the model picker
+///    fires for operators who don't yet have a default model resolved),
+///    then dispatch the PRD payload through `LoopCommand::Init` (N==1) or
+///    `BatchCommand::Init` (N>1). The `--enhance` flag is silently
+///    ignored on this path; a stderr note explains.
+///
+/// The shim and the canonical `loop init` / `batch init` arms call
+/// [`task_mgr::commands::init`] with the same `&[PathBuf]` shape — the
+/// PRD-import code path is single-rooted regardless of how the user
+/// reached it.
+fn dispatch_init(
+    db_dir: &Path,
+    verbose: bool,
+    format: OutputFormat,
+    args: DispatchInitArgs,
+) -> Result<(), TaskMgrError> {
+    // Mode 1: reject `--force` on project-level init before any disk write.
+    if args.from_json.is_empty() && args.force {
+        eprintln!(
+            "error: `task-mgr init --force` is not supported. Project-level init has no \
+             destructive form. To reset, `rm -rf .task-mgr/` and re-run `task-mgr init`."
+        );
+        process::exit(2);
+    }
+
+    if args.from_json.is_empty() {
+        dispatch_init_project(db_dir, format, args.enhance)
+    } else {
+        dispatch_init_shim(db_dir, verbose, format, args)
+    }
+}
+
+/// Mode 2: project-level scaffold. Optionally runs `enhance agents` when
+/// `--enhance` is set.
+fn dispatch_init_project(
+    db_dir: &Path,
+    format: OutputFormat,
+    enhance: bool,
+) -> Result<(), TaskMgrError> {
+    use task_mgr::commands::init::init_project;
+
+    let project_root = project_root_for_init(db_dir);
+    let _lock = LockGuard::acquire(db_dir)?;
+    let result = init_project(&project_root)?;
+
+    if enhance {
+        use task_mgr::commands::enhance::templates::EnhanceProfile;
+        use task_mgr::commands::{AgentsParams, enhance_agents};
+        let enhance_result = enhance_agents(AgentsParams {
+            targets: Vec::new(),
+            dry_run: false,
+            create: true,
+            profile: EnhanceProfile::Full,
+            cwd: project_root,
+        })?;
+        if !enhance_result.no_errors() {
+            eprintln!(
+                "warning: `task-mgr init --enhance` completed with one or more file \
+                 errors; see messages above"
+            );
+        }
+    } else {
+        eprintln!(
+            "Initialized .task-mgr/. Run `task-mgr enhance agents` to add task-mgr \
+             workflow guidance to CLAUDE.md / AGENTS.md (or rerun with `--enhance`)."
+        );
+    }
+
+    output_result(&result, format);
+    Ok(())
+}
+
+/// Mode 3: deprecated top-level shim. Runs `init_project` first (so the
+/// model picker fires before PRD-import work; FAILURE-MODE contract), then
+/// dispatches the PRD payload through the canonical `init()` path.
+fn dispatch_init_shim(
+    db_dir: &Path,
+    verbose: bool,
+    format: OutputFormat,
+    args: DispatchInitArgs,
+) -> Result<(), TaskMgrError> {
+    use task_mgr::commands::init::init_project;
+
+    eprintln!(
+        "DEPRECATED: `task-mgr init --from-json X` keeps working indefinitely but the \
+         canonical form is `task-mgr loop init X` (single PRD) or `task-mgr batch init \
+         <glob>...` (multi)."
+    );
+    if args.enhance {
+        eprintln!(
+            "note: --enhance is ignored on the deprecated --from-json path; run \
+             `task-mgr init --enhance` separately to update CLAUDE.md / AGENTS.md."
+        );
+    }
+
+    let project_root = project_root_for_init(db_dir);
+    {
+        let _lock = LockGuard::acquire(db_dir)?;
+        init_project(&project_root)?;
+    }
+
+    let prefix_mode =
+        task_mgr::commands::init::PrefixMode::from_cli_flags(args.no_prefix, args.prefix);
+
+    // Identical call shape to LoopCommand::Init / BatchCommand::Init dispatch arms.
+    let _lock = LockGuard::acquire(db_dir)?;
+    let result = init(
+        db_dir,
+        &args.from_json,
+        args.force,
+        args.append,
+        args.update_existing,
+        args.dry_run,
+        prefix_mode,
+    )?;
+
+    if verbose {
+        eprint!("{}", format_init_verbose(&result));
+    }
+    output_result(&result, format);
+    Ok(())
 }
 
 fn main() {
@@ -115,37 +273,28 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
     match cli.command {
         Commands::Init {
             from_json,
+            enhance,
             force,
             append,
             update_existing,
             dry_run,
             prefix,
             no_prefix,
-        } => {
-            let prefix_mode = if no_prefix {
-                task_mgr::commands::init::PrefixMode::Disabled
-            } else if let Some(p) = prefix {
-                task_mgr::commands::init::PrefixMode::Explicit(p)
-            } else {
-                task_mgr::commands::init::PrefixMode::Auto
-            };
-            let _lock = LockGuard::acquire(&cli.dir)?;
-            let result = init(
-                &cli.dir,
-                &from_json,
+        } => dispatch_init(
+            &cli.dir,
+            cli.verbose,
+            cli.format,
+            DispatchInitArgs {
+                from_json,
+                enhance,
                 force,
                 append,
                 update_existing,
                 dry_run,
-                prefix_mode,
-            )?;
-
-            if cli.verbose {
-                eprint!("{}", format_init_verbose(&result));
-            }
-            output_result(&result, cli.format);
-            Ok(())
-        }
+                prefix,
+                no_prefix,
+            },
+        ),
 
         Commands::List {
             status,
@@ -801,6 +950,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
         }
 
         Commands::Loop {
+            cmd,
             prd_file,
             prompt_file,
             yes,
@@ -811,44 +961,117 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             cleanup_worktree,
             parallel,
         } => {
-            let project_root = get_project_root()?;
-
-            let mut config = task_mgr::loop_engine::config::LoopConfig::from_env();
-            config.yes_mode = yes;
-            config.hours = hours;
-            config.verbose = verbose || cli.verbose;
-            config.use_worktrees = !no_worktree;
-            config.cleanup_worktree = cleanup_worktree;
-            config.parallel_slots = parallel;
-
-            // `cli.dir` is already absolute (resolved in `main()` via
-            // `resolve_db_dir`, which anchors a relative default against
-            // the main repo root when invoked from a worktree). No further
-            // per-arm massaging needed.
-            let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
-                db_dir: cli.dir.clone(),
-                source_root: project_root.clone(),
-                working_root: project_root, // May be updated by run_loop if using worktrees
+            // Resolve nested-vs-flat into a canonical LoopCommand via the
+            // shared helper. Flat-form synthesizes Run and emits a one-line
+            // stderr notice; no positional + no subcommand prints help.
+            let resolved = match resolve_loop_command(
+                cmd,
                 prd_file,
                 prompt_file,
-                config,
+                yes,
+                hours,
+                verbose,
+                no_worktree,
                 external_repo,
-                batch_sibling_prds: vec![],
-                chain_base: None,
-                prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
+                cleanup_worktree,
+                parallel,
+            ) {
+                LoopResolve::Nested(child) => child,
+                LoopResolve::Flat(child) => {
+                    eprintln!(
+                        "DEPRECATED: prefer `task-mgr loop run ...`. \
+                         The flat form will continue to work indefinitely."
+                    );
+                    child
+                }
+                LoopResolve::PrintHelp => {
+                    use clap::CommandFactory;
+                    let mut cmd = Cli::command();
+                    let _ = cmd.find_subcommand_mut("loop").map(|s| s.print_help());
+                    process::exit(2);
+                }
             };
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
-                })?;
+            match resolved {
+                LoopCommand::Init {
+                    prd_file,
+                    force,
+                    append,
+                    update_existing,
+                    dry_run,
+                    prefix,
+                    no_prefix,
+                } => {
+                    let prefix_mode =
+                        task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
+                    let _lock = LockGuard::acquire(&cli.dir)?;
+                    let result = init(
+                        &cli.dir,
+                        &[prd_file],
+                        force,
+                        append,
+                        update_existing,
+                        dry_run,
+                        prefix_mode,
+                    )?;
+                    if cli.verbose {
+                        eprint!("{}", format_init_verbose(&result));
+                    }
+                    output_result(&result, cli.format);
+                    Ok(())
+                }
+                LoopCommand::Run {
+                    prd_file,
+                    prompt_file,
+                    yes,
+                    hours,
+                    verbose,
+                    no_worktree,
+                    external_repo,
+                    cleanup_worktree,
+                    parallel,
+                } => {
+                    let project_root = get_project_root()?;
 
-            let result =
-                rt.block_on(async { task_mgr::loop_engine::engine::run_loop(run_config).await });
+                    let mut config = task_mgr::loop_engine::config::LoopConfig::from_env();
+                    config.yes_mode = yes;
+                    config.hours = hours;
+                    config.verbose = verbose || cli.verbose;
+                    config.use_worktrees = !no_worktree;
+                    config.cleanup_worktree = cleanup_worktree;
+                    config.parallel_slots = parallel;
 
-            process::exit(result.exit_code);
+                    // `cli.dir` is already absolute (resolved in `main()` via
+                    // `resolve_db_dir`, which anchors a relative default against
+                    // the main repo root when invoked from a worktree). No
+                    // further per-arm massaging needed.
+                    let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
+                        db_dir: cli.dir.clone(),
+                        source_root: project_root.clone(),
+                        working_root: project_root, // May be updated by run_loop if using worktrees
+                        prd_file,
+                        prompt_file,
+                        config,
+                        external_repo,
+                        batch_sibling_prds: vec![],
+                        chain_base: None,
+                        prefix_mode: task_mgr::commands::init::PrefixMode::Auto,
+                    };
+
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
+                        })?;
+
+                    let result = rt.block_on(async {
+                        task_mgr::loop_engine::engine::run_loop(run_config).await
+                    });
+
+                    process::exit(result.exit_code);
+                }
+            }
         }
 
         Commands::Status {
@@ -867,6 +1090,7 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
         }
 
         Commands::Batch {
+            cmd,
             patterns,
             max_iterations,
             yes,
@@ -874,36 +1098,108 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
             chain,
             parallel,
         } => {
-            let project_root = get_project_root()?;
+            // Resolve nested-vs-flat into a canonical BatchCommand via the
+            // shared helper. Flat-form (cmd: None, !patterns.is_empty()) is
+            // the deprecated shim.
+            let resolved = match resolve_batch_command(
+                cmd,
+                patterns,
+                max_iterations,
+                yes,
+                keep_worktrees,
+                chain,
+                parallel,
+            ) {
+                BatchResolve::Nested(child) => child,
+                BatchResolve::Flat(child) => {
+                    eprintln!(
+                        "DEPRECATED: prefer `task-mgr batch run ...`. \
+                         The flat form will continue to work indefinitely."
+                    );
+                    child
+                }
+                BatchResolve::PrintHelp => {
+                    use clap::CommandFactory;
+                    let mut cmd = Cli::command();
+                    let _ = cmd.find_subcommand_mut("batch").map(|s| s.print_help());
+                    process::exit(2);
+                }
+            };
 
-            // `cli.dir` is already absolute (resolved in `main()`).
-            let db_dir = cli.dir.clone();
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| {
-                    TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
-                })?;
-
-            let result = rt.block_on(async {
-                task_mgr::loop_engine::batch::run_batch(
-                    &patterns,
+            match resolved {
+                BatchCommand::Init {
+                    patterns,
+                    force,
+                    append,
+                    update_existing,
+                    dry_run,
+                    prefix,
+                    no_prefix,
+                } => {
+                    let prefix_mode =
+                        task_mgr::commands::init::PrefixMode::from_cli_flags(no_prefix, prefix);
+                    // Expand glob patterns to concrete PRD file paths.
+                    // `expand_patterns` already errors when no files match, so
+                    // an empty result is unreachable here. Keeping this arm a
+                    // thin shell around `init()` keeps the PRD-import path in
+                    // one place (commands::init::init).
+                    let paths = task_mgr::loop_engine::batch::expand_patterns(&patterns)?;
+                    let _lock = LockGuard::acquire(&cli.dir)?;
+                    let result = init(
+                        &cli.dir,
+                        &paths,
+                        force,
+                        append,
+                        update_existing,
+                        dry_run,
+                        prefix_mode,
+                    )?;
+                    if cli.verbose {
+                        eprint!("{}", format_init_verbose(&result));
+                    }
+                    output_result(&result, cli.format);
+                    Ok(())
+                }
+                BatchCommand::Run {
+                    patterns,
                     max_iterations,
                     yes,
-                    &db_dir,
-                    &project_root,
-                    cli.verbose,
                     keep_worktrees,
                     chain,
                     parallel,
-                )
-                .await
-            });
+                } => {
+                    let project_root = get_project_root()?;
 
-            // Exit with code 1 if any PRDs failed, 0 otherwise
-            let exit_code = if result.failed > 0 { 1 } else { 0 };
-            process::exit(exit_code);
+                    // `cli.dir` is already absolute (resolved in `main()`).
+                    let db_dir = cli.dir.clone();
+
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            TaskMgrError::io_error("tokio runtime", "creating async runtime", e)
+                        })?;
+
+                    let result = rt.block_on(async {
+                        task_mgr::loop_engine::batch::run_batch(
+                            &patterns,
+                            max_iterations,
+                            yes,
+                            &db_dir,
+                            &project_root,
+                            cli.verbose,
+                            keep_worktrees,
+                            chain,
+                            parallel,
+                        )
+                        .await
+                    });
+
+                    // Exit with code 1 if any PRDs failed, 0 otherwise
+                    let exit_code = if result.failed > 0 { 1 } else { 0 };
+                    process::exit(exit_code);
+                }
+            }
         }
 
         Commands::ImportLearnings {
@@ -934,6 +1230,40 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                 branch_filter.as_deref(),
             )?;
             output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Enhance { cmd } => {
+            use task_mgr::commands::{
+                AgentsParams, ShowParams, StripParams, enhance_agents, enhance_show, enhance_strip,
+            };
+            let cwd = std::env::current_dir().map_err(|e| {
+                TaskMgrError::io_error(".", "resolving current working directory", e)
+            })?;
+            let result = match cmd {
+                EnhanceCommand::Agents {
+                    target,
+                    dry_run,
+                    create,
+                    profile,
+                } => enhance_agents(AgentsParams {
+                    targets: target,
+                    dry_run,
+                    create,
+                    profile,
+                    cwd,
+                })?,
+                EnhanceCommand::Show { profile } => enhance_show(ShowParams { profile })?,
+                EnhanceCommand::Strip { target, dry_run } => enhance_strip(StripParams {
+                    targets: target,
+                    dry_run,
+                    cwd,
+                })?,
+            };
+            output_result(&result, cli.format);
+            if !result.dry_run && !result.any_success() {
+                process::exit(2);
+            }
             Ok(())
         }
 

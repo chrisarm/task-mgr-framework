@@ -60,9 +60,11 @@ Cache: `$XDG_CACHE_HOME/task-mgr/models-cache.json` (24h TTL, stale treated as m
 `difficulty==high` always escalates to `OPUS_MODEL`, independent of any
 default.
 
-The interactive picker fires from `task-mgr init` when nothing resolves and
-stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr
-hint and skip — no hang.
+The interactive picker fires from `task-mgr init` (project-level scaffold) and
+from the deprecated `task-mgr init --from-json X` shim path when nothing
+resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a
+one-line stderr hint and skip — no hang. The picker does NOT fire from
+`task-mgr loop init` or `task-mgr batch init` directly.
 
 ## Loop CLI Cheat Sheet
 
@@ -72,8 +74,22 @@ hint and skip — no hang.
 - **Permission guard**: loop iterations deny Edit/Write on `tasks/*.json` via `--disallowedTools`
 - **Never edit** `.task-mgr/tasks/*.json` directly — use the CLI and tags above
 - **Spawn-fixup PRD targeting**: when a CODE-REVIEW or MILESTONE iteration spawns ad-hoc fixup tasks (`CODE-FIX-`, `WIRE-FIX-`, `IMPL-FIX-`, `REFACTOR-N-`), the `task-mgr add --stdin` invocation MUST disambiguate the destination PRD or the entry leaks into whatever PRD JSON the CLI defaults to. Two reliable forms: (a) pass `--from-json tasks/<correct-prd>.json`, or (b) pipe `--depended-on-by <milestone-of-correct-prd>` so the prefix is unambiguous from the dependency edge. Symptom of getting it wrong: orphan `passes: false` placeholders showing up in an unrelated PRD's JSON during merge-back review (real example: this PRD's CODE-REVIEW-1 spawned `WIRE-FIX-001`/`CODE-FIX-002` into `loop-reliability.json`; the actual fix landed correctly under REFACTOR-N tasks, but the misfiled placeholders persisted as cosmetic drift).
-- **PRD JSON lives in two places — sync both before re-launching a loop**: `tasks/<feature>.json` exists in BOTH the main repo AND the worktree the loop runs in. The loop reads the **worktree's** copy on each iteration ("PRD file changed, re-importing tasks..."). Editing the main-repo JSON via `Edit` + `task-mgr init --from-json --append --update-existing` from the main repo refreshes the main DB once, but the loop will silently re-import the stale worktree copy on its next iteration, undoing the edit. Reliable fix: `cp tasks/<feature>.json <worktree>/tasks/<feature>.json` before re-launching, OR edit the worktree's copy directly. Verify by jq-comparing `.userStories[] | select(.id=="X") | .acceptanceCriteria` between both locations.
+- **PRD JSON lives in two places — sync both before re-launching a loop**: `tasks/<feature>.json` exists in BOTH the main repo AND the worktree the loop runs in. The loop reads the **worktree's** copy on each iteration ("PRD file changed, re-importing tasks..."). Editing the main-repo JSON via `Edit` + `task-mgr loop init tasks/<feature>.json --append --update-existing` from the main repo refreshes the main DB once, but the loop will silently re-import the stale worktree copy on its next iteration, undoing the edit. Reliable fix: `cp tasks/<feature>.json <worktree>/tasks/<feature>.json` before re-launching, OR edit the worktree's copy directly. Verify by jq-comparing `.userStories[] | select(.id=="X") | .acceptanceCriteria` between both locations.
 - **Soft-dep guard tokenizer false-positive on AC cross-references**: `src/commands/next/selection.rs::mentioned_fixup_prefixes` tokenizes ACs on `[A-Z0-9-]` and matches `token.starts_with("{prefix}-")` for `SPAWNED_FIXUP_PREFIXES` (`REFACTOR-N`, `CODE-FIX`, `WIRE-FIX`, `IMPL-FIX`). A non-self-fixup task whose AC mentions e.g. `CODE-FIX-002` as a standalone token will be **deferred indefinitely** while any same-prefix sibling is active — even if that sibling depends on the deferred task (deadlock). Bypass: write the cross-reference as `<prd-prefix>-CODE-FIX-002` so it tokenizes as one fully-prefixed token, OR rephrase to not name the sibling at all (e.g., "the implementation task" instead of "CODE-FIX-002"). Description and notes fields are NOT scanned — ACs only. Found in unify-execution-followups; deadlocked TEST-INIT-001 ↔ CODE-FIX-002.
+
+## Deprecation policy
+
+`task-mgr init --from-json <prd>` is a **permanent shim** — it will not be removed. Operators who use it today (scripts, docs, muscle memory) can continue to do so indefinitely. The shim prints a one-line stderr notice and dispatches to `task-mgr loop init` (N=1) or `task-mgr batch init` (N>1) after running `init_project`, so the DB state is byte-for-byte identical to the canonical path.
+
+Canonical forms for new scripts and docs:
+
+| Old (deprecated, still valid) | New (canonical) |
+|-------------------------------|-----------------|
+| `task-mgr init --from-json prd.json` | `task-mgr init && task-mgr loop init prd.json` |
+| `task-mgr init --from-json 'tasks/*.json'` | `task-mgr init && task-mgr batch init 'tasks/*.json'` |
+| `task-mgr init --from-json prd.json --append --update-existing` | `task-mgr loop init prd.json --append --update-existing` |
+
+See PRD §11 (shim permanence) for the rationale.
 
 ## Overflow recovery and diagnostics
 

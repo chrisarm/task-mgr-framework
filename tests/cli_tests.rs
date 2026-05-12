@@ -352,15 +352,21 @@ fn test_init_nonexistent_file_returns_error() {
 // ============================================================================
 
 #[test]
-fn test_init_without_from_json_returns_error() {
+fn test_init_without_from_json_runs_project_level_scaffold() {
+    // FEAT-005: `task-mgr init` (no --from-json) used to fail with a
+    // missing-arg error — clap had `required = true` on --from-json. After
+    // the init split it succeeds and runs project-level scaffolding only.
+    // The presence-of-arg check now lives on the `--force` reject path
+    // (covered by test_init_force_without_from_json_rejected) and on the
+    // shim deprecation path.
     let temp_dir = TempDir::new().unwrap();
 
     Command::new(cargo_bin("task-mgr"))
         .args(["--dir", temp_dir.path().to_str().unwrap()])
         .arg("init")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("--from-json"));
+        .success()
+        .stderr(predicate::str::contains("enhance agents"));
 }
 
 #[test]
@@ -2370,5 +2376,159 @@ fn test_invalidate_learning_json_format() {
         json["learning_id"].as_i64().unwrap(),
         learning_id,
         "JSON learning_id must match the invalidated learning"
+    );
+}
+
+// ============================================================================
+// FEAT-005: Init split — top-level dispatch behavior tests
+//
+// These integration tests cover the end-to-end behavior of the new
+// `task-mgr init` dispatch (project-level / shim / reject), exercising the
+// real binary so the library-level golden-file equivalence test in
+// `src/commands/init/tests.rs` is paired with end-to-end smoke validation.
+// ============================================================================
+
+#[test]
+fn test_init_no_args_creates_task_mgr_dir_and_emits_hint() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    let assert = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .arg("init")
+        .assert()
+        .success();
+
+    // .task-mgr/ must exist with the SQLite DB and config.json — init_project
+    // ran. Note: tasks.db is created by open_connection inside init_project.
+    assert!(db_dir.exists(), ".task-mgr/ must be created");
+    assert!(
+        db_dir.join("tasks.db").exists(),
+        "tasks.db must be created by init_project"
+    );
+    assert!(
+        db_dir.join("config.json").exists(),
+        "config.json must be written by init_project"
+    );
+
+    // Stderr must steer the user toward `task-mgr enhance agents`.
+    assert.stderr(predicate::str::contains("enhance agents"));
+}
+
+#[test]
+fn test_init_with_enhance_creates_claude_and_agents_md() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args(["init", "--enhance"])
+        .current_dir(temp_dir.path())
+        .assert()
+        .success();
+
+    let claude_md = temp_dir.path().join("CLAUDE.md");
+    let agents_md = temp_dir.path().join("AGENTS.md");
+    assert!(claude_md.exists(), "CLAUDE.md must be created by --enhance");
+    assert!(agents_md.exists(), "AGENTS.md must be created by --enhance");
+
+    let claude_body = fs::read_to_string(&claude_md).unwrap();
+    let agents_body = fs::read_to_string(&agents_md).unwrap();
+    assert!(
+        claude_body.contains("<!-- TASK_MGR:BEGIN -->"),
+        "CLAUDE.md must contain the TASK_MGR begin marker"
+    );
+    assert!(
+        claude_body.contains("<!-- TASK_MGR:END -->"),
+        "CLAUDE.md must contain the TASK_MGR end marker"
+    );
+    assert!(
+        agents_body.contains("<!-- TASK_MGR:BEGIN -->")
+            && agents_body.contains("<!-- TASK_MGR:END -->"),
+        "AGENTS.md must contain both TASK_MGR markers"
+    );
+}
+
+#[test]
+fn test_init_force_without_from_json_rejected() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    let assert = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args(["init", "--force"])
+        .assert()
+        .failure()
+        .code(2);
+    assert.stderr(predicate::str::contains("rm -rf .task-mgr/"));
+
+    // Critically: .task-mgr/ MUST NOT have been created. The reject must
+    // fire before any DB or config write.
+    assert!(
+        !db_dir.exists(),
+        "task-mgr init --force (no from_json) must not touch .task-mgr/"
+    );
+}
+
+#[test]
+fn test_init_from_json_shim_emits_deprecation_notice_and_imports() {
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = sample_prd_path();
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    let assert = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initialized"));
+    assert.stderr(predicate::str::contains("DEPRECATED"));
+
+    // Both init_project AND init() ran on the shim path: config.json
+    // (init_project) and tasks.db with imported rows (init()) both exist.
+    assert!(db_dir.join("config.json").exists());
+    assert!(db_dir.join("tasks.db").exists());
+}
+
+#[test]
+fn test_init_from_json_with_enhance_imports_prd_and_skips_enhance() {
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = sample_prd_path();
+    let db_dir = temp_dir.path().join(".task-mgr");
+
+    let assert = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", db_dir.to_str().unwrap()])
+        .args([
+            "init",
+            "--enhance",
+            "--no-prefix",
+            "--from-json",
+            prd_path.to_str().unwrap(),
+        ])
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initialized"));
+    // Stderr must explain that --enhance was ignored on the shim path.
+    assert.stderr(
+        predicate::str::contains("--enhance is ignored")
+            .or(predicate::str::contains("ignored on the deprecated")),
+    );
+
+    // PRD import succeeded — tasks.db is non-empty.
+    assert!(db_dir.join("tasks.db").exists());
+    // CLAUDE.md / AGENTS.md must NOT have been created (enhance was skipped).
+    assert!(
+        !temp_dir.path().join("CLAUDE.md").exists(),
+        "shim path must not auto-create CLAUDE.md when --enhance is passed"
+    );
+    assert!(
+        !temp_dir.path().join("AGENTS.md").exists(),
+        "shim path must not auto-create AGENTS.md when --enhance is passed"
     );
 }

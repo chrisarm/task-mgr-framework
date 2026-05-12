@@ -48,12 +48,67 @@ fn test_json_format() {
 }
 
 // Init command tests
+//
+// Two parsing groups (FEAT-005):
+//   1. NEW NO-ARG FORM: `task-mgr init` parses with empty `from_json` and
+//      default `enhance: false`. The dispatch in main.rs treats this as
+//      project-level scaffolding (init_project + optional enhance hint).
+//   2. DEPRECATED SHIM FORM: `task-mgr init --from-json X.json [...]` keeps
+//      parsing exactly as it did before — the deprecation lives in main.rs
+//      dispatch, not in the parser, so historic invocations still parse green.
+
+// --- Group 1: new no-arg form ---
+
+#[test]
+fn test_init_no_args_parses_with_empty_from_json() {
+    let cli = Cli::parse_from(["task-mgr", "init"]);
+    match cli.command {
+        Commands::Init {
+            from_json,
+            enhance,
+            force,
+            append,
+            update_existing,
+            dry_run,
+            prefix,
+            no_prefix,
+        } => {
+            assert!(from_json.is_empty(), "from_json must default to empty");
+            assert!(!enhance, "--enhance defaults to false");
+            assert!(!force);
+            assert!(!append);
+            assert!(!update_existing);
+            assert!(!dry_run);
+            assert!(prefix.is_none());
+            assert!(!no_prefix);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+#[test]
+fn test_init_with_enhance_flag() {
+    let cli = Cli::parse_from(["task-mgr", "init", "--enhance"]);
+    match cli.command {
+        Commands::Init {
+            from_json, enhance, ..
+        } => {
+            assert!(from_json.is_empty());
+            assert!(enhance);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+// --- Group 2: deprecated --from-json shim form ---
+
 #[test]
 fn test_init_with_from_json() {
     let cli = Cli::parse_from(["task-mgr", "init", "--from-json", "prd.json"]);
     match cli.command {
         Commands::Init {
             from_json,
+            enhance,
             force,
             append,
             update_existing,
@@ -61,6 +116,7 @@ fn test_init_with_from_json() {
             ..
         } => {
             assert_eq!(from_json, vec![PathBuf::from("prd.json")]);
+            assert!(!enhance);
             assert!(!force);
             assert!(!append);
             assert!(!update_existing);
@@ -199,6 +255,24 @@ fn test_init_with_dry_run() {
             assert!(!append);
             assert!(!update_existing);
             assert!(dry_run);
+        }
+        _ => panic!("Expected Init command"),
+    }
+}
+
+#[test]
+fn test_init_shim_with_enhance_parses() {
+    // `--enhance` and `--from-json` are not mutually exclusive at the parser
+    // level — the dispatch in main.rs prints a stderr note and ignores
+    // --enhance on the shim path. Validating that both can co-exist on the
+    // command line keeps that runtime contract honest at parse time.
+    let cli = Cli::parse_from(["task-mgr", "init", "--enhance", "--from-json", "prd.json"]);
+    match cli.command {
+        Commands::Init {
+            from_json, enhance, ..
+        } => {
+            assert_eq!(from_json, vec![PathBuf::from("prd.json")]);
+            assert!(enhance);
         }
         _ => panic!("Expected Init command"),
     }
@@ -2192,6 +2266,7 @@ fn test_loop_with_prd_file_and_yes() {
     let cli = Cli::parse_from(["task-mgr", "loop", ".task-mgr/tasks/prd.json", "--yes"]);
     match cli.command {
         Commands::Loop {
+            cmd,
             prd_file,
             prompt_file,
             yes,
@@ -2202,7 +2277,9 @@ fn test_loop_with_prd_file_and_yes() {
             cleanup_worktree,
             parallel,
         } => {
-            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            // Flat-form deprecated shim: cmd is None, fields populate the parent
+            assert!(cmd.is_none(), "flat form should not produce a nested cmd");
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert!(prompt_file.is_none());
             assert!(yes);
             assert!(hours.is_none());
@@ -2228,12 +2305,14 @@ fn test_loop_with_hours() {
     ]);
     match cli.command {
         Commands::Loop {
+            cmd,
             prd_file,
             hours,
             yes,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert!(cmd.is_none());
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert_eq!(hours, Some(4.5));
             assert!(yes);
         }
@@ -2253,11 +2332,13 @@ fn test_loop_with_prompt_file() {
     ]);
     match cli.command {
         Commands::Loop {
+            cmd,
             prd_file,
             prompt_file,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert!(cmd.is_none());
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert_eq!(
                 prompt_file,
                 Some(PathBuf::from(".task-mgr/tasks/custom-prompt.md"))
@@ -2290,6 +2371,7 @@ fn test_loop_minimal() {
     let cli = Cli::parse_from(["task-mgr", "loop", ".task-mgr/tasks/prd.json"]);
     match cli.command {
         Commands::Loop {
+            cmd,
             prd_file,
             prompt_file,
             yes,
@@ -2299,7 +2381,8 @@ fn test_loop_minimal() {
             external_repo,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert!(cmd.is_none());
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert!(prompt_file.is_none());
             assert!(!yes);
             assert!(hours.is_none());
@@ -2326,6 +2409,7 @@ fn test_loop_with_all_options() {
     ]);
     match cli.command {
         Commands::Loop {
+            cmd,
             prd_file,
             prompt_file,
             yes,
@@ -2335,7 +2419,8 @@ fn test_loop_with_all_options() {
             external_repo,
             ..
         } => {
-            assert_eq!(prd_file, PathBuf::from(".task-mgr/tasks/prd.json"));
+            assert!(cmd.is_none());
+            assert_eq!(prd_file, Some(PathBuf::from(".task-mgr/tasks/prd.json")));
             assert_eq!(
                 prompt_file,
                 Some(PathBuf::from(".task-mgr/tasks/prompt.md"))
@@ -2386,10 +2471,20 @@ fn test_loop_with_external_repo() {
 }
 
 #[test]
-fn test_loop_missing_prd_file_fails() {
-    // Missing required positional arg should fail
-    let result = Cli::try_parse_from(["task-mgr", "loop"]);
-    assert!(result.is_err());
+fn test_loop_missing_prd_file_parses_as_none() {
+    // After the nested-subcommand refactor, `task-mgr loop` with no args
+    // parses successfully (cmd: None, prd_file: None). The "print help;
+    // exit 2" behavior is enforced by the dispatch layer in main.rs, not by
+    // clap at parse time. See `test_loop_init_subcommand_required_prd_file_fails`
+    // for the still-required positional on `loop init`.
+    let cli = Cli::parse_from(["task-mgr", "loop"]);
+    match cli.command {
+        Commands::Loop { cmd, prd_file, .. } => {
+            assert!(cmd.is_none());
+            assert!(prd_file.is_none());
+        }
+        _ => panic!("Expected Loop command"),
+    }
 }
 
 #[test]
@@ -2469,6 +2564,494 @@ fn test_loop_short_yes_flag() {
         }
         _ => panic!("Expected Loop command"),
     }
+}
+
+// =============================================================================
+// Loop / Batch subcommand nesting tests (FEAT-004)
+// =============================================================================
+//
+// These tests cover the parent-with-optional-subcommand reshape:
+//   * canonical forms: `task-mgr loop init <PRD>`, `task-mgr loop run <PRD>`,
+//     and the same for `batch`.
+//   * flat-form shim: `task-mgr loop <PRD> --yes` parses with cmd=None and
+//     dispatch (via `resolve_loop_command`) synthesizes LoopCommand::Run.
+//   * negative / edge cases enumerated in FEAT-004's acceptance criteria.
+
+use super::commands::{
+    BatchCommand, BatchResolve, LoopCommand, LoopResolve, resolve_batch_command,
+    resolve_loop_command,
+};
+
+#[test]
+fn test_loop_init_canonical_parses() {
+    // AC #1: `task-mgr loop init <prd> --append --update-existing` →
+    // Commands::Loop { cmd: Some(LoopCommand::Init { .. }), prd_file: None, .. }
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "init",
+        "tasks/foo.json",
+        "--append",
+        "--update-existing",
+    ]);
+    match cli.command {
+        Commands::Loop { cmd, prd_file, .. } => {
+            assert!(
+                prd_file.is_none(),
+                "parent prd_file empty on subcommand path"
+            );
+            match cmd {
+                Some(LoopCommand::Init {
+                    prd_file,
+                    append,
+                    update_existing,
+                    force,
+                    dry_run,
+                    no_prefix,
+                    prefix,
+                }) => {
+                    assert_eq!(prd_file, PathBuf::from("tasks/foo.json"));
+                    assert!(append);
+                    assert!(update_existing);
+                    assert!(!force);
+                    assert!(!dry_run);
+                    assert!(!no_prefix);
+                    assert!(prefix.is_none());
+                }
+                other => panic!("expected LoopCommand::Init, got {:?}", other),
+            }
+        }
+        _ => panic!("Expected Loop command"),
+    }
+}
+
+#[test]
+fn test_loop_run_canonical_parses() {
+    // AC #2: `task-mgr loop run <prd> --yes --hours 0.5` →
+    // Commands::Loop { cmd: Some(LoopCommand::Run { yes: true, hours: Some(0.5), .. }), .. }
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "run",
+        "tasks/foo.json",
+        "--yes",
+        "--hours",
+        "0.5",
+    ]);
+    match cli.command {
+        Commands::Loop { cmd, prd_file, .. } => {
+            assert!(prd_file.is_none());
+            match cmd {
+                Some(LoopCommand::Run {
+                    prd_file,
+                    yes,
+                    hours,
+                    parallel,
+                    ..
+                }) => {
+                    assert_eq!(prd_file, PathBuf::from("tasks/foo.json"));
+                    assert!(yes);
+                    assert_eq!(hours, Some(0.5));
+                    assert_eq!(parallel, 2, "subcommand --parallel default 2");
+                }
+                other => panic!("expected LoopCommand::Run, got {:?}", other),
+            }
+        }
+        _ => panic!("Expected Loop command"),
+    }
+}
+
+#[test]
+fn test_loop_flat_form_parses_as_cmd_none() {
+    // AC #3: `task-mgr loop <prd> --yes` parses with cmd: None, prd_file: Some, yes: true.
+    let cli = Cli::parse_from(["task-mgr", "loop", "tasks/foo.json", "--yes"]);
+    match cli.command {
+        Commands::Loop {
+            cmd, prd_file, yes, ..
+        } => {
+            assert!(cmd.is_none());
+            assert_eq!(prd_file, Some(PathBuf::from("tasks/foo.json")));
+            assert!(yes);
+        }
+        _ => panic!("Expected Loop command"),
+    }
+}
+
+#[test]
+fn test_loop_flat_form_dispatch_synthesizes_run() {
+    // AC #4: on flat-form parse, dispatch synthesizes LoopCommand::Run with
+    // identical fields. Stderr capture is hard inside a unit test without
+    // forking the process; the canonical-no-deprecation assertion in
+    // `test_loop_run_canonical_no_deprecation_marker` verifies the inverse
+    // (Nested doesn't trip the Flat arm).
+    let cli = Cli::parse_from([
+        "task-mgr",
+        "loop",
+        "tasks/foo.json",
+        "--yes",
+        "--hours",
+        "1.5",
+        "--no-worktree",
+    ]);
+    let Commands::Loop {
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Loop command");
+    };
+    let resolved = resolve_loop_command(
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    );
+    match resolved {
+        LoopResolve::Flat(LoopCommand::Run {
+            prd_file,
+            yes,
+            hours,
+            no_worktree,
+            ..
+        }) => {
+            assert_eq!(prd_file, PathBuf::from("tasks/foo.json"));
+            assert!(yes);
+            assert_eq!(hours, Some(1.5));
+            assert!(no_worktree);
+        }
+        other => panic!("expected LoopResolve::Flat(Run), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_loop_run_canonical_no_deprecation_marker() {
+    // AC #10 (negative): canonical `loop run` must NOT take the Flat path.
+    let cli = Cli::parse_from(["task-mgr", "loop", "run", "tasks/foo.json", "--yes"]);
+    let Commands::Loop {
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Loop command");
+    };
+    let resolved = resolve_loop_command(
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    );
+    assert!(
+        matches!(resolved, LoopResolve::Nested(LoopCommand::Run { .. })),
+        "canonical `loop run` must dispatch via Nested, never Flat"
+    );
+}
+
+#[test]
+fn test_loop_no_args_resolves_to_print_help() {
+    // Edge: `task-mgr loop` (no positional, no subcommand) → PrintHelp.
+    let cli = Cli::parse_from(["task-mgr", "loop"]);
+    let Commands::Loop {
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Loop command");
+    };
+    let resolved = resolve_loop_command(
+        cmd,
+        prd_file,
+        prompt_file,
+        yes,
+        hours,
+        verbose,
+        no_worktree,
+        external_repo,
+        cleanup_worktree,
+        parallel,
+    );
+    assert!(matches!(resolved, LoopResolve::PrintHelp));
+}
+
+#[test]
+fn test_loop_init_subcommand_required_prd_file_fails() {
+    // Edge: `task-mgr loop init` (missing required prd_file) → clap usage error.
+    let result = Cli::try_parse_from(["task-mgr", "loop", "init"]);
+    assert!(result.is_err(), "loop init requires <PRD>");
+}
+
+#[test]
+fn test_loop_flat_positional_and_subcommand_conflict() {
+    // AC #12 (failure mode): `task-mgr loop tasks/foo.json run` (both flat
+    // positional AND nested subcommand) → clap error via
+    // args_conflicts_with_subcommands.
+    let result = Cli::try_parse_from(["task-mgr", "loop", "tasks/foo.json", "run"]);
+    assert!(
+        result.is_err(),
+        "passing both a positional and a subcommand must error at parse"
+    );
+}
+
+#[test]
+fn test_batch_init_canonical_parses() {
+    // AC #5: `task-mgr batch init '*.json'` → Commands::Batch { cmd: Some(BatchCommand::Init { .. }), .. }
+    let cli = Cli::parse_from(["task-mgr", "batch", "init", "*.json"]);
+    match cli.command {
+        Commands::Batch { cmd, patterns, .. } => {
+            assert!(
+                patterns.is_empty(),
+                "parent patterns empty on subcommand path"
+            );
+            match cmd {
+                Some(BatchCommand::Init {
+                    patterns,
+                    append,
+                    force,
+                    update_existing,
+                    dry_run,
+                    no_prefix,
+                    prefix,
+                }) => {
+                    assert_eq!(patterns, vec!["*.json".to_string()]);
+                    assert!(!append);
+                    assert!(!force);
+                    assert!(!update_existing);
+                    assert!(!dry_run);
+                    assert!(!no_prefix);
+                    assert!(prefix.is_none());
+                }
+                other => panic!("expected BatchCommand::Init, got {:?}", other),
+            }
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_init_multi_pattern_canonical_parses() {
+    // Edge: `task-mgr batch init '*.json' '*.json'` (multi-pattern) parses fine.
+    let cli = Cli::parse_from(["task-mgr", "batch", "init", "*.json", "phase2/*.json"]);
+    match cli.command {
+        Commands::Batch { cmd, .. } => match cmd {
+            Some(BatchCommand::Init { patterns, .. }) => {
+                assert_eq!(
+                    patterns,
+                    vec!["*.json".to_string(), "phase2/*.json".to_string()]
+                );
+            }
+            other => panic!("expected BatchCommand::Init, got {:?}", other),
+        },
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_run_canonical_parses() {
+    // Sanity: `task-mgr batch run '*.json' --yes` → BatchCommand::Run.
+    let cli = Cli::parse_from(["task-mgr", "batch", "run", "*.json", "--yes"]);
+    match cli.command {
+        Commands::Batch { cmd, patterns, .. } => {
+            assert!(patterns.is_empty());
+            match cmd {
+                Some(BatchCommand::Run { patterns, yes, .. }) => {
+                    assert_eq!(patterns, vec!["*.json".to_string()]);
+                    assert!(yes);
+                }
+                other => panic!("expected BatchCommand::Run, got {:?}", other),
+            }
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_flat_form_parses_as_cmd_none() {
+    // AC #6: `task-mgr batch '*.json' --yes` parses with cmd: None, patterns: ["*.json"], yes: true.
+    let cli = Cli::parse_from(["task-mgr", "batch", "*.json", "--yes"]);
+    match cli.command {
+        Commands::Batch {
+            cmd, patterns, yes, ..
+        } => {
+            assert!(cmd.is_none());
+            assert_eq!(patterns, vec!["*.json".to_string()]);
+            assert!(yes);
+        }
+        _ => panic!("Expected Batch command"),
+    }
+}
+
+#[test]
+fn test_batch_flat_form_dispatch_synthesizes_run() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "*.json", "--yes", "--chain", "-n", "7"]);
+    let Commands::Batch {
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Batch command");
+    };
+    let resolved = resolve_batch_command(
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    );
+    match resolved {
+        BatchResolve::Flat(BatchCommand::Run {
+            patterns,
+            yes,
+            chain,
+            max_iterations,
+            ..
+        }) => {
+            assert_eq!(patterns, vec!["*.json".to_string()]);
+            assert!(yes);
+            assert!(chain);
+            assert_eq!(max_iterations, Some(7));
+        }
+        other => panic!("expected BatchResolve::Flat(Run), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_batch_run_canonical_no_deprecation_marker() {
+    let cli = Cli::parse_from(["task-mgr", "batch", "run", "*.json", "--yes"]);
+    let Commands::Batch {
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Batch command");
+    };
+    let resolved = resolve_batch_command(
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    );
+    assert!(
+        matches!(resolved, BatchResolve::Nested(BatchCommand::Run { .. })),
+        "canonical `batch run` must dispatch via Nested, never Flat"
+    );
+}
+
+#[test]
+fn test_batch_no_args_resolves_to_print_help() {
+    let cli = Cli::parse_from(["task-mgr", "batch"]);
+    let Commands::Batch {
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    } = cli.command
+    else {
+        panic!("Expected Batch command");
+    };
+    let resolved = resolve_batch_command(
+        cmd,
+        patterns,
+        max_iterations,
+        yes,
+        keep_worktrees,
+        chain,
+        parallel,
+    );
+    assert!(matches!(resolved, BatchResolve::PrintHelp));
+}
+
+#[test]
+fn test_batch_init_requires_patterns() {
+    // `batch init` (no patterns) → clap usage error (required = true on the subcommand).
+    let result = Cli::try_parse_from(["task-mgr", "batch", "init"]);
+    assert!(result.is_err(), "batch init requires at least one pattern");
+}
+
+#[test]
+fn test_batch_run_subcommand_required_patterns_fails() {
+    let result = Cli::try_parse_from(["task-mgr", "batch", "run"]);
+    assert!(result.is_err(), "batch run requires at least one pattern");
+}
+
+#[test]
+fn test_loop_subcommand_tree_via_command_factory() {
+    // Learning [160]: introspect the subcommand tree via CommandFactory rather
+    // than spawning a subprocess. Confirms the parent's `loop init` / `loop
+    // run` children are wired and discoverable.
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let loop_cmd = cmd
+        .find_subcommand_mut("loop")
+        .expect("loop subcommand wired on Commands");
+    let names: Vec<String> = loop_cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    assert!(names.contains(&"init".to_string()), "loop init missing");
+    assert!(names.contains(&"run".to_string()), "loop run missing");
+
+    let batch_cmd = cmd
+        .find_subcommand_mut("batch")
+        .expect("batch subcommand wired on Commands");
+    let bnames: Vec<String> = batch_cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    assert!(bnames.contains(&"init".to_string()), "batch init missing");
+    assert!(bnames.contains(&"run".to_string()), "batch run missing");
 }
 
 // =============================================================================
@@ -2627,9 +3210,20 @@ fn test_batch_minimal() {
 }
 
 #[test]
-fn test_batch_missing_pattern_fails() {
-    let result = Cli::try_parse_from(["task-mgr", "batch"]);
-    assert!(result.is_err());
+fn test_batch_missing_pattern_parses_as_empty() {
+    // After the nested-subcommand refactor, `task-mgr batch` with no args
+    // parses successfully (cmd: None, patterns: []). The "print help; exit 2"
+    // behavior is enforced by the dispatch layer in main.rs. The required
+    // positional still lives on `batch init` and `batch run`; see
+    // `test_batch_run_subcommand_required_patterns_fails`.
+    let cli = Cli::parse_from(["task-mgr", "batch"]);
+    match cli.command {
+        Commands::Batch { cmd, patterns, .. } => {
+            assert!(cmd.is_none());
+            assert!(patterns.is_empty());
+        }
+        _ => panic!("Expected Batch command"),
+    }
 }
 
 #[test]

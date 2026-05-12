@@ -63,6 +63,19 @@ pub enum PrefixMode {
     Disabled,
 }
 
+impl PrefixMode {
+    /// Resolve from the `--no-prefix` / `--prefix <val>` CLI flags.
+    pub fn from_cli_flags(no_prefix: bool, prefix: Option<String>) -> Self {
+        if no_prefix {
+            Self::Disabled
+        } else if let Some(p) = prefix {
+            Self::Explicit(p)
+        } else {
+            Self::Auto
+        }
+    }
+}
+
 /// Apply a prefix to a single task ID.
 ///
 /// Idempotent: if the ID already starts with `{prefix}-`, returns it unchanged.
@@ -446,6 +459,8 @@ pub fn init(
             dry_run: true,
             would_delete,
             prefix_applied: resolved_prefix,
+            created_dirs: false,
+            created_config: false,
         });
     }
 
@@ -522,13 +537,12 @@ pub fn init(
         eprintln!("{}", DEPRECATED_RELATIONSHIPS_WARNING);
     }
 
-    // Offer an interactive default-model picker on fresh (non-dry-run) imports.
-    // No-ops when a default already resolves, in auto-mode, or when stdin/stderr
-    // aren't TTYs. `init` passes `auto_mode=false` because this is always a
-    // human-initiated command (loop/batch paths pass `true`).
-    if !dry_run {
-        let _ = crate::commands::models::ensure_default::ensure_default_model(dir, false);
-    }
+    // Note: the model picker is intentionally NOT invoked here. Per the
+    // Init-split contract (FEAT-005), project-scoped picker firing lives in
+    // [`init_project`]. The deprecated `task-mgr init --from-json X` shim
+    // calls `init_project` before dispatching here, so the picker still
+    // fires for that path. Direct `task-mgr loop init` / `task-mgr batch
+    // init` invocations are PRD-scoped and must not fire the picker.
 
     Ok(InitResult {
         tasks_imported,
@@ -541,5 +555,88 @@ pub fn init(
         dry_run: false,
         would_delete: None,
         prefix_applied: resolved_prefix,
+        created_dirs: false,
+        created_config: false,
+    })
+}
+
+/// Write `version: 1` default into `<db_dir>/config.json`, preserving any
+/// existing fields. Atomic via tempfile + rename; never clobbers unknown keys.
+///
+/// Returns `true` when the file was newly created, `false` when it already existed.
+fn write_project_defaults(db_dir: &Path) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let path = db_dir.join("config.json");
+    let created = !path.exists();
+
+    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => {
+            serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        _ => serde_json::json!({}),
+    };
+
+    let obj = value.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config.json is not a JSON object",
+        )
+    })?;
+
+    if !obj.contains_key("version") {
+        obj.insert("version".to_string(), serde_json::json!(1));
+    }
+
+    let contents = serde_json::to_string_pretty(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dir = path.parent().unwrap_or(db_dir);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".config-")
+        .suffix(".json")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+
+    Ok(created)
+}
+
+/// Initialize project-level scaffolding: `.task-mgr/` directory, SQLite DB with
+/// migrations, and a default `config.json` (preserving any existing fields).
+///
+/// Idempotent: safe to call when `.task-mgr/` already exists. Does NOT read or
+/// write any PRD JSON file.
+///
+/// # Arguments
+///
+/// * `dir` - Project root directory; `.task-mgr/` is created inside it.
+pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
+    let db_dir = dir.join(".task-mgr");
+
+    let created_dirs = !db_dir.exists();
+
+    // Create .task-mgr/, tasks.db, and run migrations (all idempotent).
+    let _ = open_connection(&db_dir)?;
+
+    // Write default config, preserving any existing fields.
+    let created_config = write_project_defaults(&db_dir).map_err(TaskMgrError::IoError)?;
+
+    // Fire model picker only when stdin+stderr are both TTYs; skip silently otherwise.
+    let _ = crate::commands::models::ensure_default::ensure_default_model(&db_dir, false);
+
+    Ok(InitResult {
+        tasks_imported: 0,
+        tasks_updated: 0,
+        tasks_skipped: 0,
+        files_imported: 0,
+        relationships_imported: 0,
+        fresh_import: created_dirs,
+        warnings: Vec::new(),
+        dry_run: false,
+        would_delete: None,
+        prefix_applied: None,
+        created_dirs,
+        created_config,
     })
 }

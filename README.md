@@ -61,6 +61,13 @@ task-mgr works with JSON-formatted Product Requirement Documents (PRDs). Each PR
 ### 2. Initialize the database
 
 ```bash
+# Scaffold the project (creates .task-mgr/, runs migrations, optionally picks a model)
+task-mgr init
+
+# Import a PRD (canonical form)
+task-mgr loop init tasks/my-project.json
+
+# Deprecated shim — still works, prints a stderr notice, dispatches to loop init
 task-mgr init --from-json tasks/my-project.json
 ```
 
@@ -224,6 +231,48 @@ The learnings system provides institutional memory across agent iterations. See 
 | `workaround` | Non-ideal fixes for known limitations |
 | `pattern` | Reusable code patterns and conventions |
 
+## Project-level init vs PRD-level init
+
+`task-mgr init` (no arguments) handles project scaffolding only — it creates `.task-mgr/`, runs migrations, writes a default config, and optionally fires the interactive model picker. It is idempotent and does not touch any PRD JSON files.
+
+PRD import is a separate concern handled by the loop/batch subcommands:
+
+```bash
+# Scaffold (run once per worktree)
+task-mgr init
+
+# Import a single PRD (canonical form)
+task-mgr loop init tasks/my-project.json
+
+# Import with append/update (safe for mid-effort syncs)
+task-mgr loop init tasks/my-project.json --append --update-existing
+
+# Import multiple PRDs
+task-mgr batch init 'tasks/*.json'
+```
+
+The deprecated `task-mgr init --from-json <prd>` shim runs both steps (project scaffold + PRD import) in one call and prints a stderr notice directing you to the canonical forms. The shim is permanent and will not be removed.
+
+## Agent instructions: `task-mgr enhance`
+
+`task-mgr enhance` writes and manages a marker-fenced task-mgr workflow block in `CLAUDE.md` and `AGENTS.md`. The markers (`<!-- TASK_MGR:BEGIN -->` / `<!-- TASK_MGR:END -->`) let the block be updated in place without touching surrounding content.
+
+```bash
+# Write (or update) the workflow block in CLAUDE.md and AGENTS.md
+task-mgr enhance agents
+
+# Write a full profile (workflow + general LLM-coding guidelines)
+task-mgr enhance agents --profile full
+
+# Preview what would be written (stdout only, no file changes)
+task-mgr enhance show
+
+# Remove the block entirely
+task-mgr enhance strip
+```
+
+The `--enhance` flag on `task-mgr init` is a convenience alias that runs project scaffold + `enhance agents` in one call.
+
 ## Loop Engine
 
 The built-in loop engine (`task-mgr loop`) replaces the external `claude-loop.sh` script with a native Rust implementation. Key capabilities:
@@ -325,7 +374,7 @@ task-mgr models unset-default [--project]
 
 Without both, `--remote` silently falls back to the built-in list. Live responses are cached at `$XDG_CACHE_HOME/task-mgr/models-cache.json` with a 24h TTL; stale cache is treated as a miss rather than served (no stale-on-error).
 
-The interactive picker fires automatically from `task-mgr init` when nothing resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr hint and skip — loops never hang waiting for input.
+The interactive picker fires automatically from `task-mgr init` (project-level) and from the deprecated `task-mgr init --from-json X` shim path when nothing resolves and stdin+stderr are both TTYs. Non-TTY / auto-mode runs print a one-line stderr hint and skip — loops never hang waiting for input. The picker does NOT fire from `task-mgr loop init` or `task-mgr batch init` directly (model selection is a project-level concern).
 
 ## Iterative Build Workflow
 
@@ -461,8 +510,9 @@ The loop engine warns at startup if task-mgr skills are missing from `~/.claude/
 For integrating task-mgr into your own agent loops or CI pipelines, see [docs/INTEGRATION.md](docs/INTEGRATION.md). The core pattern is:
 
 ```bash
-# Initialize
-task-mgr init --from-json prd.json
+# Initialize (scaffold project, then import PRD)
+task-mgr init
+task-mgr loop init prd.json   # canonical; or: task-mgr init --from-json prd.json (deprecated shim)
 task-mgr doctor --auto-fix
 
 # Run loop
