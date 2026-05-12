@@ -16,7 +16,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -329,10 +328,6 @@ pub struct SlotContext {
     /// identity from `prompt_bundle.task_id` so the bundle remains the
     /// canonical source-of-truth post-spawn.
     pub prompt_bundle: crate::loop_engine::prompt::slot::SlotPromptBundle,
-    /// Shared activity epoch for the slot's spawn_claude watchdog. Each slot
-    /// owns its own `Arc<AtomicU64>` — watchdogs must not share an epoch or
-    /// activity in one slot would silently extend another slot's deadline.
-    pub last_activity_epoch: Arc<AtomicU64>,
 }
 
 /// Result of running one slot during a wave.
@@ -549,11 +544,15 @@ pub fn run_slot_iteration(
     );
     claude::emit_prefixed_lines(Some(&slot_label_buf), banner.trim_start_matches('\n'));
 
-    // Per-slot timeout wired to the slot's own activity epoch. Each
-    // spawn_claude creates its own watchdog thread, so timeouts are per-slot.
+    // Per-slot activity monitor + timeout. Each slot gets its own monitor
+    // polling its own working_root so heartbeats/change-tracking lines and
+    // activity-driven deadline extensions both function in wave mode the
+    // same way they do for the sequential path. `prefix` attributes monitor
+    // output to the originating slot when slots interleave on stderr.
+    let monitor_handle = monitor::start_monitor(&slot.working_root, Some(&slot_label_buf));
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
         bundle.difficulty.as_deref(),
-        Arc::clone(&slot.last_activity_epoch),
+        Arc::clone(&monitor_handle.last_activity_epoch),
     );
 
     let claude_result = claude::spawn_claude(
@@ -573,7 +572,9 @@ pub fn run_slot_iteration(
             slot_label: Some(&slot_label_buf),
             ..Default::default()
         },
-    )?;
+    );
+    monitor::stop_monitor(monitor_handle);
+    let claude_result = claude_result?;
 
     if claude_result.timed_out {
         eprintln!(
@@ -1225,7 +1226,6 @@ fn build_slot_contexts(
                 slot_index: idx,
                 working_root: path.clone(),
                 prompt_bundle,
-                last_activity_epoch: Arc::new(AtomicU64::new(0)),
             }
         })
         .collect()
@@ -2259,7 +2259,7 @@ pub fn run_iteration(
     // Step 6: Start activity monitor, spawn Claude subprocess, stop monitor.
     // Timeout is intentionally derived from the primary task's difficulty, not
     // the cluster — synergy partners don't lengthen wall-clock inactivity budgets.
-    let monitor_handle = monitor::start_monitor(params.project_root);
+    let monitor_handle = monitor::start_monitor(params.project_root, None);
     let timeout_config = watchdog::TimeoutConfig::from_difficulty(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
@@ -6833,7 +6833,6 @@ mod tests {
         use crate::loop_engine::test_utils::{insert_task, insert_task_file};
         use crate::models::Task;
         use rusqlite::Connection;
-        use std::sync::atomic::Ordering;
 
         /// Opt every task out of the FEAT-003 buildy shared-infra heuristic.
         /// Used by wave-infrastructure tests whose `FEAT-*` task ids are
@@ -6900,7 +6899,6 @@ mod tests {
                 slot_index,
                 working_root,
                 prompt_bundle,
-                last_activity_epoch: Arc::new(AtomicU64::new(0)),
             }
         }
 
@@ -6914,7 +6912,6 @@ mod tests {
             assert_eq!(ctx.slot_index, 2);
             assert_eq!(ctx.working_root, tmp.path());
             assert_eq!(ctx.prompt_bundle.task_id, "FEAT-1");
-            assert_eq!(ctx.last_activity_epoch.load(Ordering::Relaxed), 0);
         }
 
         #[test]
@@ -7748,6 +7745,82 @@ mod tests {
                 assert!(outcome.iteration_consumed);
                 assert_eq!(task_status(&conn, "FEAT-A"), "done");
                 assert_eq!(task_status(&conn, "FEAT-B"), "done");
+            }
+
+            /// Regression: each running slot in a wave MUST start its own
+            /// activity monitor. The original bug let slot-mode iterations
+            /// silently skip `monitor::start_monitor`, so the watchdog's
+            /// `last_activity_epoch` never advanced (no activity extensions)
+            /// and there were no heartbeat / change-tracking logs.
+            ///
+            /// `MONITOR_START_COUNT` is a `#[cfg(test)]`-only call counter in
+            /// `monitor.rs`; observing it bump by `parallel_slots` proves both
+            /// slots called `start_monitor`. Uses the same fast mock-claude
+            /// scaffold as the disjoint-tasks test, so the assertion is the
+            /// only meaningful difference.
+            #[test]
+            fn test_wave_each_slot_starts_its_own_monitor() {
+                use crate::loop_engine::monitor::MONITOR_START_COUNT;
+                use std::sync::atomic::Ordering;
+
+                let _env_lock = CLAUDE_BINARY_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let script = make_mock_script("monitor_per_slot");
+                let _guard = EnvGuard::set("CLAUDE_BINARY", script.to_str().unwrap());
+                let _crash_guard = EnvGuard::remove("MOCK_CRASH_TASKS");
+
+                let (temp, mut conn) = setup_test_db();
+                let run_id = "run-wave-monitor-per-slot";
+                insert_run(&conn, run_id);
+                insert_task(&conn, "FEAT-MA", "Task MA", "todo", 10);
+                insert_task(&conn, "FEAT-MB", "Task MB", "todo", 20);
+                insert_task_file(&conn, "FEAT-MA", "src/ma.rs");
+                insert_task_file(&conn, "FEAT-MB", "src/mb.rs");
+                opt_out_buildy(&conn);
+
+                let tmp = tempfile::TempDir::new().unwrap();
+                let base_prompt = tmp.path().join("base.md");
+                std::fs::write(&base_prompt, "base").unwrap();
+                let prd = write_prd(tmp.path(), &["FEAT-MA", "FEAT-MB"]);
+                let progress = tmp.path().join("progress.txt");
+                let mode = PermissionMode::Dangerous;
+                let signal = SignalFlag::new();
+                let project_cfg = project_config::ProjectConfig::default();
+                let prd_implicit: Vec<String> = Vec::new();
+                let slot_paths = vec![tmp.path().to_path_buf(), tmp.path().to_path_buf()];
+
+                let before = MONITOR_START_COUNT.load(Ordering::Relaxed);
+                let mut ctx = IterationContext::new(5);
+                let outcome = run_wave_iteration(
+                    build_wave_params(
+                        &mut conn,
+                        temp.path(),
+                        tmp.path(),
+                        &slot_paths,
+                        &base_prompt,
+                        &mode,
+                        &signal,
+                        &prd,
+                        &progress,
+                        2,
+                        run_id,
+                        &project_cfg,
+                        &prd_implicit,
+                    ),
+                    &mut ctx,
+                );
+                let after = MONITOR_START_COUNT.load(Ordering::Relaxed);
+
+                let _ = std::fs::remove_file(&script);
+
+                // Sanity: both slots actually ran (so the assertion below isn't
+                // satisfied by a path that short-circuited before the monitor).
+                assert_eq!(outcome.tasks_completed, 2, "both slots should complete");
+                assert!(
+                    after.saturating_sub(before) >= 2,
+                    "expected ≥2 monitor starts (one per running slot); before={before}, after={after}",
+                );
             }
 
             /// AC2: signal during wave terminates all slots.

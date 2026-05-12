@@ -304,8 +304,6 @@ fn build_prompt_includes_key_decisions_block() {
 
 #[test]
 fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use task_mgr::loop_engine::engine::{SlotContext, SlotIterationParams, run_slot_iteration};
     use task_mgr::loop_engine::signals::SignalFlag;
 
@@ -332,7 +330,6 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
         slot_index: 0,
         working_root: project.path().to_path_buf(),
         prompt_bundle: bundle,
-        last_activity_epoch: Arc::new(AtomicU64::new(0)),
     };
     let params = SlotIterationParams {
         db_dir: temp.path().to_path_buf(),

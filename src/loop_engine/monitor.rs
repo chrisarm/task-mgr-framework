@@ -11,9 +11,18 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Test-only call counter: incremented every time [`start_monitor`] is invoked.
+/// Used by `run_slot_iteration` / `run_iteration` regression tests to verify
+/// the monitor was wired in (the original regression was a slot path that
+/// silently skipped `start_monitor`). Production builds don't compile this.
+#[cfg(test)]
+pub(crate) static MONITOR_START_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Interval between git status polls in seconds.
 const POLL_INTERVAL_SECS: u64 = 10;
@@ -25,6 +34,26 @@ const INITIAL_GRACE_SECS: u64 = 12;
 
 /// Interval between heartbeat messages in seconds.
 const HEARTBEAT_INTERVAL_SECS: u64 = 180;
+
+/// Sub-second-tunable timing knobs for the monitor loop. Production uses
+/// [`MonitorTiming::default`]; tests pass shortened values so activity-detection
+/// regression tests run in <1 s instead of waiting out the 10 s + 12 s defaults.
+#[derive(Clone, Copy, Debug)]
+struct MonitorTiming {
+    poll_interval: Duration,
+    initial_grace: Duration,
+    heartbeat_interval: Duration,
+}
+
+impl Default for MonitorTiming {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(POLL_INTERVAL_SECS),
+            initial_grace: Duration::from_secs(INITIAL_GRACE_SECS),
+            heartbeat_interval: Duration::from_secs(HEARTBEAT_INTERVAL_SECS),
+        }
+    }
+}
 
 /// Handle for the background activity monitor thread.
 ///
@@ -44,17 +73,31 @@ pub struct MonitorHandle {
 /// changed files are printed to stderr. If no changes occur for
 /// [`HEARTBEAT_INTERVAL_SECS`] seconds, a heartbeat message is printed.
 ///
+/// `prefix` is prepended (with a trailing space) to every heartbeat and
+/// change line so concurrent monitors (one per parallel slot) stay
+/// attributable on a shared stderr — pass e.g. `Some("[slot 1]")`. Sequential
+/// mode passes `None`.
+///
 /// Returns a [`MonitorHandle`] that must be passed to [`stop_monitor`]
 /// to cleanly shut down the thread.
-pub fn start_monitor(dir: &Path) -> MonitorHandle {
+pub fn start_monitor(dir: &Path, prefix: Option<&str>) -> MonitorHandle {
+    #[cfg(test)]
+    MONITOR_START_COUNT.fetch_add(1, Ordering::Relaxed);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let flag_clone = Arc::clone(&stop_flag);
     let last_activity_epoch = Arc::new(AtomicU64::new(0));
     let activity_clone = Arc::clone(&last_activity_epoch);
     let dir_owned = dir.to_path_buf();
+    let prefix_owned = prefix.map(|s| s.to_string());
 
     let thread = thread::spawn(move || {
-        monitor_loop(&dir_owned, &flag_clone, &activity_clone);
+        monitor_loop(
+            &dir_owned,
+            &flag_clone,
+            &activity_clone,
+            prefix_owned.as_deref(),
+            MonitorTiming::default(),
+        );
     });
 
     MonitorHandle {
@@ -92,13 +135,26 @@ fn git_status_porcelain(dir: &Path) -> Option<String> {
 }
 
 /// The main monitor loop, running on the background thread.
-fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &Arc<AtomicU64>) {
+///
+/// `timing` is parameterized so tests can shorten the grace + poll intervals
+/// to sub-second values; production paths always use `MonitorTiming::default()`.
+fn monitor_loop(
+    dir: &Path,
+    stop_flag: &Arc<AtomicBool>,
+    last_activity_epoch: &Arc<AtomicU64>,
+    prefix: Option<&str>,
+    timing: MonitorTiming,
+) {
     let mut last_status: Option<String> = None;
     let mut last_change_time = Instant::now();
     // Delay the first poll so the loop's own bookkeeping (task JSON status
     // updates, prompt file writes) settles before we start tracking activity.
-    let mut next_poll = Instant::now() + Duration::from_secs(INITIAL_GRACE_SECS);
+    let mut next_poll = Instant::now() + timing.initial_grace;
     let mut needs_baseline = true;
+    // Bound the per-tick sleep at 1 s (responsive shutdown) but never longer
+    // than the poll interval — otherwise tests with sub-second polls would
+    // sleep right past their first poll.
+    let tick_sleep = Duration::from_secs(1).min(timing.poll_interval);
 
     while !stop_flag.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -118,7 +174,7 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &A
                     };
 
                     if changed && !current_status.is_empty() {
-                        print_status_change(&current_status);
+                        eprintln!("{}", format_status_change(&current_status, prefix));
                         last_change_time = Instant::now();
                         let epoch = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -131,31 +187,49 @@ fn monitor_loop(dir: &Path, stop_flag: &Arc<AtomicBool>, last_activity_epoch: &A
                 }
             }
 
-            next_poll = now + Duration::from_secs(POLL_INTERVAL_SECS);
+            next_poll = now + timing.poll_interval;
         }
 
-        // Heartbeat if no changes for HEARTBEAT_INTERVAL_SECS
-        if last_change_time.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
-            let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
-            eprintln!("[monitor {}] heartbeat: still running, no new changes", ts);
+        // Heartbeat if no changes for the heartbeat interval
+        if last_change_time.elapsed() >= timing.heartbeat_interval {
+            eprintln!("{}", format_heartbeat(prefix));
             last_change_time = Instant::now();
         }
 
-        // Sleep in 1-second intervals to allow responsive shutdown
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(tick_sleep);
     }
 }
 
-/// Print changed files from `git status --porcelain` output to stderr.
-fn print_status_change(status: &str) {
+/// Pure formatter for the per-change line. Returned `String` is what the
+/// monitor writes to stderr — extracted so tests can assert prefixing without
+/// capturing stderr.
+fn format_status_change(status: &str, prefix: Option<&str>) -> String {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
     let files: Vec<&str> = status.lines().filter(|l| !l.is_empty()).collect();
-    eprintln!(
-        "[monitor {}] {} file(s) changed: {}",
-        ts,
-        files.len(),
-        files.join(", ")
-    );
+    match prefix {
+        Some(p) => format!(
+            "{} [monitor {}] {} file(s) changed: {}",
+            p,
+            ts,
+            files.len(),
+            files.join(", ")
+        ),
+        None => format!(
+            "[monitor {}] {} file(s) changed: {}",
+            ts,
+            files.len(),
+            files.join(", ")
+        ),
+    }
+}
+
+/// Pure formatter for the heartbeat line. See [`format_status_change`].
+fn format_heartbeat(prefix: Option<&str>) -> String {
+    let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+    match prefix {
+        Some(p) => format!("{} [monitor {}] heartbeat: still running, no new changes", p, ts),
+        None => format!("[monitor {}] heartbeat: still running, no new changes", ts),
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +248,7 @@ mod tests {
             .output()
             .expect("git init");
 
-        let handle = start_monitor(dir.path());
+        let handle = start_monitor(dir.path(), None);
         assert!(!handle.stop_flag.load(Ordering::Relaxed));
         assert!(handle.thread.is_some());
         stop_monitor(handle);
@@ -189,7 +263,7 @@ mod tests {
             .output()
             .expect("git init");
 
-        let handle = start_monitor(dir.path());
+        let handle = start_monitor(dir.path(), None);
         // Let it run briefly
         thread::sleep(Duration::from_millis(50));
         // Stop should complete without hanging
@@ -205,7 +279,7 @@ mod tests {
             .output()
             .expect("git init");
 
-        let handle = start_monitor(dir.path());
+        let handle = start_monitor(dir.path(), None);
         assert!(!handle.stop_flag.load(Ordering::Relaxed));
 
         // Set flag manually
@@ -266,16 +340,124 @@ mod tests {
     }
 
     #[test]
-    fn test_print_status_change_output() {
-        // This tests that print_status_change doesn't panic
-        // (output goes to stderr, hard to capture in unit tests)
-        print_status_change("?? new.txt\nM  existing.txt\n");
+    fn test_format_status_change_no_prefix() {
+        let line = format_status_change("?? new.txt\nM  existing.txt\n", None);
+        // Must NOT start with a slot prefix when prefix is None.
+        assert!(line.starts_with("[monitor "), "got: {line}");
+        assert!(line.contains("2 file(s) changed"), "got: {line}");
+        assert!(line.contains("?? new.txt"));
+        assert!(line.contains("M  existing.txt"));
     }
 
     #[test]
-    fn test_print_status_change_empty() {
-        // Empty status should print "0 file(s) changed"
-        print_status_change("");
+    fn test_format_status_change_with_prefix() {
+        let line = format_status_change("?? new.txt\n", Some("[slot 1]"));
+        // Slot prefix must come BEFORE the `[monitor ...]` tag so concurrent
+        // slots stay attributable on a shared stderr.
+        assert!(line.starts_with("[slot 1] [monitor "), "got: {line}");
+        assert!(line.contains("1 file(s) changed"));
+    }
+
+    #[test]
+    fn test_format_status_change_empty_input_zero_files() {
+        let line = format_status_change("", None);
+        assert!(line.contains("0 file(s) changed"), "got: {line}");
+    }
+
+    #[test]
+    fn test_format_heartbeat_no_prefix() {
+        let line = format_heartbeat(None);
+        assert!(line.starts_with("[monitor "), "got: {line}");
+        assert!(line.ends_with("heartbeat: still running, no new changes"));
+    }
+
+    #[test]
+    fn test_format_heartbeat_with_prefix() {
+        let line = format_heartbeat(Some("[slot 0]"));
+        assert!(line.starts_with("[slot 0] [monitor "), "got: {line}");
+        assert!(line.ends_with("heartbeat: still running, no new changes"));
+    }
+
+    /// Regression guard for the original bug: the slot-mode watchdog's
+    /// `last_activity_epoch` stayed at 0 forever because no monitor was
+    /// running to populate it. Drives `monitor_loop` directly with
+    /// sub-second timing on a real git repo and asserts that creating a
+    /// file after the grace period advances the epoch off zero. If the
+    /// monitor → epoch chain regresses, this test catches it in <1 s.
+    #[test]
+    fn test_monitor_advances_activity_epoch_on_file_change() {
+        let dir = TempDir::new().expect("create temp dir");
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+
+        let activity = Arc::new(AtomicU64::new(0));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let dir_buf = dir.path().to_path_buf();
+        let activity_clone = Arc::clone(&activity);
+        let stop_clone = Arc::clone(&stop_flag);
+
+        // Sub-second timings so the test stays fast. Heartbeat is set far
+        // beyond the test runtime so it can't fire and pollute results.
+        let timing = MonitorTiming {
+            poll_interval: Duration::from_millis(80),
+            initial_grace: Duration::from_millis(60),
+            heartbeat_interval: Duration::from_secs(60),
+        };
+
+        let handle = thread::spawn(move || {
+            monitor_loop(&dir_buf, &stop_clone, &activity_clone, None, timing);
+        });
+
+        // Wait past grace + one baseline poll, then create a file.
+        thread::sleep(Duration::from_millis(250));
+        fs::write(dir.path().join("activity.txt"), "data").expect("write file");
+
+        // Wait for the change-detection poll to fire.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if activity.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        stop_flag.store(true, Ordering::Relaxed);
+        handle.join().expect("monitor thread join");
+
+        let epoch = activity.load(Ordering::Acquire);
+        assert!(
+            epoch > 0,
+            "monitor should have advanced last_activity_epoch past 0 after file change"
+        );
+    }
+
+    /// Asserts the test-only call counter increments on every
+    /// `start_monitor` invocation. This is the load-bearing observation
+    /// the `run_slot_iteration` regression test relies on.
+    #[test]
+    fn test_start_monitor_increments_call_counter() {
+        let dir = TempDir::new().expect("create temp dir");
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+
+        let before = MONITOR_START_COUNT.load(Ordering::Relaxed);
+        let handle = start_monitor(dir.path(), Some("[slot 7]"));
+        let after = MONITOR_START_COUNT.load(Ordering::Relaxed);
+        stop_monitor(handle);
+
+        assert!(
+            after > before,
+            "MONITOR_START_COUNT must increment on start_monitor (before={before}, after={after})",
+        );
     }
 
     #[test]
@@ -287,7 +469,7 @@ mod tests {
             .output()
             .expect("git init");
 
-        let handle = start_monitor(dir.path());
+        let handle = start_monitor(dir.path(), None);
 
         // Create a file while monitor is running
         fs::write(dir.path().join("test.txt"), "data").expect("write file");
@@ -304,7 +486,7 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         // No git init — monitor should run gracefully (no panic)
 
-        let handle = start_monitor(dir.path());
+        let handle = start_monitor(dir.path(), None);
         thread::sleep(Duration::from_millis(50));
         stop_monitor(handle);
     }
@@ -330,7 +512,7 @@ mod tests {
         // monitor_loop should return almost immediately since flag is already set
         let start = Instant::now();
         let activity = Arc::new(AtomicU64::new(0));
-        monitor_loop(&dir_buf, &stop_flag, &activity);
+        monitor_loop(&dir_buf, &stop_flag, &activity, None, MonitorTiming::default());
         let elapsed = start.elapsed();
 
         // Should exit within 2 seconds (1 sleep + overhead)
