@@ -30,7 +30,7 @@ pub struct BatchResult {
 }
 
 /// Result of running a single PRD within a batch.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PrdRunResult {
     /// Path to the PRD JSON file.
     pub prd_file: PathBuf,
@@ -44,6 +44,16 @@ pub struct PrdRunResult {
     pub branch_name: Option<String>,
     /// Chain base ref this PRD branched from (None = branched from HEAD).
     pub chain_base: Option<String>,
+    /// Number of tasks completed during this PRD's run (per-run counter, not cumulative).
+    ///
+    /// Sourced directly from `LoopResult::tasks_completed`. Zero for skipped PRDs.
+    pub tasks_completed: u32,
+    /// Worktree path used for this PRD's run, if any.
+    ///
+    /// Sourced directly from `LoopResult::worktree_path`. Used by the batch auto-review
+    /// hook to locate the PRD files after the loop completes. `None` for skipped PRDs or
+    /// when no worktree was configured.
+    pub worktree_path: Option<PathBuf>,
 }
 
 /// Expand a glob pattern into sorted PRD file paths.
@@ -315,9 +325,7 @@ fn push_remaining_skipped(
             prd_file: remaining_prd.clone(),
             exit_code: 0,
             skipped: true,
-            stopped: false,
-            branch_name: None,
-            chain_base: None,
+            ..Default::default()
         });
     }
     *skipped += pairs.len() - from;
@@ -635,6 +643,8 @@ pub async fn run_batch(
                 stopped: true,
                 branch_name: result_branch_name.clone(),
                 chain_base: if chain { chain_base.clone() } else { None },
+                tasks_completed: loop_result.tasks_completed,
+                worktree_path: loop_result.worktree_path.clone(),
             });
             stopped += 1;
 
@@ -662,6 +672,8 @@ pub async fn run_batch(
             stopped: false,
             branch_name: result_branch_name.clone(),
             chain_base: if chain { chain_base.clone() } else { None },
+            tasks_completed: loop_result.tasks_completed,
+            worktree_path: loop_result.worktree_path.clone(),
         });
 
         if exit_code == 0 {
@@ -917,6 +929,21 @@ mod tests {
         assert_eq!(files.len(), 1);
     }
 
+    // --- PrdRunResult Default tests ---
+
+    #[test]
+    fn test_prd_run_result_default_is_zero() {
+        let r = PrdRunResult::default();
+        assert_eq!(r.prd_file, PathBuf::default());
+        assert_eq!(r.exit_code, 0);
+        assert!(!r.skipped);
+        assert!(!r.stopped);
+        assert!(r.branch_name.is_none());
+        assert!(r.chain_base.is_none());
+        assert_eq!(r.tasks_completed, 0);
+        assert!(r.worktree_path.is_none());
+    }
+
     // --- BatchResult / PrdRunResult tests ---
 
     #[test]
@@ -930,26 +957,17 @@ mod tests {
                 PrdRunResult {
                     prd_file: PathBuf::from("a.json"),
                     exit_code: 0,
-                    skipped: false,
-                    stopped: false,
-                    branch_name: None,
-                    chain_base: None,
+                    ..Default::default()
                 },
                 PrdRunResult {
                     prd_file: PathBuf::from("b.json"),
                     exit_code: 0,
-                    skipped: false,
-                    stopped: false,
-                    branch_name: None,
-                    chain_base: None,
+                    ..Default::default()
                 },
                 PrdRunResult {
                     prd_file: PathBuf::from("c.json"),
                     exit_code: 1,
-                    skipped: false,
-                    stopped: false,
-                    branch_name: None,
-                    chain_base: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -966,9 +984,7 @@ mod tests {
             prd_file: PathBuf::from("skipped.json"),
             exit_code: 0,
             skipped: true,
-            stopped: false,
-            branch_name: None,
-            chain_base: None,
+            ..Default::default()
         };
         assert!(result.skipped);
         assert!(!result.stopped);
@@ -1184,27 +1200,20 @@ mod tests {
             PrdRunResult {
                 prd_file: PathBuf::from("phase-1.json"),
                 exit_code: 0,
-                skipped: false,
-                stopped: false,
                 branch_name: Some("feat/phase-1".to_string()),
-                chain_base: None, // first PRD branches from HEAD
+                ..Default::default() // first PRD branches from HEAD
             },
             PrdRunResult {
                 prd_file: PathBuf::from("phase-2.json"),
                 exit_code: 1,
-                skipped: false,
-                stopped: false,
-                branch_name: None,
                 chain_base: Some("feat/phase-1".to_string()),
+                ..Default::default()
             },
             // PRD[2] would be skipped by stop-on-failure
             PrdRunResult {
                 prd_file: PathBuf::from("phase-3.json"),
-                exit_code: 0,
                 skipped: true,
-                stopped: false,
-                branch_name: None,
-                chain_base: None,
+                ..Default::default()
             },
         ];
 
