@@ -895,6 +895,203 @@ fn is_worktree_dirty(worktree_path: &Path) -> Result<bool, String> {
     Ok(!output.stdout.is_empty())
 }
 
+/// What `prepare_slot0_for_merge` found and did.
+// FEAT-004 wires these into merge_slot_branches_with_resolver.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum MergePreparation {
+    /// Working tree was clean; nothing to do.
+    Clean,
+    /// Working tree was dirty; changes were stashed under this tag.
+    Stashed { tag: String },
+}
+
+/// Outcome of `cleanup_preparation`.
+// FEAT-004 wires these into merge_slot_branches_with_resolver.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq)]
+pub(crate) enum CleanupOutcome {
+    /// Stash was popped (or there was nothing to restore); working tree restored.
+    Restored,
+    /// Stash pop produced merge conflicts; stash left on stack for operator.
+    PopConflict {
+        tag: String,
+        conflicted: Vec<String>,
+    },
+    /// Per-slot per-run stash count exceeded `stash_limit` after a pop conflict.
+    StashLimitExceeded { count: usize },
+}
+
+/// If slot 0's working tree is dirty, stash everything (tracked + untracked)
+/// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
+///
+/// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`
+#[allow(dead_code)]
+pub(crate) fn prepare_slot0_for_merge(
+    slot0_path: &Path,
+    slot: usize,
+    run_id: &str,
+) -> Result<MergePreparation, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git status spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Ok(MergePreparation::Clean);
+    }
+
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let tag = format!("task-mgr-slot-{slot}-{run_id}-{epoch_ms}");
+
+    let stash_out = Command::new("git")
+        .args(["stash", "push", "--include-untracked", "-m", &tag])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git stash push spawn: {e}"))?;
+    if !stash_out.status.success() {
+        return Err(format!(
+            "git stash push failed: {}",
+            format_git_failure(&stash_out.stdout, &stash_out.stderr)
+        ));
+    }
+
+    Ok(MergePreparation::Stashed { tag })
+}
+
+/// Undo `prepare_slot0_for_merge`: pop the stash if one was created.
+///
+/// On a clean pop → `Restored`.  On a pop conflict → stash stays on stack
+/// (never dropped); returns `PopConflict` unless the per-slot per-run stash
+/// count exceeds `stash_limit`, in which case returns `StashLimitExceeded`.
+/// NEVER calls `git checkout --`, `git reset --hard`, or `git stash drop`.
+#[allow(dead_code)]
+pub(crate) fn cleanup_preparation(
+    prep: &MergePreparation,
+    slot0_path: &Path,
+    slot: usize,
+    run_id: &str,
+    stash_limit: u32,
+) -> CleanupOutcome {
+    let tag = match prep {
+        MergePreparation::Clean => return CleanupOutcome::Restored,
+        MergePreparation::Stashed { tag } => tag,
+    };
+
+    let stash_ref = match resolve_stash_ref_by_tag(slot0_path, tag) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!("[warn] stash tag {tag} not found; treating as Restored");
+            return CleanupOutcome::Restored;
+        }
+        Err(e) => {
+            eprintln!("[warn] failed to resolve stash ref for {tag}: {e}");
+            return CleanupOutcome::Restored;
+        }
+    };
+
+    let pop_out = match Command::new("git")
+        .args(["stash", "pop", &stash_ref])
+        .current_dir(slot0_path)
+        .output()
+    {
+        Err(e) => {
+            eprintln!("[warn] git stash pop spawn failed: {e}");
+            return CleanupOutcome::Restored;
+        }
+        Ok(o) => o,
+    };
+
+    if pop_out.status.success() {
+        return CleanupOutcome::Restored;
+    }
+
+    // Pop failed — stash is still on the stack. Collect conflict paths and
+    // check per-slot per-run stash depth.
+    let conflicted = list_conflicted_files(slot0_path).unwrap_or_default();
+    let prefix = format!("task-mgr-slot-{slot}-{run_id}-");
+    let count = count_stashes_with_prefix(slot0_path, &prefix).unwrap_or(0);
+
+    if count > stash_limit as usize {
+        CleanupOutcome::StashLimitExceeded { count }
+    } else {
+        CleanupOutcome::PopConflict {
+            tag: tag.clone(),
+            conflicted,
+        }
+    }
+}
+
+/// Look up the stash ref (e.g. `stash@{2}`) whose subject equals `tag`.
+/// Uses `--format=%gd %gs` and splits on the first space only so multi-word
+/// subjects don't truncate.
+#[allow(dead_code)]
+fn resolve_stash_ref_by_tag(path: &Path, tag: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args(["stash", "list", "--format=%gd %gs"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("git stash list spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git stash list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // Format: `stash@{N} On <branch>: <message>`
+        // Split on first space to get the ref, then extract message after ": ".
+        if let Some(sp) = line.find(' ') {
+            let stash_ref = &line[..sp];
+            let subject = &line[sp + 1..];
+            // Subject is "On <branch>: <message>"; split on first ": " to get message.
+            let message = subject
+                .split_once(": ")
+                .map(|(_, msg)| msg)
+                .unwrap_or(subject);
+            if message == tag {
+                return Ok(Some(stash_ref.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Count how many stash entries have a subject starting with `prefix`.
+#[allow(dead_code)]
+fn count_stashes_with_prefix(path: &Path, prefix: &str) -> Result<usize, String> {
+    let output = Command::new("git")
+        .args(["stash", "list", "--format=%gs"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("git stash list spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git stash list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Subject format: "On <branch>: <message>"; extract message after first ": ".
+    Ok(text
+        .lines()
+        .filter(|l| {
+            let msg = l.split_once(": ").map(|(_, m)| m).unwrap_or(l);
+            msg.starts_with(prefix)
+        })
+        .count())
+}
+
 /// True iff `ancestor` is an ancestor of `descendant` per
 /// `git merge-base --is-ancestor`.
 ///
@@ -4045,6 +4242,353 @@ detached
             result.is_empty(),
             "no slot-N worktrees should yield empty Vec, got {:?}",
             result
+        );
+    }
+
+    // ── prepare_slot0_for_merge / cleanup_preparation ──────────────────────
+
+    /// AC: clean working tree → Clean (no stash created).
+    #[test]
+    fn test_prepare_clean_working_tree() {
+        let tmp = setup_git_repo_with_file();
+        let result = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert_eq!(result, MergePreparation::Clean);
+    }
+
+    /// AC: dirty tracked file → Stashed with a tag matching the expected pattern.
+    #[test]
+    fn test_prepare_dirty_tracked_file() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").expect("write");
+
+        let result = prepare_slot0_for_merge(tmp.path(), 1, "test-run").unwrap();
+        match &result {
+            MergePreparation::Stashed { tag } => {
+                assert!(
+                    tag.starts_with("task-mgr-slot-1-test-run-"),
+                    "tag '{tag}' does not match expected prefix"
+                );
+            }
+            MergePreparation::Clean => panic!("expected Stashed, got Clean"),
+        }
+
+        // Working tree should be clean after stash.
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "expected clean working tree after stash"
+        );
+    }
+
+    /// AC: untracked file is stashed; working tree is clean after prepare.
+    #[test]
+    fn test_prepare_untracked_file() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("scratch.log"), "log data").expect("write");
+
+        let result = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert!(
+            matches!(result, MergePreparation::Stashed { .. }),
+            "untracked file should produce Stashed"
+        );
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "expected clean working tree after stashing untracked file"
+        );
+    }
+
+    /// AC: tracked dirty + untracked file → ONE stash, not two.
+    #[test]
+    fn test_prepare_dirty_and_untracked_creates_one_stash() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").expect("write tracked");
+        std::fs::write(tmp.path().join("scratch.log"), "log").expect("write untracked");
+
+        prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+
+        let list = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly 1 stash entry, got {lines:?}"
+        );
+    }
+
+    /// AC: cleanup_preparation(Clean, ...) is a no-op and returns Restored.
+    #[test]
+    fn test_cleanup_clean_is_noop() {
+        let tmp = setup_git_repo_with_file();
+        let outcome = cleanup_preparation(&MergePreparation::Clean, tmp.path(), 0, "r", 5);
+        assert_eq!(outcome, CleanupOutcome::Restored);
+    }
+
+    /// AC: cleanup after stash pops and restores the dirty file.
+    #[test]
+    fn test_cleanup_pops_stash_and_restores() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty-content").expect("write");
+
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert!(matches!(prep, MergePreparation::Stashed { .. }));
+
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+        assert_eq!(outcome, CleanupOutcome::Restored);
+
+        // file.txt should be back to the dirty content.
+        let content = std::fs::read_to_string(tmp.path().join("file.txt")).unwrap();
+        assert_eq!(content, "dirty-content");
+
+        // Working tree should be dirty again.
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            !status.stdout.is_empty(),
+            "file.txt should be dirty again after pop"
+        );
+    }
+
+    /// AC: pop conflict → PopConflict with conflicted path; stash still on stack.
+    #[test]
+    fn test_cleanup_pop_conflict() {
+        let tmp = setup_git_repo_with_file();
+
+        // Dirty file.txt → stash it.
+        std::fs::write(tmp.path().join("file.txt"), "stash-version").expect("write");
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+
+        // Now commit a conflicting change to file.txt so pop will conflict.
+        std::fs::write(tmp.path().join("file.txt"), "commit-version").expect("overwrite");
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "conflicting commit"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+
+        match outcome {
+            CleanupOutcome::PopConflict { conflicted, .. } => {
+                assert!(
+                    conflicted.contains(&"file.txt".to_string()),
+                    "expected file.txt in conflicted list, got {conflicted:?}"
+                );
+            }
+            other => panic!("expected PopConflict, got {other:?}"),
+        }
+
+        // Stash must still be on the stack.
+        let list = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let count = std::str::from_utf8(&list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(count, 1, "stash should still be on stack after conflict");
+    }
+
+    /// Helper: pre-seed N stash entries with the given message prefix.
+    fn seed_stashes(repo: &std::path::Path, prefix: &str, n: usize) {
+        // Dirty the tracked file.txt (git stash push without --include-untracked
+        // ignores untracked files, so we must dirty a tracked file).
+        let tracked = repo.join("file.txt");
+        for i in 0..n {
+            std::fs::write(&tracked, format!("seed-{i}")).unwrap();
+            let out = Command::new("git")
+                .args(["stash", "push", "-m", &format!("{prefix}{i}")])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "seed_stashes push {i} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // After N pops the file is back to the committed content; nothing to clean up.
+    }
+
+    /// Helper: produce a pop-conflict state and return the prep.
+    fn setup_pop_conflict(repo: &std::path::Path) -> MergePreparation {
+        std::fs::write(repo.join("file.txt"), "stash-side").unwrap();
+        let prep = prepare_slot0_for_merge(repo, 0, "test-run").unwrap();
+        std::fs::write(repo.join("file.txt"), "commit-side").unwrap();
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "conflict commit"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        prep
+    }
+
+    /// AC: stash count exceeds stash_limit → StashLimitExceeded.
+    #[test]
+    fn test_cleanup_stash_limit_exceeded() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+        let prefix = "task-mgr-slot-0-test-run-";
+
+        // Pre-seed stash_limit stashes (total will be stash_limit + 1 after pop fails).
+        seed_stashes(tmp.path(), prefix, stash_limit as usize);
+
+        let prep = setup_pop_conflict(tmp.path());
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        match outcome {
+            CleanupOutcome::StashLimitExceeded { count } => {
+                assert!(
+                    count > stash_limit as usize,
+                    "count {count} should exceed limit {stash_limit}"
+                );
+            }
+            other => panic!("expected StashLimitExceeded, got {other:?}"),
+        }
+    }
+
+    /// AC: different slot index — stashes for slot 1 don't count toward slot 0's limit.
+    #[test]
+    fn test_cleanup_per_slot_scoping() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+
+        // Pre-seed stashes for a DIFFERENT slot (slot 1, not 0).
+        seed_stashes(
+            tmp.path(),
+            "task-mgr-slot-1-test-run-",
+            stash_limit as usize,
+        );
+
+        let prep = setup_pop_conflict(tmp.path());
+        // Cleanup is for slot 0 — the slot-1 stashes must not count.
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        assert!(
+            matches!(outcome, CleanupOutcome::PopConflict { .. }),
+            "different-slot stashes must not trigger StashLimitExceeded; got {outcome:?}"
+        );
+    }
+
+    /// AC: different run_id — stashes for another run don't count toward this run's limit.
+    #[test]
+    fn test_cleanup_per_run_scoping() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+
+        // Pre-seed stashes for a DIFFERENT run_id (other-run, not test-run).
+        seed_stashes(
+            tmp.path(),
+            "task-mgr-slot-0-other-run-",
+            stash_limit as usize,
+        );
+
+        let prep = setup_pop_conflict(tmp.path());
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        assert!(
+            matches!(outcome, CleanupOutcome::PopConflict { .. }),
+            "different-run stashes must not trigger StashLimitExceeded; got {outcome:?}"
+        );
+    }
+
+    /// AC: tag prefixes are deterministic across two consecutive prepare calls
+    /// in the same test (only the epoch-ms suffix differs).
+    #[test]
+    fn test_prepare_deterministic_tag_prefix() {
+        let tmp = setup_git_repo_with_file();
+
+        std::fs::write(tmp.path().join("file.txt"), "v1").unwrap();
+        let prep1 = prepare_slot0_for_merge(tmp.path(), 2, "myrun").unwrap();
+        // pop to restore clean state for the second call
+        if let MergePreparation::Stashed { ref tag } = prep1 {
+            let stash_ref = resolve_stash_ref_by_tag(tmp.path(), tag).unwrap().unwrap();
+            Command::new("git")
+                .args(["stash", "pop", &stash_ref])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+        }
+
+        std::fs::write(tmp.path().join("file.txt"), "v2").unwrap();
+        let prep2 = prepare_slot0_for_merge(tmp.path(), 2, "myrun").unwrap();
+
+        let (tag1, tag2) = match (&prep1, &prep2) {
+            (MergePreparation::Stashed { tag: t1 }, MergePreparation::Stashed { tag: t2 }) => {
+                (t1.clone(), t2.clone())
+            }
+            _ => panic!("both prepares should produce Stashed"),
+        };
+
+        assert!(
+            tag1.starts_with("task-mgr-slot-2-myrun-"),
+            "tag1 prefix wrong: {tag1}"
+        );
+        assert!(
+            tag2.starts_with("task-mgr-slot-2-myrun-"),
+            "tag2 prefix wrong: {tag2}"
+        );
+        // Tags must differ (different epoch_ms).
+        assert_ne!(tag1, tag2, "consecutive tags must be unique");
+    }
+
+    /// Negative AC: no auto-commit in git log after prepare/cleanup.
+    #[test]
+    fn test_no_auto_commit_created() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").unwrap();
+
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+
+        let log = Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let log_text = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            !log_text.contains("chore(progress)") && !log_text.contains("chore:"),
+            "no auto-commits expected; got: {log_text}"
+        );
+        // Only the initial "init" commit should exist.
+        assert_eq!(
+            log_text.lines().count(),
+            1,
+            "expected only the init commit, got:\n{log_text}"
         );
     }
 }
