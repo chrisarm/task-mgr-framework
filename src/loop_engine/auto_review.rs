@@ -187,10 +187,51 @@ impl ReviewLauncher for CapturingLauncher {
 
 /// Maybe fire the auto-review launcher after a loop run.
 ///
-/// Checks all gates in order; any failing gate prints a hint to stderr and
-/// returns without launching. Launcher errors are logged but never propagated —
-/// a review launch failure must never change the loop's exit code.
+/// Performs the TTY pre-check (interactive review requires a real terminal),
+/// then delegates the remaining gate logic to `maybe_fire_inner`. Any
+/// failing gate prints a hint to stderr and returns without launching;
+/// launcher errors are logged but never propagated — a review launch failure
+/// must never change the loop's exit code.
+///
+/// **Why the split**: under `cargo test` the process is non-TTY, so every
+/// gate after the TTY check would otherwise be unreachable from a test
+/// path — and gate tests would pass vacuously regardless of the gate's
+/// correctness. Tests bypass the TTY check by calling `maybe_fire_inner`
+/// directly. See the gate-ordering caveat in this project's `CLAUDE.md`.
 pub fn maybe_fire(
+    config: &ProjectConfig,
+    cli_force_on: bool,
+    cli_force_off: bool,
+    result: &LoopResult,
+    prd_json: &Path,
+    launcher: &dyn ReviewLauncher,
+) {
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "[auto-review] stdout is not a TTY (CI / redirected); \
+             run `claude \"/review-loop {path}\"` manually",
+            path = prd_json.display()
+        );
+        return;
+    }
+    maybe_fire_inner(
+        config,
+        cli_force_on,
+        cli_force_off,
+        result,
+        prd_json,
+        launcher,
+    );
+}
+
+/// All gate logic for [`maybe_fire`], assuming the TTY pre-check has passed.
+///
+/// Production callers must go through [`maybe_fire`] (which performs the TTY
+/// check first). This function is `pub(crate)` solely as a **test seam**:
+/// `cargo test` runs in a non-TTY env, so without this seam every gate below
+/// would be unreachable from tests and would pass vacuously. Tests assert
+/// against the `CapturingLauncher` after calling this function directly.
+pub(crate) fn maybe_fire_inner(
     config: &ProjectConfig,
     cli_force_on: bool,
     cli_force_off: bool,
@@ -206,15 +247,6 @@ pub fn maybe_fire(
         result.was_stopped,
         result.tasks_completed,
     ) {
-        return;
-    }
-
-    if !std::io::stdout().is_terminal() {
-        eprintln!(
-            "[auto-review] stdout is not a TTY (CI / redirected); \
-             run `claude \"/review-loop {path}\"` manually",
-            path = prd_json.display()
-        );
         return;
     }
 
@@ -430,13 +462,32 @@ mod tests {
     }
 
     #[test]
-    fn maybe_fire_fires_when_all_gates_pass() {
-        // We can only test the CapturingLauncher path when stdout is a TTY.
-        // In CI (non-TTY) maybe_fire returns early before reaching the launcher.
-        // Skip the launcher-assertion test in non-TTY environments.
-        if !std::io::stdout().is_terminal() {
-            return;
-        }
+    fn maybe_fire_inner_fires_when_all_gates_pass() {
+        // Calls `maybe_fire_inner` so the test exercises every gate after the
+        // TTY pre-check — under `cargo test` (non-TTY) the public `maybe_fire`
+        // would short-circuit before reaching the launcher.
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("foo.md");
+        std::fs::write(&md, "").unwrap();
+        let json = tmp.path().join("foo.json");
+
+        let launcher = CapturingLauncher::new();
+        let result = passing_result(&tmp);
+        maybe_fire_inner(&default_config(), false, false, &result, &json, &launcher);
+
+        let calls = launcher.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, md);
+        assert_eq!(calls[0].1, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn maybe_fire_outer_suppresses_in_non_tty() {
+        // Direct check of the outer's TTY gate. `cargo test` runs in a non-TTY
+        // env, so a call through the public `maybe_fire` with otherwise-passing
+        // inputs must suppress the launch. This is the discriminator that
+        // proves the TTY gate is doing real work (removing it would let the
+        // launcher fire — `CapturingLauncher.calls.len() == 1`).
         let tmp = TempDir::new().unwrap();
         let md = tmp.path().join("foo.md");
         std::fs::write(&md, "").unwrap();
@@ -446,10 +497,10 @@ mod tests {
         let result = passing_result(&tmp);
         maybe_fire(&default_config(), false, false, &result, &json, &launcher);
 
-        let calls = launcher.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, md);
-        assert_eq!(calls[0].1, Some(tmp.path().to_path_buf()));
+        assert!(
+            launcher.calls.lock().unwrap().is_empty(),
+            "outer maybe_fire must suppress launch when stdout is not a TTY",
+        );
     }
 
     #[test]
@@ -513,7 +564,10 @@ mod tests {
     }
 
     #[test]
-    fn maybe_fire_no_launch_when_worktree_missing() {
+    fn maybe_fire_inner_no_launch_when_worktree_missing() {
+        // Worktree-existence gate fires AFTER the TTY check, so call the inner
+        // so the assertion actually exercises that gate (otherwise the test
+        // would pass vacuously under `cargo test` via the TTY gate).
         let tmp = TempDir::new().unwrap();
         let md = tmp.path().join("foo.md");
         std::fs::write(&md, "").unwrap();
@@ -521,30 +575,33 @@ mod tests {
 
         let launcher = CapturingLauncher::new();
         let mut result = passing_result(&tmp);
-        // Point to a path that doesn't exist
         result.worktree_path = Some(tmp.path().join("nonexistent-worktree"));
-        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+        maybe_fire_inner(&default_config(), false, false, &result, &json, &launcher);
 
         assert!(launcher.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn maybe_fire_suppresses_when_md_path_contains_whitespace() {
+    fn maybe_fire_inner_suppresses_when_md_path_contains_whitespace() {
+        // Whitespace guard sits AFTER the TTY check in `maybe_fire`. Call the
+        // inner so the assertion is a real test of the guard — deleting the
+        // guard would let the launcher fire and `calls.len()` become 1.
         let tmp = TempDir::new().unwrap();
-        // Name both the .json and .md with a space so prd_md_path resolves to the spaced path
         let md = tmp.path().join("My PRD.md");
         std::fs::write(&md, "").unwrap();
         let json = tmp.path().join("My PRD.json");
 
         let launcher = CapturingLauncher::new();
         let result = passing_result(&tmp);
-        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+        maybe_fire_inner(&default_config(), false, false, &result, &json, &launcher);
 
         assert!(launcher.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn maybe_fire_suppresses_when_md_path_contains_tab() {
+    fn maybe_fire_inner_suppresses_when_md_path_contains_tab() {
+        // Same rationale as the space variant — exercises the `char::is_whitespace`
+        // path that an ASCII-only check would miss.
         let tmp = TempDir::new().unwrap();
         let md = tmp.path().join("My\tPRD.md");
         std::fs::write(&md, "").unwrap();
@@ -552,16 +609,16 @@ mod tests {
 
         let launcher = CapturingLauncher::new();
         let result = passing_result(&tmp);
-        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+        maybe_fire_inner(&default_config(), false, false, &result, &json, &launcher);
 
         assert!(launcher.calls.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn maybe_fire_proceeds_when_md_path_has_no_whitespace() {
-        if !std::io::stdout().is_terminal() {
-            return;
-        }
+    fn maybe_fire_inner_proceeds_when_md_path_has_no_whitespace() {
+        // Positive control: with the whitespace guard's predicate false, the
+        // launcher fires. Pairs with the two suppression tests above to prove
+        // the guard fires exactly when it should and not otherwise.
         let tmp = TempDir::new().unwrap();
         let md = tmp.path().join("my-prd.md");
         std::fs::write(&md, "").unwrap();
@@ -569,7 +626,7 @@ mod tests {
 
         let launcher = CapturingLauncher::new();
         let result = passing_result(&tmp);
-        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+        maybe_fire_inner(&default_config(), false, false, &result, &json, &launcher);
 
         assert_eq!(launcher.calls.lock().unwrap().len(), 1);
     }

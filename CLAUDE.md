@@ -140,22 +140,21 @@ no fragmented argv ever reaches `claude`). It deliberately does not attempt
 to quote or escape — quoting Claude's slash-command body is brittle, and
 suppression with a clear hint is the simpler, more honest contract.
 
-**Gate ordering caveat for tests**: in `maybe_fire`, the TTY gate
-(`stdout().is_terminal()` early-return) fires BEFORE the whitespace guard
-and before any other launch-boundary guard. Under `cargo test` (non-TTY),
-every guard placed after the TTY gate is unreachable from the test path —
-a unit test that asserts "guard suppresses launch" via `CapturingLauncher`
-will pass even if the guard is deleted, because the TTY gate alone
-suppresses. The FEAT-001 whitespace-guard tests
-(`maybe_fire_suppresses_when_md_path_contains_whitespace` and `_tab`)
-satisfy their AC verbatim but have weak regression-detection value for
-exactly this reason. When adding a new launch-boundary guard to
-`maybe_fire`, either: (a) inject the TTY check via a trait/closure so
-tests can force a TTY-true path, (b) split `maybe_fire` into a TTY-gated
-outer plus a pure inner that tests exercise directly, or (c) test the
-guard's predicate function in isolation. Asserting against
-`CapturingLauncher.calls.is_empty()` after a non-TTY `maybe_fire` call
-proves nothing about the new guard.
+**Outer/inner split for test reachability**: `maybe_fire` is a thin
+wrapper that performs the TTY pre-check and delegates to
+`maybe_fire_inner` (`pub(crate)`), which contains every launch-decision
+gate (decision, worktree existence, markdown path resolution, whitespace
+guard, launcher dispatch). `cargo test` runs in a non-TTY env, so a unit
+test that goes through the public `maybe_fire` would short-circuit at
+the TTY gate before reaching any inner gate — meaning a test asserting
+"this guard suppresses launch" via `CapturingLauncher` would pass even
+if the guard were deleted. Tests for inner-side gates
+(`maybe_fire_inner_*`) call the inner function directly to bypass the
+TTY gate and exercise the real guard logic; a single
+`maybe_fire_outer_suppresses_in_non_tty` test exercises the outer
+wrapper to prove the TTY gate still fires. When adding a new
+launch-boundary guard, add it inside `maybe_fire_inner` and test it via
+the inner — never via the outer.
 
 ## Overflow recovery and diagnostics
 
