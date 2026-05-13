@@ -95,6 +95,11 @@ pub fn should_fire(d: &Decision, exit_code: i32, was_stopped: bool, tasks_comple
 /// 2. `prd-foo.md` (prefixed form in the same directory)
 ///
 /// Returns `None` when neither exists on disk.
+///
+/// **Trust boundary**: `prd_json` is an operator-controlled CLI argument (the
+/// PRD JSON path passed to `task-mgr loop`). No path-escape detection is
+/// performed — the caller is trusted. Do not forward user-supplied, untrusted
+/// paths here without validation.
 pub fn prd_md_path(prd_json: &Path) -> Option<PathBuf> {
     let bare = prd_json.with_extension("md");
     if bare.exists() {
@@ -223,6 +228,10 @@ pub fn maybe_fire(
             );
             return;
         }
+        // Best-effort existence check: a concurrent `git worktree prune` can
+        // remove the worktree between this check and the launcher's `current_dir`
+        // call (TOCTOU). The launcher's own `Command::status()` error path
+        // surfaces the racy outcome via the `Err(e)` arm below.
         Some(wt) if !wt.exists() => {
             eprintln!(
                 "[auto-review] worktree `{wt}` does not exist; \
@@ -369,6 +378,16 @@ mod tests {
     fn should_fire_boundary_equal_to_min() {
         // tasks_completed == min_tasks should fire (>= not >)
         assert!(should_fire(&enabled_decision(3), 0, false, 3));
+    }
+
+    #[test]
+    fn should_fire_zero_threshold_fires_when_other_gates_pass() {
+        // min_tasks=0 means the threshold is no barrier at all.
+        assert!(should_fire(&enabled_decision(0), 0, false, 0));
+        assert!(should_fire(&enabled_decision(0), 0, false, 1));
+        // Other gates still block independently.
+        assert!(!should_fire(&enabled_decision(0), 1, false, 5)); // non-zero exit
+        assert!(!should_fire(&enabled_decision(0), 0, true, 5)); // was_stopped
     }
 
     // --- prd_md_path ---
