@@ -468,44 +468,12 @@ fn git_common_dir(repo_path: &Path) -> Result<PathBuf, String> {
 /// managed block is present and has the expected body. Returns `None` when
 /// no rewrite is needed.
 fn merged_attributes_contents(existing: &str) -> Option<String> {
-    let desired_block = format!("{}\n{}{}\n", ATTR_MARKER_BEGIN, ATTR_BODY, ATTR_MARKER_END);
-
-    if let (Some(begin), Some(end)) = (
-        existing.find(ATTR_MARKER_BEGIN),
-        existing.find(ATTR_MARKER_END),
-    ) && begin < end
-    {
-        // End-of-line for the END marker — include the trailing newline if
-        // present so we don't accumulate blank lines on repeated rewrites.
-        let after_end = end + ATTR_MARKER_END.len();
-        let after_end = if existing[after_end..].starts_with('\n') {
-            after_end + 1
-        } else {
-            after_end
-        };
-        let current_block = &existing[begin..after_end];
-        if current_block == desired_block {
-            return None;
-        }
-        let mut rewritten = String::with_capacity(existing.len());
-        rewritten.push_str(&existing[..begin]);
-        rewritten.push_str(&desired_block);
-        rewritten.push_str(&existing[after_end..]);
-        return Some(rewritten);
-    }
-
-    // No marker block yet — append, ensuring exactly one blank line of
-    // separation from any pre-existing content.
-    let mut rewritten = String::with_capacity(existing.len() + desired_block.len() + 2);
-    rewritten.push_str(existing);
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        rewritten.push('\n');
-    }
-    if !existing.is_empty() {
-        rewritten.push('\n');
-    }
-    rewritten.push_str(&desired_block);
-    Some(rewritten)
+    crate::util::marker_splice::merge_marker_block(
+        existing,
+        ATTR_MARKER_BEGIN,
+        ATTR_MARKER_END,
+        ATTR_BODY,
+    )
 }
 
 /// Ensure `.git/info/attributes` declares `merge=union` for per-PRD progress

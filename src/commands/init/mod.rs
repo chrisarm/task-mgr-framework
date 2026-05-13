@@ -615,48 +615,12 @@ const GITIGNORE_BODY: &str = "tasks/progress-*.txt\n";
 /// block is present and has the expected body. Returns `None` when no rewrite is
 /// needed (block already matches).
 fn merged_gitignore_contents(existing: &str) -> Option<String> {
-    let desired_block = format!(
-        "{}\n{}{}",
-        GITIGNORE_MARKER_BEGIN, GITIGNORE_BODY, GITIGNORE_MARKER_END
-    );
-    // The block as it appears in the file always ends with a newline after the
-    // END marker.
-    let desired_block_in_file = format!("{}\n", desired_block);
-
-    if let (Some(begin), Some(end)) = (
-        existing.find(GITIGNORE_MARKER_BEGIN),
-        existing.find(GITIGNORE_MARKER_END),
-    ) && begin < end
-    {
-        let after_end = end + GITIGNORE_MARKER_END.len();
-        let after_end = if existing[after_end..].starts_with('\n') {
-            after_end + 1
-        } else {
-            after_end
-        };
-        let current_block = &existing[begin..after_end];
-        if current_block == desired_block_in_file {
-            return None;
-        }
-        let mut rewritten = String::with_capacity(existing.len());
-        rewritten.push_str(&existing[..begin]);
-        rewritten.push_str(&desired_block_in_file);
-        rewritten.push_str(&existing[after_end..]);
-        return Some(rewritten);
-    }
-
-    // No marker block yet — append with one blank-line separator from any
-    // pre-existing content.
-    let mut rewritten = String::with_capacity(existing.len() + desired_block_in_file.len() + 2);
-    rewritten.push_str(existing);
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        rewritten.push('\n');
-    }
-    if !existing.is_empty() {
-        rewritten.push('\n');
-    }
-    rewritten.push_str(&desired_block_in_file);
-    Some(rewritten)
+    crate::util::marker_splice::merge_marker_block(
+        existing,
+        GITIGNORE_MARKER_BEGIN,
+        GITIGNORE_MARKER_END,
+        GITIGNORE_BODY,
+    )
 }
 
 /// Ensure `.gitignore` at `project_root` contains a marker-delimited block that

@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 use task_mgr::commands::add::add;
-use task_mgr::commands::init::{init, PrefixMode};
+use task_mgr::commands::init::{PrefixMode, init};
 use tempfile::TempDir;
 
 const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
