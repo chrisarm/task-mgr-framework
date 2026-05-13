@@ -3257,10 +3257,42 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 // Aborts startup on dirty / un-merged anomalies; otherwise
                 // returns Ok and leaves the path clear for `ensure_slot_worktrees`.
                 let halt_threshold = project_config.merge_fail_halt_threshold;
+                // Reconcile auto-recovery (FEAT-005): try to merge stale
+                // ephemerals back into the base branch using the same
+                // preflight + ClaudeMergeResolver path live waves take. Owned
+                // strings live for the duration of the reconcile call only;
+                // the synthetic `run_id` is good enough for stash-tag
+                // disambiguation because real run-id allocation is downstream
+                // (Step 12 `run_cmd::begin`). The signal flag is fresh — no
+                // handler has been installed yet at this point in startup, so
+                // SIGINT/SIGTERM during the brief recovery window proceeds via
+                // the spawned Claude's own signal handling.
+                let recovery_signal_flag = SignalFlag::new();
+                let recovery_model = project_default_model
+                    .as_deref()
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or(model::SONNET_MODEL)
+                    .to_string();
+                let recovery_effort = project_config
+                    .merge_resolver_effort
+                    .clone()
+                    .unwrap_or_else(|| "medium".to_string());
+                let recovery_timeout =
+                    Duration::from_secs(project_config.merge_resolver_timeout_secs.unwrap_or(600));
+                let recovery_cfg = worktree::AutoRecoveryConfig {
+                    model: recovery_model.as_str(),
+                    effort: recovery_effort.as_str(),
+                    claude_timeout: recovery_timeout,
+                    signal_flag: recovery_signal_flag.inner(),
+                    db_dir: Some(run_config.db_dir.as_path()),
+                    run_id: "startup-reconcile",
+                    stash_limit: project_config.slot_stash_limit,
+                };
                 if let Err(e) = worktree::reconcile_stale_ephemeral_slots(
                     &run_config.source_root,
                     branch,
                     halt_threshold,
+                    Some(&recovery_cfg),
                 ) {
                     eprintln!(
                         "Error: stale ephemeral-slot reconcile aborted startup: {}",

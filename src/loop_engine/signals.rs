@@ -128,6 +128,15 @@ impl SignalFlag {
     pub fn inner(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.flag)
     }
+
+    /// Wrap a shared `Arc<AtomicBool>` as a `SignalFlag` so callers that need
+    /// to pass `&SignalFlag` to an existing API can do so without owning the
+    /// canonical flag. Used by `reconcile_stale_ephemeral_slots` (FEAT-005)
+    /// when it builds a one-off `ClaudeMergeResolver` at startup from an
+    /// `AutoRecoveryConfig` whose own `signal_flag` field is an `Arc<AtomicBool>`.
+    pub(crate) fn from_arc(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
 }
 
 impl Default for SignalFlag {

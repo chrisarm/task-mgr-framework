@@ -6,6 +6,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 
@@ -663,13 +666,37 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
     project_root: &Path,
     branch_name: &str,
     halt_threshold: u32,
+    auto_recovery: Option<&AutoRecoveryConfig<'_>>,
+) -> TaskMgrResult<()> {
+    reconcile_stale_ephemeral_slots_inner(
+        project_root,
+        branch_name,
+        halt_threshold,
+        auto_recovery,
+        None,
+    )
+}
+
+/// Same contract as [`reconcile_stale_ephemeral_slots`] but accepts an explicit
+/// `MergeResolver` injection point for unit tests. When `auto_recovery` is
+/// `Some` and `test_resolver` is `Some`, the injected resolver is used in
+/// place of the production [`crate::loop_engine::merge_resolver::ClaudeMergeResolver`]
+/// — letting tests exercise the resolver-Failed branch without spawning Claude.
+/// When `test_resolver` is `None`, behavior is identical to the public function
+/// (production callers always pass `None` for `test_resolver`).
+pub(crate) fn reconcile_stale_ephemeral_slots_inner(
+    project_root: &Path,
+    branch_name: &str,
+    halt_threshold: u32,
+    auto_recovery: Option<&AutoRecoveryConfig<'_>>,
+    test_resolver: Option<&dyn MergeResolver>,
 ) -> TaskMgrResult<()> {
     let branches = enumerate_stale_ephemeral_branches(project_root, branch_name)?;
     if branches.is_empty() {
         return Ok(());
     }
 
-    let (unmerged, dirty_paths) = classify_stale_branches(project_root, branch_name, &branches);
+    let (mut unmerged, dirty_paths) = classify_stale_branches(project_root, branch_name, &branches);
 
     // Emit warnings for un-merged branches whether or not we're going to
     // abort — the operator needs to see the commit subjects either way.
@@ -686,6 +713,8 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
 
     // Case 4: dirty worktrees always abort. They take precedence over
     // case 3 because the operator needs to inspect uncommitted work first.
+    // **Out of scope for FEAT-005 auto-recovery** — dirty worktrees still
+    // require operator intervention regardless of `auto_recovery`.
     if !dirty_paths.is_empty() {
         let paths_str: Vec<String> = dirty_paths
             .iter()
@@ -704,25 +733,194 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
         });
     }
 
+    // FEAT-005: when auto_recovery is Some, attempt per-branch merge-back of
+    // each stale un-merged ephemeral using FEAT-003/FEAT-004's preflight +
+    // resolver path. `slot0_path` is `project_root` because reconcile runs
+    // BEFORE `ensure_slot_worktrees` — slot 0 IS the loop's main worktree at
+    // startup. Build outcomes first, THEN re-emit warnings + mutate `unmerged`,
+    // so transient classification fluctuations cannot reorder the abort list.
+    let mut attempted_failed: Vec<String> = Vec::new();
+    if let Some(cfg) = auto_recovery
+        && !unmerged.is_empty()
+    {
+        // Build the resolver once for all auto-recovery attempts in this pass.
+        // SignalFlag wraps the Arc so the existing ClaudeMergeResolver API
+        // (which takes `Option<&SignalFlag>`) is satisfied without changing
+        // its public shape.
+        let signal_flag =
+            crate::loop_engine::signals::SignalFlag::from_arc(cfg.signal_flag.clone());
+        let claude_resolver = crate::loop_engine::merge_resolver::ClaudeMergeResolver {
+            model: cfg.model.to_string(),
+            db_dir: cfg.db_dir,
+            signal_flag: Some(&signal_flag),
+            claude_timeout: cfg.claude_timeout,
+            effort: cfg.effort.to_string(),
+        };
+        let resolver: &dyn MergeResolver = test_resolver.unwrap_or(&claude_resolver);
+
+        let mut recovered: Vec<String> = Vec::new();
+        for (ephemeral, _commits) in &unmerged {
+            match attempt_auto_recovery_for_branch(
+                project_root,
+                branch_name,
+                ephemeral,
+                cfg,
+                resolver,
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "auto-recovery: successfully merged stale ephemeral {} back into {} and deleted the branch",
+                        ephemeral, branch_name
+                    );
+                    recovered.push(ephemeral.clone());
+                }
+                Err(msg) => {
+                    eprintln!(
+                        "auto-recovery: failed to recover stale ephemeral {}: {}",
+                        ephemeral, msg
+                    );
+                    attempted_failed.push(ephemeral.clone());
+                }
+            }
+        }
+
+        // Remove successfully-recovered branches from `unmerged` so they no
+        // longer drive the case-3 abort decision below. Order of remaining
+        // entries is preserved (Vec::retain is stable) — important because
+        // the abort message lists branches in the order classification found
+        // them, and tests grep on that order.
+        if !recovered.is_empty() {
+            unmerged.retain(|(name, _)| !recovered.contains(name));
+        }
+    }
+
     // Case 3: un-merged ephemeral aborts only when halt_threshold > 0.
     // halt_threshold == 0 preserves the legacy permissive posture (warn-only).
     if halt_threshold > 0 && !unmerged.is_empty() {
         let names: Vec<String> = unmerged.iter().map(|(n, _)| n.clone()).collect();
+        let attempted_clause = if attempted_failed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (auto-recovery attempted and failed for: {})",
+                attempted_failed.join(", ")
+            )
+        };
         return Err(TaskMgrError::InvalidState {
             resource_type: "Stale ephemeral slot branch".to_string(),
             id: names.join(", "),
             expected: "no un-merged stale ephemeral branches at startup".to_string(),
             actual: format!(
-                "un-merged ephemeral branch(es): {}. \
+                "un-merged ephemeral branch(es): {}{}. \
                  Inspect with `git log {base}..<branch>`, then either merge into {base} \
                  or `git branch -D <branch>` if the work should be discarded.",
                 names.join(", "),
+                attempted_clause,
                 base = branch_name
             ),
         });
     }
 
     Ok(())
+}
+
+/// Attempt to auto-merge a single stale ephemeral back into the base branch.
+///
+/// Returns `Ok(())` when the ephemeral merged cleanly (via direct merge or
+/// resolver) AND the branch was successfully deleted. Any failure along the
+/// way — preflight stash error, merge attempt failure, resolver decline,
+/// stash limit exceeded, or branch deletion error — surfaces as `Err(msg)`
+/// so the caller can keep the branch in `unmerged` and fall through to the
+/// halt_threshold abort.
+///
+/// Cleanup runs unconditionally after the merge attempt regardless of which
+/// exit path is taken — mirrors `merge_slot_branches_with_resolver`'s
+/// "cleanup is structurally guaranteed" invariant.
+fn attempt_auto_recovery_for_branch(
+    project_root: &Path,
+    branch_name: &str,
+    ephemeral: &str,
+    cfg: &AutoRecoveryConfig<'_>,
+    resolver: &dyn MergeResolver,
+) -> Result<(), String> {
+    // Recover the slot index — should always parse because the entry came
+    // from `classify_stale_branches`, which routes malformed names to its
+    // Err arm (logged + skipped, never reaching `unmerged`). Treat a parse
+    // failure as a defensive error.
+    let suffix = ephemeral
+        .strip_prefix(&format!("{}-slot-", branch_name))
+        .ok_or_else(|| {
+            format!(
+                "internal: branch name {} does not match {}-slot-N",
+                ephemeral, branch_name
+            )
+        })?;
+    let slot: usize = suffix
+        .parse()
+        .map_err(|e| format!("internal: non-numeric slot suffix in {}: {}", ephemeral, e))?;
+
+    let prep = prepare_slot0_for_merge(project_root, slot, cfg.run_id)
+        .map_err(|e| format!("pre-merge prep failed: {}", e))?;
+
+    let attempt_result = run_slot_merge_attempt(slot, project_root, ephemeral, resolver);
+    let cleanup_result =
+        cleanup_preparation(&prep, project_root, slot, cfg.run_id, cfg.stash_limit);
+
+    // Surface cleanup diagnostics regardless of attempt outcome so a
+    // stash-pop conflict is never silently dropped on the floor.
+    match &cleanup_result {
+        CleanupOutcome::Restored => {}
+        CleanupOutcome::PopConflict { tag, conflicted } => {
+            eprintln!(
+                "auto-recovery: stash pop conflict on branch {} (tag {}, paths {:?}); stash retained on stack",
+                ephemeral, tag, conflicted
+            );
+        }
+        CleanupOutcome::StashLimitExceeded { count } => {
+            eprintln!(
+                "auto-recovery: stash count {} exceeded limit {} on branch {}; stash retained on stack",
+                count, cfg.stash_limit, ephemeral
+            );
+        }
+    }
+
+    match (attempt_result, cleanup_result) {
+        // Clean merge + clean cleanup OR pop-conflict (merge still succeeded
+        // and the stash is on the stack for operator review) → remove slot
+        // worktree (if still on disk) and delete the branch. Worktree removal
+        // happens first because `git branch -D` refuses to delete a branch
+        // that's checked out in any worktree.
+        (Ok(()), CleanupOutcome::Restored) | (Ok(()), CleanupOutcome::PopConflict { .. }) => {
+            let worktree_path = compute_slot_worktree_path(project_root, branch_name, slot);
+            if worktree_path.exists()
+                && let Err(e) = remove_worktree(project_root, &worktree_path)
+            {
+                return Err(format!(
+                    "merge succeeded but slot worktree removal failed: {}",
+                    e
+                ));
+            }
+            delete_branch_force(project_root, ephemeral)
+                .map_err(|e| format!("merge succeeded but branch delete failed: {}", e))
+        }
+        // Merge succeeded but stash limit tripped — refuse to delete because
+        // the repeated pop conflicts suggest a systemic dirty-WT problem the
+        // operator should inspect first.
+        (Ok(()), CleanupOutcome::StashLimitExceeded { count }) => Err(format!(
+            "merge succeeded but stash limit exceeded ({} > {}); branch left in place for operator review",
+            count, cfg.stash_limit
+        )),
+        // Merge attempt failed — fold cleanup detail into the diagnostic.
+        (Err((msg, _kind)), CleanupOutcome::Restored) => Err(msg),
+        (Err((msg, _kind)), CleanupOutcome::PopConflict { tag, conflicted }) => Err(format!(
+            "{} | pop conflict on tag {}: paths {:?}",
+            msg, tag, conflicted
+        )),
+        (Err((msg, _kind)), CleanupOutcome::StashLimitExceeded { count }) => Err(format!(
+            "{} | stash limit exceeded ({} > {})",
+            msg, count, cfg.stash_limit
+        )),
+    }
 }
 
 /// Prune stale worktree registry entries and return all `{branch}-slot-N`
@@ -917,6 +1115,29 @@ pub(crate) enum CleanupOutcome {
     },
     /// Per-slot per-run stash count exceeded `stash_limit` after a pop conflict.
     StashLimitExceeded { count: usize },
+}
+
+/// Spawn-side knobs for `reconcile_stale_ephemeral_slots` auto-recovery (FEAT-005).
+///
+/// Held as borrows because reconcile runs once at loop startup; all referenced
+/// values outlive the call. `signal_flag` is an `Arc<AtomicBool>` rather than a
+/// `&SignalFlag` so callers can pass a flag they've already cloned for other
+/// startup machinery without coupling lifetimes — `SignalFlag::from_arc`
+/// rewraps it for the `ClaudeMergeResolver`.
+///
+/// When `auto_recovery` is `None`, reconcile preserves its pre-FEAT-005
+/// behavior byte-for-byte (warn + abort on stale ephemerals). When `Some`,
+/// reconcile attempts to merge each stale ephemeral back into the base branch
+/// using the same preflight/resolver path as live waves: `prepare_slot0_for_merge`
+/// → `git merge --no-edit` → `ClaudeMergeResolver` on conflict → `cleanup_preparation`.
+pub(crate) struct AutoRecoveryConfig<'a> {
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub claude_timeout: Duration,
+    pub signal_flag: Arc<AtomicBool>,
+    pub db_dir: Option<&'a Path>,
+    pub run_id: &'a str,
+    pub stash_limit: u32,
 }
 
 /// If slot 0's working tree is dirty, stash everything (tracked + untracked)
@@ -4364,7 +4585,7 @@ detached
             "ephemeral branch should still exist before reconcile"
         );
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed for orphan-branch case");
 
         assert!(
@@ -4390,7 +4611,7 @@ detached
         assert!(slot1_path.exists());
         assert!(branch_exists(&project_root, &ephemeral));
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed for clean-merged case");
 
         assert!(
@@ -4413,7 +4634,7 @@ detached
         // Push slot 1 past base with a commit so it is no longer an ancestor.
         commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
 
-        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2);
+        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2, None);
         assert!(
             result.is_err(),
             "reconcile must abort when halt_threshold > 0 and un-merged ephemeral exists: {:?}",
@@ -4441,7 +4662,7 @@ detached
         commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
 
         // halt_threshold = 0 → legacy permissive: warn but proceed.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should return Ok when halt_threshold == 0");
 
         // Critical AC: must NOT delete in case 3 even with halt disabled.
@@ -4467,7 +4688,7 @@ detached
 
         // Dirty must abort regardless of halt_threshold.
         for halt in [0u32, 2u32] {
-            let result = reconcile_stale_ephemeral_slots(&project_root, branch, halt);
+            let result = reconcile_stale_ephemeral_slots(&project_root, branch, halt, None);
             assert!(
                 result.is_err(),
                 "dirty worktree must abort regardless of halt_threshold (halt={}): {:?}",
@@ -4493,7 +4714,7 @@ detached
         let project_root = tmp.path().to_path_buf();
 
         // No slot branches exist; pattern matches nothing → early Ok.
-        reconcile_stale_ephemeral_slots(&project_root, "feat/no-such-branch", 2)
+        reconcile_stale_ephemeral_slots(&project_root, "feat/no-such-branch", 2, None)
             .expect("empty branch list should produce Ok with no work");
     }
 
@@ -4520,7 +4741,7 @@ detached
         // ancestor-vs-tree-diff distinction at the same time.
         commit_on_slot(&slot_paths[0], "advance.txt", "advance base");
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should not abort because of malformed sibling");
 
         assert!(
@@ -4544,9 +4765,9 @@ detached
         let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
         let _ = slot_paths;
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0).expect("first pass");
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None).expect("first pass");
         // Second pass: nothing left matching the pattern → fast Ok.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("second pass should be a no-op Ok");
     }
 
@@ -4616,7 +4837,7 @@ detached
         // Slot 1 is at base's tip → classifies CleanMerged → cleaned up
         // normally so we also verify the slot-0 guard does not break the
         // legitimate-cleanup path.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed despite slot-0 stray branch");
 
         // Critical AC: main worktree must still exist.
@@ -4642,6 +4863,393 @@ detached
         assert!(
             !slot1_path.exists(),
             "legitimate slot 1 worktree should still be removed"
+        );
+    }
+
+    // ===== FEAT-005 auto-recovery tests =====
+
+    /// Test resolver that always returns a configured outcome. Used by the
+    /// auto-recovery conflict tests in lieu of spawning Claude. Captures
+    /// invocation count so tests can assert the resolver was reached
+    /// (or not).
+    struct AutoRecoveryFixedResolver {
+        outcome: MergeResolverOutcome,
+        invocations: std::cell::RefCell<u32>,
+    }
+
+    impl AutoRecoveryFixedResolver {
+        fn new(outcome: MergeResolverOutcome) -> Self {
+            Self {
+                outcome,
+                invocations: std::cell::RefCell::new(0),
+            }
+        }
+    }
+
+    impl MergeResolver for AutoRecoveryFixedResolver {
+        fn resolve(&self, _ctx: ResolverContext<'_>) -> MergeResolverOutcome {
+            *self.invocations.borrow_mut() += 1;
+            self.outcome.clone()
+        }
+    }
+
+    /// Build a minimal `AutoRecoveryConfig` whose Claude params are inert —
+    /// they're never consumed when callers pass a `test_resolver` via
+    /// `reconcile_stale_ephemeral_slots_inner`. The signal_flag is a fresh
+    /// (unset) Arc; the run_id is a fixed string so stash tags from the test
+    /// don't collide across runs.
+    fn make_recovery_cfg<'a>(run_id: &'a str, stash_limit: u32) -> AutoRecoveryConfig<'a> {
+        AutoRecoveryConfig {
+            model: "claude-sonnet-test",
+            effort: "medium",
+            claude_timeout: Duration::from_secs(60),
+            signal_flag: Arc::new(AtomicBool::new(false)),
+            db_dir: None,
+            run_id,
+            stash_limit,
+        }
+    }
+
+    /// AC: `reconcile_stale_ephemeral_slots(_, _, halt=2, None)` with an
+    /// un-merged ephemeral must produce the same `InvalidState` error it
+    /// produced before FEAT-005 — byte-for-byte regression guard.
+    #[test]
+    fn test_reconcile_auto_recovery_disabled_preserves_abort() {
+        let branch = "feat/recon-auto-disabled";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
+
+        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2, None);
+        assert!(
+            result.is_err(),
+            "auto_recovery=None with un-merged ephemeral + halt=2 must abort: {:?}",
+            result
+        );
+
+        // Branch and worktree must be preserved on abort regardless of FEAT-005.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch must be preserved when auto_recovery is None"
+        );
+        assert!(
+            slot1_path.exists(),
+            "ephemeral worktree must be preserved when auto_recovery is None"
+        );
+
+        // Abort message must NOT mention auto-recovery — confirms no
+        // recovery attempt happened.
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            !msg.contains("auto-recovery"),
+            "abort message must not mention auto-recovery when None was passed: {}",
+            msg
+        );
+    }
+
+    /// AC: clean-merge stale ephemeral + auto_recovery=Some → merge attempted
+    /// via `prepare → run_slot_merge_attempt → cleanup`, ephemeral deleted,
+    /// reconcile returns Ok, project_root HEAD advanced past the original
+    /// pre-merge commit so we know a real merge happened.
+    #[test]
+    fn test_reconcile_auto_recovery_succeeds_when_merge_clean() {
+        let branch = "feat/recon-auto-clean";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Slot 1 adds a new file — non-conflicting → fast-forward / clean merge.
+        commit_on_slot(
+            &slot1_path,
+            "slot1-feature.txt",
+            "non-conflicting slot 1 commit",
+        );
+        let pre_merge_head = rev_parse(&project_root, "HEAD");
+
+        let cfg = make_recovery_cfg("test-clean", 5);
+        // `test_resolver=None` here would be fine — there's no conflict to
+        // trigger it — but pass an explicit one so this test exercises the
+        // injection seam too.
+        let mock = AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("unreached".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_ok(),
+            "clean-merge auto-recovery must succeed: {:?}",
+            result
+        );
+        assert_eq!(
+            *mock.invocations.borrow(),
+            0,
+            "resolver must NOT be invoked on a clean merge"
+        );
+
+        // Branch + worktree both gone after successful recovery.
+        assert!(
+            !branch_exists(&project_root, &ephemeral),
+            "merged ephemeral branch must be deleted after auto-recovery"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "merged ephemeral worktree must be removed after auto-recovery"
+        );
+
+        let post_merge_head = rev_parse(&project_root, "HEAD");
+        assert_ne!(
+            post_merge_head, pre_merge_head,
+            "project_root HEAD must advance past pre-merge to prove a real merge ran"
+        );
+    }
+
+    /// AC: conflicting stale ephemeral + auto_recovery=Some + mock resolver
+    /// returns Failed → reconcile returns Err, abort message annotated with
+    /// "auto-recovery attempted and failed for: <branches>", branch + worktree
+    /// preserved for operator review.
+    #[test]
+    fn test_reconcile_auto_recovery_fails_falls_through_to_abort() {
+        let branch = "feat/recon-auto-fail";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Conflicting commit: slot 1 modifies a file that slot 0 will also
+        // modify out-of-band so `git merge --no-edit` exits non-zero.
+        fs::write(slot1_path.join("test_file.txt"), "slot-1 version").expect("write slot 1");
+        let add1 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot1_path)
+            .output()
+            .expect("git add slot 1");
+        assert!(add1.status.success());
+        let commit1 = Command::new("git")
+            .args(["commit", "-m", "slot 1 contended change"])
+            .current_dir(&slot1_path)
+            .output()
+            .expect("git commit slot 1");
+        assert!(commit1.status.success());
+
+        // Out-of-band conflicting commit on project_root (slot 0).
+        fs::write(project_root.join("test_file.txt"), "slot-0 version").expect("write slot 0");
+        let add0 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&project_root)
+            .output()
+            .expect("git add slot 0");
+        assert!(add0.status.success());
+        let commit0 = Command::new("git")
+            .args(["commit", "-m", "slot 0 out-of-band conflicting change"])
+            .current_dir(&project_root)
+            .output()
+            .expect("git commit slot 0");
+        assert!(commit0.status.success());
+
+        let cfg = make_recovery_cfg("test-fail", 5);
+        let mock =
+            AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("test refusal".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_err(),
+            "conflicting merge + resolver Failed must abort: {:?}",
+            result
+        );
+        assert!(
+            *mock.invocations.borrow() >= 1,
+            "resolver must have been invoked at least once for the conflict"
+        );
+
+        // Branch + worktree preserved on abort.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch must be preserved on auto-recovery failure"
+        );
+        assert!(
+            slot1_path.exists(),
+            "ephemeral worktree must be preserved on auto-recovery failure"
+        );
+
+        // Abort message annotation: AC requires "auto-recovery attempted and
+        // failed for: <branches>" naming the conflicting ephemeral.
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("auto-recovery attempted and failed for:"),
+            "abort message must include FEAT-005 attempt clause: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&ephemeral),
+            "abort message must name the failed branch {}: {}",
+            ephemeral,
+            msg
+        );
+    }
+
+    /// AC: dirty scratch.log in project_root + auto_recovery=Some +
+    /// clean-merge ephemeral → preflight stashes the dirty file, merge runs,
+    /// cleanup pops, reconcile returns Ok, scratch.log restored to its
+    /// dirty state post-call.
+    #[test]
+    fn test_reconcile_auto_recovery_handles_dirty_project_root() {
+        let branch = "feat/recon-auto-dirty-root";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+
+        commit_on_slot(&slot1_path, "slot1-non-conflicting.txt", "slot 1 new file");
+
+        // Make project_root dirty with an untracked log file (the exact
+        // scenario FEAT-001 gitignores but FEAT-003 preflight handles for
+        // residual cases).
+        fs::write(project_root.join("scratch.log"), "dirty log contents").expect("write scratch");
+
+        let cfg = make_recovery_cfg("test-dirty-root", 5);
+        let mock = AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("unreached".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_ok(),
+            "clean-merge auto-recovery must succeed even with a dirty project_root: {:?}",
+            result
+        );
+
+        // Post-call: scratch.log restored to its pre-merge dirty state.
+        let scratch = project_root.join("scratch.log");
+        assert!(
+            scratch.exists(),
+            "scratch.log must be restored by preflight cleanup"
+        );
+        let body = fs::read_to_string(&scratch).expect("read scratch.log");
+        assert_eq!(
+            body, "dirty log contents",
+            "scratch.log contents must survive stash+pop intact"
+        );
+    }
+
+    /// AC: two stale ephemerals — one clean-merges, the other conflicts and
+    /// the resolver declines → clean one auto-deleted; conflicting one
+    /// surfaces in abort message; reconcile returns Err.
+    #[test]
+    fn test_reconcile_auto_recovery_mixed_outcomes() {
+        let branch = "feat/recon-auto-mixed";
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path().to_path_buf();
+
+        // Spin up a 3-slot worktree topology so we have two ephemeral
+        // siblings to manipulate independently.
+        let paths = ensure_slot_worktrees(&project_root, branch, 3)
+            .expect("ensure_slot_worktrees in test setup");
+        let slot1_path = paths[1].clone();
+        let slot2_path = paths[2].clone();
+        let slot1_ephemeral = ephemeral_slot_branch(branch, 1);
+        let slot2_ephemeral = ephemeral_slot_branch(branch, 2);
+
+        // Slot 1: non-conflicting addition (will auto-merge clean).
+        commit_on_slot(
+            &slot1_path,
+            "slot1-new.txt",
+            "slot 1 non-conflicting commit",
+        );
+
+        // Slot 2: conflicting commit on test_file.txt.
+        fs::write(slot2_path.join("test_file.txt"), "slot-2 version").expect("write slot 2");
+        let add2 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot2_path)
+            .output()
+            .expect("git add slot 2");
+        assert!(add2.status.success());
+        let commit2 = Command::new("git")
+            .args(["commit", "-m", "slot 2 contended change"])
+            .current_dir(&slot2_path)
+            .output()
+            .expect("git commit slot 2");
+        assert!(commit2.status.success());
+
+        // Out-of-band conflicting commit on project_root targeting same file.
+        fs::write(project_root.join("test_file.txt"), "slot-0 version").expect("write slot 0");
+        let add0 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&project_root)
+            .output()
+            .expect("git add slot 0");
+        assert!(add0.status.success());
+        let commit0 = Command::new("git")
+            .args(["commit", "-m", "slot 0 conflicting change"])
+            .current_dir(&project_root)
+            .output()
+            .expect("git commit slot 0");
+        assert!(commit0.status.success());
+
+        let cfg = make_recovery_cfg("test-mixed", 5);
+        let mock =
+            AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("test refusal".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_err(),
+            "mixed-outcome reconcile must abort because slot 2 conflict survived: {:?}",
+            result
+        );
+
+        // Slot 1 was successfully auto-merged → branch + worktree gone.
+        assert!(
+            !branch_exists(&project_root, &slot1_ephemeral),
+            "slot 1 ephemeral (clean-merge) must be deleted after auto-recovery"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "slot 1 worktree (clean-merge) must be removed after auto-recovery"
+        );
+
+        // Slot 2 conflicted + resolver declined → preserved for operator.
+        assert!(
+            branch_exists(&project_root, &slot2_ephemeral),
+            "slot 2 ephemeral (conflicting) must be preserved on resolver failure"
+        );
+        assert!(
+            slot2_path.exists(),
+            "slot 2 worktree (conflicting) must be preserved on resolver failure"
+        );
+
+        // Abort message names slot 2's branch but NOT slot 1's (which was
+        // recovered before the abort decision).
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains(&slot2_ephemeral),
+            "abort message must name slot 2's branch {}: {}",
+            slot2_ephemeral,
+            msg
+        );
+        assert!(
+            !msg.contains(&slot1_ephemeral),
+            "abort message must NOT name slot 1's branch (it was recovered): {}",
+            msg
+        );
+        assert!(
+            msg.contains("auto-recovery attempted and failed for:"),
+            "abort message must include FEAT-005 attempt clause for mixed outcomes: {}",
+            msg
         );
     }
 
