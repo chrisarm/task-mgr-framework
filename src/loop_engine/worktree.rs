@@ -1144,6 +1144,16 @@ pub(crate) struct AutoRecoveryConfig<'a> {
 /// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
 ///
 /// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`
+///
+/// # Errors
+///
+/// - `git status` spawn failure (OS could not exec git)
+/// - `git status` non-zero exit (e.g. not a git repo, permissions)
+/// - `git stash push` spawn failure (OS could not exec git)
+/// - `git stash push` non-zero exit (e.g. nothing stashable, index locked)
+///
+/// On any error the working tree is unchanged — no stash was created, so no
+/// cleanup is needed.
 pub(crate) fn prepare_slot0_for_merge(
     slot0_path: &Path,
     slot: usize,
@@ -1654,6 +1664,23 @@ impl MergeResolver for NoOpResolver {
 /// After the merge loop, successfully-merged slots are fast-forwarded; if
 /// their fast-forward fails the slot is demoted from `merged_slots` to
 /// `failed_slots`.
+///
+/// `run_id` is embedded in stash tags (`task-mgr-slot-{slot}-{run_id}-{epoch_ms}`)
+/// so concurrent loops do not poach each other's stashes.
+///
+/// `stash_limit` caps how many stashes with the same slot prefix may accumulate
+/// before the slot is demoted to `failed_slots(PreResolver)`. Repeated pop
+/// conflicts indicate a systemic dirty-working-tree problem; bounding the
+/// stash count prevents unbounded growth and trips the consecutive-merge-fail
+/// halt threshold. Default (from `ProjectConfig`) is 5.
+/// Set `poisoned` to `msg` when a cleanup reset failure has made slot 0's HEAD
+/// unreliable. Only fires for `PreResolver` kind with the sentinel substring.
+fn maybe_poison_slot0(poisoned: &mut Option<String>, msg: &str, kind: &SlotFailureKind) {
+    if *kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
+        *poisoned = Some(msg.to_owned());
+    }
+}
+
 pub(crate) fn merge_slot_branches_with_resolver(
     _project_root: &Path,
     branch_name: &str,
@@ -1756,9 +1783,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
             (Err((msg, kind)), CleanupOutcome::Restored) => {
                 // PreResolver kind from handle_conflict_for_slot is the
                 // signal that a cleanup reset failed — poison slot 0.
-                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
-                    slot0_poisoned = Some(msg.clone());
-                }
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
                 outcomes.failed_slots.push((slot, msg, kind));
             }
             (Err((msg, kind)), CleanupOutcome::PopConflict { tag, conflicted }) => {
@@ -1766,9 +1791,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
                     "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack",
                     slot, tag, conflicted
                 );
-                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
-                    slot0_poisoned = Some(msg.clone());
-                }
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
                 outcomes.failed_slots.push((
                     slot,
                     format!(
@@ -1783,9 +1806,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
                     "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
                     slot, count, stash_limit
                 );
-                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
-                    slot0_poisoned = Some(msg.clone());
-                }
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
                 outcomes.failed_slots.push((
                     slot,
                     format!(
