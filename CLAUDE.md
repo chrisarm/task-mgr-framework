@@ -121,6 +121,16 @@ review session is fully interactive. `ANTHROPIC_API_KEY` and other env vars inhe
 
 **Invariant**: auto-review failure NEVER changes the loop or batch exit code.
 
+**Known footgun — paths with whitespace**: `ProcessLauncher::launch`
+(`src/loop_engine/auto_review.rs:130`) interpolates the PRD path into a single
+slash-command argv element: `format!("/review-loop {}", md.display())`. Claude
+re-tokenizes the slash-command body on whitespace, so a PRD path containing
+spaces (e.g. `tasks/My PRD.md`) splits into multiple tokens and the review
+launch fails to find the file. Not a security issue (no shell, `Command::arg`
+is safe), but project convention is space-free `tasks/<feature>.md` paths for
+exactly this reason — keep it that way. If the Claude CLI grows a structured
+args form, prefer that over in-band quoting.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
