@@ -897,7 +897,6 @@ fn is_worktree_dirty(worktree_path: &Path) -> Result<bool, String> {
 
 /// What `prepare_slot0_for_merge` found and did.
 // FEAT-004 wires these into merge_slot_branches_with_resolver.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum MergePreparation {
     /// Working tree was clean; nothing to do.
@@ -907,8 +906,6 @@ pub(crate) enum MergePreparation {
 }
 
 /// Outcome of `cleanup_preparation`.
-// FEAT-004 wires these into merge_slot_branches_with_resolver.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum CleanupOutcome {
     /// Stash was popped (or there was nothing to restore); working tree restored.
@@ -926,7 +923,6 @@ pub(crate) enum CleanupOutcome {
 /// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
 ///
 /// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`
-#[allow(dead_code)]
 pub(crate) fn prepare_slot0_for_merge(
     slot0_path: &Path,
     slot: usize,
@@ -974,7 +970,6 @@ pub(crate) fn prepare_slot0_for_merge(
 /// (never dropped); returns `PopConflict` unless the per-slot per-run stash
 /// count exceeds `stash_limit`, in which case returns `StashLimitExceeded`.
 /// NEVER calls `git checkout --`, `git reset --hard`, or `git stash drop`.
-#[allow(dead_code)]
 pub(crate) fn cleanup_preparation(
     prep: &MergePreparation,
     slot0_path: &Path,
@@ -1034,7 +1029,6 @@ pub(crate) fn cleanup_preparation(
 /// Look up the stash ref (e.g. `stash@{2}`) whose subject equals `tag`.
 /// Uses `--format=%gd %gs` and splits on the first space only so multi-word
 /// subjects don't truncate.
-#[allow(dead_code)]
 fn resolve_stash_ref_by_tag(path: &Path, tag: &str) -> Result<Option<String>, String> {
     let output = Command::new("git")
         .args(["stash", "list", "--format=%gd %gs"])
@@ -1068,7 +1062,6 @@ fn resolve_stash_ref_by_tag(path: &Path, tag: &str) -> Result<Option<String>, St
 }
 
 /// Count how many stash entries have a subject starting with `prefix`.
-#[allow(dead_code)]
 fn count_stashes_with_prefix(path: &Path, prefix: &str) -> Result<usize, String> {
     let output = Command::new("git")
         .args(["stash", "list", "--format=%gs"])
@@ -1446,6 +1439,8 @@ pub(crate) fn merge_slot_branches_with_resolver(
     num_slots: usize,
     resolver: &dyn MergeResolver,
     slot_paths: &[PathBuf],
+    run_id: &str,
+    stash_limit: u32,
 ) -> MergeOutcomes {
     let mut outcomes = MergeOutcomes::default();
     if num_slots <= 1 {
@@ -1474,7 +1469,9 @@ pub(crate) fn merge_slot_branches_with_resolver(
     // slot iterations cannot trust their own `rev_parse_head` capture as a
     // reset target. Once poisoned, every remaining slot short-circuits to a
     // PreResolver failure with a clear diagnostic so the operator can see
-    // why slots after the failure point did nothing.
+    // why slots after the failure point did nothing. Once poisoned, prepare
+    // AND cleanup are skipped for remaining slots — neither can be trusted
+    // to operate against an unknown working-tree shape.
     let mut slot0_poisoned: Option<String> = None;
 
     for slot in 1..num_slots {
@@ -1490,56 +1487,139 @@ pub(crate) fn merge_slot_branches_with_resolver(
             continue;
         }
         let ephemeral = ephemeral_slot_branch(branch_name, slot);
-        let pre_merge_head = match rev_parse_head(slot0_path) {
-            Ok(h) => h,
+
+        // FEAT-004: stash any dirty working-tree state before the merge so
+        // the merge precondition never trips on residual log files or build
+        // artifacts. On prepare failure, the side effect has not been
+        // committed to disk — no cleanup is needed or wanted.
+        let prep = match prepare_slot0_for_merge(slot0_path, slot, run_id) {
+            Ok(p) => p,
             Err(e) => {
                 outcomes.failed_slots.push((
                     slot,
-                    format!("rev-parse: {}", e),
+                    format!("pre-merge prep failed: {}", e),
                     SlotFailureKind::PreResolver,
                 ));
                 continue;
             }
         };
-        let merge_result = Command::new("git")
-            .args(["merge", "--no-edit", &ephemeral])
-            .current_dir(slot0_path)
-            .output();
-        match merge_result {
-            Ok(output) if output.status.success() => outcomes.merged_slots.push(slot),
-            Ok(output) => {
-                let detail = format_git_failure(&output.stdout, &output.stderr);
-                match handle_conflict_for_slot(
-                    slot,
-                    slot0_path,
-                    &ephemeral,
-                    &pre_merge_head,
-                    &detail,
-                    resolver,
-                ) {
-                    Ok(()) => outcomes.merged_slots.push(slot),
-                    Err((msg, kind)) => {
-                        // PreResolver kind from handle_conflict_for_slot is the
-                        // signal that a cleanup reset failed — poison slot 0.
-                        if kind == SlotFailureKind::PreResolver
-                            && msg.contains("reset cleanup failed")
-                        {
-                            slot0_poisoned = Some(msg.clone());
-                        }
-                        outcomes.failed_slots.push((slot, msg, kind));
-                    }
-                }
+
+        let attempt_result = run_slot_merge_attempt(slot, slot0_path, &ephemeral, resolver);
+        let cleanup_result = cleanup_preparation(&prep, slot0_path, slot, run_id, stash_limit);
+
+        match (attempt_result, cleanup_result) {
+            (Ok(()), CleanupOutcome::Restored) => {
+                outcomes.merged_slots.push(slot);
             }
-            Err(e) => outcomes.failed_slots.push((
-                slot,
-                format!("git merge spawn: {}", e),
-                SlotFailureKind::PreResolver,
-            )),
+            (Ok(()), CleanupOutcome::PopConflict { tag, conflicted }) => {
+                eprintln!(
+                    "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack — slot still merged",
+                    slot, tag, conflicted
+                );
+                outcomes.merged_slots.push(slot);
+            }
+            (Ok(()), CleanupOutcome::StashLimitExceeded { count }) => {
+                eprintln!(
+                    "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
+                    slot, count, stash_limit
+                );
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "stash limit exceeded ({} > {}) after successful merge",
+                        count, stash_limit
+                    ),
+                    SlotFailureKind::PreResolver,
+                ));
+            }
+            (Err((msg, kind)), CleanupOutcome::Restored) => {
+                // PreResolver kind from handle_conflict_for_slot is the
+                // signal that a cleanup reset failed — poison slot 0.
+                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
+                    slot0_poisoned = Some(msg.clone());
+                }
+                outcomes.failed_slots.push((slot, msg, kind));
+            }
+            (Err((msg, kind)), CleanupOutcome::PopConflict { tag, conflicted }) => {
+                eprintln!(
+                    "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack",
+                    slot, tag, conflicted
+                );
+                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
+                    slot0_poisoned = Some(msg.clone());
+                }
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "{} | pop conflict on tag {}: paths {:?}",
+                        msg, tag, conflicted
+                    ),
+                    kind,
+                ));
+            }
+            (Err((msg, kind)), CleanupOutcome::StashLimitExceeded { count }) => {
+                eprintln!(
+                    "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
+                    slot, count, stash_limit
+                );
+                if kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
+                    slot0_poisoned = Some(msg.clone());
+                }
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "{} | stash limit exceeded ({} > {})",
+                        msg, count, stash_limit
+                    ),
+                    SlotFailureKind::PreResolver,
+                ));
+            }
         }
     }
 
     fast_forward_merged_slots(&mut outcomes, slot_paths, branch_name);
     outcomes
+}
+
+/// Per-slot merge-attempt body: captures `pre_merge_head` AFTER any preflight
+/// has run, then runs `git merge --no-edit <ephemeral>` and invokes the
+/// resolver if needed. Returns `Ok(())` on a clean merge or a verified
+/// resolver-resolved merge; `Err((diagnostic, kind))` on any failure.
+///
+/// Extracted from `merge_slot_branches_with_resolver` so that cleanup of the
+/// preflight stash is structurally guaranteed to run exactly once per slot
+/// regardless of which exit path the attempt takes (rev-parse failure,
+/// spawn failure, clean success, or any conflict-handling branch).
+fn run_slot_merge_attempt(
+    slot: usize,
+    slot0_path: &Path,
+    ephemeral: &str,
+    resolver: &dyn MergeResolver,
+) -> Result<(), (String, SlotFailureKind)> {
+    let pre_merge_head = rev_parse_head(slot0_path)
+        .map_err(|e| (format!("rev-parse: {}", e), SlotFailureKind::PreResolver))?;
+    let merge_result = Command::new("git")
+        .args(["merge", "--no-edit", ephemeral])
+        .current_dir(slot0_path)
+        .output();
+    match merge_result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let detail = format_git_failure(&output.stdout, &output.stderr);
+            handle_conflict_for_slot(
+                slot,
+                slot0_path,
+                ephemeral,
+                &pre_merge_head,
+                &detail,
+                resolver,
+            )
+        }
+        Err(e) => Err((
+            format!("git merge spawn: {}", e),
+            SlotFailureKind::PreResolver,
+        )),
+    }
 }
 
 /// `git reset --hard <commit>` in `repo_path`. Returns `Err` with formatted
@@ -2832,8 +2912,15 @@ detached
                 .expect("git commit in slot");
         }
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            3,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
         assert!(
             outcomes.failed_slots.is_empty(),
             "disjoint changes must merge cleanly: {:?}",
@@ -2917,8 +3004,15 @@ detached
 
         let pre_merge_head = rev_parse(&slot0, "HEAD");
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            3,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
 
         assert_eq!(
             outcomes.merged_slots,
@@ -3020,6 +3114,8 @@ detached
             2,
             &NoOpResolver,
             &slot_paths,
+            "test-run",
+            5,
         );
 
         assert!(
@@ -3293,8 +3389,15 @@ detached
             );
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert_eq!(*resolver.invocations.borrow(), 1, "resolver called once");
         assert!(
@@ -3347,8 +3450,15 @@ detached
             assert!(out.status.success(), "merge --abort should succeed");
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -3389,8 +3499,15 @@ detached
         // Resolver does nothing (simulating a hard error before any cleanup).
         let resolver = MockResolver::new(MergeResolverOutcome::Failed("timed out".into()), |_| {});
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -3430,8 +3547,15 @@ detached
         // should still be set after this no-op runs.
         let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |_| {});
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -3481,8 +3605,15 @@ detached
             assert!(out.status.success());
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -3511,6 +3642,8 @@ detached
             2,
             &NoOpResolver,
             &slot_paths,
+            "test-run",
+            5,
         );
         assert_eq!(outcomes.failed_slots.len(), 1);
         let (_, _, kind) = &outcomes.failed_slots[0];
@@ -3518,6 +3651,437 @@ detached
             *kind,
             SlotFailureKind::PreResolver,
             "rev-parse failure before resolver invocation must be PreResolver kind"
+        );
+    }
+
+    /// FEAT-004 (1): clean slot 0 + disjoint slot-1 commit → merged_slots = [1],
+    /// no chore commit appears on the base branch (preflight must not
+    /// auto-commit), and no stash entry is created (clean WT path).
+    #[test]
+    fn test_merge_back_clean_wt_unchanged_behavior() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/clean-wt-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: clean disjoint commit
+        fs::write(paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(outcomes.merged_slots, vec![1], "{:?}", outcomes);
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        // No `chore` commit on the base branch.
+        let log_out = Command::new("git")
+            .args(["log", "--grep", "^chore", "--format=%H"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git log");
+        assert!(log_out.status.success(), "git log failed");
+        let log = String::from_utf8_lossy(&log_out.stdout);
+        assert!(
+            log.trim().is_empty(),
+            "no chore commit must exist on base branch: {}",
+            log
+        );
+
+        // No stash entry exists on the clean-WT path.
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        assert!(stash_out.status.success());
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.trim().is_empty(),
+            "stash list should be empty for clean WT path: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (2): dirty unrelated file (scratch.log untracked) → preflight
+    /// stashes it, merge succeeds cleanly, pop restores scratch.log; stash
+    /// list ends up empty.
+    #[test]
+    fn test_merge_back_stashes_dirty_unrelated_file() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/stash-dirty-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: clean disjoint commit (slot-1-file.txt — does NOT touch scratch.log).
+        fs::write(paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log.
+        fs::write(paths[0].join("scratch.log"), "stray log line\n").expect("write scratch");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should merge cleanly: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        // Post-merge: scratch.log restored from stash → shows up in status.
+        let status_out = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status.contains("scratch.log"),
+            "scratch.log should be back as untracked after pop: {}",
+            status
+        );
+
+        // Stash list should be empty after a clean pop.
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.trim().is_empty(),
+            "stash list should be empty after clean pop: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (3): dirty scratch.log + slot-1 also commits scratch.log → pop
+    /// conflict. Slot stays in merged_slots, stash retained on stack with tag
+    /// matching our run prefix, warning emitted to stderr.
+    #[test]
+    fn test_merge_back_pop_conflict_keeps_stash_and_warns() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/pop-conflict-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: commits scratch.log (so slot 0 will receive it via merge).
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log with DIFFERENT content.
+        fs::write(paths[0].join("scratch.log"), "local dirty content\n")
+            .expect("write slot 0 scratch");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should still be in merged_slots after pop conflict: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "slot must NOT be demoted: {:?}",
+            outcomes.failed_slots
+        );
+
+        // Stash should be retained with the expected per-run tag prefix.
+        let stash_out = Command::new("git")
+            .args(["stash", "list", "--format=%gs"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.contains("task-mgr-slot-1-test-run-"),
+            "stash list should retain entry with our run prefix: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (4): pre-seed `stash_limit` stashes with our run prefix; then
+    /// trigger a pop conflict. Final count = stash_limit + 1 > stash_limit →
+    /// slot demoted to failed_slots(PreResolver) with diagnostic mentioning
+    /// the stash limit.
+    #[test]
+    fn test_merge_back_excessive_stash_count_demotes_slot() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/stash-overflow-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        let stash_limit: u32 = 3;
+
+        // Pre-seed `stash_limit` stashes with the SAME prefix our run will use.
+        for i in 0..stash_limit {
+            fs::write(paths[0].join("seed.txt"), format!("seed {}", i)).expect("write seed");
+            let tag = format!("task-mgr-slot-1-test-run-seed-{}", i);
+            let out = Command::new("git")
+                .args(["stash", "push", "--include-untracked", "-m", &tag])
+                .current_dir(&paths[0])
+                .output()
+                .expect("git stash push seed");
+            assert!(
+                out.status.success(),
+                "seed stash {} failed: {}",
+                i,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // Slot 1: commits scratch.log.
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log (will conflict on pop).
+        fs::write(paths[0].join("scratch.log"), "local dirty\n").expect("write");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            stash_limit,
+        );
+
+        assert!(
+            outcomes.merged_slots.is_empty(),
+            "slot must be demoted, not in merged_slots: {:?}",
+            outcomes.merged_slots
+        );
+        assert_eq!(
+            outcomes.failed_slots.len(),
+            1,
+            "exactly one slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+        let (slot, msg, kind) = &outcomes.failed_slots[0];
+        assert_eq!(*slot, 1);
+        assert_eq!(
+            *kind,
+            SlotFailureKind::PreResolver,
+            "stash-limit demotion must use PreResolver kind"
+        );
+        assert!(
+            msg.contains("stash limit exceeded"),
+            "diagnostic should mention stash limit: {}",
+            msg
+        );
+    }
+
+    /// FEAT-004 (5): run_id isolation — pre-seed `stash_limit` stashes for a
+    /// DIFFERENT run_id; trigger a pop conflict. Count of OUR run prefix is
+    /// just 1 (the new prep stash), so no demotion fires.
+    #[test]
+    fn test_merge_back_run_id_isolates_stash_tags() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/run-id-isolate-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        let stash_limit: u32 = 3;
+
+        // Pre-seed `stash_limit` stashes with a DIFFERENT run_id prefix.
+        for i in 0..stash_limit {
+            fs::write(paths[0].join("seed.txt"), format!("seed {}", i)).expect("write seed");
+            let tag = format!("task-mgr-slot-1-other-run-seed-{}", i);
+            let out = Command::new("git")
+                .args(["stash", "push", "--include-untracked", "-m", &tag])
+                .current_dir(&paths[0])
+                .output()
+                .expect("git stash push seed");
+            assert!(out.status.success());
+        }
+
+        // Slot 1: commits scratch.log.
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty conflicting scratch.log.
+        fs::write(paths[0].join("scratch.log"), "local dirty\n").expect("write");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            stash_limit,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "per-run scoping should prevent demotion: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+    }
+
+    /// FEAT-004 (6): resolver path with preflight in play. Dirty scratch.log
+    /// (untouched by slot 1) + a separate contended.txt that slot 1 conflicts
+    /// on (resolver fixes it). End state: slot merged, HEAD advances, stash
+    /// pops cleanly because scratch.log is unrelated to the conflict.
+    #[test]
+    fn test_merge_back_resolver_path_works_with_preflight() {
+        let branch = "feat/resolver-preflight-feat004";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
+
+        // Dirty an UNRELATED file in slot 0 so preflight stashes it.
+        fs::write(slot0.join("scratch.log"), "dirty scratch\n").expect("write scratch");
+
+        let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
+            fs::write(slot0_path.join("contended.txt"), "resolved version").expect("write");
+            let out = Command::new("git")
+                .args(["commit", "-am", "resolve conflict"])
+                .current_dir(slot0_path)
+                .output()
+                .expect("git commit");
+            assert!(
+                out.status.success(),
+                "merge-commit should succeed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        });
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should merge via resolver: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        let post = rev_parse(&slot0, "HEAD");
+        assert_ne!(post, pre_merge_head, "HEAD must advance past pre-merge");
+
+        // scratch.log restored (stash popped on top of the resolved commit).
+        let status_out = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status.contains("scratch.log"),
+            "scratch.log should be back after clean stash pop: {}",
+            status
+        );
+
+        // Stash list should be empty (clean pop).
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git stash list");
+        assert!(
+            String::from_utf8_lossy(&stash_out.stdout).trim().is_empty(),
+            "stash list should be empty after clean pop"
         );
     }
 

@@ -1813,6 +1813,8 @@ pub fn run_wave_iteration(
             params.parallel_slots,
             &resolver,
             params.slot_worktree_paths,
+            params.run_id,
+            params.project_config.slot_stash_limit,
         );
         for (slot, detail, kind) in &outcomes.failed_slots {
             if *kind == worktree::SlotFailureKind::ResolverAttempted {
