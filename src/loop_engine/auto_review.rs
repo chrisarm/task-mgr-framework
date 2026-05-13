@@ -247,6 +247,17 @@ pub fn maybe_fire(
         }
     };
 
+    if md.to_string_lossy().chars().any(char::is_whitespace) {
+        eprintln!(
+            "[auto-review] PRD path `{}` contains whitespace; Claude's slash-command \
+             parser would fragment it. Rename the file to remove spaces/tabs, then \
+             run `claude \"/review-loop {}\"` manually.",
+            md.display(),
+            md.display()
+        );
+        return;
+    }
+
     if let Err(e) = launcher.launch(&md, worktree) {
         eprintln!(
             "[auto-review] failed to launch claude ({}); \
@@ -496,5 +507,51 @@ mod tests {
         maybe_fire(&default_config(), false, false, &result, &json, &launcher);
 
         assert!(launcher.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn maybe_fire_suppresses_when_md_path_contains_whitespace() {
+        let tmp = TempDir::new().unwrap();
+        // Name both the .json and .md with a space so prd_md_path resolves to the spaced path
+        let md = tmp.path().join("My PRD.md");
+        std::fs::write(&md, "").unwrap();
+        let json = tmp.path().join("My PRD.json");
+
+        let launcher = CapturingLauncher::new();
+        let result = passing_result(&tmp);
+        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+
+        assert!(launcher.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn maybe_fire_suppresses_when_md_path_contains_tab() {
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("My\tPRD.md");
+        std::fs::write(&md, "").unwrap();
+        let json = tmp.path().join("My\tPRD.json");
+
+        let launcher = CapturingLauncher::new();
+        let result = passing_result(&tmp);
+        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+
+        assert!(launcher.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn maybe_fire_proceeds_when_md_path_has_no_whitespace() {
+        if !std::io::stdout().is_terminal() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("my-prd.md");
+        std::fs::write(&md, "").unwrap();
+        let json = tmp.path().join("my-prd.json");
+
+        let launcher = CapturingLauncher::new();
+        let result = passing_result(&tmp);
+        maybe_fire(&default_config(), false, false, &result, &json, &launcher);
+
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
     }
 }
