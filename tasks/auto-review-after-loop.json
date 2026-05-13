@@ -1,0 +1,495 @@
+{
+  "branchName": "feat/auto-review-after-loop",
+  "description": "After a successful autonomous loop run (or batch), auto-launch `claude /review-loop tasks/<prd>.md` in an interactive session. Default-on, gated to runs with >=3 completed tasks. CLI flags --auto-review / --no-auto-review and ProjectConfig fields (autoReview, autoReviewMinTasks) override defaults. Batch mode fires once for the LAST successful PRD meeting the threshold.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings`",
+      "Rust: All scoped tests pass with `cargo test -p task-mgr <scope>` (full suite at REVIEW-001 only)",
+      "Rust: `cargo fmt --check` passes",
+      "No `unwrap()` in production paths — use `map_err` / `?` / explicit `match`",
+      "No breaking changes to existing public APIs unless explicitly required by the task",
+      "Auto-review never causes the loop to exit non-zero — preflight failures print a hint and return Ok"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Auto-review launch that masks a successful loop with its own failure — review launch errors must NEVER turn a passing loop into a failing one",
+    "Spawning the interactive Claude with `--print` or `-p` (those force non-interactive) — must be a true TTY-attached session"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "7a9519ac",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `ProjectConfig::default().auto_review == true`",
+        "Positive: `ProjectConfig::default().auto_review_min_tasks == 3`",
+        "Positive: Reading `.task-mgr/config.json` with `{}` produces `auto_review=true, auto_review_min_tasks=3`",
+        "Positive: Reading `{\"autoReview\": false}` produces `auto_review=false, auto_review_min_tasks=3` (other field defaulted)",
+        "Positive: Reading `{\"autoReviewMinTasks\": 5}` produces `auto_review=true, auto_review_min_tasks=5`",
+        "Positive: Reading `{\"autoReview\": false, \"autoReviewMinTasks\": 0}` round-trips with both values exact",
+        "Positive: snake_case keys are rejected — reading `{\"auto_review\": false}` does NOT set the field; the camelCase `rename_all` on the struct enforces this and the field stays at its default `true` (regression test)",
+        "Negative: No literal `true` or `3` for these fields in the Default impl — both go through the named default fns (grep -nE 'auto_review.*true|auto_review_min_tasks.*3' src/loop_engine/project_config.rs returns matches only in the default fns)",
+        "Unit test: `test_auto_review_default_is_true` covers Default impl + missing-file + empty-JSON cases",
+        "Unit test: `test_auto_review_min_tasks_default_is_three` same pattern",
+        "Unit test: `test_auto_review_round_trips_from_json` covers explicit values + serde camelCase mapping",
+        "Known-bad: if the field is added with `#[serde(default)]` (no fn name), the test reading `{}` sees `auto_review=false` (the bool's Default::default()), not `true` — the round-trip test must catch this by reading `{}` and asserting `true`",
+        "Failure mode: malformed JSON (unrelated to these fields) — existing `read_project_config` returns `ProjectConfig::default()` which must produce `true, 3`"
+      ],
+      "dependsOn": [],
+      "description": "Add two new optional fields to `ProjectConfig` in `src/loop_engine/project_config.rs` so users can configure the new auto-review feature via `.task-mgr/config.json`.\n\nDO:\n- Add `pub auto_review: bool` with `#[serde(default = \"default_auto_review\")]`, default `true`\n- Add `pub auto_review_min_tasks: u32` with `#[serde(default = \"default_auto_review_min_tasks\")]`, default `3`\n- Add the two `default_*` fns next to existing `default_merge_fail_halt_threshold` at lines 155-157\n- Update `impl Default for ProjectConfig` at line 100-119 to populate both fields via the default fns (NOT hardcoded literals — keep one source of truth)\n- Add unit tests following the `merge_fail_halt_threshold` pattern at lines 493-535: default-when-missing, default-when-file-missing, explicit-value, JSON round-trip\n\nDO NOT:\n- Hardcode the default in two places (defaults must come from the named fns)\n- Use `Option<bool>` for `auto_review` — a bool with a default fn is cleaner and matches `merge_fail_halt_threshold`'s u32 pattern\n- Touch any other field in the struct (this is additive only)\n\nEdge cases:\n- Empty `{}` config.json → both defaults applied (true, 3)\n- Missing config.json → defaults via `read_project_config`'s `Err(_)` arm\n- Invalid JSON → defaults (existing `unwrap_or_else` already handles)\n- `{\"autoReview\": false}` only → `auto_review=false`, `auto_review_min_tasks=3`\n- `{\"autoReviewMinTasks\": 0}` → loaded as `0` (will be filtered out by `should_fire` since `tasks_completed >= 0` is always true; explicitly fine)\n\nKnown-bad to guard against:\n- A `default_value_t` on a struct field is a clap pattern, not serde — must use `#[serde(default = \"...\")]` with a named fn\n- `#[serde(default)]` without a fn name uses `Default::default()` which is `false` for bool / `0` for usize — wrong defaults",
+      "edgeCases": [
+        "Empty `{}` JSON → both defaults applied (true, 3)",
+        "Missing config.json entirely → defaults via Err(_) arm",
+        "Only one field set, other implicit → other gets default",
+        "autoReviewMinTasks = 0 → loaded exactly (no clamping at this layer)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Forgetting #[serde(default = \"fn\")] and using #[serde(default)]",
+          "expectedBehavior": "Round-trip test on {} catches this — auto_review would be false not true"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Follow the exact pattern of merge_fail_halt_threshold at project_config.rs:78-89 (declaration with #[serde(default = \"default_merge_fail_halt_threshold\")]), line 115 (Default impl), lines 155-157 (default fn), lines 493-535 (test cases). Learning [1401]: Embedding config in ProjectConfig with sensible defaults — pattern matches exactly. Learning [928]: Use serde default fn for always-resolved fields. Learning [2317]: Extend existing result structs with serde defaults for backward compatibility — additive, no breaking change.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Defaults flow through named fns (one source of truth)",
+        "Serde camelCase mapping respected (autoReview, autoReviewMinTasks)",
+        "Default-when-missing and default-when-file-missing both verified",
+        "No literal defaults outside the named fns"
+      ],
+      "taskType": "implementation",
+      "title": "Add autoReview + autoReviewMinTasks fields to ProjectConfig",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `LoopResult` has `#[derive(Debug, Default)]` annotations",
+        "Positive: `LoopResult::default()` returns all-zero/None/false including `tasks_completed: 0`",
+        "Positive: All LoopResult construction sites (current count 17 via `grep -c 'LoopResult {' src/loop_engine/engine.rs`) compile after the new field is added — every early-return site uses `..Default::default()` for non-specified fields; only the final success-path return (~engine.rs:4004) lists all fields explicitly",
+        "Positive: `LoopResult` carries `pub tasks_completed: u32` with rustdoc explaining the per-run scope",
+        "Positive: Final LoopResult construction at engine.rs:~4004 populates `tasks_completed` from the local variable passed to `print_final_banner`",
+        "Positive: Per-run-vs-cumulative semantic verified — agent has read the call site at engine.rs:~3996 and confirmed the value is incrementally tracked across this run, NOT loaded from the DB as a cumulative count (record the verification in the progress log)",
+        "Positive: `PrdRunResult` has `#[derive(Debug, Default)]` annotations",
+        "Positive: `PrdRunResult` carries `pub tasks_completed: u32` AND `pub worktree_path: Option<PathBuf>` with rustdoc",
+        "Positive: Production site at batch.rs:631 (stopped path) populates `tasks_completed: loop_result.tasks_completed` AND `worktree_path: loop_result.worktree_path.clone()`",
+        "Positive: Production site at batch.rs:658 (normal path) populates both fields identically",
+        "Positive: Production site at batch.rs:314 (skipped path) uses `..Default::default()` to absorb the new fields (skipped PRDs get 0 + None)",
+        "Negative: No early-return site contains `tasks_completed: 0` literal (must come from Default)",
+        "Negative: No site contains an explicit `worktree_path: None, branch_name: None, was_stopped: false` triplet — those defaults must spread",
+        "Negative: `Edit ... replace_all` not used (use targeted Edits with unique surrounding context)",
+        "Unit test: `LoopResult::default()` returns all-defaults including `tasks_completed: 0`",
+        "Unit test: `PrdRunResult::default()` returns all-defaults including `tasks_completed: 0` and `worktree_path: None`",
+        "Unit test: Construction with `LoopResult { exit_code: 130, ..Default::default() }` produces a LoopResult with that exit code and zeros elsewhere",
+        "Known-bad: if a single early-return site is missed (different indentation), `cargo check` fails with 'missing field tasks_completed' on the OLD form — verify the change set is complete by running `grep -n 'LoopResult {' src/loop_engine/engine.rs` and `grep -n 'PrdRunResult {' src/loop_engine/batch.rs` and confirming every match either uses `..Default::default()` OR explicitly populates the new fields",
+        "Known-bad: a `tasks_completed` value loaded via SQL `COUNT(*)` of completed tasks would include tasks completed in prior runs — must be a per-run counter; the agent must read the source to confirm",
+        "Failure mode: if LoopResult grep count differs significantly from 17 OR PrdRunResult production sites don't equal 3 (314/631/658), investigate — codebase may have evolved since the plan was drafted; re-enumerate with `grep -n` before editing",
+        "Scoped tests pass: `cargo test -p task-mgr loop_engine::engine` AND `cargo test -p task-mgr loop_engine::batch`"
+      ],
+      "dependsOn": [],
+      "description": "Structural change to BOTH `LoopResult` (engine.rs) AND `PrdRunResult` (batch.rs) so future field additions don't require updating dozens of construction sites. Then add `tasks_completed: u32` to LoopResult (for auto-review gating) AND `tasks_completed: u32` + `worktree_path: Option<PathBuf>` to PrdRunResult (for batch's end-of-batch auto-review hook).\n\nDO:\n- **LoopResult** (`src/loop_engine/engine.rs:2569`):\n  - Add `#[derive(Default)]` to the existing `#[derive(Debug)]` line (all existing fields are Default-able)\n  - Use `grep -c 'LoopResult {' src/loop_engine/engine.rs` to enumerate ALL construction sites (current count: **17** — verify the count is stable before editing; if it shifted, the codebase evolved since planning and the agent should re-list with `grep -n` to see fresh line numbers). All early-return sites plus the final success-path return at the bottom of `run_loop` (~4004-4009)\n  - Convert each early-return construction to spread Default: `LoopResult { exit_code: 1, ..Default::default() }`\n  - Add `pub tasks_completed: u32` field with rustdoc explaining it's the per-run count (NOT cumulative)\n  - Update the final construction at engine.rs:~4004-4009 to set `tasks_completed: <local var>` from the existing `tasks_completed` variable already passed to `print_final_banner` at line 3998 — **VERIFY by reading the call site that this value is per-run, not cumulative**; if cumulative, fix the source (rename the local var or count fresh) before merging\n- **PrdRunResult** (`src/loop_engine/batch.rs:34`):\n  - Add `#[derive(Debug, Default)]` (currently `#[derive(Debug)]`; the new fields plus existing PathBuf/i32/bool/Option are all Default-able)\n  - Add `pub tasks_completed: u32` and `pub worktree_path: Option<PathBuf>` fields with rustdoc\n  - Enumerate construction sites via `grep -n 'PrdRunResult {' src/loop_engine/batch.rs` — expect THREE production sites (`314` skipped path, `631` stopped path, `658` normal path) plus SEVEN test fixture sites (930, 938, 946, 965, 1184, 1192, 1201)\n  - Production sites 631 and 658: populate `tasks_completed: loop_result.tasks_completed` and `worktree_path: loop_result.worktree_path.clone()` explicitly (these have a live `loop_result` in scope)\n  - Production site 314 (skipped path): use `..Default::default()` to absorb the two new fields (skipped PRDs never ran, so tasks_completed=0 and worktree_path=None are correct)\n  - Test fixture sites: convert to `..Default::default()` for fields the test doesn't care about; some tests may need explicit values — leave those explicit but verify they compile\n  - Run `cargo check` after each batch of edits to catch any missed site (Learning [795] — replace_all misses indented sites)\n\nDO NOT:\n- Use Edit tool's `replace_all` for LoopResult or PrdRunResult — Learning [795] case study\n- Hand-roll Default impl when `#[derive(Default)]` works\n- Add `tasks_completed: 0` literal at sites that should get it from Default spread\n- Skip the per-run-vs-cumulative verification on `tasks_completed` — silent semantic bug if it's cumulative\n\nDO NOT:\n- Use Edit tool's `replace_all` for this — Learning [795] says it misses sites with different indentation (this exact struct was the case study). Use sequential targeted Edits, one site at a time, with surrounding context for uniqueness\n- Hand-roll the Default impl when `#[derive(Default)]` works (all fields are Default-able)\n- Add `tasks_completed` to construction sites where it doesn't apply (early-return sites SHOULD get 0 via Default::default — that's the whole point of the refactor)\n- Touch fields you're not adding (this is additive only)\n\nEdge cases:\n- Sites that already specify ALL fields explicitly: still convert to use `..Default::default()` even if no fields are defaulted — uniform style across all 15 sites\n- The final return at line 4004 sets all fields explicitly; just add `tasks_completed: tasks_completed` and keep the explicit-spread form (don't switch to Default for this site since every field is non-default)\n- Test helper code that constructs LoopResult: must also pick up the new field via `..Default::default()` if such helpers exist (grep tests/ for LoopResult construction)\n\nKnown-bad to guard against:\n- Using `LoopResult { exit_code: 1, worktree_path: None, branch_name: None, was_stopped: false }` after this refactor — the whole point is `..Default::default()` to absorb future fields\n- Adding `tasks_completed: 0` literal at every early-return site (defeats Default's purpose)\n- Forgetting `cargo check` between batches — Learning [795] tells the story of replace_all missing sites and the compiler being the only safety net",
+      "edgeCases": [
+        "Test helper constructions in tests/ — must also pick up Default spread",
+        "Final success-path return (engine.rs:~4004) — keep explicit field list including new tasks_completed; do NOT collapse to Default spread (all fields are non-default at the success path)",
+        "Early-return where exit_code is non-default but everything else is: `LoopResult { exit_code: N, ..Default::default() }`"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Edit replace_all misses a construction site with different indentation",
+          "expectedBehavior": "`cargo check` fails with 'missing field tasks_completed' — agent must investigate and patch the missed site, NOT proceed"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "Learning [795] (CRITICAL): replace_all misses LoopResult construction sites with different indentation — this exact struct was the case study. Use sequential targeted Edits, run cargo check between batches. Learning [2061]: Comprehensive struct field refactoring with zero regressions — 18-site IterationResult refactor succeeded by this approach. Learning [2255]: Multi-site struct field threading with grep-find-update cycle. Learning [2087]: IterationResult field population at final return site — pattern for the tasks_completed propagation. The banner call at engine.rs:3996-4002 already has `tasks_completed` in scope (passed to print_final_banner) — just copy it into the LoopResult struct literal a few lines below.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "All 15 LoopResult construction sites converted uniformly to Default spread (no literal default values left behind)",
+        "tasks_completed populates from the existing in-scope variable (no fresh DB query needed)",
+        "`cargo check` clean between every edit batch (catches indentation-mismatch misses)",
+        "Default impl is derived (no hand-rolled impl)"
+      ],
+      "taskType": "implementation",
+      "title": "Refactor LoopResult AND PrdRunResult to derive Default; add tasks_completed + worktree_path",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/loop_engine/auto_review.rs` exists with module rustdoc covering env-inheritance, TTY-inheritance, worktree-suppression rationale",
+        "Positive: `pub mod auto_review;` added to `src/loop_engine/mod.rs`",
+        "Positive: `Decision`, `resolve_decision`, `should_fire`, `prd_md_path`, `ReviewLauncher` trait, `ProcessLauncher`, `CapturingLauncher`, `maybe_fire` all defined per spec",
+        "Positive: `prd_md_path` tries bare `foo.md` first, then `prd-foo.md`, returns None if neither exists (architect-required dual lookup)",
+        "Positive: `ProcessLauncher::launch` uses `std::env::var(\"CLAUDE_BINARY\").unwrap_or_else(|_| \"claude\")` for binary resolution",
+        "Positive: `ProcessLauncher::launch` distinguishes Ok-success (Ok), Ok-non-zero (eprintln hint, Ok), Err (Err) so triage is easier",
+        "Positive: `maybe_fire` skips with recovery hint when worktree_path is None OR worktree doesn't exist (does NOT fall back to project_root)",
+        "Negative: No `--print` or `-p` flag on the spawned claude command (search auto_review.rs for those literals; only allowed in test mocks if any)",
+        "Negative: No `exec()` call (only `spawn().status()` or `.status()` direct)",
+        "Negative: No `.env_clear()` or env-stripping on the Command",
+        "CONTRACT: `ProjectConfig` fields `auto_review` and `auto_review_min_tasks` are accessed exactly as named (depends on FEAT-001)",
+        "Unit test: `resolve_decision` — `(cli_off=true, *) -> enabled=false, min_tasks=u32::MAX`",
+        "Unit test: `resolve_decision` — `(cli_on=true, config.auto_review=false) -> enabled=true, min_tasks=1`",
+        "Unit test: `resolve_decision` — `(both flags false, config defaults) -> enabled=true, min_tasks=3`",
+        "Unit test: `resolve_decision` — `(both flags false, config={auto_review:false, ...}) -> enabled=false`",
+        "Unit test: `should_fire` matrix — gate on each of exit_code != 0 / was_stopped=true / tasks_completed < min / enabled=false separately and verify each is sufficient to block",
+        "Unit test: `should_fire` boundary — `tasks_completed == min_tasks` returns true (>=, not >)",
+        "Unit test: `prd_md_path` — bare-`foo.md`-on-disk returns Some(bare)",
+        "Unit test: `prd_md_path` — only `prd-foo.md` on disk returns Some(prefixed)",
+        "Unit test: `prd_md_path` — neither on disk returns None",
+        "Unit test: `maybe_fire` with CapturingLauncher — fires once when all gates pass; verify launch args (md path, worktree path)",
+        "Unit test: `maybe_fire` with CapturingLauncher — does NOT fire when gates fail (one test per gate: exit_code != 0, was_stopped, threshold, disabled, worktree-missing)",
+        "Known-bad: a `should_fire` using `>` would pass a 4-task-with-min-3 test but fail the exact-`tasks_completed == min_tasks` boundary test — the >= test catches it",
+        "Failure mode: if Command::spawn returns Err (claude binary missing), ProcessLauncher returns Err — maybe_fire logs `[warn]` and returns; loop exit_code is unchanged",
+        "Scoped tests pass: `cargo test -p task-mgr loop_engine::auto_review`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Build the new `src/loop_engine/auto_review.rs` module with the testable core logic for deciding whether to auto-launch /review-loop and the launcher abstraction that makes batch.rs unit-testable.\n\nDO:\n- Add `pub mod auto_review;` to `src/loop_engine/mod.rs` next to existing `pub mod batch;`\n- Define `pub struct Decision { pub enabled: bool, pub min_tasks: u32 }` with `#[derive(Debug, Clone, Copy)]` — u32 matches `auto_review_min_tasks` and `tasks_completed` types throughout (engine.rs uses u32 for the per-run counter)\n- `pub fn resolve_decision(config: &ProjectConfig, cli_force_on: bool, cli_force_off: bool) -> Decision`:\n  - `cli_force_off` short-circuits to `Decision { enabled: false, min_tasks: u32::MAX }`\n  - `cli_force_on` sets `min_tasks = 1` and `enabled = true`\n  - Otherwise: `enabled = config.auto_review`, `min_tasks = config.auto_review_min_tasks`\n- `pub fn should_fire(d: &Decision, exit_code: i32, was_stopped: bool, tasks_completed: u32) -> bool`:\n  - Returns true ONLY when `d.enabled && exit_code == 0 && !was_stopped && tasks_completed >= d.min_tasks`\n- `pub fn prd_md_path(prd_json: &Path) -> Option<PathBuf>`:\n  - Try `prd_json.with_extension(\"md\")` first; if `exists()`, return Some\n  - Else build `prd-<stem>.md` in the same parent dir; if exists, return Some\n  - Else None — the convention in this repo is INCONSISTENT (both forms exist in .task-mgr/tasks/)\n- `pub(crate) trait ReviewLauncher { fn launch(&self, md: &Path, worktree: Option<&Path>) -> std::io::Result<()>; }`\n- `pub(crate) struct ProcessLauncher;` impl that runs `std::process::Command::new(claude_bin).arg(\"/review-loop <md>\").current_dir(worktree?).status()` — handle Ok-success / Ok-non-zero (print distinguishable hint, return Ok) / Err (return Err)\n- `#[cfg(test)] pub(crate) struct CapturingLauncher { pub calls: std::sync::Mutex<Vec<(PathBuf, Option<PathBuf>)>> }` impl returns Ok(()) and records the call\n- `pub fn maybe_fire(config: &ProjectConfig, cli_force_on: bool, cli_force_off: bool, result: &LoopResult, prd_json: &Path, launcher: &dyn ReviewLauncher)`:\n  - Resolve Decision via `resolve_decision`\n  - Gate via `should_fire(&decision, result.exit_code, result.was_stopped, result.tasks_completed)`\n  - Skip + hint on `!is_terminal(&stdout)` (CI/redirected output)\n  - Skip + recovery hint when `result.worktree_path.is_none() || !worktree.exists()` (architect-required: do NOT fall back to project_root — would hit push-protected main)\n  - Skip + hint when `prd_md_path` returns None\n  - Else `launcher.launch(&md, result.worktree_path.as_deref())`; log on Err but return cleanly (never propagate)\n- Takes `&LoopResult` because (a) main.rs has a real one to pass directly, (b) batch.rs synthesizes one from `PrdRunResult` fields — both call sites then share the same gate set. Earlier scalar-arg form rejected: led to FEAT-005 calling launcher.launch directly to bypass arg sprawl, defeating the centralization goal.\n- Module rustdoc must document (a) env-var inheritance is intentional, (b) TTY inheritance via Command::status() is automatic, (c) the worktree-suppression rationale\n- Comprehensive unit tests: see acceptanceCriteria\n\nDO NOT:\n- Use `--print` or `-p` flags on the spawned claude — those force non-interactive output capture (we want a real interactive TTY session)\n- Use `exec()` instead of `spawn().status()` — batch needs the parent to stay alive for end-of-batch cleanup/reporting\n- Strip env vars when constructing `Command` (ANTHROPIC_API_KEY etc. inherit by default — required for auth)\n- Fall back to `current_dir(project_root)` when worktree is missing — that walks the user into push-protected main\n- Hardcode `claude` — use `std::env::var(\"CLAUDE_BINARY\").unwrap_or_else(|_| \"claude\".to_string())` (precedent at src/loop_engine/claude.rs:285)\n\nEdge cases:\n- Both `cli_force_on` AND `cli_force_off` true → clap's `conflicts_with` prevents at parse time, but resolve_decision still handles defensively: `cli_force_off` wins (test it)\n- Config `autoReviewMinTasks = 0` and `cli_force_on = false` → `should_fire` returns true on any tasks_completed >= 0 (i.e., always — that's the explicit semantics; user wanted it on)\n- `tasks_completed >= u32::MAX` is unreachable in practice; the `enabled=false` short-circuit on `cli_force_off` makes this moot\n- prd_md_path: stem with no parent dir (just `foo.json`) → parent is empty Path; tempdir-based test must use a path with parent\n- prd_md_path: extension swap on `tasks/foo.json` → `tasks/foo.md`; on `tasks/foo` (no ext) → `tasks/foo.md` (with_extension adds it)\n\nKnown-bad to guard against:\n- A `should_fire` that gates on `tasks_completed > min_tasks` (strict >) instead of `>=` — with default min=3 and a 3-task loop, this would silently skip\n- Calling `launcher.launch(&md, worktree)` when worktree is Some but the path doesn't exist on disk — Command spawn fails confusingly\n- Swallowing `Err` from `launcher.launch` instead of logging it — silent failure mode",
+      "edgeCases": [
+        "Both cli flags true → cli_force_off wins (defensive; clap rejects upstream)",
+        "autoReviewMinTasks = 0 → always fires when other gates pass",
+        "prd_md_path with no parent dir → handled by Option<&Path> from parent()",
+        "Worktree path exists but is a file (not dir) → Command::current_dir fails — caller's launch returns Err; logged and dropped",
+        "tasks_completed exactly == min_tasks → fires (>= boundary)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "claude binary not on PATH and CLAUDE_BINARY unset",
+          "expectedBehavior": "ProcessLauncher::launch returns Err; maybe_fire logs `[warn] auto-review launch failed: ...`; returns cleanly; loop exit unaffected"
+        },
+        {
+          "cause": "claude runs but exits non-zero (e.g., user Ctrl+C during review)",
+          "expectedBehavior": "ProcessLauncher prints distinguishable `[hint] /review-loop session ended with status ... — slash command may be unavailable or review reported issues` and returns Ok"
+        },
+        {
+          "cause": "Worktree path was cleaned up before maybe_fire ran (--yes mode default)",
+          "expectedBehavior": "Skip launch entirely, print recovery hint with `git worktree add ...` reattach command"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Learning [1892]: CLAUDE_BINARY environment variable for mocking subprocess spawning — same pattern applies here, ProcessLauncher reads CLAUDE_BINARY env. Learning [1609]: Survey all spawn_claude call sites with grep before flipping a new last arg — confirms `claude_bin` resolution is established. Module rustdoc must call out: stdin/stdout/stderr inherit via Command::status() (no Stdio plumbing); env vars (ANTHROPIC_API_KEY) inherit by default — DO NOT strip; worktree-missing means SUPPRESS, not fall back. Use `std::io::IsTerminal` (Rust 1.70+) for TTY detection. CapturingLauncher is `#[cfg(test)]`-gated and uses Mutex<Vec<...>> for thread-safe call recording.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Pure functions are pure (Decision, resolve_decision, should_fire, prd_md_path) — no IO outside ProcessLauncher",
+        "ReviewLauncher trait makes maybe_fire integration-testable from batch.rs / main.rs",
+        "All boundary conditions (>=, threshold==0, conflicting flags) explicitly tested",
+        "ProcessLauncher's Ok-non-zero vs Err arms are distinguishable in stderr for triage",
+        "No env stripping, no --print, no exec() — interactive contract held"
+      ],
+      "taskType": "implementation",
+      "title": "Create auto_review.rs module: Decision, gates, ReviewLauncher trait, maybe_fire",
+      "touchesFiles": [
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr loop run tasks/foo.json --auto-review` parses cleanly",
+        "Positive: `task-mgr loop run tasks/foo.json --no-auto-review` parses cleanly",
+        "Positive: `task-mgr loop tasks/foo.json --auto-review` (flat form) parses cleanly",
+        "Positive: `task-mgr batch run 'tasks/*.json' --auto-review` parses cleanly",
+        "Positive: `task-mgr batch 'tasks/*.json' --no-auto-review` (flat form) parses cleanly",
+        "Negative: `task-mgr loop run x --auto-review --no-auto-review` exits non-zero with clap usage error (mutual exclusion verified)",
+        "Negative: No new flag added to `LoopCommand::Init` or `BatchCommand::Init`",
+        "CONTRACT: Both flat-form dispatch sites (LoopResolve::Flat, BatchResolve::Flat) populate `no_auto_review` and `auto_review` in the synthesized `Run` struct (grep -n 'LoopCommand::Run {' src/cli/commands.rs around line 1416 and verify the two new fields are present)",
+        "Unit test: `Cli::try_parse_from([\"task-mgr\", \"loop\", \"run\", \"x\", \"--auto-review\"]).is_ok()`",
+        "Unit test: `Cli::try_parse_from([\"task-mgr\", \"loop\", \"run\", \"x\", \"--no-auto-review\"]).is_ok()`",
+        "Unit test: `Cli::try_parse_from([\"task-mgr\", \"loop\", \"run\", \"x\", \"--auto-review\", \"--no-auto-review\"]).is_err()` (clap rejects in BOTH flag orders — also test reverse order to catch missing reciprocal conflicts_with)",
+        "Unit test: Same three tests for `batch run`",
+        "Unit test: Flat-form `task-mgr loop x --auto-review` → synthesized `LoopCommand::Run` has `auto_review: true, no_auto_review: false`",
+        "CLI regression: `cargo run -- loop run --help 2>&1 | grep -E '\\-\\-(no-)?auto-review' | wc -l` returns `2`",
+        "CLI regression: `cargo run -- batch run --help 2>&1 | grep -E '\\-\\-(no-)?auto-review' | wc -l` returns `2`",
+        "Known-bad: omitting one side of `conflicts_with` link (only on `auto_review`, not on `no_auto_review`) — clap may still accept both depending on flag order; reciprocal link prevents this, test must pass both orders",
+        "Failure mode: build error if `LoopResolve::Flat` synthesis doesn't include the new fields — `cargo check` catches",
+        "Scoped tests pass: `cargo test -p task-mgr cli::`"
+      ],
+      "dependsOn": [],
+      "description": "Surface the CLI override flags on both `Commands::Loop` (parent + `LoopCommand::Run`) and `Commands::Batch` (parent + `BatchCommand::Run`) in `src/cli/commands.rs`. Wire the parent's flat-form dispatch to thread the flags into the synthesized `Run` variant.\n\nDO:\n- Add the flag pair at FOUR sites (mirror exactly):\n  1. `Commands::Loop` parent (after `parallel` field around line 895)\n  2. `LoopCommand::Run` (after `parallel` field around line 1284)\n  3. `Commands::Batch` parent (after `parallel` around line 985)\n  4. `BatchCommand::Run` (after `parallel` field, same nested struct)\n- Flag definition (identical at all four sites):\n  ```rust\n  /// Skip the auto-launched `/review-loop` Claude session after a clean run\n  /// (default: auto-launch when the loop completed >=3 tasks).\n  #[arg(long = \"no-auto-review\", conflicts_with = \"auto_review\", default_value_t = false)]\n  no_auto_review: bool,\n\n  /// Force-launch `/review-loop` even on small (<3-task) runs.\n  #[arg(long = \"auto-review\", conflicts_with = \"no_auto_review\", default_value_t = false)]\n  auto_review: bool,\n  ```\n- Thread the parent's two new fields into the synthesized `Run` variant at the flat-form dispatch sites:\n  - `LoopResolve::Flat(LoopCommand::Run { ... })` around line 1416 — set `no_auto_review` and `auto_review` from the parent struct's values\n  - `BatchResolve::Flat(BatchCommand::Run { ... })` around line 1449 — same\n- Add CLI parser tests if `src/cli/tests.rs` exists (or the test module inside commands.rs): verify both flags parse, verify mutual exclusion (passing both → clap error), verify defaults (both false)\n\nDO NOT:\n- Use a single `auto_review: Option<bool>` field — the user explicitly chose `conflicts_with` to make passing both a clap usage error (rejected approach)\n- Add the flags to `LoopCommand::Init` or `BatchCommand::Init` — these are import commands, not loop runs\n- Skip the parent-variant duplication — the existing `parallel`/`yes`/etc. pattern requires it for the flat-form shim to compile\n- Forget to thread through both new fields at the flat-form dispatch — Learning [823]: full wiring path trace is mandatory\n\nEdge cases:\n- User passes both `--auto-review --no-auto-review` → clap exits with usage error before run starts (verified by `conflicts_with` reciprocal links)\n- User passes neither → both fields are `false`, downstream `resolve_decision` reads the config defaults\n- User passes only `--auto-review` on a 1-task PRD → forces fire (threshold becomes 1 in resolve_decision)\n- User passes only `--no-auto-review` → suppresses regardless of config\n\nKnown-bad to guard against:\n- Forgetting `conflicts_with` reciprocal — clap accepts both flags and the order-of-evaluation determines winner (silent bug)\n- Naming the field something different from the flag (e.g., `force_auto_review`) — breaks the natural clap derive mapping\n- Adding only at `LoopCommand::Run` but not `Commands::Loop` parent — flat-form `task-mgr loop tasks/foo.json --auto-review` fails to parse",
+      "edgeCases": [
+        "Both flags passed → clap rejects with usage error",
+        "Neither flag passed → both false (downstream reads config defaults)",
+        "Flat form vs canonical `loop run` — both must accept the flags",
+        "Flag passed to `loop init` or `batch init` → clap rejects (flags don't exist there)"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Flat-form dispatch site doesn't thread the new fields",
+          "expectedBehavior": "`cargo check` fails with 'missing field auto_review in struct initializer' — agent fixes both flat-form sites"
+        }
+      ],
+      "id": "FEAT-004",
+      "modifiesBehavior": false,
+      "notes": "Learning [823]: full wiring path trace for feature integration — this task is exactly that pattern for the CLI flag layer. The flat-form dispatch synthesis is the load-bearing piece — easy to miss because the parent and Run variants look like duplicates but the dispatch glue connects them. Existing `cleanup_worktree` and `parallel` fields are wired the same way; grep for them at commands.rs:850, 1280, 1416, 1449 to see all four touchpoints. Architect noted the parent/Run duplication is a future refactoring opportunity (`#[command(flatten)]` could compress) — out of scope here.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Flag pair added at ALL four sites (parent + Run for both Loop and Batch)",
+        "conflicts_with reciprocal on both flags (mutual exclusion verified by clap)",
+        "Flat-form dispatch threads both new fields into synthesized Run variant",
+        "CLI parser tests verify both flags + both rejections (Loop and Batch)"
+      ],
+      "taskType": "implementation",
+      "title": "Add --auto-review / --no-auto-review CLI flags to Loop + Batch (parent + Run)",
+      "touchesFiles": [
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `src/main.rs` Commands::Loop arm calls `auto_review::maybe_fire` after `engine::run_loop` returns, passing CLI override flags",
+        "Positive: `src/main.rs` Commands::Batch arm threads `auto_review`/`no_auto_review` CLI flags into `run_batch(...)` call",
+        "Positive: `run_batch` signature has two new params for the CLI overrides (additive); ALL existing callers across src/ and tests/ updated (grep -n 'run_batch(' src tests verifies)",
+        "Positive: `run_batch` reads `ProjectConfig` ONCE at the top (not in the per-PRD loop)",
+        "Positive: `pub(crate) fn pick_review_target(results: &[PrdRunResult], decision: &Decision) -> Option<&PrdRunResult>` exists, returning the LAST `PrdRunResult` matching `exit_code==0 && !skipped && !stopped && should_fire(...)`",
+        "Positive: Post-loop block in `run_batch` calls `pick_review_target` and, if Some, builds a synthetic `LoopResult { worktree_path: target.worktree_path.clone(), branch_name: target.branch_name.clone(), tasks_completed: target.tasks_completed, ..Default::default() }` and passes it to `auto_review::maybe_fire`",
+        "Positive: Hook fires AFTER the per-PRD worktree-cleanup loop (so worktree state is final)",
+        "Positive: `cargo run -- loop --help 2>&1 | grep -E '\\-\\-(no-)?auto-review' | wc -l` returns `2` (CLI regression check; FEAT-004 owns the flag definition but FEAT-005's wiring is what surfaces them in --help via the call graph)",
+        "Negative: Hook does NOT fire per-PRD (no call to `maybe_fire` or `launcher.launch` inside the per-PRD for loop)",
+        "Negative: `launcher.launch(...)` is NEVER called directly from batch.rs OR main.rs — both paths go through `auto_review::maybe_fire(...)`. grep verifies: `grep -rnE '\\.launch\\(' src/main.rs src/loop_engine/batch.rs` returns zero matches (method-call form; tightened to avoid false hits on `launch_blocking(`, hypothetical future `launch_foo(` free fns, etc.)",
+        "Negative: `maybe_fire`'s return value is dropped after logging — loop/batch exit code is unaffected by review-launch failure",
+        "Negative: `read_project_config` is NOT called inside the per-PRD loop body in batch.rs (grep -n 'read_project_config' src/loop_engine/batch.rs: at most 1 call, before the for loop)",
+        "Negative: `auto_review::maybe_fire` is NOT called BEFORE the worktree cleanup loop in batch.rs",
+        "CONTRACT: `LoopResult.tasks_completed` AND `LoopResult.worktree_path` (from FEAT-002) flow into `PrdRunResult.tasks_completed` / `PrdRunResult.worktree_path` at production push sites 631 and 658 — `grep -n 'loop_result.tasks_completed\\|loop_result.worktree_path' src/loop_engine/batch.rs` returns at least 4 matches (2 fields × 2 sites)",
+        "CONTRACT: `auto_review::maybe_fire` signature matches FEAT-003's exactly — re-read FEAT-003's module before wiring and adapt arg order",
+        "Unit test (pick_review_target): 3 results [5-task succ, 1-task succ, 4-task succ], decision{enabled, min=3} → Some(third)",
+        "Unit test (pick_review_target): 3 results [5-task succ, 1-task succ, fail], decision{enabled, min=3} → Some(first)",
+        "Unit test (pick_review_target): 3 results all sub-threshold (1, 2, 1) → None",
+        "Unit test (pick_review_target): result with stopped=true → None",
+        "Unit test (pick_review_target): result with skipped=true → None",
+        "Unit test (pick_review_target): decision.enabled=false → None regardless of results",
+        "Known-bad: a 'last successful PRD' selection that ignores threshold would fire on PRD #2 (1-task) in the second test — must filter via should_fire so PRD #1 wins",
+        "Known-bad: a 'first successful PRD' selection would fire on PRD #1 in the first test — must be LAST-meeting-threshold",
+        "Known-bad: calling `launcher.launch` directly (bypassing maybe_fire) would skip TTY-check and worktree-existence-check in batch mode → single-loop and batch would diverge silently. The negative grep above catches this",
+        "Failure mode: if `auto_review::maybe_fire` returns Err (it shouldn't — designed to swallow internally), the loop's exit_code is unaffected — `let _ = maybe_fire(...)` or call without binding",
+        "Scoped tests pass: `cargo test -p task-mgr loop_engine::batch` AND `cargo test -p task-mgr loop_engine::auto_review`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Wire the new auto_review module into both runtime paths: single-loop in `src/main.rs`'s `Commands::Loop` arm, and batch-mode in `src/loop_engine/batch.rs`. Batch fires ONCE for the last successful PRD meeting the threshold (per user decision). NOTE: FEAT-002 has already added `tasks_completed` and `worktree_path` to `PrdRunResult` AND derived Default — this task only wires the call sites and the end-of-batch selection.\n\nDO:\n- **In `src/main.rs` `Commands::Loop { ... }` arm**: after `engine::run_loop(...).await` returns, before returning the exit code:\n  - `let config = read_project_config(&db_dir);`\n  - `let launcher = auto_review::ProcessLauncher;`\n  - `auto_review::maybe_fire(&config, auto_review_cli, no_auto_review_cli, &loop_result, &prd_file, &launcher);` — main.rs has a real `LoopResult` in scope; pass by reference directly (signature is `&LoopResult` per FEAT-003)\n- **In `src/loop_engine/batch.rs`**:\n  - Thread two new params into `run_batch` signature: `cli_force_on: bool, cli_force_off: bool` (additive; verify ALL callers via `grep -n 'run_batch(' src/ tests/` and update each)\n  - Read `ProjectConfig` ONCE at the top of `run_batch` via `read_project_config(dir)` — cache for the post-loop hook (per CLAUDE.md run-level config caching convention)\n  - Optionally pre-resolve `Decision = auto_review::resolve_decision(&project_config, cli_force_on, cli_force_off)` once for use after the per-PRD loop\n  - **AFTER the per-PRD `for` loop ends AND AFTER all worktree-cleanup has run, BEFORE returning `BatchResult`**:\n    - Find target: `results.iter().rev().find(|r| r.exit_code == 0 && !r.skipped && !r.stopped && auto_review::should_fire(&decision, r.exit_code, false, r.tasks_completed))`\n    - If `Some(target)`: build a synthetic `LoopResult` from the `PrdRunResult` fields (`exit_code: 0, was_stopped: false, worktree_path: target.worktree_path.clone(), tasks_completed: target.tasks_completed, branch_name: target.branch_name.clone()` — `..Default::default()` for anything else) and call `auto_review::maybe_fire(&project_config, cli_force_on, cli_force_off, &synthetic_result, &target.prd_file, &launcher)`\n    - Reason for going through `maybe_fire` (and NOT calling `launcher.launch` directly): centralizes all suppression gates (TTY, worktree-missing, missing markdown, decision-disabled) in one place so single-loop and batch behave identically\n- **Update `src/main.rs` `Commands::Batch { ... }` arm**: thread `auto_review` and `no_auto_review` CLI flags into the `run_batch(...)` call\n- **Tests** — use the `CapturingLauncher` from FEAT-003. The cleanest test seam is a `pub(crate) fn pick_review_target(results: &[PrdRunResult], decision: &Decision) -> Option<&PrdRunResult>` that the batch hook calls; this is pure and directly unit-testable. Add it inside batch.rs (or auto_review.rs) and call it from the post-loop block.\n  - Pure unit tests on `pick_review_target`:\n    - 3 results [5-task success, 1-task success, 4-task success], decision {enabled, min_tasks=3} → returns Some(third)\n    - 3 results [5-task success, 1-task success, failed], decision {enabled, min_tasks=3} → returns Some(first)\n    - 3 results all sub-threshold (1, 2, 1 tasks) → returns None\n    - 1 result stopped → returns None (the `!r.stopped` gate)\n    - 1 result skipped → returns None (the `!r.skipped` gate)\n    - decision.enabled=false → always None\n  - Integration test (if a `run_batch` test seam takes a launcher): 3-PRD batch with CapturingLauncher → launcher.calls.len() matches expectation; if no easy seam, leave end-to-end coverage to REVIEW-001's manual smoke test and keep `pick_review_target` as the testable surface\n\nDO NOT:\n- Fire auto-review per-PRD in batch (user explicitly chose last-only)\n- Mask a successful loop with an auto-review error — `maybe_fire`'s return is dropped after logging\n- Read `ProjectConfig` inside the per-PRD loop (cache it once at top of run_batch)\n- Add the hook BEFORE the worktree-cleanup loop (cleanup MUST run first so the worktree state is final when maybe_fire decides whether to suppress)\n- Call `launcher.launch(...)` directly from batch.rs or main.rs — always go through `auto_review::maybe_fire(...)`. This is load-bearing for uniform suppression behavior\n\nEdge cases:\n- Empty batch (no PRDs matched glob) → no auto-review (results vec is empty)\n- All PRDs sub-threshold → no auto-review\n- Last success is sub-threshold but earlier success is >= threshold → fires on the EARLIER one (\"last meeting threshold\", not \"last success\")\n- Worktree cleaned up before hook → maybe_fire's worktree.exists() check suppresses, prints recovery hint\n- Batch with `--keep-worktrees` → worktree preserved, hook fires normally\n- Loop's `cleanup_worktree: true` + interactive mode → user might Y/N the cleanup prompt; hook reads final state after that\n\nKnown-bad to guard against:\n- Firing for the LAST PRD regardless of threshold (\"last successful, ignoring task count\") — must respect threshold\n- Firing for the FIRST PRD meeting threshold — must be the LAST\n- Reading ProjectConfig N times (once per PRD) — wasteful and would surface mid-loop config edits which is incorrect per the existing 'config caching' convention (CLAUDE.md section 6)\n- Inserting the hook BEFORE worktree cleanup — would always see worktree present, miss the cleanup→suppress path",
+      "edgeCases": [
+        "Empty batch → no auto-review fired",
+        "Last PRD sub-threshold but earlier success >= threshold → fires on earlier one",
+        "Worktree cleaned up in --yes mode → suppress + recovery hint",
+        "Batch chain mode → branch hand-off unaffected by auto-review (review runs after the chain completes)",
+        "Both CLI flags passed → clap rejects upstream (FEAT-004); no codepath here exercises it"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "ProcessLauncher::launch returns Err (claude not on PATH)",
+          "expectedBehavior": "eprintln `[warn]` and continue; batch summary still printed; exit code unchanged"
+        },
+        {
+          "cause": "Last threshold-meeting PRD's worktree was removed (--yes auto-cleanup)",
+          "expectedBehavior": "maybe_fire suppresses, prints recovery hint with `git worktree add ...`; batch returns normally"
+        },
+        {
+          "cause": "Auto-review CLI flag passed but config and threshold disagree",
+          "expectedBehavior": "CLI wins per resolve_decision precedence; documented and tested in FEAT-003"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Learning [823] (CRITICAL): full wiring path trace for feature integration — this task IS the full wiring (CLI → main → batch → engine → auto_review). Trace every layer in this PR description. Learning [2255]: multi-site struct field threading with grep-find-update cycle — `PrdRunResult.tasks_completed` is added at two push sites. Learning [1892]: CLAUDE_BINARY env-var mock pattern — integration tests should use `std::env::set_var(\"CLAUDE_BINARY\", \"/bin/true\")` or pass CapturingLauncher directly (preferred — pure unit test, no subprocess). The batch hook MUST come AFTER the worktree-cleanup loop (lines 651-660ish in batch.rs); inserting before would always see the worktree present and never test the suppress-on-missing path. Synthesize the post-loop selection as either a pub(crate) helper fn `pick_review_target(results, decision) -> Option<&PrdRunResult>` (unit-testable) or inline (then integration test exercises it).",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Hook fires in BOTH main.rs single-loop arm AND batch.rs end-of-batch — both paths covered",
+        "Last-successful-meeting-threshold selection is correct (not first, not last-overall)",
+        "ProjectConfig read once per run_batch invocation (not per PRD)",
+        "Hook inserted AFTER worktree cleanup so worktree-missing path is reachable",
+        "Integration tests use CapturingLauncher (pure unit, no subprocess) to verify selection logic",
+        "Loop/batch exit_code is independent of auto-review's success/failure (review never masks a passing loop)"
+      ],
+      "taskType": "implementation",
+      "title": "Wire auto-review hook in main.rs (single loop) and batch.rs (last successful PRD)",
+      "touchesFiles": [
+        "src/main.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/auto_review.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: New section heading exists in `CLAUDE.md` (e.g., `## Auto-launch /review-loop after loop end`)",
+        "Positive: Documents default-on behavior + min-3 threshold",
+        "Positive: Documents both CLI flags + their mutual exclusion",
+        "Positive: Documents batch mode = last-successful-meeting-threshold (one fire per batch max)",
+        "Positive: Documents all three suppression cases (TTY, missing markdown, missing worktree) + the recovery hint pattern",
+        "Positive: Names the module file `src/loop_engine/auto_review.rs` so grep finds it",
+        "Positive: States the invariant that auto-review NEVER changes loop exit code",
+        "Negative: No mention of the deferred / out-of-scope items (PrdFile.auto_review per-PRD override, Windows support, command-flatten refactor) — those belong in plan files, not CLAUDE.md",
+        "Negative: No example shell invocation that hardcodes a model ID (CLAUDE.md prefers tooling-agnostic phrasing)",
+        "Pre-edit Read: `CLAUDE.md` was read in this task before editing (per global rule #5)"
+      ],
+      "dependsOn": [
+        "FEAT-005"
+      ],
+      "description": "Add a new section to `/home/chris/Documents/startat0/Projects/task-mgr/CLAUDE.md` documenting the auto-review feature so future maintainers (and future Claude sessions reading the file) understand the contract.\n\nDO:\n- Add a new top-level section, e.g. `## Auto-launch /review-loop after loop end` near the existing `## Soft-dep guard for milestone scheduling` or `## Loop CLI Cheat Sheet` sections\n- Cover the following points (terse — match the existing CLAUDE.md voice):\n  - Default behavior: fires after a clean loop run with >=3 completed tasks; threshold and master switch are in `.task-mgr/config.json` (`autoReview`, `autoReviewMinTasks`)\n  - CLI overrides: `--auto-review` (force, treats threshold as 1), `--no-auto-review` (force off); mutually exclusive (clap-enforced)\n  - Batch behavior: ONE review at end of batch for the LAST successful PRD meeting the threshold (not per-PRD)\n  - Suppression cases: non-TTY (CI/pipes), missing `tasks/<prd>.md` AND `tasks/prd-<stem>.md`, missing/cleaned-up worktree — each prints a recovery hint and continues with exit_code unchanged\n  - Process model: `Command::status()` (blocking spawn, stdin/stdout/stderr inherit; ANTHROPIC_API_KEY etc. inherit)\n  - Module pointer: `src/loop_engine/auto_review.rs` (Decision, resolve_decision, should_fire, ReviewLauncher trait)\n  - Invariant: auto-review failure NEVER changes the loop/batch exit code\n\nDO NOT:\n- Duplicate the rustdoc — CLAUDE.md is for cross-cutting context and gotchas, not exhaustive API docs\n- Touch the user-level `~/.claude/CLAUDE.md` — this is the project-level file\n- Skip the suppression cases — those are the ones a future maintainer most needs to know exist\n\nEdge cases:\n- Existing CLAUDE.md is being modified — read it freshly before editing (per global CLAUDE.md hard rule #5)\n\nKnown-bad to guard against:\n- Writing prose that re-states what the code does — CLAUDE.md exists for invariants and gotchas, not narration\n- Forgetting to mention the `prd-<stem>.md` filename fallback — future PRD authors will hit it when their PRD uses one form but expect the other",
+      "edgeCases": [
+        "CLAUDE.md was modified mid-planning (system reminder noted this) — re-read fresh before editing"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "Section text drifts from actual implementation after a future refactor",
+          "expectedBehavior": "Future REVIEW-001 catches via the 'CLAUDE.md updated' acceptance criterion; not this task's concern"
+        }
+      ],
+      "id": "FEAT-006",
+      "modifiesBehavior": false,
+      "notes": "Match the existing CLAUDE.md voice — terse, gotcha-focused, with file/symbol pointers. Compare to sections like 'Soft-dep guard for milestone scheduling' or 'Slot merge-back conflict resolution' for tone. Keep under ~30 lines.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Terse, gotcha-focused (matches existing CLAUDE.md voice)",
+        "All three suppression cases documented (the user-visible surprises)",
+        "Module file path named so grep finds it",
+        "Invariant about exit-code preservation called out explicitly"
+      ],
+      "taskType": "implementation",
+      "title": "Document auto-review behavior in project CLAUDE.md",
+      "touchesFiles": [
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication (DRY principle) — except the parent/Run clap-flag duplication which is intentional (existing repo pattern; out-of-scope refactor noted in plan)",
+        "Functions under 30 lines (flag any complex ones)",
+        "Clear separation of concerns — auto_review.rs has no dependencies on engine.rs except types (LoopResult fields read, not engine.rs internals)",
+        "Code follows existing project patterns (compare against merge_resolver.rs structure for trait-based testable IO)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006"
+      ],
+      "description": "Review all implementation for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated logic across the four CLI flag-pair sites (Commands::Loop parent + LoopCommand::Run + Commands::Batch parent + BatchCommand::Run), functions >30 lines, tight coupling between auto_review.rs and engine.rs / batch.rs, redundancies between FEAT-003 unit tests and FEAT-005 integration tests.\nDO NOT: Skip — this gate catches issues before the final review. Do NOT propose the `#[command(flatten)]` refactor (it's already flagged in the plan as out-of-scope future cleanup).",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across modules (auto_review.rs vs main.rs/batch.rs wiring)",
+        "Single-responsibility functions",
+        "Pattern consistency with existing code (merge_resolver.rs, project_config.rs)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/project_config.rs",
+        "src/main.rs",
+        "src/cli/commands.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified — auto_review::maybe_fire called from both main.rs Loop arm AND batch.rs run_batch)",
+        "Positive: All errors propagated with context (map_err, not unwrap) — verify in auto_review.rs and at all wiring sites",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Negative: No unwrap() in production code paths (test code OK)",
+        "Negative: No dead code warnings for new code",
+        "Negative: Auto-review failure does NOT change loop/batch exit code — re-verify by reading the wiring (return value of maybe_fire is unused except for the eprintln)",
+        "Manual smoke test: from a real interactive shell, run `claude \"/review-loop tasks/<some-prd>.md\"` and confirm Claude starts with the slash command as the initial prompt. If it doesn't, this is the contingency point — open a follow-up FIX task to use the stdin-pipe fallback from the plan's stated-assumptions section.",
+        "Documentation: `CLAUDE.md` updated (verified by FEAT-006); architecture docs updated if new subsystems were added (none expected here)",
+        "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions (this is the last task — only update if a subsequent FIX-xxx is spawned)",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite). Also perform the manual TTY smoke test from the plan's verification step 10 because no automated test can prove `claude \"/review-loop foo.md\"` is accepted as an initial prompt by the real Claude binary.\n\nDO: Check every new function for error handling, check callers still work, verify no dead code, check if docs need updating. Run full cargo test / pytest (no scope filter). Manually run `claude \"/review-loop tasks/auto-review-after-loop.md\"` once from a real interactive shell to validate the assumption stated in the plan.\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode. Do NOT scope the test suite — this is THE place the full suite runs.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. CRITICAL manual step: the plan's stated assumption — `claude \"/review-loop foo.md\"` works as an initial-prompt arg — is unverified until this task. If the assumption is wrong, the whole feature ships as hint-line-only (config-flag-default-off); spawn a FIX-xxx to gate the spawn behind that flag and fall back to the stdin-pipe form documented in the plan. Don't ship the feature default-on if the assumption fails.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production paths",
+        "All new code wired to production entry point (grep-verified)",
+        "Full suite green including pre-existing failures",
+        "Manual smoke test of slash-command-as-initial-prompt verifies the plan's stated assumption",
+        "Auto-review never masks loop exit code (re-verified by reading the wiring)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification + manual TTY smoke test",
+      "touchesFiles": [
+        "src/loop_engine/auto_review.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/batch.rs",
+        "src/loop_engine/project_config.rs",
+        "src/main.rs",
+        "src/cli/commands.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
