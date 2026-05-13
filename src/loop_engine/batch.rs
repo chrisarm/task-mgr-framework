@@ -585,6 +585,14 @@ pub async fn run_batch(
     let mut skipped = 0usize;
     let mut stopped = 0usize;
 
+    let cleanup_ctx = WorktreeCleanupContext {
+        project_root,
+        yes,
+        keep_worktrees,
+        cleanup_worktree: LoopConfig::from_env().cleanup_worktree,
+        chain,
+    };
+
     for (i, (prd_file, prompt_file)) in pairs.iter().enumerate() {
         // Check .stop signal before each PRD (covers files placed between runs,
         // or before the batch even starts its first PRD).
@@ -636,39 +644,33 @@ pub async fn run_batch(
             prefix_mode,
         };
 
-        let should_cleanup_worktree = run_config.config.cleanup_worktree;
         let loop_result = engine::run_loop(run_config).await;
         let exit_code = loop_result.exit_code;
         let worktree_path = loop_result.worktree_path.clone();
         let result_branch_name = loop_result.branch_name.clone();
         let was_stopped = loop_result.was_stopped;
+        let tasks_completed = loop_result.tasks_completed;
+        let make_result = |stopped: bool| PrdRunResult {
+            prd_file: prd_file.clone(),
+            exit_code,
+            skipped: false,
+            stopped,
+            branch_name: result_branch_name.clone(),
+            chain_base: if chain { chain_base.clone() } else { None },
+            tasks_completed,
+            worktree_path: worktree_path.clone(),
+        };
 
         // Stop signal: if the engine was halted by a .stop file mid-run, record the
         // PRD as stopped (not succeeded) and abort the batch. The engine consumes the
         // signal file before returning, so we rely on the was_stopped flag.
         if was_stopped {
-            results.push(PrdRunResult {
-                prd_file: prd_file.clone(),
-                exit_code,
-                skipped: false,
-                stopped: true,
-                branch_name: result_branch_name.clone(),
-                chain_base: if chain { chain_base.clone() } else { None },
-                tasks_completed: loop_result.tasks_completed,
-                worktree_path: loop_result.worktree_path.clone(),
-            });
+            results.push(make_result(true));
             stopped += 1;
 
             // Worktree cleanup for the stopped PRD
             if let Some(ref wt_path) = worktree_path {
-                WorktreeCleanupContext {
-                    project_root,
-                    yes,
-                    keep_worktrees,
-                    cleanup_worktree: should_cleanup_worktree,
-                    chain,
-                }
-                .cleanup(wt_path, exit_code, result_branch_name.as_deref());
+                cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
             }
 
             eprintln!("Stop signal detected during PRD, skipping remaining PRDs");
@@ -676,16 +678,7 @@ pub async fn run_batch(
             break;
         }
 
-        results.push(PrdRunResult {
-            prd_file: prd_file.clone(),
-            exit_code,
-            skipped: false,
-            stopped: false,
-            branch_name: result_branch_name.clone(),
-            chain_base: if chain { chain_base.clone() } else { None },
-            tasks_completed: loop_result.tasks_completed,
-            worktree_path: loop_result.worktree_path.clone(),
-        });
+        results.push(make_result(false));
 
         if exit_code == 0 {
             succeeded += 1;
@@ -695,14 +688,7 @@ pub async fn run_batch(
 
         // Worktree cleanup after each PRD
         if let Some(ref wt_path) = worktree_path {
-            WorktreeCleanupContext {
-                project_root,
-                yes,
-                keep_worktrees,
-                cleanup_worktree: should_cleanup_worktree,
-                chain,
-            }
-            .cleanup(wt_path, exit_code, result_branch_name.as_deref());
+            cleanup_ctx.cleanup(wt_path, exit_code, result_branch_name.as_deref());
         }
 
         // Chain stop-on-failure: if this PRD failed, skip all remaining PRDs.
@@ -782,8 +768,7 @@ pub(crate) fn pick_review_target<'a>(
     decision: &Decision,
 ) -> Option<&'a PrdRunResult> {
     results.iter().rev().find(|r| {
-        r.exit_code == 0
-            && !r.skipped
+        !r.skipped
             && !r.stopped
             && auto_review::should_fire(decision, r.exit_code, false, r.tasks_completed)
     })
