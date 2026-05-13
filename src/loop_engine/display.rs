@@ -51,6 +51,11 @@ pub struct SessionBannerHints<'a> {
     pub prefix: Option<&'a str>,
     /// Optional active worktree path; when `None` the worktree line is omitted.
     pub worktree_path: Option<&'a std::path::Path>,
+    /// Directory where `.stop` and `.pause` signal files are read from.
+    /// When `Some`, the Stop/Pause hints display a path relative to cwd
+    /// (e.g. `tasks/.stop-P1`) so the operator doesn't have to guess where
+    /// to drop the file. When `None`, the legacy bare-filename hint is used.
+    pub tasks_dir: Option<&'a std::path::Path>,
 }
 
 /// Format the session start banner as a string (for testability).
@@ -116,7 +121,7 @@ pub fn format_session_banner(
         lines.push(sep.clone());
 
         // DB path
-        let db_str = h.db_path.display().to_string();
+        let db_str = shorten_path_for_display(h.db_path);
         let db_width = inner - "  DB: ".len();
         lines.push(format!(
             "║  DB: {:<width$}║",
@@ -125,11 +130,15 @@ pub fn format_session_banner(
         ));
 
         // Stop hint
-        let stop_file = match h.prefix {
+        let stop_name = match h.prefix {
             Some(p) => format!(".stop-{}", p),
             None => ".stop".to_string(),
         };
-        let stop_hint = format!("touch {} to stop", stop_file);
+        let stop_display = match h.tasks_dir {
+            Some(dir) => shorten_path_for_display(&dir.join(&stop_name)),
+            None => stop_name,
+        };
+        let stop_hint = format!("touch {} to stop", stop_display);
         let stop_width = inner - "  Stop: ".len();
         lines.push(format!(
             "║  Stop: {:<width$}║",
@@ -138,16 +147,25 @@ pub fn format_session_banner(
         ));
 
         // Pause hint
+        let pause_name = match h.prefix {
+            Some(p) => format!(".pause-{}", p),
+            None => ".pause".to_string(),
+        };
+        let pause_display = match h.tasks_dir {
+            Some(dir) => shorten_path_for_display(&dir.join(&pause_name)),
+            None => pause_name,
+        };
+        let pause_hint = format!("touch {} to pause", pause_display);
         let pause_width = inner - "  Pause: ".len();
         lines.push(format!(
             "║  Pause: {:<width$}║",
-            truncate_display("touch .pause to pause", pause_width),
+            truncate_display(&pause_hint, pause_width),
             width = pause_width
         ));
 
         // Worktree (only when Some)
         if let Some(wt) = h.worktree_path {
-            let wt_str = wt.display().to_string();
+            let wt_str = shorten_path_for_display(wt);
             let wt_width = inner - "  Worktree: ".len();
             lines.push(format!(
                 "║  Worktree: {:<width$}║",
@@ -335,6 +353,46 @@ fn terminal_width() -> Option<usize> {
     None
 }
 
+/// Shorten an absolute path for banner display by replacing the current
+/// working directory or `$HOME` with a relative or `~`-prefixed form.
+///
+/// Priority:
+/// 1. If `path` is under `cwd`, return a path relative to cwd (e.g.
+///    `.task-mgr/tasks.db`). An exact cwd match returns `.`.
+/// 2. Else if `path` is under `$HOME`, return `~/...`.
+/// 3. Else return the absolute path unchanged.
+///
+/// On any failure (cwd unavailable, `$HOME` unset, non-prefix path), falls
+/// back to the absolute form so the banner is always meaningful.
+fn shorten_path_for_display(path: &std::path::Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    shorten_path_for_display_with(path, cwd.as_deref(), home.as_deref())
+}
+
+/// Inner form of [`shorten_path_for_display`] with injectable `cwd` and
+/// `home` for deterministic tests.
+fn shorten_path_for_display_with(
+    path: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> String {
+    if let Some(cwd) = cwd {
+        if path == cwd {
+            return ".".to_string();
+        }
+        if let Ok(rel) = path.strip_prefix(cwd) {
+            return rel.display().to_string();
+        }
+    }
+    if let Some(home) = home
+        && let Ok(rel) = path.strip_prefix(home)
+    {
+        return format!("~/{}", rel.display());
+    }
+    path.display().to_string()
+}
+
 /// Truncate a string for display in a fixed-width box.
 fn truncate_display(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -456,6 +514,7 @@ mod tests {
             db_path: db,
             prefix: None,
             worktree_path: Some(wt),
+            tasks_dir: None,
         };
         // Must not panic and must return a non-empty string
         let banner = format_session_banner(
@@ -476,6 +535,7 @@ mod tests {
             db_path: db,
             prefix: None,
             worktree_path: None,
+            tasks_dir: None,
         };
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
@@ -483,6 +543,85 @@ mod tests {
         assert!(
             !banner_lower.contains("worktree"),
             "Banner without worktree_path must not mention 'worktree', got:\n{}",
+            banner
+        );
+    }
+
+    // --- shorten_path_for_display tests ---
+
+    #[test]
+    fn test_shorten_path_under_cwd_returns_relative() {
+        use std::path::Path;
+        let cwd = Path::new("/work/project");
+        let p = Path::new("/work/project/.task-mgr/tasks.db");
+        let out = shorten_path_for_display_with(p, Some(cwd), Some(Path::new("/home/u")));
+        assert_eq!(out, ".task-mgr/tasks.db");
+    }
+
+    #[test]
+    fn test_shorten_path_exactly_cwd_returns_dot() {
+        use std::path::Path;
+        let cwd = Path::new("/work/project");
+        let out = shorten_path_for_display_with(cwd, Some(cwd), None);
+        assert_eq!(out, ".");
+    }
+
+    #[test]
+    fn test_shorten_path_under_home_returns_tilde() {
+        use std::path::Path;
+        let cwd = Path::new("/work/project");
+        let home = Path::new("/home/u");
+        let p = Path::new("/home/u/repos/project-worktrees/feat-x");
+        let out = shorten_path_for_display_with(p, Some(cwd), Some(home));
+        assert_eq!(out, "~/repos/project-worktrees/feat-x");
+    }
+
+    #[test]
+    fn test_shorten_path_outside_cwd_and_home_returns_absolute() {
+        use std::path::Path;
+        let p = Path::new("/tmp/elsewhere/tasks.db");
+        let out = shorten_path_for_display_with(
+            p,
+            Some(Path::new("/work/project")),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(out, "/tmp/elsewhere/tasks.db");
+    }
+
+    #[test]
+    fn test_shorten_path_cwd_takes_priority_over_home() {
+        use std::path::Path;
+        // path is under both cwd and home; cwd wins (relative is more useful).
+        let cwd = Path::new("/home/u/work");
+        let home = Path::new("/home/u");
+        let p = Path::new("/home/u/work/.task-mgr/tasks.db");
+        let out = shorten_path_for_display_with(p, Some(cwd), Some(home));
+        assert_eq!(out, ".task-mgr/tasks.db");
+    }
+
+    #[test]
+    fn test_format_session_banner_with_tasks_dir_shows_stop_pause_relative() {
+        use std::path::Path;
+        // Use short paths and a short prefix so the Stop/Pause hint survives
+        // the MIN_WIDTH (48-col) truncation when no terminal is detected.
+        let db = Path::new("/x/db.db");
+        let tasks_dir = Path::new("/x/t");
+        let hints = SessionBannerHints {
+            db_path: db,
+            prefix: Some("P1"),
+            worktree_path: None,
+            tasks_dir: Some(tasks_dir),
+        };
+        let banner =
+            format_session_banner("prd.json", "main", 5, None, Some(&hints));
+        assert!(
+            banner.contains("/x/t/.stop-P1"),
+            "Stop hint must include tasks_dir prefix, got:\n{}",
+            banner
+        );
+        assert!(
+            banner.contains("/x/t/.pause-P1"),
+            "Pause hint must include tasks_dir prefix, got:\n{}",
             banner
         );
     }
@@ -495,6 +634,7 @@ mod tests {
             db_path: db,
             prefix: Some("P1"),
             worktree_path: None,
+            tasks_dir: None,
         };
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));
@@ -513,6 +653,7 @@ mod tests {
             db_path: db,
             prefix: None,
             worktree_path: None,
+            tasks_dir: None,
         };
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 5, None, Some(&hints));
@@ -537,6 +678,7 @@ mod tests {
             db_path: db,
             prefix: None,
             worktree_path: None,
+            tasks_dir: None,
         };
         let banner =
             format_session_banner(".task-mgr/tasks/prd.json", "main", 10, None, Some(&hints));

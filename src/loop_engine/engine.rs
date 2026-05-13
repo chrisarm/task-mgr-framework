@@ -3409,6 +3409,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         db_path: &db_path,
         prefix: task_prefix.as_deref(),
         worktree_path: actual_worktree_path.as_deref(),
+        tasks_dir: Some(paths.tasks_dir.as_path()),
     };
     display::print_session_banner(
         &prd_basename,
