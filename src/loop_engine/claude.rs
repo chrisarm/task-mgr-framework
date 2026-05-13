@@ -173,13 +173,18 @@ fn open_pty_for_child_output() -> std::io::Result<(
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
     // SAFETY: openpty writes the two out params; null termios/winsize/name use defaults.
+    //
+    // `as _` lets each call site adopt the platform-correct pointer kind:
+    // Linux's `libc::openpty` declares the trailing termios/winsize args as
+    // `*const _`, while macOS declares them as `*mut _`. Without the cast,
+    // `ptr::null()` would lock in `*const _` and fail to type-check on macOS.
     let ret = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut::<libc::termios>() as _,
+            std::ptr::null_mut::<libc::winsize>() as _,
         )
     };
     if ret != 0 {

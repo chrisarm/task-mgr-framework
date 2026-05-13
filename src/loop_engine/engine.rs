@@ -2572,7 +2572,7 @@ pub fn run_iteration(
 ///
 /// Carries the exit code and (when applicable) the worktree path so that
 /// callers can perform post-loop cleanup.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LoopResult {
     /// Exit code to pass to the process (0 = success, 1 = error, etc.)
     pub exit_code: i32,
@@ -2593,6 +2593,13 @@ pub struct LoopResult {
     /// to react to a mid-run stop (e.g. `run_batch`) must use this flag instead of
     /// re-checking the file system.
     pub was_stopped: bool,
+    /// Number of tasks completed during this run (per-run counter, not cumulative).
+    ///
+    /// Incremented each time a task transitions to `done` within this invocation of
+    /// `run_loop`. Does NOT count tasks completed in prior runs or via external git
+    /// reconciliation. Used by callers (e.g. batch auto-review gating) to decide
+    /// whether this run met the minimum-tasks threshold.
+    pub tasks_completed: u32,
 }
 
 /// Configuration for running the loop, built from CLI args + env.
@@ -2732,9 +2739,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Hint: Run task-mgr from within a git repository.");
         return LoopResult {
             exit_code: 1,
-            worktree_path: None,
-            branch_name: None,
-            was_stopped: false,
+            ..Default::default()
         };
     }
 
@@ -2753,9 +2758,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             );
             return LoopResult {
                 exit_code: 1,
-                worktree_path: None,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     };
@@ -2770,9 +2773,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Error creating directories: {}", e);
         return LoopResult {
             exit_code: 1,
-            worktree_path: None,
-            branch_name: None,
-            was_stopped: false,
+            ..Default::default()
         };
     }
 
@@ -2839,9 +2840,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             }
             return LoopResult {
                 exit_code: 1,
-                worktree_path: None,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     };
@@ -2893,9 +2892,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         eprintln!("Error initializing PRD: {}", e);
         return LoopResult {
             exit_code: 1,
-            worktree_path: None,
-            branch_name: None,
-            was_stopped: false,
+            ..Default::default()
         };
     }
 
@@ -2911,9 +2908,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             eprintln!("Error opening database: {}", e);
             return LoopResult {
                 exit_code: 1,
-                worktree_path: None,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     };
@@ -2966,9 +2961,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             eprintln!("Error: failed to reset stale tasks: {}", e);
             return LoopResult {
                 exit_code: 1,
-                worktree_path: None,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     }
@@ -2995,9 +2988,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             eprintln!("Error reading PRD metadata: {}", e);
             return LoopResult {
                 exit_code: 1,
-                worktree_path: None,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     };
@@ -3111,9 +3102,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     eprintln!("Error setting up worktree: {}", e);
                     return LoopResult {
                         exit_code: 1,
-                        worktree_path: None,
-                        branch_name: None,
-                        was_stopped: false,
+                        ..Default::default()
                     };
                 }
             }
@@ -3125,9 +3114,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                 eprintln!("Error: {}", e);
                 return LoopResult {
                     exit_code: 1,
-                    worktree_path: None,
-                    branch_name: None,
-                    was_stopped: false,
+                    ..Default::default()
                 };
             }
             run_config.source_root.clone()
@@ -3236,8 +3223,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
-            branch_name: None,
-            was_stopped: false,
+            ..Default::default()
         };
     }
 
@@ -3267,8 +3253,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     return LoopResult {
                         exit_code: 1,
                         worktree_path: actual_worktree_path,
-                        branch_name: None,
-                        was_stopped: false,
+                        ..Default::default()
                     };
                 }
                 match worktree::ensure_slot_worktrees(
@@ -3334,8 +3319,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         return LoopResult {
             exit_code: 1,
             worktree_path: actual_worktree_path,
-            branch_name: None,
-            was_stopped: false,
+            ..Default::default()
         };
     }
 
@@ -3348,8 +3332,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             return LoopResult {
                 exit_code: 1,
                 worktree_path: actual_worktree_path,
-                branch_name: None,
-                was_stopped: false,
+                ..Default::default()
             };
         }
     };
@@ -4012,6 +3995,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
         worktree_path: actual_worktree_path,
         branch_name: branch_name.clone(),
         was_stopped,
+        tasks_completed,
     }
 }
 
@@ -4802,6 +4786,31 @@ mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{EnvGuard, setup_test_db};
+
+    // --- LoopResult Default tests ---
+
+    #[test]
+    fn test_loop_result_default_is_zero() {
+        let r = LoopResult::default();
+        assert_eq!(r.exit_code, 0);
+        assert!(r.worktree_path.is_none());
+        assert!(r.branch_name.is_none());
+        assert!(!r.was_stopped);
+        assert_eq!(r.tasks_completed, 0);
+    }
+
+    #[test]
+    fn test_loop_result_partial_construction_via_default() {
+        let r = LoopResult {
+            exit_code: 130,
+            ..Default::default()
+        };
+        assert_eq!(r.exit_code, 130);
+        assert!(r.worktree_path.is_none());
+        assert!(r.branch_name.is_none());
+        assert!(!r.was_stopped);
+        assert_eq!(r.tasks_completed, 0);
+    }
 
     // --- pre_lock_prefix fallback tests ---
 
@@ -7400,7 +7409,7 @@ mod tests {
             // seeing the signal.
             let _env_lock = crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX
                 .lock()
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             let _env_guard = crate::loop_engine::test_utils::EnvGuard::set(
                 "CLAUDE_BINARY",
                 "/nonexistent_binary_for_test",
