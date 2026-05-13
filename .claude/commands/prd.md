@@ -13,11 +13,12 @@ Generate a structured PRD from rough requirements or bug reports.
 
 You are a product manager helping to create a clear, actionable PRD. Follow this process:
 
-> **CRITICAL — The 3 things that make a PRD effective:**
+> **CRITICAL — The 4 things that make a PRD effective:**
 >
 > 1. **Quality dimensions are explicit** — state what makes the solution _good_ (correctness, performance, style), not just what it does. Vague requirements produce vague code.
 > 2. **Edge cases are concrete and named** — naming a specific edge case (e.g., "ß → ss") forces the implementer to handle it. Unnamed edge cases get discovered in production.
-> 3. **Approaches are compared before committing** — 2-3 approaches with tradeoffs collapse multiple implement-and-rewrite cycles into one informed decision. When comparing two approaches, generally go for long-term wins over short-term gains. Excellence, speed, and thoroughness of implementation are worth taking extra time to achieve.
+> 3. **Approaches are compared before committing** — 2-3 approaches with tradeoffs collapse multiple implement-and-rewrite cycles into one informed decision. When comparing two approaches, generally go for long-term wins over short-term gains. Excellence, speed, and thoroughness of implementation are worth taking extra time to achieve. **Phase 2 foundation principle**: if a more sophisticated solution costs ~1 day now but saves ~2+ weeks of rework post-launch, take that trade-off (1:10 ratio or better). We are pre-launch — foundations laid now compound enormously.
+> 4. **Data flow contracts are verified** — for any data structure accessed across module boundaries, document the exact key type at each level with a copy-pasteable access pattern. The implementing agent cannot reliably discover correct key paths from type signatures alone; wrong-key-type bugs are silent (code compiles, tests pass with synthetic data, fails at runtime).
 
 ### Step 1: Understand the Request
 
@@ -157,8 +158,38 @@ Use Glob and Grep to identify:
 - Edge cases implied by existing code (error handling, boundary checks, special-case branches) — add these to the Known Edge Cases table in section 2.5
 - Multiple viable implementation approaches — add these to the Approaches & Tradeoffs table in section 6
 - Quality constraints implied by the codebase (e.g., no `.unwrap()`, specific error types) — add these to Quality Dimensions
+- **Data flow paths**: For any data structure that crosses module boundaries, trace the key type at each hop (struct field → map key → JSONB key). Note where key types change between levels — these need Data Flow Contracts (see Step 4.6).
+- **Existing documentation**: Check `docs/` for architecture design docs, runbooks, and dev guides. If the feature adds new modules, changes system architecture, alters developer workflows, or modifies operational procedures, note which docs need creating or updating in the PRD's Documentation section. Architecture docs (`docs/system-design-overview.md` and similar) are especially important — they allow future Claude sessions to understand the system design without reading all the code.
 
 Document findings for the Technical Considerations section.
+
+### Step 4.7: Check Institutional Memory
+
+Before generating the PRD, query the task-mgr learnings database for relevant prior experience. Run **both tag-based AND query-based recall** — they hit different indexes and return different results:
+
+```bash
+# Tag-based: exact-match on curated tags
+task-mgr recall --tags "{relevant-tags}" --limit 10
+
+# Query-based: full-text / semantic search over title + content
+task-mgr recall --query "{natural-language description of the feature}" --limit 10
+task-mgr recall --query "{key function names, error messages, or concepts}" --limit 10
+
+# Combined: tag AND query for narrow, high-precision results
+task-mgr recall --tags "{domain}" --query "{concept}" --limit 10
+```
+
+**Why run both:** tag searches miss learnings that weren't tagged with your exact domain term (taggers are inconsistent). Query searches catch those via content matching. Conversely, query searches miss high-signal learnings whose content phrases the topic differently. Run at least one of each before generating the PRD.
+
+**For research/spike tasks** (library evaluations, architecture spikes, benchmarking):
+- Search for learnings from past similar spikes: `task-mgr recall --tags "spike,evaluation,research" --limit 10`
+- Also try query-based: `task-mgr recall --query "library evaluation benchmark spike" --limit 10`
+- Past spikes have crashed when the agent tried to run Docker or heavy evaluation code. If the PRD includes evaluation work:
+  - Mark the task as `taskType: "research"` with `requiresHuman: true` so the loop agent flags it for human attention
+  - Recommend `model: opus` and `estimatedEffort: "high"`
+  - Require a clear fallback decision: "if evaluation takes >3 days, default to X and document why"
+  - Consider splitting: "define evaluation criteria" (automatable) vs "run benchmarks + write ADR" (requires human)
+- Embed relevant learnings in the PRD's Technical Considerations section so the implementing agent doesn't repeat past mistakes.
 
 ### Step 4.5: Define Public Contracts
 
@@ -181,28 +212,23 @@ Before generating the PRD, define the public interfaces this change introduces o
 
 > **Scope**: Only document public-facing interfaces (module APIs, HTTP endpoints, GenServer calls, PubSub topics). Internal helpers are implementation details for `/tasks`.
 
-### Step 4.7: Architectural Decision Points
+### Step 4.6: Define Data Flow Contracts
 
-When 2+ viable approaches exist with **no clear winner**, classify and handle as follows:
+For any data structure the implementing agent will need to access across module boundaries:
 
-- **High-impact** (affects PRD structure, spans multiple user stories, or is a fundamental design choice — e.g., "event-sourced vs. CRUD model", "sync vs. async API"): **STOP and ask the user inline** with lettered options before continuing.
+1. **Trace the actual key path** through the layers — read real code, don't guess
+2. **Document key type at each level** (struct/atom, map/string, JSONB/string)
+3. **Provide a copy-pasteable access pattern** showing the correct way to traverse the structure
+4. **Flag type transitions** where the key type changes (e.g., atom-keyed struct wrapping a string-keyed JSONB map)
+5. **Document in PRD**: Add to the "Data Flow Contracts" section in Section 6
 
-  Example prompt format:
-  > **Architectural Decision**: [brief description of the fork]
-  > A) [Option A — one sentence]
-  > B) [Option B — one sentence]
-  > Which approach should this PRD use?
-
-- **Lower-impact** (implementation detail that doesn't change the PRD shape — e.g., "which hashing library", "pagination strategy"): **Continue writing the PRD** and document the open question in Section 7 (Open Questions) with the `[ARCH DECISION]` tag.
-
-  Example entry:
-  > `[ARCH DECISION]` Cache invalidation strategy: Option A (TTL-based) vs Option B (event-driven). Recommend A for simplicity; revisit if throughput becomes a concern.
-
-**Do not** invent a winner when the trade-offs are genuinely balanced — ask or document instead.
+> **Why this matters**: Data access path bugs are silent — the code compiles, tests pass (if tests use synthetic data matching the wrong format), and failures only surface at runtime. The implementing agent cannot reliably discover the correct key path by reading type signatures alone; it needs a concrete, verified example.
+>
+> **When to skip**: If the feature only adds new modules with no cross-module data access, this section is N/A.
 
 ### Step 5: Generate the PRD
 
-Create a markdown file at `.task-mgr/tasks/prd-{feature-name}.md` with this structure:
+Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:
 
 ```markdown
 # PRD: {Feature Title}
@@ -268,7 +294,6 @@ Create a markdown file at `.task-mgr/tasks/prd-{feature-name}.md` with this stru
 | ------------------------- | ------------------------------ | -------------------- |
 | {e.g., empty input}       | {Common source of panics}      | {Return empty/error} |
 | {e.g., Unicode expansion} | {ß → ss changes string length} | {Handle correctly}   |
-| Feature implemented but not wired into production call path | All unit tests pass but feature has no effect at runtime | Integration test verifies observable behavior change from production entry point |
 
 ---
 
@@ -336,6 +361,8 @@ The following are explicitly **NOT** part of this work:
 
 **Selected Approach**: {Which approach and why. If the best elements of multiple approaches can be combined, describe the hybrid.}
 
+**Phase 2 Foundation Check**: {Does the selected approach lay a strong foundation for post-launch evolution? If a more sophisticated approach costs ~1 day now but saves ~2+ weeks of rework later (1:10 ratio or better), prefer it. State the trade-off explicitly: "Approach X costs [effort now] but avoids [rework later]" or "N/A — no phase 2 implications."}
+
 ### Risks & Mitigations
 
 | Risk     | Impact       | Likelihood   | Mitigation |
@@ -364,6 +391,20 @@ The following are explicitly **NOT** part of this work:
 | ----------------------- | ----------------- | ------------------ | --------- | ---------- |
 | {module.function/arity} | {current}         | {proposed}         | Yes/No    | {strategy} |
 
+### Data Flow Contracts
+
+<!-- For any data structure the implementing agent must access across module boundaries.
+     Trace the actual key path by reading real code — don't guess from type signatures.
+     Show copy-pasteable access patterns in the project's language. -->
+
+| Data Path | Key Types at Each Level | Copy-Pasteable Access Pattern |
+| --------- | ----------------------- | ----------------------------- |
+| {e.g., context → settings → config} | {e.g., struct (typed field) → struct (typed field) → deserialized JSON (string keys)} | {Copy-pasteable code showing correct access at each level} |
+
+<!-- Flag type transitions where key types change between levels (e.g., typed struct field
+     wrapping a deserialized JSON map with string keys) — these are the #1 source of silent
+     data access bugs because both key types compile/run without errors but return nil/default -->
+
 ### Consumers of Changed Behavior
 
 <!-- Required for Bug Fix, Enhancement, and Refactor types -->
@@ -388,6 +429,26 @@ The following are explicitly **NOT** part of this work:
 - [ ] Routing/branching decisions that depend on output reviewed?
 - [ ] Tests that validate current behavior identified?
 - [ ] Different semantic contexts for same code discovered and documented?
+
+### Documentation
+
+<!-- Identify docs that need to be created or updated. Check docs/ for existing content.
+     Architecture docs are critical — they let future Claude sessions understand the system
+     without reading all the code. When a feature adds modules, changes data flow, or
+     introduces new subsystems, the architecture docs MUST be updated. -->
+
+| Doc | Action | Description |
+| --- | ------ | ----------- |
+| {e.g., `docs/system-design-overview.md`} | Update | {Architecture changes: new modules, data flow, subsystem interactions} |
+| {e.g., `docs/feature-name.md`} | Create | {Dev guide: usage, troubleshooting, API reference} |
+| {e.g., `.claude/CLAUDE.md`} | Update | {Quick-reference for Claude sessions} |
+
+<!-- Categories to consider:
+     - Architecture docs: system-design-overview.md, data flow diagrams, module relationships
+     - Dev guides: how to use new tooling, debugging workflows, operational procedures
+     - CLAUDE.md: concise pointers so Claude agents can find relevant docs quickly
+     - Runbooks: operational procedures for new infrastructure or services
+     If no documentation changes needed, state "N/A — no architectural or operational changes" -->
 
 ---
 
@@ -415,7 +476,7 @@ After creating the PRD, provide:
 
 1. File path where PRD was saved
 2. Brief summary of what was documented
-3. Suggested next step: `/tasks .task-mgr/tasks/prd-{feature-name}.md`
+3. Suggested next step: `/tasks tasks/prd-{feature-name}.md`
 
 ## Example
 
@@ -444,12 +505,12 @@ User: A, B, C
 Claude: *explores codebase for existing theme patterns*
 *generates PRD*
 
-Created: .task-mgr/tasks/prd-dark-mode.md
+Created: tasks/prd-dark-mode.md
 
 Summary: PRD for dark mode toggle with MVP scope (OS preference + manual override),
 accessible from settings and header quick-toggle, synced to user account.
 
-Next step: Run `/tasks .task-mgr/tasks/prd-dark-mode.md` to generate the task breakdown.
+Next step: Run `/tasks tasks/prd-dark-mode.md` to generate the task breakdown.
 ```
 
 ## Notes
@@ -465,5 +526,6 @@ Next step: Run `/tasks .task-mgr/tasks/prd-dark-mode.md` to generate the task br
 > - **Section 2.5 Quality Dimensions**: Correctness, Performance, Style, and Known Edge Cases all populated
 > - **Section 6 Approaches & Tradeoffs**: At least 2 approaches compared with a selected approach stated
 > - **Section 6 Public Contracts**: New/modified interfaces documented
+> - **Section 6 Data Flow Contracts**: If the feature accesses data across module boundaries, concrete access patterns documented with key types at each level. If not applicable, state "N/A — no cross-module data access"
 > - **Known Edge Cases table**: At least 2 concrete, named edge cases (not generic placeholders)
 > - **Top 3 Risks**: Identified and documented with mitigations
