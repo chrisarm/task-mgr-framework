@@ -630,6 +630,7 @@ pub async fn run_batch(
         // (md5(branchName:filename)[:8]) that a standalone loop run would use.
         // This ensures loop→batch transitions reuse existing task IDs.
         let prefix_mode = PrefixMode::Auto;
+        let chain_base_snapshot = if chain { chain_base.clone() } else { None };
 
         let run_config = LoopRunConfig {
             db_dir: dir.to_path_buf(),
@@ -640,7 +641,7 @@ pub async fn run_batch(
             config,
             external_repo: None, // Batch mode reads from PRD metadata
             batch_sibling_prds: sibling_prds,
-            chain_base: if chain { chain_base.clone() } else { None },
+            chain_base: chain_base_snapshot.clone(),
             prefix_mode,
         };
 
@@ -656,7 +657,7 @@ pub async fn run_batch(
             skipped: false,
             stopped,
             branch_name: result_branch_name.clone(),
-            chain_base: if chain { chain_base.clone() } else { None },
+            chain_base: chain_base_snapshot.clone(),
             tasks_completed,
             worktree_path: worktree_path.clone(),
         };
