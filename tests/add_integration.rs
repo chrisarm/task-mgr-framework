@@ -1,8 +1,25 @@
 use serde_json::Value;
 use std::fs;
+use std::sync::Once;
 use task_mgr::commands::add::add;
 use task_mgr::commands::init::{PrefixMode, init};
 use tempfile::TempDir;
+
+/// Unset `TASK_MGR_ACTIVE_PREFIX` once for this test binary. The loop engine
+/// exports this var when running task-mgr inside a loop; it leaks into the
+/// cargo-test child env and causes `add()` (via `resolve_active_prefix`) to
+/// fail with "stale pin" because the leaked prefix isn't registered in the
+/// test fixtures' fresh DBs. Tests in this file never SET the var, so a
+/// one-shot unset at first-test-setup is sufficient.
+static UNSET_ACTIVE_PREFIX: Once = Once::new();
+fn ensure_active_prefix_unset() {
+    UNSET_ACTIVE_PREFIX.call_once(|| {
+        // SAFETY: runs before any test thread reads the env (all tests go
+        // through setup_with_prd, which calls this); single Once-guarded
+        // mutation, no concurrent set in this binary.
+        unsafe { std::env::remove_var("TASK_MGR_ACTIVE_PREFIX") };
+    });
+}
 
 fn minimal_prd_json(p1: i32, p2: i32) -> String {
     serde_json::json!({
@@ -19,6 +36,7 @@ fn minimal_prd_json(p1: i32, p2: i32) -> String {
 /// The PRD file is placed at the TempDir root (outside the `tasks/` subdir)
 /// so init stores its absolute path in prd_files.
 fn setup_with_prd(prd_json: &str) -> (TempDir, std::path::PathBuf) {
+    ensure_active_prefix_unset();
     let dir = TempDir::new().unwrap();
     let prd_path = dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_json).unwrap();
