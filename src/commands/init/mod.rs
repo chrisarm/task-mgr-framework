@@ -602,8 +602,159 @@ fn write_project_defaults(db_dir: &Path) -> std::io::Result<bool> {
     Ok(created)
 }
 
+/// Marker block delimiting task-mgr's managed entries in `.gitignore`.
+/// The block is rewritten in place when its contents would change; any
+/// user-authored lines outside the markers are preserved untouched.
+const GITIGNORE_MARKER_BEGIN: &str = "# task-mgr begin: progress files (untracked)";
+const GITIGNORE_MARKER_END: &str = "# task-mgr end: progress files (untracked)";
+
+/// The single pattern inserted between the gitignore markers.
+const GITIGNORE_BODY: &str = "tasks/progress-*.txt\n";
+
+/// Compute the new contents of `.gitignore` after ensuring the task-mgr managed
+/// block is present and has the expected body. Returns `None` when no rewrite is
+/// needed (block already matches).
+fn merged_gitignore_contents(existing: &str) -> Option<String> {
+    let desired_block = format!(
+        "{}\n{}{}",
+        GITIGNORE_MARKER_BEGIN, GITIGNORE_BODY, GITIGNORE_MARKER_END
+    );
+    // The block as it appears in the file always ends with a newline after the
+    // END marker.
+    let desired_block_in_file = format!("{}\n", desired_block);
+
+    if let (Some(begin), Some(end)) = (
+        existing.find(GITIGNORE_MARKER_BEGIN),
+        existing.find(GITIGNORE_MARKER_END),
+    ) && begin < end
+    {
+        let after_end = end + GITIGNORE_MARKER_END.len();
+        let after_end = if existing[after_end..].starts_with('\n') {
+            after_end + 1
+        } else {
+            after_end
+        };
+        let current_block = &existing[begin..after_end];
+        if current_block == desired_block_in_file {
+            return None;
+        }
+        let mut rewritten = String::with_capacity(existing.len());
+        rewritten.push_str(&existing[..begin]);
+        rewritten.push_str(&desired_block_in_file);
+        rewritten.push_str(&existing[after_end..]);
+        return Some(rewritten);
+    }
+
+    // No marker block yet — append with one blank-line separator from any
+    // pre-existing content.
+    let mut rewritten = String::with_capacity(existing.len() + desired_block_in_file.len() + 2);
+    rewritten.push_str(existing);
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    if !existing.is_empty() {
+        rewritten.push('\n');
+    }
+    rewritten.push_str(&desired_block_in_file);
+    Some(rewritten)
+}
+
+/// Ensure `.gitignore` at `project_root` contains a marker-delimited block that
+/// ignores `tasks/progress-*.txt`. Idempotent: only rewrites when the managed
+/// block is missing or its body has drifted. Failures are returned as `Err` so
+/// the caller can decide whether to propagate or warn.
+fn ensure_progress_gitignore(project_root: &Path) -> Result<(), String> {
+    let gitignore_path = project_root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gitignore_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {}", gitignore_path.display(), e)),
+    };
+    if let Some(updated) = merged_gitignore_contents(&existing) {
+        std::fs::write(&gitignore_path, updated)
+            .map_err(|e| format!("write {}: {}", gitignore_path.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Untrack any `tasks/progress-*.txt` files currently tracked by git using
+/// `git rm --cached` (preserving disk content), then commit the index change.
+///
+/// No-op when there are no tracked progress files, or when the directory is not
+/// a git repository (`git ls-files` non-zero exit → stderr warning, returns
+/// `Ok(())`). Returns `Err` if `git rm --cached` or `git commit` fail.
+fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let ls_output = match Command::new("git")
+        .args(["ls-files", "tasks/progress-*.txt"])
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "task-mgr: progress migration skipped (git unavailable: {})",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    if !ls_output.status.success() {
+        eprintln!(
+            "task-mgr: progress migration skipped ({})",
+            String::from_utf8_lossy(&ls_output.stderr).trim()
+        );
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&ls_output.stdout);
+    let files: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    for file in &files {
+        let rm_output = Command::new("git")
+            .args(["rm", "--cached", file])
+            .current_dir(project_root)
+            .output()
+            .map_err(|e| format!("git rm --cached '{}' spawn failed: {}", file, e))?;
+        if !rm_output.status.success() {
+            return Err(format!(
+                "git rm --cached '{}' failed: {}",
+                file,
+                String::from_utf8_lossy(&rm_output.stderr).trim()
+            ));
+        }
+    }
+
+    let commit_output = Command::new("git")
+        .args([
+            "commit",
+            "-m",
+            "chore: untrack progress files (task-mgr init migration)",
+        ])
+        .current_dir(project_root)
+        .output()
+        .map_err(|e| format!("git commit spawn failed: {}", e))?;
+
+    if !commit_output.status.success() {
+        return Err(format!(
+            "git commit failed after git rm --cached: {}",
+            String::from_utf8_lossy(&commit_output.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
 /// Initialize project-level scaffolding: `.task-mgr/` directory, SQLite DB with
 /// migrations, and a default `config.json` (preserving any existing fields).
+/// Also ensures `.gitignore` contains an entry for `tasks/progress-*.txt` and
+/// runs a one-time migration to untrack any already-tracked progress files.
 ///
 /// Idempotent: safe to call when `.task-mgr/` already exists. Does NOT read or
 /// write any PRD JSON file.
@@ -624,6 +775,17 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
 
     // Fire model picker only when stdin+stderr are both TTYs; skip silently otherwise.
     let _ = crate::commands::models::ensure_default::ensure_default_model(&db_dir, false);
+
+    // Ensure .gitignore ignores per-PRD progress files. Non-fatal: a warning is
+    // printed if the file can't be written, but init_project still succeeds.
+    if let Err(e) = ensure_progress_gitignore(dir) {
+        eprintln!("task-mgr: warning: could not update .gitignore: {}", e);
+    }
+
+    // One-time migration: untrack any already-tracked progress files. Non-fatal
+    // when git ls-files fails (not a git repo); fatal if git commit fails so the
+    // operator sees the error rather than silently leaving a half-migrated index.
+    untrack_progress_files(dir).map_err(|e| TaskMgrError::IoError(std::io::Error::other(e)))?;
 
     Ok(InitResult {
         tasks_imported: 0,

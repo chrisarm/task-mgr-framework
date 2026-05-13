@@ -2961,3 +2961,251 @@ fn test_init_does_not_fire_picker_no_default_model_written() {
          that is the exclusive responsibility of init_project"
     );
 }
+
+// ── merged_gitignore_contents tests ──────────────────────────────────────────
+
+#[test]
+fn test_merged_gitignore_inserts_block_into_empty_file() {
+    let result = merged_gitignore_contents("").expect("must rewrite empty file");
+    assert!(result.contains(GITIGNORE_MARKER_BEGIN));
+    assert!(result.contains(GITIGNORE_MARKER_END));
+    // Exact pattern — not broader like "tasks/" or "*.txt"
+    assert!(result.contains("tasks/progress-*.txt"));
+    // No line should be the bare broad patterns
+    assert!(!result.lines().any(|l| l == "tasks/"));
+    assert!(!result.lines().any(|l| l == "*.txt"));
+}
+
+#[test]
+fn test_merged_gitignore_exact_pattern() {
+    let result = merged_gitignore_contents("").expect("must rewrite");
+    assert!(
+        result.contains("tasks/progress-*.txt"),
+        "must contain the exact pattern tasks/progress-*.txt"
+    );
+    // Body must not accidentally match tasks/ or *.txt
+    for line in result.lines() {
+        assert_ne!(
+            line, "tasks/",
+            "pattern must not be the broad 'tasks/' entry"
+        );
+        assert_ne!(line, "*.txt", "pattern must not be the broad '*.txt' entry");
+    }
+}
+
+#[test]
+fn test_merged_gitignore_appends_to_existing_content() {
+    let existing = "*.log\n*.tmp\n";
+    let result = merged_gitignore_contents(existing).expect("must rewrite");
+    // Pre-existing content preserved verbatim at the top
+    assert!(result.starts_with("*.log\n*.tmp\n"));
+    // One blank line separates the existing content from the managed block
+    assert!(result.contains("*.tmp\n\n"));
+    assert!(result.contains(GITIGNORE_MARKER_BEGIN));
+    assert!(result.contains("tasks/progress-*.txt"));
+}
+
+#[test]
+fn test_merged_gitignore_idempotent_when_block_matches() {
+    let initial = merged_gitignore_contents("").expect("first write");
+    assert!(
+        merged_gitignore_contents(&initial).is_none(),
+        "second call must return None (no rewrite needed)"
+    );
+}
+
+#[test]
+fn test_merged_gitignore_rewrites_drifted_block() {
+    // Simulate a stale block from a prior task-mgr version with a different body.
+    let stale = format!(
+        "{}\nold-pattern.log\n{}\n",
+        GITIGNORE_MARKER_BEGIN, GITIGNORE_MARKER_END
+    );
+    let result = merged_gitignore_contents(&stale).expect("must rewrite drifted block");
+    assert!(
+        !result.contains("old-pattern.log"),
+        "stale body must be replaced"
+    );
+    assert!(result.contains("tasks/progress-*.txt"));
+}
+
+// ── untrack_progress_files tests ─────────────────────────────────────────────
+
+/// Set up a minimal git repo with user config and an initial commit.
+/// Returns a TempDir whose path is the repo root.
+#[cfg(test)]
+fn setup_init_git_repo() -> TempDir {
+    use std::process::Command;
+    let tmp = TempDir::new().expect("create temp dir");
+    let repo = tmp.path();
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+    // Initial commit so there is a HEAD to commit against
+    fs::write(repo.join("README.md"), "init\n").expect("write README");
+    Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo)
+        .output()
+        .expect("git commit");
+    tmp
+}
+
+#[test]
+fn test_untrack_progress_files_noop_when_nothing_tracked() {
+    use std::process::Command;
+    let tmp = setup_init_git_repo();
+    let repo = tmp.path();
+
+    // No progress files tracked yet
+    let commit_before = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    let hash_before = String::from_utf8_lossy(&commit_before.stdout)
+        .trim()
+        .to_string();
+
+    untrack_progress_files(repo).expect("should succeed with no tracked files");
+
+    let commit_after = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    let hash_after = String::from_utf8_lossy(&commit_after.stdout)
+        .trim()
+        .to_string();
+
+    assert_eq!(
+        hash_before, hash_after,
+        "no commit should be created when nothing is tracked"
+    );
+}
+
+#[test]
+fn test_untrack_progress_files_removes_tracked_and_commits() {
+    use std::process::Command;
+    let tmp = setup_init_git_repo();
+    let repo = tmp.path();
+
+    // Create and track a progress file
+    fs::create_dir_all(repo.join("tasks")).expect("mkdir tasks");
+    let progress_path = repo.join("tasks/progress-test.txt");
+    let original_content = "iteration 1 done\niteration 2 done\n";
+    fs::write(&progress_path, original_content).expect("write progress file");
+
+    Command::new("git")
+        .args(["add", "tasks/progress-test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+    Command::new("git")
+        .args(["commit", "-m", "track progress file"])
+        .current_dir(repo)
+        .output()
+        .expect("git commit");
+
+    // Confirm it's tracked before migration
+    let ls_before = Command::new("git")
+        .args(["ls-files", "tasks/progress-test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git ls-files");
+    assert!(
+        !String::from_utf8_lossy(&ls_before.stdout).trim().is_empty(),
+        "file should be tracked before migration"
+    );
+
+    untrack_progress_files(repo).expect("migration should succeed");
+
+    // File must no longer be tracked
+    let ls_after = Command::new("git")
+        .args(["ls-files", "tasks/progress-test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git ls-files");
+    assert!(
+        String::from_utf8_lossy(&ls_after.stdout).trim().is_empty(),
+        "file must not be tracked after migration"
+    );
+
+    // File content on disk must be unchanged
+    let content_after = fs::read_to_string(&progress_path).expect("read progress file");
+    assert_eq!(
+        content_after, original_content,
+        "disk content must survive git rm --cached"
+    );
+
+    // Exactly one migration commit must exist after the initial two commits
+    let log = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(repo)
+        .output()
+        .expect("git log");
+    let log_str = String::from_utf8_lossy(&log.stdout);
+    let migration_commits: Vec<&str> = log_str
+        .lines()
+        .filter(|l| l.contains("chore: untrack progress files"))
+        .collect();
+    assert_eq!(
+        migration_commits.len(),
+        1,
+        "exactly one migration commit should exist"
+    );
+    assert!(
+        migration_commits[0].contains("chore: untrack progress files"),
+        "commit message must start with 'chore: untrack progress files'"
+    );
+}
+
+#[test]
+fn test_untrack_progress_files_noop_when_not_git_repo() {
+    let tmp = TempDir::new().expect("create temp dir");
+    // No git init — untrack_progress_files must skip gracefully
+    let result = untrack_progress_files(tmp.path());
+    assert!(
+        result.is_ok(),
+        "should succeed (skip) when directory is not a git repo: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_git_rm_non_cached_never_invoked() {
+    // Grep the implementation file to verify `git rm` (non-cached) is not used.
+    // This guards the invariant that disk content is never deleted by migration.
+    let impl_src = include_str!("mod.rs");
+    // Allow "git rm --cached" but reject bare "git rm" without "--cached"
+    for line in impl_src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.contains("\"rm\"") && !trimmed.contains("\"--cached\"") {
+            panic!(
+                "Found 'git rm' without '--cached' in mod.rs line: {:?}\n\
+                 Only 'git rm --cached' is allowed — bare 'git rm' deletes disk content.",
+                line
+            );
+        }
+    }
+}
