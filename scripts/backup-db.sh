@@ -19,9 +19,6 @@ set -e
 # Configuration & Defaults
 # ============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 # Default task-mgr database directory
 TASK_MGR_DIR="${TASK_MGR_DIR:-.task-mgr}"
 QUIET=false
