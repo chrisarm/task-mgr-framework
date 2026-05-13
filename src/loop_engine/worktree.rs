@@ -1108,6 +1108,8 @@ pub(crate) struct AutoRecoveryConfig<'a> {
     pub stash_limit: u32,
 }
 
+const STASH_TAG_PREFIX: &str = "task-mgr-slot-";
+
 /// If slot 0's working tree is dirty, stash everything (tracked + untracked)
 /// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
 ///
@@ -1146,7 +1148,7 @@ pub(crate) fn prepare_slot0_for_merge(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let tag = format!("task-mgr-slot-{slot}-{run_id}-{epoch_ms}");
+    let tag = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-{epoch_ms}");
 
     let stash_out = Command::new("git")
         .args(["stash", "push", "--include-untracked", "-m", &tag])
@@ -1212,7 +1214,7 @@ pub(crate) fn cleanup_preparation(
     // Pop failed — stash is still on the stack. Collect conflict paths and
     // check per-slot per-run stash depth.
     let conflicted = list_conflicted_files(slot0_path).unwrap_or_default();
-    let prefix = format!("task-mgr-slot-{slot}-{run_id}-");
+    let prefix = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-");
     let count = count_stashes_with_prefix(slot0_path, &prefix).unwrap_or(0);
 
     if count > stash_limit as usize {
