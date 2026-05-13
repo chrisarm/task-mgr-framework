@@ -123,7 +123,7 @@ fn read_sibling_summary(
     }
 
     // Sort relevant by overlap count descending
-    relevant.sort_by(|a, b| b.1.cmp(&a.1));
+    relevant.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let filename = prd_path
         .file_name()
