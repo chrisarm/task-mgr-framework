@@ -131,6 +131,15 @@ is safe), but project convention is space-free `tasks/<feature>.md` paths for
 exactly this reason — keep it that way. If the Claude CLI grows a structured
 args form, prefer that over in-band quoting.
 
+`maybe_fire` enforces this convention with a launch-boundary guard: if the
+resolved markdown path contains any `char::is_whitespace` character, the
+launch is suppressed and a stderr hint tells the operator to rename the file
+and re-run `/review-loop` manually. The guard sits AFTER `prd_md_path` (so it
+sees the actual file we'd hand to Claude) and BEFORE `launcher.launch` (so
+no fragmented argv ever reaches `claude`). It deliberately does not attempt
+to quote or escape — quoting Claude's slash-command body is brittle, and
+suppression with a clear hint is the simpler, more honest contract.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine

@@ -7409,7 +7409,7 @@ mod tests {
             // seeing the signal.
             let _env_lock = crate::loop_engine::test_utils::CLAUDE_BINARY_MUTEX
                 .lock()
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             let _env_guard = crate::loop_engine::test_utils::EnvGuard::set(
                 "CLAUDE_BINARY",
                 "/nonexistent_binary_for_test",
