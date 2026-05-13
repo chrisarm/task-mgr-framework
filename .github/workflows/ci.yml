@@ -52,7 +52,12 @@ jobs:
         run: cargo run --bin gen-docs -- --check
 
       - name: Run tests
-        run: cargo test --all-targets
+        # Tests are run with a single thread on CI: cli_tests' setup invokes
+        # `task-mgr init`, which on the GHA runner's filesystem occasionally
+        # races on SQLite locking even with busy_timeout=5000ms. Locally
+        # (faster disk) the race never fires. Serializing trades ~2x CI
+        # runtime for deterministic test execution.
+        run: cargo test --all-targets -- --test-threads=1
 
   shellcheck:
     name: Shellcheck
