@@ -140,6 +140,23 @@ no fragmented argv ever reaches `claude`). It deliberately does not attempt
 to quote or escape — quoting Claude's slash-command body is brittle, and
 suppression with a clear hint is the simpler, more honest contract.
 
+**Gate ordering caveat for tests**: in `maybe_fire`, the TTY gate
+(`stdout().is_terminal()` early-return) fires BEFORE the whitespace guard
+and before any other launch-boundary guard. Under `cargo test` (non-TTY),
+every guard placed after the TTY gate is unreachable from the test path —
+a unit test that asserts "guard suppresses launch" via `CapturingLauncher`
+will pass even if the guard is deleted, because the TTY gate alone
+suppresses. The FEAT-001 whitespace-guard tests
+(`maybe_fire_suppresses_when_md_path_contains_whitespace` and `_tab`)
+satisfy their AC verbatim but have weak regression-detection value for
+exactly this reason. When adding a new launch-boundary guard to
+`maybe_fire`, either: (a) inject the TTY check via a trait/closure so
+tests can force a TTY-true path, (b) split `maybe_fire` into a TTY-gated
+outer plus a pure inner that tests exercise directly, or (c) test the
+guard's predicate function in isolation. Asserting against
+`CapturingLauncher.calls.is_empty()` after a non-TTY `maybe_fire` call
+proves nothing about the new guard.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
