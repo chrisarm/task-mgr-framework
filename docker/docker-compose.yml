@@ -31,7 +31,9 @@ services:
       args:
         LLAMA_BOX_VARIANT: cuda-12.8
     ports:
-      - "8080:8080"
+      # Host 8181 (project default — avoids clashing with other projects
+      # that commonly publish on 8080); container internal stays at 8080.
+      - "8181:8080"
     restart: unless-stopped
     healthcheck:
       # Try /health, fall back to /v1/models (OpenAI-compat, 200 when model loaded),
@@ -72,7 +74,8 @@ services:
     build:
       context: ./llama-box
     ports:
-      - "8080:8080"
+      # Host 8181 (see GPU variant above for rationale).
+      - "8181:8080"
     restart: unless-stopped
     healthcheck:
       # Same probe as GPU variant; wget preferred (confirmed available in base image).

@@ -324,7 +324,7 @@ Configure in `.task-mgr/config.json`:
 
 ```json
 {
-  "rerankerUrl": "http://localhost:8080",
+  "rerankerUrl": "http://localhost:8181",
   "rerankerModel": "jina-reranker-v2-base-multilingual",
   "rerankerOverFetch": 3
 }
@@ -332,15 +332,20 @@ Configure in `.task-mgr/config.json`:
 
 - **`rerankerUrl`** — base URL of a [gpustack/llama-box](https://github.com/gpustack/llama-box)
   server exposing OpenAI-compatible `/v1/rerank`. Reranker is disabled when unset.
+  Project default is host port **8181** (one off from llama-box's internal 8080
+  to avoid clashing with other projects that commonly publish on 8080); the
+  bundled docker-compose stack remaps `8181:8080` for this reason.
 - **`rerankerModel`** — model name passed in the `model` field of the rerank
   request. Required alongside `rerankerUrl`; either-or disables rerank.
 - **`rerankerOverFetch`** — per-backend over-fetch factor. Slate size is
   `min(limit * over_fetch, 30)`. Default `3`. Higher = better recall headroom,
   longer rerank latency.
-- **Example llama-box invocation** (CPU, port 8080):
+- **Example llama-box invocation** (CPU, host-native — bind to 8181 to match
+  the project default; if you run the bundled docker-compose stack instead,
+  the container's internal 8080 is remapped to host 8181 automatically):
 
   ```sh
-  llama-box --rerank-only --port 8080 \
+  llama-box --rerank-only --port 8181 \
       --model /models/jina-reranker-v2-base-multilingual.gguf
   ```
 

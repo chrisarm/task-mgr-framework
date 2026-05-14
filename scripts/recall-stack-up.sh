@@ -10,7 +10,7 @@
 #
 # Environment overrides:
 #   OLLAMA_URL        (default: http://localhost:11435)
-#   RERANKER_URL      (default: http://localhost:8080)
+#   RERANKER_URL      (default: http://localhost:8181)
 #   RERANKER_MODEL    (default: jina-reranker-v2-base-multilingual)
 #   EMBED_MODEL_SUBSTR (default: jina-embeddings-v5)
 
@@ -21,7 +21,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$PROJECT_ROOT/docker/docker-compose.yml"
 
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11435}"
-RERANKER_URL="${RERANKER_URL:-http://localhost:8080}"
+RERANKER_URL="${RERANKER_URL:-http://localhost:8181}"
 RERANKER_MODEL="${RERANKER_MODEL:-jina-reranker-v2-base-multilingual}"
 EMBED_MODEL_SUBSTR="${EMBED_MODEL_SUBSTR:-jina-embeddings-v5}"
 
