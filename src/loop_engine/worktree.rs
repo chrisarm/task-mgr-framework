@@ -6147,7 +6147,7 @@ detached
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"only-slot0\n"));
 
-        union_slot_progress_files(&[s0.clone()], "progress.txt").expect("union");
+        union_slot_progress_files(std::slice::from_ref(&s0), "progress.txt").expect("union");
 
         assert_eq!(
             read_slot0(&s0),
