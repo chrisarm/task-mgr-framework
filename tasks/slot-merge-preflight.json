@@ -417,7 +417,7 @@
       "id": "REVIEW-001",
       "model": "claude-opus-4-7",
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unwrap in production",
