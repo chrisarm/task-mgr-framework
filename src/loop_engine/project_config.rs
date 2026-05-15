@@ -96,6 +96,18 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub implicit_overlap_files: Vec<String>,
 
+    /// Maximum number of stash-pop conflicts per slot per run before the slot
+    /// is demoted to `failed_slots(PreResolver)` and the consecutive-merge-fail
+    /// halt threshold trips. Controlled by the bounded warn-and-continue policy
+    /// in `cleanup_preparation` (FEAT-003).
+    ///
+    /// Threshold semantics:
+    /// - `0` — never halt on stash-pop conflicts (matches `merge_fail_halt_threshold == 0`)
+    /// - `5` (default) — halt after 5 stash-pop conflict events on the same slot
+    #[allow(dead_code)]
+    #[serde(default = "default_slot_stash_limit")]
+    pub slot_stash_limit: u32,
+
     /// Whether to auto-launch `/review-loop` after a successful loop/batch run.
     /// Default: `true`. Set to `false` to suppress the interactive review session.
     /// CLI flags `--auto-review` / `--no-auto-review` override this value.
@@ -126,6 +138,7 @@ impl Default for ProjectConfig {
             merge_resolver_effort: None,
             merge_fail_halt_threshold: default_merge_fail_halt_threshold(),
             implicit_overlap_files: Vec::new(),
+            slot_stash_limit: default_slot_stash_limit(),
             auto_review: default_auto_review(),
             auto_review_min_tasks: default_auto_review_min_tasks(),
         }
@@ -168,6 +181,11 @@ fn default_version() -> u32 {
 /// two-in-a-row indicate a cascade.
 fn default_merge_fail_halt_threshold() -> u32 {
     2
+}
+
+/// Default per-slot per-run stash-pop conflict limit (5).
+fn default_slot_stash_limit() -> u32 {
+    5
 }
 
 /// Auto-review is enabled by default.
@@ -597,6 +615,44 @@ mod tests {
         write_default_model(dir.path(), Some(SONNET_MODEL)).unwrap();
         let config = read_project_config(dir.path());
         assert_eq!(config.default_model.as_deref(), Some(SONNET_MODEL));
+    }
+
+    #[test]
+    fn test_slot_stash_limit_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"slotStashLimit":10}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.slot_stash_limit, 10);
+    }
+
+    #[test]
+    fn test_slot_stash_limit_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"version":1}"#).unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.slot_stash_limit, 5);
+    }
+
+    #[test]
+    fn test_slot_stash_limit_accepts_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"version":1,"slotStashLimit":0}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.slot_stash_limit, 0);
+    }
+
+    #[test]
+    fn test_slot_stash_limit_default_struct() {
+        let config = ProjectConfig::default();
+        assert_eq!(config.slot_stash_limit, 5);
     }
 
     #[test]

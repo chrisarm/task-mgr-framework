@@ -275,7 +275,7 @@ impl<'a> MergeResolver for ClaudeMergeResolver<'a> {
         // act on; a spawn here would let it freelance an unrelated edit.
         if ctx.conflicted_files.is_empty() {
             return MergeResolverOutcome::Failed(
-                "no conflicts reported, refusing to spawn".to_string(),
+                "no conflicts reported, refusing to spawn (likely dirty WT blocked merge precondition; preflight should have prevented this — see worktree::prepare_slot0_for_merge; if this fires, check for non-gitignored dirty files in slot 0)".to_string(),
             );
         }
         let spawn_summary = self.run_resolver_spawn(&ctx);
@@ -512,7 +512,16 @@ mod tests {
         });
         match outcome {
             MergeResolverOutcome::Failed(msg) => {
-                assert_eq!(msg, "no conflicts reported, refusing to spawn");
+                assert!(
+                    msg.starts_with("no conflicts reported, refusing to spawn"),
+                    "diagnostic should start with the no-conflicts prefix: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("preflight should have prevented this"),
+                    "diagnostic should mention the preflight pointer: {}",
+                    msg
+                );
             }
             other => panic!("expected Failed(no conflicts...), got {:?}", other),
         }

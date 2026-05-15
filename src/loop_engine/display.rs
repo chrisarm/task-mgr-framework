@@ -612,8 +612,7 @@ mod tests {
             worktree_path: None,
             tasks_dir: Some(tasks_dir),
         };
-        let banner =
-            format_session_banner("prd.json", "main", 5, None, Some(&hints));
+        let banner = format_session_banner("prd.json", "main", 5, None, Some(&hints));
         assert!(
             banner.contains("/x/t/.stop-P1"),
             "Stop hint must include tasks_dir prefix, got:\n{}",

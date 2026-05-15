@@ -4,8 +4,13 @@
 //! detect worktree context, parse git worktree output, and create/remove
 //! git worktrees with proper cleanup.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
 
@@ -465,44 +470,12 @@ fn git_common_dir(repo_path: &Path) -> Result<PathBuf, String> {
 /// managed block is present and has the expected body. Returns `None` when
 /// no rewrite is needed.
 fn merged_attributes_contents(existing: &str) -> Option<String> {
-    let desired_block = format!("{}\n{}{}\n", ATTR_MARKER_BEGIN, ATTR_BODY, ATTR_MARKER_END);
-
-    if let (Some(begin), Some(end)) = (
-        existing.find(ATTR_MARKER_BEGIN),
-        existing.find(ATTR_MARKER_END),
-    ) && begin < end
-    {
-        // End-of-line for the END marker — include the trailing newline if
-        // present so we don't accumulate blank lines on repeated rewrites.
-        let after_end = end + ATTR_MARKER_END.len();
-        let after_end = if existing[after_end..].starts_with('\n') {
-            after_end + 1
-        } else {
-            after_end
-        };
-        let current_block = &existing[begin..after_end];
-        if current_block == desired_block {
-            return None;
-        }
-        let mut rewritten = String::with_capacity(existing.len());
-        rewritten.push_str(&existing[..begin]);
-        rewritten.push_str(&desired_block);
-        rewritten.push_str(&existing[after_end..]);
-        return Some(rewritten);
-    }
-
-    // No marker block yet — append, ensuring exactly one blank line of
-    // separation from any pre-existing content.
-    let mut rewritten = String::with_capacity(existing.len() + desired_block.len() + 2);
-    rewritten.push_str(existing);
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        rewritten.push('\n');
-    }
-    if !existing.is_empty() {
-        rewritten.push('\n');
-    }
-    rewritten.push_str(&desired_block);
-    Some(rewritten)
+    crate::util::marker_splice::merge_marker_block(
+        existing,
+        ATTR_MARKER_BEGIN,
+        ATTR_MARKER_END,
+        ATTR_BODY,
+    )
 }
 
 /// Ensure `.git/info/attributes` declares `merge=union` for per-PRD progress
@@ -663,13 +636,37 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
     project_root: &Path,
     branch_name: &str,
     halt_threshold: u32,
+    auto_recovery: Option<&AutoRecoveryConfig<'_>>,
+) -> TaskMgrResult<()> {
+    reconcile_stale_ephemeral_slots_inner(
+        project_root,
+        branch_name,
+        halt_threshold,
+        auto_recovery,
+        None,
+    )
+}
+
+/// Same contract as [`reconcile_stale_ephemeral_slots`] but accepts an explicit
+/// `MergeResolver` injection point for unit tests. When `auto_recovery` is
+/// `Some` and `test_resolver` is `Some`, the injected resolver is used in
+/// place of the production [`crate::loop_engine::merge_resolver::ClaudeMergeResolver`]
+/// — letting tests exercise the resolver-Failed branch without spawning Claude.
+/// When `test_resolver` is `None`, behavior is identical to the public function
+/// (production callers always pass `None` for `test_resolver`).
+pub(crate) fn reconcile_stale_ephemeral_slots_inner(
+    project_root: &Path,
+    branch_name: &str,
+    halt_threshold: u32,
+    auto_recovery: Option<&AutoRecoveryConfig<'_>>,
+    test_resolver: Option<&dyn MergeResolver>,
 ) -> TaskMgrResult<()> {
     let branches = enumerate_stale_ephemeral_branches(project_root, branch_name)?;
     if branches.is_empty() {
         return Ok(());
     }
 
-    let (unmerged, dirty_paths) = classify_stale_branches(project_root, branch_name, &branches);
+    let (mut unmerged, dirty_paths) = classify_stale_branches(project_root, branch_name, &branches);
 
     // Emit warnings for un-merged branches whether or not we're going to
     // abort — the operator needs to see the commit subjects either way.
@@ -686,6 +683,8 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
 
     // Case 4: dirty worktrees always abort. They take precedence over
     // case 3 because the operator needs to inspect uncommitted work first.
+    // **Out of scope for FEAT-005 auto-recovery** — dirty worktrees still
+    // require operator intervention regardless of `auto_recovery`.
     if !dirty_paths.is_empty() {
         let paths_str: Vec<String> = dirty_paths
             .iter()
@@ -704,25 +703,206 @@ pub(crate) fn reconcile_stale_ephemeral_slots(
         });
     }
 
+    // FEAT-005: when auto_recovery is Some, attempt per-branch merge-back of
+    // each stale un-merged ephemeral using FEAT-003/FEAT-004's preflight +
+    // resolver path. `slot0_path` is `project_root` because reconcile runs
+    // BEFORE `ensure_slot_worktrees` — slot 0 IS the loop's main worktree at
+    // startup. Build outcomes first, THEN re-emit warnings + mutate `unmerged`,
+    // so transient classification fluctuations cannot reorder the abort list.
+    let mut attempted_failed: Vec<String> = Vec::new();
+    if let Some(cfg) = auto_recovery
+        && !unmerged.is_empty()
+    {
+        // Build the resolver once for all auto-recovery attempts in this pass.
+        // SignalFlag wraps the Arc so the existing ClaudeMergeResolver API
+        // (which takes `Option<&SignalFlag>`) is satisfied without changing
+        // its public shape.
+        let signal_flag =
+            crate::loop_engine::signals::SignalFlag::from_arc(cfg.signal_flag.clone());
+        let claude_resolver = crate::loop_engine::merge_resolver::ClaudeMergeResolver {
+            model: cfg.model.to_string(),
+            db_dir: cfg.db_dir,
+            signal_flag: Some(&signal_flag),
+            claude_timeout: cfg.claude_timeout,
+            effort: cfg.effort.to_string(),
+        };
+        let resolver: &dyn MergeResolver = test_resolver.unwrap_or(&claude_resolver);
+
+        let mut recovered: Vec<String> = Vec::new();
+        for (ephemeral, _commits) in &unmerged {
+            match attempt_auto_recovery_for_branch(
+                project_root,
+                branch_name,
+                ephemeral,
+                cfg,
+                resolver,
+            ) {
+                Ok(()) => {
+                    eprintln!(
+                        "auto-recovery: successfully merged stale ephemeral {} back into {} and deleted the branch",
+                        ephemeral, branch_name
+                    );
+                    recovered.push(ephemeral.clone());
+                }
+                Err(msg) => {
+                    eprintln!(
+                        "auto-recovery: failed to recover stale ephemeral {}: {}",
+                        ephemeral, msg
+                    );
+                    attempted_failed.push(ephemeral.clone());
+                }
+            }
+        }
+
+        // Remove successfully-recovered branches from `unmerged` so they no
+        // longer drive the case-3 abort decision below. Order of remaining
+        // entries is preserved (Vec::retain is stable) — important because
+        // the abort message lists branches in the order classification found
+        // them, and tests grep on that order.
+        if !recovered.is_empty() {
+            unmerged.retain(|(name, _)| !recovered.contains(name));
+        }
+    }
+
     // Case 3: un-merged ephemeral aborts only when halt_threshold > 0.
     // halt_threshold == 0 preserves the legacy permissive posture (warn-only).
     if halt_threshold > 0 && !unmerged.is_empty() {
         let names: Vec<String> = unmerged.iter().map(|(n, _)| n.clone()).collect();
+        let attempted_clause = if attempted_failed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (auto-recovery attempted and failed for: {})",
+                attempted_failed.join(", ")
+            )
+        };
         return Err(TaskMgrError::InvalidState {
             resource_type: "Stale ephemeral slot branch".to_string(),
             id: names.join(", "),
             expected: "no un-merged stale ephemeral branches at startup".to_string(),
             actual: format!(
-                "un-merged ephemeral branch(es): {}. \
+                "un-merged ephemeral branch(es): {}{}. \
                  Inspect with `git log {base}..<branch>`, then either merge into {base} \
                  or `git branch -D <branch>` if the work should be discarded.",
                 names.join(", "),
+                attempted_clause,
                 base = branch_name
             ),
         });
     }
 
     Ok(())
+}
+
+/// Attempt to auto-merge a single stale ephemeral back into the base branch.
+///
+/// Returns `Ok(())` when the ephemeral merged cleanly (via direct merge or
+/// resolver) AND the branch was successfully deleted. Any failure along the
+/// way — preflight stash error, merge attempt failure, resolver decline,
+/// stash limit exceeded, or branch deletion error — surfaces as `Err(msg)`
+/// so the caller can keep the branch in `unmerged` and fall through to the
+/// halt_threshold abort.
+///
+/// Cleanup runs unconditionally after the merge attempt regardless of which
+/// exit path is taken — mirrors `merge_slot_branches_with_resolver`'s
+/// "cleanup is structurally guaranteed" invariant.
+fn attempt_auto_recovery_for_branch(
+    project_root: &Path,
+    branch_name: &str,
+    ephemeral: &str,
+    cfg: &AutoRecoveryConfig<'_>,
+    resolver: &dyn MergeResolver,
+) -> Result<(), String> {
+    // Recover the slot index — should always parse because the entry came
+    // from `classify_stale_branches`, which routes malformed names to its
+    // Err arm (logged + skipped, never reaching `unmerged`). Treat a parse
+    // failure as a defensive error.
+    let suffix = ephemeral
+        .strip_prefix(&format!("{}-slot-", branch_name))
+        .ok_or_else(|| {
+            format!(
+                "internal: branch name {} does not match {}-slot-N",
+                ephemeral, branch_name
+            )
+        })?;
+    let slot: usize = suffix
+        .parse()
+        .map_err(|e| format!("internal: non-numeric slot suffix in {}: {}", ephemeral, e))?;
+
+    let prep = prepare_slot0_for_merge(project_root, slot, cfg.run_id)
+        .map_err(|e| format!("pre-merge prep failed: {}", e))?;
+
+    let attempt_result = run_slot_merge_attempt(slot, project_root, ephemeral, resolver);
+    let cleanup_result =
+        cleanup_preparation(&prep, project_root, slot, cfg.run_id, cfg.stash_limit);
+
+    // Surface cleanup diagnostics regardless of attempt outcome so a
+    // stash-pop conflict is never silently dropped on the floor.
+    match &cleanup_result {
+        CleanupOutcome::Restored => {}
+        CleanupOutcome::PopConflict { tag, conflicted } => {
+            eprintln!(
+                "auto-recovery: stash pop conflict on branch {} (tag {}, paths {:?}); stash retained on stack",
+                ephemeral, tag, conflicted
+            );
+        }
+        CleanupOutcome::StashLimitExceeded { count } => {
+            eprintln!(
+                "auto-recovery: stash count {} exceeded limit {} on branch {}; stash retained on stack",
+                count, cfg.stash_limit, ephemeral
+            );
+        }
+    }
+
+    match (attempt_result, cleanup_result) {
+        // Clean merge + clean cleanup OR pop-conflict (merge still succeeded
+        // and the stash is on the stack for operator review) → remove slot
+        // worktree (if still on disk) and delete the branch. Worktree removal
+        // happens first because `git branch -D` refuses to delete a branch
+        // that's checked out in any worktree.
+        (Ok(()), CleanupOutcome::Restored) | (Ok(()), CleanupOutcome::PopConflict { .. }) => {
+            let worktree_path = compute_slot_worktree_path(project_root, branch_name, slot);
+            // FEAT-006: fold the recovered slot's untracked progress file into
+            // slot 0's record before the worktree/branch are removed. If the
+            // worktree was already gone, `union_slot_progress_files` no-ops.
+            if let Err(e) = union_slot_progress_files(
+                &[project_root.to_path_buf(), worktree_path.clone()],
+                cfg.progress_file_name,
+            ) {
+                eprintln!(
+                    "warning: auto-recovery failed to union progress for {}: {}",
+                    ephemeral, e
+                );
+            }
+            if worktree_path.exists()
+                && let Err(e) = remove_worktree(project_root, &worktree_path)
+            {
+                return Err(format!(
+                    "merge succeeded but slot worktree removal failed: {}",
+                    e
+                ));
+            }
+            delete_branch_force(project_root, ephemeral)
+                .map_err(|e| format!("merge succeeded but branch delete failed: {}", e))
+        }
+        // Merge succeeded but stash limit tripped — refuse to delete because
+        // the repeated pop conflicts suggest a systemic dirty-WT problem the
+        // operator should inspect first.
+        (Ok(()), CleanupOutcome::StashLimitExceeded { count }) => Err(format!(
+            "merge succeeded but stash limit exceeded ({} > {}); branch left in place for operator review",
+            count, cfg.stash_limit
+        )),
+        // Merge attempt failed — fold cleanup detail into the diagnostic.
+        (Err((msg, _kind)), CleanupOutcome::Restored) => Err(msg),
+        (Err((msg, _kind)), CleanupOutcome::PopConflict { tag, conflicted }) => Err(format!(
+            "{} | pop conflict on tag {}: paths {:?}",
+            msg, tag, conflicted
+        )),
+        (Err((msg, _kind)), CleanupOutcome::StashLimitExceeded { count }) => Err(format!(
+            "{} | stash limit exceeded ({} > {})",
+            msg, count, cfg.stash_limit
+        )),
+    }
 }
 
 /// Prune stale worktree registry entries and return all `{branch}-slot-N`
@@ -895,6 +1075,255 @@ fn is_worktree_dirty(worktree_path: &Path) -> Result<bool, String> {
     Ok(!output.stdout.is_empty())
 }
 
+/// What `prepare_slot0_for_merge` found and did.
+// FEAT-004 wires these into merge_slot_branches_with_resolver.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MergePreparation {
+    /// Working tree was clean; nothing to do.
+    Clean,
+    /// Working tree was dirty; changes were stashed under this tag.
+    Stashed { tag: String },
+}
+
+/// Outcome of `cleanup_preparation`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CleanupOutcome {
+    /// Stash was popped (or there was nothing to restore); working tree restored.
+    Restored,
+    /// Stash pop produced merge conflicts; stash left on stack for operator.
+    PopConflict {
+        tag: String,
+        conflicted: Vec<String>,
+    },
+    /// Per-slot per-run stash count exceeded `stash_limit` after a pop conflict.
+    StashLimitExceeded { count: usize },
+}
+
+/// Spawn-side knobs for `reconcile_stale_ephemeral_slots` auto-recovery (FEAT-005).
+///
+/// Held as borrows because reconcile runs once at loop startup; all referenced
+/// values outlive the call. `signal_flag` is an `Arc<AtomicBool>` rather than a
+/// `&SignalFlag` so callers can pass a flag they've already cloned for other
+/// startup machinery without coupling lifetimes — `SignalFlag::from_arc`
+/// rewraps it for the `ClaudeMergeResolver`.
+///
+/// When `auto_recovery` is `None`, reconcile preserves its pre-FEAT-005
+/// behavior byte-for-byte (warn + abort on stale ephemerals). When `Some`,
+/// reconcile attempts to merge each stale ephemeral back into the base branch
+/// using the same preflight/resolver path as live waves: `prepare_slot0_for_merge`
+/// → `git merge --no-edit` → `ClaudeMergeResolver` on conflict → `cleanup_preparation`.
+pub(crate) struct AutoRecoveryConfig<'a> {
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub claude_timeout: Duration,
+    pub signal_flag: Arc<AtomicBool>,
+    pub db_dir: Option<&'a Path>,
+    pub run_id: &'a str,
+    pub stash_limit: u32,
+    /// Progress file name (`branch::progress_file_name(prefix)`) so a
+    /// recovered slot's progress can be unioned into slot 0's file before
+    /// the slot worktree/branch are deleted (FEAT-006).
+    pub progress_file_name: &'a str,
+}
+
+const STASH_TAG_PREFIX: &str = "task-mgr-slot-";
+
+/// Process-global monotonic sequence appended to every stash tag. `epoch_ms`
+/// alone is not collision-proof: two preps for the same `(slot, run_id)` within
+/// the same millisecond would mint identical tags, and `resolve_stash_ref_by_tag`
+/// would then pop whichever entry it found first. The sequence makes each tag
+/// unique regardless of clock resolution. It sits AFTER `{run_id}-{epoch_ms}` so
+/// the `{STASH_TAG_PREFIX}{slot}-{run_id}-` prefix used by
+/// `count_stashes_with_prefix` is unaffected.
+static STASH_TAG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// If slot 0's working tree is dirty, stash everything (tracked + untracked)
+/// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
+///
+/// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}-{seq}` — `seq` is a
+/// process-global monotonic counter that guarantees tag uniqueness even when
+/// two preps land in the same millisecond.
+///
+/// # Errors
+///
+/// - `git status` spawn failure (OS could not exec git)
+/// - `git status` non-zero exit (e.g. not a git repo, permissions)
+/// - `git stash push` spawn failure (OS could not exec git)
+/// - `git stash push` non-zero exit (e.g. nothing stashable, index locked)
+///
+/// On any error the working tree is unchanged — no stash was created, so no
+/// cleanup is needed.
+pub(crate) fn prepare_slot0_for_merge(
+    slot0_path: &Path,
+    slot: usize,
+    run_id: &str,
+) -> Result<MergePreparation, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git status spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Ok(MergePreparation::Clean);
+    }
+
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seq = STASH_TAG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tag = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-{epoch_ms}-{seq}");
+
+    let stash_out = Command::new("git")
+        .args(["stash", "push", "--include-untracked", "-m", &tag])
+        .current_dir(slot0_path)
+        .output()
+        .map_err(|e| format!("git stash push spawn: {e}"))?;
+    if !stash_out.status.success() {
+        return Err(format!(
+            "git stash push failed: {}",
+            format_git_failure(&stash_out.stdout, &stash_out.stderr)
+        ));
+    }
+
+    Ok(MergePreparation::Stashed { tag })
+}
+
+/// Undo `prepare_slot0_for_merge`: pop the stash if one was created.
+///
+/// On a clean pop → `Restored`.  On a pop conflict → stash stays on stack
+/// (never dropped); returns `PopConflict` unless the per-slot per-run stash
+/// count exceeds `stash_limit`, in which case returns `StashLimitExceeded`.
+/// NEVER calls `git checkout --`, `git reset --hard`, or `git stash drop`.
+///
+/// Note on stash accumulation: retained stashes (`PopConflict` /
+/// `StashLimitExceeded`) are bounded per run by `stash_limit`, which trips the
+/// consecutive-merge-fail halt so an operator intervenes. With
+/// `merge_fail_halt_threshold == 0` the loop never halts, so a persistent
+/// dirty-working-tree problem can leak stashes across waves within that run —
+/// an accepted trade-off of the legacy permissive posture, not a leak in the
+/// default (threshold 2) configuration.
+pub(crate) fn cleanup_preparation(
+    prep: &MergePreparation,
+    slot0_path: &Path,
+    slot: usize,
+    run_id: &str,
+    stash_limit: u32,
+) -> CleanupOutcome {
+    let tag = match prep {
+        MergePreparation::Clean => return CleanupOutcome::Restored,
+        MergePreparation::Stashed { tag } => tag,
+    };
+
+    let stash_ref = match resolve_stash_ref_by_tag(slot0_path, tag) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!("[warn] stash tag {tag} not found; treating as Restored");
+            return CleanupOutcome::Restored;
+        }
+        Err(e) => {
+            eprintln!("[warn] failed to resolve stash ref for {tag}: {e}");
+            return CleanupOutcome::Restored;
+        }
+    };
+
+    let pop_out = match Command::new("git")
+        .args(["stash", "pop", &stash_ref])
+        .current_dir(slot0_path)
+        .output()
+    {
+        Err(e) => {
+            eprintln!("[warn] git stash pop spawn failed: {e}");
+            return CleanupOutcome::Restored;
+        }
+        Ok(o) => o,
+    };
+
+    if pop_out.status.success() {
+        return CleanupOutcome::Restored;
+    }
+
+    // Pop failed — stash is still on the stack. Collect conflict paths and
+    // check per-slot per-run stash depth.
+    let conflicted = list_conflicted_files(slot0_path).unwrap_or_default();
+    let prefix = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-");
+    let count = count_stashes_with_prefix(slot0_path, &prefix).unwrap_or(0);
+
+    if count > stash_limit as usize {
+        CleanupOutcome::StashLimitExceeded { count }
+    } else {
+        CleanupOutcome::PopConflict {
+            tag: tag.clone(),
+            conflicted,
+        }
+    }
+}
+
+/// Look up the stash ref (e.g. `stash@{2}`) whose subject equals `tag`.
+/// Uses `--format=%gd %gs` and splits on the first space only so multi-word
+/// subjects don't truncate.
+fn resolve_stash_ref_by_tag(path: &Path, tag: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args(["stash", "list", "--format=%gd %gs"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("git stash list spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git stash list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        // Format: `stash@{N} On <branch>: <message>`
+        // Split on first space to get the ref, then extract message after ": ".
+        if let Some(sp) = line.find(' ') {
+            let stash_ref = &line[..sp];
+            let subject = &line[sp + 1..];
+            // Subject is "On <branch>: <message>"; split on first ": " to get message.
+            let message = subject
+                .split_once(": ")
+                .map(|(_, msg)| msg)
+                .unwrap_or(subject);
+            if message == tag {
+                return Ok(Some(stash_ref.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Count how many stash entries have a subject starting with `prefix`.
+fn count_stashes_with_prefix(path: &Path, prefix: &str) -> Result<usize, String> {
+    let output = Command::new("git")
+        .args(["stash", "list", "--format=%gs"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("git stash list spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git stash list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Subject format: "On <branch>: <message>"; extract message after first ": ".
+    Ok(text
+        .lines()
+        .filter(|l| {
+            let msg = l.split_once(": ").map(|(_, m)| m).unwrap_or(l);
+            msg.starts_with(prefix)
+        })
+        .count())
+}
+
 /// True iff `ancestor` is an ancestor of `descendant` per
 /// `git merge-base --is-ancestor`.
 ///
@@ -960,6 +1389,160 @@ fn delete_branch_force(project_root: &Path, branch: &str) -> Result<(), String> 
         return Err(format!("git branch -D failed: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// Append per-slot progress-file content into slot 0's progress file so the
+/// operator has a single unified view of a parallel wave's activity.
+///
+/// FEAT-006 (slot-merge-preflight PRD). Since FEAT-001 gitignores
+/// `tasks/progress-*.txt`, each slot accumulates its own untracked copy during
+/// a wave. This helper — run at wave end and after successful reconcile
+/// auto-recovery — folds slots `1..N` into slot 0's file.
+///
+/// Behavior:
+/// - Reads `<slot_path>/tasks/<progress_file_name>` for every slot `1..N`.
+/// - APPENDS to slot 0's file a block: one
+///   `## === wave merge @ <ISO-8601 UTC> ===` separator line, then for each
+///   non-empty slot a `## --- slot {N} ({worktree-basename}) ---` header
+///   followed by that slot's content. The basename comes from
+///   `Path::file_name()` — never `Path::display()` — so no full path leaks
+///   into the progress log.
+/// - Slot 0's own content is NEVER re-included (re-including would duplicate
+///   it and cause cumulative explosion across waves) and slot 0's file is
+///   never truncated.
+/// - After appending, slots `1..N`'s files are TRUNCATED to empty (not
+///   deleted — the inode/path is kept so the next iteration's append does not
+///   trip `ENOENT`).
+///
+/// No-op when `slot_paths.len() <= 1` (no other slots to union from) or when
+/// every slot `1..N` has empty/missing progress content.
+///
+/// # Errors
+///
+/// Returns `Err` only when writing slot 0's file fails — the unified view is
+/// the load-bearing artifact. Read errors on individual slots are logged to
+/// stderr and that slot is skipped; they never propagate.
+pub(crate) fn union_slot_progress_files(
+    slot_paths: &[PathBuf],
+    progress_file_name: &str,
+) -> Result<(), String> {
+    if slot_paths.len() <= 1 {
+        return Ok(());
+    }
+
+    // Build the block from slots 1..N only — slot 0's content is already in
+    // slot 0's file.
+    let mut block = String::new();
+    for (idx, slot_path) in slot_paths.iter().enumerate().skip(1) {
+        if !slot_path.exists() {
+            // Worktree directory removed between merge-back and union (e.g.
+            // cleanup-first wiring). Warn — this is a wiring anomaly, distinct
+            // from a slot that simply never wrote a progress file.
+            eprintln!(
+                "warning: slot {} worktree {} no longer exists; skipping its progress",
+                idx,
+                slot_path.display()
+            );
+            continue;
+        }
+        let progress_path = slot_path.join("tasks").join(progress_file_name);
+        let bytes = match std::fs::read(&progress_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Slot never created its progress file — skip silently.
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read slot {} progress file {}: {} — skipping this slot",
+                    idx,
+                    progress_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        if matches!(content, std::borrow::Cow::Owned(_)) {
+            eprintln!(
+                "warning: slot {} progress file {} contained invalid UTF-8; using lossy conversion",
+                idx,
+                progress_path.display()
+            );
+        }
+        if content.is_empty() {
+            continue;
+        }
+        let basename = slot_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("<unknown>");
+        block.push_str(&format!("## --- slot {} ({}) ---\n", idx, basename));
+        block.push_str(&content);
+        if !content.ends_with('\n') {
+            block.push('\n');
+        }
+    }
+
+    // Every slot 1..N empty or missing → nothing to stamp; leave slot 0 alone.
+    if block.is_empty() {
+        return Ok(());
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let full_block = format!("## === wave merge @ {} ===\n{}", timestamp, block);
+
+    let slot0_progress = slot_paths[0].join("tasks").join(progress_file_name);
+    append_union_block(&slot0_progress, &full_block)?;
+
+    // Truncate slots 1..N's files to empty — keep the file so subsequent
+    // iterations' appends do not fail on a missing path.
+    for slot_path in slot_paths.iter().skip(1) {
+        let progress_path = slot_path.join("tasks").join(progress_file_name);
+        if progress_path.exists()
+            && let Err(e) = std::fs::write(&progress_path, b"")
+        {
+            eprintln!(
+                "warning: failed to truncate slot progress file {}: {}",
+                progress_path.display(),
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Append `block` to slot 0's progress file, creating it (and its parent
+/// `tasks/` directory) if missing. Slot 0's existing content is preserved
+/// verbatim — the block is stamped after it.
+fn append_union_block(path: &Path, block: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "failed to create {} for union progress: {}",
+            parent.display(),
+            e
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| {
+            TaskMgrError::io_error(path.display().to_string(), "opening union progress file", e)
+                .to_string()
+        })?;
+    file.write_all(block.as_bytes()).map_err(|e| {
+        TaskMgrError::io_error(
+            path.display().to_string(),
+            "appending union progress block",
+            e,
+        )
+        .to_string()
+    })
 }
 
 /// Remove the worktree at `worktree_path` and then delete `ephemeral`.
@@ -1243,12 +1826,31 @@ impl MergeResolver for NoOpResolver {
 /// After the merge loop, successfully-merged slots are fast-forwarded; if
 /// their fast-forward fails the slot is demoted from `merged_slots` to
 /// `failed_slots`.
+///
+/// `run_id` is embedded in stash tags (`task-mgr-slot-{slot}-{run_id}-{epoch_ms}`)
+/// so concurrent loops do not poach each other's stashes.
+///
+/// `stash_limit` caps how many stashes with the same slot prefix may accumulate
+/// before the slot is demoted to `failed_slots(PreResolver)`. Repeated pop
+/// conflicts indicate a systemic dirty-working-tree problem; bounding the
+/// stash count prevents unbounded growth and trips the consecutive-merge-fail
+/// halt threshold. Default (from `ProjectConfig`) is 5.
+/// Set `poisoned` to `msg` when a cleanup reset failure has made slot 0's HEAD
+/// unreliable. Only fires for `PreResolver` kind with the sentinel substring.
+fn maybe_poison_slot0(poisoned: &mut Option<String>, msg: &str, kind: &SlotFailureKind) {
+    if *kind == SlotFailureKind::PreResolver && msg.contains("reset cleanup failed") {
+        *poisoned = Some(msg.to_owned());
+    }
+}
+
 pub(crate) fn merge_slot_branches_with_resolver(
     _project_root: &Path,
     branch_name: &str,
     num_slots: usize,
     resolver: &dyn MergeResolver,
     slot_paths: &[PathBuf],
+    run_id: &str,
+    stash_limit: u32,
 ) -> MergeOutcomes {
     let mut outcomes = MergeOutcomes::default();
     if num_slots <= 1 {
@@ -1277,7 +1879,9 @@ pub(crate) fn merge_slot_branches_with_resolver(
     // slot iterations cannot trust their own `rev_parse_head` capture as a
     // reset target. Once poisoned, every remaining slot short-circuits to a
     // PreResolver failure with a clear diagnostic so the operator can see
-    // why slots after the failure point did nothing.
+    // why slots after the failure point did nothing. Once poisoned, prepare
+    // AND cleanup are skipped for remaining slots — neither can be trusted
+    // to operate against an unknown working-tree shape.
     let mut slot0_poisoned: Option<String> = None;
 
     for slot in 1..num_slots {
@@ -1293,56 +1897,133 @@ pub(crate) fn merge_slot_branches_with_resolver(
             continue;
         }
         let ephemeral = ephemeral_slot_branch(branch_name, slot);
-        let pre_merge_head = match rev_parse_head(slot0_path) {
-            Ok(h) => h,
+
+        // FEAT-004: stash any dirty working-tree state before the merge so
+        // the merge precondition never trips on residual log files or build
+        // artifacts. On prepare failure, the side effect has not been
+        // committed to disk — no cleanup is needed or wanted.
+        let prep = match prepare_slot0_for_merge(slot0_path, slot, run_id) {
+            Ok(p) => p,
             Err(e) => {
                 outcomes.failed_slots.push((
                     slot,
-                    format!("rev-parse: {}", e),
+                    format!("pre-merge prep failed: {}", e),
                     SlotFailureKind::PreResolver,
                 ));
                 continue;
             }
         };
-        let merge_result = Command::new("git")
-            .args(["merge", "--no-edit", &ephemeral])
-            .current_dir(slot0_path)
-            .output();
-        match merge_result {
-            Ok(output) if output.status.success() => outcomes.merged_slots.push(slot),
-            Ok(output) => {
-                let detail = format_git_failure(&output.stdout, &output.stderr);
-                match handle_conflict_for_slot(
-                    slot,
-                    slot0_path,
-                    &ephemeral,
-                    &pre_merge_head,
-                    &detail,
-                    resolver,
-                ) {
-                    Ok(()) => outcomes.merged_slots.push(slot),
-                    Err((msg, kind)) => {
-                        // PreResolver kind from handle_conflict_for_slot is the
-                        // signal that a cleanup reset failed — poison slot 0.
-                        if kind == SlotFailureKind::PreResolver
-                            && msg.contains("reset cleanup failed")
-                        {
-                            slot0_poisoned = Some(msg.clone());
-                        }
-                        outcomes.failed_slots.push((slot, msg, kind));
-                    }
-                }
+
+        let attempt_result = run_slot_merge_attempt(slot, slot0_path, &ephemeral, resolver);
+        let cleanup_result = cleanup_preparation(&prep, slot0_path, slot, run_id, stash_limit);
+
+        match (attempt_result, cleanup_result) {
+            (Ok(()), CleanupOutcome::Restored) => {
+                outcomes.merged_slots.push(slot);
             }
-            Err(e) => outcomes.failed_slots.push((
-                slot,
-                format!("git merge spawn: {}", e),
-                SlotFailureKind::PreResolver,
-            )),
+            (Ok(()), CleanupOutcome::PopConflict { tag, conflicted }) => {
+                eprintln!(
+                    "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack — slot still merged",
+                    slot, tag, conflicted
+                );
+                outcomes.merged_slots.push(slot);
+            }
+            (Ok(()), CleanupOutcome::StashLimitExceeded { count }) => {
+                eprintln!(
+                    "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
+                    slot, count, stash_limit
+                );
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "stash limit exceeded ({} > {}) after successful merge",
+                        count, stash_limit
+                    ),
+                    SlotFailureKind::PreResolver,
+                ));
+            }
+            (Err((msg, kind)), CleanupOutcome::Restored) => {
+                // PreResolver kind from handle_conflict_for_slot is the
+                // signal that a cleanup reset failed — poison slot 0.
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
+                outcomes.failed_slots.push((slot, msg, kind));
+            }
+            (Err((msg, kind)), CleanupOutcome::PopConflict { tag, conflicted }) => {
+                eprintln!(
+                    "warning: slot {} stash pop conflict (tag {}, paths {:?}); stash retained on stack",
+                    slot, tag, conflicted
+                );
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "{} | pop conflict on tag {}: paths {:?}",
+                        msg, tag, conflicted
+                    ),
+                    kind,
+                ));
+            }
+            (Err((msg, kind)), CleanupOutcome::StashLimitExceeded { count }) => {
+                eprintln!(
+                    "warning: slot {} stash count {} exceeded limit {}; demoting slot to failed_slots — repeated pop conflicts suggest a systemic dirty-WT problem",
+                    slot, count, stash_limit
+                );
+                maybe_poison_slot0(&mut slot0_poisoned, &msg, &kind);
+                outcomes.failed_slots.push((
+                    slot,
+                    format!(
+                        "{} | stash limit exceeded ({} > {})",
+                        msg, count, stash_limit
+                    ),
+                    SlotFailureKind::PreResolver,
+                ));
+            }
         }
     }
 
     fast_forward_merged_slots(&mut outcomes, slot_paths, branch_name);
     outcomes
+}
+
+/// Per-slot merge-attempt body: captures `pre_merge_head` AFTER any preflight
+/// has run, then runs `git merge --no-edit <ephemeral>` and invokes the
+/// resolver if needed. Returns `Ok(())` on a clean merge or a verified
+/// resolver-resolved merge; `Err((diagnostic, kind))` on any failure.
+///
+/// Extracted from `merge_slot_branches_with_resolver` so that cleanup of the
+/// preflight stash is structurally guaranteed to run exactly once per slot
+/// regardless of which exit path the attempt takes (rev-parse failure,
+/// spawn failure, clean success, or any conflict-handling branch).
+fn run_slot_merge_attempt(
+    slot: usize,
+    slot0_path: &Path,
+    ephemeral: &str,
+    resolver: &dyn MergeResolver,
+) -> Result<(), (String, SlotFailureKind)> {
+    let pre_merge_head = rev_parse_head(slot0_path)
+        .map_err(|e| (format!("rev-parse: {}", e), SlotFailureKind::PreResolver))?;
+    let merge_result = Command::new("git")
+        .args(["merge", "--no-edit", ephemeral])
+        .current_dir(slot0_path)
+        .output();
+    match merge_result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let detail = format_git_failure(&output.stdout, &output.stderr);
+            handle_conflict_for_slot(
+                slot,
+                slot0_path,
+                ephemeral,
+                &pre_merge_head,
+                &detail,
+                resolver,
+            )
+        }
+        Err(e) => Err((
+            format!("git merge spawn: {}", e),
+            SlotFailureKind::PreResolver,
+        )),
+    }
 }
 
 /// `git reset --hard <commit>` in `repo_path`. Returns `Err` with formatted
@@ -2642,8 +3323,15 @@ detached
                 .expect("git commit in slot");
         }
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            3,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
         assert!(
             outcomes.failed_slots.is_empty(),
             "disjoint changes must merge cleanly: {:?}",
@@ -2727,8 +3415,15 @@ detached
 
         let pre_merge_head = rev_parse(&slot0, "HEAD");
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 3, &NoOpResolver, &paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            3,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
 
         assert_eq!(
             outcomes.merged_slots,
@@ -2830,6 +3525,8 @@ detached
             2,
             &NoOpResolver,
             &slot_paths,
+            "test-run",
+            5,
         );
 
         assert!(
@@ -3103,8 +3800,15 @@ detached
             );
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert_eq!(*resolver.invocations.borrow(), 1, "resolver called once");
         assert!(
@@ -3157,8 +3861,15 @@ detached
             assert!(out.status.success(), "merge --abort should succeed");
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -3199,8 +3910,15 @@ detached
         // Resolver does nothing (simulating a hard error before any cleanup).
         let resolver = MockResolver::new(MergeResolverOutcome::Failed("timed out".into()), |_| {});
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -3240,8 +3958,15 @@ detached
         // should still be set after this no-op runs.
         let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |_| {});
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(
             outcomes.merged_slots.is_empty(),
@@ -3291,8 +4016,15 @@ detached
             assert!(out.status.success());
         });
 
-        let outcomes =
-            merge_slot_branches_with_resolver(tmp.path(), branch, 2, &resolver, &slot_paths);
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
 
         assert!(outcomes.merged_slots.is_empty());
         assert_eq!(outcomes.failed_slots.len(), 1);
@@ -3321,6 +4053,8 @@ detached
             2,
             &NoOpResolver,
             &slot_paths,
+            "test-run",
+            5,
         );
         assert_eq!(outcomes.failed_slots.len(), 1);
         let (_, _, kind) = &outcomes.failed_slots[0];
@@ -3328,6 +4062,437 @@ detached
             *kind,
             SlotFailureKind::PreResolver,
             "rev-parse failure before resolver invocation must be PreResolver kind"
+        );
+    }
+
+    /// FEAT-004 (1): clean slot 0 + disjoint slot-1 commit → merged_slots = [1],
+    /// no chore commit appears on the base branch (preflight must not
+    /// auto-commit), and no stash entry is created (clean WT path).
+    #[test]
+    fn test_merge_back_clean_wt_unchanged_behavior() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/clean-wt-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: clean disjoint commit
+        fs::write(paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(outcomes.merged_slots, vec![1], "{:?}", outcomes);
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        // No `chore` commit on the base branch.
+        let log_out = Command::new("git")
+            .args(["log", "--grep", "^chore", "--format=%H"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git log");
+        assert!(log_out.status.success(), "git log failed");
+        let log = String::from_utf8_lossy(&log_out.stdout);
+        assert!(
+            log.trim().is_empty(),
+            "no chore commit must exist on base branch: {}",
+            log
+        );
+
+        // No stash entry exists on the clean-WT path.
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        assert!(stash_out.status.success());
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.trim().is_empty(),
+            "stash list should be empty for clean WT path: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (2): dirty unrelated file (scratch.log untracked) → preflight
+    /// stashes it, merge succeeds cleanly, pop restores scratch.log; stash
+    /// list ends up empty.
+    #[test]
+    fn test_merge_back_stashes_dirty_unrelated_file() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/stash-dirty-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: clean disjoint commit (slot-1-file.txt — does NOT touch scratch.log).
+        fs::write(paths[1].join("slot-1-file.txt"), "slot 1 content").expect("write");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 disjoint"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log.
+        fs::write(paths[0].join("scratch.log"), "stray log line\n").expect("write scratch");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should merge cleanly: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        // Post-merge: scratch.log restored from stash → shows up in status.
+        let status_out = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status.contains("scratch.log"),
+            "scratch.log should be back as untracked after pop: {}",
+            status
+        );
+
+        // Stash list should be empty after a clean pop.
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.trim().is_empty(),
+            "stash list should be empty after clean pop: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (3): dirty scratch.log + slot-1 also commits scratch.log → pop
+    /// conflict. Slot stays in merged_slots, stash retained on stack with tag
+    /// matching our run prefix, warning emitted to stderr.
+    #[test]
+    fn test_merge_back_pop_conflict_keeps_stash_and_warns() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/pop-conflict-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Slot 1: commits scratch.log (so slot 0 will receive it via merge).
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log with DIFFERENT content.
+        fs::write(paths[0].join("scratch.log"), "local dirty content\n")
+            .expect("write slot 0 scratch");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should still be in merged_slots after pop conflict: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "slot must NOT be demoted: {:?}",
+            outcomes.failed_slots
+        );
+
+        // Stash should be retained with the expected per-run tag prefix.
+        let stash_out = Command::new("git")
+            .args(["stash", "list", "--format=%gs"])
+            .current_dir(&paths[0])
+            .output()
+            .expect("git stash list");
+        let stash = String::from_utf8_lossy(&stash_out.stdout);
+        assert!(
+            stash.contains("task-mgr-slot-1-test-run-"),
+            "stash list should retain entry with our run prefix: {}",
+            stash
+        );
+    }
+
+    /// FEAT-004 (4): pre-seed `stash_limit` stashes with our run prefix; then
+    /// trigger a pop conflict. Final count = stash_limit + 1 > stash_limit →
+    /// slot demoted to failed_slots(PreResolver) with diagnostic mentioning
+    /// the stash limit.
+    #[test]
+    fn test_merge_back_excessive_stash_count_demotes_slot() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/stash-overflow-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        let stash_limit: u32 = 3;
+
+        // Pre-seed `stash_limit` stashes with the SAME prefix our run will use.
+        for i in 0..stash_limit {
+            fs::write(paths[0].join("seed.txt"), format!("seed {}", i)).expect("write seed");
+            let tag = format!("task-mgr-slot-1-test-run-seed-{}", i);
+            let out = Command::new("git")
+                .args(["stash", "push", "--include-untracked", "-m", &tag])
+                .current_dir(&paths[0])
+                .output()
+                .expect("git stash push seed");
+            assert!(
+                out.status.success(),
+                "seed stash {} failed: {}",
+                i,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // Slot 1: commits scratch.log.
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty untracked scratch.log (will conflict on pop).
+        fs::write(paths[0].join("scratch.log"), "local dirty\n").expect("write");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            stash_limit,
+        );
+
+        assert!(
+            outcomes.merged_slots.is_empty(),
+            "slot must be demoted, not in merged_slots: {:?}",
+            outcomes.merged_slots
+        );
+        assert_eq!(
+            outcomes.failed_slots.len(),
+            1,
+            "exactly one slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+        let (slot, msg, kind) = &outcomes.failed_slots[0];
+        assert_eq!(*slot, 1);
+        assert_eq!(
+            *kind,
+            SlotFailureKind::PreResolver,
+            "stash-limit demotion must use PreResolver kind"
+        );
+        assert!(
+            msg.contains("stash limit exceeded"),
+            "diagnostic should mention stash limit: {}",
+            msg
+        );
+    }
+
+    /// FEAT-004 (5): run_id isolation — pre-seed `stash_limit` stashes for a
+    /// DIFFERENT run_id; trigger a pop conflict. Count of OUR run prefix is
+    /// just 1 (the new prep stash), so no demotion fires.
+    #[test]
+    fn test_merge_back_run_id_isolates_stash_tags() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/run-id-isolate-feat004";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        let stash_limit: u32 = 3;
+
+        // Pre-seed `stash_limit` stashes with a DIFFERENT run_id prefix.
+        for i in 0..stash_limit {
+            fs::write(paths[0].join("seed.txt"), format!("seed {}", i)).expect("write seed");
+            let tag = format!("task-mgr-slot-1-other-run-seed-{}", i);
+            let out = Command::new("git")
+                .args(["stash", "push", "--include-untracked", "-m", &tag])
+                .current_dir(&paths[0])
+                .output()
+                .expect("git stash push seed");
+            assert!(out.status.success());
+        }
+
+        // Slot 1: commits scratch.log.
+        fs::write(paths[1].join("scratch.log"), "slot-1 version\n").expect("write slot 1");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 scratch"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        // Slot 0: dirty conflicting scratch.log.
+        fs::write(paths[0].join("scratch.log"), "local dirty\n").expect("write");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            stash_limit,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "per-run scoping should prevent demotion: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+    }
+
+    /// FEAT-004 (6): resolver path with preflight in play. Dirty scratch.log
+    /// (untouched by slot 1) + a separate contended.txt that slot 1 conflicts
+    /// on (resolver fixes it). End state: slot merged, HEAD advances, stash
+    /// pops cleanly because scratch.log is unrelated to the conflict.
+    #[test]
+    fn test_merge_back_resolver_path_works_with_preflight() {
+        let branch = "feat/resolver-preflight-feat004";
+        let (tmp, slot0, pre_merge_head) = setup_conflicting_slot1(branch);
+        let slot_paths = vec![
+            compute_slot_worktree_path(tmp.path(), branch, 0),
+            compute_slot_worktree_path(tmp.path(), branch, 1),
+        ];
+
+        // Dirty an UNRELATED file in slot 0 so preflight stashes it.
+        fs::write(slot0.join("scratch.log"), "dirty scratch\n").expect("write scratch");
+
+        let resolver = MockResolver::new(MergeResolverOutcome::Resolved, |slot0_path| {
+            fs::write(slot0_path.join("contended.txt"), "resolved version").expect("write");
+            let out = Command::new("git")
+                .args(["commit", "-am", "resolve conflict"])
+                .current_dir(slot0_path)
+                .output()
+                .expect("git commit");
+            assert!(
+                out.status.success(),
+                "merge-commit should succeed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        });
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &resolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.merged_slots,
+            vec![1],
+            "slot should merge via resolver: {:?}",
+            outcomes
+        );
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "no slot should fail: {:?}",
+            outcomes.failed_slots
+        );
+
+        let post = rev_parse(&slot0, "HEAD");
+        assert_ne!(post, pre_merge_head, "HEAD must advance past pre-merge");
+
+        // scratch.log restored (stash popped on top of the resolved commit).
+        let status_out = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status.contains("scratch.log"),
+            "scratch.log should be back after clean stash pop: {}",
+            status
+        );
+
+        // Stash list should be empty (clean pop).
+        let stash_out = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&slot0)
+            .output()
+            .expect("git stash list");
+        assert!(
+            String::from_utf8_lossy(&stash_out.stdout).trim().is_empty(),
+            "stash list should be empty after clean pop"
         );
     }
 
@@ -3610,7 +4775,7 @@ detached
             "ephemeral branch should still exist before reconcile"
         );
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed for orphan-branch case");
 
         assert!(
@@ -3636,7 +4801,7 @@ detached
         assert!(slot1_path.exists());
         assert!(branch_exists(&project_root, &ephemeral));
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed for clean-merged case");
 
         assert!(
@@ -3659,7 +4824,7 @@ detached
         // Push slot 1 past base with a commit so it is no longer an ancestor.
         commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
 
-        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2);
+        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2, None);
         assert!(
             result.is_err(),
             "reconcile must abort when halt_threshold > 0 and un-merged ephemeral exists: {:?}",
@@ -3687,7 +4852,7 @@ detached
         commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
 
         // halt_threshold = 0 → legacy permissive: warn but proceed.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should return Ok when halt_threshold == 0");
 
         // Critical AC: must NOT delete in case 3 even with halt disabled.
@@ -3713,7 +4878,7 @@ detached
 
         // Dirty must abort regardless of halt_threshold.
         for halt in [0u32, 2u32] {
-            let result = reconcile_stale_ephemeral_slots(&project_root, branch, halt);
+            let result = reconcile_stale_ephemeral_slots(&project_root, branch, halt, None);
             assert!(
                 result.is_err(),
                 "dirty worktree must abort regardless of halt_threshold (halt={}): {:?}",
@@ -3739,7 +4904,7 @@ detached
         let project_root = tmp.path().to_path_buf();
 
         // No slot branches exist; pattern matches nothing → early Ok.
-        reconcile_stale_ephemeral_slots(&project_root, "feat/no-such-branch", 2)
+        reconcile_stale_ephemeral_slots(&project_root, "feat/no-such-branch", 2, None)
             .expect("empty branch list should produce Ok with no work");
     }
 
@@ -3766,7 +4931,7 @@ detached
         // ancestor-vs-tree-diff distinction at the same time.
         commit_on_slot(&slot_paths[0], "advance.txt", "advance base");
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should not abort because of malformed sibling");
 
         assert!(
@@ -3790,9 +4955,9 @@ detached
         let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
         let _ = slot_paths;
 
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0).expect("first pass");
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None).expect("first pass");
         // Second pass: nothing left matching the pattern → fast Ok.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("second pass should be a no-op Ok");
     }
 
@@ -3862,7 +5027,7 @@ detached
         // Slot 1 is at base's tip → classifies CleanMerged → cleaned up
         // normally so we also verify the slot-0 guard does not break the
         // legitimate-cleanup path.
-        reconcile_stale_ephemeral_slots(&project_root, branch, 0)
+        reconcile_stale_ephemeral_slots(&project_root, branch, 0, None)
             .expect("reconcile should succeed despite slot-0 stray branch");
 
         // Critical AC: main worktree must still exist.
@@ -3888,6 +5053,394 @@ detached
         assert!(
             !slot1_path.exists(),
             "legitimate slot 1 worktree should still be removed"
+        );
+    }
+
+    // ===== FEAT-005 auto-recovery tests =====
+
+    /// Test resolver that always returns a configured outcome. Used by the
+    /// auto-recovery conflict tests in lieu of spawning Claude. Captures
+    /// invocation count so tests can assert the resolver was reached
+    /// (or not).
+    struct AutoRecoveryFixedResolver {
+        outcome: MergeResolverOutcome,
+        invocations: std::cell::RefCell<u32>,
+    }
+
+    impl AutoRecoveryFixedResolver {
+        fn new(outcome: MergeResolverOutcome) -> Self {
+            Self {
+                outcome,
+                invocations: std::cell::RefCell::new(0),
+            }
+        }
+    }
+
+    impl MergeResolver for AutoRecoveryFixedResolver {
+        fn resolve(&self, _ctx: ResolverContext<'_>) -> MergeResolverOutcome {
+            *self.invocations.borrow_mut() += 1;
+            self.outcome.clone()
+        }
+    }
+
+    /// Build a minimal `AutoRecoveryConfig` whose Claude params are inert —
+    /// they're never consumed when callers pass a `test_resolver` via
+    /// `reconcile_stale_ephemeral_slots_inner`. The signal_flag is a fresh
+    /// (unset) Arc; the run_id is a fixed string so stash tags from the test
+    /// don't collide across runs.
+    fn make_recovery_cfg<'a>(run_id: &'a str, stash_limit: u32) -> AutoRecoveryConfig<'a> {
+        AutoRecoveryConfig {
+            model: "claude-sonnet-test",
+            effort: "medium",
+            claude_timeout: Duration::from_secs(60),
+            signal_flag: Arc::new(AtomicBool::new(false)),
+            db_dir: None,
+            run_id,
+            stash_limit,
+            progress_file_name: "progress.txt",
+        }
+    }
+
+    /// AC: `reconcile_stale_ephemeral_slots(_, _, halt=2, None)` with an
+    /// un-merged ephemeral must produce the same `InvalidState` error it
+    /// produced before FEAT-005 — byte-for-byte regression guard.
+    #[test]
+    fn test_reconcile_auto_recovery_disabled_preserves_abort() {
+        let branch = "feat/recon-auto-disabled";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        commit_on_slot(&slot1_path, "slot1-only.txt", "slot 1 only commit");
+
+        let result = reconcile_stale_ephemeral_slots(&project_root, branch, 2, None);
+        assert!(
+            result.is_err(),
+            "auto_recovery=None with un-merged ephemeral + halt=2 must abort: {:?}",
+            result
+        );
+
+        // Branch and worktree must be preserved on abort regardless of FEAT-005.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch must be preserved when auto_recovery is None"
+        );
+        assert!(
+            slot1_path.exists(),
+            "ephemeral worktree must be preserved when auto_recovery is None"
+        );
+
+        // Abort message must NOT mention auto-recovery — confirms no
+        // recovery attempt happened.
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            !msg.contains("auto-recovery"),
+            "abort message must not mention auto-recovery when None was passed: {}",
+            msg
+        );
+    }
+
+    /// AC: clean-merge stale ephemeral + auto_recovery=Some → merge attempted
+    /// via `prepare → run_slot_merge_attempt → cleanup`, ephemeral deleted,
+    /// reconcile returns Ok, project_root HEAD advanced past the original
+    /// pre-merge commit so we know a real merge happened.
+    #[test]
+    fn test_reconcile_auto_recovery_succeeds_when_merge_clean() {
+        let branch = "feat/recon-auto-clean";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Slot 1 adds a new file — non-conflicting → fast-forward / clean merge.
+        commit_on_slot(
+            &slot1_path,
+            "slot1-feature.txt",
+            "non-conflicting slot 1 commit",
+        );
+        let pre_merge_head = rev_parse(&project_root, "HEAD");
+
+        let cfg = make_recovery_cfg("test-clean", 5);
+        // `test_resolver=None` here would be fine — there's no conflict to
+        // trigger it — but pass an explicit one so this test exercises the
+        // injection seam too.
+        let mock = AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("unreached".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_ok(),
+            "clean-merge auto-recovery must succeed: {:?}",
+            result
+        );
+        assert_eq!(
+            *mock.invocations.borrow(),
+            0,
+            "resolver must NOT be invoked on a clean merge"
+        );
+
+        // Branch + worktree both gone after successful recovery.
+        assert!(
+            !branch_exists(&project_root, &ephemeral),
+            "merged ephemeral branch must be deleted after auto-recovery"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "merged ephemeral worktree must be removed after auto-recovery"
+        );
+
+        let post_merge_head = rev_parse(&project_root, "HEAD");
+        assert_ne!(
+            post_merge_head, pre_merge_head,
+            "project_root HEAD must advance past pre-merge to prove a real merge ran"
+        );
+    }
+
+    /// AC: conflicting stale ephemeral + auto_recovery=Some + mock resolver
+    /// returns Failed → reconcile returns Err, abort message annotated with
+    /// "auto-recovery attempted and failed for: <branches>", branch + worktree
+    /// preserved for operator review.
+    #[test]
+    fn test_reconcile_auto_recovery_fails_falls_through_to_abort() {
+        let branch = "feat/recon-auto-fail";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+        let ephemeral = ephemeral_slot_branch(branch, 1);
+
+        // Conflicting commit: slot 1 modifies a file that slot 0 will also
+        // modify out-of-band so `git merge --no-edit` exits non-zero.
+        fs::write(slot1_path.join("test_file.txt"), "slot-1 version").expect("write slot 1");
+        let add1 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot1_path)
+            .output()
+            .expect("git add slot 1");
+        assert!(add1.status.success());
+        let commit1 = Command::new("git")
+            .args(["commit", "-m", "slot 1 contended change"])
+            .current_dir(&slot1_path)
+            .output()
+            .expect("git commit slot 1");
+        assert!(commit1.status.success());
+
+        // Out-of-band conflicting commit on project_root (slot 0).
+        fs::write(project_root.join("test_file.txt"), "slot-0 version").expect("write slot 0");
+        let add0 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&project_root)
+            .output()
+            .expect("git add slot 0");
+        assert!(add0.status.success());
+        let commit0 = Command::new("git")
+            .args(["commit", "-m", "slot 0 out-of-band conflicting change"])
+            .current_dir(&project_root)
+            .output()
+            .expect("git commit slot 0");
+        assert!(commit0.status.success());
+
+        let cfg = make_recovery_cfg("test-fail", 5);
+        let mock =
+            AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("test refusal".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_err(),
+            "conflicting merge + resolver Failed must abort: {:?}",
+            result
+        );
+        assert!(
+            *mock.invocations.borrow() >= 1,
+            "resolver must have been invoked at least once for the conflict"
+        );
+
+        // Branch + worktree preserved on abort.
+        assert!(
+            branch_exists(&project_root, &ephemeral),
+            "ephemeral branch must be preserved on auto-recovery failure"
+        );
+        assert!(
+            slot1_path.exists(),
+            "ephemeral worktree must be preserved on auto-recovery failure"
+        );
+
+        // Abort message annotation: AC requires "auto-recovery attempted and
+        // failed for: <branches>" naming the conflicting ephemeral.
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("auto-recovery attempted and failed for:"),
+            "abort message must include FEAT-005 attempt clause: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&ephemeral),
+            "abort message must name the failed branch {}: {}",
+            ephemeral,
+            msg
+        );
+    }
+
+    /// AC: dirty scratch.log in project_root + auto_recovery=Some +
+    /// clean-merge ephemeral → preflight stashes the dirty file, merge runs,
+    /// cleanup pops, reconcile returns Ok, scratch.log restored to its
+    /// dirty state post-call.
+    #[test]
+    fn test_reconcile_auto_recovery_handles_dirty_project_root() {
+        let branch = "feat/recon-auto-dirty-root";
+        let (_tmp, project_root, slot_paths) = setup_ephemeral_slot_for_recon(branch);
+        let slot1_path = slot_paths[1].clone();
+
+        commit_on_slot(&slot1_path, "slot1-non-conflicting.txt", "slot 1 new file");
+
+        // Make project_root dirty with an untracked log file (the exact
+        // scenario FEAT-001 gitignores but FEAT-003 preflight handles for
+        // residual cases).
+        fs::write(project_root.join("scratch.log"), "dirty log contents").expect("write scratch");
+
+        let cfg = make_recovery_cfg("test-dirty-root", 5);
+        let mock = AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("unreached".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_ok(),
+            "clean-merge auto-recovery must succeed even with a dirty project_root: {:?}",
+            result
+        );
+
+        // Post-call: scratch.log restored to its pre-merge dirty state.
+        let scratch = project_root.join("scratch.log");
+        assert!(
+            scratch.exists(),
+            "scratch.log must be restored by preflight cleanup"
+        );
+        let body = fs::read_to_string(&scratch).expect("read scratch.log");
+        assert_eq!(
+            body, "dirty log contents",
+            "scratch.log contents must survive stash+pop intact"
+        );
+    }
+
+    /// AC: two stale ephemerals — one clean-merges, the other conflicts and
+    /// the resolver declines → clean one auto-deleted; conflicting one
+    /// surfaces in abort message; reconcile returns Err.
+    #[test]
+    fn test_reconcile_auto_recovery_mixed_outcomes() {
+        let branch = "feat/recon-auto-mixed";
+        let tmp = setup_git_repo_with_file();
+        let project_root = tmp.path().to_path_buf();
+
+        // Spin up a 3-slot worktree topology so we have two ephemeral
+        // siblings to manipulate independently.
+        let paths = ensure_slot_worktrees(&project_root, branch, 3)
+            .expect("ensure_slot_worktrees in test setup");
+        let slot1_path = paths[1].clone();
+        let slot2_path = paths[2].clone();
+        let slot1_ephemeral = ephemeral_slot_branch(branch, 1);
+        let slot2_ephemeral = ephemeral_slot_branch(branch, 2);
+
+        // Slot 1: non-conflicting addition (will auto-merge clean).
+        commit_on_slot(
+            &slot1_path,
+            "slot1-new.txt",
+            "slot 1 non-conflicting commit",
+        );
+
+        // Slot 2: conflicting commit on test_file.txt.
+        fs::write(slot2_path.join("test_file.txt"), "slot-2 version").expect("write slot 2");
+        let add2 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&slot2_path)
+            .output()
+            .expect("git add slot 2");
+        assert!(add2.status.success());
+        let commit2 = Command::new("git")
+            .args(["commit", "-m", "slot 2 contended change"])
+            .current_dir(&slot2_path)
+            .output()
+            .expect("git commit slot 2");
+        assert!(commit2.status.success());
+
+        // Out-of-band conflicting commit on project_root targeting same file.
+        fs::write(project_root.join("test_file.txt"), "slot-0 version").expect("write slot 0");
+        let add0 = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&project_root)
+            .output()
+            .expect("git add slot 0");
+        assert!(add0.status.success());
+        let commit0 = Command::new("git")
+            .args(["commit", "-m", "slot 0 conflicting change"])
+            .current_dir(&project_root)
+            .output()
+            .expect("git commit slot 0");
+        assert!(commit0.status.success());
+
+        let cfg = make_recovery_cfg("test-mixed", 5);
+        let mock =
+            AutoRecoveryFixedResolver::new(MergeResolverOutcome::Failed("test refusal".into()));
+        let result = reconcile_stale_ephemeral_slots_inner(
+            &project_root,
+            branch,
+            2,
+            Some(&cfg),
+            Some(&mock),
+        );
+        assert!(
+            result.is_err(),
+            "mixed-outcome reconcile must abort because slot 2 conflict survived: {:?}",
+            result
+        );
+
+        // Slot 1 was successfully auto-merged → branch + worktree gone.
+        assert!(
+            !branch_exists(&project_root, &slot1_ephemeral),
+            "slot 1 ephemeral (clean-merge) must be deleted after auto-recovery"
+        );
+        assert!(
+            !slot1_path.exists(),
+            "slot 1 worktree (clean-merge) must be removed after auto-recovery"
+        );
+
+        // Slot 2 conflicted + resolver declined → preserved for operator.
+        assert!(
+            branch_exists(&project_root, &slot2_ephemeral),
+            "slot 2 ephemeral (conflicting) must be preserved on resolver failure"
+        );
+        assert!(
+            slot2_path.exists(),
+            "slot 2 worktree (conflicting) must be preserved on resolver failure"
+        );
+
+        // Abort message names slot 2's branch but NOT slot 1's (which was
+        // recovered before the abort decision).
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains(&slot2_ephemeral),
+            "abort message must name slot 2's branch {}: {}",
+            slot2_ephemeral,
+            msg
+        );
+        assert!(
+            !msg.contains(&slot1_ephemeral),
+            "abort message must NOT name slot 1's branch (it was recovered): {}",
+            msg
+        );
+        assert!(
+            msg.contains("auto-recovery attempted and failed for:"),
+            "abort message must include FEAT-005 attempt clause for mixed outcomes: {}",
+            msg
         );
     }
 
@@ -4052,6 +5605,581 @@ detached
             result.is_empty(),
             "no slot-N worktrees should yield empty Vec, got {:?}",
             result
+        );
+    }
+
+    // ── prepare_slot0_for_merge / cleanup_preparation ──────────────────────
+
+    /// AC: clean working tree → Clean (no stash created).
+    #[test]
+    fn test_prepare_clean_working_tree() {
+        let tmp = setup_git_repo_with_file();
+        let result = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert_eq!(result, MergePreparation::Clean);
+    }
+
+    /// AC: dirty tracked file → Stashed with a tag matching the expected pattern.
+    #[test]
+    fn test_prepare_dirty_tracked_file() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").expect("write");
+
+        let result = prepare_slot0_for_merge(tmp.path(), 1, "test-run").unwrap();
+        match &result {
+            MergePreparation::Stashed { tag } => {
+                assert!(
+                    tag.starts_with("task-mgr-slot-1-test-run-"),
+                    "tag '{tag}' does not match expected prefix"
+                );
+            }
+            MergePreparation::Clean => panic!("expected Stashed, got Clean"),
+        }
+
+        // Working tree should be clean after stash.
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "expected clean working tree after stash"
+        );
+    }
+
+    /// AC: untracked file is stashed; working tree is clean after prepare.
+    #[test]
+    fn test_prepare_untracked_file() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("scratch.log"), "log data").expect("write");
+
+        let result = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert!(
+            matches!(result, MergePreparation::Stashed { .. }),
+            "untracked file should produce Stashed"
+        );
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "expected clean working tree after stashing untracked file"
+        );
+    }
+
+    /// AC: tracked dirty + untracked file → ONE stash, not two.
+    #[test]
+    fn test_prepare_dirty_and_untracked_creates_one_stash() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").expect("write tracked");
+        std::fs::write(tmp.path().join("scratch.log"), "log").expect("write untracked");
+
+        prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+
+        let list = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly 1 stash entry, got {lines:?}"
+        );
+    }
+
+    /// AC: cleanup_preparation(Clean, ...) is a no-op and returns Restored.
+    #[test]
+    fn test_cleanup_clean_is_noop() {
+        let tmp = setup_git_repo_with_file();
+        let outcome = cleanup_preparation(&MergePreparation::Clean, tmp.path(), 0, "r", 5);
+        assert_eq!(outcome, CleanupOutcome::Restored);
+    }
+
+    /// AC: cleanup after stash pops and restores the dirty file.
+    #[test]
+    fn test_cleanup_pops_stash_and_restores() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty-content").expect("write");
+
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        assert!(matches!(prep, MergePreparation::Stashed { .. }));
+
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+        assert_eq!(outcome, CleanupOutcome::Restored);
+
+        // file.txt should be back to the dirty content.
+        let content = std::fs::read_to_string(tmp.path().join("file.txt")).unwrap();
+        assert_eq!(content, "dirty-content");
+
+        // Working tree should be dirty again.
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            !status.stdout.is_empty(),
+            "file.txt should be dirty again after pop"
+        );
+    }
+
+    /// AC: pop conflict → PopConflict with conflicted path; stash still on stack.
+    #[test]
+    fn test_cleanup_pop_conflict() {
+        let tmp = setup_git_repo_with_file();
+
+        // Dirty file.txt → stash it.
+        std::fs::write(tmp.path().join("file.txt"), "stash-version").expect("write");
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+
+        // Now commit a conflicting change to file.txt so pop will conflict.
+        std::fs::write(tmp.path().join("file.txt"), "commit-version").expect("overwrite");
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "conflicting commit"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+
+        match outcome {
+            CleanupOutcome::PopConflict { conflicted, .. } => {
+                assert!(
+                    conflicted.contains(&"file.txt".to_string()),
+                    "expected file.txt in conflicted list, got {conflicted:?}"
+                );
+            }
+            other => panic!("expected PopConflict, got {other:?}"),
+        }
+
+        // Stash must still be on the stack.
+        let list = Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let count = std::str::from_utf8(&list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(count, 1, "stash should still be on stack after conflict");
+    }
+
+    /// Helper: pre-seed N stash entries with the given message prefix.
+    fn seed_stashes(repo: &std::path::Path, prefix: &str, n: usize) {
+        // Dirty the tracked file.txt (git stash push without --include-untracked
+        // ignores untracked files, so we must dirty a tracked file).
+        let tracked = repo.join("file.txt");
+        for i in 0..n {
+            std::fs::write(&tracked, format!("seed-{i}")).unwrap();
+            let out = Command::new("git")
+                .args(["stash", "push", "-m", &format!("{prefix}{i}")])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "seed_stashes push {i} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // After N pops the file is back to the committed content; nothing to clean up.
+    }
+
+    /// Helper: produce a pop-conflict state and return the prep.
+    fn setup_pop_conflict(repo: &std::path::Path) -> MergePreparation {
+        std::fs::write(repo.join("file.txt"), "stash-side").unwrap();
+        let prep = prepare_slot0_for_merge(repo, 0, "test-run").unwrap();
+        std::fs::write(repo.join("file.txt"), "commit-side").unwrap();
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "conflict commit"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        prep
+    }
+
+    /// AC: stash count exceeds stash_limit → StashLimitExceeded.
+    #[test]
+    fn test_cleanup_stash_limit_exceeded() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+        let prefix = "task-mgr-slot-0-test-run-";
+
+        // Pre-seed stash_limit stashes (total will be stash_limit + 1 after pop fails).
+        seed_stashes(tmp.path(), prefix, stash_limit as usize);
+
+        let prep = setup_pop_conflict(tmp.path());
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        match outcome {
+            CleanupOutcome::StashLimitExceeded { count } => {
+                assert!(
+                    count > stash_limit as usize,
+                    "count {count} should exceed limit {stash_limit}"
+                );
+            }
+            other => panic!("expected StashLimitExceeded, got {other:?}"),
+        }
+    }
+
+    /// AC: different slot index — stashes for slot 1 don't count toward slot 0's limit.
+    #[test]
+    fn test_cleanup_per_slot_scoping() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+
+        // Pre-seed stashes for a DIFFERENT slot (slot 1, not 0).
+        seed_stashes(
+            tmp.path(),
+            "task-mgr-slot-1-test-run-",
+            stash_limit as usize,
+        );
+
+        let prep = setup_pop_conflict(tmp.path());
+        // Cleanup is for slot 0 — the slot-1 stashes must not count.
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        assert!(
+            matches!(outcome, CleanupOutcome::PopConflict { .. }),
+            "different-slot stashes must not trigger StashLimitExceeded; got {outcome:?}"
+        );
+    }
+
+    /// AC: different run_id — stashes for another run don't count toward this run's limit.
+    #[test]
+    fn test_cleanup_per_run_scoping() {
+        let tmp = setup_git_repo_with_file();
+        let stash_limit: u32 = 3;
+
+        // Pre-seed stashes for a DIFFERENT run_id (other-run, not test-run).
+        seed_stashes(
+            tmp.path(),
+            "task-mgr-slot-0-other-run-",
+            stash_limit as usize,
+        );
+
+        let prep = setup_pop_conflict(tmp.path());
+        let outcome = cleanup_preparation(&prep, tmp.path(), 0, "test-run", stash_limit);
+
+        assert!(
+            matches!(outcome, CleanupOutcome::PopConflict { .. }),
+            "different-run stashes must not trigger StashLimitExceeded; got {outcome:?}"
+        );
+    }
+
+    /// AC: tag prefixes are deterministic across two consecutive prepare calls
+    /// in the same test (only the epoch-ms suffix differs).
+    #[test]
+    fn test_prepare_deterministic_tag_prefix() {
+        let tmp = setup_git_repo_with_file();
+
+        std::fs::write(tmp.path().join("file.txt"), "v1").unwrap();
+        let prep1 = prepare_slot0_for_merge(tmp.path(), 2, "myrun").unwrap();
+        // pop to restore clean state for the second call
+        if let MergePreparation::Stashed { ref tag } = prep1 {
+            let stash_ref = resolve_stash_ref_by_tag(tmp.path(), tag).unwrap().unwrap();
+            Command::new("git")
+                .args(["stash", "pop", &stash_ref])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+        }
+
+        std::fs::write(tmp.path().join("file.txt"), "v2").unwrap();
+        let prep2 = prepare_slot0_for_merge(tmp.path(), 2, "myrun").unwrap();
+
+        let (tag1, tag2) = match (&prep1, &prep2) {
+            (MergePreparation::Stashed { tag: t1 }, MergePreparation::Stashed { tag: t2 }) => {
+                (t1.clone(), t2.clone())
+            }
+            _ => panic!("both prepares should produce Stashed"),
+        };
+
+        assert!(
+            tag1.starts_with("task-mgr-slot-2-myrun-"),
+            "tag1 prefix wrong: {tag1}"
+        );
+        assert!(
+            tag2.starts_with("task-mgr-slot-2-myrun-"),
+            "tag2 prefix wrong: {tag2}"
+        );
+        // Tags must differ (different epoch_ms).
+        assert_ne!(tag1, tag2, "consecutive tags must be unique");
+    }
+
+    /// Negative AC: no auto-commit in git log after prepare/cleanup.
+    #[test]
+    fn test_no_auto_commit_created() {
+        let tmp = setup_git_repo_with_file();
+        std::fs::write(tmp.path().join("file.txt"), "dirty").unwrap();
+
+        let prep = prepare_slot0_for_merge(tmp.path(), 0, "test-run").unwrap();
+        cleanup_preparation(&prep, tmp.path(), 0, "test-run", 5);
+
+        let log = Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let log_text = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            !log_text.contains("chore(progress)") && !log_text.contains("chore:"),
+            "no auto-commits expected; got: {log_text}"
+        );
+        // Only the initial "init" commit should exist.
+        assert_eq!(
+            log_text.lines().count(),
+            1,
+            "expected only the init commit, got:\n{log_text}"
+        );
+    }
+
+    // ===== union_slot_progress_files tests (FEAT-006) =====
+
+    /// Create `<parent>/<name>/tasks/` and optionally write a `progress.txt`
+    /// with the given bytes. Returns the slot path. `progress_content: None`
+    /// leaves the slot worktree present but with no progress file.
+    fn make_slot_dir(parent: &Path, name: &str, progress_content: Option<&[u8]>) -> PathBuf {
+        let slot = parent.join(name);
+        fs::create_dir_all(slot.join("tasks")).expect("create slot tasks dir");
+        if let Some(content) = progress_content {
+            fs::write(slot.join("tasks").join("progress.txt"), content)
+                .expect("write slot progress file");
+        }
+        slot
+    }
+
+    fn read_slot0(slot0: &Path) -> String {
+        fs::read_to_string(slot0.join("tasks").join("progress.txt")).expect("read slot 0 progress")
+    }
+
+    #[test]
+    fn test_union_slot_progress_basic() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"pre-existing-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1.clone()], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        let idx_pre = content
+            .find("pre-existing-slot0")
+            .expect("slot0 content present");
+        let idx_wave = content
+            .find("## === wave merge")
+            .expect("wave separator present");
+        let idx_hdr = content
+            .find("## --- slot 1 (slot-1) ---")
+            .expect("slot 1 header present");
+        let idx_c1 = content
+            .find("slot1-content")
+            .expect("slot 1 content present");
+        assert!(
+            idx_pre < idx_wave && idx_wave < idx_hdr && idx_hdr < idx_c1,
+            "order pre<wave<hdr<content violated in:\n{content}"
+        );
+
+        // Slot 1's file is truncated to empty but still exists.
+        let s1_file = s1.join("tasks").join("progress.txt");
+        assert!(s1_file.exists(), "slot 1 progress file must still exist");
+        assert_eq!(
+            fs::read(&s1_file).expect("read slot 1").len(),
+            0,
+            "slot 1 progress file must be truncated to empty"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_does_not_duplicate_slot0() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"pre-existing-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert_eq!(
+            content.matches("pre-existing-slot0").count(),
+            1,
+            "slot 0 content must appear exactly once (no cumulative explosion)"
+        );
+        assert!(
+            !content.contains("## --- slot 0"),
+            "slot 0 must never get its own header"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_skips_missing() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+        // slot 2's worktree exists but never created a progress file.
+        let s2 = make_slot_dir(tmp.path(), "slot-2", None);
+
+        union_slot_progress_files(&[s0.clone(), s1, s2], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(content.contains("slot1-content"), "slot 1 still unioned");
+        assert!(
+            !content.contains("## --- slot 2"),
+            "slot 2 has no progress file → no header"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_preserves_order() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"AAA-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"BBB-slot1\n"));
+        let s2 = make_slot_dir(tmp.path(), "slot-2", Some(b"CCC-slot2\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1, s2], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        let i0 = content.find("AAA-slot0").expect("slot0");
+        let i1 = content.find("BBB-slot1").expect("slot1");
+        let i2 = content.find("CCC-slot2").expect("slot2");
+        assert!(
+            i0 < i1 && i1 < i2,
+            "output order must match slot_paths order"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_idempotent_on_empty_slots() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b""));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b""));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.is_empty(),
+            "all-empty slots must leave slot 0 empty (no spurious headers), got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_handles_invalid_utf8() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        // 0xff/0xfe are not valid UTF-8 lead bytes.
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(&[0xff, 0xfe, b'h', b'i', b'\n']));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union must not panic");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("## --- slot 1 (slot-1) ---"),
+            "invalid-utf8 slot still unioned via lossy conversion"
+        );
+        assert!(
+            content.contains("hi"),
+            "valid bytes survive lossy conversion"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_wave_separator_and_append() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"wave-1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1.clone()], "progress.txt").expect("wave 1");
+
+        // Next wave: slot 1 writes fresh content into its (now empty) file.
+        fs::write(s1.join("tasks").join("progress.txt"), b"wave-2-content\n")
+            .expect("write wave 2 content");
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("wave 2");
+
+        let content = read_slot0(&s0);
+        assert_eq!(
+            content.matches("## === wave merge").count(),
+            2,
+            "two waves → two separators"
+        );
+        let i1 = content.find("wave-1-content").expect("wave 1 content");
+        let i2 = content.find("wave-2-content").expect("wave 2 content");
+        assert!(i1 < i2, "waves appear in chronological order");
+    }
+
+    #[test]
+    fn test_union_slot_progress_header_basename_only() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let nested = tmp.path().join("long").join("nested").join("path");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let s1 = make_slot_dir(&nested, "feat-foo-slot-1", Some(b"nested-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("## --- slot 1 (feat-foo-slot-1) ---"),
+            "header uses basename only"
+        );
+        assert!(
+            !content.contains("long/nested/path"),
+            "full path must not leak into the progress log"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_handles_removed_slot_worktree() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        // slot 1's worktree directory was removed (never created here).
+        let s1_removed = tmp.path().join("slot-1");
+        let s2 = make_slot_dir(tmp.path(), "slot-2", Some(b"slot2-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1_removed, s2], "progress.txt")
+            .expect("union must not error on a removed worktree");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("slot2-content"),
+            "slot 2 still unioned despite slot 1's worktree being gone"
+        );
+        assert!(
+            content.contains("## --- slot 2 (slot-2) ---"),
+            "slot 2 header present"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_single_slot_is_noop() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"only-slot0\n"));
+
+        union_slot_progress_files(std::slice::from_ref(&s0), "progress.txt").expect("union");
+
+        assert_eq!(
+            read_slot0(&s0),
+            "only-slot0\n",
+            "single-slot wave must leave slot 0 untouched"
         );
     }
 }

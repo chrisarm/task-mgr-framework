@@ -51,6 +51,64 @@ pub fn splice_block(
     result
 }
 
+/// Compute new file contents after ensuring a managed marker-block is present
+/// and has the expected body. Returns `None` when no rewrite is needed (the
+/// block already matches the desired content).
+///
+/// # Contract
+///
+/// * `body` **must** end with `'\n'`. The on-disk form is always:
+///   `{begin_marker}\n{body}{end_marker}\n`.
+/// * When a valid marker pair is found, the block (from `begin_marker` through
+///   the newline after `end_marker`) is replaced in-place only if it differs
+///   from the desired form; content outside the markers is preserved
+///   byte-for-byte.
+/// * When no marker pair is found, the block is appended after a blank-line
+///   separator when `existing` is non-empty.
+///
+/// Returns `None` (no I/O needed) or `Some(new_contents)` (caller writes the
+/// file). The function is infallible.
+pub fn merge_marker_block(
+    existing: &str,
+    begin_marker: &str,
+    end_marker: &str,
+    body: &str,
+) -> Option<String> {
+    let desired_block = format!("{begin_marker}\n{body}{end_marker}\n");
+
+    if let (Some(begin), Some(end)) = (existing.find(begin_marker), existing.find(end_marker))
+        && begin < end
+    {
+        let after_end = end + end_marker.len();
+        let after_end = if existing[after_end..].starts_with('\n') {
+            after_end + 1
+        } else {
+            after_end
+        };
+        let current_block = &existing[begin..after_end];
+        if current_block == desired_block {
+            return None;
+        }
+        let mut rewritten = String::with_capacity(existing.len());
+        rewritten.push_str(&existing[..begin]);
+        rewritten.push_str(&desired_block);
+        rewritten.push_str(&existing[after_end..]);
+        return Some(rewritten);
+    }
+
+    // No marker block yet — append with one blank-line separator.
+    let mut rewritten = String::with_capacity(existing.len() + desired_block.len() + 2);
+    rewritten.push_str(existing);
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    if !existing.is_empty() {
+        rewritten.push('\n');
+    }
+    rewritten.push_str(&desired_block);
+    Some(rewritten)
+}
+
 /// Write `content` to `path` atomically via tempfile + rename in the same
 /// directory. A crash mid-write leaves the original file untouched.
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {

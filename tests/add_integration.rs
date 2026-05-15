@@ -1,24 +1,42 @@
 use serde_json::Value;
 use std::fs;
-use std::sync::Once;
 use task_mgr::commands::add::add;
 use task_mgr::commands::init::{PrefixMode, init};
 use tempfile::TempDir;
 
-/// Unset `TASK_MGR_ACTIVE_PREFIX` once for this test binary. The loop engine
-/// exports this var when running task-mgr inside a loop; it leaks into the
-/// cargo-test child env and causes `add()` (via `resolve_active_prefix`) to
-/// fail with "stale pin" because the leaked prefix isn't registered in the
-/// test fixtures' fresh DBs. Tests in this file never SET the var, so a
-/// one-shot unset at first-test-setup is sufficient.
-static UNSET_ACTIVE_PREFIX: Once = Once::new();
-fn ensure_active_prefix_unset() {
-    UNSET_ACTIVE_PREFIX.call_once(|| {
-        // SAFETY: runs before any test thread reads the env (all tests go
-        // through setup_with_prd, which calls this); single Once-guarded
-        // mutation, no concurrent set in this binary.
-        unsafe { std::env::remove_var("TASK_MGR_ACTIVE_PREFIX") };
-    });
+const ACTIVE_PREFIX_ENV: &str = "TASK_MGR_ACTIVE_PREFIX";
+
+static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: clears `TASK_MGR_ACTIVE_PREFIX` for the duration of the test,
+/// then restores it on drop.  Held alongside `ENV_PREFIX_MUTEX` so concurrent
+/// tests don't race on env-var state.
+///
+/// The loop engine exports this var when running task-mgr inside a loop; it
+/// leaks into the cargo-test child env and causes `add()` (via
+/// `resolve_active_prefix`) to fail with "stale pin" because the leaked prefix
+/// isn't registered in the test fixtures' fresh DBs.
+struct EnvIsolation {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl EnvIsolation {
+    fn new() -> Self {
+        let lock = ENV_PREFIX_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(ACTIVE_PREFIX_ENV).ok();
+        unsafe { std::env::remove_var(ACTIVE_PREFIX_ENV) };
+        Self { _lock: lock, prior }
+    }
+}
+
+impl Drop for EnvIsolation {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => unsafe { std::env::set_var(ACTIVE_PREFIX_ENV, v) },
+            None => unsafe { std::env::remove_var(ACTIVE_PREFIX_ENV) },
+        }
+    }
 }
 
 fn minimal_prd_json(p1: i32, p2: i32) -> String {
@@ -36,7 +54,6 @@ fn minimal_prd_json(p1: i32, p2: i32) -> String {
 /// The PRD file is placed at the TempDir root (outside the `tasks/` subdir)
 /// so init stores its absolute path in prd_files.
 fn setup_with_prd(prd_json: &str) -> (TempDir, std::path::PathBuf) {
-    ensure_active_prefix_unset();
     let dir = TempDir::new().unwrap();
     let prd_path = dir.path().join("test_prd.json");
     fs::write(&prd_path, prd_json).unwrap();
@@ -59,6 +76,7 @@ fn setup_with_prd(prd_json: &str) -> (TempDir, std::path::PathBuf) {
 
 #[test]
 fn test_add_roundtrips_task_into_prd_json() {
+    let _env = EnvIsolation::new();
     let (dir, prd_path) = setup_with_prd(&minimal_prd_json(50, 100));
 
     let new_task = serde_json::json!({
@@ -140,6 +158,7 @@ fn test_add_roundtrips_task_into_prd_json() {
 
 #[test]
 fn test_auto_priority_derives_from_top() {
+    let _env = EnvIsolation::new();
     // Seeds: priorities [50, 100].
     // Top task (selected first by select_next_task) is priority 50.
     // New task must get 49, NOT 99 (one less than the other task).
@@ -161,6 +180,7 @@ fn test_auto_priority_derives_from_top() {
 
 #[test]
 fn test_no_tmp_file_left_after_successful_add() {
+    let _env = EnvIsolation::new();
     let (dir, prd_path) = setup_with_prd(&minimal_prd_json(50, 100));
 
     let new_task = serde_json::json!({"id": "NEW-TMP-001", "title": "tmp file check"}).to_string();
@@ -184,6 +204,7 @@ fn test_no_tmp_file_left_after_successful_add() {
 
 #[test]
 fn test_add_with_empty_user_stories() {
+    let _env = EnvIsolation::new();
     let empty_prd = serde_json::json!({
         "project": "test-proj",
         "userStories": []
@@ -217,6 +238,7 @@ fn test_add_with_empty_user_stories() {
 
 #[test]
 fn test_add_succeeds_when_prd_json_deleted() {
+    let _env = EnvIsolation::new();
     let (dir, prd_path) = setup_with_prd(&minimal_prd_json(50, 100));
 
     // Remove the PRD JSON to simulate deletion between init and add.
@@ -250,6 +272,7 @@ fn test_add_succeeds_when_prd_json_deleted() {
 
 #[test]
 fn test_depended_on_by_updates_prd_json_dependson() {
+    let _env = EnvIsolation::new();
     // Seed a PRD where SEED-001 has no dependsOn. After add with
     // --depended-on-by SEED-001, SEED-001's userStories entry must gain
     // the new task id in its dependsOn array.
@@ -306,6 +329,7 @@ fn test_depended_on_by_updates_prd_json_dependson() {
 
 #[test]
 fn test_depended_on_by_missing_target_in_prd_json_logs_but_dbstill_updated() {
+    let _env = EnvIsolation::new();
     // Scenario: target exists in the DB (so pre-flight validation passes)
     // but is MISSING from the on-disk PRD JSON (out-of-band edit). The DB
     // write must commit, a warning logs for the missing target, and the

@@ -528,6 +528,75 @@ Note: merge resolution is intentionally NOT part of the shared
 working-tree state owned by `run_wave_iteration`, not the per-slot
 post-Claude processing block.
 
+### Gitignored progress files (FEAT-001, slot-merge-preflight PRD)
+
+The per-PRD progress file `tasks/progress-<prefix>.txt` is the most common
+source of slot-0 dirtiness — slot 1 commits to it on every wave iteration —
+and git's merge precondition aborts when slot 0 has uncommitted local
+changes to a file the incoming merge would touch (`"Your local changes to
+the following files would be overwritten by merge"`, non-zero exit with **no
+conflict markers**). The `ClaudeMergeResolver` then correctly short-circuits
+because there's nothing to act on, and the slot's commits get stranded.
+`task-mgr init` writes/refreshes a managed marker-block in `.gitignore`
+covering `tasks/progress-*.txt` and runs a one-time `git rm --cached`
+migration so existing repos drop the tracked file from the index without
+losing its on-disk content. See `src/commands/init/mod.rs::ensure_progress_gitignore`
+and `untrack_progress_files`. **The `git rm --cached` (NOT bare `git rm`)
+distinction is load-bearing** — bare `git rm` would delete the file on disk
+and lose the operator's loop history.
+
+### Stash-based preflight (FEAT-003 / FEAT-004, slot-merge-preflight PRD)
+
+For residual non-progress dirtiness (log files, build artifacts the project
+hasn't gitignored, stray test fixtures), `merge_slot_branches_with_resolver`
+runs a stash-based preflight before every per-slot `git merge --no-edit`.
+`prepare_slot0_for_merge` stashes everything dirty (tracked + untracked)
+under a deterministic tag `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`;
+`cleanup_preparation` pops after the merge attempt — successful or not.
+Pop conflicts are warned-and-continued (stash retained on stack for operator
+inspection), and once `count_stashes_with_prefix` exceeds
+`ProjectConfig.slot_stash_limit` (default 5) on the same slot, the slot is
+demoted to `failed_slots(PreResolver)` and the FEAT-002 consecutive-merge-fail
+halt threshold trips. **Cleanup is structurally guaranteed to run exactly
+once per slot** — `run_slot_merge_attempt` was extracted as a helper so
+every exit path (rev-parse failure, spawn failure, clean success, any
+conflict-handling branch) goes through the same `cleanup_preparation` call.
+No auto-commit — that would pollute base-branch history with `chore(progress)`
+commits. Stash tags include `run_id` so concurrent loops don't poach each
+other's stashes. See `src/loop_engine/worktree.rs::prepare_slot0_for_merge`
+and `cleanup_preparation`. `merge_resolver.rs:278` annotates the
+"no conflicts reported, refusing to spawn" diagnostic with a preflight
+pointer so the next operator who hits a regression knows where to look.
+
+### Reconcile auto-recovery (FEAT-005, slot-merge-preflight PRD)
+
+`reconcile_stale_ephemeral_slots` now accepts an optional
+`AutoRecoveryConfig` (model / effort / claude_timeout / signal_flag /
+db_dir / run_id / stash_limit). When `Some`, the function attempts an
+automatic merge-back of each `CleanUnmerged` stale ephemeral at loop
+startup using the same preflight + `ClaudeMergeResolver` path live waves
+take — `prepare_slot0_for_merge` → `git merge --no-edit` →
+`ClaudeMergeResolver` on conflict → `cleanup_preparation` → `git worktree
+remove` + `git branch -D` on success. `slot0_path` is `project_root`
+because reconcile runs **before** `ensure_slot_worktrees` — slot 0 IS the
+loop's main worktree at startup. Per-branch failures keep the branch in
+`unmerged` and fall through to the existing `halt_threshold` abort, with
+the message annotated `(auto-recovery attempted and failed for:
+<branches>)` so the operator sees which branches the resolver attempted
+vs. didn't. When `None`, behavior is byte-for-byte identical to the
+pre-FEAT-005 abort path. **Out of scope: case-4 dirty stale worktrees**
+still always abort regardless of `auto_recovery` — auto-recovery never
+runs on a worktree that has uncommitted work, by design.
+Test-injection seam: `reconcile_stale_ephemeral_slots_inner` (pub(crate))
+accepts an explicit `&dyn MergeResolver` so unit tests exercise the
+resolver-Failed branch without spawning Claude. Engine wiring lives in
+`src/loop_engine/engine.rs` at the FEAT-005 reconcile call site (Step 9.5)
+— it builds a one-off `AutoRecoveryConfig` from `project_default_model` /
+`project_config.merge_resolver_effort` / `merge_resolver_timeout_secs` /
+`slot_stash_limit` with a fresh `SignalFlag` and a synthetic
+`"startup-reconcile"` run-id (real run-id allocation happens later in
+Step 12 `run_cmd::begin`).
+
 ## Parallel-slot scheduling
 
 Five layered defenses harden parallel-slot execution against the cascade
