@@ -555,6 +555,15 @@ struct BatchOutput {
     raw_clusters: Result<Vec<RawDedupCluster>, ()>,
 }
 
+/// One unit of work for `process_batches_parallel`. Per-batch already-judged
+/// pairs travel alongside the items so the worker can build the prompt with
+/// the dismissal disclosure already in place — main thread reads `dismissals`
+/// from the DB once and slices it per batch before dispatch.
+struct DedupBatchInput {
+    items: Vec<DeduplicateLearningItem>,
+    already_judged_distinct: Vec<(i64, i64)>,
+}
+
 /// Dispatches LLM batch calls in parallel using `std::thread` + `mpsc`.
 ///
 /// Spawns `min(concurrency, batches.len())` worker threads. Each worker pulls
@@ -565,7 +574,7 @@ struct BatchOutput {
 /// An error in one batch does not block other batches; the failed batch is
 /// represented as `BatchOutput { raw_clusters: Err(()) }`.
 fn process_batches_parallel(
-    batches: Vec<Vec<DeduplicateLearningItem>>,
+    batches: Vec<DedupBatchInput>,
     threshold: f64,
     concurrency: usize,
     model: &str,
@@ -575,7 +584,7 @@ fn process_batches_parallel(
         return Vec::new();
     }
 
-    type WorkQueue = Arc<Mutex<VecDeque<(usize, Vec<DeduplicateLearningItem>)>>>;
+    type WorkQueue = Arc<Mutex<VecDeque<(usize, DedupBatchInput)>>>;
     let work_queue: WorkQueue = Arc::new(Mutex::new(batches.into_iter().enumerate().collect()));
 
     let (tx, rx) = mpsc::channel::<BatchOutput>();
@@ -593,13 +602,18 @@ fn process_batches_parallel(
                     let mut guard = queue.lock().expect("work queue lock poisoned");
                     guard.pop_front()
                 };
-                let (batch_idx, batch_items) = match item {
+                let (batch_idx, batch_input) = match item {
                     Some(x) => x,
                     None => break,
                 };
 
+                let batch_items = batch_input.items;
                 let eligible_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
-                let prompt = build_dedup_prompt(&batch_items, threshold);
+                let prompt = build_dedup_prompt(
+                    &batch_items,
+                    threshold,
+                    &batch_input.already_judged_distinct,
+                );
 
                 let raw_clusters = match spawn_claude(
                     &prompt,
@@ -761,19 +775,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
 
         if emb_list.is_empty() {
             // No embeddings stored — standard batch path.
-            let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
-            let batch_size = params
-                .batch_size
-                .unwrap_or_else(|| {
-                    if total_chars < 150_000 {
-                        items.len()
-                    } else {
-                        let avg = total_chars / items.len();
-                        (200_000 / avg.max(1)).clamp(20, 100)
-                    }
-                })
-                .max(1);
-            items.chunks(batch_size).map(|s| s.to_vec()).collect()
+            build_standard_batches(&items, params.batch_size, &dismissals)
         } else {
             // Pre-filter: cluster embedded learnings; send clusters to the LLM;
             // route unembedded learnings to standard-size fallback batches.
@@ -814,8 +816,25 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
             let mut batches: Vec<Vec<DeduplicateLearningItem>> = Vec::new();
 
             // Each embedding cluster → one or more LLM batches.
-            // Large clusters (from transitive chaining) are split to avoid
-            // exceeding the LLM context window.
+            //
+            // `cluster_by_embedding_similarity` already sorts each cluster's
+            // IDs ascending (dedup.rs `g.sort_unstable()`), so `batch` below
+            // is ID-sorted. Sub-batching via `chunks(max_cluster_batch)` is
+            // therefore stable across runs *as long as cluster membership is
+            // identical*. New merged learnings get monotonically-higher IDs
+            // and append at the tail, so a re-run after a merge only invalidates
+            // the LAST sub-batch — earlier sub-batches remain bit-identical
+            // and benefit from the dismissal cache. A boundary-shift inside
+            // an embedding cluster (e.g., a previously-isolated subset joins
+            // a larger component) is not fixed by sub-batching stability and
+            // is instead handled at the prompt level (Fix 1, below).
+            //
+            // After sub-batching, each batch is finalized via
+            // `finalize_dedup_batch`: members whose every intra-batch pair is
+            // already dismissed are pruned, but a batch is never dropped here.
+            // A batch that pruning would empty (fully dismissed) is kept
+            // intact so the skip filter further down counts it as
+            // `clusters_skipped` and skips the LLM call.
             let max_cluster_batch = params.batch_size.unwrap_or(7).max(2);
             for cluster_ids in clusters {
                 let batch: Vec<DeduplicateLearningItem> = cluster_ids
@@ -825,19 +844,30 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 if batch.len() < 2 {
                     continue;
                 }
-                if batch.len() <= max_cluster_batch {
-                    batches.push(batch);
-                } else {
-                    for chunk in batch.chunks(max_cluster_batch) {
-                        if chunk.len() >= 2 {
-                            batches.push(chunk.to_vec());
-                        }
+                let sub_batches: Vec<Vec<DeduplicateLearningItem>> =
+                    if batch.len() <= max_cluster_batch {
+                        vec![batch]
+                    } else {
+                        batch
+                            .chunks(max_cluster_batch)
+                            .filter(|c| c.len() >= 2)
+                            .map(<[DeduplicateLearningItem]>::to_vec)
+                            .collect()
+                    };
+                for sub in sub_batches {
+                    if let Some(finalized) = finalize_dedup_batch(&sub, &dismissals) {
+                        batches.push(finalized);
                     }
                 }
             }
 
             // Unembedded learnings → standard-size fallback batches.
+            // Sort by ID first so chunk boundaries are deterministic across
+            // runs (the source `items` order depends on the DB query result
+            // order and is not guaranteed stable when rows are added or
+            // retired between runs).
             if !without_emb.is_empty() {
+                without_emb.sort_by_key(|i| i.id);
                 let total_chars: usize = without_emb.iter().map(|i| i.content.len()).sum();
                 let batch_size = params
                     .batch_size
@@ -851,34 +881,29 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                     })
                     .max(1);
                 for chunk in without_emb.chunks(batch_size) {
-                    batches.push(chunk.to_vec());
+                    if let Some(finalized) = finalize_dedup_batch(chunk, &dismissals) {
+                        batches.push(finalized);
+                    }
                 }
             }
 
             batches
         }
     } else {
-        // embed_model empty — standard batch path (original behaviour).
-        let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
-        let batch_size = params
-            .batch_size
-            .unwrap_or_else(|| {
-                if total_chars < 150_000 {
-                    items.len()
-                } else {
-                    let avg = total_chars / items.len();
-                    (200_000 / avg.max(1)).clamp(20, 100)
-                }
-            })
-            .max(1);
-        items.chunks(batch_size).map(|s| s.to_vec()).collect()
+        // embed_model empty — standard batch path (original behaviour, plus
+        // ID-sorted chunking and member pruning for cache-hit stability).
+        build_standard_batches(&items, params.batch_size, &dismissals)
     };
 
     // Skip batches whose entire C(N,2) pair set is already recorded as dismissed.
     // Every skipped batch is one we would otherwise send to the LLM with
     // identical input and get an identical "no duplicates" response.
+    //
+    // For partially-dismissed batches we still call the LLM, but the prompt
+    // includes the already-judged-distinct pair list so the LLM only spends
+    // attention on the un-judged subset.
     let mut clusters_skipped: usize = 0;
-    let batches: Vec<Vec<DeduplicateLearningItem>> = batches
+    let batches: Vec<DedupBatchInput> = batches
         .into_iter()
         .filter_map(|batch| {
             let ids: Vec<i64> = batch.iter().map(|i| i.id).collect();
@@ -886,7 +911,11 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 clusters_skipped += 1;
                 None
             } else {
-                Some(batch)
+                let already_judged_distinct = dismissed_pairs_within(&ids, &dismissals);
+                Some(DedupBatchInput {
+                    items: batch,
+                    already_judged_distinct,
+                })
             }
         })
         .collect();
@@ -900,15 +929,26 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     // dismissed (batch pairs minus merged-cluster internal pairs minus prior-retired IDs).
     let batch_item_ids: Vec<Vec<i64>> = batches
         .iter()
-        .map(|b| b.iter().map(|i| i.id).collect())
+        .map(|b| b.items.iter().map(|i| i.id).collect())
         .collect();
 
     let total_batches = batches.len();
     if total_batches > 1 {
-        eprintln!(
-            "Processing {} batches (concurrency={})...",
-            total_batches, params.concurrency
-        );
+        let partial_count = batches
+            .iter()
+            .filter(|b| !b.already_judged_distinct.is_empty())
+            .count();
+        if partial_count > 0 {
+            eprintln!(
+                "Processing {total_batches} batch(es) (concurrency={}), {partial_count} with already-judged pair hints",
+                params.concurrency
+            );
+        } else {
+            eprintln!(
+                "Processing {total_batches} batch(es) (concurrency={})",
+                params.concurrency
+            );
+        }
     }
 
     let batch_outputs =
@@ -1359,6 +1399,132 @@ pub(crate) fn is_fully_dismissed(cluster_ids: &[i64], dismissals: &HashSet<(i64,
         return false;
     }
     unordered_pairs(cluster_ids).all(|p| dismissals.contains(&p))
+}
+
+/// Returns the subset of `all_dismissals` whose `(lo, hi)` are both members of
+/// `batch_ids`. Output is sorted by `(lo, hi)` for deterministic prompt content.
+///
+/// Used to disclose already-judged pairs in the dedup prompt so the LLM does
+/// not re-propose them as duplicates.
+pub(crate) fn dismissed_pairs_within(
+    batch_ids: &[i64],
+    all_dismissals: &HashSet<(i64, i64)>,
+) -> Vec<(i64, i64)> {
+    if batch_ids.len() < 2 || all_dismissals.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(i64, i64)> = unordered_pairs(batch_ids)
+        .filter(|p| all_dismissals.contains(p))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Builds standard (non-embedding-clustered) LLM batches with stable ordering
+/// and member pruning applied.
+///
+/// Stability: sorts a copy of `items` by id before chunking so re-runs with
+/// the same population produce identical chunk boundaries. Without this the
+/// chunks depend on the upstream DB query order, which has no guaranteed
+/// stable ordering across schema mutations.
+///
+/// Pruning: each candidate chunk is passed through [`prune_batch_to_judgable`]
+/// so a member whose every intra-chunk pair is already dismissed is dropped.
+/// Chunks that fall below 2 members post-prune are discarded entirely.
+fn build_standard_batches(
+    items: &[DeduplicateLearningItem],
+    batch_size_override: Option<usize>,
+    dismissals: &HashSet<(i64, i64)>,
+) -> Vec<Vec<DeduplicateLearningItem>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let total_chars: usize = items.iter().map(|i| i.content.len()).sum();
+    let batch_size = batch_size_override
+        .unwrap_or_else(|| {
+            if total_chars < 150_000 {
+                items.len()
+            } else {
+                let avg = total_chars / items.len();
+                (200_000 / avg.max(1)).clamp(20, 100)
+            }
+        })
+        .max(1);
+    let mut sorted: Vec<DeduplicateLearningItem> = items.to_vec();
+    sorted.sort_by_key(|i| i.id);
+    sorted
+        .chunks(batch_size)
+        .filter_map(|chunk| finalize_dedup_batch(chunk, dismissals))
+        .collect()
+}
+
+/// Finalizes a candidate batch for the work list. Prunes members that have no
+/// un-dismissed neighbour (via [`prune_batch_to_judgable`]) but never drops the
+/// batch entirely — that is the downstream skip-filter's job:
+///
+/// - An empty input yields `None` (nothing to schedule).
+/// - A batch smaller than 2 is returned unchanged: it is too small to prune,
+///   and the legacy standard path always kept per-item batches when the caller
+///   set `batch_size` to 1. `is_fully_dismissed` treats a <2 batch as not
+///   dismissed, so it still flows to the LLM path exactly as before.
+/// - A batch that pruning would empty (every intra-batch pair already
+///   dismissed) is returned UNPRUNED so the skip-filter sees the full id set,
+///   counts it as `clusters_skipped`, and suppresses the LLM call.
+/// - Otherwise the pruned batch (guaranteed `>= 2` members — pruning is
+///   symmetric, so it never yields exactly 1) is returned.
+fn finalize_dedup_batch(
+    chunk: &[DeduplicateLearningItem],
+    dismissals: &HashSet<(i64, i64)>,
+) -> Option<Vec<DeduplicateLearningItem>> {
+    if chunk.is_empty() {
+        return None;
+    }
+    if chunk.len() < 2 {
+        return Some(chunk.to_vec());
+    }
+    let pruned = prune_batch_to_judgable(chunk, dismissals);
+    if pruned.len() >= 2 {
+        Some(pruned)
+    } else {
+        // Fully dismissed — keep the batch intact for the skip-filter to count.
+        Some(chunk.to_vec())
+    }
+}
+
+/// Drops a batch member if every pair it participates in within the batch is
+/// already dismissed — i.e., it has no un-judged neighbor in this batch.
+///
+/// Pruning is single-pass: we compute, for each member, whether at least one
+/// of its `n - 1` intra-batch pairs is un-dismissed; only those members are
+/// kept. (A two-pass "remove, recompute" formulation could prune more
+/// aggressively but rarely matters in practice — embedding clusters with the
+/// pruning structure we're targeting are small.)
+///
+/// Returns the surviving items in their original order — either 0 (every pair
+/// dismissed) or `>= 2` (pruning is symmetric: if member A keeps an un-judged
+/// neighbour B, B keeps A, so a lone survivor is impossible). Callers go
+/// through [`finalize_dedup_batch`], which decides what to do with an
+/// empty result rather than dropping the batch outright.
+pub(crate) fn prune_batch_to_judgable(
+    items: &[DeduplicateLearningItem],
+    all_dismissals: &HashSet<(i64, i64)>,
+) -> Vec<DeduplicateLearningItem> {
+    if items.len() < 2 {
+        return items.to_vec();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, item)| {
+            items.iter().enumerate().any(|(j, other)| {
+                if *i == j {
+                    return false;
+                }
+                !all_dismissals.contains(&normalize_pair(item.id, other.id))
+            })
+        })
+        .map(|(_, item)| item.clone())
+        .collect()
 }
 
 /// Computes the deduplicated set of dismissal pairs to record for one LLM batch,
