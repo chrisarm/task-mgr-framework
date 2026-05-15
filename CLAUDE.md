@@ -91,6 +91,71 @@ Canonical forms for new scripts and docs:
 
 See PRD §11 (shim permanence) for the rationale.
 
+## Auto-launch /review-loop after loop end
+
+After a clean loop exit (all tasks complete), `task-mgr` can spawn an interactive
+`claude "/review-loop tasks/<prd>.md"` session automatically. The user lands directly
+in the review without a manual hand-off step.
+
+**Default behavior**: fires when `autoReview: true` (default) AND `tasks_completed >= autoReviewMinTasks`
+(default 3). Both live in `.task-mgr/config.json`. An empty config means both defaults apply.
+
+**CLI overrides** (clap-enforced mutual exclusion):
+- `--auto-review` — force on; treats the task-count threshold as 1
+- `--no-auto-review` — force off unconditionally
+
+**Batch mode**: ONE review fires at end-of-batch for the LAST successful PRD that met the
+threshold — never per-PRD. Earlier PRDs in the batch are skipped even if they individually
+qualified.
+
+**Suppression cases** (prints a recovery hint, continues, exit code unchanged):
+- Non-TTY stdout (CI, pipes) — hint: re-run interactively to get the review
+- `tasks/<prd>.md` not found AND `tasks/prd-<stem>.md` not found — hint: name the markdown file to match
+- Worktree path missing or cleaned up — hint: re-run `claude "/review-loop tasks/<prd>.md"` manually
+
+**Process model**: `Command::status()` — blocking spawn, stdin/stdout/stderr inherit so the
+review session is fully interactive. `ANTHROPIC_API_KEY` and other env vars inherit automatically.
+
+**Module**: `src/loop_engine/auto_review.rs` — `Decision`, `resolve_decision`, `should_fire`,
+`ReviewLauncher` trait, `maybe_fire`.
+
+**Invariant**: auto-review failure NEVER changes the loop or batch exit code.
+
+**Known footgun — paths with whitespace**: `ProcessLauncher::launch`
+(`src/loop_engine/auto_review.rs:130`) interpolates the PRD path into a single
+slash-command argv element: `format!("/review-loop {}", md.display())`. Claude
+re-tokenizes the slash-command body on whitespace, so a PRD path containing
+spaces (e.g. `tasks/My PRD.md`) splits into multiple tokens and the review
+launch fails to find the file. Not a security issue (no shell, `Command::arg`
+is safe), but project convention is space-free `tasks/<feature>.md` paths for
+exactly this reason — keep it that way. If the Claude CLI grows a structured
+args form, prefer that over in-band quoting.
+
+`maybe_fire` enforces this convention with a launch-boundary guard: if the
+resolved markdown path contains any `char::is_whitespace` character, the
+launch is suppressed and a stderr hint tells the operator to rename the file
+and re-run `/review-loop` manually. The guard sits AFTER `prd_md_path` (so it
+sees the actual file we'd hand to Claude) and BEFORE `launcher.launch` (so
+no fragmented argv ever reaches `claude`). It deliberately does not attempt
+to quote or escape — quoting Claude's slash-command body is brittle, and
+suppression with a clear hint is the simpler, more honest contract.
+
+**Outer/inner split for test reachability**: `maybe_fire` is a thin
+wrapper that performs the TTY pre-check and delegates to
+`maybe_fire_inner` (`pub(crate)`), which contains every launch-decision
+gate (decision, worktree existence, markdown path resolution, whitespace
+guard, launcher dispatch). `cargo test` runs in a non-TTY env, so a unit
+test that goes through the public `maybe_fire` would short-circuit at
+the TTY gate before reaching any inner gate — meaning a test asserting
+"this guard suppresses launch" via `CapturingLauncher` would pass even
+if the guard were deleted. Tests for inner-side gates
+(`maybe_fire_inner_*`) call the inner function directly to bypass the
+TTY gate and exercise the real guard logic; a single
+`maybe_fire_outer_suppresses_in_non_tty` test exercises the outer
+wrapper to prove the TTY gate still fires. When adding a new
+launch-boundary guard, add it inside `maybe_fire_inner` and test it via
+the inner — never via the outer.
+
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
@@ -259,7 +324,7 @@ Configure in `.task-mgr/config.json`:
 
 ```json
 {
-  "rerankerUrl": "http://localhost:8080",
+  "rerankerUrl": "http://localhost:8181",
   "rerankerModel": "jina-reranker-v2-base-multilingual",
   "rerankerOverFetch": 3
 }
@@ -267,15 +332,20 @@ Configure in `.task-mgr/config.json`:
 
 - **`rerankerUrl`** — base URL of a [gpustack/llama-box](https://github.com/gpustack/llama-box)
   server exposing OpenAI-compatible `/v1/rerank`. Reranker is disabled when unset.
+  Project default is host port **8181** (one off from llama-box's internal 8080
+  to avoid clashing with other projects that commonly publish on 8080); the
+  bundled docker-compose stack remaps `8181:8080` for this reason.
 - **`rerankerModel`** — model name passed in the `model` field of the rerank
   request. Required alongside `rerankerUrl`; either-or disables rerank.
 - **`rerankerOverFetch`** — per-backend over-fetch factor. Slate size is
   `min(limit * over_fetch, 30)`. Default `3`. Higher = better recall headroom,
   longer rerank latency.
-- **Example llama-box invocation** (CPU, port 8080):
+- **Example llama-box invocation** (CPU, host-native — bind to 8181 to match
+  the project default; if you run the bundled docker-compose stack instead,
+  the container's internal 8080 is remapped to host 8181 automatically):
 
   ```sh
-  llama-box --rerank-only --port 8080 \
+  llama-box --rerank-only --port 8181 \
       --model /models/jina-reranker-v2-base-multilingual.gguf
   ```
 

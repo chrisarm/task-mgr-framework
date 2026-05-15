@@ -523,7 +523,7 @@ fn rotation_keeps_only_newest_three_dumps() {
             )
         })
         .collect();
-    with_mtime.sort_by(|a, b| b.0.cmp(&a.0));
+    with_mtime.sort_by_key(|b| std::cmp::Reverse(b.0));
     // The newest dump must correspond to iteration 5 (filename embeds iter).
     let newest = with_mtime[0]
         .1

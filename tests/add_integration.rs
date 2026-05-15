@@ -11,6 +11,11 @@ static ENV_PREFIX_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// RAII guard: clears `TASK_MGR_ACTIVE_PREFIX` for the duration of the test,
 /// then restores it on drop.  Held alongside `ENV_PREFIX_MUTEX` so concurrent
 /// tests don't race on env-var state.
+///
+/// The loop engine exports this var when running task-mgr inside a loop; it
+/// leaks into the cargo-test child env and causes `add()` (via
+/// `resolve_active_prefix`) to fail with "stale pin" because the leaked prefix
+/// isn't registered in the test fixtures' fresh DBs.
 struct EnvIsolation {
     _lock: std::sync::MutexGuard<'static, ()>,
     prior: Option<String>,

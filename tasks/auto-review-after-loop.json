@@ -79,7 +79,7 @@
       "id": "FEAT-001",
       "modifiesBehavior": false,
       "notes": "Follow the exact pattern of merge_fail_halt_threshold at project_config.rs:78-89 (declaration with #[serde(default = \"default_merge_fail_halt_threshold\")]), line 115 (Default impl), lines 155-157 (default fn), lines 493-535 (test cases). Learning [1401]: Embedding config in ProjectConfig with sensible defaults — pattern matches exactly. Learning [928]: Use serde default fn for always-resolved fields. Learning [2317]: Extend existing result structs with serde defaults for backward compatibility — additive, no breaking change.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Defaults flow through named fns (one source of truth)",
@@ -134,7 +134,7 @@
       "id": "FEAT-002",
       "modifiesBehavior": false,
       "notes": "Learning [795] (CRITICAL): replace_all misses LoopResult construction sites with different indentation — this exact struct was the case study. Use sequential targeted Edits, run cargo check between batches. Learning [2061]: Comprehensive struct field refactoring with zero regressions — 18-site IterationResult refactor succeeded by this approach. Learning [2255]: Multi-site struct field threading with grep-find-update cycle. Learning [2087]: IterationResult field population at final return site — pattern for the tasks_completed propagation. The banner call at engine.rs:3996-4002 already has `tasks_completed` in scope (passed to print_final_banner) — just copy it into the LoopResult struct literal a few lines below.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "All 15 LoopResult construction sites converted uniformly to Default spread (no literal default values left behind)",
@@ -207,7 +207,7 @@
       "id": "FEAT-003",
       "modifiesBehavior": false,
       "notes": "Learning [1892]: CLAUDE_BINARY environment variable for mocking subprocess spawning — same pattern applies here, ProcessLauncher reads CLAUDE_BINARY env. Learning [1609]: Survey all spawn_claude call sites with grep before flipping a new last arg — confirms `claude_bin` resolution is established. Module rustdoc must call out: stdin/stdout/stderr inherit via Command::status() (no Stdio plumbing); env vars (ANTHROPIC_API_KEY) inherit by default — DO NOT strip; worktree-missing means SUPPRESS, not fall back. Use `std::io::IsTerminal` (Rust 1.70+) for TTY detection. CapturingLauncher is `#[cfg(test)]`-gated and uses Mutex<Vec<...>> for thread-safe call recording.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Pure functions are pure (Decision, resolve_decision, should_fire, prd_md_path) — no IO outside ProcessLauncher",
@@ -262,7 +262,7 @@
       "id": "FEAT-004",
       "modifiesBehavior": false,
       "notes": "Learning [823]: full wiring path trace for feature integration — this task is exactly that pattern for the CLI flag layer. The flat-form dispatch synthesis is the load-bearing piece — easy to miss because the parent and Run variants look like duplicates but the dispatch glue connects them. Existing `cleanup_worktree` and `parallel` fields are wired the same way; grep for them at commands.rs:850, 1280, 1416, 1449 to see all four touchpoints. Architect noted the parent/Run duplication is a future refactoring opportunity (`#[command(flatten)]` could compress) — out of scope here.",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Flag pair added at ALL four sites (parent + Run for both Loop and Batch)",
@@ -338,7 +338,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Learning [823] (CRITICAL): full wiring path trace for feature integration — this task IS the full wiring (CLI → main → batch → engine → auto_review). Trace every layer in this PR description. Learning [2255]: multi-site struct field threading with grep-find-update cycle — `PrdRunResult.tasks_completed` is added at two push sites. Learning [1892]: CLAUDE_BINARY env-var mock pattern — integration tests should use `std::env::set_var(\"CLAUDE_BINARY\", \"/bin/true\")` or pass CapturingLauncher directly (preferred — pure unit test, no subprocess). The batch hook MUST come AFTER the worktree-cleanup loop (lines 651-660ish in batch.rs); inserting before would always see the worktree present and never test the suppress-on-missing path. Synthesize the post-loop selection as either a pub(crate) helper fn `pick_review_target(results, decision) -> Option<&PrdRunResult>` (unit-testable) or inline (then integration test exercises it).",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Hook fires in BOTH main.rs single-loop arm AND batch.rs end-of-batch — both paths covered",
@@ -386,7 +386,7 @@
       "id": "FEAT-006",
       "modifiesBehavior": false,
       "notes": "Match the existing CLAUDE.md voice — terse, gotcha-focused, with file/symbol pointers. Compare to sections like 'Soft-dep guard for milestone scheduling' or 'Slot merge-back conflict resolution' for tone. Keep under ~30 lines.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "Terse, gotcha-focused (matches existing CLAUDE.md voice)",
@@ -421,7 +421,7 @@
       "id": "REFACTOR-001",
       "model": "claude-opus-4-7",
       "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
-      "passes": false,
+      "passes": true,
       "priority": 98,
       "qualityDimensions": [
         "DRY across modules (auto_review.rs vs main.rs/batch.rs wiring)",
@@ -468,7 +468,7 @@
       "id": "REVIEW-001",
       "model": "claude-opus-4-7",
       "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. CRITICAL manual step: the plan's stated assumption — `claude \"/review-loop foo.md\"` works as an initial-prompt arg — is unverified until this task. If the assumption is wrong, the whole feature ships as hint-line-only (config-flag-default-off); spawn a FIX-xxx to gate the spawn behind that flag and fall back to the stdin-pipe form documented in the plan. Don't ship the feature default-on if the assumption fails.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "No unwrap in production paths",
@@ -488,23 +488,6 @@
         "src/main.rs",
         "src/cli/commands.rs",
         "CLAUDE.md"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "WorktreeCleanupContext built once before the for loop, not per-PRD",
-        "PrdRunResult construction appears in exactly one place inside the loop body (closure or helper)",
-        "pick_review_target predicate no longer contains the redundant r.exit_code == 0 clause",
-        "No behavior change: existing batch.rs tests (test_prd_run_result_*, pick_review_target_*, test_cleanup_*) pass unchanged",
-        "cargo clippy -- -D warnings clean, cargo fmt --check clean"
-      ],
-      "description": "REFACTOR-001 found three small DRY violations inside src/loop_engine/batch.rs::run_batch. None are bugs; all are mechanical cleanups limited to the per-PRD loop body and pick_review_target. (1) PrdRunResult constructed twice (lines 650-659 stopped path, lines 679-688 normal path). Eight identical fields; only stopped differs. (2) WorktreeCleanupContext built twice (lines 663-672, 697-706) with byte-identical fields. The fields do NOT vary per PRD. (3) pick_review_target (line 784) duplicates the exit_code == 0 check; should_fire already enforces it via the exit_code arg.",
-      "id": "7a9519ac-REFACTOR-FIX-001",
-      "passes": false,
-      "priority": 60,
-      "title": "Consolidate batch.rs duplication: hoist cleanup ctx + PrdRunResult helper + simplify pick_review_target",
-      "touchesFiles": [
-        "src/loop_engine/batch.rs"
       ]
     }
   ],

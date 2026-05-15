@@ -292,7 +292,7 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
     }
 
     // Sort newest first.
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     for (_, path) in entries.into_iter().skip(keep) {
         if let Err(e) = fs::remove_file(&path) {

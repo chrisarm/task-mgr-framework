@@ -6,7 +6,7 @@ two HTTP services running locally:
 | Service     | Port  | What it does                                                                 |
 |-------------|-------|------------------------------------------------------------------------------|
 | `ollama`    | 11435 | Generates query embeddings via `jina-embeddings-v5-text-small-retrieval`     |
-| `llama-box` | 8080  | Cross-encoder reranker (`jina-reranker-v2-base-multilingual`) over top-K hits |
+| `llama-box` | 8181  | Cross-encoder reranker (`jina-reranker-v2-base-multilingual`) over top-K hits |
 
 Both ship as Docker images in this repo; both bake the model weights at build
 time so first-call latency is ~ms, not "download a model" minutes.
@@ -23,10 +23,11 @@ time so first-call latency is ~ms, not "download a model" minutes.
 - **CPU path**: works on any machine; reranks are noticeably slower (5–30 s
   for a typical batch on a laptop CPU) but functionally identical.
 - **~3 GB free disk** for the two images (model weights dominate).
-- **Free TCP ports 11435 and 8080** — if anything else binds them, stop it
+- **Free TCP ports 11435 and 8181** — if anything else binds them, stop it
   first or override via the compose file. (Note: 11435 is intentionally one
   port off from ollama's default 11434 so it doesn't clash with a host-installed
-  `ollama` daemon.)
+  `ollama` daemon; 8181 is similarly off from llama-box's internal 8080 so
+  the host port doesn't clash with the many other projects that publish on 8080.)
 
 ## First-time bring-up
 
@@ -41,7 +42,7 @@ scripts/recall-stack-up.sh --cpu --rebuild
 The script:
 1. Verifies `docker` is installed and the daemon is reachable.
 2. Runs `docker compose -f docker/docker-compose.yml up -d` (with `--build` if requested).
-3. Polls `http://localhost:11435/api/tags` and `http://localhost:8080/v1/models`
+3. Polls `http://localhost:11435/api/tags` and `http://localhost:8181/v1/models`
    until both respond (timeouts: 120 s and 180 s).
 4. Confirms the embedding model is loaded inside ollama.
 5. Sends a real `/v1/rerank` request and confirms it returns `relevance_score`
@@ -69,7 +70,7 @@ Add to the project's `.task-mgr/config.json` (already set on this machine):
 {
   "ollamaUrl": "http://localhost:11435",
   "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0",
-  "rerankerUrl": "http://localhost:8080",
+  "rerankerUrl": "http://localhost:8181",
   "rerankerModel": "jina-reranker-v2-base-multilingual",
   "rerankerOverFetch": 3
 }
@@ -92,7 +93,7 @@ reranker is healthy, and `vector similarity` when it soft-fails.
 | Build fails downloading model from Hugging Face         | Transient HF outage. The Dockerfile retries 3× with back-off; if it still fails, re-run `--rebuild` later.                 |
 | `task-mgr recall` errors "Ollama embedding service unreachable" | Ollama container is down. Run the script. Or pass `--allow-degraded` to fall back to FTS5/pattern recall.            |
 | `task-mgr recall` warns "reranker: ... using un-reranked order" | Reranker container is down — recall still returns results, just without cross-encoder rerank. Run the script.       |
-| Port 11435 or 8080 already in use                       | Another service owns the port. Stop it or change the host-side mapping in `docker/docker-compose.yml` (`"<HOST>:11434"` for ollama, `"<HOST>:8080"` for llama-box) and update `.task-mgr/config.json` to match. |
+| Port 11435 or 8181 already in use                       | Another service owns the port. Stop it or change the host-side mapping in `docker/docker-compose.yml` (`"<HOST>:11434"` for ollama, `"<HOST>:8080"` for llama-box) and update `.task-mgr/config.json` to match. |
 | Slow first rerank after reboot                          | llama-box does a one-time JIT warmup on the first request; subsequent calls are fast.                                      |
 
 ## What's pinned and where

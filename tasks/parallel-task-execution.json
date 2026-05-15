@@ -930,6 +930,170 @@
       "touchesFiles": [
         "src/commands/curate/enrich.rs"
       ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No #[allow(dead_code)] on the four slot worktree fns",
+        "cargo clippy clean",
+        "cargo test passes"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: compute_slot_worktree_path, ensure_slot_worktrees, merge_slot_branches, and cleanup_slot_worktrees are genuinely called from run_loop and run_wave_iteration in engine.rs. The doc-comment claim that the first non-test caller has not landed is stale — parallel wave execution shipped in FEAT-009/010.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-071",
+      "passes": false,
+      "priority": 71,
+      "title": "Remove stale #[allow(dead_code)] on slot worktree fns",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated eligibility/scoring/sort logic between the two public fns",
+        "Same selection behavior (existing tests still pass)",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: select_next_task (selection.rs:86) and select_parallel_group (selection.rs:328) duplicate ~50 LOC: completed_ids load, todo_tasks load, dependency map load, task_files load, eligibility filter, weight load, after_files HashSet, scoring loop, sort. The only real difference is the post-sort selection step (top-1 vs greedy file-overlap walk).",
+      "estimatedEffort": "medium",
+      "id": "ab55fca5-REFACTOR-072",
+      "passes": false,
+      "priority": 72,
+      "title": "Extract shared scoring helper from select_next_task / select_parallel_group",
+      "touchesFiles": [
+        "src/commands/next/selection.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Parameter removed from both fn signatures",
+        "All call sites updated",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: select_next_task and select_parallel_group both accept _recently_completed: &[String] and never read it. run_wave_iteration always passes &[]. Dead parameter clutters the signature.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-073",
+      "passes": false,
+      "priority": 73,
+      "title": "Remove unused _recently_completed parameter from selection fns",
+      "touchesFiles": [
+        "src/commands/next/selection.rs",
+        "src/commands/next/mod.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "run_wave_iteration < 200 LOC",
+        "Each helper has single responsibility",
+        "All existing run_wave_iteration tests pass unchanged"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: run_wave_iteration is 459 LOC with 14 numbered steps (engine.rs:783-1242). Hard to read, harder to test individually. Slot post-processing inside the for loop is itself ~170 LOC handling status updates + completed tags + scan_output + crash bookkeeping + reorder queueing.",
+      "estimatedEffort": "high",
+      "id": "ab55fca5-REFACTOR-074",
+      "passes": false,
+      "priority": 74,
+      "title": "Decompose run_wave_iteration into smaller helpers",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "WaveTerminal struct defined and used",
+        "No raw (i32, String, Option<RunStatus>) tuples remain",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: WaveOutcome.terminal: Option<(i32, String, Option<RunStatus>)> is opaque at every call site. Six different return paths each construct (code, reason, status) tuples and the meaning is positional only.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-075",
+      "passes": false,
+      "priority": 75,
+      "title": "Replace WaveOutcome.terminal opaque tuple with named struct",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No SlotEarlyExit struct",
+        "Single SlotResult constructor family covers all early-exit paths",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: slot_early_exit (engine.rs:422) and slot_failure_result (engine.rs:611) both build SlotResult { iteration_result } with overlapping fields. Four call sites in run_slot_iteration and three in run_parallel_wave construct similar SlotEarlyExit/IterationResult literals.",
+      "estimatedEffort": "medium",
+      "id": "ab55fca5-REFACTOR-076",
+      "passes": false,
+      "priority": 76,
+      "title": "Consolidate slot_early_exit and slot_failure_result builders",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Single helper used by both run_iteration and run_wave_iteration",
+        "Identical SQL semantics preserved",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: run_iteration (engine.rs:~1382) and run_wave_iteration (engine.rs:~1189) both build essentially the same SELECT COUNT(*) FROM tasks WHERE status NOT IN (...) {prefix_clause} query, just with different terminal-status sets. Manually wires Vec<&dyn ToSql> in both places.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-077",
+      "passes": false,
+      "priority": 77,
+      "title": "Extract count_remaining_tasks helper",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No magic-string check() calls in run_wave_iteration",
+        "Named API or call-site comments explain intent",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: run_wave_iteration calls ctx.stale_tracker.check(\"stale\", \"stale\") (engine.rs:850) and check(\"a\", \"b\") (engine.rs:890). The string arguments are placeholder/dummy values; the intent is mark-stale vs mark-progress.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-078",
+      "passes": false,
+      "priority": 78,
+      "title": "Replace magic stale_tracker.check string args with named methods",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/state.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No #[allow(clippy::too_many_arguments)] on log_iteration",
+        "All call sites construct LogEntry inline",
+        "cargo clippy clean"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: progress::log_iteration takes 8 args and uses #[allow(clippy::too_many_arguments)]. Sequential call sites pass slot=None; wave call site is the only consumer of the new slot field. A params struct keeps additions cheap and removes the lint suppression.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-079",
+      "passes": false,
+      "priority": 79,
+      "title": "Convert progress::log_iteration 8-arg signature to a params struct",
+      "touchesFiles": [
+        "src/loop_engine/progress.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No manual serde_json::json! mutation",
+        "Optional fields handled by skip_serializing_if",
+        "Slot prompt content unchanged for tasks with all-Some fields"
+      ],
+      "description": "From REFACTOR-REVIEW-FINAL: build_slot_prompt (engine.rs:320-348) hand-writes serde_json::json!({...}) and 5 if-let blocks for optional task fields. Adding a Task field requires updating this code; missing it silently omits the field from slot prompts.",
+      "estimatedEffort": "low",
+      "id": "ab55fca5-REFACTOR-080",
+      "passes": false,
+      "priority": 80,
+      "title": "Replace manual JSON construction in build_slot_prompt with serde",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
     }
   ],
   "version": "1.0"

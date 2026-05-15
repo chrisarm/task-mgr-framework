@@ -91,11 +91,15 @@ fn test_lock_metadata_none_fields_omitted() {
 
 #[test]
 fn test_banner_includes_db_path() {
-    let db_path = Path::new("/home/user/.task-mgr/tasks.db");
+    // Use a path outside both $HOME and cwd so shorten_path_for_display
+    // returns the absolute form verbatim, and short enough to fit the 48-col
+    // MIN_WIDTH banner without triggering truncate_display.
+    let db_path = Path::new("/nonex/tasks.db");
     let hints = SessionBannerHints {
         db_path,
         prefix: None,
         worktree_path: None,
+        tasks_dir: None,
     };
 
     let banner = format_session_banner(
@@ -123,6 +127,7 @@ fn test_banner_includes_worktree_path_when_set() {
         db_path,
         prefix: None,
         worktree_path: Some(wt_path),
+        tasks_dir: None,
     };
 
     let banner = format_session_banner("tasks/prd.json", "feat/test", 5, Some(1.0), Some(&hints));
@@ -143,6 +148,7 @@ fn test_banner_omits_worktree_line_when_none() {
         db_path,
         prefix: None,
         worktree_path: None,
+        tasks_dir: None,
     };
 
     let banner = format_session_banner("tasks/prd.json", "main", 10, None, Some(&hints));

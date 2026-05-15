@@ -108,7 +108,7 @@ pub fn cluster_by_embedding_similarity(
             g
         })
         .collect();
-    clusters.sort_by(|a, b| a[0].cmp(&b[0]));
+    clusters.sort_by_key(|c| c[0]);
     clusters
 }
 

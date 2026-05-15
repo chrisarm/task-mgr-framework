@@ -107,6 +107,18 @@ pub struct ProjectConfig {
     #[allow(dead_code)]
     #[serde(default = "default_slot_stash_limit")]
     pub slot_stash_limit: u32,
+
+    /// Whether to auto-launch `/review-loop` after a successful loop/batch run.
+    /// Default: `true`. Set to `false` to suppress the interactive review session.
+    /// CLI flags `--auto-review` / `--no-auto-review` override this value.
+    #[serde(default = "default_auto_review")]
+    pub auto_review: bool,
+
+    /// Minimum number of completed tasks required to trigger auto-review.
+    /// Runs that completed fewer than this many tasks are not reviewed automatically.
+    /// Default: `3`.
+    #[serde(default = "default_auto_review_min_tasks")]
+    pub auto_review_min_tasks: u32,
 }
 
 impl Default for ProjectConfig {
@@ -127,6 +139,8 @@ impl Default for ProjectConfig {
             merge_fail_halt_threshold: default_merge_fail_halt_threshold(),
             implicit_overlap_files: Vec::new(),
             slot_stash_limit: default_slot_stash_limit(),
+            auto_review: default_auto_review(),
+            auto_review_min_tasks: default_auto_review_min_tasks(),
         }
     }
 }
@@ -172,6 +186,16 @@ fn default_merge_fail_halt_threshold() -> u32 {
 /// Default per-slot per-run stash-pop conflict limit (5).
 fn default_slot_stash_limit() -> u32 {
     5
+}
+
+/// Auto-review is enabled by default.
+fn default_auto_review() -> bool {
+    true
+}
+
+/// Minimum completed tasks before auto-review fires (default 3).
+fn default_auto_review_min_tasks() -> u32 {
+    3
 }
 
 /// Read project config from `<db_dir>/config.json`.
@@ -629,5 +653,73 @@ mod tests {
     fn test_slot_stash_limit_default_struct() {
         let config = ProjectConfig::default();
         assert_eq!(config.slot_stash_limit, 5);
+    }
+
+    #[test]
+    fn test_auto_review_default_is_true() {
+        // Default impl
+        assert!(ProjectConfig::default().auto_review);
+
+        // Missing file → defaults
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.auto_review);
+
+        // Empty JSON → serde default fn fires (not bool's Default::default())
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.auto_review);
+    }
+
+    #[test]
+    fn test_auto_review_min_tasks_default_is_three() {
+        // Default impl
+        assert_eq!(ProjectConfig::default().auto_review_min_tasks, 3);
+
+        // Missing file → defaults
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.auto_review_min_tasks, 3);
+
+        // Empty JSON → serde default fn fires
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        let config = read_project_config(dir.path());
+        assert_eq!(config.auto_review_min_tasks, 3);
+    }
+
+    #[test]
+    fn test_auto_review_round_trips_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Explicit false + explicit min_tasks
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"autoReview": false, "autoReviewMinTasks": 0}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert!(!config.auto_review);
+        assert_eq!(config.auto_review_min_tasks, 0);
+
+        // Only autoReview=false, min_tasks stays at default
+        fs::write(dir.path().join("config.json"), r#"{"autoReview": false}"#).unwrap();
+        let config = read_project_config(dir.path());
+        assert!(!config.auto_review);
+        assert_eq!(config.auto_review_min_tasks, 3);
+
+        // Only autoReviewMinTasks=5, auto_review stays at default true
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"autoReviewMinTasks": 5}"#,
+        )
+        .unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.auto_review);
+        assert_eq!(config.auto_review_min_tasks, 5);
+
+        // snake_case keys are rejected — field stays at default true
+        fs::write(dir.path().join("config.json"), r#"{"auto_review": false}"#).unwrap();
+        let config = read_project_config(dir.path());
+        assert!(config.auto_review, "snake_case key must not set the field");
     }
 }

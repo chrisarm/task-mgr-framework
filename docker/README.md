@@ -5,7 +5,7 @@ Two services that back the optional recall features:
 | Service | Port | Purpose |
 |---------|------|---------|
 | `ollama` / `ollama-cpu` | 11435 | Hosts the jina-embeddings model for semantic recall |
-| `llama-box` / `llama-box-cpu` | 8080 | Hosts the jina-reranker cross-encoder for recall reranking |
+| `llama-box` / `llama-box-cpu` | 8181 | Hosts the jina-reranker cross-encoder for recall reranking (container internal: 8080) |
 
 Both models are baked into the image at build time — container startup is instant
 with no network dependency at runtime.
@@ -26,7 +26,7 @@ docker compose -f docker/docker-compose.yml up -d --build
 
 # Verify
 curl localhost:11435/api/tags
-curl -X POST localhost:8080/v1/rerank \
+curl -X POST localhost:8181/v1/rerank \
   -H 'Content-Type: application/json' \
   -d '{"model":"jina-reranker-v2-base-multilingual","query":"test","documents":["a","b"],"top_n":2}'
 ```
@@ -52,7 +52,7 @@ Add to `.task-mgr/config.json`:
 {
   "ollamaUrl": "http://localhost:11435",
   "embeddingModel": "hf.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF:Q8_0",
-  "rerankerUrl": "http://localhost:8080",
+  "rerankerUrl": "http://localhost:8181",
   "rerankerModel": "jina-reranker-v2-base-multilingual",
   "rerankerOverFetch": 3
 }
@@ -72,7 +72,7 @@ Add to `.task-mgr/config.json`:
 - Base image: `ghcr.io/gpustack/llama-box:latest`
   (TODO: pin to a specific version, e.g. `ghcr.io/gpustack/llama-box:v0.0.x`, for reproducibility)
 - Baked model: `gpustack/jina-reranker-v2-base-multilingual-GGUF` (f16 GGUF)
-- Port: `8080`
+- Host port: `8181` (mapped to container port `8080`, llama-box's internal default — host-side 8181 avoids conflict with other projects on 8080)
 - Runs in rerank mode: `--rerank --model /models/jina-reranker-v2.gguf --port 8080 --host 0.0.0.0`
 
 ## Failure Modes
@@ -91,7 +91,7 @@ Add to `.task-mgr/config.json`:
 curl localhost:11435/api/tags | python3 -m json.tool
 
 # Confirms llama-box rerank endpoint is alive
-curl -s -X POST localhost:8080/v1/rerank \
+curl -s -X POST localhost:8181/v1/rerank \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "jina-reranker-v2-base-multilingual",
