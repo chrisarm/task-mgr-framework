@@ -4,6 +4,8 @@
 //! detect worktree context, parse git worktree output, and create/remove
 //! git worktrees with proper cleanup.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -860,6 +862,18 @@ fn attempt_auto_recovery_for_branch(
         // that's checked out in any worktree.
         (Ok(()), CleanupOutcome::Restored) | (Ok(()), CleanupOutcome::PopConflict { .. }) => {
             let worktree_path = compute_slot_worktree_path(project_root, branch_name, slot);
+            // FEAT-006: fold the recovered slot's untracked progress file into
+            // slot 0's record before the worktree/branch are removed. If the
+            // worktree was already gone, `union_slot_progress_files` no-ops.
+            if let Err(e) = union_slot_progress_files(
+                &[project_root.to_path_buf(), worktree_path.clone()],
+                cfg.progress_file_name,
+            ) {
+                eprintln!(
+                    "warning: auto-recovery failed to union progress for {}: {}",
+                    ephemeral, e
+                );
+            }
             if worktree_path.exists()
                 && let Err(e) = remove_worktree(project_root, &worktree_path)
             {
@@ -1106,6 +1120,10 @@ pub(crate) struct AutoRecoveryConfig<'a> {
     pub db_dir: Option<&'a Path>,
     pub run_id: &'a str,
     pub stash_limit: u32,
+    /// Progress file name (`branch::progress_file_name(prefix)`) so a
+    /// recovered slot's progress can be unioned into slot 0's file before
+    /// the slot worktree/branch are deleted (FEAT-006).
+    pub progress_file_name: &'a str,
 }
 
 const STASH_TAG_PREFIX: &str = "task-mgr-slot-";
@@ -1351,6 +1369,160 @@ fn delete_branch_force(project_root: &Path, branch: &str) -> Result<(), String> 
         return Err(format!("git branch -D failed: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// Append per-slot progress-file content into slot 0's progress file so the
+/// operator has a single unified view of a parallel wave's activity.
+///
+/// FEAT-006 (slot-merge-preflight PRD). Since FEAT-001 gitignores
+/// `tasks/progress-*.txt`, each slot accumulates its own untracked copy during
+/// a wave. This helper — run at wave end and after successful reconcile
+/// auto-recovery — folds slots `1..N` into slot 0's file.
+///
+/// Behavior:
+/// - Reads `<slot_path>/tasks/<progress_file_name>` for every slot `1..N`.
+/// - APPENDS to slot 0's file a block: one
+///   `## === wave merge @ <ISO-8601 UTC> ===` separator line, then for each
+///   non-empty slot a `## --- slot {N} ({worktree-basename}) ---` header
+///   followed by that slot's content. The basename comes from
+///   `Path::file_name()` — never `Path::display()` — so no full path leaks
+///   into the progress log.
+/// - Slot 0's own content is NEVER re-included (re-including would duplicate
+///   it and cause cumulative explosion across waves) and slot 0's file is
+///   never truncated.
+/// - After appending, slots `1..N`'s files are TRUNCATED to empty (not
+///   deleted — the inode/path is kept so the next iteration's append does not
+///   trip `ENOENT`).
+///
+/// No-op when `slot_paths.len() <= 1` (no other slots to union from) or when
+/// every slot `1..N` has empty/missing progress content.
+///
+/// # Errors
+///
+/// Returns `Err` only when writing slot 0's file fails — the unified view is
+/// the load-bearing artifact. Read errors on individual slots are logged to
+/// stderr and that slot is skipped; they never propagate.
+pub(crate) fn union_slot_progress_files(
+    slot_paths: &[PathBuf],
+    progress_file_name: &str,
+) -> Result<(), String> {
+    if slot_paths.len() <= 1 {
+        return Ok(());
+    }
+
+    // Build the block from slots 1..N only — slot 0's content is already in
+    // slot 0's file.
+    let mut block = String::new();
+    for (idx, slot_path) in slot_paths.iter().enumerate().skip(1) {
+        if !slot_path.exists() {
+            // Worktree directory removed between merge-back and union (e.g.
+            // cleanup-first wiring). Warn — this is a wiring anomaly, distinct
+            // from a slot that simply never wrote a progress file.
+            eprintln!(
+                "warning: slot {} worktree {} no longer exists; skipping its progress",
+                idx,
+                slot_path.display()
+            );
+            continue;
+        }
+        let progress_path = slot_path.join("tasks").join(progress_file_name);
+        let bytes = match std::fs::read(&progress_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Slot never created its progress file — skip silently.
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read slot {} progress file {}: {} — skipping this slot",
+                    idx,
+                    progress_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        if matches!(content, std::borrow::Cow::Owned(_)) {
+            eprintln!(
+                "warning: slot {} progress file {} contained invalid UTF-8; using lossy conversion",
+                idx,
+                progress_path.display()
+            );
+        }
+        if content.is_empty() {
+            continue;
+        }
+        let basename = slot_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("<unknown>");
+        block.push_str(&format!("## --- slot {} ({}) ---\n", idx, basename));
+        block.push_str(&content);
+        if !content.ends_with('\n') {
+            block.push('\n');
+        }
+    }
+
+    // Every slot 1..N empty or missing → nothing to stamp; leave slot 0 alone.
+    if block.is_empty() {
+        return Ok(());
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let full_block = format!("## === wave merge @ {} ===\n{}", timestamp, block);
+
+    let slot0_progress = slot_paths[0].join("tasks").join(progress_file_name);
+    append_union_block(&slot0_progress, &full_block)?;
+
+    // Truncate slots 1..N's files to empty — keep the file so subsequent
+    // iterations' appends do not fail on a missing path.
+    for slot_path in slot_paths.iter().skip(1) {
+        let progress_path = slot_path.join("tasks").join(progress_file_name);
+        if progress_path.exists()
+            && let Err(e) = std::fs::write(&progress_path, b"")
+        {
+            eprintln!(
+                "warning: failed to truncate slot progress file {}: {}",
+                progress_path.display(),
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Append `block` to slot 0's progress file, creating it (and its parent
+/// `tasks/` directory) if missing. Slot 0's existing content is preserved
+/// verbatim — the block is stamped after it.
+fn append_union_block(path: &Path, block: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!(
+            "failed to create {} for union progress: {}",
+            parent.display(),
+            e
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|e| {
+            TaskMgrError::io_error(path.display().to_string(), "opening union progress file", e)
+                .to_string()
+        })?;
+    file.write_all(block.as_bytes()).map_err(|e| {
+        TaskMgrError::io_error(
+            path.display().to_string(),
+            "appending union progress block",
+            e,
+        )
+        .to_string()
+    })
 }
 
 /// Remove the worktree at `worktree_path` and then delete `ephemeral`.
@@ -4898,6 +5070,7 @@ detached
             db_dir: None,
             run_id,
             stash_limit,
+            progress_file_name: "progress.txt",
         }
     }
 
@@ -5752,6 +5925,234 @@ detached
             log_text.lines().count(),
             1,
             "expected only the init commit, got:\n{log_text}"
+        );
+    }
+
+    // ===== union_slot_progress_files tests (FEAT-006) =====
+
+    /// Create `<parent>/<name>/tasks/` and optionally write a `progress.txt`
+    /// with the given bytes. Returns the slot path. `progress_content: None`
+    /// leaves the slot worktree present but with no progress file.
+    fn make_slot_dir(parent: &Path, name: &str, progress_content: Option<&[u8]>) -> PathBuf {
+        let slot = parent.join(name);
+        fs::create_dir_all(slot.join("tasks")).expect("create slot tasks dir");
+        if let Some(content) = progress_content {
+            fs::write(slot.join("tasks").join("progress.txt"), content)
+                .expect("write slot progress file");
+        }
+        slot
+    }
+
+    fn read_slot0(slot0: &Path) -> String {
+        fs::read_to_string(slot0.join("tasks").join("progress.txt")).expect("read slot 0 progress")
+    }
+
+    #[test]
+    fn test_union_slot_progress_basic() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"pre-existing-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1.clone()], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        let idx_pre = content
+            .find("pre-existing-slot0")
+            .expect("slot0 content present");
+        let idx_wave = content
+            .find("## === wave merge")
+            .expect("wave separator present");
+        let idx_hdr = content
+            .find("## --- slot 1 (slot-1) ---")
+            .expect("slot 1 header present");
+        let idx_c1 = content
+            .find("slot1-content")
+            .expect("slot 1 content present");
+        assert!(
+            idx_pre < idx_wave && idx_wave < idx_hdr && idx_hdr < idx_c1,
+            "order pre<wave<hdr<content violated in:\n{content}"
+        );
+
+        // Slot 1's file is truncated to empty but still exists.
+        let s1_file = s1.join("tasks").join("progress.txt");
+        assert!(s1_file.exists(), "slot 1 progress file must still exist");
+        assert_eq!(
+            fs::read(&s1_file).expect("read slot 1").len(),
+            0,
+            "slot 1 progress file must be truncated to empty"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_does_not_duplicate_slot0() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"pre-existing-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert_eq!(
+            content.matches("pre-existing-slot0").count(),
+            1,
+            "slot 0 content must appear exactly once (no cumulative explosion)"
+        );
+        assert!(
+            !content.contains("## --- slot 0"),
+            "slot 0 must never get its own header"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_skips_missing() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"slot1-content\n"));
+        // slot 2's worktree exists but never created a progress file.
+        let s2 = make_slot_dir(tmp.path(), "slot-2", None);
+
+        union_slot_progress_files(&[s0.clone(), s1, s2], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(content.contains("slot1-content"), "slot 1 still unioned");
+        assert!(
+            !content.contains("## --- slot 2"),
+            "slot 2 has no progress file → no header"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_preserves_order() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"AAA-slot0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"BBB-slot1\n"));
+        let s2 = make_slot_dir(tmp.path(), "slot-2", Some(b"CCC-slot2\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1, s2], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        let i0 = content.find("AAA-slot0").expect("slot0");
+        let i1 = content.find("BBB-slot1").expect("slot1");
+        let i2 = content.find("CCC-slot2").expect("slot2");
+        assert!(
+            i0 < i1 && i1 < i2,
+            "output order must match slot_paths order"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_idempotent_on_empty_slots() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b""));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b""));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.is_empty(),
+            "all-empty slots must leave slot 0 empty (no spurious headers), got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_handles_invalid_utf8() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        // 0xff/0xfe are not valid UTF-8 lead bytes.
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(&[0xff, 0xfe, b'h', b'i', b'\n']));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union must not panic");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("## --- slot 1 (slot-1) ---"),
+            "invalid-utf8 slot still unioned via lossy conversion"
+        );
+        assert!(
+            content.contains("hi"),
+            "valid bytes survive lossy conversion"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_wave_separator_and_append() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let s1 = make_slot_dir(tmp.path(), "slot-1", Some(b"wave-1-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1.clone()], "progress.txt").expect("wave 1");
+
+        // Next wave: slot 1 writes fresh content into its (now empty) file.
+        fs::write(s1.join("tasks").join("progress.txt"), b"wave-2-content\n")
+            .expect("write wave 2 content");
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("wave 2");
+
+        let content = read_slot0(&s0);
+        assert_eq!(
+            content.matches("## === wave merge").count(),
+            2,
+            "two waves → two separators"
+        );
+        let i1 = content.find("wave-1-content").expect("wave 1 content");
+        let i2 = content.find("wave-2-content").expect("wave 2 content");
+        assert!(i1 < i2, "waves appear in chronological order");
+    }
+
+    #[test]
+    fn test_union_slot_progress_header_basename_only() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        let nested = tmp.path().join("long").join("nested").join("path");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let s1 = make_slot_dir(&nested, "feat-foo-slot-1", Some(b"nested-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1], "progress.txt").expect("union");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("## --- slot 1 (feat-foo-slot-1) ---"),
+            "header uses basename only"
+        );
+        assert!(
+            !content.contains("long/nested/path"),
+            "full path must not leak into the progress log"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_handles_removed_slot_worktree() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"s0\n"));
+        // slot 1's worktree directory was removed (never created here).
+        let s1_removed = tmp.path().join("slot-1");
+        let s2 = make_slot_dir(tmp.path(), "slot-2", Some(b"slot2-content\n"));
+
+        union_slot_progress_files(&[s0.clone(), s1_removed, s2], "progress.txt")
+            .expect("union must not error on a removed worktree");
+
+        let content = read_slot0(&s0);
+        assert!(
+            content.contains("slot2-content"),
+            "slot 2 still unioned despite slot 1's worktree being gone"
+        );
+        assert!(
+            content.contains("## --- slot 2 (slot-2) ---"),
+            "slot 2 header present"
+        );
+    }
+
+    #[test]
+    fn test_union_slot_progress_single_slot_is_noop() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let s0 = make_slot_dir(tmp.path(), "slot-0", Some(b"only-slot0\n"));
+
+        union_slot_progress_files(&[s0.clone()], "progress.txt").expect("union");
+
+        assert_eq!(
+            read_slot0(&s0),
+            "only-slot0\n",
+            "single-slot wave must leave slot 0 untouched"
         );
     }
 }

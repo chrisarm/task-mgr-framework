@@ -1,0 +1,444 @@
+{
+  "branchName": "feat/slot-merge-preflight",
+  "description": "Eliminate the 'slot 1 merge-back failed because slot 0's working tree was dirty' class of failure in the parallel-slot loop. Primary fix: gitignore the per-PRD progress files (`tasks/progress-*.txt`) so they never participate in merge-back preconditions or cleanup-dirty checks. Defense-in-depth: stash-based preflight on the per-slot merge for any residual non-progress dirty state (build artifacts, log files), bounded warn-and-continue on pop conflicts (configurable via ProjectConfig.slot_stash_limit), and auto-recovery in reconcile_stale_ephemeral_slots for legacy strandings created before this PRD landed.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: no warnings in `cargo check`",
+      "Rust: no warnings in `cargo clippy -- -D warnings`",
+      "Rust: scoped tests pass (`cargo test -p task-mgr <module>::` or narrower)",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public APIs unless the task description explicitly authorizes it (signature changes on `merge_slot_branches_with_resolver` and `reconcile_stale_ephemeral_slots` ARE authorized — every caller must be updated in the same task)",
+      "No unwrap() in production code paths; use map_err with TaskMgrError variants"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Auto-commits to the base branch (chore(progress) or similar) — the whole point of the gitignore is to keep progress files out of git entirely",
+    "Stashes that leak across iterations because cleanup was skipped on an exit path",
+    "Bare git stash@{N} positional refs in production code — always look up by tag",
+    "A migration step that does `git rm` (non-cached) and deletes the operator's existing progress data — only `git rm --cached` is allowed; the file content must survive on disk"
+  ],
+  "project": "task-mgr",
+  "taskPrefix": "9895c470",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: after `task-mgr init` on a fresh repo, `.gitignore` exists and contains a marker block delimiting `tasks/progress-*.txt`",
+        "Positive: re-running `task-mgr init` is a byte-for-byte no-op on `.gitignore` (no diff produced)",
+        "Positive: if `.gitignore` had pre-existing content, it survives the marker-block insertion verbatim",
+        "Unit test: marker-block rewrite when the body drifted from prior version (mirror test_merged_attributes_rewrites_drifted_block at worktree.rs ~line 2152)",
+        "Unit test: appends to existing .gitignore with one blank-line separator",
+        "Unit test: idempotent re-run when block already matches → no rewrite",
+        "Unit test: `git rm --cached` runs for each match from `git ls-files tasks/progress-*.txt`; the file content on disk is unchanged (read-after-migration shows the original content)",
+        "Unit test: migration is a no-op (no commit) when `git ls-files tasks/progress-*.txt` returns empty",
+        "Unit test: migration creates exactly one commit with message starting with `chore: untrack progress files` when at least one file was tracked",
+        "Negative: `git rm` (non-cached) is NEVER invoked — verified by grep on the implementation file",
+        "Negative: the gitignore entry pattern is `tasks/progress-*.txt`, NOT `tasks/` or `*.txt` (assert exact pattern in test)",
+        "Negative: no migration commit on a branch other than HEAD",
+        "Failure mode: `git ls-files` fails (e.g., not a git repo) → migration step skipped with stderr warning; .gitignore step still completes",
+        "Failure mode: `git commit` fails (e.g., pre-commit hook rejects) → surface error to user; .gitignore changes already on disk should be left for manual recovery"
+      ],
+      "dependsOn": [],
+      "description": "Eliminate the most common merge-back precondition failure by ensuring per-PRD progress files (`tasks/progress-*.txt`) are NEVER tracked by git. Both the loop engine's progress logging and the agent's progress appends will then accumulate in untracked files that git's merge-precondition + dirty-worktree checks ignore entirely.\n\nDO:\n- During `task-mgr init` (and the `task-mgr loop init` / `task-mgr batch init` paths that call init_project), ensure a `.gitignore` entry exists for `tasks/progress-*.txt`. Idempotent: if the entry is already present, no-op. If `.gitignore` doesn't exist, create it with the single entry (don't dump a big default gitignore).\n- Use a marker-delimited block like the `ensure_progress_union_merge` pattern (worktree.rs:424-434): `# task-mgr begin: progress files (untracked)` / `tasks/progress-*.txt` / `# task-mgr end: progress files (untracked)`. Content outside the markers is preserved untouched.\n- One-time migration: at the same call site, run `git ls-files tasks/progress-*.txt`. For each match, run `git rm --cached <path>` (NOT `git rm` — the file content must stay on disk for the operator to keep their history visible). Then `git commit -m \"chore: untrack progress files (task-mgr init migration)\"` on the current branch ONLY IF there were matches. If there were no matches, no commit.\n- Add unit tests verifying: fresh repo gets the marker block, existing .gitignore is preserved + appended, idempotent re-run produces no diff, migration runs `git rm --cached` only when files are tracked, migration is a no-op when nothing is tracked.\n\nDO NOT:\n- Delete the progress file from disk. `git rm --cached` is the ONLY allowed migration. The operator's progress history is content they may want to read.\n- Touch the loop's per-iteration progress writing logic in this task. The writing path (iteration_pipeline.rs::progress_path, branch.rs::progress_file_name) keeps writing to `tasks/progress-{prefix}.txt` per-worktree — git just doesn't see those files anymore.\n- Add an entry that's broader than `tasks/progress-*.txt` (e.g., the bare `tasks/` or `*.txt`). The pattern must be tight enough to avoid accidentally ignoring task-list JSON or learnings.\n- Run the migration commit on a different branch than the one `task-mgr init` is invoked on.\n\nEdge cases:\n- `.gitignore` doesn't exist → create with marker block + the one entry.\n- `.gitignore` exists but doesn't have the marker → append marker block with one blank-line separator.\n- `.gitignore` has the marker block with the right body → no-op.\n- `.gitignore` has the marker block but body drifted from prior version → rewrite the body in place (mirrors `merged_attributes_contents` in worktree.rs:467).\n- No tracked progress files → no migration commit, no error.\n- Tracked progress files exist on a dirty worktree → still safe (`git rm --cached` doesn't touch WT); commit message clearly attributes the cache-only removal.\n- Bare repo / no commits yet → migration step is a no-op (nothing to ls-files); .gitignore still gets written.\n\nKnown-bad to guard against:\n- Calling `git rm` without `--cached` would delete the operator's progress files from disk — irreversible data loss. The test must include a 'progress file content survives migration' assertion.\n- Appending the pattern at the end without a marker block (just `echo '...' >> .gitignore`) would prevent idempotent re-runs from detecting the existing entry and would duplicate the line on each `task-mgr init`. Use the marker block.",
+      "edgeCases": [
+        ".gitignore missing → created with marker block",
+        ".gitignore exists with unrelated content → marker block appended, original preserved",
+        "Marker block exists with drifted body → body rewritten, surrounding preserved",
+        "Marker block exists with matching body → no-op",
+        "No tracked progress files → migration no-op, no commit",
+        "Tracked progress files on dirty WT → cached removal safe; commit succeeds",
+        "Not a git repo → .gitignore still written; migration step skipped with warning"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "git ls-files fails",
+          "expectedBehavior": "migration skipped with stderr warning; .gitignore write still proceeds"
+        },
+        {
+          "cause": "git commit fails (pre-commit hook, etc.)",
+          "expectedBehavior": "surface error to user; .gitignore write is already committed to disk (not the index) and survives for manual cleanup"
+        },
+        {
+          "cause": "filesystem read/write error on .gitignore",
+          "expectedBehavior": "return TaskMgrError::IoError with context; do not partially write"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": true,
+      "notes": "Init code lives in src/commands/init/. Look for the `init_project` function entry point. Use the marker-block pattern from worktree.rs:424-505 (`merged_attributes_contents`, `ensure_progress_union_merge`) — same shape, different file (`.gitignore` instead of `info/attributes`), different body. Run `git ls-files tasks/progress-*.txt 2>/dev/null` to enumerate tracked files. `git rm --cached` does not touch WT; safe even if WT is dirty. The migration commit should be on the current branch — use `git symbolic-ref HEAD` or `git branch --show-current` to confirm. Learning [1825]: slot-aware patterns already exist in worktree.rs; mirror them rather than inventing.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Marker-block rewrite is idempotent and preserves user-authored gitignore lines verbatim",
+        "Migration uses `git rm --cached` exclusively — never `git rm` plain",
+        "Pattern is tight (`tasks/progress-*.txt`), not overly broad",
+        "Failure modes (not-a-git-repo, no-tracked-files, dirty WT) all handled without panic"
+      ],
+      "taskType": "implementation",
+      "title": "Gitignore tasks/progress-*.txt + untrack existing tracked progress files",
+      "touchesFiles": [
+        "src/commands/init/mod.rs",
+        "src/commands/init/parse.rs",
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `ProjectConfig` exposes `pub slot_stash_limit: u32` with rustdoc explaining the policy",
+        "Positive: `default_slot_stash_limit()` returns 5",
+        "Positive: `ProjectConfig::default()` returns 5 for `slot_stash_limit`",
+        "Unit test: deserialize `{\"version\":1,\"slotStashLimit\":10}` produces `slot_stash_limit == 10`",
+        "Unit test: deserialize `{\"version\":1}` (field absent) produces `slot_stash_limit == 5`",
+        "Unit test: deserialize `{\"version\":1,\"slotStashLimit\":0}` produces `slot_stash_limit == 0` and is accepted",
+        "Negative: no other field in `ProjectConfig` is renamed, removed, or has its default changed",
+        "CONTRACT: field name in JSON is `slotStashLimit` (camelCase per `#[serde(rename_all = \"camelCase\")]` on the struct)"
+      ],
+      "dependsOn": [],
+      "description": "Promote SLOT_STASH_LIMIT from a hardcoded const to a configurable field on `ProjectConfig` so operators can tune the bounded-warn-then-halt threshold without recompiling.\n\nDO:\n- Add `pub slot_stash_limit: u32` field to `ProjectConfig` in `src/loop_engine/project_config.rs`.\n- Default to `5` via a `default_slot_stash_limit()` free function (mirror `default_merge_fail_halt_threshold()` at line ~89).\n- Rustdoc explains: bounded warn-and-continue policy on stash-pop conflicts in `cleanup_preparation` (FEAT-003); when count of per-slot per-run stashes exceeds this, the slot is demoted to failed_slots(PreResolver) and the consecutive-merge-fail halt threshold trips. Document the `0` value: accepted as 'never halt' for consistency with merge_fail_halt_threshold == 0.\n- Update the `impl Default for ProjectConfig` block (line ~100) to include the new field.\n- Add unit tests in project_config.rs verifying deserialize from `{\"slotStashLimit\":10}`, default = 5 when absent, accepts 0.\n\nDO NOT:\n- Wire the field into `cleanup_preparation` in this task — FEAT-003 owns the integration.\n- Promote any other unrelated const to config — single-purpose task.\n- Add a CLI flag for it — operators set it via `.task-mgr/config.json` only.\n\nEdge cases:\n- Field absent in JSON → defaults to 5.\n- Field set to 0 → accepted, interpreted as 'never halt' (matches `merge_fail_halt_threshold == 0`).\n- Field set to very high value (e.g., 9999) → no special handling; operator accepts the risk.\n\nKnown-bad to guard against:\n- Hard-coding the value in `cleanup_preparation` (FEAT-003) after this task — FEAT-003 must read from ProjectConfig and thread it through, not silently override.",
+      "edgeCases": [
+        "Field absent in config JSON → defaults to 5",
+        "Field explicitly set to 0 → accepted, interpreted as 'unbounded'"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "config JSON fails to parse",
+          "expectedBehavior": "existing ProjectConfig error handling applies; this field doesn't introduce new failure modes"
+        }
+      ],
+      "id": "FEAT-002",
+      "modifiesBehavior": false,
+      "notes": "ProjectConfig location: src/loop_engine/project_config.rs:11. Default function pattern at line 89 (`default_merge_fail_halt_threshold`). impl Default at line 100. Add field alongside `merge_fail_halt_threshold` since they're cousins (both control halt behavior). Tests likely live in the same file (`#[cfg(test)] mod tests` at the bottom) or in `tests/project_config.rs` — grep first.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Rustdoc explains policy clearly including the 0 special case",
+        "Defaults match plan: 5",
+        "Field added adjacent to merge_fail_halt_threshold, not appended at the end"
+      ],
+      "taskType": "implementation",
+      "title": "Add slot_stash_limit to ProjectConfig (default 5)",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Unit test: prepare_slot0_for_merge returns Clean when `git status --porcelain -uall` is empty",
+        "Unit test: prepare_slot0_for_merge with a dirty tracked file produces Stashed with tag matching `^task-mgr-slot-\\d+-test-run-\\d+$`",
+        "Unit test: prepare_slot0_for_merge with an untracked file (e.g., scratch.log) stashes it; post-prepare `git status --porcelain` is empty",
+        "Unit test: prepare_slot0_for_merge with BOTH tracked dirty file AND untracked file produces ONE stash entry (`git stash list | wc -l == 1`), not two",
+        "Unit test: cleanup_preparation(Clean, ...) is a no-op and returns Restored",
+        "Unit test: cleanup_preparation(Stashed{tag}, ...) after clean dirty-then-stash sequence pops the stash, restores the dirty file (post-cleanup `git status --porcelain` shows it), and returns Restored",
+        "Unit test: cleanup_preparation under forced pop conflict returns PopConflict with conflicted path; `git stash list` still shows the entry; working tree contains conflict markers",
+        "Unit test: cleanup_preparation when per-slot per-run stash count exceeds stash_limit returns StashLimitExceeded — pre-seed stash_limit synthetic stashes with matching tag prefix",
+        "Unit test: cleanup_preparation counts ONLY tags matching `task-mgr-slot-{slot}-{run_id}-*` — pre-seed stashes for a DIFFERENT slot index; verify cleanup does NOT report StashLimitExceeded (per-slot scoping)",
+        "Unit test: cleanup_preparation counts ONLY tags matching this run_id — pre-seed stashes for a different run_id; verify cleanup does NOT report StashLimitExceeded (per-run scoping)",
+        "Unit test: run_id 'test-run' produces deterministic tag prefixes across two consecutive prepare calls in the same test (epoch-millis suffix differs)",
+        "Negative: MergePreparation has exactly two variants (Clean, Stashed); CleanupOutcome has exactly three (Restored, PopConflict, StashLimitExceeded) — no Committed, no AutoResolved",
+        "Negative: no `chore(progress)` or `chore:` auto-commit appears in `git log` after any unit test",
+        "Negative: cleanup_preparation never invokes `git checkout --`, `git reset --hard`, or `git stash drop` (grep the implementation)",
+        "Failure mode: if `git stash push` exits non-zero, prepare_slot0_for_merge returns Err with formatted git stderr; working tree state is whatever git left it in"
+      ],
+      "dependsOn": [],
+      "description": "Defense-in-depth for slot 0's merge-back: when slot 0 has uncommitted non-progress dirty state (build artifacts, log files, stray test fixtures), stash it before merge and pop it after. Progress files no longer enter this path (FEAT-001 gitignores them, so `git status --porcelain` doesn't see them), but other dirty state still can.\n\nNO integration with merge_slot_branches_with_resolver in this task — that's FEAT-004. This delivers helpers + unit tests in isolation.\n\nDO:\n- Define `MergePreparation` enum: `Clean` and `Stashed { tag: String }`. (No `Committed` variant — auto-commit is forbidden per prohibitedOutcomes; the gitignore approach removes the only motivation for it.)\n- Define `CleanupOutcome` enum: `Restored`, `PopConflict { tag: String, conflicted: Vec<String> }`, `StashLimitExceeded { count: usize }`.\n- Implement `prepare_slot0_for_merge(slot0_path: &Path, slot: usize, run_id: &str) -> Result<MergePreparation, String>`. Runs `git status --porcelain -uall`. If empty → return Clean. Otherwise → `git stash push --include-untracked -m \"task-mgr-slot-{slot}-{run_id}-{epoch_ms}\"`; return Stashed { tag }.\n- Implement `cleanup_preparation(prep: &MergePreparation, slot0_path: &Path, slot: usize, run_id: &str, stash_limit: u32) -> CleanupOutcome`. For Stashed: resolve stash ref by tag via `git stash list --format='%gd %gs'` + first-line tag match, then `git stash pop <ref>`. Clean pop → Restored. Pop conflict → count stashes matching `task-mgr-slot-{slot}-{run_id}-*`; if > stash_limit return StashLimitExceeded, else return PopConflict { tag, conflicted }.\n- Stash limit count uses per-slot per-run prefix (NOT broad `task-mgr-slot-`) so concurrent loops / sibling slots don't trip each other.\n- No regex crate; use `str::starts_with` matching on tag prefix.\n\nDO NOT:\n- Auto-commit anything. Stash everything (FEAT-001's gitignore means progress files don't reach this code).\n- Classify dirty paths by file type. Single stash covers everything that git considers dirty.\n- Touch merge_slot_branches_with_resolver in this task — wiring belongs to FEAT-004.\n- Use git stash@{N} positional references — always resolve by message tag.\n- Destroy user data on pop conflict (no `git checkout --`, `git reset --hard`, or `git stash drop`).\n\nEdge cases:\n- Empty working tree → Clean; no stash created. (With FEAT-001 in place, this is now the COMMON case — progress files no longer trigger dirtiness.)\n- Stash push fails (e.g., submodule with uncommitted changes that --include-untracked can't capture) → Err returned, no partial state.\n- Stash pop succeeds without conflict → Restored.\n- Stash pop hits a conflict → leave stash on stack, report conflicted paths; do NOT auto-resolve.\n\nKnown-bad to guard against:\n- `git stash list` parsing splitting on whitespace breaks on multi-word messages — use `--format='%gd %gs'` and split only on first space.\n- A test that pushes an empty stash via `--allow-empty` and asserts the prepare path created one — empty stashes are NOT created by prepare; that would test a fake code path.\n- Counting `task-mgr-slot-*` (any slot, any run) instead of `task-mgr-slot-{slot}-{run_id}-*` (the specific scope) would false-halt on sibling-loop activity.",
+      "edgeCases": [
+        "Clean working tree → Clean, no stash",
+        "Stash push fails → Err, no partial state",
+        "Stash list parsing on multi-word messages → handled via --format='%gd %gs'",
+        "Pop conflict → leave stash, report conflicted paths",
+        "Sibling loop creates stashes with prefix `task-mgr-slot-` → not counted (different run_id)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "git stash push exits non-zero",
+          "expectedBehavior": "prepare returns Err with formatted stderr+stdout; caller logs and skips slot"
+        },
+        {
+          "cause": "git stash pop exits non-zero AND not a conflict",
+          "expectedBehavior": "cleanup returns PopConflict with conflicted=[] and the stash tag"
+        },
+        {
+          "cause": "git stash list parsing fails (corrupt output)",
+          "expectedBehavior": "cleanup returns Restored (best-effort); StashLimitExceeded will catch persistent issues later"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Place helpers in src/loop_engine/worktree.rs after is_worktree_dirty (~line 896). Reuse `format_git_failure` (~line 1564) for error message formatting. Reuse `setup_git_repo_with_file()` (src/loop_engine/test_utils.rs:245) in tests. Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`. Use `std::time::SystemTime::now().duration_since(UNIX_EPOCH).as_millis()` for epoch_ms. Learning [1806]: never destroy user data on cleanup — log, leave state inspectable, let operator decide.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "All pub(crate) helpers have rustdoc explaining contract including what Err means",
+        "No regex crate; prefix matching via str::starts_with",
+        "Pop-conflict path NEVER destroys user data",
+        "Stash count check is scoped per-slot per-run, not global",
+        "Tag format is deterministic for a fixed run_id (epoch suffix is the only varying part)"
+      ],
+      "taskType": "implementation",
+      "title": "Stash-based preflight helpers (prepare_slot0_for_merge + cleanup_preparation)",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/test_utils.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `merge_slot_branches_with_resolver` signature is `(_project_root, branch_name, num_slots, resolver, slot_paths, run_id: &str, stash_limit: u32)`",
+        "Positive: engine.rs call site at ~line 1810 passes `params.run_id` and `params.project_config.slot_stash_limit`",
+        "Positive: `run_slot_merge_attempt(slot, slot0_path, ephemeral, resolver) -> Result<(), (String, SlotFailureKind)>` is a new private function in worktree.rs; the per-slot loop calls it exactly once per slot",
+        "Positive: cleanup_preparation is called exactly once per slot iteration AFTER run_slot_merge_attempt returns — verifiable by code reading",
+        "Positive: merge_resolver.rs:278 message ends with the appended hint (exact string match)",
+        "Unit test (test_merge_back_clean_wt_unchanged_behavior): clean slot 0 + disjoint slot-1 commit → merged_slots = [1], no chore commit in `git log --grep '^chore'`, no stash created",
+        "Unit test (test_merge_back_stashes_dirty_unrelated_file): dirty scratch.log → merge succeeds, post-merge `git status --porcelain` shows scratch.log, stash list empty",
+        "Unit test (test_merge_back_pop_conflict_keeps_stash_and_warns): slot-1's commit modifies scratch.log (same path as stashed) → merged_slots = [1], NOT in failed_slots, stash list retains entry with tag `task-mgr-slot-1-test-run-*`",
+        "Unit test (test_merge_back_excessive_stash_count_demotes_slot): pre-seed stash_limit stashes with matching tag prefix, dirty scratch.log + conflicting slot-1 commit → failed_slots contains slot with PreResolver kind",
+        "Unit test (test_merge_back_run_id_isolates_stash_tags): pre-seed stash_limit stashes for 'other-run' → slot does NOT demote (per-run scoping)",
+        "Unit test (test_merge_back_resolver_path_works_with_preflight): dirty scratch.log + conflicting merge that resolver can resolve → merged_slots contains slot, HEAD advanced, stash popped post-resolution",
+        "Negative: no test expects a chore commit on the base branch",
+        "Negative: removing the cleanup_preparation call from the post-attempt position causes at least one new test to fail",
+        "Negative: hardcoding `stash_limit = 5` inside cleanup_preparation (ignoring the parameter) causes the limit-exceeded test to behave incorrectly when stash_limit is set to a different value",
+        "CONTRACT: pre_merge_head captured inside run_slot_merge_attempt AFTER prepare_slot0_for_merge returns Ok",
+        "Failure mode: prepare returns Err → slot pushed to failed_slots(PreResolver) with 'pre-merge prep failed: {e}'; cleanup NOT called",
+        "Failure mode: run_slot_merge_attempt returns Err AND cleanup returns StashLimitExceeded → outcomes.failed_slots contains slot once; both diagnostics folded into message"
+      ],
+      "dependsOn": [
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Wire FEAT-003's helpers into the per-slot loop body. Extract the per-slot body into `run_slot_merge_attempt` so cleanup runs on every exit path. Thread `run_id` and `stash_limit` through the function signature. Update the engine.rs call site. Apply 1-line diagnostic tweak in merge_resolver.rs.\n\nDO:\n- Change `merge_slot_branches_with_resolver` signature to accept `run_id: &str` and `stash_limit: u32`. Update the engine.rs call site at line ~1810 (params.run_id already in scope; ProjectConfig cached in WaveIterationParams::project_config so `params.project_config.slot_stash_limit` is the threading source).\n- Inside the per-slot loop body: call `prepare_slot0_for_merge(slot0_path, slot, run_id)` BEFORE the rev-parse + git merge. On Err, push to failed_slots(PreResolver), continue (no cleanup needed; prepare failed before side effect).\n- Extract the post-prepare body (rev-parse + git merge + handle_conflict_for_slot) into private `run_slot_merge_attempt(slot, slot0_path, ephemeral, resolver) -> Result<(), (String, SlotFailureKind)>`. The helper captures its own `pre_merge_head` post-prepare. Outer loop: `let attempt_result = run_slot_merge_attempt(...)` then `let cleanup_result = cleanup_preparation(&prep, slot0_path, slot, run_id, stash_limit)`. ALWAYS run cleanup after run_slot_merge_attempt returns, regardless of attempt outcome.\n- Fold cleanup into outcome: Restored or PopConflict leaves attempt's outcome as recorded; StashLimitExceeded demotes the slot to failed_slots(PreResolver) even if merge attempt succeeded.\n- Emit a warning on PopConflict naming tag + conflicted paths; stronger warning on StashLimitExceeded.\n- Apply 1-line diagnostic tweak in src/loop_engine/merge_resolver.rs:278: append ' (likely dirty WT blocked merge precondition; preflight should have prevented this — see worktree::prepare_slot0_for_merge; if this fires, check for non-gitignored dirty files in slot 0)' to the existing 'no conflicts reported, refusing to spawn' string.\n- Update all existing tests calling merge_slot_branches_with_resolver to pass a test `run_id` (e.g., 'test-run') and a test `stash_limit` (use the default 5 or a smaller value for limit-exceeded tests). Find call sites via `grep -n 'merge_slot_branches_with_resolver(' src/loop_engine/worktree.rs`.\n- Add 6 integration tests as per the plan (clean WT baseline; dirty unrelated file; pop conflict keeps stash; excessive stash count demotes; run_id isolation; resolver-clean and resolver-declined paths still work).\n\nDO NOT:\n- Re-introduce progress-file classification or any path-based filtering in this PRD's preflight code. FEAT-001's gitignore is the only path-based handling needed; progress files no longer reach this code path.\n- Auto-commit anything. Forbidden.\n- Move `pre_merge_head` capture BEFORE `prepare_slot0_for_merge`. Must be post-prepare.\n- Skip cleanup on the rev-parse failure path. The `run_slot_merge_attempt` extraction makes 'cleanup runs once at end' a structural invariant.\n- Use stash@{N} positional refs. Always resolve by tag.\n- Change the meaning of `slot0_poisoned` — if poisoned, slot skips prepare AND cleanup.\n\nEdge cases:\n- Clean slot 0 + clean merge → merged_slots contains slot; no stash; no auto-commits anywhere.\n- Dirty slot 0 + clean merge → stash, merge, pop cleanly; merged_slots contains slot.\n- Dirty slot 0 + merge conflict (resolver succeeds) → stash, resolver resolves, HEAD advances, pop on top.\n- Dirty slot 0 + merge conflict (resolver declines) → stash, hard_reset(pre_merge_head), pop onto reset HEAD.\n- Dirty slot 0 + pop conflict (rare; only happens for non-gitignored files slot 1 also touched) → slot in merged_slots, stash retained, warning logged.\n- Excessive stash accumulation → slot demoted to failed_slots(PreResolver).\n\nKnown-bad to guard against:\n- Capturing `pre_merge_head` BEFORE prepare would create an inconsistent reset target.\n- Calling cleanup INSIDE per-slot match arms would miss the rev-parse-failure path. Use the extraction.\n- Threading `stash_limit` from anywhere other than ProjectConfig defeats FEAT-002.",
+      "edgeCases": [
+        "Clean slot 0 + clean merge → Clean preparation, cleanup no-op",
+        "Dirty slot 0 + clean merge → stash, pop transparent",
+        "Dirty slot 0 + resolver-resolved conflict → stash applied AFTER resolver commits",
+        "Dirty slot 0 + resolver-declined conflict → hard_reset, then stash pop",
+        "Pop conflict → slot in merged_slots, stash retained",
+        "Excessive stash accumulation → slot demoted",
+        "Multi-run scoping → another run's stashes don't contribute to count"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "prepare_slot0_for_merge returns Err",
+          "expectedBehavior": "slot in failed_slots(PreResolver) with prep error; cleanup not called; continue to next slot"
+        },
+        {
+          "cause": "cleanup returns PopConflict",
+          "expectedBehavior": "warning logged with tag + conflicted paths; slot's attempt outcome preserved"
+        },
+        {
+          "cause": "cleanup returns StashLimitExceeded",
+          "expectedBehavior": "slot demoted to failed_slots(PreResolver) regardless of attempt outcome; stronger warning with count"
+        }
+      ],
+      "id": "FEAT-004",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Engine.rs call site: src/loop_engine/engine.rs:1810. params.run_id is already in scope (verified: appears at 1847, 1861). ProjectConfig cached in WaveIterationParams::project_config (per CLAUDE.md 'Run-level config caching'). Existing tests calling merge_slot_branches_with_resolver: lines 2639, 2724, 2820, 3100, 3154, 3196, 3237, 3288, 3311 (verify by re-grep — FEAT-003 may shift line numbers). All need test run_id + stash_limit. Data contract: ProjectConfig.slot_stash_limit (project_config.rs) → cleanup_preparation arg (worktree.rs); both u32.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Cleanup runs on EVERY post-prepare exit path — structural invariant via run_slot_merge_attempt extraction",
+        "stash_limit threaded from ProjectConfig, not hardcoded",
+        "Existing tests pass after adding new parameters (use 'test-run' run_id and default 5 stash_limit)",
+        "merge_resolver.rs diagnostic tweak is exactly 1 line of source text",
+        "No new public API surface — run_slot_merge_attempt is private"
+      ],
+      "taskType": "implementation",
+      "title": "Integrate preflight into merge_slot_branches_with_resolver + diagnostic tweak",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/merge_resolver.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `reconcile_stale_ephemeral_slots` signature adds `auto_recovery: Option<&AutoRecoveryConfig<'_>>` as the last parameter",
+        "Positive: when auto_recovery is None, the function behavior is byte-for-byte identical to today (regression test asserts same Err for same input)",
+        "Positive: when auto_recovery is Some and the stale ephemeral merges cleanly with preflight, the branch is deleted and reconcile returns Ok",
+        "Positive: when auto_recovery is Some and the stale ephemeral fails to merge, function aborts per existing halt_threshold logic but the abort message includes 'auto-recovery attempted and failed for: <branches>'",
+        "Unit test (test_reconcile_auto_recovery_disabled_preserves_abort): unmerged ephemeral + auto_recovery=None + halt_threshold=2 → same InvalidState error as today",
+        "Unit test (test_reconcile_auto_recovery_succeeds_when_merge_clean): unmerged ephemeral with only a non-conflicting commit + auto_recovery=Some(mock_resolver) → branch deleted, reconcile Ok, project_root HEAD advanced",
+        "Unit test (test_reconcile_auto_recovery_fails_falls_through_to_abort): unmerged ephemeral with conflicting commit + mock resolver returns Failed → reconcile returns Err, abort message annotated",
+        "Unit test (test_reconcile_auto_recovery_handles_dirty_project_root): dirty scratch.log in project_root + auto_recovery=Some + clean-merge ephemeral → preflight stashes, merges, cleanup pops, reconcile Ok, scratch.log dirty again post-call",
+        "Unit test (test_reconcile_auto_recovery_mixed_outcomes): two stale ephemerals, one merges, one conflicts and resolver declines → first deleted; second in abort message; Err returned",
+        "Negative: case-4 dirty stale worktree path NOT changed by this task",
+        "Negative: classify_ephemeral_branch's slot-0 rejection guard preserved (no broadened glob)",
+        "Documentation: CLAUDE.md updated by FEAT-005 (NOT REVIEW-001) with paragraphs covering gitignore, preflight, AND auto-recovery — all three layers in the right existing section",
+        "CONTRACT: AutoRecoveryConfig fields match exactly the struct shown in description (model: &'a str, effort: &'a str, claude_timeout: Duration, signal_flag: Arc<AtomicBool>, db_dir: Option<&'a Path>, run_id: &'a str, stash_limit: u32)",
+        "Failure mode: spawn_claude binary missing during auto-recovery → preflight cleanup runs, affected ephemeral stays in unmerged, abort fires"
+      ],
+      "dependsOn": [
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Extend `reconcile_stale_ephemeral_slots` to attempt automatic merge-back of stale unmerged ephemeral branches at loop startup, using FEAT-004's preflight + resolver path. Cleans up legacy strandings (created before this PRD's gitignore + preflight landed) without operator intervention.\n\nDO:\n- Define `AutoRecoveryConfig<'a>` struct in worktree.rs alongside MergePreparation/CleanupOutcome:\n```rust\npub(crate) struct AutoRecoveryConfig<'a> {\n    pub model: &'a str,\n    pub effort: &'a str,\n    pub claude_timeout: Duration,\n    pub signal_flag: Arc<AtomicBool>,\n    pub db_dir: Option<&'a Path>,\n    pub run_id: &'a str,\n    pub stash_limit: u32,\n}\n```\n- Extend `reconcile_stale_ephemeral_slots` signature to add `auto_recovery: Option<&AutoRecoveryConfig<'_>>` as the trailing parameter. When None, behavior is byte-for-byte identical to today. When Some, attempt per-branch merge-back using `run_slot_merge_attempt` + `cleanup_preparation` with `slot0_path = project_root` (slot 0 IS the loop's main worktree at startup).\n- On per-branch auto-recovery success: delete the now-merged ephemeral via `delete_branch_force` (worktree.rs:949), remove from `unmerged` before the abort decision.\n- On per-branch auto-recovery failure: keep branch in `unmerged`, fall through to existing halt_threshold abort; surface in the abort message which branches the resolver attempted vs. didn't.\n- Wire `auto_recovery: Some(&cfg)` from engine.rs startup (before `ensure_slot_worktrees`). Build a one-off ClaudeMergeResolver from `ProjectConfig.merge_resolver_model` / `merge_resolver_effort` / `merge_resolver_timeout_secs` (existing fields with defaults).\n- Add tests: legacy abort path preserved when auto_recovery is None; successful auto-recovery deletes branch and lets startup continue; failed auto-recovery still aborts with annotated message; multi-branch mixed-outcome case; dirty project_root preflight stashes then pops.\n- Update CLAUDE.md `Slot merge-back conflict resolution` AND/OR `Parallel-slot scheduling` section: ~1 paragraph each for (a) gitignore approach (FEAT-001), (b) preflight stash for residual dirty state (FEAT-003/004), (c) reconcile auto-recovery (this task). FEAT-005 owns the CLAUDE.md edit; REVIEW-001 only verifies.\n\nDO NOT:\n- Spawn the resolver from a separate worktree or fresh slot setup. Reconcile runs before slot worktrees exist; use project_root directly.\n- Change halt_threshold semantics.\n- Make auto_recovery mandatory. None must preserve today's behavior.\n- Run auto-recovery on case-4 dirty-worktree branches. Dirty worktrees still abort as today.\n- Try to fast-forward the stale ephemeral's slot worktree — it's gone (this is reconcile of stragglers).\n- Broaden `classify_ephemeral_branch`'s slot-0 rejection guard — it's load-bearing per CLAUDE.md.\n\nEdge cases:\n- Zero stale ephemerals → early return Ok.\n- Stale ephemeral + auto_recovery=Some + clean preflight + resolver-clean merge → branch auto-merged, deleted; Ok.\n- Stale ephemeral + auto_recovery=Some + dirty project_root → preflight stashes; merge runs; cleanup pops; branch deleted on success.\n- Stale ephemeral + auto_recovery=Some + resolver declines → preflight cleanup reverses; branch remains in unmerged; abort fires.\n- Multiple stale ephemerals + mixed outcomes → successful ones deleted; failed ones surface in abort message.\n- auto_recovery=None → byte-for-byte identical to today.\n\nKnown-bad to guard against:\n- A test that asserts auto-recovery runs when None was passed would mask a regression.\n- Mutating `unmerged` mid-iteration without preserving order. Build recovery outcomes first, THEN re-emit warnings.\n- Bypassing the slot-0 guard in classify_ephemeral_branch.",
+      "edgeCases": [
+        "auto_recovery None → identical to today",
+        "auto_recovery Some + clean merge → branch deleted, Ok",
+        "auto_recovery Some + dirty project_root + clean merge → preflight stash/pop, Ok",
+        "auto_recovery Some + resolver-declined → abort with annotated message",
+        "Multiple stale ephemerals mixed outcomes → partial success surfaced",
+        "Case-4 dirty stale worktree → unchanged abort behavior",
+        "spawn_claude missing → preflight cleanup, ephemeral stays in unmerged, abort"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "Resolver returns Failed during auto-recovery",
+          "expectedBehavior": "preflight cleanup runs; ephemeral stays in unmerged; case-3 abort fires with annotated message"
+        },
+        {
+          "cause": "preflight stash push fails",
+          "expectedBehavior": "branch skipped; stays in unmerged; abort with prep-failure diagnostic"
+        },
+        {
+          "cause": "post-recovery delete_branch_force fails",
+          "expectedBehavior": "warning logged; branch remains in unmerged for abort decision"
+        }
+      ],
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "reconcile_stale_ephemeral_slots: src/loop_engine/worktree.rs:662. Engine startup call site: grep `reconcile_stale_ephemeral_slots(` in engine.rs. ClaudeMergeResolver constructor: src/loop_engine/merge_resolver.rs ~line 220. delete_branch_force: src/loop_engine/worktree.rs:949. Reuse run_slot_merge_attempt + cleanup_preparation from FEAT-004 verbatim — pass slot0_path = project_root. Out-of-scope: case-4 dirty worktree.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "auto_recovery None path is bit-for-bit identical to today's function — verified by regression test",
+        "Auto-recovery reuses FEAT-004's helpers, not parallel re-implementation",
+        "Halt-threshold semantics unchanged when None or when recovery fails",
+        "slot-0 safety guard in classify_ephemeral_branch preserved",
+        "Operator-visible abort message includes 'auto-recovery attempted' framing"
+      ],
+      "taskType": "implementation",
+      "title": "Auto-recovery in reconcile_stale_ephemeral_slots",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Shared marker-block rewrite logic between .gitignore (FEAT-001) and info/attributes (existing `merged_attributes_contents`) is extracted if structurally identical — OR documented why duplication is intentional (e.g., different escape rules)",
+        "No code duplication between preflight cleanup logic and auto-recovery merge logic",
+        "Functions under 30 lines (flag complex ones for splitting)",
+        "Tag prefix `task-mgr-slot-` defined as a single const, not duplicated",
+        "All new pub(crate) helpers have rustdoc covering contract, Err semantics, side effects",
+        "Code follows existing project patterns (format_git_failure style, hard_reset error handling pattern)",
+        "If issues found: REFACTOR-FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001` — MUST pass --depended-on-by so the prefix is unambiguous from the dependency edge",
+        "If no issues: emit `<task-status>REFACTOR-001:done</task-status>` with one-line 'No issues' note"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005"
+      ],
+      "description": "Review all implementation across FEAT-001..005 for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated logic between gitignore marker-block handling and the worktree.rs ATTR marker-block code (worktree.rs:424-505) — they should share a helper if the marker-block rewrite logic is structurally identical. Verify cleanup_preparation and the auto-recovery merge path don't duplicate stash-management code. Verify run_slot_merge_attempt has a single responsibility. Function sizes (<30 lines per fn body). Tag prefix `task-mgr-slot-` defined in one place, not duplicated.\nDO NOT: Skip — this gate catches DRY issues before the final review.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. Use rust-python-code-reviewer agent for the review pass. Common smells in this PRD: copy-paste between gitignore marker-block code and worktree.rs attr marker-block; hardcoded `\"task-mgr-slot-\"` in multiple places; run_slot_merge_attempt growing to handle both wave-merge and reconcile-recovery without clean factoring.",
+      "passes": true,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY: tag prefix const + helper functions used everywhere",
+        "Single-responsibility: run_slot_merge_attempt does merge-attempt only",
+        "Pattern consistency: error formatting matches format_git_failure / hard_reset style",
+        "Shared marker-block logic between .gitignore and info/attributes if structurally identical"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/commands/init/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: all new code reachable from production entry points (grep-verified): gitignore helper called from init_project, env-threaded slot_stash_limit reaches cleanup_preparation, AutoRecoveryConfig built and passed at engine startup",
+        "Positive: all errors propagated with context (map_err with TaskMgrError variants, not unwrap)",
+        "Positive: FULL `cargo test` clean (no scope filter)",
+        "Positive: `cargo clippy -- -D warnings` clean",
+        "Positive: `cargo fmt --check` clean",
+        "Negative: no unwrap() in production code paths added by this PRD",
+        "Negative: no dead code warnings for new code",
+        "Negative: `git log --grep '^chore(progress)' main..HEAD` is empty — no auto-commit pattern crept in",
+        "Negative: `grep -rn 'git rm tasks/progress' src/` returns ZERO matches (only `git rm --cached` is allowed for migration)",
+        "Documentation: verify FEAT-005 updated CLAUDE.md with all three paragraphs (gitignore, preflight, auto-recovery). If a paragraph is missing, add it; do NOT replace existing content",
+        "Documentation: rustdoc on changed function signatures reflects the new parameters and their semantics",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001` (MUST pass --depended-on-by)",
+        "End-to-end smoke procedure DOCUMENTED in progress.txt as a manual post-merge operator check (do NOT attempt to run it inside the loop iteration). Include: (1) fresh `task-mgr init` writes the gitignore marker block; (2) `git status` after a wave does not list tasks/progress-*.txt as dirty; (3) for a project with prior tracked progress files, the migration commit appears in `git log -1`; (4) 2-slot loop with non-progress dirty file (e.g. scratch.log) merges back cleanly via stash/pop"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Check every new function for error handling, check callers still work, verify no dead code, check if docs need updating. Run full `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` (no scope filter). Verify FEAT-001's gitignore change is wired into init_project (not just defined as a helper). Verify FEAT-005's auto-recovery is wired into engine.rs startup with `Some(&cfg)`, not `None`.\nDO NOT: Skip the integration wiring check. Do NOT scope the test suite — this is THE place the full suite runs. Do NOT re-edit CLAUDE.md if FEAT-005 already updated it; only verify content presence + accuracy.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry points",
+        "Full suite green including pre-existing",
+        "No chore(progress) commits on the branch",
+        "No `git rm` (non-cached) calls anywhere",
+        "CLAUDE.md reflects all three layers (gitignore, preflight, auto-recovery)"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/merge_resolver.rs",
+        "src/commands/init/mod.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

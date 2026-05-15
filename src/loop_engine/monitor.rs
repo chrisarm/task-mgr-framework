@@ -227,7 +227,10 @@ fn format_status_change(status: &str, prefix: Option<&str>) -> String {
 fn format_heartbeat(prefix: Option<&str>) -> String {
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
     match prefix {
-        Some(p) => format!("{} [monitor {}] heartbeat: still running, no new changes", p, ts),
+        Some(p) => format!(
+            "{} [monitor {}] heartbeat: still running, no new changes",
+            p, ts
+        ),
         None => format!("[monitor {}] heartbeat: still running, no new changes", ts),
     }
 }
@@ -512,7 +515,13 @@ mod tests {
         // monitor_loop should return almost immediately since flag is already set
         let start = Instant::now();
         let activity = Arc::new(AtomicU64::new(0));
-        monitor_loop(&dir_buf, &stop_flag, &activity, None, MonitorTiming::default());
+        monitor_loop(
+            &dir_buf,
+            &stop_flag,
+            &activity,
+            None,
+            MonitorTiming::default(),
+        );
         let elapsed = start.elapsed();
 
         // Should exit within 2 seconds (1 sleep + overhead)

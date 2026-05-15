@@ -1842,6 +1842,17 @@ pub fn run_wave_iteration(
                 task_id,
             });
         }
+
+        // FEAT-006: fold each slot's untracked progress file into slot 0's so
+        // the operator sees one unified, wave-separated view by wave end.
+        // Runs after merge-back, before cleanup_slot_worktrees, so slot 1+
+        // paths still exist. A union failure never blocks the wave.
+        if let Err(e) = worktree::union_slot_progress_files(
+            &params.slot_worktree_paths[..n_slots],
+            &branch::progress_file_name(params.task_prefix),
+        ) {
+            eprintln!("Warning: failed to union slot progress files: {}", e);
+        }
     }
 
     if let Err(e) = run_cmd::update(
@@ -3279,6 +3290,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     .unwrap_or_else(|| "medium".to_string());
                 let recovery_timeout =
                     Duration::from_secs(project_config.merge_resolver_timeout_secs.unwrap_or(600));
+                // FEAT-006: progress file name for unioning a recovered
+                // slot's progress into slot 0 before its branch is deleted.
+                let recovery_progress_fname = branch::progress_file_name(task_prefix.as_deref());
                 let recovery_cfg = worktree::AutoRecoveryConfig {
                     model: recovery_model.as_str(),
                     effort: recovery_effort.as_str(),
@@ -3287,6 +3301,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     db_dir: Some(run_config.db_dir.as_path()),
                     run_id: "startup-reconcile",
                     stash_limit: project_config.slot_stash_limit,
+                    progress_file_name: recovery_progress_fname.as_str(),
                 };
                 if let Err(e) = worktree::reconcile_stale_ephemeral_slots(
                     &run_config.source_root,
