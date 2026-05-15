@@ -2735,12 +2735,57 @@ fn make_dedup_items(pairs: &[(i64, &str, &str)]) -> Vec<DeduplicateLearningItem>
         .collect()
 }
 
+/// `finalize_dedup_batch` prunes dismissed members but never silently drops a
+/// batch: sub-2 batches pass through unchanged, and a fully-dismissed batch is
+/// returned intact so the downstream skip-filter can count it.
+#[test]
+fn test_finalize_dedup_batch_keeps_small_and_fully_dismissed_batches() {
+    use super::finalize_dedup_batch;
+    use std::collections::HashSet;
+
+    // Empty input → None.
+    assert!(finalize_dedup_batch(&[], &HashSet::new()).is_none());
+
+    // Size-1 batch → kept as-is (legacy batch_size=1 behaviour).
+    let one = make_dedup_items(&[(1, "A", "a")]);
+    assert_eq!(
+        finalize_dedup_batch(&one, &HashSet::new())
+            .expect("size-1 kept")
+            .len(),
+        1,
+    );
+
+    // Fully-dismissed 2-item batch → kept INTACT (not emptied) so the
+    // skip-filter sees both ids and counts clusters_skipped.
+    let pair = make_dedup_items(&[(1, "A", "a"), (2, "B", "b")]);
+    let dismissed: HashSet<(i64, i64)> = [(1, 2)].into_iter().collect();
+    let kept_pair = finalize_dedup_batch(&pair, &dismissed).expect("fully-dismissed kept");
+    assert_eq!(
+        kept_pair.iter().map(|i| i.id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "fully-dismissed batch must survive intact for the skip-filter",
+    );
+
+    // Partially-dismissed batch → the member with no un-judged neighbour is
+    // pruned; the rest (>= 2) survive. (1,2) and (1,3) dismissed, (2,3) is not,
+    // so id 1 has no un-judged neighbour and is dropped; 2 and 3 remain.
+    let trio = make_dedup_items(&[(1, "A", "a"), (2, "B", "b"), (3, "C", "c")]);
+    let partial: HashSet<(i64, i64)> = [(1, 2), (1, 3)].into_iter().collect();
+    let kept = finalize_dedup_batch(&trio, &partial).expect("partial kept");
+    let kept_ids: Vec<i64> = kept.iter().map(|i| i.id).collect();
+    assert_eq!(
+        kept_ids,
+        vec![2, 3],
+        "member with no un-judged neighbour pruned"
+    );
+}
+
 #[test]
 
 fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
     // AC: prompt contains a random UUID boundary delimiter (injection protection)
     let items = make_dedup_items(&[(1, "Title A", "Content A"), (2, "Title B", "Content B")]);
-    let prompt = build_dedup_prompt(&items, 0.85);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
 
     // The delimiter must contain "===BOUNDARY_" followed by a UUID fragment
     assert!(
@@ -2760,7 +2805,7 @@ fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
 fn test_dedup_prompt_contains_untrusted_warning() {
     // AC: prompt contains UNTRUSTED warning for learning content
     let items = make_dedup_items(&[(1, "Title", "Content")]);
-    let prompt = build_dedup_prompt(&items, 0.85);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
 
     assert!(
         prompt.contains("UNTRUSTED"),
@@ -2780,7 +2825,7 @@ fn test_dedup_prompt_includes_learning_ids_titles_content() {
             "Add composite indexes for slow queries",
         ),
     ]);
-    let prompt = build_dedup_prompt(&items, 0.85);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
 
     assert!(prompt.contains("42"), "prompt must include learning ID 42");
     assert!(
@@ -2807,7 +2852,7 @@ fn test_dedup_prompt_includes_learning_ids_titles_content() {
 fn test_dedup_prompt_includes_threshold_value() {
     // AC: prompt includes threshold value as guidance
     let items = make_dedup_items(&[(1, "Title", "Content")]);
-    let prompt = build_dedup_prompt(&items, 0.85);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
 
     assert!(
         prompt.contains("0.85"),
@@ -4140,8 +4185,8 @@ fn test_e2e_threshold_flag_changes_prompt_content() {
         },
     ];
 
-    let prompt_low = build_dedup_prompt(&items, 0.3);
-    let prompt_high = build_dedup_prompt(&items, 0.9);
+    let prompt_low = build_dedup_prompt(&items, 0.3, &[]);
+    let prompt_high = build_dedup_prompt(&items, 0.9, &[]);
 
     // Both prompts must mention the threshold value.
     assert!(
