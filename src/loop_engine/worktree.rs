@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::error::{TaskMgrError, TaskMgrResult};
@@ -1128,10 +1128,21 @@ pub(crate) struct AutoRecoveryConfig<'a> {
 
 const STASH_TAG_PREFIX: &str = "task-mgr-slot-";
 
+/// Process-global monotonic sequence appended to every stash tag. `epoch_ms`
+/// alone is not collision-proof: two preps for the same `(slot, run_id)` within
+/// the same millisecond would mint identical tags, and `resolve_stash_ref_by_tag`
+/// would then pop whichever entry it found first. The sequence makes each tag
+/// unique regardless of clock resolution. It sits AFTER `{run_id}-{epoch_ms}` so
+/// the `{STASH_TAG_PREFIX}{slot}-{run_id}-` prefix used by
+/// `count_stashes_with_prefix` is unaffected.
+static STASH_TAG_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// If slot 0's working tree is dirty, stash everything (tracked + untracked)
 /// under a deterministic tag and return `Stashed`. If clean, return `Clean`.
 ///
-/// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}`
+/// Tag format: `task-mgr-slot-{slot}-{run_id}-{epoch_ms}-{seq}` — `seq` is a
+/// process-global monotonic counter that guarantees tag uniqueness even when
+/// two preps land in the same millisecond.
 ///
 /// # Errors
 ///
@@ -1166,7 +1177,8 @@ pub(crate) fn prepare_slot0_for_merge(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let tag = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-{epoch_ms}");
+    let seq = STASH_TAG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tag = format!("{STASH_TAG_PREFIX}{slot}-{run_id}-{epoch_ms}-{seq}");
 
     let stash_out = Command::new("git")
         .args(["stash", "push", "--include-untracked", "-m", &tag])
@@ -1189,6 +1201,14 @@ pub(crate) fn prepare_slot0_for_merge(
 /// (never dropped); returns `PopConflict` unless the per-slot per-run stash
 /// count exceeds `stash_limit`, in which case returns `StashLimitExceeded`.
 /// NEVER calls `git checkout --`, `git reset --hard`, or `git stash drop`.
+///
+/// Note on stash accumulation: retained stashes (`PopConflict` /
+/// `StashLimitExceeded`) are bounded per run by `stash_limit`, which trips the
+/// consecutive-merge-fail halt so an operator intervenes. With
+/// `merge_fail_halt_threshold == 0` the loop never halts, so a persistent
+/// dirty-working-tree problem can leak stashes across waves within that run —
+/// an accepted trade-off of the legacy permissive posture, not a leak in the
+/// default (threshold 2) configuration.
 pub(crate) fn cleanup_preparation(
     prep: &MergePreparation,
     slot0_path: &Path,

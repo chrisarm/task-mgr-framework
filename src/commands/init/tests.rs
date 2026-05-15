@@ -3178,6 +3178,89 @@ fn test_untrack_progress_files_removes_tracked_and_commits() {
 }
 
 #[test]
+fn test_untrack_progress_files_skips_when_index_dirty() {
+    use std::process::Command;
+    // When the operator already has staged work, the migration must refuse to
+    // run rather than sweep that work into the `chore: untrack` commit.
+    let tmp = setup_init_git_repo();
+    let repo = tmp.path();
+
+    // Track a progress file (committed — index is clean afterwards).
+    fs::create_dir_all(repo.join("tasks")).expect("mkdir tasks");
+    fs::write(repo.join("tasks/progress-test.txt"), "p\n").expect("write progress");
+    Command::new("git")
+        .args(["add", "tasks/progress-test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add progress");
+    Command::new("git")
+        .args(["commit", "-m", "track progress file"])
+        .current_dir(repo)
+        .output()
+        .expect("git commit progress");
+
+    let head_before = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    let hash_before = String::from_utf8_lossy(&head_before.stdout)
+        .trim()
+        .to_string();
+
+    // Operator stages an unrelated in-flight change.
+    fs::write(repo.join("unrelated.txt"), "in-flight work\n").expect("write unrelated");
+    Command::new("git")
+        .args(["add", "unrelated.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add unrelated");
+
+    untrack_progress_files(repo).expect("dirty-index case must skip, not error");
+
+    // No migration commit was created.
+    let head_after = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("git rev-parse");
+    assert_eq!(
+        hash_before,
+        String::from_utf8_lossy(&head_after.stdout).trim(),
+        "no migration commit must be created while the index is dirty"
+    );
+
+    // The progress file is still tracked (migration was skipped, not partial).
+    let ls = Command::new("git")
+        .args(["ls-files", "tasks/progress-test.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git ls-files");
+    assert!(
+        !String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
+        "progress file must remain tracked when the migration is skipped"
+    );
+
+    // The operator's unrelated change is untouched — still staged.
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(repo)
+        .output()
+        .expect("git diff --cached");
+    let staged_str = String::from_utf8_lossy(&staged.stdout);
+    assert!(
+        staged_str.contains("unrelated.txt"),
+        "unrelated staged change must remain staged: {}",
+        staged_str
+    );
+    assert!(
+        !staged_str.contains("progress-test.txt"),
+        "progress file must NOT have been staged for removal: {}",
+        staged_str
+    );
+}
+
+#[test]
 fn test_untrack_progress_files_noop_when_not_git_repo() {
     let tmp = TempDir::new().expect("create temp dir");
     // No git init — untrack_progress_files must skip gracefully

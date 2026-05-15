@@ -644,9 +644,18 @@ fn ensure_progress_gitignore(project_root: &Path) -> Result<(), String> {
 /// Untrack any `tasks/progress-*.txt` files currently tracked by git using
 /// `git rm --cached` (preserving disk content), then commit the index change.
 ///
-/// No-op when there are no tracked progress files, or when the directory is not
-/// a git repository (`git ls-files` non-zero exit → stderr warning, returns
-/// `Ok(())`). Returns `Err` if `git rm --cached` or `git commit` fail.
+/// No-op (`Ok(())`) when there are no tracked progress files, when the
+/// directory is not a git repository (`git ls-files` non-zero exit → stderr
+/// warning), or when the operator already has staged changes — the migration
+/// commits the whole index, so it refuses to run rather than sweep unrelated
+/// in-flight work into the `chore: untrack` commit. `init` is idempotent, so
+/// the migration simply runs on a later invocation once the index is clean.
+///
+/// Returns `Err` if `git rm --cached` or `git commit` fail in an actual repo;
+/// the caller treats that as a non-fatal warning so `init` still succeeds.
+/// `--no-verify` skips hooks because this is a mechanical housekeeping commit.
+/// On any failure *after* paths were staged, the staged removals are rolled
+/// back (`git reset`) so the operator is never left with a half-migrated index.
 fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
     use std::process::Command;
 
@@ -657,6 +666,7 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
     {
         Ok(o) => o,
         Err(e) => {
+            // Not a fatal condition: task-mgr is usable outside a git repo.
             eprintln!(
                 "task-mgr: progress migration skipped (git unavailable: {})",
                 e
@@ -680,6 +690,26 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    // Refuse to run when the operator already has staged changes: the migration
+    // commits the whole index, so proceeding would sweep their in-flight work
+    // into the `chore: untrack` commit. `git diff --cached --quiet` exits 0 when
+    // the index is clean, non-zero when something is staged.
+    match Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(o) if !o.status.success() => {
+            eprintln!(
+                "task-mgr: progress migration skipped — you have staged changes; \
+                 commit or unstage them and re-run `task-mgr init`"
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("git diff --cached spawn failed: {}", e)),
+    }
+
     for file in &files {
         let rm_output = Command::new("git")
             .args(["rm", "--cached", file])
@@ -687,6 +717,7 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
             .output()
             .map_err(|e| format!("git rm --cached '{}' spawn failed: {}", file, e))?;
         if !rm_output.status.success() {
+            unstage_paths(project_root, &files);
             return Err(format!(
                 "git rm --cached '{}' failed: {}",
                 file,
@@ -695,24 +726,53 @@ fn untrack_progress_files(project_root: &Path) -> Result<(), String> {
         }
     }
 
+    // The index now holds only our staged removals (verified clean above), so a
+    // plain commit captures exactly the migration and nothing else.
     let commit_output = Command::new("git")
         .args([
             "commit",
             "-m",
             "chore: untrack progress files (task-mgr init migration)",
+            "--no-verify",
         ])
         .current_dir(project_root)
-        .output()
-        .map_err(|e| format!("git commit spawn failed: {}", e))?;
+        .output();
 
-    if !commit_output.status.success() {
-        return Err(format!(
-            "git commit failed after git rm --cached: {}",
-            String::from_utf8_lossy(&commit_output.stderr).trim()
-        ));
+    match commit_output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            unstage_paths(project_root, &files);
+            Err(format!(
+                "git commit failed after git rm --cached (staged removals rolled back): {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ))
+        }
+        Err(e) => {
+            unstage_paths(project_root, &files);
+            Err(format!("git commit spawn failed: {}", e))
+        }
     }
+}
 
-    Ok(())
+/// Best-effort `git reset -- <pathspec>` to undo staged progress-file removals
+/// when the migration cannot complete. Restores the index entries for those
+/// paths from HEAD so a failed migration leaves no half-staged state. Failures
+/// here are only logged — there is no further recovery to attempt.
+fn unstage_paths(project_root: &Path, files: &[&str]) {
+    use std::process::Command;
+
+    let mut args: Vec<&str> = vec!["reset", "--quiet", "HEAD", "--"];
+    args.extend(files.iter().copied());
+    if let Err(e) = Command::new("git")
+        .args(&args)
+        .current_dir(project_root)
+        .output()
+    {
+        eprintln!(
+            "task-mgr: warning: could not roll back staged progress removals: {}",
+            e
+        );
+    }
 }
 
 /// Initialize project-level scaffolding: `.task-mgr/` directory, SQLite DB with
@@ -746,10 +806,13 @@ pub fn init_project(dir: &Path) -> TaskMgrResult<InitResult> {
         eprintln!("task-mgr: warning: could not update .gitignore: {}", e);
     }
 
-    // One-time migration: untrack any already-tracked progress files. Non-fatal
-    // when git ls-files fails (not a git repo); fatal if git commit fails so the
-    // operator sees the error rather than silently leaving a half-migrated index.
-    untrack_progress_files(dir).map_err(|e| TaskMgrError::IoError(std::io::Error::other(e)))?;
+    // One-time migration: untrack any already-tracked progress files. Fully
+    // non-fatal — any failure (not a git repo, no git identity, hook rejection)
+    // is reported as a warning and any staged removals are rolled back inside
+    // `untrack_progress_files`, so `init` still succeeds with a clean index.
+    if let Err(e) = untrack_progress_files(dir) {
+        eprintln!("task-mgr: warning: progress migration failed: {}", e);
+    }
 
     Ok(InitResult {
         tasks_imported: 0,
