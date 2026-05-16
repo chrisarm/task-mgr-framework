@@ -1,0 +1,374 @@
+{
+  "version": "1.0",
+  "project": "task-mgr",
+  "model": "claude-sonnet-4-6",
+  "branchName": "feat/dedup-review-followup",
+  "description": "Remove the cluster-prompt path from `task-mgr curate dedup`. Pair-judgment becomes the only mode. Replace item-chunking with pair-batching so every cosine-≥-threshold candidate pair lands in at least one LLM batch and gets recorded in `dedup_dismissals`. Hard-require embeddings (no legacy fallback) and abstract `OllamaEmbedder` behind a new `Embedder` trait so a second provider can drop in later. Remove the `--pair-mode` flag.",
+  "requires": [],
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use that can't be reasonably extended (the Embedder trait IS justified because it's named scaffolding for additional providers)",
+    "Error messages that don't identify what went wrong or what config to inspect",
+    "Catch-all error handlers that swallow context",
+    "Cross-batch candidate pairs that silently end up in no LLM batch (the leak this PR exists to fix)",
+    "`unwrap()` in production paths — use `map_err`/`?` with `TaskMgrError` variants",
+    "Editing `tasks/*.json` directly (use `task-mgr add --stdin` / `<task-status>` tags)",
+    "Reading `tasks/learnings.md` or `tasks/long-term-learnings.md` directly (use `task-mgr recall`)"
+  ],
+  "globalAcceptanceCriteria": {
+    "description": "These criteria apply to ALL implementation tasks",
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All tests pass with scoped `cargo test` (full suite at REVIEW-001)",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing APIs unless explicitly required by this PR's scope (which DOES require breaking changes to dedup CLI and embedder construction)"
+    ]
+  },
+  "userStories": [
+    {
+      "id": "FEAT-001",
+      "title": "Embedder trait + factory; OllamaEmbedder behind the trait",
+      "taskType": "implementation",
+      "description": "Introduce `pub trait Embedder: Send + Sync` in `src/learnings/embeddings/mod.rs` with methods `provider() -> &'static str`, `model() -> &str`, `endpoint() -> &str`, `is_available() -> Result<bool, String>`, and `embed_batch(&[&str]) -> TaskMgrResult<Vec<Vec<f32>>>`. Provide a default method `embed(&str) -> TaskMgrResult<Vec<f32>>` that delegates to `embed_batch`. Implement the trait for the existing `OllamaEmbedder` (signatures already match — adapt only as needed).\n\nAdd a factory `pub fn make_embedder(provider: &str, endpoint: &str, model: &str) -> TaskMgrResult<Box<dyn Embedder>>` that returns the Ollama impl for `\"ollama\"` and a `TaskMgrError::ConfigError` for any other string (no other providers ship in this PR — the factory exists so a follow-up can add one without touching dedup).\n\nAdd `embedding_provider: Option<String>` to `ProjectConfig` at `src/loop_engine/project_config.rs` (alongside the existing `ollama_url` and `embedding_model` fields). Default value when unset is `\"ollama\"`. Wire the new field through `read_project_config`.\n\nMigrate the following call sites from constructing `OllamaEmbedder` directly to going through `make_embedder`:\n- `try_embed_learning` (`src/learnings/embeddings/mod.rs:~352`)\n- `try_embed_learnings_batch` (`src/learnings/embeddings/mod.rs:~402`)\n- `curate_embed` Ollama wiring (`src/commands/curate/mod.rs:~1175–1199`)\n\nDO move callers to `make_embedder`.\nDO keep `VectorBackend` (`src/learnings/retrieval/vector.rs`) on a concrete `OllamaEmbedder` field — it consumes `base_url()` directly when building `TaskMgrError::OllamaUnreachable`, and rationalizing that error variant is out of scope.\nDO NOT introduce a second provider in this PR — the trait is scaffolding.\nDO NOT modify `OllamaEmbedder`'s internal HTTP logic (timeouts, agents) — only add the trait impl.\n\nEdge cases:\n- `make_embedder` called with unknown provider string: return `ConfigError` naming the bad value.\n- `embedding_provider` field missing from config: defaults to `\"ollama\"` (no error).\n- `embed_batch` called with empty slice: returns `Ok(Vec::new())` (matches existing OllamaEmbedder behavior).\n\nKnown-bad to guard against:\n- Implementing `embed` directly on the trait instead of as a default method that calls `embed_batch` — would force every impl to duplicate the single-element extraction logic.\n- Forgetting to add `: Send + Sync` to the trait — would prevent the worker thread queue from accepting `Box<dyn Embedder>` once dedup picks it up in FEAT-003.",
+      "acceptanceCriteria": [
+        "Positive: `pub trait Embedder: Send + Sync` exists in `src/learnings/embeddings/mod.rs` with the five methods named in the description and a default `embed` method",
+        "Positive: `impl Embedder for OllamaEmbedder` covers all five required methods; `provider()` returns the string `\"ollama\"`",
+        "Positive: `pub fn make_embedder(provider, endpoint, model) -> TaskMgrResult<Box<dyn Embedder>>` returns Ollama impl for `\"ollama\"`",
+        "Positive: `try_embed_learning`, `try_embed_learnings_batch`, and `curate_embed` all construct their embedder via `make_embedder` instead of `OllamaEmbedder::new` directly",
+        "Positive: `ProjectConfig` has `pub embedding_provider: Option<String>` field with serde rename matching neighbors (e.g., camelCase `embeddingProvider`)",
+        "Negative: `VectorBackend` still holds a concrete `OllamaEmbedder` field — this PR does NOT migrate retrieval to the trait",
+        "Negative: No new concrete `Embedder` impl other than `OllamaEmbedder` is added in this commit",
+        "Negative: `make_embedder` does NOT silently fall back to Ollama for unknown providers — it returns `ConfigError`",
+        "Unit test: `make_embedder(\"ollama\", url, model)` returns `Ok(Box<dyn Embedder>)` whose `provider()` returns `\"ollama\"`",
+        "Unit test: `make_embedder(\"openai\", _, _)` returns `Err(ConfigError)` whose message contains the string `\"openai\"`",
+        "Unit test: trait-object dispatch — a fn taking `&dyn Embedder` correctly calls each of the four required methods on an OllamaEmbedder instance (use a mocked HTTP layer or skip HTTP-bound methods)",
+        "Unit test: `ProjectConfig` default for `embedding_provider` resolves to `\"ollama\"` when the field is absent from JSON",
+        "Known-bad: an impl that defines `embed_batch` to delegate to `embed` (instead of the other way around) would still compile but cause infinite recursion — verify the default `embed` calls `embed_batch`, not the reverse",
+        "CONTRACT: every existing caller of `OllamaEmbedder::new` enumerated in the description either (a) moves to `make_embedder` or (b) is the documented exception (`VectorBackend`)",
+        "Failure mode: if `make_embedder` is called before `ProjectConfig` is read: caller is responsible for passing explicit `provider`/`endpoint`/`model` args (no global state)"
+      ],
+      "priority": 1,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "OllamaEmbedder's existing surface (is_available, embed, embed_batch, model, base_url) maps almost 1:1 — rename `base_url` → `endpoint` only in the trait, keep `base_url()` as a `pub fn` on the concrete struct for VectorBackend's continued use. Reuse: `OllamaEmbedder::new` at src/learnings/embeddings/mod.rs:39. ProjectConfig fields at src/loop_engine/project_config.rs:~11,34–39. Learning [1401]: ProjectConfig pattern with Option<String> + sensible defaults is the established shape. Learning [1944]: keep OllamaEmbedder's 3s/30s timeout discipline — don't break the consistency reranker shares. Learning [1918]: mockito mocks Ollama HTTP endpoints — useful for the trait dispatch test.",
+      "qualityDimensions": [
+        "Trait object dispatch through `Box<dyn Embedder>` works in single-threaded contexts (Send + Sync sufficient for the worker queue)",
+        "`make_embedder` factory pattern matches the rest of the codebase (e.g., `read_project_config` style)",
+        "OllamaEmbedder's existing HTTP timeout discipline (3s/30s) preserved",
+        "Error messages from `make_embedder` name the bad provider string verbatim so operators can grep config"
+      ],
+      "edgeCases": [
+        "Unknown provider string: `ConfigError` with the bad value in the message",
+        "Empty endpoint/model strings: pass through (let the concrete impl decide whether to reject)",
+        "`embed_batch` with empty `texts` slice: returns `Ok(Vec::new())` without HTTP call"
+      ],
+      "failureModes": [
+        {
+          "cause": "Unknown embedding provider in config",
+          "expectedBehavior": "`TaskMgrError::ConfigError` with the offending provider string named in the message"
+        },
+        {
+          "cause": "Ollama unreachable at the configured endpoint",
+          "expectedBehavior": "Same behavior as today — `is_available()` returns `Err(String)` describing the connection failure"
+        }
+      ],
+      "touchesFiles": [
+        "src/learnings/embeddings/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "src/commands/curate/mod.rs"
+      ],
+      "dependsOn": []
+    },
+    {
+      "id": "FEAT-002",
+      "title": "cluster_by_embedding_similarity returns candidate pairs; rename pair prompt; delete cluster prompt",
+      "taskType": "implementation",
+      "description": "Refactor `cluster_by_embedding_similarity` (`src/commands/curate/dedup.rs:73`) to return a struct carrying both the existing clusters AND the actual cosine-≥-threshold pairs:\n\n```rust\npub struct EmbeddingClusterResult {\n    pub clusters: Vec<Vec<i64>>,\n    /// Sorted unique (lo, hi) pairs with cosine(lo, hi) >= threshold.\n    pub candidate_pairs: Vec<(i64, i64)>,\n}\n```\n\nThe existing pairwise loop already computes each cosine; record qualifying `(lo, hi)` pairs as the loop runs. Output `candidate_pairs` sorted ascending by `(lo, hi)`, deduplicated. Clusters retain their current shape (each inner Vec sorted ascending; outer Vec sorted by `c[0]`).\n\nThen delete `build_dedup_prompt` (the cluster-shaped prompt, `src/commands/curate/dedup.rs:~126–184`) entirely. Rename `build_pair_judgment_prompt` (`src/commands/curate/dedup.rs:~210–266`) to `build_dedup_prompt` (canonical name; signature: `pub fn build_dedup_prompt(items: &[DeduplicateLearningItem], candidate_pairs: &[(i64, i64)], similarity_threshold: f64) -> String`). Update the `pub use` re-export in `src/commands/curate/mod.rs:12` to drop `build_pair_judgment_prompt`.\n\nThis task does NOT yet change the orchestrator. After this commit, the orchestrator continues to call the renamed `build_dedup_prompt` from item-based sub-batches (the pair-mode sketch's current behavior under a different name). Coverage leak still exists — FEAT-003 fixes it.\n\nDO update all test call sites to the new `build_dedup_prompt` signature with three args.\nDO update orchestrator call sites in `src/commands/curate/mod.rs` to the new prompt-builder name.\nDO delete tests that exercised the removed cluster prompt OR the renamed pair prompt under the old name.\nDO NOT yet remove `--pair-mode` flag or change `DedupBatchInput` shape — those are FEAT-003.\nDO NOT yet remove `dismissed_pairs_within` / `prune_batch_to_judgable` / `finalize_dedup_batch` / `build_standard_batches` / `unjudged_pairs_within` / `is_fully_dismissed` — those die in FEAT-003 when their callers go away.\nDO NOT change `parse_dedup_response` or `validate_clusters` — response shape unchanged.\n\nEdge cases:\n- Empty embeddings input: `EmbeddingClusterResult { clusters: vec![], candidate_pairs: vec![] }`.\n- N=2 with cosine below threshold: no clusters, no pairs.\n- Transitive case (cosine(A,B) ≥ T, cosine(B,C) ≥ T, cosine(A,C) < T): clusters contains `[A, B, C]` (union-find); candidate_pairs contains `[(A,B), (B,C)]` only — no `(A,C)`.\n- Duplicate pair surfacing (shouldn't happen with i<j iteration, but defensive): sort + dedup before returning.\n\nKnown-bad to guard against:\n- Including transitive (A,C) in candidate_pairs because the union-find groups them — silently makes pair-mode behave like the old cluster mode, defeating the user-chosen sparsity invariant.\n- Forgetting to update the rustdoc on `cluster_by_embedding_similarity` to mention the new return type — future readers will mis-interpret.\n- Test-call-site updates that pass `&[]` to satisfy the new signature instead of constructing the pair list the test actually means to send.",
+      "acceptanceCriteria": [
+        "Positive: `EmbeddingClusterResult` struct is `pub` and has the documented fields with the documented orderings",
+        "Positive: `cluster_by_embedding_similarity` returns `EmbeddingClusterResult`; clusters field matches the prior return value semantics",
+        "Positive: `candidate_pairs` contains exactly the `(lo, hi)` pairs where `cosine(lo, hi) >= threshold`, sorted ascending, deduplicated",
+        "Positive: `build_dedup_prompt` (after rename) takes three args and is reachable via `pub use dedup::build_dedup_prompt`",
+        "Negative: The cluster-shaped `build_dedup_prompt` (with `already_judged_distinct` parameter) is REMOVED — no longer compiles, no longer exported",
+        "Negative: `build_pair_judgment_prompt` no longer exists — only the canonical `build_dedup_prompt` remains",
+        "Negative: Transitive pairs (A,C) where `cosine(A,C) < threshold` MUST NOT appear in `candidate_pairs` even when A and C share a union-find root via some B",
+        "Unit test: `test_cluster_by_embedding_similarity_returns_threshold_pairs` — 3-vector input with A·B and B·C above threshold but A·C below: `candidate_pairs == [(A, B), (B, C)]` exactly",
+        "Unit test: existing `test_cluster_*` tests still pass (clusters semantics unchanged) — adapt to the new return type",
+        "Unit test: `test_dedup_prompt_lists_candidates_and_restricts_body` (renamed from `test_pair_judgment_prompt_*`) — `build_dedup_prompt(items, candidate_pairs, threshold)` lists each pair as `(lo, hi)`, restricts items in the prompt body to those referenced by some candidate pair, keeps the UNTRUSTED warning and boundary delimiter",
+        "Unit test: `build_dedup_prompt` with `candidate_pairs.is_empty()` produces a prompt that elicits `[]` (still valid; LLM will just see no pairs to judge)",
+        "Known-bad: a refactor that emits pairs from `groups.into_values()` (union-find roots) instead of from the pairwise cosine loop would include transitive (A,C); the targeted test pins the correct behavior",
+        "CONTRACT: every test in `src/commands/curate/tests.rs` that calls `build_dedup_prompt` uses the three-arg signature; grep for two-arg calls returns zero hits in `src/`",
+        "Failure mode: if `candidate_pairs` has duplicates (shouldn't, but defensively): sort + dedup before returning, do NOT panic"
+      ],
+      "priority": 2,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Existing pairwise loop at src/commands/curate/dedup.rs:86–93 already computes each cosine — record qualifying pairs there. UnionFind helper at lines 20–55 is unchanged. The renamed `build_dedup_prompt` body is identical to today's `build_pair_judgment_prompt` (it already restricts items to referenced learnings and keeps the UNTRUSTED guard). Test call sites that pass `&[]` for already_judged_distinct become `&[]` for candidate_pairs — same shape, different meaning. Learning [1414]: embedding pre-filter pattern is the architecture being refined here. Learning [1819]: cover empty/singleton/two-item/transitive edge cases in tests.",
+      "qualityDimensions": [
+        "Single pairwise loop computes both cluster membership AND candidate_pairs — no second O(N²) pass",
+        "candidate_pairs is the actual cosine-≥-threshold edge set, NOT the union-find cluster's C(N,2) projection",
+        "Rustdoc on `EmbeddingClusterResult` explicitly states the (lo < hi) canonical ordering and the no-transitive-pair invariant",
+        "Tests pin both the cluster semantics AND the new candidate_pairs semantics independently"
+      ],
+      "edgeCases": [
+        "Empty embeddings: EmbeddingClusterResult with both fields empty",
+        "Single learning: both fields empty (no pairs to compute, no multi-member cluster)",
+        "Two learnings below threshold: clusters empty, candidate_pairs empty",
+        "Two learnings at or above threshold: clusters has one cluster of 2, candidate_pairs has the one (lo, hi)",
+        "Transitive A~B~C without A·C: clusters has [A,B,C], candidate_pairs has [(A,B), (B,C)] only"
+      ],
+      "failureModes": [
+        {
+          "cause": "Caller passes empty embeddings slice",
+          "expectedBehavior": "Return empty result, no panic, no allocation work"
+        },
+        {
+          "cause": "All pairs above threshold (everything similar)",
+          "expectedBehavior": "Single cluster of all N items, C(N,2) candidate pairs"
+        }
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/tests.rs"
+      ],
+      "dependsOn": ["FEAT-001"]
+    },
+    {
+      "id": "FEAT-003",
+      "title": "Pair-batching with full coverage; hard-require embeddings; remove --pair-mode flag",
+      "taskType": "implementation",
+      "description": "The heart of the PR. Replace item-chunking with pair-batching in `curate_dedup`, hard-require embeddings (no legacy fallback), and remove the now-redundant `--pair-mode` flag.\n\nADD: a new helper in `src/commands/curate/dedup.rs`:\n```rust\npub(crate) fn pack_pair_batches(\n    items: &[DeduplicateLearningItem],\n    candidate_pairs: &[(i64, i64)],\n    max_items: usize,\n) -> Vec<(Vec<DeduplicateLearningItem>, Vec<(i64, i64)>)>\n```\n\nAlgorithm — greedy first-fit over the candidate pair list pre-sorted ascending by `(lo, hi)`. For each pair `(a, b)`:\n1. Iterate existing batches IN INSERTION ORDER.\n2. Accept the first batch whose item set ∪ `{a, b}` has ≤ `max_items` items. Append the pair (and any newly-introduced items) there.\n3. If no batch fits, start a new batch seeded with `{a, b}` and the pair.\n\nEmpty `candidate_pairs` → empty output. Deterministic given identical input.\n\nREWRITE the embedding-cluster branch in `curate_dedup` (`src/commands/curate/mod.rs:~813–907`) to:\n1. Call `cluster_by_embedding_similarity` and destructure the new `EmbeddingClusterResult`.\n2. Filter `candidate_pairs` to keep only those NOT in the loaded `dismissals` HashSet.\n3. Project the filtered pairs onto their owning cluster (build a `HashMap<i64, usize>` from id to cluster index, then bucket pairs accordingly).\n4. For each cluster with at least one un-dismissed pair: hydrate the items via `item_map`, call `pack_pair_batches(&cluster_items, &cluster_pairs, max_items)`, and push each resulting `(items, pairs)` as a `DedupBatchInput`.\n\nCOLLAPSE `DedupBatchInput` to:\n```rust\nstruct DedupBatchInput {\n    items: Vec<DeduplicateLearningItem>,\n    candidate_pairs: Vec<(i64, i64)>,\n}\n```\n(Drop `already_judged_distinct` field and the `Option<>` wrapper on `candidate_pairs`.)\n\nSIMPLIFY the worker prompt-construction (`src/commands/curate/mod.rs:~620–630`) to always call `build_dedup_prompt(&items, &candidate_pairs, threshold)`.\n\nDELETE the skip filter wrap (the `filter_map` block at `~920–944`) entirely — the batch builder now only emits batches with non-empty candidate pairs, so `is_fully_dismissed` cannot fire. Replace with a direct `Vec<DedupBatchInput>` assignment.\n\nDELETE these helpers (no remaining callers): `finalize_dedup_batch`, `prune_batch_to_judgable`, `dismissed_pairs_within`, `build_standard_batches`, `unjudged_pairs_within`, `is_fully_dismissed`. Delete their tests as well.\n\nHARD-REQUIRE embeddings: when `emb_list.is_empty()` OR `params.embed_model.is_empty()`, return `TaskMgrError::ConfigError(\"curate dedup requires an embedding provider with stored embeddings. Run `task-mgr curate embed` first, or check `.task-mgr/config.json` `embeddingProvider`.\".into())`. Delete the `if emb_list.is_empty()` branch and the outer `else` (embed_model empty) branch.\n\nREMOVE the `--pair-mode` CLI flag:\n- `src/cli/commands.rs:~1694–1695` — delete the clap arg and the `pair_mode: bool` field on the destructure.\n- `src/main.rs:~1408,1426` — drop `pair_mode` from the `CurateAction::Dedup` destructure and from the `DedupParams { ... }` literal.\n- `src/commands/curate/types.rs:~244,263` — drop `pub pair_mode` field from `DedupParams` and `pair_mode: false` from `Default`.\n\nUPDATE `DedupResult.clusters_skipped` semantics: keep the field (it has `serde(default = 0)` for JSON-output compat) but always set to zero. Drop it from the operator stderr summary. Note in rustdoc that it's reserved for future use.\n\nUPDATE the operator stderr summary (`src/commands/curate/mod.rs:~962–991`) to a single line:\n```\nProcessing {total_batches} batch(es) (concurrency={N}), {pair_count} candidate pair(s) across {cluster_count} embedding cluster(s)\n```\nFires whenever total_batches > 0. When total_batches == 0 (zero candidate pairs after dismissal filter), emit \"No candidate pairs to examine (every cosine-≥-threshold pair already in dedup_dismissals).\"\n\nUPDATE `compute_dismissal_pairs` rustdoc ONLY (do not change body) to note that under the new flow `batch_ids` is the union of items participating in the batch's candidate pairs, which may include cosine-<-threshold pairs (the LLM was never asked about them). These ARE dismissed by transitivity of the embedding pre-filter — semantically defensible and operationally useful.\n\nDO populate `candidate_pairs` for every batch (no `Option`, no skip filter — the batch builder ensures non-empty).\nDO route the dedup orchestrator's embedding loader through `make_embedder` (from FEAT-001) so the hard-error message names the configured provider.\nDO use `dismissals.contains(&p)` for the filter — `dismissals` is already `HashSet<(i64, i64)>` from `load_dismissals`.\nDO NOT keep `--pair-mode` as a no-op flag or as a deprecation shim — hard-remove.\nDO NOT keep any of the deleted helpers as `#[allow(dead_code)]` — fully remove.\nDO NOT modify `parse_dedup_response`, `validate_clusters`, `merge_cluster`, `compute_dismissal_pairs`, or `record_dismissals` bodies — they are unchanged.\nDO NOT change `VectorBackend` — it stays concrete-Ollama.\n\nEdge cases:\n- Cluster with all pairs already dismissed: zero pairs after filter → no batch emitted → no LLM call (replaces the old `clusters_skipped` count).\n- Cluster N=2, single pair, un-dismissed: one batch with both items and the one pair.\n- Cluster N=9, all 36 pairs un-dismissed, max_items=7: pack_pair_batches produces multiple batches; UNION of all batches' pairs == the 36 input pairs.\n- Pair list `[(1,2),(1,3),...,(1,K)]` (star), max_items=7: packs into `ceil((K-1)/6)` batches sharing the anchor 1.\n- Pair count > C(max_items, 2): forces multiple batches.\n- No embeddings stored: hard error before any work.\n- Empty `--pair-mode` invocation: clap rejects with \"unexpected argument\".\n\nKnown-bad to guard against:\n- A first-fit that iterates batches in REVERSE insertion order — still correct, but non-deterministic output across refactors; pin insertion-order in the algorithm AND test.\n- A skip filter that re-checks `is_fully_dismissed` after pruning — would short-circuit batches the new batch builder correctly skipped before they got created. Don't reintroduce.\n- A test for the algorithm that asserts batch count (brittle, depends on packing) instead of the union-coverage invariant — the right test asserts `union(batches[i].pairs) == input_pairs`.\n- Keeping `unjudged_pairs_within` because \"it's still useful\" — the new orchestrator uses `dismissals.contains(p)` directly; no caller remains.",
+      "acceptanceCriteria": [
+        "Positive: `pack_pair_batches(items, candidate_pairs, max_items)` returns a Vec where the union of all batches' `candidate_pairs` equals the input `candidate_pairs` exactly (set equality)",
+        "Positive: every emitted batch has `items.len() <= max_items`",
+        "Positive: identical calls produce identical output (deterministic)",
+        "Positive: `DedupBatchInput` has exactly two fields: `items` and `candidate_pairs: Vec<(i64, i64)>` (no Option, no `already_judged_distinct`)",
+        "Positive: worker always calls `build_dedup_prompt(&items, &candidate_pairs, threshold)` — no match on prompt-mode",
+        "Positive: orchestrator branch construct `DedupBatchInput` from `pack_pair_batches` output; no `chunks(max_cluster_batch)` call remains",
+        "Positive: `curate_dedup` with `emb_list.is_empty()` returns `TaskMgrError::ConfigError` whose message mentions `\"task-mgr curate embed\"` and `\"embeddingProvider\"`",
+        "Positive: `compute_dismissal_pairs` rustdoc has a new paragraph explaining the post-refactor semantics (records cosine-<-threshold pairs that share a batch with a candidate pair, by transitivity of embedding pre-filter)",
+        "Negative: `--pair-mode` flag is GONE — `task-mgr curate dedup --pair-mode` exits non-zero with clap's \"unexpected argument\" message",
+        "Negative: `pair_mode: bool` field on `DedupParams` is GONE — `cargo check` errors anywhere it's still referenced",
+        "Negative: `finalize_dedup_batch`, `prune_batch_to_judgable`, `dismissed_pairs_within`, `build_standard_batches`, `unjudged_pairs_within`, `is_fully_dismissed` all DELETED — no `#[allow(dead_code)]` retention",
+        "Negative: no `batch.chunks(max_cluster_batch)` call remains in `curate_dedup` — grep returns zero hits in `src/commands/curate/mod.rs`",
+        "Negative: no cross-batch pair leaks — every cosine-≥-threshold pair the embeddings surface lands in some batch's `candidate_pairs`",
+        "Unit test: `test_pack_pair_batches_covers_every_input_pair` — N=9 items, 12 sparse candidate pairs, max=7: assert union of all batches' candidate_pairs equals the input set (no missing, no extras)",
+        "Unit test: `test_pack_pair_batches_single_cluster_fits_in_one_batch` — N ≤ max_items: exactly one batch containing all items and all input pairs",
+        "Unit test: `test_pack_pair_batches_forces_split_when_pair_count_exceeds_clique` — 4-item cluster with all 6 pairs candidates, max_items=3: produces ≥ 2 batches, each with items.len() ≤ 3, union covers all 6 pairs",
+        "Unit test: `test_pack_pair_batches_respects_max_items` — every emitted batch has items.len() ≤ max_items across multiple random input sizes",
+        "Unit test: `test_pack_pair_batches_is_deterministic` — same input twice produces bitwise-identical output Vec",
+        "Unit test: `test_pack_pair_batches_star_pattern_packs_efficiently` — input `[(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8)]` (anchor=1, 7 pairs), max_items=7: first batch = `{1,2,3,4,5,6,7}` + first 6 pairs (`(1,2)..(1,7)`); second batch = `{1,8}` + last pair `(1,8)`; total 2 batches",
+        "Unit test: `test_pack_pair_batches_empty_pairs` — empty candidate_pairs returns empty Vec, regardless of items",
+        "Integration test: `test_dedup_rejects_when_no_embeddings_configured` — `embed_model = \"\"` returns ConfigError with the documented message",
+        "Integration test: `test_curate_dedup_records_every_candidate_pair_end_to_end` — 9-item cluster, all 36 pairs are candidates, mock LLM returns `[]`, `batch_size=7`. After run: `SELECT COUNT(*) FROM dedup_dismissals` for these IDs equals at least 36 (may be slightly higher due to cosine-<-threshold incidental pairs from `compute_dismissal_pairs` semantics — but never lower)",
+        "Integration test: `test_curate_dedup_zero_llm_calls_on_clean_rerun` — populate `dedup_dismissals` with every cosine-≥-threshold pair, then run `curate_dedup`. Mock `spawn_claude` to panic if called. Assert successful return and stderr summary names zero batches",
+        "Known-bad: a `pack_pair_batches` impl that uses `items.into_iter().chunks(max_items)` (item-chunking instead of pair-packing) would pass the determinism + max-items tests but FAIL the coverage invariant when pair count exceeds C(max_items, 2)",
+        "CONTRACT: `cluster_by_embedding_similarity` is called exactly once per `curate_dedup` invocation (no second O(N²) pass)",
+        "CONTRACT: every consumer of the old `DedupBatchInput.already_judged_distinct` field has been removed; grep returns zero hits in `src/`",
+        "Failure mode: empty embeddings table (post-config-validation): ConfigError before any LLM call",
+        "Failure mode: a single cluster produces a giant pair list (e.g., 200 items, ~20k pairs): `pack_pair_batches` still terminates and produces deterministic output; consider emitting an `eprintln!` warning at >16 batches per cluster"
+      ],
+      "priority": 3,
+      "estimatedEffort": "high",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Hot zone for the refactor:\n- batch builder at src/commands/curate/mod.rs:813–907\n- DedupBatchInput at ~565–574\n- worker prompt at ~620–630\n- skip-filter wrap at ~920–944\n- operator output at ~962–991\n- compute_dismissal_pairs rustdoc at ~1587–1607 (body UNCHANGED)\n- helpers to delete: finalize_dedup_batch (~1495), prune_batch_to_judgable (~1508), dismissed_pairs_within (~1439), build_standard_batches (~1453), unjudged_pairs_within (~1466), is_fully_dismissed (~1427)\n- CLI flag at src/cli/commands.rs:1694\n- main.rs Dedup arm at 1408,1426\n- DedupParams at src/commands/curate/types.rs:244,263\n\nLearning [1837]: cluster_internal_pairs MUST be excluded from dismissals — already handled by compute_dismissal_pairs unchanged. Learning [1833]: this PR completes the skip-aware framing. Learning [1818]: load/record/clear CRUD set stays; only is_fully_dismissed is removed (the new flow doesn't need a fully-dismissed check). Learning [2690]: normalize_pair canonical form (lo < hi) MUST be preserved; pack_pair_batches outputs pairs in canonical form. Learning [1822]: NO new migration in this PR — v18 dedup_dismissals is sufficient. Learning [1420]: WIRE-FIX-tagged review check — verify the new orchestrator branch is reachable from `task-mgr curate dedup`.",
+      "qualityDimensions": [
+        "Coverage invariant: union of all emitted batches' candidate_pairs equals the post-dismissal-filter input (no missing pairs, no spurious extras)",
+        "Determinism: identical input across two calls produces bitwise-identical batch list",
+        "Item-bound: no batch's items.len() exceeds max_items",
+        "Single pass over candidate_pairs in pack_pair_batches (no nested loops over the full pair list)",
+        "Orchestrator no longer reads `dismissed_pairs_within` — uses `dismissals.contains(p)` directly",
+        "Hard-error path produces a single clear stderr line naming `task-mgr curate embed` and the config key",
+        "Zero-pair clusters generate zero batches AND zero stderr noise (`No candidate pairs to examine` line)"
+      ],
+      "edgeCases": [
+        "Empty candidate_pairs after dismissal filter: zero batches emitted, no LLM call",
+        "Cluster N=2, one pair, un-dismissed: one batch with the one pair",
+        "N=9 cluster with all 36 pairs candidates, max=7: multiple batches; union covers all 36",
+        "Star pattern `[(1,2),(1,3),...,(1,K)]`: packs into `ceil((K-1)/(max_items-1))` batches with anchor reused",
+        "Pair count > C(max_items, 2): forces multiple batches",
+        "Empty embeddings table: hard error before LLM",
+        "Operator passes `--pair-mode`: clap rejects with unexpected-argument error"
+      ],
+      "failureModes": [
+        {
+          "cause": "No embeddings stored",
+          "expectedBehavior": "TaskMgrError::ConfigError with message naming `task-mgr curate embed` and the config key"
+        },
+        {
+          "cause": "Operator passes legacy `--pair-mode`",
+          "expectedBehavior": "Non-zero exit; clap prints \"unexpected argument: --pair-mode\""
+        },
+        {
+          "cause": "Single embedding cluster of 200 items (~20k pairs)",
+          "expectedBehavior": "Algorithm terminates with deterministic output; emit eprintln warning if a single cluster generates > 16 batches suggesting `--batch-size` increase"
+        }
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/tests.rs",
+        "src/cli/commands.rs",
+        "src/main.rs"
+      ],
+      "dependsOn": ["FEAT-002"]
+    },
+    {
+      "id": "FEAT-004",
+      "title": "Update CLAUDE.md Dedup Dismissal Memory + Embedding sections",
+      "taskType": "implementation",
+      "description": "Update `CLAUDE.md` (project root) to reflect the new dedup architecture. Two sections need updating: \"Embedding / Ollama Configuration\" (lines ~291–315) and \"Dedup Dismissal Memory\" (lines ~374–418).\n\n**Embedding section changes:**\n- Add a subsection titled \"Embedder trait\" explaining `pub trait Embedder` + `make_embedder` factory + `embedding_provider` config field. State: the dedup orchestrator and `curate embed` route through the factory; `VectorBackend` stays Ollama-concrete (rationale: `TaskMgrError::OllamaUnreachable` error variant is Ollama-named; rationalization is out of scope).\n- Change the \"Graceful Degradation\" entry for `curate dedup` from `\"works without Ollama — falls back to standard batch sizing when no embeddings exist\"` to `\"hard-requires an embedding provider; emits a ConfigError naming `task-mgr curate embed` when no embeddings are stored\"`.\n\n**Dedup Dismissal Memory section changes:**\n- Drop the \"Subsequent runs skip batches whose every C(N,2) pair is already dismissed\" framing.\n- Replace with: \"The batch builder filters candidate pairs against `dedup_dismissals` before packing — a cluster with all candidate pairs dismissed produces zero batches and zero LLM calls.\"\n- Drop mentions of `is_fully_dismissed` (deleted).\n- Update the \"When dismissals are recorded\" bullet to reflect that `batch_ids` is now the union of items participating in the batch's candidate pairs (may include cosine-<-threshold pairs that share a batch with a candidate pair). Note this is semantically defensible: cosine-<-threshold pairs are distinct by the embedding pre-filter, so recording them as dismissed is correct and operationally useful (re-runs skip them).\n- Note that `--pair-mode` has been removed; pair-judgment is the only path.\n- Add a new subsection \"Candidate pairs are cosine-≥-threshold edges, not transitive cluster pairs\" explaining: `cluster_by_embedding_similarity` returns `EmbeddingClusterResult { clusters, candidate_pairs }`; transitive A~B~C without A·C above threshold does NOT make (A,C) a candidate; the LLM is only asked about pairs the embedding pre-filter actually flagged.\n- Keep existing notes on: v18 schema, normalize_pair, narrow conflict suppression, multi-row INSERT, merge-map rewrite, when NOT recorded (dry_run/LLM error), --reset-dismissals, DedupResult.clusters_skipped (note now reserved for future use; always zero post-refactor), no-foreign-key invariant. All still accurate.\n\nDO preserve the technical depth of the existing section — these notes are load-bearing for future maintainers.\nDO update the rustdoc on `compute_dismissal_pairs` (already done in FEAT-003) to match the CLAUDE.md narrative.\nDO NOT delete the existing notes that are still accurate.\nDO NOT introduce new technical claims that aren't backed by code in this PR.\n\nEdge cases:\n- A reader who only reads CLAUDE.md should be able to understand why a re-run with merges from the prior run still triggers some LLM calls (new merged-into IDs surface fresh neighbor pairs).\n- A reader who only reads CLAUDE.md should not be misled into thinking `is_fully_dismissed` is still callable.\n\nKnown-bad to guard against:\n- A wholesale rewrite that loses load-bearing details (e.g., the `ON CONFLICT DO NOTHING` vs `INSERT OR IGNORE` distinction, the v18 CHECK constraint defense-in-depth).\n- Adding new claims about behavior that aren't actually implemented (e.g., claiming the algorithm uses set-cover when it uses greedy first-fit).",
+      "acceptanceCriteria": [
+        "Positive: CLAUDE.md \"Embedding / Ollama Configuration\" section has a new \"Embedder trait\" subsection describing the trait + factory + `embedding_provider` config field",
+        "Positive: CLAUDE.md \"Graceful Degradation\" subsection notes that `curate dedup` now hard-requires embeddings",
+        "Positive: CLAUDE.md \"Dedup Dismissal Memory\" section reflects pair-batching (not batch-level skip)",
+        "Positive: CLAUDE.md notes that `--pair-mode` has been removed and pair-judgment is the only path",
+        "Positive: CLAUDE.md has a new subsection explaining `candidate_pairs` = cosine-≥-threshold edges only (no transitive pairs)",
+        "Negative: CLAUDE.md does NOT mention `is_fully_dismissed`, `finalize_dedup_batch`, `prune_batch_to_judgable`, `build_standard_batches`, `dismissed_pairs_within`, or `unjudged_pairs_within` (all deleted)",
+        "Negative: CLAUDE.md does NOT mention `--pair-mode` as an active flag (only as a historical removal note, if at all)",
+        "Negative: CLAUDE.md does NOT introduce new technical claims unbacked by this PR's code",
+        "CONTRACT: every behavior described in the updated CLAUDE.md sections is grep-verifiable in `src/commands/curate/`, `src/learnings/embeddings/`, or `src/loop_engine/project_config.rs`",
+        "Failure mode: if FEAT-003's compute_dismissal_pairs rustdoc disagrees with CLAUDE.md's narrative on dismissal semantics: surface the disagreement in REVIEW-001 and update one of them"
+      ],
+      "priority": 4,
+      "estimatedEffort": "low",
+      "passes": false,
+      "modifiesBehavior": false,
+      "notes": "CLAUDE.md sections at lines ~291–315 (Embedding) and ~374–418 (Dedup Dismissal Memory). Learning [1426]: CLAUDE.md updated alongside embedding config additions is the established pattern. Keep the section's bulleted technical-depth structure; this PR's job is to update the narrative, not restructure the doc.",
+      "qualityDimensions": [
+        "Every claim is grep-verifiable in the current codebase",
+        "Load-bearing technical details (v18 CHECK, ON CONFLICT semantics, normalize_pair) preserved",
+        "Reader can understand both the new architecture AND the rationale for the design choices (sparse cosine pairs, hard-require embeddings, trait scaffolding)",
+        "No mention of removed symbols as if they still exist"
+      ],
+      "edgeCases": [
+        "Reader who hasn't seen this PR: should be able to understand pair-batching without reading the PR itself",
+        "Reader debugging a re-run that still calls the LLM after merges: should find the explanation (new merged-into IDs)"
+      ],
+      "failureModes": [
+        {
+          "cause": "CLAUDE.md narrative diverges from code reality after future PRs",
+          "expectedBehavior": "REVIEW-001 and future /compound runs catch the drift; not this task's job to prevent"
+        }
+      ],
+      "touchesFiles": ["CLAUDE.md"],
+      "dependsOn": ["FEAT-003"]
+    },
+    {
+      "id": "REFACTOR-001",
+      "title": "Review for refactoring opportunities",
+      "taskType": "review",
+      "description": "Review all implementation in FEAT-001..FEAT-004 for DRY violations, complexity, coupling, and maintainability.\n\nDO: Check for duplicated logic between the new `pack_pair_batches` algorithm and any prior batching code; verify the Embedder trait surface is minimal (no methods that exist only for one caller); check `pack_pair_batches` and `cluster_by_embedding_similarity` aren't doing redundant O(N²) work; confirm helper deletions left no dead imports or `#[allow(dead_code)]` in their wake; check that the rustdoc on the new types (`EmbeddingClusterResult`, `Embedder`, `DedupBatchInput` post-refactor) is clear about invariants.\nDO NOT: Skip — this gate catches issues before the final review.",
+      "acceptanceCriteria": [
+        "No code duplication: `pack_pair_batches` algorithm logic appears in exactly one place; trait `embed` default and concrete `OllamaEmbedder::embed` aren't duplicated",
+        "Functions under 30 lines (flag complex ones — `curate_dedup`'s body may legitimately exceed this; if so, extract the embedding-cluster branch into a private helper)",
+        "Clear separation of concerns: pair-packing in `dedup.rs`, dismissal recording in `mod.rs`, prompt building in `dedup.rs`",
+        "Code follows existing project patterns (factory functions return `TaskMgrResult<Box<dyn Trait>>`; ProjectConfig fields use `Option<String>` with `unwrap_or_else`)",
+        "No `#[allow(dead_code)]` or commented-out blocks left behind from deletions",
+        "Imports clean: `cargo check` produces zero unused-import warnings",
+        "Rustdoc on `EmbeddingClusterResult` and `pack_pair_batches` documents the coverage invariant and ordering guarantees explicitly",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "priority": 98,
+      "estimatedEffort": "high",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "timeoutSecs": 1800,
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "qualityDimensions": [
+        "DRY across modules (especially between the old and new batching paths — old code MUST be gone, not coexisting)",
+        "Single-responsibility functions",
+        "Pattern consistency with existing code",
+        "No orphan `#[allow(dead_code)]` after helper deletions"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/tests.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/learnings/embeddings/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"]
+    },
+    {
+      "id": "REVIEW-001",
+      "title": "Code review + final verification",
+      "taskType": "review",
+      "description": "Review all implementation for quality, security, integration wiring, and documentation needs. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: Check every new function for error handling; check callers still work (especially after `Embedder` trait migration); verify no dead code; check the operator-visible stderr lines are correct on a smoke run; verify the coverage invariant via the integration test; run full `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` (no scope filter); verify `task-mgr curate dedup --pair-mode` exits non-zero with clap's unexpected-argument error; verify `task-mgr curate dedup` on a DB with zero embeddings returns the documented `ConfigError`.\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode. DO NOT scope the test suite — this is THE place the full suite runs.",
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (`task-mgr curate dedup` invocation; the `Embedder` trait reaches via `make_embedder`)",
+        "Positive: All errors propagated with context (map_err, not unwrap)",
+        "Positive: FULL `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all clean (no scope filter)",
+        "Positive: Smoke run on a real DB with seeded embeddings: `task-mgr curate dedup` runs to completion; stderr shows the new single-line summary",
+        "Positive: Smoke re-run immediately after: stderr says \"No candidate pairs to examine\" (assuming the prior run produced no merges; if merges occurred, document the residual `(N, neighbor)` candidates as expected)",
+        "Positive: `task-mgr curate dedup --pair-mode` exits non-zero with clap's \"unexpected argument\" message",
+        "Positive: `task-mgr curate dedup` on a DB with zero embeddings returns the documented `ConfigError` mentioning `task-mgr curate embed` and `embeddingProvider`",
+        "Negative: No unwrap() in production code paths",
+        "Negative: No dead code warnings for new code",
+        "Negative: No `synergyWith` / `batchWith` / `conflictsWith` populated in any spawned fix task's JSON",
+        "Documentation: CLAUDE.md updates from FEAT-004 are accurate against the final code; if any discrepancy, fix CLAUDE.md (FEAT-004 was speculative; this is the verification gate)",
+        "Documentation: `compute_dismissal_pairs` rustdoc accurately describes the new semantics (batch_ids = union of items in candidate pairs)",
+        "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "priority": 99,
+      "estimatedEffort": "medium",
+      "passes": false,
+      "model": "claude-opus-4-7",
+      "timeoutSecs": 1800,
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001`. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note. Review remaining tasks — if implementation changed APIs, update task descriptions via the loop-engine sync path. Learning [1420]: known WIRE-FIX-style review pattern — grep for the new helper names from entry-point modules to verify reachability.",
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point (grep-verified)",
+        "Full suite green including pre-existing",
+        "CLAUDE.md and rustdoc agree on dismissal semantics",
+        "Operator-visible stderr lines match the documented format"
+      ],
+      "touchesFiles": [
+        "src/commands/curate/dedup.rs",
+        "src/commands/curate/mod.rs",
+        "src/commands/curate/types.rs",
+        "src/commands/curate/tests.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/learnings/embeddings/mod.rs",
+        "src/loop_engine/project_config.rs",
+        "CLAUDE.md"
+      ],
+      "dependsOn": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "REFACTOR-001"]
+    }
+  ]
+}

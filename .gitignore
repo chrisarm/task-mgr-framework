@@ -5,6 +5,7 @@ target/
 # Task manager runtime (SQLite databases, locks)
 .task-mgr/*
 !.task-mgr/tasks/
+.task-mgr/tasks/archive/
 *.db
 **/progress*.txt
 
