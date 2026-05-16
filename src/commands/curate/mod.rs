@@ -933,11 +933,14 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         .collect();
 
     let total_batches = batches.len();
-    if total_batches > 1 {
-        let partial_count = batches
-            .iter()
-            .filter(|b| !b.already_judged_distinct.is_empty())
-            .count();
+    let partial_count = batches
+        .iter()
+        .filter(|b| !b.already_judged_distinct.is_empty())
+        .count();
+    // Print the batch summary when there is more than one batch, OR whenever
+    // any batch carries already-judged hints — a lone partially-dismissed
+    // batch is exactly the re-run case the operator wants visibility into.
+    if total_batches > 1 || partial_count > 0 {
         if partial_count > 0 {
             eprintln!(
                 "Processing {total_batches} batch(es) (concurrency={}), {partial_count} with already-judged pair hints",

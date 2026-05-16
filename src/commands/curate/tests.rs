@@ -2780,6 +2780,91 @@ fn test_finalize_dedup_batch_keeps_small_and_fully_dismissed_batches() {
     );
 }
 
+/// `dismissed_pairs_within` returns only pairs whose BOTH ids are batch
+/// members, normalized and sorted ascending. Pairs touching a non-member id
+/// are excluded.
+#[test]
+fn test_dismissed_pairs_within_returns_sorted_member_subset() {
+    use super::dismissed_pairs_within;
+    use std::collections::HashSet;
+
+    let batch_ids = [1_i64, 2, 3, 5];
+    let dismissals: HashSet<(i64, i64)> = [(2, 3), (1, 2), (4, 5), (1, 5)].into_iter().collect();
+
+    let within = dismissed_pairs_within(&batch_ids, &dismissals);
+    assert_eq!(
+        within,
+        vec![(1, 2), (1, 5), (2, 3)],
+        "only pairs with both ids in the batch, sorted ascending; (4,5) excluded (4 absent)"
+    );
+
+    // Fewer than 2 ids, or no dismissals → empty.
+    assert!(dismissed_pairs_within(&[7], &dismissals).is_empty());
+    assert!(dismissed_pairs_within(&batch_ids, &HashSet::new()).is_empty());
+}
+
+/// `prune_batch_to_judgable` never returns exactly one survivor: pruning is
+/// symmetric, so a batch resolves to either 0 (fully dismissed) or >= 2.
+#[test]
+fn test_prune_batch_to_judgable_symmetric_zero_or_two_plus() {
+    use super::prune_batch_to_judgable;
+    use std::collections::HashSet;
+
+    let trio = make_dedup_items(&[(1, "A", "a"), (2, "B", "b"), (3, "C", "c")]);
+
+    // Every pair dismissed → 0 survivors.
+    let all: HashSet<(i64, i64)> = [(1, 2), (1, 3), (2, 3)].into_iter().collect();
+    assert!(prune_batch_to_judgable(&trio, &all).is_empty());
+
+    // One un-judged pair (2,3) → both endpoints survive; id 1 pruned.
+    let partial: HashSet<(i64, i64)> = [(1, 2), (1, 3)].into_iter().collect();
+    let kept: Vec<i64> = prune_batch_to_judgable(&trio, &partial)
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(kept, vec![2, 3], "survivors always come in pairs, never lone");
+
+    // No dismissals → all survive.
+    assert_eq!(prune_batch_to_judgable(&trio, &HashSet::new()).len(), 3);
+}
+
+/// When `already_judged_distinct` is non-empty the prompt carries an
+/// ALREADY JUDGED DISTINCT block listing each pair as `(lo, hi)`, and that
+/// block precedes the UNTRUSTED warning so the warning stays adjacent to the
+/// delimiter it guards.
+#[test]
+fn test_dedup_prompt_includes_already_judged_block() {
+    let items = make_dedup_items(&[(1, "A", "a"), (2, "B", "b"), (3, "C", "c")]);
+    let prompt = build_dedup_prompt(&items, 0.85, &[(1, 2), (1, 3)]);
+
+    assert!(
+        prompt.contains("ALREADY JUDGED DISTINCT"),
+        "non-empty slice must produce the disclosure block"
+    );
+    assert!(prompt.contains("(1, 2)"), "pair (1,2) must be listed");
+    assert!(prompt.contains("(1, 3)"), "pair (1,3) must be listed");
+
+    let block_pos = prompt
+        .find("ALREADY JUDGED DISTINCT")
+        .expect("block present");
+    let warning_pos = prompt.find("UNTRUSTED").expect("warning present");
+    assert!(
+        block_pos < warning_pos,
+        "disclosure block must precede the UNTRUSTED warning"
+    );
+}
+
+/// An empty `already_judged_distinct` slice produces no disclosure block.
+#[test]
+fn test_dedup_prompt_omits_already_judged_block_when_empty() {
+    let items = make_dedup_items(&[(1, "A", "a"), (2, "B", "b")]);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
+    assert!(
+        !prompt.contains("ALREADY JUDGED DISTINCT"),
+        "empty slice must not emit the disclosure block"
+    );
+}
+
 #[test]
 
 fn test_dedup_prompt_contains_uuid_boundary_delimiter() {
