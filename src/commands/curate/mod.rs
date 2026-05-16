@@ -931,9 +931,7 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 // Pair mode only helps a batch that actually has dismissed
                 // pairs to elide — otherwise the candidate set is the full
                 // C(N,2) and the cluster prompt is the simpler equivalent.
-                let candidate_pairs = if params.pair_mode
-                    && !already_judged_distinct.is_empty()
-                {
+                let candidate_pairs = if params.pair_mode && !already_judged_distinct.is_empty() {
                     Some(unjudged_pairs_within(&ids, &dismissals))
                 } else {
                     None

@@ -2823,7 +2823,11 @@ fn test_prune_batch_to_judgable_symmetric_zero_or_two_plus() {
         .iter()
         .map(|i| i.id)
         .collect();
-    assert_eq!(kept, vec![2, 3], "survivors always come in pairs, never lone");
+    assert_eq!(
+        kept,
+        vec![2, 3],
+        "survivors always come in pairs, never lone"
+    );
 
     // No dismissals → all survive.
     assert_eq!(prune_batch_to_judgable(&trio, &HashSet::new()).len(), 3);
@@ -2885,7 +2889,11 @@ fn test_unjudged_pairs_within_is_dismissed_complement() {
 
     // Complement invariant: dismissed ∪ unjudged = full C(N,2), disjoint.
     let dismissed = dismissed_pairs_within(&ids, &dismissals);
-    assert_eq!(dismissed.len() + unjudged.len(), 6, "C(4,2) = 6 total pairs");
+    assert_eq!(
+        dismissed.len() + unjudged.len(),
+        6,
+        "C(4,2) = 6 total pairs"
+    );
     assert!(
         dismissed.iter().all(|p| !unjudged.contains(p)),
         "the two sets must be disjoint"
