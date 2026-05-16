@@ -20,8 +20,9 @@ use crate::models::{Confidence, LearningOutcome};
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
     DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt,
-    clear_dismissals, compute_dismissal_pairs, curate_count, curate_retire, curate_unretire,
-    is_fully_dismissed, load_dismissals, merge_cluster, parse_dedup_response, record_dismissals,
+    build_pair_judgment_prompt, clear_dismissals, compute_dismissal_pairs, curate_count,
+    curate_retire, curate_unretire, is_fully_dismissed, load_dismissals, merge_cluster,
+    parse_dedup_response, record_dismissals,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2862,6 +2863,69 @@ fn test_dedup_prompt_omits_already_judged_block_when_empty() {
     assert!(
         !prompt.contains("ALREADY JUDGED DISTINCT"),
         "empty slice must not emit the disclosure block"
+    );
+}
+
+/// `unjudged_pairs_within` is the complement of `dismissed_pairs_within`: it
+/// returns exactly the C(N,2) batch pairs NOT in the dismissals, sorted.
+#[test]
+fn test_unjudged_pairs_within_is_dismissed_complement() {
+    use super::{dismissed_pairs_within, unjudged_pairs_within};
+    use std::collections::HashSet;
+
+    let ids = [1_i64, 2, 3, 4];
+    let dismissals: HashSet<(i64, i64)> = [(1, 2), (1, 3), (2, 4)].into_iter().collect();
+
+    let unjudged = unjudged_pairs_within(&ids, &dismissals);
+    assert_eq!(
+        unjudged,
+        vec![(1, 4), (2, 3), (3, 4)],
+        "un-judged = all C(4,2) pairs minus the three dismissed, sorted"
+    );
+
+    // Complement invariant: dismissed ∪ unjudged = full C(N,2), disjoint.
+    let dismissed = dismissed_pairs_within(&ids, &dismissals);
+    assert_eq!(dismissed.len() + unjudged.len(), 6, "C(4,2) = 6 total pairs");
+    assert!(
+        dismissed.iter().all(|p| !unjudged.contains(p)),
+        "the two sets must be disjoint"
+    );
+
+    // No dismissals → every pair is a candidate.
+    assert_eq!(unjudged_pairs_within(&ids, &HashSet::new()).len(), 6);
+}
+
+/// `build_pair_judgment_prompt` enumerates the candidate pairs, keeps the
+/// UNTRUSTED fence + boundary delimiter, and includes ONLY learnings
+/// referenced by a candidate pair (id 3 here is referenced by none).
+#[test]
+fn test_pair_judgment_prompt_lists_candidates_and_restricts_body() {
+    let items = make_dedup_items(&[
+        (1, "Alpha", "alpha content"),
+        (2, "Beta", "beta content"),
+        (3, "Gamma", "gamma content"),
+    ]);
+    let prompt = build_pair_judgment_prompt(&items, &[(1, 2)], 0.85);
+
+    assert!(
+        prompt.contains("CANDIDATE PAIRS: (1, 2)"),
+        "the single candidate pair must be enumerated"
+    );
+    assert!(
+        prompt.contains("ID: 1") && prompt.contains("ID: 2"),
+        "learnings referenced by a candidate pair must appear in the body"
+    );
+    assert!(
+        !prompt.contains("ID: 3"),
+        "a learning referenced by no candidate pair must be excluded from the body"
+    );
+    assert!(
+        prompt.contains("UNTRUSTED"),
+        "pair-judgment prompt must retain the UNTRUSTED injection guard"
+    );
+    assert!(
+        prompt.matches("===BOUNDARY_").count() >= 2,
+        "untrusted content must stay wrapped by the boundary delimiter"
     );
 }
 

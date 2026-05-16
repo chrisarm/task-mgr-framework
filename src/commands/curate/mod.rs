@@ -9,7 +9,10 @@ mod json_utils;
 pub mod output;
 pub mod types;
 
-pub use dedup::{build_dedup_prompt, cluster_by_embedding_similarity, parse_dedup_response};
+pub use dedup::{
+    build_dedup_prompt, build_pair_judgment_prompt, cluster_by_embedding_similarity,
+    parse_dedup_response,
+};
 pub use output::{
     format_count_text, format_dedup_text, format_embed_text, format_enrich_text,
     format_retire_text, format_unretire_text,
@@ -561,7 +564,14 @@ struct BatchOutput {
 /// from the DB once and slices it per batch before dispatch.
 struct DedupBatchInput {
     items: Vec<DeduplicateLearningItem>,
+    /// Pairs within this batch already judged distinct — disclosed to the LLM
+    /// in cluster mode so it does not re-propose them.
     already_judged_distinct: Vec<(i64, i64)>,
+    /// `Some` ⇒ pair-judgment mode: the worker builds `build_pair_judgment_prompt`
+    /// restricted to these un-dismissed candidate pairs. `None` ⇒ cluster mode
+    /// (`build_dedup_prompt`). Set only when `--pair-mode` is on and the batch
+    /// actually has dismissed pairs to elide.
+    candidate_pairs: Option<Vec<(i64, i64)>>,
 }
 
 /// Dispatches LLM batch calls in parallel using `std::thread` + `mpsc`.
@@ -609,11 +619,16 @@ fn process_batches_parallel(
 
                 let batch_items = batch_input.items;
                 let eligible_ids: Vec<i64> = batch_items.iter().map(|i| i.id).collect();
-                let prompt = build_dedup_prompt(
-                    &batch_items,
-                    threshold,
-                    &batch_input.already_judged_distinct,
-                );
+                let prompt = match &batch_input.candidate_pairs {
+                    Some(candidate_pairs) => {
+                        build_pair_judgment_prompt(&batch_items, candidate_pairs, threshold)
+                    }
+                    None => build_dedup_prompt(
+                        &batch_items,
+                        threshold,
+                        &batch_input.already_judged_distinct,
+                    ),
+                };
 
                 let raw_clusters = match spawn_claude(
                     &prompt,
@@ -899,9 +914,10 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
     // Every skipped batch is one we would otherwise send to the LLM with
     // identical input and get an identical "no duplicates" response.
     //
-    // For partially-dismissed batches we still call the LLM, but the prompt
-    // includes the already-judged-distinct pair list so the LLM only spends
-    // attention on the un-judged subset.
+    // For partially-dismissed batches we still call the LLM. In cluster mode
+    // the prompt discloses the already-judged-distinct pairs so the LLM only
+    // spends attention on the un-judged subset; in `--pair-mode` the prompt
+    // instead enumerates exactly the un-judged candidate pairs.
     let mut clusters_skipped: usize = 0;
     let batches: Vec<DedupBatchInput> = batches
         .into_iter()
@@ -912,9 +928,20 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
                 None
             } else {
                 let already_judged_distinct = dismissed_pairs_within(&ids, &dismissals);
+                // Pair mode only helps a batch that actually has dismissed
+                // pairs to elide — otherwise the candidate set is the full
+                // C(N,2) and the cluster prompt is the simpler equivalent.
+                let candidate_pairs = if params.pair_mode
+                    && !already_judged_distinct.is_empty()
+                {
+                    Some(unjudged_pairs_within(&ids, &dismissals))
+                } else {
+                    None
+                };
                 Some(DedupBatchInput {
                     items: batch,
                     already_judged_distinct,
+                    candidate_pairs,
                 })
             }
         })
@@ -937,11 +964,20 @@ pub fn curate_dedup(conn: &Connection, params: DedupParams) -> TaskMgrResult<Ded
         .iter()
         .filter(|b| !b.already_judged_distinct.is_empty())
         .count();
+    let pair_mode_count = batches
+        .iter()
+        .filter(|b| b.candidate_pairs.is_some())
+        .count();
     // Print the batch summary when there is more than one batch, OR whenever
     // any batch carries already-judged hints — a lone partially-dismissed
     // batch is exactly the re-run case the operator wants visibility into.
     if total_batches > 1 || partial_count > 0 {
-        if partial_count > 0 {
+        if pair_mode_count > 0 {
+            eprintln!(
+                "Processing {total_batches} batch(es) (concurrency={}), {pair_mode_count} in pair-judgment mode",
+                params.concurrency
+            );
+        } else if partial_count > 0 {
             eprintln!(
                 "Processing {total_batches} batch(es) (concurrency={}), {partial_count} with already-judged pair hints",
                 params.concurrency
@@ -1418,6 +1454,24 @@ pub(crate) fn dismissed_pairs_within(
     }
     let mut out: Vec<(i64, i64)> = unordered_pairs(batch_ids)
         .filter(|p| all_dismissals.contains(p))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Returns the C(N,2) pairs of `batch_ids` NOT present in `all_dismissals` —
+/// the candidate set a pair-judgment prompt must examine. Sorted ascending
+/// for deterministic prompt content. The complement of `dismissed_pairs_within`
+/// over the same batch.
+pub(crate) fn unjudged_pairs_within(
+    batch_ids: &[i64],
+    all_dismissals: &HashSet<(i64, i64)>,
+) -> Vec<(i64, i64)> {
+    if batch_ids.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<(i64, i64)> = unordered_pairs(batch_ids)
+        .filter(|p| !all_dismissals.contains(p))
         .collect();
     out.sort_unstable();
     out

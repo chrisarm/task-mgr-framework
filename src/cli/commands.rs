@@ -1687,6 +1687,12 @@ THRESHOLD:
         /// of every cluster). Applies even with --dry-run.
         #[arg(long = "reset-dismissals", default_value_t = false)]
         reset_dismissals: bool,
+
+        /// Use the pair-judgment prompt for partially-dismissed batches: the
+        /// LLM judges only the un-dismissed candidate pairs instead of
+        /// re-scanning the whole cluster. Opt-in; default uses cluster prompts.
+        #[arg(long = "pair-mode", default_value_t = false)]
+        pair_mode: bool,
     },
 
     /// Enrich learning metadata using LLM analysis
