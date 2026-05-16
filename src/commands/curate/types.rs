@@ -237,6 +237,11 @@ pub struct DedupParams {
     /// If true, delete all rows from `dedup_dismissals` before running. Applies
     /// even when `dry_run` is true (a reset is a deliberate administrative action).
     pub reset_dismissals: bool,
+    /// If true, partially-dismissed batches use the pair-judgment prompt
+    /// (`build_pair_judgment_prompt`) — the LLM judges only the un-dismissed
+    /// candidate pairs instead of re-scanning the whole cluster. Opt-in
+    /// (`--pair-mode`); default `false` preserves the cluster-prompt path.
+    pub pair_mode: bool,
 }
 
 /// Default Claude model for `curate dedup` LLM calls.
@@ -255,6 +260,7 @@ impl Default for DedupParams {
             model: DEFAULT_DEDUP_MODEL.to_string(),
             db_dir: None,
             reset_dismissals: false,
+            pair_mode: false,
         }
     }
 }

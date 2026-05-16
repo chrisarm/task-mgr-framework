@@ -20,8 +20,9 @@ use crate::models::{Confidence, LearningOutcome};
 use super::output::{format_retire_text, format_unretire_text};
 use super::{
     DeduplicateLearningItem, MergeClusterParams, RetireParams, build_dedup_prompt,
-    clear_dismissals, compute_dismissal_pairs, curate_count, curate_retire, curate_unretire,
-    is_fully_dismissed, load_dismissals, merge_cluster, parse_dedup_response, record_dismissals,
+    build_pair_judgment_prompt, clear_dismissals, compute_dismissal_pairs, curate_count,
+    curate_retire, curate_unretire, is_fully_dismissed, load_dismissals, merge_cluster,
+    parse_dedup_response, record_dismissals,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2777,6 +2778,162 @@ fn test_finalize_dedup_batch_keeps_small_and_fully_dismissed_batches() {
         kept_ids,
         vec![2, 3],
         "member with no un-judged neighbour pruned"
+    );
+}
+
+/// `dismissed_pairs_within` returns only pairs whose BOTH ids are batch
+/// members, normalized and sorted ascending. Pairs touching a non-member id
+/// are excluded.
+#[test]
+fn test_dismissed_pairs_within_returns_sorted_member_subset() {
+    use super::dismissed_pairs_within;
+    use std::collections::HashSet;
+
+    let batch_ids = [1_i64, 2, 3, 5];
+    let dismissals: HashSet<(i64, i64)> = [(2, 3), (1, 2), (4, 5), (1, 5)].into_iter().collect();
+
+    let within = dismissed_pairs_within(&batch_ids, &dismissals);
+    assert_eq!(
+        within,
+        vec![(1, 2), (1, 5), (2, 3)],
+        "only pairs with both ids in the batch, sorted ascending; (4,5) excluded (4 absent)"
+    );
+
+    // Fewer than 2 ids, or no dismissals → empty.
+    assert!(dismissed_pairs_within(&[7], &dismissals).is_empty());
+    assert!(dismissed_pairs_within(&batch_ids, &HashSet::new()).is_empty());
+}
+
+/// `prune_batch_to_judgable` never returns exactly one survivor: pruning is
+/// symmetric, so a batch resolves to either 0 (fully dismissed) or >= 2.
+#[test]
+fn test_prune_batch_to_judgable_symmetric_zero_or_two_plus() {
+    use super::prune_batch_to_judgable;
+    use std::collections::HashSet;
+
+    let trio = make_dedup_items(&[(1, "A", "a"), (2, "B", "b"), (3, "C", "c")]);
+
+    // Every pair dismissed → 0 survivors.
+    let all: HashSet<(i64, i64)> = [(1, 2), (1, 3), (2, 3)].into_iter().collect();
+    assert!(prune_batch_to_judgable(&trio, &all).is_empty());
+
+    // One un-judged pair (2,3) → both endpoints survive; id 1 pruned.
+    let partial: HashSet<(i64, i64)> = [(1, 2), (1, 3)].into_iter().collect();
+    let kept: Vec<i64> = prune_batch_to_judgable(&trio, &partial)
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![2, 3],
+        "survivors always come in pairs, never lone"
+    );
+
+    // No dismissals → all survive.
+    assert_eq!(prune_batch_to_judgable(&trio, &HashSet::new()).len(), 3);
+}
+
+/// When `already_judged_distinct` is non-empty the prompt carries an
+/// ALREADY JUDGED DISTINCT block listing each pair as `(lo, hi)`, and that
+/// block precedes the UNTRUSTED warning so the warning stays adjacent to the
+/// delimiter it guards.
+#[test]
+fn test_dedup_prompt_includes_already_judged_block() {
+    let items = make_dedup_items(&[(1, "A", "a"), (2, "B", "b"), (3, "C", "c")]);
+    let prompt = build_dedup_prompt(&items, 0.85, &[(1, 2), (1, 3)]);
+
+    assert!(
+        prompt.contains("ALREADY JUDGED DISTINCT"),
+        "non-empty slice must produce the disclosure block"
+    );
+    assert!(prompt.contains("(1, 2)"), "pair (1,2) must be listed");
+    assert!(prompt.contains("(1, 3)"), "pair (1,3) must be listed");
+
+    let block_pos = prompt
+        .find("ALREADY JUDGED DISTINCT")
+        .expect("block present");
+    let warning_pos = prompt.find("UNTRUSTED").expect("warning present");
+    assert!(
+        block_pos < warning_pos,
+        "disclosure block must precede the UNTRUSTED warning"
+    );
+}
+
+/// An empty `already_judged_distinct` slice produces no disclosure block.
+#[test]
+fn test_dedup_prompt_omits_already_judged_block_when_empty() {
+    let items = make_dedup_items(&[(1, "A", "a"), (2, "B", "b")]);
+    let prompt = build_dedup_prompt(&items, 0.85, &[]);
+    assert!(
+        !prompt.contains("ALREADY JUDGED DISTINCT"),
+        "empty slice must not emit the disclosure block"
+    );
+}
+
+/// `unjudged_pairs_within` is the complement of `dismissed_pairs_within`: it
+/// returns exactly the C(N,2) batch pairs NOT in the dismissals, sorted.
+#[test]
+fn test_unjudged_pairs_within_is_dismissed_complement() {
+    use super::{dismissed_pairs_within, unjudged_pairs_within};
+    use std::collections::HashSet;
+
+    let ids = [1_i64, 2, 3, 4];
+    let dismissals: HashSet<(i64, i64)> = [(1, 2), (1, 3), (2, 4)].into_iter().collect();
+
+    let unjudged = unjudged_pairs_within(&ids, &dismissals);
+    assert_eq!(
+        unjudged,
+        vec![(1, 4), (2, 3), (3, 4)],
+        "un-judged = all C(4,2) pairs minus the three dismissed, sorted"
+    );
+
+    // Complement invariant: dismissed ∪ unjudged = full C(N,2), disjoint.
+    let dismissed = dismissed_pairs_within(&ids, &dismissals);
+    assert_eq!(
+        dismissed.len() + unjudged.len(),
+        6,
+        "C(4,2) = 6 total pairs"
+    );
+    assert!(
+        dismissed.iter().all(|p| !unjudged.contains(p)),
+        "the two sets must be disjoint"
+    );
+
+    // No dismissals → every pair is a candidate.
+    assert_eq!(unjudged_pairs_within(&ids, &HashSet::new()).len(), 6);
+}
+
+/// `build_pair_judgment_prompt` enumerates the candidate pairs, keeps the
+/// UNTRUSTED fence + boundary delimiter, and includes ONLY learnings
+/// referenced by a candidate pair (id 3 here is referenced by none).
+#[test]
+fn test_pair_judgment_prompt_lists_candidates_and_restricts_body() {
+    let items = make_dedup_items(&[
+        (1, "Alpha", "alpha content"),
+        (2, "Beta", "beta content"),
+        (3, "Gamma", "gamma content"),
+    ]);
+    let prompt = build_pair_judgment_prompt(&items, &[(1, 2)], 0.85);
+
+    assert!(
+        prompt.contains("CANDIDATE PAIRS: (1, 2)"),
+        "the single candidate pair must be enumerated"
+    );
+    assert!(
+        prompt.contains("ID: 1") && prompt.contains("ID: 2"),
+        "learnings referenced by a candidate pair must appear in the body"
+    );
+    assert!(
+        !prompt.contains("ID: 3"),
+        "a learning referenced by no candidate pair must be excluded from the body"
+    );
+    assert!(
+        prompt.contains("UNTRUSTED"),
+        "pair-judgment prompt must retain the UNTRUSTED injection guard"
+    );
+    assert!(
+        prompt.matches("===BOUNDARY_").count() >= 2,
+        "untrusted content must stay wrapped by the boundary delimiter"
     );
 }
 
