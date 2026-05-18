@@ -14,7 +14,9 @@ use task_mgr::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNE
 use task_mgr::loop_engine::overflow::{
     self, OverflowEvent, RecoveryAction, sanitize_id_for_filename,
 };
+use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- helpers ----------------------------------------------------------
 
@@ -117,6 +119,8 @@ fn dispatch_wave_overflows(
             Some("run-wave"),
             tmp_dir,
             Some(slot),
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         results.push((slot, action));
     }
@@ -503,6 +507,8 @@ fn sequential_jsonl_event_has_no_slot_index_field() {
         Some("run-seq"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let raw_events = read_event_values(tmp.path());
@@ -552,6 +558,8 @@ fn dump_rotation_keeps_newest_3_across_wave_iterations() {
             Some("run-wave"),
             tmp.path(),
             Some(2),
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         // Clear model_overrides so each call re-selects the intended rung.
         ctx.model_overrides.remove(task_id);
@@ -607,6 +615,8 @@ fn dump_rotation_namespaces_are_per_task_id() {
             Some("run-wave"),
             tmp.path(),
             Some(0),
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         ctx.effort_overrides.remove(task_a);
         ctx.overflow_recovered.remove(task_a);
@@ -627,6 +637,8 @@ fn dump_rotation_namespaces_are_per_task_id() {
             Some("run-wave"),
             tmp.path(),
             Some(1),
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         ctx.effort_overrides.remove(task_b);
         ctx.overflow_recovered.remove(task_b);
@@ -676,6 +688,8 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
         Some("run-wave"),
         tmp.path(),
         Some(4),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(
         matches!(wave_action, RecoveryAction::DowngradeEffort { .. }),
@@ -705,6 +719,8 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
         Some("run-seq"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(
         matches!(seq_action, RecoveryAction::EscalateModel { .. }),
@@ -776,6 +792,8 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
         Some("run-seq"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(ctx.overflow_recovered.contains(task_id));
     assert_eq!(
@@ -798,6 +816,8 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
         Some("run-wave"),
         tmp.path(),
         Some(0),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(
         matches!(wave_action, RecoveryAction::EscalateModel { ref new_model } if new_model == SONNET_MODEL),
@@ -846,6 +866,8 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
         Some("run-wave-1"),
         tmp.path(),
         Some(1),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(ctx.overflow_recovered.contains(wave1_task));
 
@@ -863,6 +885,8 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
         Some("run-wave-2"),
         tmp.path(),
         Some(0),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     // Both task_ids in overflow_recovered (long-lived ctx, wave-global set).
@@ -929,6 +953,8 @@ fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
         Some("run-wave"),
         tmp.path(),
         Some(0),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     // Verify typed struct has task_difficulty propagated.

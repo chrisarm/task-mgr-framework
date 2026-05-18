@@ -17,7 +17,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::loop_engine::model;
+use crate::loop_engine::project_config::ProjectConfig;
 use crate::loop_engine::prompt::PromptResult;
+use crate::loop_engine::runner::RunnerKind;
 
 /// Recovery action chosen by `handle_prompt_too_long` for a given overflow.
 ///
@@ -38,6 +40,16 @@ pub enum RecoveryAction {
     #[serde(rename = "to_1m_model")]
     To1mModel {
         new_model: String,
+    },
+    /// Rung 4 (FEAT-006): the Claude ladder is exhausted and the fallback
+    /// runner config is enabled — promote the task to the fallback provider
+    /// (Grok today). Fires only when `project_config.fallback_runner` is
+    /// `Some(cfg)` with `cfg.enabled = true` AND the effective runner is
+    /// still `RunnerKind::Claude` (idempotency guard — a task already on
+    /// Grok falls through to `Blocked`).
+    FallbackToProvider {
+        provider: String,
+        model: String,
     },
     Blocked,
 }
@@ -61,6 +73,11 @@ impl RecoveryAction {
             ),
             Self::To1mModel { new_model } => format!(
                 "Prompt is too long for {task_id} at effort {eff}, model {mdl} — escalating to 1M-context variant {new_model} (already at Opus)",
+            ),
+            Self::FallbackToProvider {
+                model: grok_model, ..
+            } => format!(
+                "Prompt is too long for {task_id} at effort {eff}, model {mdl} — falling back to {grok_model} (Claude ladder exhausted)",
             ),
             Self::Blocked => format!(
                 "Prompt is too long for {task_id} at effort {eff}, model {mdl} — no recovery available (already at Opus[1M] with effort=high)",
@@ -306,6 +323,17 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
     Ok(())
 }
 
+/// Read the current `tasks.model` column for a task, returning `Ok(None)` when
+/// the column is NULL and `Err` only on a connectivity / schema failure.
+/// Used by [`handle_prompt_too_long`] to capture the pre-fallback model into
+/// `ctx.overflow_original_task_model` before the rung-4 UPDATE mutates the
+/// column.
+fn read_task_model_from_db(conn: &Connection, task_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT model FROM tasks WHERE id = ?1", [task_id], |r| {
+        r.get::<_, Option<String>>(0)
+    })
+}
+
 /// Handle a `PromptTooLong` outcome end-to-end: pick a recovery rung, mutate
 /// `IterationContext`, update the task row, emit the stderr message, and
 /// write the diagnostics bundle (dump + JSONL + rotation).
@@ -316,9 +344,13 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
 ///
 /// **Order of operations** (must not be reordered — the recovery state
 /// must be durable before any best-effort observability runs):
-/// 1. Pick recovery rung (1-effort downgrade → 2-model escalate → 3-1M model → 4-blocked).
-/// 2. Update `ctx.overflow_recovered` and `ctx.overflow_original_model` (first-overflow only).
-/// 3. UPDATE the task row (status='todo' on rungs 1-3, 'blocked' on rung 4).
+/// 1. Pick recovery rung (1-effort downgrade → 2-model escalate → 3-1M model
+///    → 4-fallback-to-provider → 5-blocked).
+/// 2. Update `ctx.overflow_recovered`, `ctx.overflow_original_model`
+///    (first-overflow only), and `ctx.overflow_original_task_model`
+///    (first-fallback snapshot of the `tasks.model` DB column).
+/// 3. UPDATE the task row (status='todo' on rungs 1-3, 'todo' AND set
+///    `tasks.model = cfg.model` on rung 4, 'blocked' on rung 5).
 /// 4. Emit the rung-specific stderr message.
 /// 5. Best-effort: write prompt dump.
 /// 6. Best-effort: append JSONL event line.
@@ -326,6 +358,12 @@ pub fn rotate_dumps_keep_n(dir: &Path, sanitized_task_id: &str, keep: usize) -> 
 ///
 /// Filesystem failures in steps 5-7 are logged via `eprintln!` and never
 /// propagate — observability is best-effort, recovery is not.
+///
+/// `effective_runner` is the single computed value from
+/// [`crate::loop_engine::engine::resolve_effective_runner`] at the spawn
+/// site — the rung-4 idempotency guard pins on this value (PRD §2.5
+/// "single-predicate guard" — never re-derive via
+/// `runner_overrides.get(task)` OR `provider_for_model(model)`).
 #[allow(clippy::too_many_arguments)]
 pub fn handle_prompt_too_long(
     ctx: &mut crate::loop_engine::engine::IterationContext,
@@ -338,8 +376,17 @@ pub fn handle_prompt_too_long(
     run_id: Option<&str>,
     base_dir: &Path,
     slot_index: Option<usize>,
+    effective_runner: RunnerKind,
+    project_config: &ProjectConfig,
 ) -> RecoveryAction {
-    // Step 1: pick recovery rung.
+    // Step 1: pick recovery rung. Rung 4 (FallbackToProvider) sits between
+    // rung 3 (to_1m_model) and rung 5 (Blocked); its precondition is a
+    // SINGLE-predicate guard (PRD §2.5): the computed `effective_runner`
+    // value MUST be `RunnerKind::Claude` AND the fallback config MUST be
+    // enabled. Re-deriving the guard via
+    // `runner_overrides.get(...).is_none() || provider_for_model(...) == Claude`
+    // is explicitly prohibited because it can silently drift between the
+    // spawn-site value and the rung-4 check.
     let action = if let Some(next_effort) = model::downgrade_effort(effort) {
         ctx.effort_overrides
             .insert(task_id.to_string(), next_effort);
@@ -358,25 +405,66 @@ pub fn handle_prompt_too_long(
         RecoveryAction::To1mModel {
             new_model: m1m.to_string(),
         }
+    } else if effective_runner == RunnerKind::Claude
+        && let Some(cfg) = project_config.fallback_runner.as_ref()
+        && cfg.enabled
+    {
+        ctx.runner_overrides
+            .insert(task_id.to_string(), RunnerKind::Grok);
+        ctx.model_overrides
+            .insert(task_id.to_string(), cfg.model.clone());
+        RecoveryAction::FallbackToProvider {
+            provider: cfg.provider.clone(),
+            model: cfg.model.clone(),
+        }
     } else {
         RecoveryAction::Blocked
     };
 
     // Step 2: capture overflow markers — first-overflow capture for
     // `overflow_original_model` (entry().or_insert_with), unconditional
-    // insert for the recovered set.
+    // insert for the recovered set. Also capture the pre-fallback
+    // `tasks.model` DB column into `overflow_original_task_model` BEFORE the
+    // rung-4 DB UPDATE mutates it; the snapshot is used by FEAT-008's
+    // `check_override_invalidation` to detect operator edits and drop stale
+    // overrides. Captured for every rung (entry().or_insert_with is
+    // idempotent) so the snapshot remains stable across repeated overflows
+    // on the same task.
     ctx.overflow_recovered.insert(task_id.to_string());
     ctx.overflow_original_model
         .entry(task_id.to_string())
         .or_insert_with(|| effective_model.unwrap_or("(default)").to_string());
+    ctx.overflow_original_task_model
+        .entry(task_id.to_string())
+        .or_insert_with(|| read_task_model_from_db(conn, task_id).unwrap_or(None));
 
-    // Step 3: update DB (status='todo' resets started_at; 'blocked' leaves it for audit).
-    let sql = if matches!(action, RecoveryAction::Blocked) {
-        "UPDATE tasks SET status = 'blocked' WHERE id = ?1 AND status = 'in_progress'"
-    } else {
-        "UPDATE tasks SET status = 'todo', started_at = NULL WHERE id = ?1 AND status = 'in_progress'"
-    };
-    let _ = conn.execute(sql, rusqlite::params![task_id]);
+    // Step 3: update DB.
+    //   - Blocked            → status='blocked' (started_at preserved for audit)
+    //   - FallbackToProvider → status='todo' + clear started_at + set tasks.model = cfg.model
+    //                          so `resolve_task_model` picks the Grok model on next iteration.
+    //   - Rungs 1-3          → status='todo' + clear started_at (model unchanged)
+    match action {
+        RecoveryAction::Blocked => {
+            let _ = conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?1 AND status = 'in_progress'",
+                rusqlite::params![task_id],
+            );
+        }
+        RecoveryAction::FallbackToProvider { ref model, .. } => {
+            let _ = conn.execute(
+                "UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL \
+                 WHERE id = ?2 AND status = 'in_progress'",
+                rusqlite::params![model, task_id],
+            );
+        }
+        _ => {
+            let _ = conn.execute(
+                "UPDATE tasks SET status = 'todo', started_at = NULL \
+                 WHERE id = ?1 AND status = 'in_progress'",
+                rusqlite::params![task_id],
+            );
+        }
+    }
 
     // Step 4: rung-specific stderr message.
     eprintln!("{}", action.user_message(task_id, effort, effective_model));
@@ -536,6 +624,50 @@ mod tests {
             msg,
             "Prompt is too long for MY-TASK-001 at effort (default), model (default) — no recovery available (already at Opus[1M] with effort=high)"
         );
+    }
+
+    #[test]
+    fn user_message_fallback_to_provider_exact_string() {
+        let msg = RecoveryAction::FallbackToProvider {
+            provider: "grok".to_string(),
+            model: "grok-4-fast".to_string(),
+        }
+        .user_message("MY-TASK-001", Some("high"), Some(model::OPUS_MODEL_1M));
+        assert_eq!(
+            msg,
+            format!(
+                "Prompt is too long for MY-TASK-001 at effort high, model {} — falling back to grok-4-fast (Claude ladder exhausted)",
+                model::OPUS_MODEL_1M,
+            )
+        );
+    }
+
+    #[test]
+    fn recovery_fallback_to_provider_serialization() {
+        let v = serde_json::to_value(RecoveryAction::FallbackToProvider {
+            provider: "grok".to_string(),
+            model: "grok-4-fast".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "action": "fallback_to_provider",
+                "provider": "grok",
+                "model": "grok-4-fast",
+            })
+        );
+    }
+
+    #[test]
+    fn recovery_fallback_to_provider_round_trip() {
+        let action = RecoveryAction::FallbackToProvider {
+            provider: "grok".to_string(),
+            model: "grok-4-fast".to_string(),
+        };
+        let s = serde_json::to_string(&action).unwrap();
+        let back: RecoveryAction = serde_json::from_str(&s).unwrap();
+        assert_eq!(action, back);
     }
 
     fn sample_event() -> OverflowEvent {

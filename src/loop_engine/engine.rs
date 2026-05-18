@@ -151,6 +151,12 @@ pub struct IterationParams<'a> {
     pub permission_mode: &'a PermissionMode,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
     pub batch_sibling_prds: &'a [PathBuf],
+    /// Full per-project loop configuration (`.task-mgr/config.json`). Read
+    /// once at the start of `run_loop` and threaded through here so that
+    /// `overflow::handle_prompt_too_long` (FEAT-006 rung 4) can consult
+    /// `fallback_runner` without re-reading the file from every iteration.
+    /// Matches the wave-mode plumbing on `WaveIterationParams::project_config`.
+    pub project_config: &'a project_config::ProjectConfig,
 }
 
 /// Result of a single iteration.
@@ -1419,12 +1425,11 @@ fn process_slot_result(
             section_sizes: slot_result.section_sizes.clone(),
         };
         // FEAT-005: resolve effective_runner via the single-source helper so
-        // FEAT-008's overflow rung 4 (FallbackToProvider) can pin its
-        // idempotency guard on the same value the slot used to dispatch.
-        // Underscore-prefixed until the handler signature gains the
-        // parameter — kept in scope here so the contract sites stay
-        // co-located.
-        let _effective_runner = resolve_effective_runner(
+        // FEAT-006's overflow rung 4 (FallbackToProvider) pins its idempotency
+        // guard on the same value the slot used to dispatch. Computed once
+        // here and passed through to `handle_prompt_too_long` — never
+        // re-derived inside the handler (PRD §2.5 "single-predicate guard").
+        let effective_runner = resolve_effective_runner(
             ctx,
             tid,
             slot_result.iteration_result.effective_model.as_deref(),
@@ -1440,6 +1445,8 @@ fn process_slot_result(
             Some(params.run_id),
             params.db_dir,
             Some(slot_idx),
+            effective_runner,
+            params.project_config,
         );
     }
 
@@ -2626,6 +2633,10 @@ pub fn run_iteration(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) {
+        // FEAT-006: compute `effective_runner` once via the single-source
+        // helper and pass it through so the rung-4 idempotency guard pins on
+        // the same value the iteration's spawn site resolved (PRD §2.5).
+        let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
         let _ = overflow::handle_prompt_too_long(
             ctx,
             params.conn,
@@ -2637,6 +2648,8 @@ pub fn run_iteration(
             Some(params.run_id),
             params.db_dir,
             None,
+            effective_runner,
+            params.project_config,
         );
     }
 
@@ -3782,6 +3795,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             user_default_model: user_default_model.as_deref(),
             permission_mode: &permission_mode,
             batch_sibling_prds: &run_config.batch_sibling_prds,
+            project_config: &project_config,
         };
 
         let mut result = match run_iteration(&mut ctx, &iteration_params) {
