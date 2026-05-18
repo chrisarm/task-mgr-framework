@@ -168,6 +168,25 @@ pub enum TaskMgrError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Grok CLI failed to authenticate.
+    ///
+    /// Detected by `GrokRunner` (FR-007) when the Grok CLI exits non-zero
+    /// within ~3 seconds of spawn AND stderr contains a well-known
+    /// auth-failure substring (case-insensitive): `not authenticated`,
+    /// `please run grok login`, `grok login required`. The fast-fail timing
+    /// window distinguishes a real auth lapse from a tool-use runtime error
+    /// emitted after the agent has been running for a while.
+    ///
+    /// Recovery is operator-driven (run `grok login`); the loop engine
+    /// short-circuits Grok promotion when it sees this so an unauthenticated
+    /// Grok install does not silently churn through retries.
+    #[error("Grok authentication failed: {hint}")]
+    GrokAuthFailure {
+        /// Operator-friendly remediation hint (e.g., "Run `grok login` to
+        /// authenticate, then retry the task.").
+        hint: String,
+    },
 }
 
 /// Default hint for lock errors when a specific PID is known.
