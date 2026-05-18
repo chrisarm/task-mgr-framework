@@ -13,6 +13,30 @@ use crate::commands::complete as complete_cmd;
 use crate::db::prefix::prefix_and;
 use crate::loop_engine::prd_reconcile::update_prd_task_passes;
 
+fn query_incomplete_task_ids(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let (pfx_clause, pfx_param) = prefix_and(task_prefix);
+    let sql = format!(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+        Some(p) => vec![p],
+        None => vec![],
+    };
+    let ids = stmt
+        .query_map(params.as_slice(), |row| row.get(0))
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ids)
+}
+
 /// Scan recent commits in an external git repo for task completion evidence.
 ///
 /// Queries all incomplete task IDs from the DB, then checks recent git commits
@@ -74,32 +98,13 @@ pub(crate) fn reconcile_external_git_completions(
     let commit_lines: Vec<String> = output.lines().map(|l| l.to_uppercase()).collect();
 
     // Query all incomplete task IDs, scoped to this PRD's prefix.
-    let (regc_pfx_clause, regc_pfx_param) = prefix_and(task_prefix);
-    let regc_sql = format!(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {regc_pfx_clause}"
-    );
-    let mut stmt = match conn.prepare(&regc_sql) {
-        Ok(s) => s,
+    let task_ids = match query_incomplete_task_ids(conn, task_prefix) {
+        Ok(ids) => ids,
         Err(e) => {
             eprintln!("Warning: could not query tasks for reconciliation: {}", e);
             return 0;
         }
     };
-
-    let regc_params: Vec<&dyn rusqlite::types::ToSql> = match &regc_pfx_param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    let task_ids: Vec<String> = stmt
-        .query_map(regc_params.as_slice(), |row| row.get(0))
-        .ok()
-        .map(|rows| {
-            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    drop(stmt);
 
     let mut reconciled = 0;
 
@@ -238,32 +243,13 @@ pub(crate) fn reconcile_merged_slot_completions(
     }
 
     // Enumerate incomplete tasks, scoped to this PRD's prefix.
-    let (pfx_clause, pfx_param) = prefix_and(task_prefix);
-    let sql = format!(
-        "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') AND archived_at IS NULL {pfx_clause}"
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
+    let task_ids = match query_incomplete_task_ids(conn, task_prefix) {
+        Ok(ids) => ids,
         Err(e) => {
             eprintln!("Post-merge reconcile: could not query tasks: {}", e);
             return Vec::new();
         }
     };
-
-    let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
-        Some(p) => vec![p],
-        None => vec![],
-    };
-    let task_ids: Vec<String> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))
-        .ok()
-        .map(|rows| {
-            rows.filter_map(|r: rusqlite::Result<String>| r.ok())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    drop(stmt);
 
     let mut reconciled: Vec<String> = Vec::new();
 
