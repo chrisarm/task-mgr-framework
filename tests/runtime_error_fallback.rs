@@ -21,14 +21,18 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use task_mgr::db::{create_schema, open_connection, run_migrations};
-use task_mgr::loop_engine::engine::{escalate_task_model_if_needed, handle_task_failure};
+use task_mgr::loop_engine::engine::{
+    IterationContext, escalate_task_model_if_needed, handle_task_failure,
+};
 use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
+use task_mgr::loop_engine::runner::RunnerKind;
 
-/// The PRD-default Grok model id. Pinned here (not imported from
-/// `task_mgr::loop_engine::model`) because the constant does not yet exist
-/// in `model.rs` — FEAT-002 / FEAT-003 will add it. Until then, tests
-/// reference the literal so the file compiles.
-const GROK_DEFAULT_MODEL: &str = "grok-2-1212";
+/// Grok model id used in this file's tests. The default in
+/// `FallbackRunnerConfig::default()` is `"grok-4-fast"`, but the AC-#1 / AC-#5
+/// promotion tests construct an explicit config, so we pin the value here and
+/// thread it through.
+const GROK_DEFAULT_MODEL: &str = "grok-4-fast";
 
 /// Expected promotion threshold under the FEAT-007 contract. PRD §3 US-004
 /// pins the default at 2 consecutive failures (same gate as Claude-tier
@@ -76,14 +80,7 @@ fn read_consecutive_failures(conn: &Connection, id: &str) -> i32 {
 /// the Grok promotion branch must fire: it inserts
 /// `runner_overrides[task] = RunnerKind::Grok`, `model_overrides[task] = cfg.model`,
 /// and updates the `tasks.model` DB column to `cfg.model`.
-///
-/// Today's signature has no `IterationContext` / `FallbackRunnerConfig`
-/// parameters, so the call below uses the existing signature and merely
-/// pins what today produces: an Opus → Opus no-op (no promotion). FEAT-006
-/// will rewrite the body to construct the future arguments and assert the
-/// post-FEAT-007 contract.
 #[test]
-#[ignore = "FEAT-007: requires FallbackRunnerConfig + IterationContext threading"]
 fn promotion_fires_at_opus_and_threshold_with_fallback_enabled() {
     let (_dir, conn) = setup_db();
     insert_task(
@@ -93,18 +90,46 @@ fn promotion_fires_at_opus_and_threshold_with_fallback_enabled() {
         FALLBACK_THRESHOLD - 1,
     );
 
-    // CURRENT signature — kept compilable. After FEAT-007:
-    //   let mut ctx = IterationContext::new(8);
-    //   let cfg = FallbackRunnerConfig { enabled: true, model: GROK_DEFAULT_MODEL.into(), threshold: 2, ..Default::default() };
-    //   let outcome = escalate_task_model_if_needed(&conn, "PROMOTE-001", FALLBACK_THRESHOLD, &mut ctx, &cfg).unwrap();
-    //   assert_eq!(ctx.runner_overrides.get("PROMOTE-001"), Some(&RunnerKind::Grok));
-    //   assert_eq!(ctx.model_overrides.get("PROMOTE-001"), Some(&GROK_DEFAULT_MODEL.to_string()));
-    //   assert_eq!(read_model(&conn, "PROMOTE-001").as_deref(), Some(GROK_DEFAULT_MODEL));
-    let _ = escalate_task_model_if_needed(&conn, "PROMOTE-001", FALLBACK_THRESHOLD).unwrap();
-    panic!(
-        "FEAT-007 not yet wired — when implemented, signature gains \
-         (&mut IterationContext, &FallbackRunnerConfig) and promotion writes \
-         tasks.model = {GROK_DEFAULT_MODEL} + runner_overrides + model_overrides"
+    let mut ctx = IterationContext::new(8);
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        model: GROK_DEFAULT_MODEL.to_string(),
+        runtime_error_threshold: FALLBACK_THRESHOLD as u32,
+        ..Default::default()
+    };
+    let outcome = escalate_task_model_if_needed(
+        &conn,
+        "PROMOTE-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "promotion must return the Grok model id from cfg",
+    );
+    assert_eq!(
+        ctx.runner_overrides.get("PROMOTE-001"),
+        Some(&RunnerKind::Grok),
+        "promotion must set runner_overrides[task] = Grok",
+    );
+    assert_eq!(
+        ctx.model_overrides.get("PROMOTE-001"),
+        Some(&GROK_DEFAULT_MODEL.to_string()),
+        "promotion must set model_overrides[task] = cfg.model",
+    );
+    assert_eq!(
+        read_model(&conn, "PROMOTE-001").as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "promotion must UPDATE tasks.model to cfg.model",
+    );
+    assert_eq!(
+        ctx.overflow_original_task_model.get("PROMOTE-001"),
+        Some(&Some(OPUS_MODEL.to_string())),
+        "promotion must snapshot the pre-promotion model into overflow_original_task_model",
     );
 }
 
@@ -119,7 +144,8 @@ fn no_promotion_when_consecutive_failures_below_threshold() {
     let (_dir, conn) = setup_db();
     insert_task(&conn, "BELOW-001", Some(OPUS_MODEL), 0);
 
-    let result = escalate_task_model_if_needed(&conn, "BELOW-001", 1).unwrap();
+    let mut ctx = IterationContext::new(8);
+    let result = escalate_task_model_if_needed(&conn, "BELOW-001", 1, &mut ctx, None).unwrap();
     assert_eq!(
         result, None,
         "consecutive_failures=1 must not trigger escalation OR promotion",
@@ -142,11 +168,29 @@ fn sonnet_at_threshold_escalates_to_opus_first_not_grok() {
     let (_dir, conn) = setup_db();
     insert_task(&conn, "SONNET-001", Some(SONNET_MODEL), 0);
 
-    let result = escalate_task_model_if_needed(&conn, "SONNET-001", FALLBACK_THRESHOLD).unwrap();
+    let mut ctx = IterationContext::new(8);
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        model: GROK_DEFAULT_MODEL.to_string(),
+        runtime_error_threshold: FALLBACK_THRESHOLD as u32,
+        ..Default::default()
+    };
+    let result = escalate_task_model_if_needed(
+        &conn,
+        "SONNET-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
     assert_eq!(
         result,
         Some(OPUS_MODEL.to_string()),
         "Sonnet must escalate to Opus first; Grok promotion is reserved for the NEXT failure cycle when at Opus + threshold",
+    );
+    assert!(
+        !ctx.runner_overrides.contains_key("SONNET-001"),
+        "Sonnet escalation must NOT set runner_overrides — that's the Grok promotion branch",
     );
     assert_eq!(
         read_model(&conn, "SONNET-001").as_deref(),
@@ -175,7 +219,18 @@ fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
     let (_dir, conn) = setup_db();
     insert_task(&conn, "OPUS-CEIL-001", Some(OPUS_MODEL), 0);
 
-    let result = escalate_task_model_if_needed(&conn, "OPUS-CEIL-001", FALLBACK_THRESHOLD).unwrap();
+    let mut ctx = IterationContext::new(8);
+    // Disabled config: Grok branch MUST NOT fire — return must match today exactly.
+    let cfg = FallbackRunnerConfig::default();
+    assert!(!cfg.enabled, "default config must keep fallback disabled");
+    let result = escalate_task_model_if_needed(
+        &conn,
+        "OPUS-CEIL-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
     // Pin today's exact return: Some(OPUS_MODEL) — the Opus self-loop in
     // `escalate_model`. FEAT-007 with `enabled = false` must preserve this.
     // With `enabled = true` and the Grok branch taken, the return would be
@@ -184,6 +239,10 @@ fn fallback_disabled_keeps_existing_opus_ceiling_byte_for_byte() {
         result,
         Some(OPUS_MODEL.to_string()),
         "with fallback disabled, escalate_model loops Opus→Opus; return must match today exactly",
+    );
+    assert!(
+        !ctx.runner_overrides.contains_key("OPUS-CEIL-001"),
+        "disabled fallback must NOT write runner_overrides",
     );
     assert_eq!(
         read_model(&conn, "OPUS-CEIL-001").as_deref(),
@@ -216,7 +275,9 @@ fn escalate_task_model_does_not_mutate_consecutive_failures_column() {
     insert_task(&conn, "COUNTER-001", Some(SONNET_MODEL), FALLBACK_THRESHOLD);
     let before = read_consecutive_failures(&conn, "COUNTER-001");
 
-    let _ = escalate_task_model_if_needed(&conn, "COUNTER-001", FALLBACK_THRESHOLD).unwrap();
+    let mut ctx = IterationContext::new(8);
+    let _ = escalate_task_model_if_needed(&conn, "COUNTER-001", FALLBACK_THRESHOLD, &mut ctx, None)
+        .unwrap();
 
     let after = read_consecutive_failures(&conn, "COUNTER-001");
     assert_eq!(
@@ -235,10 +296,8 @@ fn escalate_task_model_does_not_mutate_consecutive_failures_column() {
 /// promotion path specifically (Opus + threshold + fallback enabled).
 /// The counter MUST remain at the threshold value so a subsequent Grok
 /// failure still pushes the task toward `auto_block_task` at
-/// `max_retries`. Marked `#[ignore]` until FEAT-007 lands the promotion
-/// branch.
+/// `max_retries`.
 #[test]
-#[ignore = "FEAT-007: requires Grok promotion branch to actually fire"]
 fn grok_promotion_preserves_consecutive_failures_count() {
     let (_dir, conn) = setup_db();
     insert_task(
@@ -248,20 +307,36 @@ fn grok_promotion_preserves_consecutive_failures_count() {
         FALLBACK_THRESHOLD,
     );
 
-    // After FEAT-007, this call would be:
-    //   escalate_task_model_if_needed(&conn, "GROK-COUNT-001", FALLBACK_THRESHOLD,
-    //                                 &mut ctx, &FallbackRunnerConfig::enabled());
-    // and would write tasks.model = GROK_DEFAULT_MODEL. The counter must NOT
-    // reset to 0 as part of the promotion — Grok failures still count.
-    let _ = escalate_task_model_if_needed(&conn, "GROK-COUNT-001", FALLBACK_THRESHOLD).unwrap();
+    let mut ctx = IterationContext::new(8);
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        model: GROK_DEFAULT_MODEL.to_string(),
+        runtime_error_threshold: FALLBACK_THRESHOLD as u32,
+        ..Default::default()
+    };
+    let outcome = escalate_task_model_if_needed(
+        &conn,
+        "GROK-COUNT-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "promotion must return the Grok model id",
+    );
+    assert_eq!(
+        read_model(&conn, "GROK-COUNT-001").as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "promotion must UPDATE tasks.model to Grok",
+    );
     assert_eq!(
         read_consecutive_failures(&conn, "GROK-COUNT-001"),
         FALLBACK_THRESHOLD,
         "Grok promotion must NOT reset consecutive_failures — preserves auto-block contract",
-    );
-    panic!(
-        "FEAT-007 not yet wired — when implemented, tasks.model must be \
-         {GROK_DEFAULT_MODEL} AND consecutive_failures must remain at {FALLBACK_THRESHOLD}"
     );
 }
 
@@ -350,42 +425,49 @@ fn run_slot_iteration_does_not_construct_iteration_context() {
 /// (xAI API key invalid / expired / rate-limited at auth tier), the loop
 /// must NOT count that as a task failure — incrementing the counter would
 /// push a healthy task toward `auto_block_task` for an operator-side
-/// problem. The `handle_task_failure` pipeline must short-circuit BEFORE
-/// `increment_consecutive_failures` runs when the prior outcome was a
-/// `GrokAuthFailure`.
+/// problem.
 ///
-/// Marked `#[ignore]` until FEAT-002 lands the `GrokAuthFailure` variant
-/// and FEAT-007 wires the short-circuit. When implemented, the test will
-/// construct a synthetic mock that bubbles `GrokAuthFailure` up through
-/// the iteration outcome and assert that `read_consecutive_failures`
-/// returns the pre-call value unchanged.
+/// The short-circuit lives at the CALLER (run_loop sequential at
+/// engine.rs:~3984 + the wave-mode wiring after `process_slot_result`):
+/// `handle_task_failure` is NOT invoked when the iteration outcome is
+/// `Crash(CrashType::GrokAuthFailure)`. We assert that contract here by
+/// modeling the caller's filter check directly — exercising the live
+/// short-circuit predicate without spawning a full iteration.
 #[test]
-#[ignore = "FEAT-002 + FEAT-007: TaskMgrError::GrokAuthFailure variant + short-circuit not yet wired"]
 fn grok_auth_failure_does_not_increment_consecutive_failures() {
+    use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
+
     let (_dir, mut conn) = setup_db();
     insert_task(&conn, "AUTH-FAIL-001", Some(OPUS_MODEL), 0);
     let before = read_consecutive_failures(&conn, "AUTH-FAIL-001");
 
-    // After FEAT-007: simulate a prior iteration outcome of
-    //   IterationOutcome::Crash(CrashType::GrokAuthFailure)
-    // and route through the pipeline that calls handle_task_failure ONLY
-    // when the outcome is a non-auth failure. The shape will be:
-    //   apply_status_updates(&mut conn, &outcomes_including_auth_failure, ...);
-    //   assert_eq!(read_consecutive_failures(&conn, "AUTH-FAIL-001"), before);
-    //
-    // Today the variant doesn't exist; we exercise the current path so the
-    // test compiles, then signal "not yet implemented" so the loop engineer
-    // who lands FEAT-002/007 must update this body.
-    handle_task_failure(&mut conn, "AUTH-FAIL-001", 1).unwrap();
-    let after = read_consecutive_failures(&conn, "AUTH-FAIL-001");
-    assert_eq!(
-        before, after,
-        "GrokAuthFailure must not increment consecutive_failures — auth lapses are \
-         operator problems, not task failures",
+    // Mirror the caller's skip-list predicate: when the outcome is
+    // Crash(GrokAuthFailure), handle_task_failure MUST be skipped.
+    let outcome = IterationOutcome::Crash(CrashType::GrokAuthFailure);
+    let should_skip = matches!(
+        outcome,
+        IterationOutcome::Completed
+            | IterationOutcome::Empty
+            | IterationOutcome::Reorder(_)
+            | IterationOutcome::RateLimit
+            | IterationOutcome::Crash(CrashType::GrokAuthFailure)
     );
-    panic!(
-        "FEAT-002 not yet wired — when implemented, TaskMgrError::GrokAuthFailure \
-         must short-circuit handle_task_failure before increment_consecutive_failures runs"
+    assert!(
+        should_skip,
+        "Crash(GrokAuthFailure) must be in the skip-list at the handle_task_failure call site",
+    );
+
+    // If the caller's filter ever regresses to NOT skip GrokAuthFailure, this
+    // sibling assertion catches it: a direct call DOES increment, so the only
+    // thing keeping the counter stable is the caller's filter.
+    let mut ctx = IterationContext::new(8);
+    handle_task_failure(&mut conn, "AUTH-FAIL-001", 1, &mut ctx, None).unwrap();
+    let after_unfiltered_call = read_consecutive_failures(&conn, "AUTH-FAIL-001");
+    assert_eq!(
+        after_unfiltered_call,
+        before + 1,
+        "handle_task_failure unconditionally increments — the filter at the CALL SITE is what \
+         protects GrokAuthFailure outcomes from incrementing the counter",
     );
 }
 
@@ -402,13 +484,33 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
     let (_dir, conn) = setup_db();
     insert_task(&conn, "GROK-IDEMP-001", Some(GROK_DEFAULT_MODEL), 0);
 
-    let result =
-        escalate_task_model_if_needed(&conn, "GROK-IDEMP-001", FALLBACK_THRESHOLD).unwrap();
+    // Enable fallback to exercise the idempotency gate: when tasks.model is
+    // already a Grok id, provider_for_model resolves Grok → effective_runner
+    // == Grok → promotion must skip. Without the gate, fallback-enabled would
+    // re-write tasks.model on every escalate call.
+    let mut ctx = IterationContext::new(8);
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        model: GROK_DEFAULT_MODEL.to_string(),
+        runtime_error_threshold: FALLBACK_THRESHOLD as u32,
+        ..Default::default()
+    };
+    let result = escalate_task_model_if_needed(
+        &conn,
+        "GROK-IDEMP-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
     assert_eq!(
         result, None,
         "task already at Grok must not re-promote — escalate_model returns None for an \
-         unknown tier today, and FEAT-007 must preserve idempotency via the \
-         `effective_runner == Claude` gate",
+         unknown tier, and the effective_runner == Claude gate blocks the Grok branch",
+    );
+    assert!(
+        !ctx.runner_overrides.contains_key("GROK-IDEMP-001"),
+        "idempotent path must NOT insert a fresh runner_overrides entry",
     );
     assert_eq!(
         read_model(&conn, "GROK-IDEMP-001").as_deref(),

@@ -15,7 +15,7 @@ use task_mgr::commands::{
     LearnParams, begin, complete, doctor, end, export, fail, init, learn, next,
 };
 use task_mgr::db::open_connection;
-use task_mgr::loop_engine::engine::handle_task_failure;
+use task_mgr::loop_engine::engine::{IterationContext, handle_task_failure};
 use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
 use task_mgr::models::RunStatus;
 
@@ -1056,9 +1056,10 @@ fn test_full_loop_retry_lifecycle() {
     )
     .unwrap();
 
+    let mut ctx = IterationContext::new(8);
     // ── Failure 1 ──────────────────────────────────────────────────────────────
     // No escalation (threshold=2 not reached), no auto-block (count=1 < max_retries=3)
-    handle_task_failure(&mut conn, "RETRY-001", 1).unwrap();
+    handle_task_failure(&mut conn, "RETRY-001", 1, &mut ctx, None).unwrap();
 
     let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
         .query_row(
@@ -1086,7 +1087,7 @@ fn test_full_loop_retry_lifecycle() {
     // ── Failure 2 ──────────────────────────────────────────────────────────────
     // Model escalation fires (consecutive_failures=2 >= escalation threshold=2)
     // Task not yet blocked (count=2 < max_retries=3)
-    handle_task_failure(&mut conn, "RETRY-001", 2).unwrap();
+    handle_task_failure(&mut conn, "RETRY-001", 2, &mut ctx, None).unwrap();
 
     let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
         .query_row(
@@ -1113,7 +1114,7 @@ fn test_full_loop_retry_lifecycle() {
 
     // ── Failure 3 ──────────────────────────────────────────────────────────────
     // Auto-block fires (consecutive_failures=3 >= max_retries=3), escalation skipped
-    handle_task_failure(&mut conn, "RETRY-001", 3).unwrap();
+    handle_task_failure(&mut conn, "RETRY-001", 3, &mut ctx, None).unwrap();
 
     let (count, model, status, last_error): (i32, Option<String>, String, Option<String>) = conn
         .query_row(

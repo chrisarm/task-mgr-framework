@@ -471,6 +471,11 @@ pub enum CrashType {
     /// exceeded the model's context window. Handled by reducing the next
     /// iteration's effort and resetting the task for retry.
     PromptTooLong,
+    /// Grok CLI returned `TaskMgrError::GrokAuthFailure` — xAI key invalid,
+    /// expired, or auth-tier rate-limited. Cascade prevention: this outcome
+    /// must NOT count as a task failure (no `consecutive_failures` increment,
+    /// no model promotion). Recovery is operator-driven (`grok login`).
+    GrokAuthFailure,
 }
 
 /// Outcome of a single loop iteration, determined by analyzing Claude's output.

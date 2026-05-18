@@ -646,7 +646,31 @@ pub fn run_slot_iteration(
         },
     );
     monitor::stop_monitor(monitor_handle);
-    let claude_result = claude_result?;
+    // FEAT-007: route TaskMgrError::GrokAuthFailure into a Crash(GrokAuthFailure)
+    // outcome instead of propagating out of the slot. The post-wave aggregator
+    // detects this variant and skips both the failure-counter increment AND
+    // the Grok promotion hook (cascade prevention).
+    let claude_result = match claude_result {
+        Ok(r) => r,
+        Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
+            eprintln!(
+                "[slot {}] Grok auth failure for task {}: {}",
+                slot.slot_index, task_id, hint
+            );
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: hint,
+                    effective_model,
+                    effective_effort: effort,
+                },
+            ));
+        }
+        Err(e) => return Err(e),
+    };
 
     if claude_result.timed_out {
         eprintln!(
@@ -1863,6 +1887,46 @@ pub fn run_wave_iteration(
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
     }
 
+    // FEAT-007: post-wave retry tracking. Mirrors the sequential call site in
+    // `run_loop` (engine.rs:~3992) so wave-mode RuntimeError slots feed the
+    // `consecutive_failures` counter, the Claude-tier escalation ladder, AND
+    // the new Grok promotion hook on the main thread (Learning #1810:
+    // IterationContext is not thread-safe; this MUST NOT run inside a slot
+    // worker). Skips claim-fail entries (`claim_succeeded == false`) so a
+    // synthetic crash record never increments the counter on a task that
+    // never actually executed. Crash(GrokAuthFailure) short-circuits — auth
+    // lapses are operator problems, not task failures.
+    for slot_result in &wave_result.outcomes {
+        if !slot_result.claim_succeeded {
+            continue;
+        }
+        let Some(ref task_id) = slot_result.iteration_result.task_id else {
+            continue;
+        };
+        if matches!(
+            slot_result.iteration_result.outcome,
+            IterationOutcome::Completed
+                | IterationOutcome::Empty
+                | IterationOutcome::Reorder(_)
+                | IterationOutcome::RateLimit
+                | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
+        ) {
+            continue;
+        }
+        if let Err(e) = handle_task_failure(
+            params.conn,
+            task_id,
+            params.iteration as i64,
+            ctx,
+            params.project_config.fallback_runner.as_ref(),
+        ) {
+            eprintln!(
+                "Warning: failed to start retry tracking transaction for slot {} task {}: {}",
+                slot_result.slot_index, task_id, e
+            );
+        }
+    }
+
     // CrashTracker policy per FEAT-010 AC.
     if agg.any_completed {
         ctx.crash_tracker.record_success();
@@ -2421,7 +2485,29 @@ pub fn run_iteration(
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
-    let claude_result = claude_result?;
+    // FEAT-007: surface TaskMgrError::GrokAuthFailure as a Crash(GrokAuthFailure)
+    // outcome instead of bubbling out of the iteration. The retry-tracking site
+    // in `run_loop` skips this variant so an xAI auth lapse never pushes a
+    // healthy task toward `auto_block_task`.
+    let claude_result = match claude_result {
+        Ok(r) => r,
+        Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
+            eprintln!("Grok auth failure for task {}: {}", task_id, hint);
+            return Ok(IterationResult {
+                outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                output: hint,
+                effective_model,
+                effective_effort: effort,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Step 6.1: Print hints for denied tools
     let denied_cmds = claude::extract_denied_commands(&claude_result.permission_denials);
@@ -3981,6 +4067,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
+        // FEAT-007: also exclude Crash(GrokAuthFailure) — an xAI auth lapse is an operator
+        // problem, not a task failure; incrementing here would push a healthy task toward
+        // auto_block_task with a misleading reason.
         if let Some(ref task_id) = result.task_id
             && !matches!(
                 result.outcome,
@@ -3988,8 +4077,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Empty
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
+                    | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
             )
-            && let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64)
+            && let Err(e) = handle_task_failure(
+                &mut conn,
+                task_id,
+                iteration as i64,
+                &mut ctx,
+                project_config.fallback_runner.as_ref(),
+            )
         {
             eprintln!("Warning: failed to start retry tracking transaction: {}", e);
         }
@@ -4693,12 +4789,31 @@ pub fn should_escalate_for_consecutive_failures(consecutive_failures: i32) -> bo
 /// - `None` or empty model assumes sonnet baseline → escalates to opus.
 /// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
 ///
-/// Returns `Some(new_model)` if escalation fired, `None` if below threshold or
-/// the model tier is unknown. The DB is updated in-place when `Some` is returned.
+/// **FEAT-007 Grok promotion**: after the Claude-tier escalation runs, when
+/// `cfg.enabled` AND the post-escalation model is Opus AND `effective_runner`
+/// resolves to Claude AND `new_count >= cfg.runtime_error_threshold`, the
+/// task is promoted to the Grok runner. The promotion writes BOTH the
+/// `tasks.model` column AND the in-memory override maps on `ctx`
+/// (`runner_overrides`, `model_overrides`) so the next iteration's
+/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
+/// `tasks.model` value is captured into `ctx.overflow_original_task_model`
+/// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
+/// detector can spot operator edits later.
+///
+/// When `cfg` is `None` or `!enabled`, behavior is byte-identical to the
+/// pre-FEAT-007 ladder (Sonnet → Opus → terminal). The `ctx` argument is
+/// otherwise unused in that path.
+///
+/// Returns `Some(new_model)` if escalation OR promotion fired, `None` if
+/// below threshold, the model tier is unknown (e.g. already at Grok), or
+/// the Opus self-loop produced no change AND promotion conditions weren't met.
+/// The DB is updated in-place when `Some` is returned.
 pub fn escalate_task_model_if_needed(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
 ) -> TaskMgrResult<Option<String>> {
     if !should_escalate_for_consecutive_failures(new_count) {
         return Ok(None);
@@ -4722,7 +4837,47 @@ pub fn escalate_task_model_if_needed(
             task_id, new_model, new_count
         );
     }
-    Ok(escalated)
+
+    // FEAT-007: Grok fallback promotion. Fires only when the task was
+    // ALREADY at Opus before this call (i.e. the Claude escalation step was
+    // a no-op self-loop or no escalation was needed) — Sonnet-tier
+    // escalations get a fresh chance at Opus before any Grok pivot is
+    // considered. The effective runner is computed against the
+    // pre-escalation model so a task already on Grok skips this branch via
+    // Provider::Grok (idempotency).
+    let fallback = match cfg {
+        Some(c) if c.enabled => c,
+        _ => return Ok(escalated),
+    };
+    let was_at_opus = matches!(current_model.as_deref(), Some(m) if m == model::OPUS_MODEL);
+    if !was_at_opus || new_count < fallback.runtime_error_threshold as i32 {
+        return Ok(escalated);
+    }
+    let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
+    if effective_runner != RunnerKind::Claude {
+        return Ok(escalated);
+    }
+
+    // All gates passed — promote to Grok. Capture the pre-promotion model
+    // snapshot for FEAT-008 override-invalidation detection BEFORE the DB
+    // UPDATE rewrites tasks.model.
+    ctx.overflow_original_task_model
+        .entry(task_id.to_string())
+        .or_insert_with(|| current_model.clone());
+
+    conn.execute(
+        "UPDATE tasks SET model = ? WHERE id = ?",
+        rusqlite::params![fallback.model, task_id],
+    )?;
+    ctx.runner_overrides
+        .insert(task_id.to_string(), RunnerKind::Grok);
+    ctx.model_overrides
+        .insert(task_id.to_string(), fallback.model.clone());
+    eprintln!(
+        "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
+        task_id, fallback.model, new_count
+    );
+    Ok(Some(fallback.model.clone()))
 }
 
 /// Increment `consecutive_failures` for a task in the DB.
@@ -4779,10 +4934,20 @@ pub fn auto_block_task(
 /// `current_iteration` is used to set `blocked_at_iteration` on auto-blocked tasks for
 /// decay tracking. Escalation is skipped when auto-block fires on the same iteration
 /// (the escalated model would never be used).
+///
+/// **FEAT-007**: `ctx` threads `IterationContext` through so the embedded
+/// `escalate_task_model_if_needed` call can write Grok promotion overrides
+/// (paired with the DB UPDATE). `cfg` carries the optional fallback-runner
+/// configuration; pass `None` to suppress the Grok branch entirely (preserves
+/// pre-FEAT-007 behavior byte-for-byte). Callers MUST short-circuit BEFORE
+/// invoking this when the iteration outcome is `Crash(GrokAuthFailure)` so
+/// auth lapses do not push healthy tasks toward `auto_block_task`.
 pub fn handle_task_failure(
     conn: &mut Connection,
     task_id: &str,
     current_iteration: i64,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
 ) -> TaskMgrResult<()> {
     let tx = conn.transaction()?;
 
@@ -4804,7 +4969,7 @@ pub fn handle_task_failure(
 
     // Only escalate if auto-block won't immediately follow (escalated model would never be used)
     if !should_auto_block(new_count, max_retries)
-        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count)
+        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count, ctx, cfg)
     {
         eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
     }
@@ -6438,7 +6603,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6466,7 +6632,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6651,7 +6818,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6679,7 +6847,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 1).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None).unwrap();
         assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
