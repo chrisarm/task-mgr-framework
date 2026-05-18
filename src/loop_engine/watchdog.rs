@@ -29,7 +29,7 @@ pub(crate) const POST_COMPLETION_GRACE_SECS: u64 = 180;
 
 /// Configuration for per-iteration timeout with activity-based extensions.
 #[derive(Clone)]
-pub(crate) struct TimeoutConfig {
+pub struct TimeoutConfig {
     /// Maximum time allowed for the iteration.
     pub(crate) base_timeout: Duration,
     /// First activity extension amount (decreases by `EXTENSION_DECREMENT_SECS` each use).
