@@ -61,6 +61,7 @@ use crate::loop_engine::prd_reconcile::{
 use crate::loop_engine::progress;
 use crate::loop_engine::project_config;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
+use crate::loop_engine::runner::{self, RunnerKind};
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status_queries::read_prd_hints;
@@ -277,6 +278,24 @@ pub struct IterationContext {
     /// - `1` — halts on any merge-back failure
     /// - `2` (default) — halts after two consecutive failure waves
     pub consecutive_merge_fail_waves: u32,
+    /// Per-task runner overrides. Pinned to the single computed
+    /// `effective_runner` at the spawn site (FEAT-005, PRD §2.5). Written by
+    /// the overflow rung-4 `FallbackToProvider` (FEAT-008) and the
+    /// RuntimeError fallback hook (FEAT-007); read at every spawn site via
+    /// [`resolve_effective_runner`]. Empty by default — preserves today's
+    /// pure-Claude behavior byte-for-byte (regression guard).
+    ///
+    /// Loop-thread-local: writes happen on the main thread only. Slot
+    /// workers receive a precomputed `RunnerKind` via `SlotContext` and
+    /// never touch this map (Learning #1810 thread-safety).
+    pub runner_overrides: std::collections::HashMap<String, RunnerKind>,
+    /// Per-task snapshot of the `tasks.model` DB column captured at the
+    /// moment a runner override was first inserted. Used by
+    /// `check_override_invalidation` (FEAT-008) to detect operator edits to
+    /// the model column and silently clear stale overrides. `None` value
+    /// records that the DB column was NULL at snapshot time, distinct from
+    /// the key being absent.
+    pub overflow_original_task_model: std::collections::HashMap<String, Option<String>>,
 }
 
 impl IterationContext {
@@ -298,8 +317,36 @@ impl IterationContext {
             pending_reorder_hints: Vec::new(),
             pending_slot_tasks: Vec::new(),
             consecutive_merge_fail_waves: 0,
+            runner_overrides: std::collections::HashMap::new(),
+            overflow_original_task_model: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Compute the effective runner for a task: per-task override → provider of
+/// the effective model → default Claude.
+///
+/// Single source of truth (PRD §2.5): every spawn site MUST resolve runner
+/// kind through this helper, never via an OR-style fallback. Re-deriving
+/// the formula independently in two places risks silent drift if either
+/// branch updates without the other (the prohibition is explicit in the
+/// PRD "Prohibited outcomes" list).
+///
+/// The helper lives in `engine.rs` (not `runner.rs`) so `runner.rs` stays
+/// free of `IterationContext` coupling — the runner module remains
+/// provider-neutral.
+pub fn resolve_effective_runner(
+    ctx: &IterationContext,
+    task_id: &str,
+    effective_model: Option<&str>,
+) -> RunnerKind {
+    ctx.runner_overrides
+        .get(task_id)
+        .copied()
+        .unwrap_or_else(|| match model::provider_for_model(effective_model) {
+            model::Provider::Grok => RunnerKind::Grok,
+            model::Provider::Claude => RunnerKind::Claude,
+        })
 }
 
 /// Per-slot execution context for parallel wave iterations.
@@ -328,6 +375,15 @@ pub struct SlotContext {
     /// identity from `prompt_bundle.task_id` so the bundle remains the
     /// canonical source-of-truth post-spawn.
     pub prompt_bundle: crate::loop_engine::prompt::slot::SlotPromptBundle,
+    /// Pre-resolved runner kind for this slot's task (FEAT-005). Computed on
+    /// the main thread via [`resolve_effective_runner`] BEFORE the worker
+    /// spawns, so the slot can dispatch without touching
+    /// `IterationContext.runner_overrides` (Learning #1810 thread-safety;
+    /// the no-override-maps-in-slot-body test enforces this). Default is
+    /// `RunnerKind::Claude` for slots constructed without main-thread
+    /// enrichment (e.g. test fixtures) — matches today's pure-Claude
+    /// behavior byte-for-byte.
+    pub effective_runner: RunnerKind,
 }
 
 /// Result of running one slot during a wave.
@@ -558,7 +614,13 @@ pub fn run_slot_iteration(
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
 
-    let claude_result = claude::spawn_claude(
+    // FEAT-005: dispatch via the precomputed effective_runner (resolved on
+    // the main thread in `run_wave_iteration` before the slot was spawned).
+    // The slot body MUST NOT read the IterationContext override maps
+    // directly (Learning #1810; enforced by the source-sniff test in
+    // tests/runtime_error_fallback.rs).
+    let claude_result = runner::dispatch(
+        slot.effective_runner,
         &bundle.prompt,
         &params.permission_mode,
         claude::SpawnOpts {
@@ -1230,6 +1292,13 @@ fn build_slot_contexts(
                 slot_index: idx,
                 working_root: path.clone(),
                 prompt_bundle,
+                // Default to Claude. Main-thread enrichment in
+                // `run_wave_iteration` overwrites with the resolved value
+                // from `resolve_effective_runner(ctx, ...)` before the slot
+                // thread spawns. Test fixtures that call `build_slot_contexts`
+                // directly (without the enrichment step) inherit Claude —
+                // the default-empty regression behavior.
+                effective_runner: RunnerKind::Claude,
             }
         })
         .collect()
@@ -1349,6 +1418,17 @@ fn process_slot_result(
             cluster_effort: slot_result.iteration_result.effective_effort,
             section_sizes: slot_result.section_sizes.clone(),
         };
+        // FEAT-005: resolve effective_runner via the single-source helper so
+        // FEAT-008's overflow rung 4 (FallbackToProvider) can pin its
+        // idempotency guard on the same value the slot used to dispatch.
+        // Underscore-prefixed until the handler signature gains the
+        // parameter — kept in scope here so the contract sites stay
+        // co-located.
+        let _effective_runner = resolve_effective_runner(
+            ctx,
+            tid,
+            slot_result.iteration_result.effective_model.as_deref(),
+        );
         let _ = overflow::handle_prompt_too_long(
             ctx,
             params.conn,
@@ -1746,7 +1826,23 @@ pub fn run_wave_iteration(
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
     let slot_prompt_params = build_slot_prompt_params(&params);
-    let slot_contexts = build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
+    let mut slot_contexts =
+        build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
+    // FEAT-005: resolve effective runner per slot on the main thread before
+    // spawning the worker. Single source of truth for the formula — slots
+    // never read `ctx.runner_overrides` directly (Learning #1810). The
+    // effective_model mirrors what `run_slot_iteration` recomputes internally
+    // (bundle.resolved_model → params.default_model fallback) so the
+    // runner resolution sees the same model string the slot will use.
+    for slot in slot_contexts.iter_mut() {
+        let effective_model = slot
+            .prompt_bundle
+            .resolved_model
+            .as_deref()
+            .or(params.default_model);
+        slot.effective_runner =
+            resolve_effective_runner(ctx, &slot.prompt_bundle.task_id, effective_model);
+    }
     let slot_params = build_shared_slot_params(&params);
 
     // Run wave (blocks until every spawned slot thread joins).
@@ -2282,7 +2378,13 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
-    let claude_result = claude::spawn_claude(
+    // FEAT-005: resolve effective runner once per iteration (PRD §2.5
+    // single source of truth). Reused below by the PromptTooLong overflow
+    // handler call site so the runner identity stays consistent across
+    // dispatch + downstream idempotency checks.
+    let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
+    let claude_result = runner::dispatch(
+        effective_runner,
         &prompt_result.prompt,
         params.permission_mode,
         claude::SpawnOpts {
@@ -4837,6 +4939,93 @@ mod tests {
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{EnvGuard, setup_test_db};
 
+    // --- FEAT-005: resolve_effective_runner + IterationContext fields ---
+    //
+    // Regression guards for the single-source effective_runner formula
+    // (PRD §2.5). The default-empty IterationContext + no Grok model case
+    // MUST resolve to `RunnerKind::Claude` so today's pure-Claude behavior
+    // is preserved byte-for-byte. An explicit `runner_overrides` entry
+    // wins over the model-derived provider — that's how FEAT-007 / FEAT-008
+    // pin a task to Grok once a fallback fires.
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_no_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        assert_eq!(
+            resolve_effective_runner(&ctx, "ANY-TASK-001", None),
+            RunnerKind::Claude,
+            "default-empty IterationContext with effective_model=None MUST \
+             default to ClaudeRunner — preserves pre-FEAT-005 behavior",
+        );
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_claude_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        for model in &[OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL] {
+            assert_eq!(
+                resolve_effective_runner(&ctx, "TASK-001", Some(model)),
+                RunnerKind::Claude,
+                "Claude model {model} with empty runner_overrides MUST resolve to Claude",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_grok_model_resolves_to_grok() {
+        let ctx = IterationContext::new(8);
+        // Token-equality on `-` splits — `grok-4-fast` has token `grok`.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("grok-4-fast")),
+            RunnerKind::Grok,
+            "Grok model with empty runner_overrides MUST resolve to Grok via \
+             provider_for_model token-equality",
+        );
+        // Groq Inc. (different vendor) MUST NOT mis-route — substring match
+        // would catch `groq-llama-3` because `grok` is a substring of `groq`;
+        // token-equality correctly rejects it.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3")),
+            RunnerKind::Claude,
+            "Groq Inc. model (different vendor) MUST NOT mis-route to Grok",
+        );
+    }
+
+    #[test]
+    fn feat_005_runner_override_wins_over_model_derived_provider() {
+        let mut ctx = IterationContext::new(8);
+        ctx.runner_overrides
+            .insert("TASK-PINNED".to_string(), RunnerKind::Grok);
+        // Model says Claude (Opus), but the override pins to Grok — override wins.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-PINNED", Some(OPUS_MODEL)),
+            RunnerKind::Grok,
+            "explicit runner_overrides entry MUST win over the model-derived \
+             provider — that's how FEAT-007/FEAT-008 pin a task post-fallback",
+        );
+        // A different task with no override falls through to the model's provider.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-OTHER", Some(OPUS_MODEL)),
+            RunnerKind::Claude,
+            "other tasks without overrides MUST still resolve via the model",
+        );
+    }
+
+    #[test]
+    fn feat_005_iteration_context_new_initializes_runner_fields_empty() {
+        let ctx = IterationContext::new(8);
+        assert!(
+            ctx.runner_overrides.is_empty(),
+            "fresh IterationContext.runner_overrides MUST be empty — regression \
+             guard against accidental seeded entries that would silently route \
+             tasks through a non-Claude runner",
+        );
+        assert!(
+            ctx.overflow_original_task_model.is_empty(),
+            "fresh IterationContext.overflow_original_task_model MUST be empty",
+        );
+    }
+
     // --- LoopResult Default tests ---
 
     #[test]
@@ -6965,6 +7154,7 @@ mod tests {
                 slot_index,
                 working_root,
                 prompt_bundle,
+                effective_runner: RunnerKind::Claude,
             }
         }
 
