@@ -114,8 +114,11 @@ fn run_add(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Don't let the user's TASK_MGR_DIR (or any other repo-relative env)
-        // leak into the subprocess and confound the test.
-        .env_remove("TASK_MGR_DIR");
+        // leak into the subprocess and confound the test. TASK_MGR_ACTIVE_PREFIX
+        // is set when running under `task-mgr loop` and would otherwise trip
+        // the prefix-registered-in-prd_metadata guard inside `add`.
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

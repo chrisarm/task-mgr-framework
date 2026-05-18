@@ -1595,6 +1595,16 @@ pub(crate) enum SlotFailureKind {
 pub(crate) struct MergeOutcomes {
     pub merged_slots: Vec<usize>,
     pub failed_slots: Vec<(usize, String, SlotFailureKind)>,
+    /// HEAD of slot 0 (the loop's primary worktree) captured immediately after
+    /// the early-return guards pass and before any merge attempts begin.
+    /// Consumed by `reconcile_merged_slot_completions` to scan the
+    /// `{pre_merge_head}..HEAD` range for `<TASK-ID>-completed` markers.
+    ///
+    /// `None` in three cases:
+    /// - `num_slots <= 1`: early-return path, no merge is attempted.
+    /// - `slot_paths.len() < num_slots`: validation-failure path.
+    /// - `rev_parse_head` returned `Err` (e.g., fresh repo with no commits).
+    pub pre_merge_head: Option<String>,
 }
 
 /// Capture the current HEAD commit-ish in `repo_path` for later restoration
@@ -1873,6 +1883,7 @@ pub(crate) fn merge_slot_branches_with_resolver(
     }
 
     let slot0_path = &slot_paths[0];
+    outcomes.pre_merge_head = rev_parse_head(slot0_path).ok();
 
     // Slot-0 poisoning marker. Set when a `hard_reset` cleanup fails — at
     // that point HEAD may have drifted from any sensible base, so subsequent
@@ -6180,6 +6191,95 @@ detached
             read_slot0(&s0),
             "only-slot0\n",
             "single-slot wave must leave slot 0 untouched"
+        );
+    }
+
+    /// FEAT-001: multi-slot call captures slot 0's HEAD in pre_merge_head.
+    #[test]
+    fn pre_merge_head_captured_when_num_slots_gt_1() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/pre-merge-head-capture";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Give slot 1 a disjoint commit so the merge has something to do.
+        fs::write(paths[1].join("slot-1-capture.txt"), "content").expect("write");
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "slot-1 capture test commit"])
+            .current_dir(&paths[1])
+            .output()
+            .expect("git commit");
+
+        let expected_head = rev_parse(&paths[0], "HEAD");
+        assert_eq!(expected_head.len(), 40, "sanity: HEAD must be a full SHA");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            2,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert_eq!(
+            outcomes.pre_merge_head,
+            Some(expected_head),
+            "pre_merge_head must be slot 0's HEAD at the time merge_slot_branches was called"
+        );
+    }
+
+    /// FEAT-001: single-slot call hits the num_slots<=1 early-return; pre_merge_head must be None.
+    #[test]
+    fn pre_merge_head_none_when_num_slots_le_1() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/pre-merge-head-single";
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 1).expect("ensure_slot_worktrees");
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            branch,
+            1,
+            &NoOpResolver,
+            &paths,
+            "test-run",
+            5,
+        );
+
+        assert!(
+            outcomes.pre_merge_head.is_none(),
+            "single-slot early-return path must yield pre_merge_head=None"
+        );
+    }
+
+    /// FEAT-001: slot_paths.len() < num_slots hits the validation-failure early-return;
+    /// pre_merge_head must be None.
+    #[test]
+    fn pre_merge_head_none_when_slot_paths_invalid() {
+        let tmp = setup_git_repo_with_file();
+        // Provide only 1 path but claim num_slots=2 — triggers the validation guard.
+        let slot_paths = vec![tmp.path().to_path_buf()];
+
+        let outcomes = merge_slot_branches_with_resolver(
+            tmp.path(),
+            "feat/invalid-paths",
+            2,
+            &NoOpResolver,
+            &slot_paths,
+            "test-run",
+            5,
+        );
+
+        assert!(
+            outcomes.pre_merge_head.is_none(),
+            "validation-failure early-return path must yield pre_merge_head=None"
         );
     }
 }
