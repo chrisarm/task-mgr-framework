@@ -513,34 +513,7 @@ impl LlmRunner for GrokRunner {
         write_prompt_to_stdin(&mut child, prompt, &binary, "Grok")?;
         let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
-        // Tee stderr to parent stderr while buffering the first
-        // GROK_STDERR_SNIFF_CAP_BYTES for the post-exit auth-failure sniff.
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .expect("stderr should be piped (Stdio::piped() was set on spawn)");
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let stderr_handle = {
-            let buf = Arc::clone(&stderr_buf);
-            let label = slot_label.map(str::to_owned);
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stderr_pipe);
-                for line_result in reader.lines() {
-                    match line_result {
-                        Ok(line) => {
-                            emit_prefixed_lines(label.as_deref(), &line);
-                            if let Ok(mut b) = buf.lock()
-                                && b.len() < GROK_STDERR_SNIFF_CAP_BYTES
-                            {
-                                b.push_str(&line);
-                                b.push('\n');
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-        };
+        let (stderr_buf, stderr_handle) = spawn_grok_stderr_sniffer(&mut child, slot_label);
 
         // Plain pipe — grok PTY support is out of v1 scope.
         let reader = BufReader::new(
@@ -652,6 +625,42 @@ impl WatchdogHandles {
             self.completion_killed.load(Ordering::Acquire),
         )
     }
+}
+
+/// Grok-specific: spawn a stderr-tee thread that mirrors child stderr to the
+/// parent (with slot-label prefix) AND buffers up to
+/// [`GROK_STDERR_SNIFF_CAP_BYTES`] for the post-exit auth-failure sniff.
+/// Returns the shared buffer (for the sniff) and the join handle (for clean
+/// teardown).
+fn spawn_grok_stderr_sniffer(
+    child: &mut std::process::Child,
+    slot_label: Option<&str>,
+) -> (Arc<Mutex<String>>, std::thread::JoinHandle<()>) {
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("stderr should be piped (Stdio::piped() was set on spawn)");
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let buf = Arc::clone(&stderr_buf);
+    let label = slot_label.map(str::to_owned);
+    let handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr_pipe);
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    emit_prefixed_lines(label.as_deref(), &line);
+                    if let Ok(mut b) = buf.lock()
+                        && b.len() < GROK_STDERR_SNIFF_CAP_BYTES
+                    {
+                        b.push_str(&line);
+                        b.push('\n');
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (stderr_buf, handle)
 }
 
 /// Wire subprocess environment variables common to every LLM runner.
