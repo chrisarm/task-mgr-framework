@@ -1077,7 +1077,7 @@
       "id": "MILESTONE-2",
       "model": "claude-opus-4-7",
       "notes": "Standard MILESTONE protocol — full suite, fix or spawn for any unrelated failures.",
-      "passes": false,
+      "passes": true,
       "priority": 50,
       "qualityDimensions": [
         "Full unscoped test suite — milestone gate",
@@ -1109,7 +1109,7 @@
       "estimatedEffort": "low",
       "id": "INT-001",
       "notes": "Reference: PRD §6 Data Flow Contracts; learning #2485 (camelCase ↔ snake_case).",
-      "passes": false,
+      "passes": true,
       "priority": 55,
       "qualityDimensions": [
         "Trace is grounded in real code reads — every file:line cited from the actual codebase",
@@ -1142,7 +1142,7 @@
       "estimatedEffort": "low",
       "id": "INT-002",
       "notes": "Reference: PRD §6 Consumers of Changed Behavior 'src/loop_engine/engine.rs:4599-4602' (escalate_task_model_if_needed writes tasks.model); PRD §2.5 'tasks.model DB column interaction'.\n\nThis traces the architect's #1 silent-bug class. If the trace reveals a real gap, the WIRE-FIX-xxx spawned here gets priority 57-65.",
-      "passes": false,
+      "passes": true,
       "priority": 56,
       "qualityDimensions": [
         "Read actual code at each cited line — do not infer from struct names",
@@ -1270,6 +1270,26 @@
         "src/loop_engine/",
         "tests/",
         "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each helper function under 60 lines",
+        "No behavior change: existing runner.rs tests pass unchanged",
+        "cargo test --lib loop_engine::runner passes",
+        "cargo clippy -- -D warnings clean",
+        "ClaudeRunner::spawn and GrokRunner::spawn under 160 lines each",
+        "Helpers do not match on provider — provider-specific divergence stays in per-runner bodies"
+      ],
+      "description": "ClaudeRunner::spawn (runner.rs:230-564, 335 lines) and GrokRunner::spawn (runner.rs:602-879, 277 lines) duplicate ~130 lines of process-lifecycle scaffolding nearly verbatim. Each runner re-implements: (1) env wiring (LOOP_ALLOW_DESTRUCTIVE, TASK_MGR_DIR canonicalize, ACTIVE_PREFIX_ENV, working_dir, process_group(0) cfg(unix)) — runner.rs:359-395 vs 690-709; (2) spawn + ErrorKind::NotFound → IoErrorWithContext mapping — 397-414 vs 712-726; (3) stdin write_all + BrokenPipe match — 418-439 vs 728-748; (4) watchdog construction (AtomicU64 completion_epoch + 2 AtomicBool flags + conditional watchdog thread) — 448-479 vs 750-778; (5) plain-mode stdout reader loop — 511-531 vs 819-839; (6) child.wait + watchdog teardown + atomic loads — 533-554 vs 841-855. Extract into private free fns in runner.rs: apply_common_env, spawn_with_context, write_prompt_to_stdin, spawn_watchdog, read_plain_stdout. Keep argv assembly + provider-specific stdio wiring (PTY vs piped) in the per-runner bodies.",
+      "estimatedEffort": "medium",
+      "id": "5ba153a7-REFACTOR-1-RUNNER-DRY",
+      "notes": "Reviewer report from REFACTOR-REVIEW-FINAL. Sole HIGH-severity issue. Subsumes MED-severity function-length finding.",
+      "passes": false,
+      "priority": 75,
+      "title": "Extract shared process-lifecycle helpers from ClaudeRunner and GrokRunner",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
       ]
     }
   ],
