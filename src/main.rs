@@ -1055,6 +1055,16 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     // `resolve_db_dir`, which anchors a relative default against
                     // the main repo root when invoked from a worktree). No
                     // further per-arm massaging needed.
+                    // Startup binary check (FR-006): fail before the first
+                    // iteration if the fallback runner binary is missing.
+                    {
+                        use task_mgr::loop_engine::project_config::{
+                            check_fallback_runner_binary, read_project_config,
+                        };
+                        let proj_cfg = read_project_config(&cli.dir);
+                        check_fallback_runner_binary(proj_cfg.fallback_runner.as_ref())?;
+                    }
+
                     let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
                         db_dir: cli.dir.clone(),
                         source_root: project_root.clone(),

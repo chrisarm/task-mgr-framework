@@ -1,6 +1,53 @@
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::error::{TaskMgrError, TaskMgrResult};
+
+/// Configuration for the Grok fallback runner (US-005, FR-006).
+///
+/// When `enabled = true`, the loop engine promotes tasks to the Grok CLI
+/// after the Claude overflow ladder is exhausted (rung 4) or after
+/// `runtime_error_threshold` consecutive `RuntimeError` rounds. Absent or
+/// `enabled = false` → no change to the existing 4-rung ladder.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackRunnerConfig {
+    /// Whether the Grok fallback runner is active. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// LLM provider name. Must be `"grok"` for the xAI Grok CLI.
+    /// Default: `"grok"`.
+    #[serde(default = "default_fallback_provider")]
+    pub provider: String,
+
+    /// Grok model ID passed as `--model`. Default: `"grok-4-fast"`.
+    #[serde(default = "default_fallback_model")]
+    pub model: String,
+
+    /// Absolute path to the Grok CLI binary. When `None`, the binary is
+    /// resolved as `"grok"` on the system PATH.
+    #[serde(default)]
+    pub cli_binary: Option<String>,
+
+    /// Number of consecutive `RuntimeError` rounds on a task before the
+    /// Grok fallback hook fires. Default: `2`.
+    #[serde(default = "default_fallback_runtime_error_threshold")]
+    pub runtime_error_threshold: u32,
+}
+
+impl Default for FallbackRunnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_fallback_provider(),
+            model: default_fallback_model(),
+            cli_binary: None,
+            runtime_error_threshold: default_fallback_runtime_error_threshold(),
+        }
+    }
+}
+
 /// Per-project loop configuration read from `.task-mgr/config.json`.
 ///
 /// Allows projects to extend the default tool allowlist with project-specific
@@ -119,6 +166,12 @@ pub struct ProjectConfig {
     /// Default: `3`.
     #[serde(default = "default_auto_review_min_tasks")]
     pub auto_review_min_tasks: u32,
+
+    /// Grok fallback runner configuration. Absent key → `None`; explicit
+    /// `null` → `None`; explicit object → `Some` (with per-field defaults
+    /// applied for any omitted optional fields). Default: `None`.
+    #[serde(default)]
+    pub fallback_runner: Option<FallbackRunnerConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -141,6 +194,7 @@ impl Default for ProjectConfig {
             slot_stash_limit: default_slot_stash_limit(),
             auto_review: default_auto_review(),
             auto_review_min_tasks: default_auto_review_min_tasks(),
+            fallback_runner: None,
         }
     }
 }
@@ -196,6 +250,65 @@ fn default_auto_review() -> bool {
 /// Minimum completed tasks before auto-review fires (default 3).
 fn default_auto_review_min_tasks() -> u32 {
     3
+}
+
+/// Default provider name for the Grok fallback runner (PRD §6).
+fn default_fallback_provider() -> String {
+    "grok".to_string()
+}
+
+/// Default model ID for the Grok fallback runner (PRD §6).
+fn default_fallback_model() -> String {
+    "grok-4-fast".to_string()
+}
+
+/// Default consecutive-RuntimeError threshold before Grok fallback fires (PRD §3 US-005).
+fn default_fallback_runtime_error_threshold() -> u32 {
+    2
+}
+
+/// Verify that the Grok fallback binary is reachable at loop startup.
+///
+/// Returns `Ok(())` when:
+/// - `cfg` is `None` (fallback not configured), or
+/// - `cfg.enabled` is `false` (explicitly disabled — no PATH probe occurs).
+///
+/// Returns `Err` when `cfg.enabled` is `true` and the resolved binary path
+/// does not exist. The error message names the binary so operators can
+/// diagnose without re-reading config.
+///
+/// Binary resolution order:
+/// 1. `cfg.cli_binary` — probed at the path verbatim (not re-resolved via PATH).
+/// 2. `None` — searches PATH directories for the bare name `"grok"`.
+pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskMgrResult<()> {
+    let cfg = match cfg {
+        None => return Ok(()),
+        Some(c) if !c.enabled => return Ok(()),
+        Some(c) => c,
+    };
+
+    let (binary, found) = if let Some(explicit) = &cfg.cli_binary {
+        let exists = std::path::Path::new(explicit).exists();
+        (explicit.clone(), exists)
+    } else {
+        let name = "grok";
+        let found = std::env::var_os("PATH")
+            .map(|path_var| std::env::split_paths(&path_var).any(|dir| dir.join(name).exists()))
+            .unwrap_or(false);
+        (name.to_string(), found)
+    };
+
+    if found {
+        Ok(())
+    } else {
+        Err(TaskMgrError::NotFound {
+            resource_type: "Fallback runner binary".to_string(),
+            id: format!(
+                "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
+                 correct path, then retry"
+            ),
+        })
+    }
 }
 
 /// Read project config from `<db_dir>/config.json`.
