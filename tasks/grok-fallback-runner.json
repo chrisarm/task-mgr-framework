@@ -1177,7 +1177,7 @@
       "id": "REFACTOR-REVIEW-FINAL",
       "model": "claude-opus-4-7",
       "notes": "For each refactor: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Priority for spawned refactors: 71-85.",
-      "passes": false,
+      "passes": true,
       "priority": 70,
       "qualityDimensions": [
         "Use rust-python-code-reviewer agent — surface specific findings rather than vague impressions",
@@ -1216,7 +1216,7 @@
       "id": "VERIFY-001",
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §6 Documentation table; PRD §3 US-001 through US-006 ACs.\n\nThe smoke tests document themselves in the progress file — paste the exact commands run and the exact outputs observed.",
-      "passes": false,
+      "passes": true,
       "priority": 90,
       "qualityDimensions": [
         "Documentation is the most-leveraged artifact for future maintainers — invest in clarity over brevity here",
@@ -1255,7 +1255,7 @@
       "id": "MILESTONE-FINAL",
       "model": "claude-opus-4-7",
       "notes": "Standard MILESTONE protocol. If any unrelated failure appears in the full-suite run, follow the spawn-FIX protocol from the prompt.",
-      "passes": false,
+      "passes": true,
       "priority": 99,
       "qualityDimensions": [
         "Final milestone — leave the trunk fully green AND fully tested AND fully documented",
@@ -1285,11 +1285,73 @@
       "estimatedEffort": "medium",
       "id": "5ba153a7-REFACTOR-1-RUNNER-DRY",
       "notes": "Reviewer report from REFACTOR-REVIEW-FINAL. Sole HIGH-severity issue. Subsumes MED-severity function-length finding.",
-      "passes": false,
+      "passes": true,
       "priority": 75,
       "title": "Extract shared process-lifecycle helpers from ClaudeRunner and GrokRunner",
       "touchesFiles": [
         "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "git log main..HEAD now includes the PR #9 commit bb9cb29 (or its merge equivalent)",
+        "git diff main..HEAD no longer shows phantom deletions of src/loop_engine/git_reconcile.rs or tasks/post-merge-slot-reconcile.* — those files reappear on the branch",
+        "tests/worktree_db_resolution.rs conflict resolved with both feature-side and main-side intent preserved (verify by reading the file end-to-end after resolution)",
+        "cargo test --lib loop_engine passes (scoped gate)",
+        "cargo test passes (full unscoped suite — milestone-level)",
+        "cargo clippy -- -D warnings clean",
+        "Merge commit message follows project conventions"
+      ],
+      "description": "From /review-loop H1. The feature branch's merge base is 0ac56743, but local main is at bb9cb29 (PR #9 — Post-merge slot completion reconciliation). git diff main..HEAD shows -728 lines on src/loop_engine/git_reconcile.rs and -756 lines across tasks/post-merge-slot-reconcile.{json,md} — these are NOT deletions on the feature branch, they are PR #9 content not yet on the branch. Merge main into the branch. Expect ONE conflict in tests/worktree_db_resolution.rs (both feature and main touched it post 0ac56743): on feature side commits 4288135 / 722e4fe modified it for grok-fallback work; on main side PR #9 modified it for slot reconciliation. Resolve preserving both behaviors. After merge: run cargo test --lib loop_engine (scoped) AND cargo test (full unscoped suite) AND cargo clippy -- -D warnings. Commit the merge with a conventional message. Do NOT force-push. Do NOT skip hooks.",
+      "estimatedEffort": "medium",
+      "id": "5ba153a7-REVIEW-FIX-1-MERGE-MAIN",
+      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. H1 of 3 high-severity findings. Reviewer cite: review reply, 'H1: rebase or merge main into the branch; resolve the single conflict in tests/worktree_db_resolution.rs'.",
+      "passes": false,
+      "priority": 80,
+      "title": "Merge main into feat/grok-fallback-runner; resolve worktree_db_resolution.rs conflict; re-run full suite",
+      "touchesFiles": [
+        "tests/worktree_db_resolution.rs",
+        "src/loop_engine/git_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "H2: cargo test runtime_error_fallback passes a regression test that promotes from claude-opus-4-7[1m] at threshold",
+        "H2: engine.rs:4913 region no longer uses string-eq with OPUS_MODEL; uses ModelTier-based inclusive check",
+        "M1: threshold comparison uses u32 throughout or guards the cast",
+        "H3: each non-primary resolve_effective_runner call site has debug_assert_eq! cross-check against the primary, OR the primary value is threaded through; debug build catches a deliberate mismatch in test",
+        "M2: a wave-mode promotion test asserts exactly ONE banner line on stderr per promoted task per iteration (no duplicate)",
+        "M3: tests/fallback_config.rs covers the case where GROK_BINARY is set; check_fallback_runner_binary succeeds when GROK_BINARY points at a real binary even if cli_binary is None and `grok` is not on PATH",
+        "M5: TASK_MGR_GROK_AUTH_WINDOW_SECS env override implemented and exercised by a test that uses it to make the timing gate deterministic",
+        "L1: temp-script tests use TempDir or a Drop guard; no `remove_file` on a raw path",
+        "L2: overflow.rs:77 region uses `target_model` (not `grok_model`)",
+        "L3: engine.rs:235-238 rustdoc disambiguates the FEAT-007 reference",
+        "L4: a short comment near model_tier or provider_for_model pins the substring-vs-token divergence",
+        "L5: rustdoc field-clear order in engine.rs check_override_invalidation matches code order",
+        "cargo test --lib loop_engine passes",
+        "cargo test (full unscoped suite) passes",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "dependsOn": [
+        "5ba153a7-REVIEW-FIX-1-MERGE-MAIN"
+      ],
+      "description": "From /review-loop on 2026-05-18 (H2, H3, M1, M2, M3, M5, L1-L5 bundled into one atomic fix). Implement each finding below; run cargo test --lib loop_engine + cargo clippy after every batch; commit at the end of the task.\n\n## H2 — was_at_opus misses Opus[1M] (src/loop_engine/engine.rs:4913)\nCurrent: `let was_at_opus = matches!(current_model.as_deref(), Some(m) if m == model::OPUS_MODEL);` — string-eq excludes `claude-opus-4-7[1m]`. Goal #2 of the PRD ('after the Opus ceiling is reached') intends the Opus *tier*, not the exact ID. Fix: use the inclusive ModelTier check (e.g. `matches!(model::model_tier(current_model.as_deref()), ModelTier::Opus)` — confirm the exact helper name in src/loop_engine/model.rs). Add a regression test in tests/runtime_error_fallback.rs that puts a task on `claude-opus-4-7[1m]` with consecutive_failures >= threshold and asserts promotion to Grok.\n\n## M1 — u32 → i32 cast (engine.rs:4914)\nSame line region. `new_count < fallback.runtime_error_threshold as i32` casts u32 lossily at >= 2^31. Compare in u32 space (or guard the cast). Default threshold is 2, so no behavior change for sane inputs; cleanup only.\n\n## H3 — effective_runner re-derivation drift guard\nresolve_effective_runner is called at engine.rs:1456, 1877, 2437, 2731, 4917. PRD §2.5 mandates a single computed value per iteration to prevent silent drift. Choose the lighter fix: at each non-primary call site, add `debug_assert_eq!(resolve_effective_runner(...), <primary_computed_value>);` cross-checks where the primary value is in scope. If threading the single value is cleaner, do that instead — but keep the diff small. Goal: a future refactor that returns the wrong value at one site fails a debug build before reaching production.\n\n## M2 — Double eprintln! on promotion\nFind the two promotion eprintln! sites (rung-4 in overflow.rs and the RuntimeError hook in engine.rs ~4937). Under wave-mode aggregation a single task can hit both in one wave. Consolidate so each promotion emits exactly one banner line per iteration. Acceptable approach: gate the second eprintln! on the override map being empty (i.e. first-time promotion only), or move the banner to a shared site after both gates have run.\n\n## M3 — check_fallback_runner_binary does not honor $GROK_BINARY (project_config.rs:283)\nThe startup check resolves `cli_binary or 'grok'` but skips the env var, while GrokRunner::spawn uses `$GROK_BINARY → cli_binary → 'grok'`. Mismatch confuses operators who set GROK_BINARY for test/dev. Update check_fallback_runner_binary to use the same resolution chain. Update tests/fallback_config.rs to cover the env-var-set case.\n\n## M5 — Fixed 3s GROK_AUTH_FAILURE_WINDOW with no env override (runner.rs:41)\nAdd TASK_MGR_GROK_AUTH_WINDOW_SECS env override mirroring the CLAUDE_BINARY test-only pattern. Parse u64, fall back to 3 on missing/invalid. Document in rustdoc as a test-only seam. Update tests/grok_auth_failure.rs to use the env override for the fast/slow case rather than depending on real timing.\n\n## L1 — Temp-script test cleanup hardening\ntests/grok_auth_failure.rs and tests/grok_runner_unit.rs use std::env::temp_dir() with `let _ = std::fs::remove_file(...)` cleanup. Wrap in a tempfile::TempDir or a Drop guard so test panics don't leak files.\n\n## L2 — Rename grok_model → target_model in RecoveryAction::FallbackToProvider.user_message (overflow.rs:77-81)\nThe provider name is configurable; the local should not bake 'grok' into the identifier. Pure rename.\n\n## L3 — Disambiguate FEAT-007 in IterationContext::crashed_last_iteration rustdoc (engine.rs:235-238)\nThe doc references 'FEAT-007' but this PRD also has its own FEAT-007. Clarify which PRD/scope.\n\n## L4 — Comment substring-vs-token divergence in model.rs\nmodel::model_tier uses substring matching while model::provider_for_model uses token equality (intentional). A short comment near either function pinning the divergence prevents a future 'fix' that aligns them and breaks Groq Inc. routing.\n\n## L5 — Reorder six-field clear rustdoc in engine.rs:4812-4817 to match code order\nCosmetic: the rustdoc lists the cleared fields in one order and the code clears them in another. Align.\n\n## Out of scope here\nL6 (the diff-stat 'deletions' that resolve when H1 merges main) is resolved by 5ba153a7-REVIEW-FIX-1-MERGE-MAIN. M4 was already resolved during review (assertion exists at tests/grok_runner_unit.rs:167).",
+      "estimatedEffort": "high",
+      "id": "5ba153a7-REVIEW-FIX-2-ALL",
+      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. Bundles H2, H3, M1, M2, M3, M5, L1-L5 into one atomic fix. Depends on 5ba153a7-REVIEW-FIX-1-MERGE-MAIN (H1) so the merged base is the starting point.",
+      "passes": false,
+      "priority": 81,
+      "title": "Address all remaining /review-loop findings: Opus[1M] gate, drift guards, banner dedupe, startup env parity, auth window env, low nits",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/runner.rs",
+        "tests/runtime_error_fallback.rs",
+        "tests/grok_auth_failure.rs",
+        "tests/grok_runner_unit.rs",
+        "tests/fallback_config.rs"
       ]
     }
   ],
