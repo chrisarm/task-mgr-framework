@@ -2362,6 +2362,11 @@ pub fn run_iteration(
         );
     }
 
+    // FEAT-005/009: resolve effective runner once per iteration (PRD §2.5
+    // single source of truth). Placed before the banner so the "(via grok)"
+    // annotation can be included in the iteration header.
+    let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
+
     // Step 5: Print iteration header (with post-escalation effective_model + effort)
     eprintln!(
         "{}",
@@ -2374,6 +2379,7 @@ pub fn run_iteration(
             effort,
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            effective_runner,
         )
     );
 
@@ -2385,11 +2391,6 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
-    // FEAT-005: resolve effective runner once per iteration (PRD §2.5
-    // single source of truth). Reused below by the PromptTooLong overflow
-    // handler call site so the runner identity stays consistent across
-    // dispatch + downstream idempotency checks.
-    let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
     let claude_result = runner::dispatch(
         effective_runner,
         &prompt_result.prompt,

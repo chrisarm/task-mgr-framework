@@ -224,6 +224,7 @@ pub fn format_iteration_banner_with_recovery(
     effort: Option<&str>,
     overflow_recovered: &std::collections::HashSet<String>,
     overflow_original_model: &std::collections::HashMap<String, String>,
+    effective_runner: crate::loop_engine::runner::RunnerKind,
 ) -> String {
     let model_display = model.unwrap_or("(default)");
     let recovery_suffix = if overflow_recovered.contains(task_id) {
@@ -234,14 +235,20 @@ pub fn format_iteration_banner_with_recovery(
     } else {
         String::new()
     };
+    let grok_suffix = if effective_runner == crate::loop_engine::runner::RunnerKind::Grok {
+        " (via grok)"
+    } else {
+        ""
+    };
     let effort_display = effort.unwrap_or("(default)");
     format!(
-        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {}{} ═══ Effort: {} ═══ Elapsed: {} ═══",
+        "\n═══ Iteration {}/{} ═══ Task: {} ═══ Model: {}{}{} ═══ Effort: {} ═══ Elapsed: {} ═══",
         iteration,
         max_iterations,
         task_id,
         model_display,
         recovery_suffix,
+        grok_suffix,
         effort_display,
         format_duration(elapsed_secs)
     )
@@ -692,6 +699,7 @@ mod tests {
 
     use crate::loop_engine::engine::IterationContext;
     use crate::loop_engine::model::OPUS_MODEL;
+    use crate::loop_engine::runner::RunnerKind;
 
     /// Positive: overflow_recovered marks the task AND original is recorded →
     /// banner Model field gets the "(overflow recovery from <orig>)" suffix.
@@ -712,6 +720,7 @@ mod tests {
             Some("high"),
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            RunnerKind::Claude,
         );
 
         assert!(
@@ -747,6 +756,7 @@ mod tests {
             Some("high"),
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            RunnerKind::Claude,
         );
 
         assert!(
@@ -771,6 +781,7 @@ mod tests {
             Some("high"),
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            RunnerKind::Claude,
         );
         let baseline = format_iteration_header(1, 10, task_id, 30, Some(OPUS_MODEL), Some("high"));
 
@@ -800,6 +811,7 @@ mod tests {
             Some("high"),
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            RunnerKind::Claude,
         );
 
         assert!(
@@ -815,6 +827,56 @@ mod tests {
         assert!(
             !banner.contains("None"),
             "Banner must never leak literal 'None' into user output; got:\n{}",
+            banner
+        );
+    }
+
+    /// FEAT-009: effective_runner=Grok → banner contains '(via grok)'.
+    #[test]
+    fn test_banner_shows_via_grok_when_runner_is_grok() {
+        let ctx = IterationContext::new(3);
+        let task_id = "FEAT-009";
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            task_id,
+            30,
+            Some("grok-4-fast"),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+            RunnerKind::Grok,
+        );
+
+        assert!(
+            banner.contains("(via grok)"),
+            "Banner must contain '(via grok)' when effective_runner=Grok; got:\n{}",
+            banner
+        );
+    }
+
+    /// FEAT-009: effective_runner=Claude → banner does NOT contain '(via grok)'.
+    #[test]
+    fn test_banner_no_via_grok_when_runner_is_claude() {
+        let ctx = IterationContext::new(3);
+        let task_id = "FEAT-009";
+
+        let banner = format_iteration_banner_with_recovery(
+            1,
+            10,
+            task_id,
+            30,
+            Some(OPUS_MODEL),
+            Some("high"),
+            &ctx.overflow_recovered,
+            &ctx.overflow_original_model,
+            RunnerKind::Claude,
+        );
+
+        assert!(
+            !banner.contains("(via grok)"),
+            "Banner must NOT contain '(via grok)' when effective_runner=Claude; got:\n{}",
             banner
         );
     }

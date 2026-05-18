@@ -121,6 +121,11 @@ pub struct OverflowEvent {
     pub dropped_sections: Vec<String>,
     pub recovery: RecoveryAction,
     pub dump_path: String,
+    /// LLM runner that was active when the overflow fired. `None` for legacy
+    /// events that predate this field; `Some("claude")` / `Some("grok")` for
+    /// current events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 /// Sanitize a task ID for safe use as a filename component.
@@ -513,6 +518,13 @@ pub fn handle_prompt_too_long(
         dropped_sections: prompt_result.dropped_sections.clone(),
         recovery: action.clone(),
         dump_path: dump_path.to_string_lossy().into_owned(),
+        runner: Some(
+            match effective_runner {
+                RunnerKind::Claude => "claude",
+                RunnerKind::Grok => "grok",
+            }
+            .to_string(),
+        ),
     };
     if let Err(e) = append_event_log(base_dir, &event) {
         eprintln!("warning: overflow event log append failed: {}", e);
@@ -691,6 +703,7 @@ mod tests {
                 new_model: model::OPUS_MODEL.to_string(),
             },
             dump_path: "/tmp/dump.txt".to_string(),
+            runner: None,
         }
     }
 
@@ -838,6 +851,49 @@ mod tests {
         assert!(
             failure_count >= 4,
             "passthrough stub must fail at least 4 cases, only failed {failure_count}: {failures:?}"
+        );
+    }
+
+    // --- OverflowEvent.runner field tests (FEAT-009) ---
+
+    /// Parse an OverflowEvent with runner='grok' from JSONL — field populated correctly.
+    #[test]
+    fn runner_field_deserializes_grok() {
+        let json = r#"{"ts":"2026-05-04T20:00:00+00:00","task_id":"FEAT-001","iteration":1,"prompt_bytes":100,"sections":[],"dropped_sections":[],"recovery":{"action":"blocked"},"dump_path":"/tmp/d.txt","runner":"grok"}"#;
+        let event: OverflowEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.runner, Some("grok".to_string()));
+    }
+
+    /// Parse a legacy OverflowEvent (no runner field) — field is None; no panic.
+    #[test]
+    fn legacy_event_without_runner_deserializes_as_none() {
+        let json = r#"{"ts":"2026-05-04T20:00:00+00:00","task_id":"FEAT-001","iteration":1,"prompt_bytes":100,"sections":[],"dropped_sections":[],"recovery":{"action":"blocked"},"dump_path":"/tmp/d.txt"}"#;
+        let event: OverflowEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.runner, None);
+    }
+
+    /// Serialize an OverflowEvent with runner=None — 'runner' key OMITTED from JSON.
+    #[test]
+    fn runner_none_omitted_from_serialization() {
+        let mut event = sample_event();
+        event.runner = None;
+        let v = serde_json::to_value(&event).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("runner"),
+            "runner=None must be omitted from JSON; got {v}"
+        );
+    }
+
+    /// Serialize an OverflowEvent with runner=Some("grok") — 'runner':'grok' present.
+    #[test]
+    fn runner_some_grok_present_in_serialization() {
+        let mut event = sample_event();
+        event.runner = Some("grok".to_string());
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            v.get("runner").and_then(|v| v.as_str()),
+            Some("grok"),
+            "runner=Some('grok') must serialize as 'grok'; got {v}"
         );
     }
 }
