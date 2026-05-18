@@ -131,7 +131,6 @@ fn dispatch_grok_with_mock(
 /// discriminator — a future stub that returns `Ok(default())` produces no
 /// marker and the assertion fails loudly.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_runner_returns_echoed_stdout_via_mock_binary() {
     let marker = "GROK_RUNNER_ECHO_MARKER_5BA153A7";
     let script = make_argv_echo_script("echo_stdout", marker);
@@ -165,7 +164,6 @@ fn grok_runner_returns_echoed_stdout_via_mock_binary() {
 /// Verified by inspecting the echoed argv lines from the mock: no `argv:
 /// --session-id` line should appear regardless of the opt-in.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_runner_silently_ignores_cleanup_title_artifact() {
     let marker = "GROK_RUNNER_CLEANUP_MARKER_5BA153A7";
     let script = make_argv_echo_script("cleanup_ignored", marker);
@@ -212,7 +210,6 @@ fn grok_runner_silently_ignores_cleanup_title_artifact() {
 /// silently swallows `Dangerous` (treating it as `Scoped`) lacks the flag
 /// pair entirely.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_runner_dangerous_permission_mode_emits_bypass_flag() {
     let marker = "GROK_RUNNER_DANGEROUS_MARKER_5BA153A7";
     let script = make_argv_echo_script("dangerous", marker);
@@ -238,25 +235,28 @@ fn grok_runner_dangerous_permission_mode_emits_bypass_flag() {
     );
 }
 
-// ── v1 behavior pin: dispatch(Grok) is unimplemented until FEAT-003 ───────────
+// ── v1 behavior pin: dispatch(Grok) reaches a real GrokRunner ─────────────────
 
-/// Until FEAT-003 lands, `dispatch(RunnerKind::Grok, ...)` panics with the
-/// documented `unimplemented!("...FEAT-003 will land GrokRunner")` message.
-/// This test runs unconditionally and FAILS once FEAT-003 lands — the
-/// FEAT-003 author must then either delete this test or invert it (assert
-/// `Ok(...)`), in the same commit that un-#[ignore]s the AC 9-11 tests
-/// above. The forcing function ensures the un-ignore step is never silently
-/// missed.
+/// FEAT-003 landed: `dispatch(RunnerKind::Grok, ...)` now reaches a real
+/// `GrokRunner` impl. The test points `GROK_BINARY` at a mock script so the
+/// run does not depend on a real grok install — proving the dispatch arm
+/// no longer panics and the runner body actually executes the resolved
+/// binary. The inverted shape is the post-FEAT-003 counterpart of the
+/// pre-FEAT-003 `#[should_panic]` guard.
 #[test]
-#[should_panic(expected = "FEAT-003")]
 fn grok_runner_dispatch_variant_is_reachable() {
-    // The mock binary is irrelevant — dispatch panics before any spawn.
+    let marker = "GROK_RUNNER_REACHABLE_MARKER_5BA153A7";
+    let script = make_argv_echo_script("reachable", marker);
     let perm = scoped_coding();
-    let _ = dispatch(
-        RunnerKind::Grok,
-        "this-will-panic-until-feat-003",
-        &perm,
-        RunnerOpts::default(),
+    let result = dispatch_grok_with_mock(&script, "reachable-probe", &perm, RunnerOpts::default());
+    let _ = std::fs::remove_file(&script);
+
+    let r = result.expect("dispatch(Grok) returned Err — runner body not reached");
+    assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
+    assert!(
+        r.output.contains(marker),
+        "expected marker {marker:?} in stdout (runner body must have spawned the binary), got {:?}",
+        r.output,
     );
 }
 

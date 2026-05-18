@@ -130,7 +130,6 @@ fn assert_is_grok_auth_failure(
 
 /// AC 1: stderr `not authenticated` + non-zero exit < 3s → GrokAuthFailure.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_auth_failure_on_not_authenticated_fast_fail() {
     let script = make_grok_mock("not_auth_fast", "Error: not authenticated", 1, 0);
     let result = dispatch_grok_with_mock(&script);
@@ -140,7 +139,6 @@ fn grok_auth_failure_on_not_authenticated_fast_fail() {
 
 /// AC 2: stderr `please run grok login` + non-zero exit < 3s → GrokAuthFailure.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_auth_failure_on_please_run_grok_login_fast_fail() {
     let script = make_grok_mock(
         "please_run_login",
@@ -155,7 +153,6 @@ fn grok_auth_failure_on_please_run_grok_login_fast_fail() {
 
 /// AC 3: stderr `grok login required` + non-zero exit < 3s → GrokAuthFailure.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_auth_failure_on_grok_login_required_fast_fail() {
     let script = make_grok_mock(
         "login_required",
@@ -172,7 +169,6 @@ fn grok_auth_failure_on_grok_login_required_fast_fail() {
 /// GrokAuthFailure. The sniff MUST be case-insensitive; the architect's
 /// rationale is that the grok CLI's wording is not contractually stable.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_auth_failure_is_case_insensitive() {
     let script = make_grok_mock("uppercase", "FATAL: NOT AUTHENTICATED", 1, 0);
     let result = dispatch_grok_with_mock(&script);
@@ -189,7 +185,7 @@ fn grok_auth_failure_is_case_insensitive() {
 /// (it's `#[ignore]`'d for FEAT-003 reasons anyway); CI must run with
 /// `--include-ignored` once un-#[ignore]'d.
 #[test]
-#[ignore = "FEAT-003 + slow (>3s sleep) — un-ignore when GrokRunner lands"]
+#[ignore = "slow (>3s sleep) — run with `cargo test -- --ignored` to exercise the timing window"]
 fn grok_auth_substring_past_window_is_not_auth_failure() {
     let script = make_grok_mock(
         "past_window",
@@ -216,7 +212,6 @@ fn grok_auth_substring_past_window_is_not_auth_failure() {
 /// deprecation warnings, etc.); only the combination of substring + non-zero
 /// exit is a credible auth-failure signal.
 #[test]
-#[ignore = "FEAT-003: dispatch(Grok) currently unimplemented!() — un-ignore when GrokRunner lands"]
 fn grok_auth_substring_with_clean_exit_is_success() {
     let script = make_grok_mock(
         "warning_clean_exit",

@@ -15,6 +15,14 @@ use tempfile::TempDir;
 /// Using a single shared static ensures cross-module serialization.
 pub static CLAUDE_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Shared mutex for tests that mutate the `GROK_BINARY` environment variable.
+///
+/// Per-runner mutex (paired with [`CLAUDE_BINARY_MUTEX`]): tests touching only
+/// one binary env var serialize within that runner's pool; tests that mutate
+/// BOTH (e.g. a future cross-runner integration test) must take both locks in
+/// a consistent order to avoid deadlock.
+pub static GROK_BINARY_MUTEX: Mutex<()> = Mutex::new(());
+
 /// RAII guard that sets an environment variable and restores it on drop.
 ///
 /// Prevents env-var leaks when a test panics before the cleanup line.
