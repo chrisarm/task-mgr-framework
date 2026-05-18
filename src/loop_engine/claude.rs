@@ -7,19 +7,22 @@
 ///
 /// When a `SignalFlag` is provided, a watchdog thread monitors for SIGINT/SIGTERM
 /// and escalates: SIGTERM → 3s grace → SIGKILL.
-use std::io::{BufRead, BufReader, Read};
+///
+/// The actual subprocess body now lives in `runner::ClaudeRunner::spawn`
+/// (FEAT-001 trait extraction). `spawn_claude` is a thin compatibility
+/// wrapper that constructs `RunnerKind::Claude` and calls `runner::dispatch`;
+/// `SpawnOpts` / `ClaudeResult` are `pub type` aliases for
+/// `RunnerOpts` / `RunnerResult` so all 10 existing call sites compile unchanged.
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
-use crate::error::{TaskMgrError, TaskMgrResult};
+use crate::error::TaskMgrResult;
 use crate::loop_engine::config::PermissionMode;
-use crate::loop_engine::signals::SignalFlag;
-use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
+use crate::loop_engine::runner::{self, RunnerKind, RunnerOpts, RunnerResult};
 
 /// Maximum bytes for the formatted conversation in stream-json mode.
 /// Byte-based for O(1) checking; limits are approximate and mostly-ASCII content means bytes ≈ chars.
@@ -53,35 +56,19 @@ pub(crate) fn encoded_cwd_dir(cwd: &Path, home: &Path) -> PathBuf {
 }
 
 /// Result of a Claude subprocess invocation.
-#[derive(Debug)]
-pub struct ClaudeResult {
-    /// Process exit code (0 = success, non-zero = error/crash)
-    pub exit_code: i32,
-    /// Complete stdout output collected from the process.
-    /// In stream-json mode, this is the `result.result` field from the final line.
-    /// In plain mode, this is the raw stdout.
-    pub output: String,
-    /// Formatted conversation transcript (only set in stream-json mode).
-    /// Contains assistant text, tool calls, and tool results.
-    pub conversation: Option<String>,
-    /// Whether the process was killed due to iteration timeout.
-    pub timed_out: bool,
-    /// Whether the process was killed by the post-completion grace window
-    /// elapsing (watchdog saw `<completed>TARGET</completed>` and the
-    /// POST_COMPLETION_GRACE_SECS window ran out). This produces a SIGTERM
-    /// (exit code 143) that is NOT an external Ctrl+C and must not
-    /// propagate to the parent's signal flag.
-    pub completion_killed: bool,
-    /// Tool calls denied by the permission system during this invocation.
-    /// Each entry is a raw JSON value from the stream-json `permission_denials` array.
-    pub permission_denials: Vec<serde_json::Value>,
-}
+///
+/// Type alias of [`RunnerResult`](crate::loop_engine::runner::RunnerResult) —
+/// FEAT-001 moved the struct definition into the provider-neutral runner
+/// module. Kept here under the legacy name so all existing call sites compile
+/// without modification.
+pub type ClaudeResult = RunnerResult;
 
 /// Optional settings for a `spawn_claude` invocation.
 ///
-/// Every field has a safe default (`None` / `false`), so callers only need to
-/// set what's relevant to their use case. `prompt` and `permission_mode`
-/// remain required positional args because they have no meaningful default.
+/// Type alias of [`RunnerOpts`](crate::loop_engine::runner::RunnerOpts) —
+/// FEAT-001 moved the struct definition into the provider-neutral runner
+/// module. Kept here under the legacy name so all 10 existing call sites
+/// continue to compile with no source modifications.
 ///
 /// Example:
 /// ```ignore
@@ -92,63 +79,7 @@ pub struct ClaudeResult {
 ///     ..SpawnOpts::default()
 /// })
 /// ```
-#[derive(Default)]
-pub struct SpawnOpts<'a> {
-    /// Watchdog signal flag. When set, a watchdog thread polls this every
-    /// 200ms and escalates SIGTERM → 3s grace → SIGKILL on trip.
-    pub signal_flag: Option<&'a SignalFlag>,
-    /// Working directory for the spawned subprocess. Required when running
-    /// inside a git worktree so Claude's sandbox scopes writes correctly.
-    pub working_dir: Option<&'a Path>,
-    /// `--model` flag value; empty/None omits the flag.
-    pub model: Option<&'a str>,
-    /// Iteration timeout configuration; `None` disables the timeout thread.
-    pub timeout: Option<TimeoutConfig>,
-    /// When `true`, use `--verbose --output-format stream-json` instead of
-    /// plain mode.
-    pub stream_json: bool,
-    /// `--effort` flag value; empty/None omits the flag.
-    pub effort: Option<&'a str>,
-    /// `--disallowedTools` value; empty/None omits the flag.
-    pub disallowed_tools: Option<&'a str>,
-    /// Canonical task-mgr DB dir to pin via `TASK_MGR_DIR` env.
-    pub db_dir: Option<&'a Path>,
-    /// When `true`, inject `--session-id <uuid>` before `-p` and synchronously
-    /// delete `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` after the
-    /// child process exits. Workaround for Claude Code 2.1.110 leaking
-    /// ai-title metadata despite `--no-session-persistence`.
-    pub cleanup_title_artifact: bool,
-    /// When `true` (Unix only), wire the child's stdout+stderr to a
-    /// pseudo-TTY slave instead of a regular pipe. Node.js (and therefore
-    /// Claude Code) line-buffers stdout only when `isatty(1)` is true, so
-    /// a pipe causes block-buffered bursts while a PTY streams per line.
-    /// stdin remains a pipe (unchanged prompt delivery + no echo).
-    /// Ignored on non-Unix — falls back to piped stdout / inherited stderr.
-    pub use_pty: bool,
-    /// The task ID this spawn is working on. When `Some`, the stream-json
-    /// tee scans assistant text for `<completed>TARGET</completed>` and,
-    /// on first match, starts a bounded post-completion grace window
-    /// (see `watchdog::POST_COMPLETION_GRACE_SECS`). After the grace
-    /// elapses, the watchdog terminates the process even if the agent is
-    /// still waiting on background tasks. Only the *current* target's
-    /// completion triggers the grace — other `<completed>` tags (e.g.
-    /// tasks finished en route) are collected normally but do not arm it.
-    pub target_task_id: Option<&'a str>,
-    /// Optional prefix applied to every live-output line this spawn emits
-    /// (assistant text, plain-mode stdout passthrough, malformed-JSON
-    /// warnings). Used by parallel-wave callers to disambiguate which
-    /// slot's Claude is talking when multiple subprocesses tee to stderr
-    /// concurrently. Sequential callers pass `None` and output is unprefixed.
-    /// Note: child stderr is inherited (not piped) and therefore cannot be
-    /// prefixed — only output that flows through our tee paths is tagged.
-    pub slot_label: Option<&'a str>,
-    /// Active PRD prefix to forward to the child via `TASK_MGR_ACTIVE_PREFIX`.
-    /// The loop engine sets this to the iteration's `task_prefix` so that
-    /// `task-mgr add --stdin` calls from inside the subprocess auto-prefix IDs
-    /// to the correct PRD. All non-loop callers (curate, learnings, merge
-    /// resolver, etc.) pass `None`, leaving the variable unset in the child.
-    pub active_prefix: Option<&'a str>,
-}
+pub type SpawnOpts<'a> = RunnerOpts<'a>;
 
 /// Allocate a pseudo-TTY pair for piping the child's stdout+stderr through.
 ///
@@ -163,7 +94,7 @@ pub struct SpawnOpts<'a> {
 /// `isatty(1)` returns true. A plain pipe triggers block-buffering (~8KB),
 /// which makes stream-json lines arrive in bursts instead of live.
 #[cfg(unix)]
-fn open_pty_for_child_output() -> std::io::Result<(
+pub(crate) fn open_pty_for_child_output() -> std::io::Result<(
     std::os::fd::OwnedFd,
     std::os::fd::OwnedFd,
     std::os::fd::OwnedFd,
@@ -218,7 +149,7 @@ fn open_pty_for_child_output() -> std::io::Result<(
 /// slave fd has been closed — i.e. once the child exits and its stdout/stderr
 /// descriptors are released. Non-PTY readers never produce EIO, so this check
 /// is safe to apply unconditionally in the read loops.
-fn is_pty_read_eof(e: &std::io::Error) -> bool {
+pub(crate) fn is_pty_read_eof(e: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
         e.raw_os_error() == Some(libc::EIO)
@@ -272,329 +203,7 @@ pub(crate) fn spawn_claude(
     permission_mode: &PermissionMode,
     opts: SpawnOpts<'_>,
 ) -> TaskMgrResult<ClaudeResult> {
-    let SpawnOpts {
-        signal_flag,
-        working_dir,
-        model,
-        timeout,
-        stream_json,
-        effort,
-        disallowed_tools,
-        db_dir,
-        cleanup_title_artifact,
-        use_pty,
-        target_task_id,
-        slot_label,
-        active_prefix,
-    } = opts;
-    let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-    let mut args: Vec<String> = if stream_json {
-        vec![
-            "--print".to_string(),
-            "--verbose".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--no-session-persistence".to_string(),
-        ]
-    } else {
-        vec![
-            "--print".to_string(),
-            "--no-session-persistence".to_string(),
-        ]
-    };
-    match permission_mode {
-        PermissionMode::Dangerous => {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-        PermissionMode::Scoped { allowed_tools } => {
-            args.push("--permission-mode".to_string());
-            args.push("dontAsk".to_string());
-            if let Some(tools) = allowed_tools {
-                args.push("--allowedTools".to_string());
-                args.push(tools.clone());
-            }
-        }
-        PermissionMode::Auto { allowed_tools } => {
-            args.push("--permission-mode".to_string());
-            args.push("auto".to_string());
-            if let Some(tools) = allowed_tools {
-                args.push("--allowedTools".to_string());
-                args.push(tools.clone());
-            }
-        }
-    }
-    if let Some(tools) = disallowed_tools
-        && !tools.trim().is_empty()
-    {
-        args.push("--disallowedTools".to_string());
-        args.push(tools.to_string());
-    }
-    if let Some(m) = model
-        && !m.trim().is_empty()
-    {
-        args.push("--model".to_string());
-        args.push(m.to_string());
-    }
-    if let Some(e) = effort
-        && !e.trim().is_empty()
-    {
-        args.push("--effort".to_string());
-        args.push(e.to_string());
-    }
-    // Claude Code 2.1.110 writes an ai-title jsonl despite --no-session-persistence;
-    // forcing a known UUID lets the post-wait cleanup delete that exact file.
-    // Must stay before -p — Claude only parses flags left of the prompt.
-    let cleanup_session_id: Option<Uuid> = cleanup_title_artifact.then(|| {
-        let id = Uuid::new_v4();
-        args.push("--session-id".to_string());
-        args.push(id.to_string());
-        id
-    });
-    args.push("-p".to_string());
-    // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
-    // limits when prompts are large (e.g. curate dedup with many learnings).
-
-    let mut cmd = Command::new(&binary);
-    cmd.args(&args).stdin(Stdio::piped());
-
-    // PTY mode (Unix): wire stdout+stderr to a pseudo-TTY slave so Node.js
-    // line-buffers its writes. Pipe mode (default): piped stdout for our
-    // reader, inherited stderr for direct terminal passthrough.
-    //
-    // `pty_master` stays in scope through the end of the read loop — dropping
-    // it early would close our end of the PTY and cause reads to EIO mid-run.
-    #[cfg(unix)]
-    let pty_master: Option<std::os::fd::OwnedFd> = if use_pty {
-        match open_pty_for_child_output() {
-            Ok((master, slave_out, slave_err)) => {
-                cmd.stdout(Stdio::from(slave_out));
-                cmd.stderr(Stdio::from(slave_err));
-                Some(master)
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to allocate PTY for streaming (falling back to pipe): {}",
-                    e
-                );
-                cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
-                None
-            }
-        }
-    } else {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
-        None
-    };
-    #[cfg(not(unix))]
-    {
-        let _ = use_pty;
-        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
-    }
-
-    // Tell the guard-destructive hook to allow all commands.  The loop
-    // engine already scopes permissions via --allowedTools, so the hook's
-    // interactive-approval model is not applicable here.
-    cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
-
-    // Pin every `task-mgr` invocation inside the spawned Claude (and any
-    // nested subprocesses that inherit env) to the canonical DB. Without
-    // this, when `working_dir` is a worktree, a `task-mgr add` from inside
-    // the subprocess would resolve `--dir=".task-mgr"` against the worktree
-    // cwd and silently create a stray `<worktree>/.task-mgr/tasks.db` —
-    // the original bug this whole feature exists to fix.
-    //
-    // Canonicalize defensively: the loop's `db_dir` may differ from the
-    // git-resolved path the subprocess would compute when reached via a
-    // symlinked worktree.
-    if let Some(dir) = db_dir {
-        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        cmd.env("TASK_MGR_DIR", canonical);
-    }
-
-    // Pin the active PRD prefix so subprocess calls to `task-mgr add --stdin`
-    // auto-prefix IDs to the correct PRD. Set only when Some and non-empty —
-    // when None (or empty), leave the variable unset so manual `task-mgr`
-    // invocations from inside a worktree inherit the parent env unchanged.
-    if let Some(p) = active_prefix.filter(|p| !p.is_empty()) {
-        cmd.env(ACTIVE_PREFIX_ENV, p);
-    }
-
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
-
-    // Put child in its own process group so we can kill the entire tree on signal.
-    // kill(-child_pid, sig) targets the group. The watchdog thread monitors the
-    // signal flag and escalates: SIGTERM → 3s grace → SIGKILL.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            TaskMgrError::IoErrorWithContext {
-                file_path: binary.clone(),
-                operation: format!("spawning Claude subprocess (is '{}' in your PATH?)", binary),
-                source: e,
-            }
-        } else {
-            TaskMgrError::IoErrorWithContext {
-                file_path: binary.clone(),
-                operation: "spawning Claude subprocess".to_string(),
-                source: e,
-            }
-        }
-    })?;
-
-    // Write the prompt to stdin and close it so the child can start processing.
-    // This must happen before reading stdout to avoid deadlock.
-    {
-        use std::io::Write;
-        let mut stdin = child
-            .stdin
-            .take()
-            .expect("stdin should be piped (Stdio::piped() was set on spawn)");
-        match stdin.write_all(prompt.as_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                // Child closed stdin early (e.g., crashed during startup).
-                // We'll capture its exit code below.
-            }
-            Err(e) => {
-                return Err(TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: "writing prompt to Claude subprocess stdin".to_string(),
-                    source: e,
-                });
-            }
-        }
-        // stdin is dropped here, closing the pipe
-    }
-
-    // Extract PID before starting watchdog — no race condition
-    let child_pid = child.id();
-
-    // Shared epoch seconds of when the current task's `<completed>` tag was
-    // first observed in the stream. 0 = not yet seen. Written by the reader
-    // thread (tee_stream_json), read by the watchdog thread; the watchdog
-    // force-exits POST_COMPLETION_GRACE_SECS after the value goes non-zero.
-    let completion_epoch = Arc::new(AtomicU64::new(0));
-
-    // Start watchdog thread if signal handling, timeout, or completion-grace
-    // is requested. target_task_id alone justifies a watchdog because it's
-    // what triggers the post-completion kill.
-    let stop_watchdog = Arc::new(AtomicBool::new(false));
-    let timed_out_flag = Arc::new(AtomicBool::new(false));
-    let completion_killed_flag = Arc::new(AtomicBool::new(false));
-    let watchdog_handle = if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some()
-    {
-        let stop = Arc::clone(&stop_watchdog);
-        let flag = signal_flag.cloned();
-        let timeout_cfg = timeout;
-        let timed_out = Arc::clone(&timed_out_flag);
-        let epoch = Arc::clone(&completion_epoch);
-        let target = target_task_id.map(str::to_owned);
-        let completion_killed = Arc::clone(&completion_killed_flag);
-        Some(std::thread::spawn(move || {
-            watchdog_loop(
-                child_pid,
-                flag.as_ref(),
-                &stop,
-                timeout_cfg.as_ref(),
-                &timed_out,
-                Some(&epoch),
-                target.as_deref(),
-                Some(&completion_killed),
-            );
-        }))
-    } else {
-        None
-    };
-
-    // In PTY mode, reads come from our master fd (child wrote via the slave end);
-    // otherwise they come from the piped stdout. Both implement `Read`; we box to
-    // a single type so the downstream tee logic stays generic over the source.
-    let reader_source: Box<dyn Read + Send> = {
-        #[cfg(unix)]
-        {
-            if let Some(master) = pty_master {
-                Box::new(std::fs::File::from(master))
-            } else {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .expect("stdout should be piped (Stdio::piped() was set on spawn)");
-                Box::new(stdout)
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let stdout = child
-                .stdout
-                .take()
-                .expect("stdout should be piped (Stdio::piped() was set on spawn)");
-            Box::new(stdout)
-        }
-    };
-    let reader = BufReader::new(reader_source);
-
-    let (output, conversation, permission_denials) = if stream_json {
-        tee_stream_json(reader, target_task_id, &completion_epoch, slot_label)
-    } else {
-        let mut buf = String::new();
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    // Tee: echo to stderr (live display) and collect in buffer
-                    emit_prefixed_lines(slot_label, &line);
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-                Err(e) if is_pty_read_eof(&e) => break,
-                Err(e) => {
-                    emit_prefixed_lines(
-                        slot_label,
-                        &format!("Warning: error reading Claude stdout: {}", e),
-                    );
-                    break;
-                }
-            }
-        }
-        (buf, None, Vec::new())
-    };
-
-    let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
-        file_path: binary,
-        operation: "waiting for Claude subprocess to exit".to_string(),
-        source: e,
-    })?;
-
-    // Stop the watchdog thread
-    stop_watchdog.store(true, Ordering::Release);
-    if let Some(handle) = watchdog_handle {
-        let _ = handle.join();
-    }
-
-    // Child has exited: the ai-title jsonl is guaranteed written (or never will
-    // be). Delete it synchronously so it's gone before this function returns,
-    // even if the caller (curate_dedup worker) immediately exits the process.
-    if let Some(uuid) = cleanup_session_id {
-        cleanup_title_artifact_sync(uuid, working_dir);
-    }
-
-    let exit_code = exit_code_from_status(status);
-    let timed_out = timed_out_flag.load(Ordering::Acquire);
-    let completion_killed = completion_killed_flag.load(Ordering::Acquire);
-
-    Ok(ClaudeResult {
-        exit_code,
-        output,
-        conversation,
-        timed_out,
-        completion_killed,
-        permission_denials,
-    })
+    runner::dispatch(RunnerKind::Claude, prompt, permission_mode, opts)
 }
 
 /// Read stream-json lines from Claude, tee assistant text to stderr, and return
@@ -607,7 +216,7 @@ pub(crate) fn spawn_claude(
 /// Each JSON line is parsed exactly once; the parsed `Value` is passed to both
 /// `tee_assistant_text` (for live display) and `process_stream_json_values` (for
 /// conversation building).
-fn tee_stream_json(
+pub(crate) fn tee_stream_json(
     reader: BufReader<impl std::io::Read>,
     target_task_id: Option<&str>,
     completion_epoch: &AtomicU64,
@@ -1144,7 +753,7 @@ static CLEANUP_WARN_ONCE: AtomicBool = AtomicBool::new(false);
 /// honors `--no-session-persistence`). The first non-`NotFound` error in
 /// a process is logged to stderr (rate-limited via `CLEANUP_WARN_ONCE`)
 /// so environmental misconfiguration surfaces without flooding output.
-fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
+pub(crate) fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
     let home = match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => PathBuf::from(h),
         _ => return,
@@ -1178,10 +787,15 @@ fn cleanup_title_artifact_sync(session_id: Uuid, working_dir: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TaskMgrError;
     use crate::loop_engine::config::CODING_ALLOWED_TOOLS;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
+    use crate::loop_engine::signals::SignalFlag;
     use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status};
     use rstest::rstest;
+    use std::io::BufReader;
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
