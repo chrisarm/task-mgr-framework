@@ -154,8 +154,9 @@ paths cannot drift again.
 
 **Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
 external-git reconciliation, post-merge-back slot completion reconciliation
-(slot-0 `{pre_merge_head}..HEAD` scan; see "Post-merge slot reconcile"
-touchpoint below), human-review trigger, rate-limit waits, pause-signal
+(slot-0 `{pre_merge_head}..HEAD` scan via
+`git_reconcile::reconcile_merged_slot_completions` — see the Touchpoints
+table below), human-review trigger, rate-limit waits, pause-signal
 handling, slot merge resolution (see "Slot merge-back conflict
 resolution" below).
 

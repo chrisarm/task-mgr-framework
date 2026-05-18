@@ -1527,9 +1527,10 @@ mod tests {
             r#"{"id":"FEAT-001","title":"Feat one","passes":false,"priority":1}"#,
         );
 
-        // Path deliberately non-existent — if the function tried to run git
-        // here, it would emit the git-log warning line, but it must short-circuit
-        // first because pre_merge_head is empty.
+        // Path deliberately non-existent — the function must short-circuit on
+        // the empty `pre_merge_head` before any `Command::new("git")` call, so
+        // the path never matters. The assertions below only inspect the return
+        // value and DB state.
         let bogus = std::path::Path::new("/nonexistent/path/that/does/not/exist");
         let reconciled =
             reconcile_merged_slot_completions(bogus, "", &mut conn, "run-1", &prd_path, None);
