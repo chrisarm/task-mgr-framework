@@ -1,0 +1,300 @@
+{
+  "branchName": "feat/post-merge-slot-reconcile",
+  "description": "Close the wave-mode silent-completion gap: when a slot agent commits work with the {TASK-ID}-COMPLETED marker but the subprocess exits before flushing the <completed> tag, the task today stays in_progress and the next loop has to re-do the work. Surface slot 0's pre-merge HEAD on MergeOutcomes, add a post-merge git-log scan in git_reconcile.rs that marks matched tasks done, wire it into run_wave_iteration, and drain pending_slot_tasks so the loop-exit cleanup doesn't undo the DB write.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: All scoped tests pass with `cargo test -p task-mgr <module>` (REVIEW-001 runs the full suite)",
+      "Rust: `cargo fmt --check` passes",
+      "No public-API breaking changes — MergeOutcomes.pre_merge_head is additive (Option<String>, defaulted via #[derive(Default)])",
+      "No new abstractions; reuse contains_task_id, prefix_and, complete_cmd::complete, update_prd_task_passes, rev_parse_head"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION — ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE — Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit — qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation — prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases — every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 — REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong",
+    "Catch-all error handlers that swallow context",
+    "Touching reconcile_external_git_completions or its call sites — this change is additive only",
+    "Bare task-mgr init --from-json (wipes status fields); use task-mgr loop init --append --update-existing for any mid-loop JSON sync"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "fe7fe9fe",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: MergeOutcomes struct gains `pub pre_merge_head: Option<String>` with rustdoc explaining the three None-yielding cases",
+        "Positive: `merge_slot_branches_with_resolver` sets `outcomes.pre_merge_head = rev_parse_head(slot0_path).ok()` immediately after `let slot0_path = &slot_paths[0];` at line 1875",
+        "Negative: pre_merge_head must NOT be captured before the early-return guards at lines 1856-1873; verify by reading the diff",
+        "Negative: per-slot pre_merge_head at run_slot_merge_attempt:2003 must remain unchanged",
+        "Unit test: `pre_merge_head_captured_when_num_slots_gt_1` — multi-slot call returns `Some(<40-char hex>)` in pre_merge_head",
+        "Unit test: `pre_merge_head_none_when_num_slots_le_1` — single-slot call returns None (early-return path at worktree.rs:1856-1857)",
+        "Unit test: `pre_merge_head_none_when_slot_paths_invalid` — call with slot_paths.len() < num_slots returns None (validation-failure path at worktree.rs:1859-1872)",
+        "Known-bad: if rev_parse_head used `.unwrap()`, a fresh-repo test (no initial commit) would panic; the `.ok()` form must produce None instead",
+        "CONTRACT: existing callers of merge_slot_branches_with_resolver (engine.rs:1810, reconcile_stale_ephemeral_slots) compile cleanly without changes — additive field with default"
+      ],
+      "dependsOn": [],
+      "description": "Add a `pre_merge_head: Option<String>` field to `MergeOutcomes` (`src/loop_engine/worktree.rs:1595-1598`) and capture slot 0's HEAD via the existing `rev_parse_head` helper inside `merge_slot_branches_with_resolver`, immediately after the early-return guards at lines 1856-1873 succeed and `slot0_path` is bound at line 1875.\n\nDO: Use `rev_parse_head(slot0_path).ok()` so any capture failure becomes `None` rather than aborting the merge. Document the field with rustdoc describing the three cases that yield `None` (num_slots <= 1, slot_paths validation failure, rev_parse_head Err) and that the field is consumed by `reconcile_merged_slot_completions`.\n\nDO NOT: Touch the per-slot rev-parse at `run_slot_merge_attempt:2003` — that capture is used for the `git reset --hard` rollback target and must remain per-attempt. Do NOT change the early-return behavior; if num_slots <= 1, return immediately with default outcomes (which now includes pre_merge_head=None).\n\nEdge cases:\n- num_slots <= 1: pre_merge_head must be None (early-return path).\n- slot_paths.len() < num_slots: pre_merge_head must be None (validation-failure path).\n- rev_parse_head returns Err (e.g., fresh repo with no HEAD): pre_merge_head must be None; merge loop continues normally.\n\nKnown-bad to guard against:\n- Capturing pre_merge_head BEFORE the early-return guards would set it to Some(hash) in cases where num_slots<=1 or slot_paths is invalid, breaking the invariant that None means 'do not run post-merge reconcile'. Capture must be AFTER both guards.\n- Using `unwrap()` on rev_parse_head would panic on a fresh repo or git command failure — must use `.ok()` to convert Err into None.",
+      "edgeCases": [
+        "num_slots <= 1: pre_merge_head is None (early-return path)",
+        "slot_paths.len() < num_slots: pre_merge_head is None (validation-failure path)",
+        "rev_parse_head returns Err (no HEAD ref): pre_merge_head is None, merge continues"
+      ],
+      "estimatedEffort": "low",
+      "failureModes": [
+        {
+          "cause": "rev_parse_head fails (no HEAD, git not in PATH, IO error)",
+          "expectedBehavior": "pre_merge_head set to None; merge loop proceeds exactly as before"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Reuse `rev_parse_head` at worktree.rs:1605. The existing #[derive(Default)] on MergeOutcomes means Option<String> defaults to None automatically — no constructor changes. Existing tests for `merge_slot_branches_with_resolver` are in src/loop_engine/worktree.rs mod tests (starts ~:2334). Add the three new tests adjacent to the existing ones.\n\nLearning [1914]: Task DB vs git history can desync when a prior iteration committed but didn't sync the DB — this is exactly the bug the parent feature fixes; this task is the substrate. Learning [2788]: Slot 0 reuses the loop's branch; slots 1+ create ephemeral branches — slot_paths[0] IS the loop's primary working tree. Learning [866]: Three-file coordinated change (helper, consumer, caller) is the natural pattern for this work.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Additive struct field — no breaking change to existing callers",
+        "None-on-failure semantics consistent for all three failure paths",
+        "Rustdoc on the new field is precise about when it's None and who consumes it",
+        "Tests pin all three None cases AND the happy-path Some case"
+      ],
+      "taskType": "implementation",
+      "title": "Surface pre-merge HEAD on MergeOutcomes",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: New function exists at git_reconcile.rs with signature `pub(crate) fn reconcile_merged_slot_completions(slot0_path: &Path, pre_merge_head: &str, conn: &mut Connection, run_id: &str, prd_path: &Path, task_prefix: Option<&str>) -> Vec<String>`",
+        "Positive: Uses `git log --no-merges {pre_merge_head}..HEAD --format=%H%x00%B%x00` exactly",
+        "Positive: Reuses `contains_task_id` (git_reconcile.rs:148), `prefix_and` (db/prefix.rs:94), `complete_cmd::complete` (commands/complete.rs:68 with force=false), `update_prd_task_passes` (prd_reconcile.rs:122)",
+        "Positive: Per-task stderr emits `Post-merge reconcile: marked {id} done (found in merged-back commits)`",
+        "Negative: Function does NOT panic on any failure path — every IO/DB/git error is warn-and-continue, return is always Vec<String>",
+        "Negative: NEVER uses force=true on complete_cmd::complete — dependency gating must remain",
+        "Negative: reconcile_external_git_completions and its call sites are unchanged",
+        "Unit test (a) happy-path: slot worktree has commit with FEAT-001-COMPLETED in body, pre→HEAD range covers it, function returns vec![\"FEAT-001\"], DB row is `done`, PRD `passes: true`",
+        "Unit test (b) no-match: pre→HEAD has commits but none contain the marker → returns vec![], no DB writes, no PRD writes",
+        "Unit test (c) no-op merge: pre_merge_head == HEAD (no commits in range) → returns vec![], git log emits empty stdout, no DB writes",
+        "Unit test (d) commit-body match (not subject): marker in body, not subject; function still finds it",
+        "Unit test (e) cross-PRD prefix isolation: task_prefix Some(\"acdfb313\") does NOT let `P9-FEAT-001-COMPLETED` match `acdfb313-FEAT-001`",
+        "Unit test (f) empty pre_merge_head short-circuits: pass \"\", function returns vec![] immediately; pass a non-existent path to assert no git invocation happened",
+        "Unit test (g) force=false respects dep gating: task whose dependency is incomplete does NOT get marked done even when marker is present",
+        "Unit test (h) merge-commit poisoning defended: synthesize a merge commit whose body carries FEAT-001-COMPLETED (e.g., `git merge -m \"Merge slot-1<newline><newline>FEAT-001-completed\"`); confirm --no-merges filter excludes it and the task is NOT marked done",
+        "Unit test (i) non-UTF-8 commit body does not panic: build a commit via `git commit-tree` with invalid UTF-8 bytes in the message; assert the reconcile returns cleanly",
+        "Known-bad: if --no-merges were dropped, test (h) would fail by marking FEAT-001 done from the merge commit's body",
+        "Known-bad: if return type were usize, the call site in FEAT-003 couldn't drain pending_slot_tasks without a re-query; pin the Vec<String> contract with a test that inspects the returned IDs"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Add `pub(crate) fn reconcile_merged_slot_completions(slot0_path, pre_merge_head, conn, run_id, prd_path, task_prefix) -> Vec<String>` to `src/loop_engine/git_reconcile.rs`, immediately after `reconcile_external_git_completions` (after current line 143). The function scans `{pre_merge_head}..HEAD` in `slot0_path` for commits whose bodies contain `<TASK-ID>-COMPLETED` markers and marks matched tasks done.\n\nDO: Mirror the existing `reconcile_external_git_completions` pattern (`git_reconcile.rs:23-143`) for: candidate enumeration via `prefix_and(task_prefix)` SQL; word-boundary matching via `contains_task_id`; DB write via `complete_cmd::complete(conn, &[id], Some(run_id), None, false)` with force=false; PRD update via `update_prd_task_passes(prd_path, id, true, task_prefix)`; per-task stderr line. Return `Vec<String>` of reconciled IDs (NOT usize) so the caller can drain pending_slot_tasks.\n\nUse the git log invocation: `git log --no-merges {pre_merge_head}..HEAD --format=%H%x00%B%x00`. The `--no-merges` flag is LOAD-BEARING — it excludes merge commits produced by ClaudeMergeResolver, whose `git commit --no-edit` can carry merged-in commit bodies and would otherwise allow a resolver merge commit on slot A to mark slot B's task done. Slot agents write single-parent commits; the resolver writes merge commits.\n\nDO NOT: Touch `reconcile_external_git_completions` or its call sites — this is additive. Do NOT use `--oneline` — slot agents put the marker in the commit body, not just the subject. Do NOT use a fixed depth scan (e.g. `-N`); the pre/post HEAD range bounds it naturally. Do NOT panic on git failure, malformed UTF-8, or DB errors — every failure path is warn-and-continue.\n\nEdge cases:\n- pre_merge_head is empty string: return Vec::new() with one stderr line (capture-failed sentinel from FEAT-001).\n- pre_merge_head == HEAD (no commits in range, no-op merge): return Vec::new(); git log emits empty stdout.\n- Commit body contains marker but for an already-done task: SQL filter (`status NOT IN ('done', 'irrelevant')`) excludes it; no double-marking.\n- Commit body contains a marker whose task has unmet dependencies: complete_cmd::complete fails dep-gating with force=false; warn-and-skip, do not error.\n- Non-UTF-8 commit body bytes: `String::from_utf8_lossy` at git_reconcile.rs:202 already handles this; pin with a test.\n- Merge commit body carries `FEAT-001-COMPLETED` copied from a merged-in slot commit: `--no-merges` filter excludes it; task NOT marked.\n- Cross-PRD ID collision (e.g., another PRD's P9-FEAT-001 vs this PRD's acdfb313-FEAT-001): prefix_and isolates candidate enumeration; contains_task_id's word-boundary check prevents the marker from matching.\n\nKnown-bad to guard against:\n- Returning usize instead of Vec<String>: the caller (FEAT-003) needs the IDs to drain pending_slot_tasks via retain. Returning a count forces a re-query of 'just-completed-in-this-run-id', which is messier and slower.\n- Omitting --no-merges: a resolver merge commit on slot 1's merge could carry slot 2's `FEAT-002-COMPLETED` marker in its body and falsely mark FEAT-002 done. The test (h) below pins this.\n- Using `force=true` for complete_cmd::complete: would bypass dependency gating. Slot tasks are in_progress at this boundary (pending_slot_tasks drain only fires at loop exit), so force=false is correct AND preserves dep gating identically to the external-git reconcile.",
+      "edgeCases": [
+        "Empty pre_merge_head: immediate return Vec::new() with one stderr line",
+        "Empty range (pre == HEAD): empty git log output → return Vec::new()",
+        "Already-done candidate: excluded by SQL filter; no double-marking",
+        "Unmet-dependency candidate: complete() with force=false fails dep-gating; warn-and-skip",
+        "Non-UTF-8 commit body: String::from_utf8_lossy handles; no panic",
+        "Merge commit with copied marker body: --no-merges excludes; task NOT marked",
+        "Cross-PRD prefix collision: prefix_and scopes candidates; contains_task_id word-boundary blocks marker match"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "git log subprocess fails (binary missing, repo corrupt)",
+          "expectedBehavior": "Warn to stderr; return Vec::new(); do not propagate"
+        },
+        {
+          "cause": "DB candidate enumeration prepare fails",
+          "expectedBehavior": "Warn to stderr; return Vec::new()"
+        },
+        {
+          "cause": "complete_cmd::complete fails for one ID (dep gating, transition violation)",
+          "expectedBehavior": "Warn to stderr; skip that ID; continue with next candidate"
+        },
+        {
+          "cause": "update_prd_task_passes fails after successful DB write",
+          "expectedBehavior": "Warn to stderr; ID still pushed into result Vec (DB write is authoritative)"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Place adjacent to `reconcile_external_git_completions` so future readers see the parallel structure. Test harness: setup_test_db, setup_git_repo, insert_run in src/loop_engine/test_utils.rs (lines 69, 236, 174). Existing test module starts at git_reconcile.rs:308 — look at `test_reconcile_finds_completed_tasks_in_external_repo` for the harness shape and `test_check_git_completion_finds_task_in_commit_body` (~:498) for body-match testing pattern.\n\nFEAT-001 must land before this task — function signature needs the `pre_merge_head` parameter and the test harness depends on the captured-HEAD semantics (though FEAT-002's tests can construct their own pre_merge_head value independently of MergeOutcomes).\n\nLearning [2289]: `mark_task_done` at prd_reconcile.rs:192 consolidates `complete → prune crashed_last_iteration → update PRD`. NOT using it here because the external-git reconcile precedent (the model for this code) calls `complete_cmd::complete` and `update_prd_task_passes` directly and doesn't prune crashed_last_iteration. Stay consistent with the precedent unless REVIEW-001 finds a reason to consolidate. Learning [2641]: `git commit --allow-empty` is the right way to create test commits without staging files.",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Mirrors reconcile_external_git_completions' control flow shape — no novel patterns",
+        "--no-merges flag is load-bearing for resolver-poisoning defense; not optional",
+        "Range-scoped (pre..HEAD), not depth-scoped — bounded by actual merged work",
+        "Returns Vec<String> not usize — enables pending_slot_tasks drain in FEAT-003",
+        "Word-boundary matching via contains_task_id prevents cross-PRD collisions",
+        "force=false on complete_cmd::complete preserves dependency gating",
+        "Every failure path is warn-and-continue; function never returns Result, never panics"
+      ],
+      "taskType": "implementation",
+      "title": "Add reconcile_merged_slot_completions to git_reconcile",
+      "touchesFiles": [
+        "src/loop_engine/git_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: new `if let (Some(ref pre), Some(slot0)) = (outcomes.pre_merge_head.as_ref(), params.slot_worktree_paths.first())` block sits between line 1856 and line 1858 (BEFORE run_cmd::update and BEFORE the external-git shadow at 1869)",
+        "Positive: on non-empty reconciled Vec, agg.tasks_completed is incremented, agg.any_completed=true, ctx.crash_tracker.record_success() is called, pending_slot_tasks is retained (drain reconciled IDs), and a one-line stderr summary is emitted",
+        "Positive: import block at engine.rs:47-49 includes `reconcile_merged_slot_completions`",
+        "Positive: stale comment at engine.rs:1282-1285 rewritten to name `reconcile_merged_slot_completions` and the `{pre..HEAD}` range — verify by grep that the words 'reconcile_merged_slot_completions' appears in the rewritten comment",
+        "Negative: `params.slot_worktree_paths[0]` direct indexing must NOT appear in the new code — use `.first()`",
+        "Negative: must NOT reorder relative to the four terminal returns at lines 1891/1904/1918/1937 — they must see the incremented counter",
+        "Negative: must NOT touch the external-git reconcile block (1869-1885) — additive only",
+        "Engine-level test (added to engine.rs's existing `mod tests`, near :8476 / :8616 patterns): set up `ctx.pending_slot_tasks` with `[\"FEAT-001\", \"FEAT-002\"]`, drive the wave path with FEAT-001 in the merged-back range, assert `pending_slot_tasks == [\"FEAT-002\"]` after the wave returns AND `agg.tasks_completed` incremented by 1 AND `agg.any_completed == true`",
+        "Known-bad: if the call were placed AFTER line 1869, the existing `let mut tasks_completed = agg.tasks_completed;` shadow would be stale and the four terminal returns would report the wrong counter. Pin with a test that asserts tasks_completed in the returned WaveOutcome includes reconciled tasks",
+        "CONTRACT: outcomes is the Vec/Struct returned by merge_slot_branches_with_resolver at line 1810; the new block reads outcomes.pre_merge_head and outcomes is still in scope at line 1857 (the existing `for (slot, detail, kind) in &outcomes.failed_slots` at line 1819 only borrows). Verify outcomes is not moved before the new block."
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002"
+      ],
+      "description": "Invoke `reconcile_merged_slot_completions` from `run_wave_iteration` in `src/loop_engine/engine.rs`, using `outcomes.pre_merge_head` (from FEAT-001) as the lower bound. Place the call between the close of the `if params.parallel_slots > 1` block at line 1856 and the `run_cmd::update` call at line 1858, BEFORE the external-git reconcile shadow at line 1869 and BEFORE all four terminal-condition gates at lines 1891, 1904, 1918, 1937.\n\nDO: On non-empty `reconciled` Vec, (1) increment `agg.tasks_completed`, (2) set `agg.any_completed = true`, (3) call `ctx.crash_tracker.record_success()`, (4) drain reconciled IDs from `ctx.pending_slot_tasks` via `retain(|t| !reconciled.contains(t))`, (5) emit a one-line summary to stderr. Also update the import at engine.rs:47-49 to include `reconcile_merged_slot_completions`. Also rewrite the stale rustdoc at engine.rs:1282-1285 (the wave-mode `skip_git_completion_detection: true` comment) to accurately describe `reconcile_merged_slot_completions` and the `{pre..HEAD}` range — currently it falsely promises a post-merge reconcile that did not exist.\n\nDO NOT: Place the call AFTER any terminal-condition gate — the incremented counter must be visible to all four returns. Do NOT use `[0]` indexing on `params.slot_worktree_paths`; use `.first()` and skip on None (defensive against malformed WaveParams, mirrors engine.rs:1370-1374). Do NOT skip the `pending_slot_tasks.retain` — without it, step 17.6 at engine.rs:3950 will reset the row back to `todo` at loop exit and undo the DB write done by FEAT-002.\n\nEdge cases:\n- outcomes.pre_merge_head is None (single-slot wave or capture failure): the `if let (Some(pre), Some(slot0)) = ...` block doesn't fire; existing behavior unchanged.\n- params.slot_worktree_paths is empty: `.first()` returns None; reconcile skipped.\n- reconciled Vec is empty (no markers found): existing behavior unchanged; no agg mutations.\n- Task was already drained from pending_slot_tasks by process_slot_result (engine.rs:1436) because the slot DID flush its <completed> tag: the retain is a no-op for that ID; reconcile's DB write is also a no-op (complete_cmd returns was_already_done=true). Correct behavior.\n- Two waves race for the same task: impossible by construction (run_wave_iteration is single-threaded within the loop), but document the invariant in a comment.\n\nKnown-bad to guard against:\n- Placing the call AFTER the external-git reconcile block (1869-1885): the external-git block establishes a local `let mut tasks_completed = agg.tasks_completed;` shadow that the terminal returns consume. Mutating agg.tasks_completed AFTER the shadow is created leaves the shadow stale and the counter wrong in the terminal returns. Place BEFORE line 1869.\n- Indexing slot_worktree_paths[0] without a .first() guard: a misconfigured WaveParams would panic mid-wave; the surrounding engine code (e.g. engine.rs:1370-1374) defends slot-path lookups this way for exactly this reason.",
+      "edgeCases": [
+        "outcomes.pre_merge_head is None: block doesn't fire; existing behavior unchanged",
+        "params.slot_worktree_paths empty: .first() yields None; block doesn't fire",
+        "reconciled Vec empty: agg unchanged; no stderr noise (only emit on non-empty)",
+        "Task already drained by process_slot_result success path: retain is no-op for that ID; complete_cmd returns was_already_done=true"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "reconcile_merged_slot_completions returns Vec::new() (no markers found)",
+          "expectedBehavior": "agg untouched, no stderr line, terminal-condition gates evaluate unchanged"
+        },
+        {
+          "cause": "reconcile_merged_slot_completions internally fails (git error, DB error)",
+          "expectedBehavior": "Function returns Vec::new() per FEAT-002 contract; caller treats it as the no-markers case"
+        }
+      ],
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Callers affected by modifiesBehavior: any code reading `WaveOutcome.tasks_completed` (terminal returns at engine.rs:1891/1904/1918/1937 and downstream `run_loop` accounting). The behavior change is strictly additive — `tasks_completed` can only go up by the count of reconciled IDs that weren't already counted. No caller needs to handle a NEW failure mode because the reconcile function never errors; it just returns Vec<String> (possibly empty).\n\nLearning [866]: Three-file coordinated change (helper, consumer, caller) — this is the caller in the trio (FEAT-001=helper, FEAT-002=consumer). Learning [2728]: ctx.crashed_last_iteration is a HashMap bounded by active task count; do NOT touch it in this task (the reconcile function deliberately does not, per FEAT-002 design). Learning [2852]: Wave mode iteration pipeline shares the post-Claude post-processing with sequential — this reconcile sits OUTSIDE that pipeline (it's at the wave boundary, not the slot boundary), so it doesn't need to be in iteration_pipeline.rs.\n\nData contract: MergeOutcomes (worktree.rs:1595) → run_wave_iteration consumer (engine.rs:1857).\nSource field (after FEAT-001): outcomes.pre_merge_head: Option<String>\nAccess: `if let (Some(ref pre), Some(slot0)) = (outcomes.pre_merge_head.as_ref(), params.slot_worktree_paths.first()) { ... }`\nNote: outcomes is mutably borrowed at line 1819 via `for (slot, detail, kind) in &outcomes.failed_slots`; that borrow ends at the for-loop close at line 1844, so outcomes is fully available at line 1857. ConfirmAt edit time.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Injection point preserves the existing 4-terminal-return invariant — counter visible everywhere",
+        ".first() defensive pattern, not [0] indexing — mirrors engine.rs:1370-1374",
+        "pending_slot_tasks.retain is load-bearing — drains reconciled IDs so loop-exit cleanup doesn't undo the DB write",
+        "Stale comment at engine.rs:1282-1285 rewritten to accurately describe what now exists",
+        "Engine-level test pins the pending_slot_tasks drain interaction"
+      ],
+      "taskType": "implementation",
+      "title": "Wire reconcile into run_wave_iteration + fix stale comment",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No code duplication that could cleanly factor out (mechanical-only, not semantic)",
+        "Functions under 30 lines where reasonable (flag complex ones)",
+        "Clear separation of concerns: git_reconcile.rs owns scanning, engine.rs owns wiring, worktree.rs owns merge mechanics",
+        "Code follows existing project patterns (warn-and-continue error model, eprintln formats, rustdoc style)",
+        "Any issues found spawn REFACTOR-FIX-xxx tasks via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003"
+      ],
+      "description": "Review all implementation across FEAT-001 / FEAT-002 / FEAT-003 for DRY violations, complexity, coupling, and adherence to existing patterns.\n\nDO: Compare `reconcile_merged_slot_completions` (FEAT-002) shape-for-shape against `reconcile_external_git_completions` — they should look structurally near-identical. Verify the new function reuses contains_task_id, prefix_and, complete_cmd::complete, update_prd_task_passes. Check the engine.rs wiring (FEAT-003) for unnecessary helper extraction or branching complexity. Look for inline TODOs left behind.\n\nDO NOT: Skip — this gate catches issues before the final review. Do NOT propose extracting a shared helper between `reconcile_external_git_completions` and `reconcile_merged_slot_completions` unless the duplication is mechanical (same SQL, same parsing) — there are real semantic differences (depth vs range, --no-merges vs not, usize vs Vec<String> return) that justify keeping them separate for now.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "If issues found: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for each (priority 50-97) — atomic DB+JSON sync, no manual JSON edit. If no issues, invoke /simplify on any ugly touchpoint, then emit `<task-status>REFACTOR-001:done</task-status>` with a one-line progress note.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across modules — but only when semantic equivalence holds (don't merge similar-looking but semantically different code)",
+        "Single-responsibility functions",
+        "Pattern consistency with reconcile_external_git_completions"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points (grep-verified: `reconcile_merged_slot_completions` referenced from engine.rs; MergeOutcomes.pre_merge_head set in worktree.rs and consumed in engine.rs)",
+        "Positive: All errors propagated with warn-and-continue (no unwrap, no expect) in the new code paths",
+        "Positive: FULL cargo test, cargo clippy -- -D warnings, cargo fmt --check all clean (no scope filter)",
+        "Negative: No unwrap() in production code paths in any of the three modified files",
+        "Negative: No dead code warnings for new code",
+        "Documentation: src/loop_engine/CLAUDE.md 'Iteration pipeline (shared)' → 'Out of scope' bullet added",
+        "Documentation: src/loop_engine/CLAUDE.md Touchpoints table row added for 'Post-merge slot reconcile' → `git_reconcile.rs::reconcile_merged_slot_completions`",
+        "Documentation: `task-mgr learn` entry recorded with the title, tags, and applies-to-files specified above",
+        "Verification: Manual reproduction of the FEAT-003 scenario succeeds (commit with marker on slot branch → wave runs → task marked done without any <completed> tag emitted)",
+        "Verification: Negative reproduction succeeds (commit WITHOUT -completed suffix → task stays in_progress; no spurious marking)",
+        "Task update: Remaining tasks reviewed and updated if implementation changed APIs/assumptions",
+        "Pre-existing test failures fixed (or spawned as FIX-xxx with verifyCommand if >~12 unrelated)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "REFACTOR-001"
+      ],
+      "description": "Review all implementation for quality, security, integration wiring, AND update documentation. RUN THE FULL QUALITY GATE (unscoped test suite).\n\nDO: (1) Check every new function for error handling, check callers still work, verify no dead code, run full `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`. (2) Update `src/loop_engine/CLAUDE.md`: add a bullet to 'Iteration pipeline (shared)' → 'Out of scope for the pipeline' covering 'post-merge-back slot completion reconciliation'; add a new Touchpoints table row mapping 'Post-merge slot reconcile' to `git_reconcile.rs::reconcile_merged_slot_completions`. (3) Record a `task-mgr learn --outcome pattern --title 'Wave-mode slot tasks complete via post-merge reconcile when <completed> tag is dropped' --tags loop-engine,wave-mode,git-reconcile --applies-to-files src/loop_engine/engine.rs,src/loop_engine/git_reconcile.rs --confidence high` entry so future related-task `recall` surfaces this path. (4) Manually reproduce the FEAT-003 scenario per the plan's verification section (commit with `feat: <prefix>-FEAT-X-completed - test` on a slot branch, run a wave, confirm row transitions to done without the agent emitting any tag).\n\nDO NOT: Skip the integration wiring check — unconnected code is the #1 failure mode. Do NOT scope the test suite — this is THE place the full suite runs. Do NOT skip the manual reproduction — the unit tests pin individual behaviors but not the end-to-end wave flow.",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` — DB + PRD JSON synced atomically, no manual edit. If no issues: emit `<task-status>REVIEW-001:done</task-status>` with 'Clean review' note.\n\nManual reproduction (run from a worktree):\n1. `task-mgr init` and pick a small FEAT task to claim\n2. In a slot worktree, `git commit --allow-empty -m 'feat: <prefix>-FEAT-X-completed - test'` on the slot branch\n3. Let the wave run to merge-back\n4. `task-mgr show <prefix>-FEAT-X` should now show `status: done` and `tasks/<prd>.json` should show `passes: true`\n5. Negative: same setup but commit message WITHOUT `-completed`; row should stay `in_progress`",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production",
+        "All new code wired to production entry point",
+        "Full suite green including pre-existing",
+        "CLAUDE.md accurately reflects the new post-merge reconcile path",
+        "task-mgr learn entry indexed so future related tasks recall this path"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification + docs",
+      "touchesFiles": [
+        "src/loop_engine/worktree.rs",
+        "src/loop_engine/git_reconcile.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
