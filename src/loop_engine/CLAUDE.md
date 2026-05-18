@@ -153,8 +153,10 @@ sequential prompt MUST also be wired through the wave builder so the two
 paths cannot drift again.
 
 **Out of scope for the pipeline** (kept at the call sites): wrapper-commit,
-external-git reconciliation, human-review trigger, rate-limit waits,
-pause-signal handling, slot merge resolution (see "Slot merge-back conflict
+external-git reconciliation, post-merge-back slot completion reconciliation
+(slot-0 `{pre_merge_head}..HEAD` scan; see "Post-merge slot reconcile"
+touchpoint below), human-review trigger, rate-limit waits, pause-signal
+handling, slot merge resolution (see "Slot merge-back conflict
 resolution" below).
 
 ## Slot merge-back conflict resolution
@@ -417,3 +419,4 @@ otherwise downstream "is_empty" checks invert the safety guarantee.
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |
 | Stash preflight | `src/loop_engine/worktree.rs` | `prepare_slot0_for_merge`, `cleanup_preparation`, `run_slot_merge_attempt` |
+| Post-merge slot reconcile | `src/loop_engine/git_reconcile.rs` | `reconcile_merged_slot_completions` |
