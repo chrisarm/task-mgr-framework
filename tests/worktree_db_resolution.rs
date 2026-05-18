@@ -58,6 +58,7 @@ fn migrate_db(db_dir: &Path) {
         .arg(db_dir)
         .args(["migrate", "all"])
         .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .output()
         .expect("spawn task-mgr migrate");
     assert!(
@@ -115,7 +116,8 @@ fn run_add(
         .stderr(Stdio::piped())
         // Don't let the user's TASK_MGR_DIR (or any other repo-relative env)
         // leak into the subprocess and confound the test.
-        .env_remove("TASK_MGR_DIR");
+        .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -303,6 +305,7 @@ fn models_show_from_worktree_prints_db_dir_and_source() {
         .current_dir(&wt)
         .args(["models", "show"])
         .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .output()
         .expect("spawn task-mgr models show");
     assert!(

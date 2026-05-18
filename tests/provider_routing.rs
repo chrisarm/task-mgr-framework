@@ -15,7 +15,7 @@
 //!    - `grok-4`, `grok-4-fast`, `grok-code-fast-1`, `GROK-4`, `Grok-4-Fast`
 //!      → `Provider::Grok`
 //!    - `groq-llama-70b`, `groq-llama-3` (Groq Inc., NOT xAI) → `Provider::Claude`
-//!    - `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-…`,
+//!    - `OPUS_MODEL`, `SONNET_MODEL`, `HAIKU_MODEL` (Claude model constants),
 //!      `None`, `""`, `unknown-model`, `grokomatic-1`
 //!      (single token `grokomatic` != `grok`) → `Provider::Claude`
 //!
@@ -128,9 +128,6 @@ fn provider_for_model_default_cases_route_to_claude() {
         Some(SONNET_MODEL),
         Some(HAIKU_MODEL),
         Some(OPUS_MODEL_1M),
-        Some("claude-opus-4-7"),
-        Some("claude-sonnet-4-6"),
-        Some("claude-haiku-4-5"),
         Some("unknown-model"),
         Some(""),
         Some("   "),
