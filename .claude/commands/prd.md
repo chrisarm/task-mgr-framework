@@ -101,7 +101,15 @@ Ask 3-5 questions to fill gaps. Use lettered options (A, B, C, D) when possible:
 
 4. **Known edge cases**: List specific inputs, scenarios, or conditions that commonly cause bugs in this area. Be concrete — naming an edge case (e.g., "Unicode chars that expand when lowercased like ß → ss") forces the implementation to handle it.
 
+5. **Value vs. Effort triage** — Looking at the full vision, which 1–2 capabilities deliver the least user or operational value relative to the complexity, maintenance burden, or risk they would introduce?
+
+   - A) We should explicitly cut or heavily defer them now (recommended)
+   - B) They’re marginal — only build them if the core turns out to be trivial
+   - C) They actually matter more than they first appear (please explain why)
+
 > **Why this matters**: Vague requirements produce vague code. Stating quality dimensions and edge cases explicitly in the PRD gives the implementing agent precise targets instead of hoping it discovers them independently.
+
+> Explicitly naming low-value / high-effort items early protects the team’s ability to ship the important parts cleanly and prevents the loop from accidentally optimizing for things we intentionally wanted to skip.
 
 ### Step 3.5: Breaking Change Analysis (for behavior-modifying changes)
 
@@ -125,6 +133,8 @@ The `/analyze` skill will:
 **Copy the Consumer Impact Table** from `/analyze` output into the Technical Considerations section.
 
 ### Step 3.6: Design Critique — Top 3 Risks
+
+**If you (or the user) have already run a `/spike` on the risky area**, summarize its hypothesis, experiment, and outcome here instead of repeating the full work. The spike owns the heavy "2-3 approaches + inversion" exploration.
 
 For **all request types**, identify the top 3 risks to the design:
 
@@ -288,12 +298,38 @@ Create a markdown file at `tasks/prd-{feature-name}.md` with this structure:
 
 ### Known Edge Cases
 
-{List specific inputs, scenarios, or conditions that the implementation MUST handle correctly. These flow directly into TEST-INIT tasks as required test cases.}
+{List specific inputs, scenarios, or conditions that the implementation MUST handle correctly. These become `edgeCases` on the relevant CONTRACT-xxx (if any) or implementation tasks, and must have corresponding known-bad discriminators.}
 
 | Edge Case                 | Why It Matters                 | Expected Behavior    |
 | ------------------------- | ------------------------------ | -------------------- |
 | {e.g., empty input}       | {Common source of panics}      | {Return empty/error} |
 | {e.g., Unicode expansion} | {ß → ss changes string length} | {Handle correctly}   |
+
+---
+
+## 2.6. Boundary Contracts & Modularity Targets
+
+> This section makes explicit the contracts and coupling decisions that will affect multiple parts of the system. It is the source of truth for `CONTRACT-xxx` tasks and for the Data Flow Contracts that later appear in the prompt.
+
+### New or Changed Public Boundaries
+
+- **Contract owner**: Which module / file "owns" this abstraction or interface?
+- **Consumers**: List every story / downstream task that will call or implement against it.
+- **Data Flow Contracts** (copy-pasteable access patterns for any struct that crosses module boundaries — see PRD Step 4.6):
+  | Data Path | Key Types at Each Level | Copy-Pasteable Access Pattern |
+  | --------- | ----------------------- | ----------------------------- |
+  | ...       | ...                     | ...                           |
+
+### Modularity & Coupling Targets
+
+- **Target public surface area**: How many new public functions / types / CLI commands / DB columns does this PRD introduce? (Keep deliberately small.)
+- **Ownership clarity**: Every new concept has one clear owning module.
+- **Coupling budget**: We will not add a direct call from A to B if an intermediate contract or interface keeps them independent.
+- **Cohesion signal**: Functions and types that change together live together (or we have documented the reason they don't).
+
+### When to Emit a CONTRACT-xxx Task
+
+Create an explicit `CONTRACT-xxx` predecessor task (priority 0-1, `taskType: "contract"`) when **the decision has ramifications on more than one part of the effort** (i.e., 2+ downstream stories will implement against or call the new abstraction). The spike or PRD author is responsible for identifying this and recommending the task ID in the PRD.
 
 ---
 
@@ -338,6 +374,20 @@ The following are explicitly **NOT** part of this work:
 
 ---
 
+## 5.5. Low-Value / High-Effort Areas (Explicit Cuts or Deferrals)
+
+We deliberately call out parts of the request that deliver relatively low user (or operational) value compared to the implementation, maintenance, cognitive load, or risk they would create.
+
+| Area / Capability                     | Why the value is low relative to cost                  | Rough effort cost | Recommended action          |
+| ------------------------------------- | ------------------------------------------------------ | ----------------- | --------------------------- |
+| {Example: Advanced scheduling rules}  | Only 2–3 users per year would ever use this            | High              | **Cut** for v1              |
+| {Example: Real-time collaborative editing} | 90%+ of usage is single-user; nice for demos only | Very high         | Defer (consider spike first)|
+| ...                                   | ...                                                    | ...               | ...                         |
+
+**Rationale**: We are optimizing for learning velocity and long-term maintainability. Anything that scores poorly on “value delivered per unit of long-term cost” should be explicitly named and decided on *before* the task list is written, rather than discovered mid-loop or during review.
+
+---
+
 ## 6. Technical Considerations
 
 ### Affected Components
@@ -352,7 +402,7 @@ The following are explicitly **NOT** part of this work:
 
 ### Approaches & Tradeoffs
 
-> Identify 2-3 implementation approaches before committing to one. This collapses what would otherwise be multiple implementation-and-rewrite cycles into a single informed decision.
+> If a `/spike` was run on this area, summarize its conclusion and chosen approach here (with link to the spike result). Otherwise, identify 2-3 implementation approaches before committing to one. This collapses what would otherwise be multiple implementation-and-rewrite cycles into a single informed decision.
 
 | Approach     | Pros        | Cons         | Recommendation                     |
 | ------------ | ----------- | ------------ | ---------------------------------- |
@@ -524,8 +574,9 @@ Next step: Run `/tasks tasks/prd-dark-mode.md` to generate the task breakdown.
 > **Final check before saving the PRD — these sections must not be empty:**
 >
 > - **Section 2.5 Quality Dimensions**: Correctness, Performance, Style, and Known Edge Cases all populated
-> - **Section 6 Approaches & Tradeoffs**: At least 2 approaches compared with a selected approach stated
-> - **Section 6 Public Contracts**: New/modified interfaces documented
-> - **Section 6 Data Flow Contracts**: If the feature accesses data across module boundaries, concrete access patterns documented with key types at each level. If not applicable, state "N/A — no cross-module data access"
-> - **Known Edge Cases table**: At least 2 concrete, named edge cases (not generic placeholders)
-> - **Top 3 Risks**: Identified and documented with mitigations
+> - **Section 2.6 Boundary Contracts & Modularity Targets**: Public surface, ownership, coupling budget, and Data Flow Contracts documented (even if "none" or "N/A")
+> - **Section 6 Approaches & Tradeoffs**: At least one rejected alternative + rationale (full 2-3 table only if no `/spike` was run; otherwise summarize the spike conclusion)
+> - **Section 6 Public Contracts** + **Data Flow Contracts**: Documented (or explicit "N/A")
+> - **CONTRACT-xxx recommendation**: If any boundary will be used by 2+ downstream stories, the PRD explicitly names the recommended `CONTRACT-xxx` task ID
+> - **Known Edge Cases table**: At least 2 concrete, named edge cases with known-bad discriminators implied
+> - **Top 3 Risks**: Identified; at least one has an empirical test or "N/A — resolved by prior spike" note

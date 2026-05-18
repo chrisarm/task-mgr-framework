@@ -28,6 +28,7 @@ Load the specified PRD file and extract:
 - Functional requirements
 - Technical considerations (affected files)
 - Non-goals (scope boundaries)
+- Low-value / high-effort areas (PRD §5.5) — treat as out of scope by default
 
 ### Step 1.5: Resolve Current Model IDs
 
@@ -186,6 +187,7 @@ Use context-appropriate prefixes. Set the `taskType` field on each task to let t
 | Prefix                | `taskType`         | Notes                                                              |
 | --------------------- | ------------------ | ------------------------------------------------------------------ |
 | `ANALYSIS-xxx`        | `"analysis"`       | Consumer and semantic analysis (priority 0, blocks implementation) |
+| `CONTRACT-xxx`        | `"contract"`       | Foundational abstraction/interface with multi-task downstream impact. Design-only task. |
 | `FEAT-xxx`            | `"implementation"` | New features                                                       |
 | `FIX-xxx`             | `"implementation"` | Bug fixes                                                          |
 | `ENV-xxx`             | `"implementation"` | Environment/configuration                                          |
@@ -204,6 +206,7 @@ Use context-appropriate prefixes. Set the `taskType` field on each task to let t
 **Special `taskType` values:**
 
 - `"research"` — For spike/evaluation tasks (e.g., "evaluate 3 libraries, write ADR"). Set `requiresHuman: true` so the loop agent skips it and flags it for human attention. Set `difficulty: "high"` so the loop controller selects a larger model if it does attempt the task.
+- `"contract"` — Design-only task that defines a stable foundational abstraction, interface, data shape or error model used by 2+ downstream FEAT/FIX tasks. The agent produces precise signatures + edge cases + invariants + known-bad discriminators + rationale, records the full contract in the progress log, and emits no production code. Later tasks list it in `dependsOn`. Use only when the decision has clear multi-story ramifications (see `/spike` and `/tasks` guidance on when to emit one).
 - `"milestone"` — Agent behavior: review completed work, update remaining tasks, check sibling PRDs.
 - `"review"` — Agent behavior: read and analyze code, spawn fix tasks, don't implement.
 - `"verification"` — Agent behavior: run full test suite, verify integration, update docs.
@@ -636,9 +639,9 @@ Scoping heuristic: start from `touchesFiles`. For each Rust file, run `cargo tes
 
 **Do NOT** run the entire workspace test suite (`cargo test` with no filter, `pytest` with no path) during regular iterations — that's the milestone's job.
 
-### Milestone gate (MILESTONE-1 / -2 / -FINAL)
+### Final gate at REVIEW-001 (the milestone)
 
-Milestones run the **full, unscoped** suite on a clean checkout and must finish green:
+The single `REVIEW-001` task at the end of the lean path runs the **full, unscoped** suite on a clean checkout and must finish green. There are no separate MILESTONE-1 or MILESTONE-2 tasks in the reduced-ceremony skeleton.
 
 ```bash
 # Rust
@@ -672,16 +675,31 @@ New code must be reachable from production — CODE-REVIEW-1 verifies. Most comm
 
 ---
 
+## Contract Tasks
+
+`CONTRACT-xxx` tasks (`taskType: "contract"`) are **design-only**. Their job is to produce a stable, reviewable foundational contract (interface, data shape, error model, ownership) that 2+ downstream implementation tasks will depend on.
+
+**When you are given a CONTRACT task**:
+- Do not write production code or full test suites.
+- Produce the precise definition + extreme details (edge cases, invariants, known-bad discriminators, failure modes, alternatives considered + rationale).
+- Explicitly list every downstream story / task ID that will depend on this contract.
+- Record the **full contract text** in the progress log under a clear `## CONTRACT-001` (or equivalent) header so later agents can read it directly.
+- Emit `<task-status>CONTRACT-001:done</task-status>` when the contract is recorded and the acceptance criteria are satisfied.
+
+Downstream FEAT/FIX tasks that list a CONTRACT task in `dependsOn` are expected to implement against the recorded contract. If the contract needs revision, the revision must be done by re-opening the CONTRACT task (or spawning a follow-up CONTRACT-FIX via `task-mgr add`).
+
+---
+
 ## Review Tasks
 
 Review-type tasks (`CODE-REVIEW-1`, `REFACTOR-REVIEW-FINAL`) spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
 
 ### What each review looks for
 
-| Review                  | Priority | Spawns (priority)                  | Before            | Focus                                                                                                   |
-| ----------------------- | -------- | ---------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------- |
-| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-16)    | MILESTONE-1       | Language idioms, security, memory, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable |
-| REFACTOR-REVIEW-FINAL   | 70       | `REFACTOR-xxx` (71-85)             | MILESTONE-FINAL   | All code + tests: DRY, complexity, coupling, clarity, pattern adherence — full-context final pass        |
+| Review                  | Priority | Spawns (priority)                  | Before                  | Focus                                                                                                   |
+| ----------------------- | -------- | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| CODE-REVIEW-1           | 13       | `CODE-FIX` / `WIRE-FIX` (14-16)    | early FEATs + CONTRACT  | Language idioms, security, error handling, `qualityDimensions`, wiring, respect for any CONTRACT        |
+| REFACTOR-REVIEW-FINAL   | 70       | `REFACTOR-xxx` (71-85)             | all implementation      | All code + tests: DRY, complexity, coupling, clarity, contract fidelity — full-context final pass        |
 
 Use the **rust-python-code-reviewer** / equivalent language agent when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-REVIEW-FINAL, invoke `/simplify` on that touchpoint directly — don't file a dedicated review task just for it.
 
@@ -864,40 +882,31 @@ These are **verified access patterns** for cross-module data structures. Use the
 
 ### Step 7: Include Required Task Types
 
-Every task list follows this phased structure. The table is the spine; notes below cover non-obvious requirements per type.
+Every task list follows a lean phased structure. The table below is the spine for the *reduced-ceremony* path (the old 11-phase skeleton with middle MILESTONE-1/2, separate TEST-INIT, INT-xxx, and VERIFY-001 has been collapsed — see the anti-pattern table in `plan-tasks.md` and the `/spike` skill for the rationale).
 
 | # | Priority | ID pattern                      | Type            | Spawned by       | Depends on                          | Model / timeout        |
 | - | -------- | ------------------------------- | --------------- | ---------------- | ----------------------------------- | ---------------------- |
-| 0 | 0        | `ANALYSIS-xxx`                  | analysis        | —                | —                                   | opus                   |
-| 1 | 1-5      | `TEST-INIT-xxx`                 | test            | —                | ANALYSIS (if present)               | opus                   |
-| 2 | 6-12     | `FEAT-xxx`/`FIX-xxx`            | implementation  | —                | relevant TEST-INIT                  | —                      |
-| 3 | 13       | `CODE-REVIEW-1`                 | review          | —                | all FEAT/FIX                        | opus                   |
-| 3a| 14-16    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | — (→ MILESTONE-1)                   | —                      |
-| 4 | 20       | `MILESTONE-1`                   | milestone       | —                | CODE-REVIEW-1 + all FEAT/FIX + spawned FIX/WIRE-FIX | opus / 1800s |
-| 5 | 25-38    | `TEST-xxx`                      | test            | —                | MILESTONE-1                         | —                      |
-| 6 | 39-42    | `IMPL-FIX-xxx`                  | implementation  | TEST-xxx         | the failing TEST-xxx                | —                      |
-| 7 | 50       | `MILESTONE-2`                   | milestone       | —                | MILESTONE-1 + all TEST-xxx + IMPL-FIX | opus / 1800s         |
-| 8 | 55-65    | `INT-xxx`                       | verification    | —                | MILESTONE-2                         | —                      |
-| 9 | 70       | `REFACTOR-REVIEW-FINAL`         | review          | —                | all INT-xxx                         | opus                   |
-| 9a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | — (→ MILESTONE-FINAL)          | —                      |
-|10 | 90-95    | `VERIFY-001`                    | verification    | —                | REFACTOR-REVIEW-FINAL + all INT-xxx | opus / 1800s           |
-|11 | 99       | `MILESTONE-FINAL`               | milestone       | —                | VERIFY-001 + all REFACTOR-xxx       | opus / 1800s           |
+| 0 | 0-1      | `CONTRACT-xxx` (optional)       | contract        | — / `/spike`     | —                                   | opus (if complex)      |
+| 1 | 2-12     | `FEAT-xxx` / `FIX-xxx`          | implementation  | —                | relevant CONTRACT (if any)          | —                      |
+| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | opus                   |
+| 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | —                      |
+| 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation                  | opus                   |
+| 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | —                      |
+| 4 | 99       | `REVIEW-001` (the final gate)   | review          | —                | all prior work + REFACTOR (if any)  | opus / 1800s           |
+
+**REVIEW-001 is the milestone.** It runs the full, unscoped quality gate and must leave the repo green (including pre-existing failures). There are no separate MILESTONE-1 / MILESTONE-2 tasks in the lean skeleton.
 
 ### Notes that don't fit in the table
 
-- **ANALYSIS-xxx** (phase 0) — only when the PRD has behavior-modifying changes. Identifies consumers, documents semantic distinctions, outputs the Consumer Impact Table into the progress file. Blocks dependent FEAT/FIX until it passes.
+- **CONTRACT-xxx** (optional, early) — Use only when a design decision (abstraction, interface, data shape, error model, ownership) has clear ramifications on 2+ downstream stories. The task is design-only. Its acceptance criteria focus on precision, known-bad discriminators, alternatives considered, and an explicit "Downstream Impact" list. The full contract text must be recorded in the progress log so dependents can read it. Produced by `/spike` or by the person running `/tasks` when the PRD identifies the need. See the `CONTRACT-xxx` template below.
 
-- **TEST-INIT-xxx** (phase 1) — tests first; PRD Known Edge Cases MUST flow into the `edgeCases` field (1:1). Required per task: `edgeCases` (3+), `invariants` (2-5), `failureModes` (1+). Cross-module tests must use production-shaped data (real structs/schemas) — never hand-built maps, because matching the wrong key format silently passes.
+- **ANALYSIS-xxx** (opt-in) — Only for behavior-modifying changes that span >2 top-level directories *or* when the PRD/spike author explicitly requests it (set `requiresConsumerAnalysis: true` or create the task manually). For small localized changes, document the callers directly in the FEAT task description instead.
 
-- **FEAT-xxx** (phase 2) — set `model: "<opus-id>"` only on tasks that are `estimatedEffort: "high"` OR `modifiesBehavior: true`. The old "first FEAT is always opus" rule was pattern-worship — iterations don't inherit patterns across runs.
+- **FEAT-xxx / FIX-xxx** — Tests for the new behavior live *inside* the same coherent change (see the lean skeleton in `plan-tasks.md`). `edgeCases`, `invariants`, and known-bad discriminators are still required on the task. Set `model: opus` only for `estimatedEffort: "high"` OR `modifiesBehavior: true`.
 
-- **INT-xxx** (phase 8) — names a specific data/control path (e.g., "CLI arg → parse → DB insert → query → display"), lists handoff points at each boundary. Does NOT write new code unless wiring is missing. Cap: 1 INT-xxx per distinct cross-boundary path.
+- **Middle milestones, separate TEST-INIT, INT-xxx, and VERIFY-001 removed** — These were identified as low-ROI ceremony (see anti-pattern table in `plan-tasks.md`). The single `REVIEW-001` at the end runs the full gate and serves as the milestone. `INT-xxx` concerns are now handled inside the final review's acceptance criteria and the PRD's Boundary Contracts section. A `CONTRACT-xxx` (when present) does the deep edge-case/invariant work before any implementation begins.
 
-- **Milestones** — gates, not sweeping update sessions. Each milestone checks all its `dependsOn` are `passes: true`, **runs the full quality gate** (see Quality Checks — tests, lint, format, type-check), and **must leave the repo fully green** (fix any pre-existing failures before closing). Milestones do NOT sweep the JSON to rewrite remaining task descriptions — if a later task is stale because of an earlier implementation change, the agent working that task will fail its preflight or spawn a FIX at pickup time. This keeps the milestone's job scoped.
-
-- **VERIFY-001** (phase 10) — authoritative final check. Acceptance must include: architecture docs updated (if new subsystems), CLAUDE.md updated, dev guide in `docs/` (if new developer-facing tooling), grep-verified reachability for new public functions/CLI commands, no `.unwrap()` in production, test fixtures use real struct field names.
-
-- **Refactoring** — the old REFACTOR-REVIEW-1 and -2 phases (after implementation, after tests) are removed. CODE-REVIEW-1 catches most DRY/complexity issues during implementation phase; the `/simplify` skill can be invoked ad-hoc on a specific touchpoint if a task produces something ugly; REFACTOR-REVIEW-FINAL before merge catches everything with full context.
+- **Refactoring** — The old REFACTOR-REVIEW-1 and -2 phases were removed long ago. CODE-REVIEW-1 (when used) + REFACTOR-REVIEW-FINAL before the final gate catch DRY/complexity/coupling issues. The `/simplify` skill can be invoked ad-hoc on any ugly touchpoint.
 
 ### Step 7.1: Task Templates
 
@@ -939,7 +948,40 @@ Adds three test-only fields on top of the base shape:
 }
 ```
 
-#### Review tasks — one shape, four instances
+#### CONTRACT-xxx (priority 0-1, `taskType: "contract"`, model: opus when the contract is complex)
+
+Design-only task. Use only when a single abstraction, interface, data shape, or error model will be depended on by 2+ downstream FEAT/FIX tasks (the "ramifications on more than one part" rule from `/spike` and the user's guidance).
+
+```json
+{
+  "id": "CONTRACT-001",
+  "title": "Define stable <Abstraction/Interface/Contract> for consumers B, C, D",
+  "taskType": "contract",
+  "description": "Design-only. Produces the precise contract (signatures, data shapes, error model, ownership) plus extreme details so multiple later implementation tasks can depend on it without drift or repeated rework.",
+  "acceptanceCriteria": [
+    "Precise interface: exact function signatures / struct definitions / error types / module ownership (grep-verified against existing code)",
+    "Edge cases: every relevant case from the PRD + spike is named with expected behavior",
+    "Invariants: properties that every implementation and every caller must maintain",
+    "Known-bad discriminators: at least one scenario describing a plausible wrong implementation of this contract that would still pass naive tests",
+    "Failure modes: what happens on each major error path and what the contract promises callers",
+    "Alternatives considered: for the hardest 1-2 design decisions, the rejected option + one-line rationale",
+    "Downstream impact: explicit list of the FEAT/FIX task IDs (or future stories) that will list this task in their `dependsOn`",
+    "Contract text recorded: the full, copy-pasteable definition is written into the progress log under a clear ## CONTRACT-001 header so dependents can read it without re-exploration"
+  ],
+  "priority": 1,
+  "estimatedEffort": "medium",
+  "model": "<opus-id-if-complex>",
+  "touchesFiles": ["src/the/module/that/will/own/the/contract.rs"],
+  "dependsOn": [],
+  "modifiesBehavior": false,
+  "qualityDimensions": ["The contract must be stable enough that three independent implementations can be written against it across iterations without revision"],
+  "notes": "Produced by /spike on YYYY-MM-DD. Experiment hypothesis and result: <one paragraph>. Downstream tasks must treat the recorded contract as authoritative."
+}
+```
+
+**Agent behavior for `taskType: "contract"`**: You are doing pure design. Write the contract, the extreme details, and the rationale. Do **not** write production implementation code or tests (unless a minimal structural test is required to validate the shape itself). Record the complete contract in the progress log. Later FEAT tasks will depend on this task and will be expected to implement against what you defined.
+
+#### Review tasks — one shape, four instances (updated for lean path)
 
 All review tasks share this structure. Vary per the table below.
 
@@ -961,10 +1003,10 @@ All review tasks share this structure. Vary per the table below.
 }
 ```
 
-| Review ID               | Priority | Spawns prefix         | Depends on                 | Focus (drives acceptance criteria)                                     |
-| ----------------------- | -------- | --------------------- | -------------------------- | ---------------------------------------------------------------------- |
-| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` | all `FEAT` / `FIX` tasks | `unwrap()`, error propagation, injection, `qualityDimensions` met, wiring |
-| `REFACTOR-REVIEW-FINAL` | 70       | `REFACTOR-xxx`        | all `INT-xxx`              | All code + tests: DRY, complexity, coupling, clarity — full-context final pass |
+| Review ID               | Priority | Spawns prefix         | Depends on                          | Focus (drives acceptance criteria)                                     |
+| ----------------------- | -------- | --------------------- | ----------------------------------- | ---------------------------------------------------------------------- |
+| `CODE-REVIEW-1`         | 13       | `CODE-FIX` / `WIRE-FIX` | early FEAT/FIX + any CONTRACT-xxx   | `unwrap()`, error propagation, injection, `qualityDimensions` met, wiring, respect for any CONTRACT |
+| `REFACTOR-REVIEW-FINAL` | 70       | `REFACTOR-xxx`        | all implementation                  | All code + tests: DRY, complexity, coupling, clarity, contract fidelity — full-context final pass |
 
 ### Step 8: Validate and Report
 

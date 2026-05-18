@@ -46,13 +46,20 @@ This block is managed by `task-mgr enhance` — edits inside the
   ```
 
   Priority is auto-computed (top-task priority minus one). Pass
-  `--depended-on-by <milestone-id>` when the new task should block a
-  milestone — this is the canonical way to wire spawn-fixups into the
-  correct PRD (see "Spawn-fixup PRD targeting" below).
+  `--depended-on-by CONTRACT-001` (or the PRD's final milestone) when the
+  new task implements against a contract defined earlier.
 
 - **Mark status from a loop iteration**: emit a `<task-status>` tag in your
   output. Recognized statuses: `done`, `failed`, `skipped`, `irrelevant`,
   `blocked`. Example: `<task-status>TASK-ID:done</task-status>`.
+
+### Recommended planning & PRD flow (2026 update)
+
+- **Default for most work**: short plan-mode interview → `/spike "risky area or multi-impact abstraction"` (when the riskiest assumption or a contract used by 2+ stories is unclear) → `/plan-tasks` (lean) or light `/tasks`.
+- `/spike` owns exploration, thin vertical slice, 2-3 approaches, and (when warranted) emits a `CONTRACT-xxx` task for foundational abstractions.
+- Full `/prd "..."` + heavy `/tasks` is reserved for large cross-subsystem efforts. The expensive design critique now lives in the spike.
+- PRDs contain a new **2.6 Boundary Contracts & Modularity Targets** section. This is the source for `CONTRACT-xxx` tasks (`taskType: "contract"`).
+- Wire dependents with `--depended-on-by CONTRACT-001` (or the PRD milestone). The contract text lives in the progress log.
 
 ### Mid-loop JSON sync
 
@@ -61,10 +68,7 @@ descriptions, recording human-review outcomes), NEVER run bare
 `task-mgr init --from-json <prd>.json` — it wipes `status`, `started_at`,
 and `completed_at` for every task in the list.
 
-Correct incremental sync (post this PR, `task-mgr loop init` is the
-canonical form; `task-mgr init --from-json` survives indefinitely as a
-deprecated shim that prints a stderr notice and dispatches to the same
-path):
+Correct incremental sync (`task-mgr loop init` is the canonical form):
 
 ```sh
 task-mgr loop init <prd>.json --append --update-existing --dry-run  # preview
@@ -108,8 +112,7 @@ or the entry leaks into whatever PRD JSON the CLI defaults to. Two
 reliable forms:
 
 - (a) `--from-json tasks/<correct-prd>.json` — explicit path
-- (b) `--depended-on-by <milestone-of-correct-prd>` — the prefix is
-  unambiguous from the dependency edge
+- (b) `--depended-on-by CONTRACT-001` (or the PRD’s final milestone) — the canonical way to attach a fixup or implementation task to a contract or milestone of the correct PRD. The prefix is unambiguous from the dependency edge.
 
 Symptom of getting it wrong: orphan `passes: false` placeholders show
 up in an unrelated PRD's JSON during merge-back review.
