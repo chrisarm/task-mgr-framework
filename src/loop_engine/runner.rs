@@ -251,20 +251,18 @@ impl LlmRunner for ClaudeRunner {
             fallback_cli_binary: _,
         } = opts;
         let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-        let mut args: Vec<String> = if stream_json {
-            vec![
-                "--print".to_string(),
-                "--verbose".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--no-session-persistence".to_string(),
+        let base: &[&str] = if stream_json {
+            &[
+                "--print",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--no-session-persistence",
             ]
         } else {
-            vec![
-                "--print".to_string(),
-                "--no-session-persistence".to_string(),
-            ]
+            &["--print", "--no-session-persistence"]
         };
+        let mut args: Vec<String> = base.iter().map(|s| s.to_string()).collect();
         match permission_mode {
             PermissionMode::Dangerous => {
                 args.push("--dangerously-skip-permissions".to_string());
@@ -286,24 +284,9 @@ impl LlmRunner for ClaudeRunner {
                 }
             }
         }
-        if let Some(tools) = disallowed_tools
-            && !tools.trim().is_empty()
-        {
-            args.push("--disallowedTools".to_string());
-            args.push(tools.to_string());
-        }
-        if let Some(m) = model
-            && !m.trim().is_empty()
-        {
-            args.push("--model".to_string());
-            args.push(m.to_string());
-        }
-        if let Some(e) = effort
-            && !e.trim().is_empty()
-        {
-            args.push("--effort".to_string());
-            args.push(e.to_string());
-        }
+        push_optional_flag(&mut args, "--disallowedTools", disallowed_tools);
+        push_optional_flag(&mut args, "--model", model);
+        push_optional_flag(&mut args, "--effort", effort);
         // Claude Code 2.1.110 writes an ai-title jsonl despite --no-session-persistence;
         // forcing a known UUID lets the post-wait cleanup delete that exact file.
         // Must stay before -p — Claude only parses flags left of the prompt.
@@ -314,18 +297,12 @@ impl LlmRunner for ClaudeRunner {
             id
         });
         args.push("-p".to_string());
-        // Prompt is piped via stdin (not as a CLI argument) to avoid OS ARG_MAX
-        // limits when prompts are large (e.g. curate dedup with many learnings).
 
         let mut cmd = Command::new(&binary);
         cmd.args(&args).stdin(Stdio::piped());
 
-        // PTY mode (Unix): wire stdout+stderr to a pseudo-TTY slave so Node.js
-        // line-buffers its writes. Pipe mode (default): piped stdout for our
-        // reader, inherited stderr for direct terminal passthrough.
-        //
-        // `pty_master` stays in scope through the end of the read loop — dropping
-        // it early would close our end of the PTY and cause reads to EIO mid-run.
+        // PTY: Node.js line-buffers only when isatty(1). `pty_master` must stay
+        // in scope through the read loop — dropping it early causes EIO mid-run.
         #[cfg(unix)]
         let pty_master: Option<std::os::fd::OwnedFd> = if use_pty {
             match open_pty_for_child_output() {
@@ -353,134 +330,12 @@ impl LlmRunner for ClaudeRunner {
             cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
         }
 
-        // Tell the guard-destructive hook to allow all commands.  The loop
-        // engine already scopes permissions via --allowedTools, so the hook's
-        // interactive-approval model is not applicable here.
-        cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
+        apply_common_env(&mut cmd, db_dir, active_prefix, working_dir);
+        let mut child = spawn_with_context(&mut cmd, &binary, "Claude")?;
+        write_prompt_to_stdin(&mut child, prompt, &binary, "Claude")?;
+        let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
-        // Pin every `task-mgr` invocation inside the spawned Claude (and any
-        // nested subprocesses that inherit env) to the canonical DB. Without
-        // this, when `working_dir` is a worktree, a `task-mgr add` from inside
-        // the subprocess would resolve `--dir=".task-mgr"` against the worktree
-        // cwd and silently create a stray `<worktree>/.task-mgr/tasks.db` —
-        // the original bug this whole feature exists to fix.
-        //
-        // Canonicalize defensively: the loop's `db_dir` may differ from the
-        // git-resolved path the subprocess would compute when reached via a
-        // symlinked worktree.
-        if let Some(dir) = db_dir {
-            let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            cmd.env("TASK_MGR_DIR", canonical);
-        }
-
-        // Pin the active PRD prefix so subprocess calls to `task-mgr add --stdin`
-        // auto-prefix IDs to the correct PRD. Set only when Some and non-empty —
-        // when None (or empty), leave the variable unset so manual `task-mgr`
-        // invocations from inside a worktree inherit the parent env unchanged.
-        if let Some(p) = active_prefix.filter(|p| !p.is_empty()) {
-            cmd.env(ACTIVE_PREFIX_ENV, p);
-        }
-
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
-
-        // Put child in its own process group so we can kill the entire tree on signal.
-        // kill(-child_pid, sig) targets the group. The watchdog thread monitors the
-        // signal flag and escalates: SIGTERM → 3s grace → SIGKILL.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: format!(
-                        "spawning Claude subprocess (is '{}' in your PATH?)",
-                        binary
-                    ),
-                    source: e,
-                }
-            } else {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: "spawning Claude subprocess".to_string(),
-                    source: e,
-                }
-            }
-        })?;
-
-        // Write the prompt to stdin and close it so the child can start processing.
-        // This must happen before reading stdout to avoid deadlock.
-        {
-            use std::io::Write;
-            let mut stdin = child
-                .stdin
-                .take()
-                .expect("stdin should be piped (Stdio::piped() was set on spawn)");
-            match stdin.write_all(prompt.as_bytes()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                    // Child closed stdin early (e.g., crashed during startup).
-                    // We'll capture its exit code below.
-                }
-                Err(e) => {
-                    return Err(TaskMgrError::IoErrorWithContext {
-                        file_path: binary.clone(),
-                        operation: "writing prompt to Claude subprocess stdin".to_string(),
-                        source: e,
-                    });
-                }
-            }
-            // stdin is dropped here, closing the pipe
-        }
-
-        // Extract PID before starting watchdog — no race condition
-        let child_pid = child.id();
-
-        // Shared epoch seconds of when the current task's `<completed>` tag was
-        // first observed in the stream. 0 = not yet seen. Written by the reader
-        // thread (tee_stream_json), read by the watchdog thread; the watchdog
-        // force-exits POST_COMPLETION_GRACE_SECS after the value goes non-zero.
-        let completion_epoch = Arc::new(AtomicU64::new(0));
-
-        // Start watchdog thread if signal handling, timeout, or completion-grace
-        // is requested. target_task_id alone justifies a watchdog because it's
-        // what triggers the post-completion kill.
-        let stop_watchdog = Arc::new(AtomicBool::new(false));
-        let timed_out_flag = Arc::new(AtomicBool::new(false));
-        let completion_killed_flag = Arc::new(AtomicBool::new(false));
-        let watchdog_handle =
-            if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some() {
-                let stop = Arc::clone(&stop_watchdog);
-                let flag = signal_flag.cloned();
-                let timeout_cfg = timeout;
-                let timed_out = Arc::clone(&timed_out_flag);
-                let epoch = Arc::clone(&completion_epoch);
-                let target = target_task_id.map(str::to_owned);
-                let completion_killed = Arc::clone(&completion_killed_flag);
-                Some(std::thread::spawn(move || {
-                    watchdog_loop(
-                        child_pid,
-                        flag.as_ref(),
-                        &stop,
-                        timeout_cfg.as_ref(),
-                        &timed_out,
-                        Some(&epoch),
-                        target.as_deref(),
-                        Some(&completion_killed),
-                    );
-                }))
-            } else {
-                None
-            };
-
-        // In PTY mode, reads come from our master fd (child wrote via the slave end);
-        // otherwise they come from the piped stdout. Both implement `Read`; we box to
-        // a single type so the downstream tee logic stays generic over the source.
+        // Box to a single `Read` so the tee logic is generic over PTY vs pipe.
         let reader_source: Box<dyn Read + Send> = {
             #[cfg(unix)]
             {
@@ -506,28 +361,18 @@ impl LlmRunner for ClaudeRunner {
         let reader = BufReader::new(reader_source);
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(reader, target_task_id, &completion_epoch, slot_label)
+            tee_stream_json(
+                reader,
+                target_task_id,
+                &watchdog.completion_epoch,
+                slot_label,
+            )
         } else {
-            let mut buf = String::new();
-            for line_result in reader.lines() {
-                match line_result {
-                    Ok(line) => {
-                        // Tee: echo to stderr (live display) and collect in buffer
-                        emit_prefixed_lines(slot_label, &line);
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                    Err(e) if is_pty_read_eof(&e) => break,
-                    Err(e) => {
-                        emit_prefixed_lines(
-                            slot_label,
-                            &format!("Warning: error reading Claude stdout: {}", e),
-                        );
-                        break;
-                    }
-                }
-            }
-            (buf, None, Vec::new())
+            (
+                read_plain_stdout(reader, slot_label, "Claude"),
+                None,
+                Vec::new(),
+            )
         };
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
@@ -536,25 +381,15 @@ impl LlmRunner for ClaudeRunner {
             source: e,
         })?;
 
-        // Stop the watchdog thread
-        stop_watchdog.store(true, Ordering::Release);
-        if let Some(handle) = watchdog_handle {
-            let _ = handle.join();
-        }
+        let (timed_out, completion_killed) = watchdog.teardown();
 
-        // Child has exited: the ai-title jsonl is guaranteed written (or never will
-        // be). Delete it synchronously so it's gone before this function returns,
-        // even if the caller (curate_dedup worker) immediately exits the process.
+        // Child has exited: ai-title jsonl is guaranteed written (or never will be).
         if let Some(uuid) = cleanup_session_id {
             cleanup_title_artifact_sync(uuid, working_dir);
         }
 
-        let exit_code = exit_code_from_status(status);
-        let timed_out = timed_out_flag.load(Ordering::Acquire);
-        let completion_killed = completion_killed_flag.load(Ordering::Acquire);
-
         Ok(RunnerResult {
-            exit_code,
+            exit_code: exit_code_from_status(status),
             output,
             conversation,
             timed_out,
@@ -659,24 +494,9 @@ impl LlmRunner for GrokRunner {
                 }
             }
         }
-        if let Some(tools) = disallowed_tools
-            && !tools.trim().is_empty()
-        {
-            args.push("--disallowed-tools".to_string());
-            args.push(tools.to_string());
-        }
-        if let Some(m) = model
-            && !m.trim().is_empty()
-        {
-            args.push("--model".to_string());
-            args.push(m.to_string());
-        }
-        if let Some(e) = effort
-            && !e.trim().is_empty()
-        {
-            args.push("--effort".to_string());
-            args.push(e.to_string());
-        }
+        push_optional_flag(&mut args, "--disallowed-tools", disallowed_tools);
+        push_optional_flag(&mut args, "--model", model);
+        push_optional_flag(&mut args, "--effort", effort);
         args.push("-p".to_string());
 
         let mut cmd = Command::new(&binary);
@@ -687,95 +507,11 @@ impl LlmRunner for GrokRunner {
             // while still teeing each line to the parent stderr in real time.
             .stderr(Stdio::piped());
 
-        cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
-
-        if let Some(dir) = db_dir {
-            let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            cmd.env("TASK_MGR_DIR", canonical);
-        }
-
-        if let Some(p) = active_prefix.filter(|p| !p.is_empty()) {
-            cmd.env(ACTIVE_PREFIX_ENV, p);
-        }
-
-        if let Some(dir) = working_dir {
-            cmd.current_dir(dir);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
+        apply_common_env(&mut cmd, db_dir, active_prefix, working_dir);
         let spawn_instant = Instant::now();
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: format!("spawning Grok subprocess (is '{}' in your PATH?)", binary),
-                    source: e,
-                }
-            } else {
-                TaskMgrError::IoErrorWithContext {
-                    file_path: binary.clone(),
-                    operation: "spawning Grok subprocess".to_string(),
-                    source: e,
-                }
-            }
-        })?;
-
-        // Pipe the prompt to stdin and close it so the child can start.
-        {
-            use std::io::Write;
-            let mut stdin = child
-                .stdin
-                .take()
-                .expect("stdin should be piped (Stdio::piped() was set on spawn)");
-            match stdin.write_all(prompt.as_bytes()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                    // Child closed stdin early (e.g., crashed during startup).
-                }
-                Err(e) => {
-                    return Err(TaskMgrError::IoErrorWithContext {
-                        file_path: binary.clone(),
-                        operation: "writing prompt to Grok subprocess stdin".to_string(),
-                        source: e,
-                    });
-                }
-            }
-        }
-
-        let child_pid = child.id();
-        let completion_epoch = Arc::new(AtomicU64::new(0));
-        let stop_watchdog = Arc::new(AtomicBool::new(false));
-        let timed_out_flag = Arc::new(AtomicBool::new(false));
-        let completion_killed_flag = Arc::new(AtomicBool::new(false));
-        let watchdog_handle =
-            if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some() {
-                let stop = Arc::clone(&stop_watchdog);
-                let flag = signal_flag.cloned();
-                let timeout_cfg = timeout;
-                let timed_out = Arc::clone(&timed_out_flag);
-                let epoch = Arc::clone(&completion_epoch);
-                let target = target_task_id.map(str::to_owned);
-                let completion_killed = Arc::clone(&completion_killed_flag);
-                Some(std::thread::spawn(move || {
-                    watchdog_loop(
-                        child_pid,
-                        flag.as_ref(),
-                        &stop,
-                        timeout_cfg.as_ref(),
-                        &timed_out,
-                        Some(&epoch),
-                        target.as_deref(),
-                        Some(&completion_killed),
-                    );
-                }))
-            } else {
-                None
-            };
+        let mut child = spawn_with_context(&mut cmd, &binary, "Grok")?;
+        write_prompt_to_stdin(&mut child, prompt, &binary, "Grok")?;
+        let watchdog = spawn_watchdog(child.id(), signal_flag, timeout, target_task_id);
 
         // Tee stderr to parent stderr while buffering the first
         // GROK_STDERR_SNIFF_CAP_BYTES for the post-exit auth-failure sniff.
@@ -806,36 +542,27 @@ impl LlmRunner for GrokRunner {
             })
         };
 
-        // Stdout reader (plain pipe — grok PTY support is out of v1 scope).
-        let stdout = child
-            .stdout
-            .take()
-            .expect("stdout should be piped (Stdio::piped() was set on spawn)");
-        let reader_source: Box<dyn Read + Send> = Box::new(stdout);
-        let reader = BufReader::new(reader_source);
+        // Plain pipe — grok PTY support is out of v1 scope.
+        let reader = BufReader::new(
+            child
+                .stdout
+                .take()
+                .expect("stdout should be piped (Stdio::piped() was set on spawn)"),
+        );
 
         let (output, conversation, permission_denials) = if stream_json {
-            tee_stream_json(reader, target_task_id, &completion_epoch, slot_label)
+            tee_stream_json(
+                reader,
+                target_task_id,
+                &watchdog.completion_epoch,
+                slot_label,
+            )
         } else {
-            let mut buf = String::new();
-            for line_result in reader.lines() {
-                match line_result {
-                    Ok(line) => {
-                        emit_prefixed_lines(slot_label, &line);
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                    Err(e) if is_pty_read_eof(&e) => break,
-                    Err(e) => {
-                        emit_prefixed_lines(
-                            slot_label,
-                            &format!("Warning: error reading Grok stdout: {}", e),
-                        );
-                        break;
-                    }
-                }
-            }
-            (buf, None, Vec::new())
+            (
+                read_plain_stdout(reader, slot_label, "Grok"),
+                None,
+                Vec::new(),
+            )
         };
 
         let status = child.wait().map_err(|e| TaskMgrError::IoErrorWithContext {
@@ -844,16 +571,10 @@ impl LlmRunner for GrokRunner {
             source: e,
         })?;
 
-        stop_watchdog.store(true, Ordering::Release);
-        if let Some(handle) = watchdog_handle {
-            let _ = handle.join();
-        }
+        let (timed_out, completion_killed) = watchdog.teardown();
         let _ = stderr_handle.join();
-
-        let exit_code = exit_code_from_status(status);
-        let timed_out = timed_out_flag.load(Ordering::Acquire);
-        let completion_killed = completion_killed_flag.load(Ordering::Acquire);
         let elapsed = spawn_instant.elapsed();
+        let exit_code = exit_code_from_status(status);
 
         // Auth-failure sniff: only credible when the child died fast AND with
         // a known auth-phrase on stderr. Either condition alone falls through
@@ -904,6 +625,198 @@ fn stderr_contains_auth_failure(stderr: &str) -> bool {
     GROK_AUTH_FAILURE_SUBSTRINGS
         .iter()
         .any(|needle| lower.contains(needle))
+}
+
+/// Process-lifecycle handles for the subprocess watchdog thread.
+///
+/// Created by [`spawn_watchdog`]; torn down by [`WatchdogHandles::teardown`].
+struct WatchdogHandles {
+    /// Written by the reader when `<completed>` is first seen; 0 = unseen.
+    /// Must be passed to `tee_stream_json` before calling `teardown`.
+    completion_epoch: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+    completion_killed: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogHandles {
+    /// Signal the watchdog to stop, join it, and return `(timed_out, completion_killed)`.
+    fn teardown(self) -> (bool, bool) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle {
+            let _ = h.join();
+        }
+        (
+            self.timed_out.load(Ordering::Acquire),
+            self.completion_killed.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Wire subprocess environment variables common to every LLM runner.
+///
+/// Sets `LOOP_ALLOW_DESTRUCTIVE`, `TASK_MGR_DIR` (canonicalized), and
+/// `TASK_MGR_ACTIVE_PREFIX`; applies `current_dir`; puts the child in its
+/// own process group on Unix.
+fn apply_common_env(
+    cmd: &mut Command,
+    db_dir: Option<&Path>,
+    active_prefix: Option<&str>,
+    working_dir: Option<&Path>,
+) {
+    cmd.env("LOOP_ALLOW_DESTRUCTIVE", "1");
+    if let Some(dir) = db_dir {
+        let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        cmd.env("TASK_MGR_DIR", canonical);
+    }
+    if let Some(p) = active_prefix.filter(|p| !p.is_empty()) {
+        cmd.env(ACTIVE_PREFIX_ENV, p);
+    }
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+/// Spawn `cmd`, mapping `NotFound` to a helpful `IoErrorWithContext`.
+///
+/// `provider_label` ("Claude" or "Grok") is interpolated into the operation
+/// string so the error identifies which runner failed.
+fn spawn_with_context(
+    cmd: &mut Command,
+    binary: &str,
+    provider_label: &str,
+) -> TaskMgrResult<std::process::Child> {
+    cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            TaskMgrError::IoErrorWithContext {
+                file_path: binary.to_string(),
+                operation: format!(
+                    "spawning {provider_label} subprocess (is '{binary}' in your PATH?)"
+                ),
+                source: e,
+            }
+        } else {
+            TaskMgrError::IoErrorWithContext {
+                file_path: binary.to_string(),
+                operation: format!("spawning {provider_label} subprocess"),
+                source: e,
+            }
+        }
+    })
+}
+
+/// Write `prompt` to the child's stdin and close the pipe.
+///
+/// `BrokenPipe` is swallowed — the child may close stdin early on a startup
+/// crash; the exit code captured after `child.wait()` is the authoritative
+/// signal. Any other write error returns `IoErrorWithContext`.
+fn write_prompt_to_stdin(
+    child: &mut std::process::Child,
+    prompt: &str,
+    binary: &str,
+    provider_label: &str,
+) -> TaskMgrResult<()> {
+    use std::io::Write;
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("stdin should be piped (Stdio::piped() was set on spawn)");
+    match stdin.write_all(prompt.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(TaskMgrError::IoErrorWithContext {
+            file_path: binary.to_string(),
+            operation: format!("writing prompt to {provider_label} subprocess stdin"),
+            source: e,
+        }),
+    }
+}
+
+/// Create the watchdog Arcs and optionally spawn a watchdog thread.
+///
+/// Returns [`WatchdogHandles`] whose `completion_epoch` must be passed to
+/// `tee_stream_json` before calling `teardown`.
+fn spawn_watchdog(
+    child_pid: u32,
+    signal_flag: Option<&SignalFlag>,
+    timeout: Option<TimeoutConfig>,
+    target_task_id: Option<&str>,
+) -> WatchdogHandles {
+    let completion_epoch = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let completion_killed = Arc::new(AtomicBool::new(false));
+    let handle = if signal_flag.is_some() || timeout.is_some() || target_task_id.is_some() {
+        let stop_w = Arc::clone(&stop);
+        let flag = signal_flag.cloned();
+        let timed_out_w = Arc::clone(&timed_out);
+        let epoch = Arc::clone(&completion_epoch);
+        let target = target_task_id.map(str::to_owned);
+        let completion_killed_w = Arc::clone(&completion_killed);
+        Some(std::thread::spawn(move || {
+            watchdog_loop(
+                child_pid,
+                flag.as_ref(),
+                &stop_w,
+                timeout.as_ref(),
+                &timed_out_w,
+                Some(&epoch),
+                target.as_deref(),
+                Some(&completion_killed_w),
+            );
+        }))
+    } else {
+        None
+    };
+    WatchdogHandles {
+        completion_epoch,
+        stop,
+        timed_out,
+        completion_killed,
+        handle,
+    }
+}
+
+/// Push `flag value` onto `args` when `value` is non-empty; no-op otherwise.
+fn push_optional_flag(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+        args.push(flag.to_string());
+        args.push(v.to_string());
+    }
+}
+
+/// Drain a plain-text stdout reader line-by-line, tee-ing each line to stderr
+/// and collecting into a `String`. Handles PTY EOF gracefully.
+fn read_plain_stdout(
+    reader: impl BufRead,
+    slot_label: Option<&str>,
+    provider_label: &str,
+) -> String {
+    let mut buf = String::new();
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                emit_prefixed_lines(slot_label, &line);
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            Err(e) if is_pty_read_eof(&e) => break,
+            Err(e) => {
+                emit_prefixed_lines(
+                    slot_label,
+                    &format!("Warning: error reading {provider_label} stdout: {e}"),
+                );
+                break;
+            }
+        }
+    }
+    buf
 }
 
 /// Route a runner invocation to the correct backend.
