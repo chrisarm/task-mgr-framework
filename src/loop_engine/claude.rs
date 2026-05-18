@@ -93,7 +93,7 @@ pub struct ClaudeResult {
 /// })
 /// ```
 #[derive(Default)]
-pub(crate) struct SpawnOpts<'a> {
+pub struct SpawnOpts<'a> {
     /// Watchdog signal flag. When set, a watchdog thread polls this every
     /// 200ms and escalates SIGTERM → 3s grace → SIGKILL on trip.
     pub signal_flag: Option<&'a SignalFlag>,
