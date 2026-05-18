@@ -75,9 +75,10 @@ impl RecoveryAction {
                 "Prompt is too long for {task_id} at effort {eff}, model {mdl} — escalating to 1M-context variant {new_model} (already at Opus)",
             ),
             Self::FallbackToProvider {
-                model: grok_model, ..
+                model: target_model,
+                ..
             } => format!(
-                "Prompt is too long for {task_id} at effort {eff}, model {mdl} — falling back to {grok_model} (Claude ladder exhausted)",
+                "Prompt is too long for {task_id} at effort {eff}, model {mdl} — falling back to {target_model} (Claude ladder exhausted)",
             ),
             Self::Blocked => format!(
                 "Prompt is too long for {task_id} at effort {eff}, model {mdl} — no recovery available (already at Opus[1M] with effort=high)",
@@ -384,6 +385,11 @@ pub fn handle_prompt_too_long(
     effective_runner: RunnerKind,
     project_config: &ProjectConfig,
 ) -> RecoveryAction {
+    // M2: snapshot whether this task already has a Grok promotion recorded
+    // BEFORE the rung-4 arm can insert one. Used below to suppress a duplicate
+    // banner when the RuntimeError hook fires in the same wave for the same task.
+    let was_already_promoted = ctx.runner_overrides.contains_key(task_id);
+
     // Step 1: pick recovery rung. Rung 4 (FallbackToProvider) sits between
     // rung 3 (to_1m_model) and rung 5 (Blocked); its precondition is a
     // SINGLE-predicate guard (PRD §2.5): the computed `effective_runner`
@@ -471,8 +477,13 @@ pub fn handle_prompt_too_long(
         }
     }
 
-    // Step 4: rung-specific stderr message.
-    eprintln!("{}", action.user_message(task_id, effort, effective_model));
+    // Step 4: rung-specific stderr message. For FallbackToProvider, suppress
+    // the banner when this task was already promoted (was_already_promoted ==
+    // true) so a wave-mode task that triggers BOTH the overflow rung-4 path
+    // and the RuntimeError hook in the same wave emits exactly one banner.
+    if !matches!(action, RecoveryAction::FallbackToProvider { .. }) || !was_already_promoted {
+        eprintln!("{}", action.user_message(task_id, effort, effective_model));
+    }
 
     // Step 5: best-effort prompt dump.
     let dumps_dir = base_dir.join("overflow-dumps");

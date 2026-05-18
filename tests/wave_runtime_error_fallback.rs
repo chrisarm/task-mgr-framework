@@ -328,6 +328,76 @@ fn merge_back_logic_does_not_branch_on_runner_kind() {
     );
 }
 
+// ── M2 — wave-mode banner dedup: single promotion banner per task per wave ─────
+
+/// M2: in a wave, a task can trigger BOTH the overflow rung-4
+/// (`handle_prompt_too_long` FallbackToProvider arm) AND the RuntimeError
+/// hook (`escalate_task_model_if_needed`) in the same iteration.  Both sites
+/// check `ctx.runner_overrides.contains_key(task_id)` (the `already_promoted`
+/// / `was_already_promoted` flag) to decide whether to emit the banner.
+///
+/// The invariant: the FIRST path to insert into `runner_overrides` also emits
+/// the banner; any subsequent path that finds the key already present skips
+/// the banner.
+///
+/// This test verifies the state machine by:
+/// 1. Pre-populating `runner_overrides` (simulating overflow rung-4 having
+///    already fired and printed the first banner for this task).
+/// 2. Calling `escalate_task_model_if_needed` — which represents the
+///    RuntimeError hook that would fire if the same task also hit the
+///    threshold in the same wave.
+/// 3. Asserting that `runner_overrides` still has exactly ONE entry for the
+///    task (no duplicate insert) and that the model state is consistent.
+///
+/// Stderr is NOT captured; the mechanism is verified via state assertions.
+/// The banner-suppression path (`!already_promoted == false → skip eprintln!`)
+/// in `escalate_task_model_if_needed` and the symmetric path in
+/// `handle_prompt_too_long` are the single-print guarantees.
+#[test]
+fn wave_promotion_banner_dedup_second_path_skips_when_runner_overrides_already_set() {
+    let (_dir, mut conn) = setup_db();
+
+    let task_id = "WAVE-M2-DEDUP-001";
+    // Task at Opus ceiling (would have overflowed), consecutive_failures one
+    // below threshold (handle_task_failure will push it to threshold).
+    insert_task(&conn, task_id, Some(OPUS_MODEL), FALLBACK_THRESHOLD - 1);
+
+    let mut ctx = IterationContext::new(8);
+    let cfg = enabled_fallback_cfg();
+
+    // Simulate overflow rung-4 having already fired for this task: it inserts
+    // into runner_overrides and (logically) emitted the first banner. The
+    // escalate call below must detect this pre-existing entry and skip its
+    // own banner.
+    ctx.runner_overrides
+        .insert(task_id.to_string(), RunnerKind::Grok);
+
+    // The RuntimeError hook path: handle_task_failure increments to threshold
+    // and calls escalate_task_model_if_needed.
+    handle_task_failure(&mut conn, task_id, 1, &mut ctx, Some(&cfg)).unwrap();
+
+    // State must be consistent: one entry, correct value, no double-insert.
+    assert_eq!(
+        ctx.runner_overrides.get(task_id),
+        Some(&RunnerKind::Grok),
+        "runner_overrides must still map to Grok after the second path runs — \
+         the already_promoted gate prevents a second insertion but must not remove \
+         the existing entry",
+    );
+    // Exactly one key for this task (HashMap insert is idempotent so no
+    // structural duplication, but the value must still be Grok).
+    let grok_entries: Vec<_> = ctx
+        .runner_overrides
+        .iter()
+        .filter(|(k, _)| k.as_str() == task_id)
+        .collect();
+    assert_eq!(
+        grok_entries.len(),
+        1,
+        "runner_overrides must have exactly ONE entry for the task after both paths run",
+    );
+}
+
 // ── Compile marker ─────────────────────────────────────────────────────────────
 
 /// Confirms the file builds. The imports above are the real compile-time

@@ -1306,7 +1306,7 @@
       "estimatedEffort": "medium",
       "id": "5ba153a7-REVIEW-FIX-1-MERGE-MAIN",
       "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. H1 of 3 high-severity findings. Reviewer cite: review reply, 'H1: rebase or merge main into the branch; resolve the single conflict in tests/worktree_db_resolution.rs'.",
-      "passes": false,
+      "passes": true,
       "priority": 80,
       "title": "Merge main into feat/grok-fallback-runner; resolve worktree_db_resolution.rs conflict; re-run full suite",
       "touchesFiles": [

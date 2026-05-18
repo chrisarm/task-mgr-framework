@@ -2,12 +2,18 @@
 //! (FR-006).
 
 use std::fs;
+use std::sync::Mutex;
 
 use tempfile::TempDir;
 
 use task_mgr::loop_engine::project_config::{
     FallbackRunnerConfig, ProjectConfig, check_fallback_runner_binary, read_project_config,
 };
+
+/// Serializes GROK_BINARY env-var mutations in this test binary.
+/// check_fallback_runner_binary reads GROK_BINARY, so tests that set it
+/// must hold this lock to avoid races with other tests.
+static GROK_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -155,6 +161,12 @@ fn fallback_runner_enabled_false_returns_some_not_none() {
 
 #[test]
 fn startup_check_fires_when_enabled_and_binary_missing() {
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Clear GROK_BINARY so the env-var resolution chain does not intercept
+    // the explicit cli_binary probe below (another test may have set it).
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
     let cfg = FallbackRunnerConfig {
         enabled: true,
         cli_binary: Some("/nonexistent/path/to/grok-binary-9b2f".to_string()),
@@ -199,6 +211,12 @@ fn startup_check_skipped_when_disabled_or_none() {
 
 #[test]
 fn startup_check_cli_binary_precedence() {
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Clear GROK_BINARY so both sub-cases below see the env-var chain with
+    // no override — the test is probing cli_binary and PATH precedence only.
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
     // Sub-case 1: cli_binary = Some("/usr/bin/true"). `/usr/bin/true` exists
     // on every Linux test host AND is not on PATH as `grok`, so this proves
     // the explicit path is honored verbatim (not re-resolved via PATH).
@@ -231,6 +249,39 @@ fn startup_check_cli_binary_precedence() {
             "error MUST name the bare binary name `grok` for the PATH-lookup case",
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M3 — GROK_BINARY env var is honored by check_fallback_runner_binary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// M3: when `GROK_BINARY` points at a real binary (e.g. `/usr/bin/true`),
+/// `check_fallback_runner_binary` should succeed even when `cli_binary` is
+/// `None` and `grok` is NOT on PATH. This proves the startup check uses the
+/// same resolution chain as `GrokRunner::spawn` (env var → cli_binary → PATH).
+#[test]
+fn startup_check_honors_grok_binary_env_var() {
+    if !std::path::Path::new("/usr/bin/true").exists() {
+        // Host doesn't have /usr/bin/true — skip rather than fail.
+        return;
+    }
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::set_var("GROK_BINARY", "/usr/bin/true") };
+
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        cli_binary: None, // env var must take precedence
+        ..Default::default()
+    };
+    let result = check_fallback_runner_binary(Some(&cfg));
+
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
+    result.expect(
+        "GROK_BINARY=/usr/bin/true must pass the startup check even when \
+         cli_binary is None — env var has the highest resolution priority",
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

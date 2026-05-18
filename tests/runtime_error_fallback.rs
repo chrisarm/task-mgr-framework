@@ -24,7 +24,7 @@ use task_mgr::db::{create_schema, open_connection, run_migrations};
 use task_mgr::loop_engine::engine::{
     IterationContext, escalate_task_model_if_needed, handle_task_failure,
 };
-use task_mgr::loop_engine::model::{OPUS_MODEL, SONNET_MODEL};
+use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::project_config::FallbackRunnerConfig;
 use task_mgr::loop_engine::runner::RunnerKind;
 
@@ -516,6 +516,56 @@ fn task_already_at_grok_is_idempotent_no_second_promotion() {
         read_model(&conn, "GROK-IDEMP-001").as_deref(),
         Some(GROK_DEFAULT_MODEL),
         "DB model column must remain at Grok when the task is already at Grok",
+    );
+}
+
+// ── H2 regression — Opus[1M] must also trigger Grok promotion ────────────────
+
+/// H2: a task at `OPUS_MODEL_1M` (the 1M-context Opus variant) with
+/// consecutive_failures >= threshold must be promoted to Grok. The original
+/// code used string-equality against `OPUS_MODEL` which excluded the 1M
+/// variant; the fix uses the ModelTier-based inclusive check so both
+/// `OPUS_MODEL` and `OPUS_MODEL_1M` satisfy the "was at Opus" gate.
+#[test]
+fn promotion_fires_at_opus_1m_and_threshold() {
+    let (_dir, conn) = setup_db();
+    insert_task(
+        &conn,
+        "OPUS1M-001",
+        Some(OPUS_MODEL_1M),
+        FALLBACK_THRESHOLD - 1,
+    );
+
+    let mut ctx = IterationContext::new(8);
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        model: GROK_DEFAULT_MODEL.to_string(),
+        runtime_error_threshold: FALLBACK_THRESHOLD as u32,
+        ..Default::default()
+    };
+    let outcome = escalate_task_model_if_needed(
+        &conn,
+        "OPUS1M-001",
+        FALLBACK_THRESHOLD,
+        &mut ctx,
+        Some(&cfg),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "Opus[1M] task at threshold must be promoted to Grok (H2 regression)"
+    );
+    assert_eq!(
+        ctx.runner_overrides.get("OPUS1M-001"),
+        Some(&RunnerKind::Grok),
+        "runner_overrides must be set to Grok for the Opus[1M] task"
+    );
+    assert_eq!(
+        read_model(&conn, "OPUS1M-001").as_deref(),
+        Some(GROK_DEFAULT_MODEL),
+        "tasks.model must be updated to the Grok model for the Opus[1M] task"
     );
 }
 

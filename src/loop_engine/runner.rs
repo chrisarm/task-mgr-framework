@@ -33,12 +33,29 @@ use crate::loop_engine::config::PermissionMode;
 use crate::loop_engine::signals::SignalFlag;
 use crate::loop_engine::watchdog::{TimeoutConfig, exit_code_from_status, watchdog_loop};
 
-/// Fast-fail window for the Grok auth-failure sniff. A non-zero exit within
-/// this window combined with one of [`GROK_AUTH_FAILURE_SUBSTRINGS`] on
-/// stderr is classified as [`TaskMgrError::GrokAuthFailure`]. Past the
-/// window, a substring match is more likely a tool-use runtime error than an
-/// auth lapse, so we fall through to a generic IoError. PRD §6 FR-007.
-const GROK_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(3);
+/// Default fast-fail window for the Grok auth-failure sniff (3 seconds).
+///
+/// A non-zero exit within this window combined with one of
+/// [`GROK_AUTH_FAILURE_SUBSTRINGS`] on stderr is classified as
+/// [`TaskMgrError::GrokAuthFailure`]. Past the window a substring match is
+/// more likely a tool-use runtime error than an auth lapse. PRD §6 FR-007.
+///
+/// **Test-only seam**: set `TASK_MGR_GROK_AUTH_WINDOW_SECS` to override
+/// the window duration without waiting 3 real seconds. Missing or
+/// non-numeric values are silently ignored and fall back to this default.
+/// Do NOT set this env var in production.
+const GROK_AUTH_FAILURE_WINDOW_DEFAULT_SECS: u64 = 3;
+
+/// Read the auth-failure sniff window, honouring the `TASK_MGR_GROK_AUTH_WINDOW_SECS`
+/// test-only env override. Falls back to [`GROK_AUTH_FAILURE_WINDOW_DEFAULT_SECS`]
+/// on missing or non-numeric values.
+fn grok_auth_failure_window() -> Duration {
+    std::env::var("TASK_MGR_GROK_AUTH_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(GROK_AUTH_FAILURE_WINDOW_DEFAULT_SECS))
+}
 
 /// Case-insensitive substrings that, combined with a non-zero exit within
 /// [`GROK_AUTH_FAILURE_WINDOW`] of spawn, indicate an unauthenticated Grok
@@ -425,9 +442,10 @@ impl LlmRunner for ClaudeRunner {
 ///
 /// Auth-failure detection (FR-007): stderr is captured into a bounded buffer
 /// while still being tee'd to the parent process. After the child exits, if
-/// it terminated non-zero AND elapsed wall-clock is within
-/// [`GROK_AUTH_FAILURE_WINDOW`] AND lowercased stderr matches one of
-/// [`GROK_AUTH_FAILURE_SUBSTRINGS`], the runner returns
+/// it terminated non-zero AND elapsed wall-clock is within the window returned
+/// by [`grok_auth_failure_window`] (default 3 s; overridable via
+/// `TASK_MGR_GROK_AUTH_WINDOW_SECS` for tests) AND lowercased stderr matches
+/// one of [`GROK_AUTH_FAILURE_SUBSTRINGS`], the runner returns
 /// [`TaskMgrError::GrokAuthFailure`] instead of `Ok(RunnerResult)`. The
 /// timing guard distinguishes a real auth lapse (fast-fail at startup) from
 /// a long-running tool-use error that happens to mention auth strings.
@@ -551,8 +569,8 @@ impl LlmRunner for GrokRunner {
 
         // Auth-failure sniff: only credible when the child died fast AND with
         // a known auth-phrase on stderr. Either condition alone falls through
-        // to a normal RunnerResult.
-        if exit_code != 0 && elapsed < GROK_AUTH_FAILURE_WINDOW {
+        // to a normal RunnerResult. Window is overridable via env var for tests.
+        if exit_code != 0 && elapsed < grok_auth_failure_window() {
             let stderr_str = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
             if stderr_contains_auth_failure(&stderr_str) {
                 return Err(TaskMgrError::GrokAuthFailure {

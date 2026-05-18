@@ -61,6 +61,23 @@ use task_mgr::loop_engine::runner::{RunnerKind, RunnerOpts, dispatch};
 /// so no cross-binary mutex coordination is needed.
 static GROK_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Drop guard that removes a temporary script file on scope exit so test
+/// panics don't leak files in temp dir.
+struct ScriptGuard(std::path::PathBuf);
+
+impl std::ops::Deref for ScriptGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ScriptGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// The permission-bypass flag the GrokRunner must emit for
 /// `PermissionMode::Dangerous`. Pinned to one option; FEAT-003 may switch
 /// to `--always-approve` if that matches the grok-cli convention better —
@@ -92,7 +109,7 @@ fn scoped_coding() -> PermissionMode {
 ///
 /// Tests can then assert on substring presence/absence to verify flag
 /// mapping without depending on argv order.
-fn make_argv_echo_script(name: &str, marker: &str) -> std::path::PathBuf {
+fn make_argv_echo_script(name: &str, marker: &str) -> ScriptGuard {
     let path = std::env::temp_dir().join(format!("task_mgr_grok_{name}.sh"));
     {
         let mut f = std::fs::File::create(&path).expect("create grok mock");
@@ -104,7 +121,7 @@ fn make_argv_echo_script(name: &str, marker: &str) -> std::path::PathBuf {
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod grok mock");
-    path
+    ScriptGuard(path)
 }
 
 /// Run `dispatch(RunnerKind::Grok, ...)` with `GROK_BINARY` pointed at the
@@ -137,9 +154,7 @@ fn grok_runner_returns_echoed_stdout_via_mock_binary() {
     let perm = scoped_coding();
 
     let result = dispatch_grok_with_mock(&script, "hello-grok", &perm, RunnerOpts::default());
-
-    let _ = std::fs::remove_file(&script);
-
+    // script is auto-removed by ScriptGuard on drop; no explicit remove_file needed.
     let r = result.expect("dispatch(Grok) returned Err");
     assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     assert!(
@@ -178,9 +193,7 @@ fn grok_runner_silently_ignores_cleanup_title_artifact() {
             ..RunnerOpts::default()
         },
     );
-
-    let _ = std::fs::remove_file(&script);
-
+    // script auto-removed by ScriptGuard
     let r = result.expect("dispatch(Grok) returned Err");
     assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     assert!(
@@ -216,9 +229,7 @@ fn grok_runner_dangerous_permission_mode_emits_bypass_flag() {
     let perm = PermissionMode::Dangerous;
 
     let result = dispatch_grok_with_mock(&script, "dangerous-probe", &perm, RunnerOpts::default());
-
-    let _ = std::fs::remove_file(&script);
-
+    // script auto-removed by ScriptGuard
     let r = result.expect("dispatch(Grok) returned Err");
     assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     let want_flag = format!("argv: {EXPECTED_DANGEROUS_FLAG}");
@@ -249,8 +260,7 @@ fn grok_runner_dispatch_variant_is_reachable() {
     let script = make_argv_echo_script("reachable", marker);
     let perm = scoped_coding();
     let result = dispatch_grok_with_mock(&script, "reachable-probe", &perm, RunnerOpts::default());
-    let _ = std::fs::remove_file(&script);
-
+    // script auto-removed by ScriptGuard
     let r = result.expect("dispatch(Grok) returned Err — runner body not reached");
     assert_eq!(r.exit_code, 0, "expected clean exit, got {r:?}");
     assert!(

@@ -48,6 +48,23 @@ use task_mgr::loop_engine::runner::{RunnerKind, RunnerOpts, dispatch};
 /// take an additional lock — none here do.
 static GROK_BINARY_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Drop guard that removes a temporary script file on scope exit.
+/// Prevents file leaks when tests panic before the explicit remove_file call.
+struct ScriptGuard(std::path::PathBuf);
+
+impl std::ops::Deref for ScriptGuard {
+    type Target = std::path::Path;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ScriptGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn scoped_coding() -> PermissionMode {
     PermissionMode::Scoped {
         allowed_tools: Some(CODING_ALLOWED_TOOLS.to_string()),
@@ -63,12 +80,7 @@ fn scoped_coding() -> PermissionMode {
 /// `delay_secs = 0` means "fire immediately" (within the fast-fail window);
 /// `delay_secs >= 4` puts the exit comfortably past the 3-second threshold.
 /// Returns the absolute path of the executable script.
-fn make_grok_mock(
-    name: &str,
-    stderr_str: &str,
-    exit_code: i32,
-    delay_secs: u64,
-) -> std::path::PathBuf {
+fn make_grok_mock(name: &str, stderr_str: &str, exit_code: i32, delay_secs: u64) -> ScriptGuard {
     let path = std::env::temp_dir().join(format!("task_mgr_it_grok_{name}.sh"));
     {
         let mut f = std::fs::File::create(&path).expect("create mock grok script");
@@ -83,18 +95,27 @@ fn make_grok_mock(
     }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod mock grok script");
-    path
+    ScriptGuard(path)
 }
 
 /// Run `dispatch(RunnerKind::Grok, ...)` with `GROK_BINARY` pointed at the
-/// given script. Restores env state and removes the script before returning,
-/// regardless of result. Holds the `GROK_BINARY_MUTEX` for the duration.
+/// given script. Restores env state before returning. Holds the
+/// `GROK_BINARY_MUTEX` for the duration. The `ScriptGuard` is auto-cleaned
+/// on drop, so callers need not call `remove_file` explicitly.
+///
+/// `auth_window_secs`: when `Some(n)`, sets `TASK_MGR_GROK_AUTH_WINDOW_SECS`
+/// to `n` for the duration of the call so tests can control timing without
+/// real sleeps. `None` leaves the env var unset (defaults to 3 s in prod).
 fn dispatch_grok_with_mock(
     script: &std::path::Path,
+    auth_window_secs: Option<u64>,
 ) -> task_mgr::error::TaskMgrResult<task_mgr::loop_engine::runner::RunnerResult> {
     let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
     unsafe { std::env::set_var("GROK_BINARY", script) };
+    if let Some(secs) = auth_window_secs {
+        unsafe { std::env::set_var("TASK_MGR_GROK_AUTH_WINDOW_SECS", secs.to_string()) };
+    }
     let perm = scoped_coding();
     let result = dispatch(
         RunnerKind::Grok,
@@ -103,6 +124,7 @@ fn dispatch_grok_with_mock(
         RunnerOpts::default(),
     );
     unsafe { std::env::remove_var("GROK_BINARY") };
+    unsafe { std::env::remove_var("TASK_MGR_GROK_AUTH_WINDOW_SECS") };
     result
 }
 
@@ -132,8 +154,7 @@ fn assert_is_grok_auth_failure(
 #[test]
 fn grok_auth_failure_on_not_authenticated_fast_fail() {
     let script = make_grok_mock("not_auth_fast", "Error: not authenticated", 1, 0);
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     assert_is_grok_auth_failure(&result);
 }
 
@@ -146,8 +167,7 @@ fn grok_auth_failure_on_please_run_grok_login_fast_fail() {
         1,
         0,
     );
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     assert_is_grok_auth_failure(&result);
 }
 
@@ -160,8 +180,7 @@ fn grok_auth_failure_on_grok_login_required_fast_fail() {
         1,
         0,
     );
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     assert_is_grok_auth_failure(&result);
 }
 
@@ -171,8 +190,7 @@ fn grok_auth_failure_on_grok_login_required_fast_fail() {
 #[test]
 fn grok_auth_failure_is_case_insensitive() {
     let script = make_grok_mock("uppercase", "FATAL: NOT AUTHENTICATED", 1, 0);
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     assert_is_grok_auth_failure(&result);
 }
 
@@ -183,7 +201,8 @@ fn grok_auth_failure_is_case_insensitive() {
 ///
 /// Slow: sleeps ~4 seconds. The integration-test binary skips this by default
 /// (it's `#[ignore]`'d for FEAT-003 reasons anyway); CI must run with
-/// `--include-ignored` once un-#[ignore]'d.
+/// `--include-ignored` once un-#[ignore]'d. See also
+/// `auth_failure_past_env_window_fast` for a deterministic timing-free variant.
 #[test]
 #[ignore = "slow (>3s sleep) — run with `cargo test -- --ignored` to exercise the timing window"]
 fn grok_auth_substring_past_window_is_not_auth_failure() {
@@ -193,8 +212,7 @@ fn grok_auth_substring_past_window_is_not_auth_failure() {
         1,
         4, // > 3s threshold
     );
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     // Contract is purely negative: anything BUT GrokAuthFailure is acceptable
     // (generic IoError, unrecognized non-zero exit, etc.) — a late substring
     // is more likely a tool-use runtime error than an auth lapse.
@@ -202,6 +220,33 @@ fn grok_auth_substring_past_window_is_not_auth_failure() {
         panic!(
             "auth substring past the fast-fail window must NOT be classified \
              as GrokAuthFailure — it is more likely a tool-use runtime error"
+        );
+    }
+}
+
+/// M5 fast case: with `TASK_MGR_GROK_AUTH_WINDOW_SECS=10`, an instant exit
+/// (delay=0) is well within the window → GrokAuthFailure. Exercises the env
+/// override without depending on real wall-clock timing.
+#[test]
+fn auth_failure_within_env_window_fast() {
+    let script = make_grok_mock("env_window_fast", "Error: not authenticated", 1, 0);
+    // 10-second window; instant script is guaranteed within it.
+    let result = dispatch_grok_with_mock(&script, Some(10));
+    assert_is_grok_auth_failure(&result);
+}
+
+/// M5 slow case: with `TASK_MGR_GROK_AUTH_WINDOW_SECS=0`, even an instant
+/// exit is past the (zero-length) window → NOT GrokAuthFailure. Exercises
+/// the timing-gate without a real 4-second sleep.
+#[test]
+fn auth_failure_past_env_window_fast() {
+    let script = make_grok_mock("env_window_past", "Error: not authenticated", 1, 0);
+    // Zero-second window: any positive elapsed time is past the window.
+    let result = dispatch_grok_with_mock(&script, Some(0));
+    if let Err(TaskMgrError::GrokAuthFailure { .. }) = result {
+        panic!(
+            "with TASK_MGR_GROK_AUTH_WINDOW_SECS=0 no exit can be within the \
+             window — must NOT be classified as GrokAuthFailure"
         );
     }
 }
@@ -219,8 +264,7 @@ fn grok_auth_substring_with_clean_exit_is_success() {
         0,
         0,
     );
-    let result = dispatch_grok_with_mock(&script);
-    let _ = std::fs::remove_file(&script);
+    let result = dispatch_grok_with_mock(&script, None);
     match result {
         Err(TaskMgrError::GrokAuthFailure { .. }) => {
             panic!(

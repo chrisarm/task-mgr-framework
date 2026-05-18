@@ -220,7 +220,8 @@ pub struct IterationContext {
     /// Per-task crash flag for the most recent iteration on each task. The
     /// pipeline writes one entry per iteration:
     /// `map[task_id] = matches!(outcome, IterationOutcome::Crash(_))`.
-    /// `check_crash_escalation` (post-FEAT-007) consults this map directly,
+    /// `check_crash_escalation` (updated in the grok-fallback-runner PRD, task
+    /// FEAT-007 of that PRD) consults this map directly,
     /// replacing the `(last_task_id == current) && last_was_crash` predicate
     /// that today's two scalar fields encode.
     ///
@@ -436,6 +437,12 @@ pub struct SlotResult {
     /// `task_difficulty` instead of hardcoding `None`. `None` when the task
     /// has no difficulty set or for `slot_failure_result` entries.
     pub task_difficulty: Option<String>,
+    /// Pre-resolved runner kind threaded from `SlotContext::effective_runner`.
+    /// Used by `process_slot_result` so the overflow rung-4 idempotency guard
+    /// pins on the same value the slot used to dispatch (PRD §2.5 single-source
+    /// rule). Defaults to `RunnerKind::Claude` for failure entries where no
+    /// slot was actually dispatched.
+    pub effective_runner: RunnerKind,
 }
 
 /// Aggregate result of a parallel wave.
@@ -526,6 +533,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         section_sizes: slot.prompt_bundle.section_sizes.clone(),
         dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
         task_difficulty: slot.prompt_bundle.difficulty.clone(),
+        effective_runner: slot.effective_runner,
     }
 }
 
@@ -753,6 +761,7 @@ pub fn run_slot_iteration(
         section_sizes: bundle.section_sizes.clone(),
         dropped_sections: bundle.dropped_sections.clone(),
         task_difficulty: bundle.difficulty.clone(),
+        effective_runner: slot.effective_runner,
     })
 }
 
@@ -829,6 +838,7 @@ fn slot_failure_result(
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
         task_difficulty: None,
+        effective_runner: RunnerKind::Claude,
     }
 }
 
@@ -1451,15 +1461,19 @@ fn process_slot_result(
             cluster_effort: slot_result.iteration_result.effective_effort,
             section_sizes: slot_result.section_sizes.clone(),
         };
-        // FEAT-005: resolve effective_runner via the single-source helper so
-        // FEAT-006's overflow rung 4 (FallbackToProvider) pins its idempotency
-        // guard on the same value the slot used to dispatch. Computed once
-        // here and passed through to `handle_prompt_too_long` — never
-        // re-derived inside the handler (PRD §2.5 "single-predicate guard").
-        let effective_runner = resolve_effective_runner(
-            ctx,
-            tid,
-            slot_result.iteration_result.effective_model.as_deref(),
+        // FEAT-005/H3: use the pre-dispatch runner threaded from SlotContext
+        // so the rung-4 idempotency guard pins on the same value the slot used.
+        // The debug_assert cross-checks that re-derivation from the result's
+        // effective_model agrees (catches drift if runner_overrides logic changes).
+        let effective_runner = slot_result.effective_runner;
+        debug_assert_eq!(
+            resolve_effective_runner(
+                ctx,
+                tid,
+                slot_result.iteration_result.effective_model.as_deref()
+            ),
+            effective_runner,
+            "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"
         );
         let _ = overflow::handle_prompt_too_long(
             ctx,
@@ -2801,10 +2815,9 @@ pub fn run_iteration(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) {
-        // FEAT-006: compute `effective_runner` once via the single-source
-        // helper and pass it through so the rung-4 idempotency guard pins on
-        // the same value the iteration's spawn site resolved (PRD §2.5).
-        let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
+        // FEAT-006/H3: use the primary effective_runner computed above (PRD §2.5
+        // single-source rule — never re-derive). The outer binding from the
+        // banner step is in scope here; shadowing it would be drift-prone.
         let _ = overflow::handle_prompt_too_long(
             ctx,
             params.conn,
@@ -4850,12 +4863,12 @@ pub fn check_crash_escalation(
 /// never trigger the overflow ladder) is free.
 ///
 /// When the current DB value differs from the snapshot, all six per-task
-/// override entries are cleared:
-/// 1. `effort_overrides`
+/// override entries are cleared (in the same order the code removes them):
+/// 1. `runner_overrides`
 /// 2. `model_overrides`
-/// 3. `overflow_recovered`
-/// 4. `overflow_original_model`
-/// 5. `runner_overrides`
+/// 3. `effort_overrides`
+/// 4. `overflow_recovered`
+/// 5. `overflow_original_model`
 /// 6. `overflow_original_task_model`
 ///
 /// A single stderr line is emitted so operators can see the escape valve fired.
@@ -4986,8 +4999,15 @@ pub fn escalate_task_model_if_needed(
         Some(c) if c.enabled => c,
         _ => return Ok(escalated),
     };
-    let was_at_opus = matches!(current_model.as_deref(), Some(m) if m == model::OPUS_MODEL);
-    if !was_at_opus || new_count < fallback.runtime_error_threshold as i32 {
+    // H2: use ModelTier-based inclusive check so both OPUS_MODEL and OPUS_MODEL_1M
+    // qualify as "at Opus" — string-eq on OPUS_MODEL excluded the 1M variant.
+    let was_at_opus = matches!(
+        model::model_tier(current_model.as_deref()),
+        model::ModelTier::Opus
+    );
+    // M1: compare in u32 space; new_count is a DB counter (always >= 0 in practice)
+    // but guard the negative case to keep the cast sound for all inputs.
+    if !was_at_opus || new_count < 0 || (new_count as u32) < fallback.runtime_error_threshold {
         return Ok(escalated);
     }
     let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
@@ -5006,14 +5026,22 @@ pub fn escalate_task_model_if_needed(
         "UPDATE tasks SET model = ? WHERE id = ?",
         rusqlite::params![fallback.model, task_id],
     )?;
+    // M2: gate banner on first promotion only. In wave-mode a task with
+    // Crash(PromptTooLong) can reach both the overflow rung-4 banner and this
+    // RuntimeError hook in the same wave; the overflow handler fires first and
+    // inserts into runner_overrides, so a pre-existing entry means the banner
+    // already printed (no duplicate).
+    let already_promoted = ctx.runner_overrides.contains_key(task_id);
     ctx.runner_overrides
         .insert(task_id.to_string(), RunnerKind::Grok);
     ctx.model_overrides
         .insert(task_id.to_string(), fallback.model.clone());
-    eprintln!(
-        "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
-        task_id, fallback.model, new_count
-    );
+    if !already_promoted {
+        eprintln!(
+            "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
+            task_id, fallback.model, new_count
+        );
+    }
     Ok(Some(fallback.model.clone()))
 }
 
@@ -7513,6 +7541,7 @@ mod tests {
                 section_sizes: Vec::new(),
                 dropped_sections: Vec::new(),
                 task_difficulty: None,
+                effective_runner: RunnerKind::Claude,
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(

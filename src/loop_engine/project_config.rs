@@ -287,7 +287,14 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
         Some(c) => c,
     };
 
-    let (binary, found) = if let Some(explicit) = &cfg.cli_binary {
+    // Resolution order mirrors GrokRunner::spawn: GROK_BINARY env var →
+    // cfg.cli_binary → bare "grok" on PATH. Keeping the same priority chain
+    // prevents operators who set GROK_BINARY for dev/test from hitting a
+    // misleading "binary not found" startup error.
+    let (binary, found) = if let Ok(env_bin) = std::env::var("GROK_BINARY") {
+        let exists = std::path::Path::new(&env_bin).exists();
+        (env_bin, exists)
+    } else if let Some(explicit) = &cfg.cli_binary {
         let exists = std::path::Path::new(explicit).exists();
         (explicit.clone(), exists)
     } else {

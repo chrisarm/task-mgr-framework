@@ -133,6 +133,14 @@ pub fn difficulty_rank(difficulty: Option<&str>) -> Option<usize> {
 ///
 /// Variants are ordered from lowest to highest capability/cost.
 /// `Default` represents an unknown or unspecified model.
+///
+/// Note: `model_tier` uses **substring** matching (`.contains("opus")` etc.)
+/// because model variant suffixes like `[1m]` must still map to the correct
+/// tier. `provider_for_model` deliberately uses **token equality** on `-`
+/// splits to avoid mis-routing Groq Inc. models (`groq-llama-3`, which
+/// contains "groq" but not the token "grok") to the xAI Grok runner. The
+/// two functions' matching strategies are intentionally different — do not
+/// "unify" them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelTier {
     /// No model specified or unrecognized model string
