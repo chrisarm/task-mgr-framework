@@ -28,7 +28,10 @@ fn main() -> ExitCode {
         }
     };
     let model_rs = root.join("src/loop_engine/model.rs");
-    let tasks_md = root.join(".claude/commands/tasks.md");
+    let targets = [
+        root.join(".claude/commands/tasks.md"),
+        root.join(".claude/commands/plan-tasks.md"),
+    ];
 
     let block = match render_block(&model_rs) {
         Ok(b) => b,
@@ -41,59 +44,70 @@ fn main() -> ExitCode {
         }
     };
 
-    let current = match fs::read_to_string(&tasks_md) {
-        Ok(s) => s,
-        Err(e) => {
+    let mut any_updated = false;
+
+    for target in &targets {
+        let current = match fs::read_to_string(target) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "gen-docs: could not read {}: {e}. Skipping.",
+                    target.display()
+                );
+                continue;
+            }
+        };
+
+        // gen-docs requires exactly one marker pair — validate before splicing.
+        let begin_count = current.matches(MODELS_BEGIN).count();
+        let end_count = current.matches(MODELS_END).count();
+        if begin_count == 0 || end_count == 0 {
             eprintln!(
-                "gen-docs: could not read {}: {e}. Create the file and add {MODELS_BEGIN} / {MODELS_END} markers.",
-                tasks_md.display()
+                "gen-docs: expected {MODELS_BEGIN} and {MODELS_END} markers in {}; \
+                 found {begin_count} begin / {end_count} end — skipping",
+                target.display()
             );
+            continue;
+        }
+        if begin_count > 1 || end_count > 1 {
+            eprintln!(
+                "gen-docs: ambiguous markers in {}: expected exactly one pair, \
+                 found {begin_count} begin / {end_count} end — skipping",
+                target.display()
+            );
+            continue;
+        }
+
+        let new_contents = marker_splice::splice_block(&current, MODELS_BEGIN, MODELS_END, &block);
+
+        if new_contents == current {
+            if !check_mode {
+                println!("gen-docs: {} already up to date", target.display());
+            }
+            continue;
+        }
+
+        if check_mode {
+            eprintln!(
+                "gen-docs: {} is stale. Run `cargo run --bin gen-docs` to regenerate.",
+                target.display()
+            );
+            eprintln!("--- expected block ---\n{block}\n--- end ---");
+            return ExitCode::from(1);
+        }
+
+        if let Err(e) = marker_splice::write_atomic(target, &new_contents) {
+            eprintln!("gen-docs: failed to write {}: {e}", target.display());
             return ExitCode::from(2);
         }
-    };
-
-    // gen-docs requires exactly one marker pair — validate before splicing.
-    let begin_count = current.matches(MODELS_BEGIN).count();
-    let end_count = current.matches(MODELS_END).count();
-    if begin_count == 0 || end_count == 0 {
-        eprintln!(
-            "gen-docs: expected {MODELS_BEGIN} and {MODELS_END} markers in {}; \
-             found {begin_count} begin / {end_count} end",
-            tasks_md.display()
-        );
-        return ExitCode::from(2);
-    }
-    if begin_count > 1 || end_count > 1 {
-        eprintln!(
-            "gen-docs: ambiguous markers in {}: expected exactly one pair, \
-             found {begin_count} begin / {end_count} end",
-            tasks_md.display()
-        );
-        return ExitCode::from(2);
-    }
-    let new_contents = marker_splice::splice_block(&current, MODELS_BEGIN, MODELS_END, &block);
-
-    if new_contents == current {
-        if !check_mode {
-            println!("gen-docs: {} already up to date", tasks_md.display());
-        }
-        return ExitCode::SUCCESS;
+        println!("gen-docs: updated {}", target.display());
+        any_updated = true;
     }
 
-    if check_mode {
-        eprintln!(
-            "gen-docs: {} is stale. Run `cargo run --bin gen-docs` to regenerate.",
-            tasks_md.display()
-        );
-        eprintln!("--- expected block ---\n{block}\n--- end ---");
-        return ExitCode::from(1);
+    if !any_updated && !check_mode {
+        println!("gen-docs: all target files up to date");
     }
 
-    if let Err(e) = marker_splice::write_atomic(&tasks_md, &new_contents) {
-        eprintln!("gen-docs: failed to write {}: {e}", tasks_md.display());
-        return ExitCode::from(2);
-    }
-    println!("gen-docs: updated {}", tasks_md.display());
     ExitCode::SUCCESS
 }
 

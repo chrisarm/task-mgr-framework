@@ -196,7 +196,15 @@ Append:
 
 Target audience: internal team + ops. Cap each PRD entry at ~200 words.
 
-### 2.6 Pattern graduation check → potentially a new agent
+### 2.6 Experiment / Spike Fidelity & Boundary Contract Health
+
+Ask: "Did the PRD or plan explicitly name a riskiest assumption + cheapest falsifying experiment (or `/spike`)? Was it actually run? What did we learn vs. assume?"
+
+Ask: "Were any `CONTRACT-xxx` tasks or 'Boundary Contracts & Modularity Targets' sections created? Did downstream implementation stay within the recorded contract, or did we have to revise it? Capture any contract drift or coupling surprises as learnings."
+
+Record durable outcomes under the appropriate category below (or as new indexed learnings with tags `spike`, `contract`, `coupling`).
+
+### 2.7 Pattern graduation check → potentially a new agent
 
 For each learning recorded in 2.2:
 
@@ -231,7 +239,7 @@ Count the results where confidence ≥ 50%. If **count ≥ 12**, the pattern has
      task-mgr learn-tag $id --add "superseded-by:$POINTER_ID"
    done
    ```
-   If it doesn't, **record in the compound report** as a human-follow-up item listing the IDs — do not silently drop this step. This is a known iter-1 gap; iter 2 may add the CLI support.
+   If it doesn't, **record in the compound report** as a human-follow-up item listing the IDs — do not silently drop this step. Current CLI (as of 2026) has `edit-learning` for supersession and tag management; there is no `learn-tag` subcommand.
 
 4. **Flag in the compound report:**
    ```

@@ -125,6 +125,8 @@ This is NOT a full second code review — it's a targeted coherence pass that le
 
 **If you make any inline fixes during this step** (a doc typo, a one-line correction the reviewer surfaced as trivial), the Edit/Write `file_path` MUST begin with `$WORKTREE/`. Commit via `git -C "$WORKTREE" ...`. Same rule as the top-of-skill mechanics — no exceptions for "small" edits. If a fix is non-trivial, prefer spawning a `CODE-FIX` task (see Step 6 critical-findings branch) over patching it here.
 
+**Coherence spot-check for new mechanisms**: If the PRD used any `CONTRACT-xxx` tasks or a prior `/spike`, verify that downstream code respected the recorded contract / spike decision and that the progress log contains the expected contract text or experiment result. Flag any drift.
+
 ### Step 5: Consolidated Report
 
 Present to the user:

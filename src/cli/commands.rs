@@ -39,22 +39,24 @@ EXAMPLES:
     # into CLAUDE.md and AGENTS.md (creating them if absent)
     task-mgr init --enhance
 
-    # DEPRECATED but supported indefinitely: import a PRD via the top-level shim.
-    # Prefer `task-mgr loop init <prd>` (single) or `task-mgr batch init <glob>` (multi).
+    # Modern canonical forms (recommended)
+    task-mgr loop init tasks/my-prd.json
+    task-mgr batch init 'tasks/*.json'
+    task-mgr loop init prd.json --append --update-existing --dry-run
+
+    # DEPRECATED but supported indefinitely: the top-level shim still works
+    # and will print a notice then dispatch to the commands above.
     task-mgr init --from-json tasks/my-prd.json
-    task-mgr init --from-json phase1.json --from-json phase2.json
-    task-mgr init --from-json prd.json --append --update-existing --dry-run
 
 PROJECT-LEVEL vs PRD-IMPORT:
     `task-mgr init` (no --from-json) is project-level: it scaffolds `.task-mgr/`
     and is idempotent. There is no `--force` for project-level init — to reset,
     `rm -rf .task-mgr/` and re-run.
 
-    `task-mgr init --from-json X` (deprecated shim) runs project-level scaffolding
-    first (so the model picker fires), then dispatches to `loop init` (when N=1)
-    or `batch init` (when N>1). The companion flags below (--force, --append,
-    --update-existing, --dry-run, --prefix, --no-prefix) are honored on the shim
-    path only; they are ignored when --from-json is empty.
+    `task-mgr init --from-json X` is the legacy shim. It runs project-level
+    scaffolding first (so the model picker can fire), then dispatches to
+    `loop init` (N=1) or `batch init` (N>1). Prefer the direct `loop init` /
+    `batch init` forms in new documentation and scripts.
 
 TASK ID PREFIXING:
     By default, all task IDs are prefixed to prevent cross-phase collisions.
@@ -317,8 +319,8 @@ COMMON USE CASES:
     task-mgr doctor --auto-fix
     # This resets tasks stuck in in_progress to todo status
 
-    # In claude-loop.sh startup:
-    task-mgr doctor --auto-fix || task-mgr init --from-json prd.json
+    # In claude-loop.sh startup (modern form):
+    task-mgr doctor --auto-fix || task-mgr loop init prd.json
 ")]
     Doctor {
         /// Automatically fix issues found
