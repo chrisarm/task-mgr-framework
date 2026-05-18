@@ -4,7 +4,7 @@
 //! fallback hook leaves in `IterationContext`:
 //!   - `runner_overrides[task] = RunnerKind::Grok`
 //!   - `model_overrides[task] = "grok-4-fast"`
-//!   - `overflow_original_task_model[task] = Some("claude-opus-4-7")`
+//!   - `overflow_original_task_model[task] = Some(<OPUS_MODEL>)`
 //!
 //! When the operator subsequently edits `tasks.model` to a different value,
 //! `check_override_invalidation` must clear ALL SIX per-task override channels

@@ -902,7 +902,7 @@
       "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-7",
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1`. Priority for spawned fixes: 14-16. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line 'No issues found' in the progress file.\n\nCRITICAL focus areas (from architect review):\n- Single-source effective_runner formula — verify only one provider_for_model call in main iteration path\n- tasks.model DB UPDATE always paired with runner_overrides insert\n- Wave-mode RuntimeError hook NEVER inside slot worker\n- Idempotency guard pinned to single value (not OR of predicates)\n- provider_for_model token-equality (not substring) — defensive against 'groq-llama'\n- Auth-failure handling preserves counter integrity\n- Override invalidation reads fresh DB state every iteration",
-      "passes": false,
+      "passes": true,
       "priority": 13,
       "qualityDimensions": [
         "Read every file in touchesFiles end-to-end; do not skim",
@@ -943,7 +943,7 @@
       "id": "MILESTONE-1",
       "model": "claude-opus-4-7",
       "notes": "This is a milestone — runs the full unscoped suite per the prompt's MILESTONE protocol. Pre-existing failures get fixed or spawned per the protocol (default: fix inline; escape hatch: >12 unrelated failures → spawn FIX-xxx tasks with verifyCommand).",
-      "passes": false,
+      "passes": true,
       "priority": 20,
       "qualityDimensions": [
         "Full unscoped test suite — milestone gate, not scoped per-iteration",
@@ -977,7 +977,7 @@
       "estimatedEffort": "medium",
       "id": "TEST-001",
       "notes": "Reference: PRD §6 Risks 'Tag-emission drift on real iteration prompts'; PRD §3 US-002 AC for #[ignore]'d integration test.\n\nFixture assembly:\n```rust\nlet prompt = format!(\n    \"{claude_md}\\n\\n{skill_content}\\n\\n{learnings_section}\\n\\n## Current Iteration\\nTask: ...\",\n    claude_md = std::fs::read_to_string(\"CLAUDE.md\")?,\n    skill_content = std::fs::read_to_string(\".claude/skills/tasks.md\").unwrap_or_default(),\n    learnings_section = generate_synthetic_learnings(50_000),  // ~50KB\n);\n```\n\nIf grok produces something other than the expected tags on the larger prompt, the fix per PRD Open Question is to add `--rules` system-prompt override that re-asserts the tag contract.",
-      "passes": false,
+      "passes": true,
       "priority": 25,
       "qualityDimensions": [
         "Realistic prompt scale (10-100 KB) — NOT spike-scale (1 KB). The spike validated the small case; this test confirms the large case",
@@ -1010,7 +1010,7 @@
       "estimatedEffort": "medium",
       "id": "TEST-002",
       "notes": "Reference: PRD §3 US-006 AC for the operator escape-valve test.\n\nLeverage the existing in-memory sqlite test helper pattern from tests/overflow_filesystem.rs or similar.\n\nLearning [2728]: per-task HashMap pattern — assertions iterate over the six maps.",
-      "passes": false,
+      "passes": true,
       "priority": 26,
       "qualityDimensions": [
         "Test uses REAL Connection (in-memory sqlite via the existing test helper pattern) — NOT a mock",
@@ -1043,7 +1043,7 @@
       "estimatedEffort": "high",
       "id": "TEST-003",
       "notes": "Reference: PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; learning #1810 (IterationContext not thread-safe); learning #1860 (reorder hints buffer in parallel context); learning #2286 (iteration_pipeline shared sequential+slot).",
-      "passes": false,
+      "passes": true,
       "priority": 27,
       "qualityDimensions": [
         "Wave-mode wiring assertion is MANDATORY — learning #1810 confirms IterationContext is not thread-safe; this is the critical guard",
