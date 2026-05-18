@@ -37,6 +37,56 @@ pub const OPUS_MODEL_1M: &str = "claude-opus-4-7[1m]";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// LLM provider classification.
+///
+/// Computed from a model id by [`provider_for_model`] (token-equality on the
+/// lowercased, hyphen-split model string). Used to pick the right
+/// `RunnerKind` and to short-circuit Claude-only helpers like
+/// [`escalate_model`] when the active model belongs to a different provider.
+///
+/// New provider variants are added here when a new runner is plumbed
+/// through `dispatch`; today the only two are Claude (default) and Grok
+/// (FR-002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    /// Anthropic Claude models (default for unknown / unset inputs).
+    Claude,
+    /// xAI Grok models (`grok-4`, `grok-4-fast`, `grok-code-fast-1`, …).
+    Grok,
+}
+
+/// Classify a model id as a provider.
+///
+/// Algorithm: lowercase the input, split on `-`, return [`Provider::Grok`]
+/// iff *some token is exactly* `"grok"`. Every other input — including
+/// `None`, the empty string, `"unknown-model"`, the Claude model constants,
+/// and Groq Inc. models like `"groq-llama-70b"` — falls through to
+/// [`Provider::Claude`].
+///
+/// Token-equality (not substring matching) is load-bearing: `groq-llama-3`
+/// from Groq Inc. is **not** an xAI product, and `.contains("grok")` would
+/// mis-route it. Splitting on `-` and comparing each token to the literal
+/// `"grok"` rejects Groq cleanly. Total function: every `Option<&str>`
+/// input produces some `Provider`; never panics.
+///
+/// # Examples
+///
+/// ```ignore
+/// use task_mgr::loop_engine::model::{Provider, provider_for_model};
+/// assert_eq!(provider_for_model(Some("grok-4-fast")), Provider::Grok);
+/// assert_eq!(provider_for_model(Some("groq-llama-3")), Provider::Claude);
+/// assert_eq!(provider_for_model(Some("claude-opus-4-7")), Provider::Claude);
+/// assert_eq!(provider_for_model(None), Provider::Claude);
+/// ```
+pub fn provider_for_model(model: Option<&str>) -> Provider {
+    let lower = model.unwrap_or("").to_ascii_lowercase();
+    if lower.split('-').any(|t| t == "grok") {
+        Provider::Grok
+    } else {
+        Provider::Claude
+    }
+}
+
 /// Mapping from task difficulty to Claude CLI `--effort` level.
 ///
 /// Scaling: low difficulty → medium effort, medium → high, high → xhigh.
