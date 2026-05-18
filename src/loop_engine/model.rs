@@ -260,6 +260,9 @@ pub fn downgrade_effort(effort: Option<&str>) -> Option<&'static str> {
 /// - None → None
 /// - unknown/Default tier → None (cannot escalate unrecognized model)
 pub fn escalate_model(model: Option<&str>) -> Option<String> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         None => None,
         Some(m) => match model_tier(Some(m)) {
@@ -289,6 +292,9 @@ pub fn escalate_model(model: Option<&str>) -> Option<String> {
 /// - opus (incl. 1M variant) → None (already at ceiling)
 /// - None / unknown tier → None
 pub fn escalate_below_opus(model: Option<&str>) -> Option<&'static str> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         None => None,
         Some(m) => match model_tier(Some(m)) {
@@ -309,6 +315,9 @@ pub fn is_1m_model(model: Option<&str>) -> bool {
 /// Currently only Opus has a 1M variant. Returns `None` if the model is
 /// already 1M, not Opus-tier, or `None`.
 pub fn to_1m_model(model: Option<&str>) -> Option<&'static str> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         Some(m) if is_1m_model(Some(m)) => None,
         Some(m) if model_tier(Some(m)) == ModelTier::Opus => Some(OPUS_MODEL_1M),
