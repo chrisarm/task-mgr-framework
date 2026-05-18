@@ -1866,6 +1866,8 @@ pub fn run_wave_iteration(
     // (bundle.resolved_model → params.default_model fallback) so the
     // runner resolution sees the same model string the slot will use.
     for slot in slot_contexts.iter_mut() {
+        // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
+        check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
         let effective_model = slot
             .prompt_bundle
             .resolved_model
@@ -2425,6 +2427,9 @@ pub fn run_iteration(
             effort.unwrap_or("(default)"),
         );
     }
+
+    // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
+    check_override_invalidation(ctx, params.conn, &task_id);
 
     // FEAT-005/009: resolve effective runner once per iteration (PRD §2.5
     // single source of truth). Placed before the banner so the "(via grok)"
@@ -4758,6 +4763,62 @@ pub fn check_crash_escalation(
         None => Some(model::OPUS_MODEL.to_string()),
         Some(m) => model::escalate_model(Some(m)),
     }
+}
+
+/// Operator escape valve: detect when an operator edited `tasks.model` in the
+/// DB out-of-band and clear any stale auto-recovery overrides for that task.
+///
+/// Called at the top of every iteration (both wave and sequential) BEFORE
+/// `resolve_effective_runner`. Short-circuits immediately when `task_id` has no
+/// entry in `ctx.overflow_original_task_model` — the dominant case (most tasks
+/// never trigger the overflow ladder) is free.
+///
+/// When the current DB value differs from the snapshot, all six per-task
+/// override entries are cleared:
+/// 1. `effort_overrides`
+/// 2. `model_overrides`
+/// 3. `overflow_recovered`
+/// 4. `overflow_original_model`
+/// 5. `runner_overrides`
+/// 6. `overflow_original_task_model`
+///
+/// A single stderr line is emitted so operators can see the escape valve fired.
+/// DB read errors are logged and treated as no-op so a transient failure never
+/// blocks the iteration.
+pub fn check_override_invalidation(ctx: &mut IterationContext, conn: &Connection, task_id: &str) {
+    // No snapshot → no override was ever set for this task; skip DB round-trip.
+    if !ctx.overflow_original_task_model.contains_key(task_id) {
+        return;
+    }
+
+    let current_model: Option<String> = match conn.query_row(
+        "SELECT model FROM tasks WHERE id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: check_override_invalidation({task_id}): DB read failed: {e}");
+            return;
+        }
+    };
+
+    let snapshotted = ctx.overflow_original_task_model.get(task_id);
+    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
+        return;
+    }
+
+    // Operator changed tasks.model — clear all six per-task override channels.
+    ctx.runner_overrides.remove(task_id);
+    ctx.model_overrides.remove(task_id);
+    ctx.effort_overrides.remove(task_id);
+    ctx.overflow_recovered.remove(task_id);
+    ctx.overflow_original_model.remove(task_id);
+    ctx.overflow_original_task_model.remove(task_id);
+
+    eprintln!(
+        "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
+    );
 }
 
 /// Treat `Some("")` and `Some("   ")` as "no model known" so both escalation
