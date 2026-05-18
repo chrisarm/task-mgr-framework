@@ -1,0 +1,456 @@
+# Claude Code Agent Instructions
+
+You are an autonomous coding agent implementing **post-merge-back slot completion reconciliation** for **task-mgr**.
+
+## Problem Statement
+
+In wave / parallel-slot mode, the loop engine sometimes leaves a task `in_progress` even though its work has been committed and merged back. Concretely: a slot agent finishes work, runs `git commit` with the prompt-prescribed marker (`feat: <TASK-ID>-completed - <title>`), but its subprocess exits before flushing the `<completed>` tag (output buffer drop, watchdog kill, deadline, signal). The per-slot completion ladder runs with `skip_git_completion_detection: true` (`src/loop_engine/engine.rs:1388`) because slot commits live on un-merged ephemeral branches, and the stale comment at `engine.rs:1282-1285` promises a post-merge reconcile that **does not exist**. The only existing post-merge reconcile (`reconcile_external_git_completions` at `engine.rs:1870-1885`) only fires when `params.external_repo_path` is `Some` — irrelevant for in-repo PRDs. Result: the task stays `in_progress` until loop exit; step 17.6 (`engine.rs:3950`) drains `ctx.pending_slot_tasks` and resets the row to `todo`; the next loop reselects the same task; the agent must rediscover from `git log` that the work is already merged.
+
+This task list closes the gap by (1) surfacing slot 0's pre-merge HEAD on `MergeOutcomes`, (2) adding `reconcile_merged_slot_completions` in `git_reconcile.rs` to scan the `{pre_merge_head}..HEAD` range for `<TASK-ID>-COMPLETED` markers, and (3) wiring the call into `run_wave_iteration` with a `pending_slot_tasks` drain so the loop-exit cleanup doesn't undo the DB write.
+
+---
+
+## Non-Negotiable Process (Read Every Iteration)
+
+Before writing code:
+
+1. **Internalize quality targets** — Read `qualityDimensions`; that's what "done well" means for THIS task.
+2. **Plan edge-case handling** — For each `edgeCases` / `failureModes` entry on the task, decide how it'll be handled before coding.
+3. **Pick an approach** — State assumptions in your head. Only for `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, name the one alternative you rejected and why.
+
+After writing code, the scoped quality gate is your critic — run it (Quality Checks § Per-iteration). Don't add a separate self-critique step; the linters, type-checker, and targeted tests catch more than a re-read does.
+
+---
+
+## Priority Philosophy
+
+In order: **PLAN** (anticipate edge cases) → **PHASE 2 FOUNDATION** (~1 day now to save ~2+ weeks later — take it, we're pre-launch) → **FUNCTIONING CODE** (pragmatic, reliable) → **CORRECTNESS** (compiles, type-checks, scoped tests pass deterministically) → **CODE QUALITY** (clean, no warnings) → **POLISH** (docs, formatting).
+
+Non-negotiables: tests drive implementation; satisfy every `qualityDimensions` entry; handle `Option`/`Result` explicitly (no `unwrap()` in production). For `estimatedEffort: "high"` or `modifiesBehavior: true` tasks, note the one alternative you rejected and why. For everything else, pick and go.
+
+**Prohibited outcomes:**
+
+- Tests that only assert 'no crash' or check type without verifying content
+- Tests that mirror implementation internals (break when refactoring)
+- Abstractions with only one concrete use
+- Error messages that don't identify what went wrong
+- Catch-all error handlers that swallow context
+- Touching `reconcile_external_git_completions` or its call sites — this change is additive only
+- Bare `task-mgr init --from-json` (wipes status fields); use `task-mgr loop init --append --update-existing` for any mid-loop JSON sync
+
+---
+
+## Global Acceptance Criteria
+
+These apply to **every** implementation task — the task-level `acceptanceCriteria` returned by `task-mgr next` are layered on top. If any of these fails, the task is not done.
+
+- Rust: No warnings in `cargo check` output
+- Rust: No warnings in `cargo clippy -- -D warnings` output
+- Rust: All scoped tests pass with `cargo test -p task-mgr <module>` (REVIEW-001 runs the full suite)
+- Rust: `cargo fmt --check` passes
+- No public-API breaking changes — `MergeOutcomes.pre_merge_head` is additive (`Option<String>`, defaulted via `#[derive(Default)]`)
+- No new abstractions; reuse `contains_task_id`, `prefix_and`, `complete_cmd::complete`, `update_prd_task_passes`, `rev_parse_head`
+
+---
+
+## Task Files + CLI (IMPORTANT — context economy)
+
+**Never read or edit `tasks/*.json` directly.** Loading the JSON wastes context and editing corrupts loop-engine state. Everything the agent needs about a task is returned by `task-mgr next`; everything global (Priority Philosophy, Prohibited Outcomes, Global Acceptance Criteria, Key Learnings, CLAUDE.md Excerpts, Data Flow Contracts, Key Context) is already embedded in **this prompt file** — that is the authoritative copy. If something here looks inconsistent with the JSON, trust this file and surface the discrepancy.
+
+### Getting your task prefix
+
+The `taskPrefix` is auto-generated by `task-mgr init` and written into the JSON. Fetch it once at the start of an iteration (don't hardcode it):
+
+```bash
+PREFIX=$(jq -r '.taskPrefix' tasks/post-merge-slot-reconcile.json)
+```
+
+Use `$PREFIX` in every CLI call below so you stay scoped to this task list.
+
+### Commands you'll actually run
+
+| Need                                    | Command                                                                                                                                                                           |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pick + claim the next eligible task     | `task-mgr next --prefix $PREFIX --claim`                                                                                                                                          |
+| Inspect one task (full acceptance etc.) | `task-mgr show $PREFIX-TASK-ID`                                                                                                                                                   |
+| List remaining tasks (debug only)       | `task-mgr list --prefix $PREFIX --status todo`                                                                                                                                    |
+| Recall learnings relevant to a task     | `task-mgr recall --for-task $PREFIX-TASK-ID` (also: `--query <text>`, `--tag <tag>`)                                                                                              |
+| Add a follow-up task (review spawns)    | `echo '{...}' \| task-mgr add --stdin --depended-on-by REVIEW-001` — priority auto-computed; DB + PRD JSON updated atomically                                                    |
+| Mark status                             | Emit `<task-status>$PREFIX-TASK-ID:done</task-status>` (statuses: `done`, `failed`, `skipped`, `irrelevant`, `blocked`) — loop engine routes through `task-mgr` and syncs the JSON |
+
+### Files you DO touch
+
+| File                                                  | Purpose                                                                |
+| ----------------------------------------------------- | ---------------------------------------------------------------------- |
+| `tasks/post-merge-slot-reconcile-prompt.md`           | This prompt file (read-only)                                           |
+| `tasks/progress-$PREFIX.txt`                          | Progress log — **tail** for recent context, **append** after each task |
+
+**Reading progress** — sections are separated by `---` lines and each starts with `## <Date> - <TASK-ID>`. Never Read the whole log; it grows every iteration. Two targeted patterns cover every case:
+
+```bash
+# Most recent section only (default recency check)
+tac tasks/progress-$PREFIX.txt 2>/dev/null | awk '/^---$/{exit} {print}' | tac
+
+# Specific prior task (e.g. a synergy task you're building on, or a dependsOn task)
+grep -n -A 40 '## .* - <TASK-ID>' tasks/progress-$PREFIX.txt
+```
+
+Skip the read entirely on the first iteration (file won't exist). Before appending, create it with a minimal header if missing; never crash on absent files.
+
+---
+
+## Your Task (every iteration)
+
+Optimize for context economy: pull only what's needed, don't dump whole files.
+
+1. **Resolve prefix and claim the next task**:
+   ```bash
+   PREFIX=$(jq -r '.taskPrefix' tasks/post-merge-slot-reconcile.json)
+   task-mgr next --prefix $PREFIX --claim
+   ```
+   The output includes `id`, `title`, `description`, `acceptanceCriteria`, `qualityDimensions`, `edgeCases`, `touchesFiles`, `dependsOn`, `branchName`, and `notes` — everything you need. If it reports no eligible task or unmet cross-PRD `requires`, output `<promise>BLOCKED</promise>` with the printed reason and stop.
+
+2. **Pull only the progress context you need** — most iterations want just the most recent section (the `tac | awk | tac` command above). If `task-mgr next` listed a `dependsOn` task whose rationale you need, grep that specific task's block instead of reading the whole log. Skip entirely on the first iteration.
+
+3. **Recall focused learnings** — `task-mgr recall --for-task <TASK-ID>` returns the learnings scored highest for this specific task. That's the ONLY way to reach `tasks/long-term-learnings.md` / `tasks/learnings.md` content — **do not** Read those files directly; they grow unboundedly.
+
+   **Never Read `CLAUDE.md` in full.** If the task description references a specific section, or the task touches a file that's likely documented there, `grep` for the relevant term and read only the surrounding lines:
+   ```bash
+   grep -n -A 10 '<keyword or header>' CLAUDE.md src/loop_engine/CLAUDE.md
+   ```
+   The authoritative per-task rules (Priority Philosophy, Prohibited Outcomes, Data Flow Contracts, Key Context, and the CLAUDE.md excerpts that matter here) are already embedded in **this prompt file**. Prefer it over re-reading source docs.
+
+4. **Verify branch** — `git branch --show-current` matches the `branchName` task-mgr printed (`feat/post-merge-slot-reconcile`). Switch if wrong.
+
+5. **Think before coding** (in context, not on disk):
+   - State assumptions to yourself.
+   - For each `edgeCases` / `failureModes` entry, note how it'll be handled.
+   - Cross-module data access → consult the **Data Flow Contracts** section or grep 2-3 existing call sites. Never guess key types from variable names.
+   - Pick an approach. Only survey alternatives when `estimatedEffort: "high"` OR `modifiesBehavior: true` — one rejected alternative with a one-line reason is enough. For normal tasks: pick and go.
+
+6. **Implement** — single task, code and tests in one coherent change.
+
+7. **Run the scoped quality gate** (see Quality Checks below — scoped tests only, NOT the full suite). Fix failures before committing; never commit broken code.
+
+8. **Commit**: `feat: <TASK-ID>-completed - [Title]` (or `refactor:`/`fix:`/`test:` as appropriate).
+
+9. **Emit status**: `<task-status><TASK-ID>:done</task-status>` — the loop engine flips `passes` and syncs the PRD JSON. Do NOT edit the JSON.
+
+10. **Append progress** — ONE post-implementation block, using the format below, terminated with `---` so the next iteration's tail works.
+
+---
+
+## Task Selection (reference)
+
+`task-mgr next --prefix $PREFIX --claim` already picks: eligible tasks (`passes: false`, deps complete), preferring file-overlap with the previous task's `touchesFiles`, then lowest priority. You don't pick — you claim what it returns.
+
+---
+
+## Behavior Modification Protocol (only when `modifiesBehavior: true`)
+
+When a task declares `modifiesBehavior: true`:
+
+1. Read the specific callers/consumers named in the task description.
+2. Decide per-caller: `OK` (proceed), `BREAKS` (split the task into per-context subtasks via `task-mgr add --stdin`, then `task-mgr skip` the original with reason "split into …"), or `NEEDS_REVIEW` (verify manually before implementing).
+3. If multiple call sites need different handling, split rather than shoehorn.
+
+**FEAT-003 caller impact** — the only task in this list with `modifiesBehavior: true`. The behavior change is strictly additive: `WaveOutcome.tasks_completed` can only go up by the count of newly-reconciled IDs. Callers consuming the counter (the four terminal returns in `run_wave_iteration` at `engine.rs:1891/1904/1918/1937` and downstream `run_loop` accounting) cannot fail in a new way because the reconcile function never errors — it just returns `Vec<String>` (possibly empty). Verdict: **OK across all callers**, no split needed.
+
+---
+
+## Quality Checks
+
+The full test suite is expensive. Per-iteration tasks run a **scoped** gate; **REVIEW-001** runs the full gate and must leave the repo fully green (including pre-existing failures).
+
+### Per-iteration scoped gate (FEAT / FIX / REFACTOR-FIX tasks)
+
+Format → type-check → lint → **scoped tests for touched files** → pre-commit hooks. Fix every failure before committing.
+
+```bash
+# Rust — scope tests to the touched crate/module
+cargo fmt --check 2>&1 | tee /tmp/fmt.txt | tail -5
+cargo check 2>&1 | tee /tmp/check.txt | tail -5
+cargo clippy --tests -- -D warnings 2>&1 | tee /tmp/clippy.txt | tail -10 && grep "^error" /tmp/clippy.txt | head -10
+# Module-scoped test (use the file you touched; examples below)
+cargo test --lib loop_engine::git_reconcile 2>&1 | tee /tmp/test.txt | tail -10 && grep "FAILED\|error\[" /tmp/test.txt | head -10
+cargo test --lib loop_engine::worktree 2>&1 | tee /tmp/test.txt | tail -10 && grep "FAILED\|error\[" /tmp/test.txt | head -10
+cargo test --lib loop_engine::engine 2>&1 | tee /tmp/test.txt | tail -10 && grep "FAILED\|error\[" /tmp/test.txt | head -10
+```
+
+Scoping heuristic: start from `touchesFiles`. For this PRD, each task touches one file at a time; scope tests to that file's module.
+
+**Do NOT** run the entire workspace test suite (`cargo test` with no filter) during regular iterations — that's REVIEW-001's job.
+
+### Full gate (REFACTOR-001 / REVIEW-001)
+
+These tasks run the **full, unscoped** suite on a clean checkout and must finish green:
+
+```bash
+cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test 2>&1 | tee /tmp/full-test.txt | tail -15 && grep "FAILED\|error\[" /tmp/full-test.txt | head -20
+```
+
+If ANY test fails — including pre-existing failures that predate this change — REVIEW-001 fixes them. Default: **attempt every failure**, even ones that look out-of-scope. Trunk-green is the invariant this mechanism exists to protect.
+
+Pragmatic escape hatch: if there are **more than ~12 failures AND they're all clearly unrelated to this work**, triage:
+
+1. Fix everything attributable to this change's diff, inline in the REVIEW-001 commit.
+2. For the remaining unrelated failures: spawn a single `FIX-xxx` task via `task-mgr add --stdin --depended-on-by REVIEW-001` listing the failing test names + error summaries, and `<promise>BLOCKED</promise>` with that task ID so a human can route ownership.
+
+Below the ~12-failure threshold, just fix them.
+
+---
+
+## Common Wiring Failures (REVIEW-001 reference)
+
+New code must be reachable from production — REVIEW-001 verifies. Most common misses:
+
+- Not registered in dispatcher/router → add to registration
+- Test mocks bypass real wiring → verify production path separately
+- Config field read but not passed through → wire through
+- Unused-import warning on new code → call sites missing
+- Wrong key type on map access — struct keys ≠ JSONB keys → check Data Flow Contracts
+- New CLI subcommand / DB column / JSON field defined but not threaded into the dispatcher / `TryFrom<Row>` / parse-to-task mapping
+
+**For this PRD specifically**: REVIEW-001 should grep that `reconcile_merged_slot_completions` is referenced from `engine.rs`, that `MergeOutcomes.pre_merge_head` is set in `worktree.rs` AND consumed in `engine.rs`, and that the stale rustdoc at `engine.rs:1282-1285` no longer claims a non-existent reconcile.
+
+---
+
+## Review Tasks
+
+REFACTOR-001 and REVIEW-001 spawn follow-up tasks for each issue found. The loop re-reads state every iteration, so spawned tasks are picked up automatically.
+
+### What each review looks for
+
+| Review         | Priority | Spawns (priority)                  | Focus                                                                                                                         |
+| -------------- | -------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| REFACTOR-001   | 98       | `REFACTOR-FIX-xxx` (50-97)         | DRY, complexity, coupling, clarity, pattern adherence with `reconcile_external_git_completions`                               |
+| REVIEW-001     | 99       | `FIX-xxx` / `WIRE-FIX-xxx` (50-97) | Language idioms, security, error handling, no `unwrap()`, `qualityDimensions` met, wiring reachable, full-suite green, CLAUDE.md updated, `task-mgr learn` recorded, manual reproduction succeeded |
+
+Use the **rust-python-code-reviewer** when reviewing code. Document findings in the progress file. If a specific prior iteration produced something ugly and you don't want to wait for REFACTOR-001, invoke `/simplify` on that touchpoint directly.
+
+### Spawning follow-up tasks
+
+```sh
+echo '{
+  "id": "FIX-001",
+  "title": "Fix: <specific issue>",
+  "description": "From REVIEW-001: <details>",
+  "rootCause": "<file:line + issue>",
+  "exactFix": "<specific change>",
+  "verifyCommand": "<shell command that proves the fix>",
+  "acceptanceCriteria": ["Issue resolved", "No new warnings"],
+  "priority": 60,
+  "touchesFiles": ["affected/file.rs"]
+}' | task-mgr add --stdin --depended-on-by REVIEW-001
+```
+
+`--depended-on-by` wires the new task into REVIEW-001's `dependsOn` AND syncs the PRD JSON atomically — don't edit the JSON yourself. Commit with `chore: <REVIEW-ID> - Add <FIX|REFACTOR> tasks`, then emit `<task-status><REVIEW-ID>:done</task-status>`. If no issues found, emit the status with a one-line "No issues found" in the progress file.
+
+---
+
+## Progress Report Format
+
+APPEND a block to `tasks/progress-$PREFIX.txt` (create with a one-line header if missing). Keep it **tight** — future iterations tail this; verbosity here bloats every later context.
+
+```
+## [YYYY-MM-DD HH:MM] - [TASK-ID]
+Approach: [one sentence — what you chose and why]
+Files: [comma-separated paths touched]
+Learnings: [1-3 bullets, one line each]
+---
+```
+
+Target: ~10 lines per block. If your entry is longer than ~25 lines, compress it — a future iteration has to read this.
+
+---
+
+## Learnings Guidelines
+
+Learnings live in `tasks/long-term-learnings.md` (curated) and `tasks/learnings.md` (raw, auto-appended). **Do not Read those files directly** during a loop iteration — they grow unboundedly. Instead:
+
+- `task-mgr recall --for-task <TASK-ID>` — indexed retrieval of learnings scored for this task
+- `task-mgr recall --query "<keywords>"` / `--tag <tag>` — targeted queries when recall is sparse
+
+Record your own learnings with `task-mgr learn` so they're indexed for future recall. Don't append directly to those files.
+
+**Write concise learnings** (1-2 lines each).
+
+---
+
+## Stop and Blocked Conditions
+
+### Stop Condition
+
+Before outputting `<promise>COMPLETE</promise>`:
+
+1. Verify ALL tasks have `passes: true`
+2. Verify no new tasks were created in final review
+3. Verify REVIEW-001 passed with full suite green AND CLAUDE.md updated AND `task-mgr learn` recorded
+
+If verified:
+
+```
+<promise>COMPLETE</promise>
+```
+
+### Blocked Condition
+
+If blocked (missing dependencies, unclear requirements):
+
+1. Document blocker in the progress file
+2. Create clarification task via `echo '{...}' | task-mgr add --stdin --depended-on-by <blocked-task>` (priority 0)
+3. Output:
+
+```
+<promise>BLOCKED</promise>
+```
+
+---
+
+## Key Learnings (from task-mgr recall)
+
+These are pre-distilled learnings relevant to this task list. Treat them as authoritative — do NOT Read `tasks/long-term-learnings.md` or `tasks/learnings.md` unless a task explicitly needs a learning that isn't here (then use `task-mgr recall --query <text>`, not a full Read).
+
+- **[1914]** Task DB vs git history can desync when a prior iteration committed but didn't sync the DB — THIS IS THE EXACT BUG this PRD fixes. The work was committed; the DB row stayed `in_progress` until the next loop's agent rediscovered from `git log` that the work was already merged.
+- **[2289]** `mark_task_done` (`prd_reconcile.rs:192`) consolidates the pattern "complete in DB → prune `crashed_last_iteration` → update PRD". The existing `reconcile_external_git_completions` deliberately does NOT use it — it calls `complete_cmd::complete` + `update_prd_task_passes` directly and does not prune crash state. Mirror that precedent in `reconcile_merged_slot_completions` unless REVIEW-001 finds a reason to consolidate.
+- **[2641]** `git commit --allow-empty` is the right way to create test commits without staging files — use it for test fixture setup in FEAT-001 and FEAT-002 tests.
+- **[2788]** Slot 0 reuses the loop's branch directly; slots 1+ create ephemeral branches named `{branch}-slot-N`. `slot_worktree_paths[0]` IS the loop's primary working tree.
+- **[2789]** Production code never creates a `{branch}-slot-0` ref — there's a hardcoded guard in `classify_ephemeral_branch` rejecting slot==0. This invariant matters when reasoning about which branches the new reconcile sees.
+- **[2852]** Wave mode's post-Claude post-processing now shares the same pipeline as sequential mode (`iteration_pipeline::process_iteration_output`). The new post-merge reconcile sits OUTSIDE that shared pipeline — it's at the wave boundary in `run_wave_iteration`, not the per-slot post-Claude boundary.
+- **[2728]** `ctx.crashed_last_iteration` is a HashMap bounded by active task count. The new reconcile deliberately does NOT prune it (mirrors `reconcile_external_git_completions`); only the `<task-status>` tag dispatch path touches it.
+- **[866]** This change follows the "three-file coordinated change: helper, consumer, caller" pattern — FEAT-001=helper (worktree.rs), FEAT-002=consumer (git_reconcile.rs), FEAT-003=caller (engine.rs). Land them in this order so each commit compiles + tests cleanly.
+- **[2010]** Tests for merge mechanics use real git worktrees as standard setup (not mocks). The harness in `test_utils::setup_git_repo` provides `git init -b main` + user config + README.md + initial commit; layer on top with `git_commit` helpers.
+
+---
+
+## CLAUDE.md Excerpts (only what applies to this change)
+
+These bullets were extracted from `CLAUDE.md` and `src/loop_engine/CLAUDE.md` for the subsystems this change touches. They're the only CLAUDE.md content you need for iteration work — do NOT Read the full file.
+
+**Autonomous Loop Mode Override (from `~/.claude/CLAUDE.md` §0):**
+- Do NOT ask clarifying questions — output `<promise>BLOCKED</promise>` instead.
+- Skip waypoints and planning phases — implement directly per the prompt file.
+- Do NOT invoke sub-agents for plan review — the prompt file IS the plan.
+- Prefer `task-mgr` CLI over reading task JSON files directly.
+
+**task-mgr workflow patterns (from `~/.claude/CLAUDE.md` §3a):**
+- Never run bare `task-mgr init --from-json <prd>.json` — wipes `status` / `started_at` / `completed_at`. The loop engine handles re-syncs; you don't run it manually mid-task.
+- Mid-loop status update: emit `<task-status>$PREFIX-TASK-ID:done</task-status>` — do NOT edit the JSON.
+- Pipe test/clippy output through `tee` + tail+grep in ONE command (never re-run to see the tail).
+
+**Slot path threading (from `src/loop_engine/CLAUDE.md`):**
+- `merge_slot_branches_with_resolver` uses `slot_paths[0]` (NOT `compute_slot_worktree_path(_, _, 0)`) for slot 0 — the recomputation diverges when the loop runs from inside the matching worktree. Engine threads paths via `WaveParams::slot_worktree_paths`.
+- The slot-0 SAFETY GUARD in `classify_ephemeral_branch` rejects slot==0 — never broaden the glob without that rejection at the same boundary.
+
+**Iteration pipeline (shared) — out of scope (from `src/loop_engine/CLAUDE.md`):**
+- Wrapper-commit, external-git reconciliation, human-review trigger, rate-limit waits, pause-signal handling, slot merge resolution — kept at the call sites, NOT in `iteration_pipeline.rs`.
+- Per the plan, this PRD adds **post-merge-back slot completion reconciliation** to that "out of scope" list. REVIEW-001 updates the bullet.
+
+**Slot merge-back conflict resolution (from `src/loop_engine/CLAUDE.md`):**
+- `merge_slot_branches_with_resolver` runs `git merge --no-edit` from slot 0 for each ephemeral slot branch. On conflict, `ClaudeMergeResolver` spawns in slot 0's worktree. The resolver's `Resolved` claim is NEVER trusted — caller re-inspects `MERGE_HEAD` and `HEAD` post-spawn.
+- This is why FEAT-002 uses `--no-merges` on its git log: resolver merge commits CAN carry merged-in commit bodies via `git commit --no-edit`, and would otherwise allow a resolver commit on slot A's merge to mark slot B's task done.
+
+**Touchpoints table (from `src/loop_engine/CLAUDE.md`):**
+
+| Concern                            | File                                                      | Symbol                              |
+| ---------------------------------- | --------------------------------------------------------- | ----------------------------------- |
+| Slot path threading                | `src/loop_engine/worktree.rs`                             | `merge_slot_branches_with_resolver` |
+| Merge resolver                     | `src/loop_engine/merge_resolver.rs`                       | `ClaudeMergeResolver`               |
+| Shared post-Claude pipeline        | `src/loop_engine/iteration_pipeline.rs`                   | `process_iteration_output`          |
+| (NEW after REVIEW-001) Post-merge slot reconcile | `src/loop_engine/git_reconcile.rs`            | `reconcile_merged_slot_completions` |
+
+---
+
+## Data Flow Contracts
+
+These are **verified access patterns** for cross-module data structures. Use these exactly — do NOT guess key types from variable names or comments.
+
+### Contract 1: `MergeOutcomes` → `run_wave_iteration` consumer
+
+**Source struct** (`src/loop_engine/worktree.rs:1595`, after FEAT-001):
+
+```rust
+#[derive(Debug, Default)]
+pub(crate) struct MergeOutcomes {
+    pub merged_slots: Vec<usize>,
+    pub failed_slots: Vec<(usize, String, SlotFailureKind)>,
+    pub pre_merge_head: Option<String>,  // NEW in FEAT-001
+}
+```
+
+**Producer**: `merge_slot_branches_with_resolver` (`worktree.rs:1846`). The new line sits immediately after `let slot0_path = &slot_paths[0];` at line 1875:
+
+```rust
+outcomes.pre_merge_head = rev_parse_head(slot0_path).ok();
+```
+
+**Consumer call site** (`src/loop_engine/engine.rs:~1857`, after FEAT-003):
+
+```rust
+let outcomes = worktree::merge_slot_branches_with_resolver(...);  // line 1810
+// existing iteration borrow at line 1819: `for (slot, detail, kind) in &outcomes.failed_slots`
+// — that borrow ends at the for-loop close (~line 1844)
+// outcomes is fully available below.
+
+if let (Some(ref pre), Some(slot0)) = (
+    outcomes.pre_merge_head.as_ref(),
+    params.slot_worktree_paths.first(),
+) {
+    let reconciled = git_reconcile::reconcile_merged_slot_completions(
+        slot0,
+        pre,
+        params.conn,
+        params.run_id,
+        params.prd_path,
+        params.task_prefix,
+    );
+    if !reconciled.is_empty() {
+        agg.tasks_completed += reconciled.len() as u32;
+        agg.any_completed = true;
+        ctx.crash_tracker.record_success();
+        ctx.pending_slot_tasks
+            .retain(|t| !reconciled.contains(t));
+        eprintln!("Post-merge slot reconcile: marked {} task(s) done", reconciled.len());
+    }
+}
+```
+
+**Key types**: `outcomes.pre_merge_head` is `Option<String>`; `params.slot_worktree_paths` is `&[PathBuf]`; `reconciled` is `Vec<String>`. The `as_ref()` on the Option preserves the borrow so `pre` is `&String`.
+
+**Borrow note**: `outcomes` is referenced (not moved) at line 1819 via the `for` loop. That borrow ends at the for-loop close. Confirm at edit time that `outcomes` is still in scope at the new block — it should be.
+
+### Contract 2: `params.task_prefix` flows through prefix-scoped SQL
+
+**Source field**: `WaveIterationParams::task_prefix: Option<&'a str>` (`engine.rs:878`).
+
+**Consumer**: `prefix_and(task_prefix)` in `db/prefix.rs:94`:
+
+```rust
+let (pfx_clause, pfx_param) = prefix_and(task_prefix);
+// pfx_clause: String — either "" or "AND id LIKE ? ESCAPE '\\'"
+// pfx_param:  Option<String> — either None or Some("PREFIX-%")
+let sql = format!(
+    "SELECT id FROM tasks WHERE status NOT IN ('done', 'irrelevant') \
+     AND archived_at IS NULL {pfx_clause}"
+);
+let params: Vec<&dyn rusqlite::types::ToSql> = match &pfx_param {
+    Some(p) => vec![p],
+    None => vec![],
+};
+```
+
+**Key type transition**: `Option<&str>` → `(String, Option<String>)`. The SQL clause is interpolated as a string; the parameter is bound via the SQLite param array. Never concatenate the prefix into the SQL directly — always go through `prefix_and`.
+
+---
+
+## Important Rules
+
+- Work on **ONE task per iteration**
+- **Commit frequently** after each passing task
+- **Keep CI green** — never commit failing code
+- **Read before writing** — always read files first
+- **Minimal changes** — only implement what's required
+- Work on the correct branch: **feat/post-merge-slot-reconcile**
+- The three FEAT tasks form a strict dependency chain: FEAT-001 → FEAT-002 → FEAT-003. Don't try to land them in parallel.
+- `reconcile_external_git_completions` and its call sites are **off-limits**. This change is additive only.
+- The `--no-merges` flag in FEAT-002's git log is load-bearing. Don't drop it for "simplicity" — it's the only thing keeping resolver merge commits from poisoning the reconcile.

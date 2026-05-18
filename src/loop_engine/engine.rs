@@ -45,7 +45,8 @@ use crate::loop_engine::detection;
 use crate::loop_engine::display;
 use crate::loop_engine::env;
 use crate::loop_engine::git_reconcile::{
-    check_git_for_task_completion, reconcile_external_git_completions, wrapper_commit,
+    check_git_for_task_completion, reconcile_external_git_completions,
+    reconcile_merged_slot_completions, wrapper_commit,
 };
 use crate::loop_engine::guidance::SessionGuidance;
 use crate::loop_engine::iteration_pipeline;
@@ -1379,9 +1380,11 @@ fn build_slot_prompt_params<'a>(
 /// ladder (status-tag → completed-tag → output-scan → already-complete
 /// fallback), learning extraction, and bandit feedback — runs inside
 /// `iteration_pipeline::process_iteration_output`. `skip_git_completion_detection`
-/// is `true` because slot commits live on an unmerged ephemeral branch; git
-/// reconciliation happens once at the `run_wave_iteration` boundary after the
-/// merge-back step.
+/// is `true` because slot commits live on an unmerged ephemeral branch; the
+/// post-merge reconcile at the `run_wave_iteration` boundary
+/// (`reconcile_merged_slot_completions` over the `{pre_merge_head}..HEAD`
+/// range on slot 0) catches `<TASK-ID>-completed` markers from agents whose
+/// subprocess exited before flushing the `<completed>` tag.
 ///
 /// Slot-specific bookkeeping stays here: pending-slot-task accounting, the
 /// `agg.all_crashed` invariant, reorder hint queueing (with `[slot N]` log
@@ -1746,6 +1749,55 @@ fn read_prd_implicit_overlap_files(prd_path: &Path) -> Vec<String> {
     prd.implicit_overlap_files.unwrap_or_default()
 }
 
+/// FEAT-003 post-merge reconcile step. Scans slot 0's `{pre_merge_head}..HEAD`
+/// for `<TASK-ID>-completed` markers and, on a non-empty result, mirrors the
+/// agg/ctx mutations the sequential completion ladder performs:
+///   - bump `agg.tasks_completed` by the reconciled count,
+///   - flip `agg.any_completed`,
+///   - record success on the crash tracker (FEAT-010 parity with the
+///     `any_completed` branch in `run_wave_iteration`),
+///   - drain reconciled IDs from `ctx.pending_slot_tasks` so step 17.6's
+///     loop-exit reset doesn't flip the row back to `todo`,
+///   - emit a one-line stderr summary for the operator.
+///
+/// Called from `run_wave_iteration` BEFORE `run_cmd::update` and BEFORE the
+/// external-git `let mut tasks_completed = agg.tasks_completed;` shadow so
+/// the terminal returns observe the bumped counter. The reconcile function
+/// itself never errors — failures (git, DB, PRD I/O) are absorbed there and
+/// surface as an empty Vec, so this caller has no failure path.
+#[allow(clippy::too_many_arguments)]
+fn apply_post_merge_reconcile(
+    slot0_path: &Path,
+    pre_merge_head: &str,
+    conn: &mut Connection,
+    run_id: &str,
+    prd_path: &Path,
+    task_prefix: Option<&str>,
+    ctx: &mut IterationContext,
+    agg: &mut WaveAggregator,
+) {
+    let reconciled = reconcile_merged_slot_completions(
+        slot0_path,
+        pre_merge_head,
+        conn,
+        run_id,
+        prd_path,
+        task_prefix,
+    );
+    if reconciled.is_empty() {
+        return;
+    }
+    agg.tasks_completed += reconciled.len() as u32;
+    agg.any_completed = true;
+    ctx.crash_tracker.record_success();
+    ctx.pending_slot_tasks.retain(|t| !reconciled.contains(t));
+    eprintln!(
+        "Post-merge reconcile: marked {} task(s) done from merged commits ({})",
+        reconciled.len(),
+        reconciled.join(", ")
+    );
+}
+
 /// Wave-mode equivalent of `run_iteration` for the parallel execution path.
 ///
 /// Pre-wave: signal/stop checks, crash backoff, parallel group selection,
@@ -2021,6 +2073,30 @@ pub fn run_wave_iteration(
             &branch::progress_file_name(params.task_prefix),
         ) {
             eprintln!("Warning: failed to union slot progress files: {}", e);
+        }
+
+        // FEAT-003: post-merge reconcile. Scan slot 0's `{pre..HEAD}` for
+        // `<TASK-ID>-completed` markers from slot agents whose subprocess
+        // exited before flushing `<completed>` (output drop, watchdog kill,
+        // deadline). Must run BEFORE `run_cmd::update` AND BEFORE the
+        // external-git `tasks_completed` shadow below — otherwise the shadow
+        // captures a stale agg and the terminal returns report the wrong
+        // counter. Single-threaded within the loop, so the `retain` on
+        // `pending_slot_tasks` cannot race another wave.
+        if let (Some(pre), Some(slot0)) = (
+            outcomes.pre_merge_head.as_deref(),
+            params.slot_worktree_paths.first(),
+        ) {
+            apply_post_merge_reconcile(
+                slot0,
+                pre,
+                params.conn,
+                params.run_id,
+                params.prd_path,
+                params.task_prefix,
+                ctx,
+                &mut agg,
+            );
         }
     }
 
@@ -9301,6 +9377,160 @@ mod tests {
             crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
             "todo",
             "AC: halted run must NOT leave any task in `in_progress` for the failed slots"
+        );
+    }
+
+    // --- FEAT-003: post-merge reconcile wiring tests ---
+
+    /// AC: drive the wave path's post-merge reconcile step with FEAT-001 in
+    /// the merged-back range. Expect pending_slot_tasks drained of FEAT-001
+    /// only (FEAT-002 retained), agg.tasks_completed bumped by 1, and
+    /// agg.any_completed flipped to true. Pins the contract that the four
+    /// terminal returns in `run_wave_iteration` (which read either
+    /// `agg.tasks_completed` directly or the `let mut tasks_completed =
+    /// agg.tasks_completed` shadow created BEFORE the external-git block)
+    /// see the reconciled count — i.e. the reconcile call sits BEFORE the
+    /// shadow, not after.
+    #[test]
+    fn test_post_merge_reconcile_drains_pending_and_bumps_agg() {
+        use std::process::Command;
+
+        let (_db_tmp, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, status, priority) VALUES
+             ('FEAT-001', 'Feat one', 'in_progress', 1),
+             ('FEAT-002', 'Feat two', 'in_progress', 1);",
+        )
+        .unwrap();
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
+
+        // Slot 0 worktree with a commit whose body carries FEAT-001's
+        // completion marker — the realistic "agent merged-back but never
+        // flushed <completed>" shape.
+        let repo = crate::loop_engine::test_utils::setup_git_repo();
+        let pre_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("rev-parse HEAD");
+        let pre = String::from_utf8_lossy(&pre_out.stdout).trim().to_string();
+        let msg = "feat: implement thing\n\nfeat: FEAT-001-completed - Implement feature";
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", msg])
+            .current_dir(repo.path())
+            .output()
+            .expect("create marker commit");
+
+        let prd_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = prd_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"test","userStories":[
+                {"id":"FEAT-001","title":"Feat one","passes":false,"priority":1},
+                {"id":"FEAT-002","title":"Feat two","passes":false,"priority":1}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        ctx.pending_slot_tasks.push("FEAT-002".to_string());
+
+        let mut agg = WaveAggregator::new(2);
+        let before_completed = agg.tasks_completed;
+
+        apply_post_merge_reconcile(
+            repo.path(),
+            &pre,
+            &mut conn,
+            "run-1",
+            &prd_path,
+            None,
+            &mut ctx,
+            &mut agg,
+        );
+
+        assert_eq!(
+            ctx.pending_slot_tasks,
+            vec!["FEAT-002".to_string()],
+            "FEAT-001 must be drained; FEAT-002 retained"
+        );
+        assert_eq!(
+            agg.tasks_completed,
+            before_completed + 1,
+            "agg.tasks_completed must reflect the one reconciled task so terminal returns report it"
+        );
+        assert!(
+            agg.any_completed,
+            "agg.any_completed must flip so the all-tasks-done terminal can fire"
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "done",
+            "the underlying reconcile must have marked FEAT-001 done"
+        );
+    }
+
+    /// AC negative: empty reconciled Vec leaves agg, ctx, and DB untouched.
+    /// Mirrors the "no marker in {pre..HEAD}" production path — the helper
+    /// must not eat the crash-tracker success budget or drain unrelated
+    /// pending slot tasks on a no-op call.
+    #[test]
+    fn test_post_merge_reconcile_no_match_is_noop() {
+        use std::process::Command;
+
+        let (_db_tmp, mut conn) = crate::loop_engine::test_utils::setup_test_db();
+        insert_in_progress_task(&conn, "FEAT-001");
+        crate::loop_engine::test_utils::insert_run(&conn, "run-1");
+
+        let repo = crate::loop_engine::test_utils::setup_git_repo();
+        let pre_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .expect("rev-parse HEAD");
+        let pre = String::from_utf8_lossy(&pre_out.stdout).trim().to_string();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "chore: unrelated"])
+            .current_dir(repo.path())
+            .output()
+            .expect("create commit");
+
+        let prd_dir = tempfile::TempDir::new().unwrap();
+        let prd_path = prd_dir.path().join("prd.json");
+        std::fs::write(
+            &prd_path,
+            r#"{"project":"test","userStories":[
+                {"id":"FEAT-001","title":"Feat one","passes":false,"priority":1}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut ctx = IterationContext::new(5);
+        ctx.pending_slot_tasks.push("FEAT-001".to_string());
+        let mut agg = WaveAggregator::new(1);
+
+        apply_post_merge_reconcile(
+            repo.path(),
+            &pre,
+            &mut conn,
+            "run-1",
+            &prd_path,
+            None,
+            &mut ctx,
+            &mut agg,
+        );
+
+        assert_eq!(agg.tasks_completed, 0);
+        assert!(!agg.any_completed);
+        assert_eq!(
+            ctx.pending_slot_tasks,
+            vec!["FEAT-001".to_string()],
+            "no drain on no-match"
+        );
+        assert_eq!(
+            crate::loop_engine::test_utils::get_task_status(&conn, "FEAT-001"),
+            "in_progress"
         );
     }
 }
