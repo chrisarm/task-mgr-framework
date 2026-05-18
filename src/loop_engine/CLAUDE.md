@@ -74,7 +74,7 @@ the inner — never via the outer.
 ## Overflow recovery and diagnostics
 
 When the Claude CLI subprocess returns "Prompt is too long", the loop engine
-walks a **four-rung recovery ladder** and writes a diagnostics bundle. Entry
+walks a **five-rung recovery ladder** and writes a diagnostics bundle. Entry
 point: `overflow::handle_prompt_too_long` in `src/loop_engine/overflow.rs`,
 called from the `PromptTooLong` arm of `run_iteration` in
 `src/loop_engine/engine.rs`.
@@ -88,10 +88,47 @@ called from the `PromptTooLong` arm of `run_iteration` in
    (`haiku → sonnet`, `sonnet → opus`). Closes the Sonnet-default gap that
    used to immediately block the loop on iteration 1.
 3. **Escalate to 1M-context Opus** — `model::to_1m_model` (`opus → opus[1m]`).
-4. **Block** — task status set to `blocked`; no further recovery attempts.
+4. **Fall back to provider (`FallbackToProvider`)** — fires only when
+   `project_config.fallback_runner` is `Some(cfg)` with `cfg.enabled = true`
+   AND the effective runner is still `RunnerKind::Claude`. Promotes the task
+   to the fallback provider (Grok today) by writing `cfg.model` to the
+   `tasks.model` DB column AND inserting matching entries into
+   `ctx.runner_overrides` / `ctx.model_overrides`. Idempotency guard: a task
+   already on Grok skips this rung and falls through to rung 5. The DB UPDATE
+   AND the override-map inserts MUST run together — otherwise
+   `resolve_task_model` on the next iteration silently shadows the override.
+5. **Block** — task status set to `blocked`; no further recovery attempts.
 
-Rungs 1-3 reset the task status to `todo` (and clear `started_at`) so the next
-iteration retries with the override applied; rung 4 sets `blocked`.
+Rungs 1-4 reset the task status to `todo` (and clear `started_at`) so the next
+iteration retries with the override applied; rung 5 sets `blocked`. Behavior
+is byte-identical to the pre-Grok 4-rung ladder when `fallbackRunner` is
+absent or `enabled: false` — rung 4 is unreachable in that configuration and
+the path collapses to rungs 1-3 → blocked.
+
+**Operator escape valve — `check_override_invalidation`**: at the top of
+every iteration (before `resolve_effective_runner`),
+`engine::check_override_invalidation` compares the current `tasks.model` DB
+value against `ctx.overflow_original_task_model[task_id]` (the snapshot
+captured at first overflow / RuntimeError fallback). When they diverge — i.e.
+an operator edited `tasks.model` out-of-band — all six per-task auto-recovery
+channels are cleared in one shot: `effort_overrides`, `model_overrides`,
+`overflow_recovered`, `overflow_original_model`, `runner_overrides`,
+`overflow_original_task_model`. A single stderr line announces the clear so
+the operator sees the escape valve fired. Short-circuits for any task that
+never triggered the ladder (the dominant case is free).
+
+**Provider routing — `model::provider_for_model`**: classifies a model id as
+`Provider::Claude` or `Provider::Grok` via **token equality on `-` splits of
+the lowercased id**, returning `Provider::Grok` iff *some token is exactly*
+`"grok"`. Substring matching (`.contains("grok")`) is explicitly prohibited
+because it would mis-route Groq Inc. models (`groq-llama-3`, etc.) to the
+xAI Grok runner. Every other input — `None`, the empty string, unknown
+model ids, the Claude constants, and Groq family ids — falls through to
+`Provider::Claude`. Total function: every `Option<&str>` produces some
+`Provider`; never panics. This routine is the SINGLE source of truth used
+by `resolve_effective_runner` (in `engine.rs`) for the spawn-site dispatch
+discriminant — re-deriving the formula independently is explicitly
+prohibited (PRD §2.5).
 
 **Diagnostics bundle (best-effort; failures log via `eprintln!` and never
 propagate)**:
@@ -412,7 +449,11 @@ otherwise downstream "is_empty" checks invert the safety guarantee.
 | Cross-wave overlay | `src/loop_engine/worktree.rs` + `src/commands/next/selection.rs` | `list_unmerged_branch_files`, `ephemeral_overlay` parameter |
 | Startup hygiene + slot-0 guard | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots`, `classify_ephemeral_branch` |
 | Run-level config caching | `src/loop_engine/engine.rs` | `WaveIterationParams::project_config`, `prd_implicit_overlap_files` |
-| Overflow recovery ladder | `src/loop_engine/overflow.rs` | `handle_prompt_too_long`, `sanitize_id_for_filename`, `rotate_dumps_keep_n` |
+| Overflow recovery ladder | `src/loop_engine/overflow.rs` | `handle_prompt_too_long`, `sanitize_id_for_filename`, `rotate_dumps_keep_n`, `RecoveryAction::FallbackToProvider` |
+| LLM runner dispatch | `src/loop_engine/runner.rs` + `src/loop_engine/engine.rs` | `RunnerKind`, `dispatch`, `ClaudeRunner`, `GrokRunner`, `resolve_effective_runner` |
+| Provider routing | `src/loop_engine/model.rs` | `Provider`, `provider_for_model` |
+| Operator escape valve | `src/loop_engine/engine.rs` | `check_override_invalidation`, `IterationContext::overflow_original_task_model` |
+| Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |
 | Merge resolver | `src/loop_engine/merge_resolver.rs` | `ClaudeMergeResolver`, `MergeResolver` trait |

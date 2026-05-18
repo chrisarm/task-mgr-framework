@@ -199,6 +199,40 @@ yourself.
 
 <!-- TASK_MGR:END -->
 
+### Fallback runner config (Grok)
+
+The loop engine supports a Grok CLI fallback that promotes a stuck task off
+Claude after the overflow ladder is exhausted (rung 4) or after repeated
+`RuntimeError` crashes at the Opus ceiling. Disabled by default; opt-in via
+`.task-mgr/config.json`:
+
+```json
+{
+  "version": 1,
+  "fallbackRunner": {
+    "enabled": true,
+    "provider": "grok",
+    "model": "grok-4-fast",
+    "cliBinary": "/usr/local/bin/grok",
+    "runtimeErrorThreshold": 2
+  }
+}
+```
+
+Field defaults: `enabled=false`, `provider="grok"`, `model="grok-4-fast"`,
+`cliBinary=null` (resolves bare `grok` on PATH), `runtimeErrorThreshold=2`.
+With the block absent or `enabled:false`, loop behavior is byte-identical
+to the pure-Claude 4-rung overflow ladder ending in `Blocked`.
+
+`task-mgr loop run` performs a startup binary check: when `enabled=true`,
+the configured `cliBinary` (or bare `grok` on PATH) must resolve to an
+existing file or the loop exits with a helpful error before the first
+iteration. Subsystem design notes are in
+[`src/loop_engine/CLAUDE.md`](src/loop_engine/CLAUDE.md) — see "Overflow
+recovery and diagnostics" for the 5-rung ladder, "Operator escape valve" for
+the override-invalidation contract, and "Provider routing" for the
+token-equality classification algorithm.
+
 ## LLM coding guidelines
 
 These guidelines apply to every code change in this repository regardless
