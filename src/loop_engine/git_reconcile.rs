@@ -173,7 +173,6 @@ pub(crate) fn reconcile_external_git_completions(
 /// every match was already-done / blocked by dependency gating.
 ///
 /// Every IO/DB/git failure is warn-and-continue; this function never panics.
-#[allow(dead_code)] // call site wired in FEAT-003
 pub(crate) fn reconcile_merged_slot_completions(
     slot0_path: &Path,
     pre_merge_head: &str,
