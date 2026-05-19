@@ -212,7 +212,23 @@ fn dispatch_init_shim(
 }
 
 fn main() {
-    let mut cli = Cli::parse();
+    let mut cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Try to inject a hint. Wrap in catch_unwind so a panic inside
+            // hint lookup never silences clap's own error message.
+            let argv: Vec<String> = std::env::args().collect();
+            let hint =
+                std::panic::catch_unwind(|| task_mgr::cli::error_recovery::lookup_hint(&argv))
+                    .unwrap_or(None);
+
+            let _ = err.print();
+            if let Some(hint_text) = hint {
+                eprintln!("{hint_text}");
+            }
+            process::exit(err.exit_code());
+        }
+    };
 
     // Make machine-readable output mode observable to library helpers that
     // emit informational stderr notes (e.g., `loop_engine::env::resolve_paths`

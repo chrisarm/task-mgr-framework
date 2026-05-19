@@ -15,6 +15,7 @@ use clap::Parser;
 
 pub mod commands;
 pub mod enums;
+pub mod error_recovery;
 pub mod introspect;
 
 #[cfg(test)]
