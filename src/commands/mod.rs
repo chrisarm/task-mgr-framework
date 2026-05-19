@@ -24,6 +24,7 @@
 
 pub mod add;
 pub mod apply_learning;
+pub mod cheatsheet;
 pub mod complete;
 pub mod curate;
 pub mod current;
@@ -61,6 +62,7 @@ pub use add::{
 pub use apply_learning::{
     ApplyLearningResult, apply_learning, format_text as format_apply_learning_text,
 };
+pub use cheatsheet::{CheatsheetResult, cheatsheet, format_text as format_cheatsheet_text};
 pub use complete::{
     CompleteResult, TaskCompletionResult, complete, format_text as format_complete_text,
 };

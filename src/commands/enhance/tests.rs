@@ -45,6 +45,47 @@ fn full_template_strictly_contains_workflow_template() {
 }
 
 #[test]
+fn templates_source_calls_generate_command_reference_at_runtime() {
+    // FEAT-002 CONTRACT: "enhance/templates.rs uses
+    // generate_command_reference() at render time (not concatenated at
+    // compile time as another literal) - grep enhance/templates.rs for
+    // the function call".
+    //
+    // Source-grep test so a future contributor can't silently revert
+    // body() to returning a baked-in &str.
+    use std::path::PathBuf;
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let templates_path = crate_root.join("src/commands/enhance/templates.rs");
+    let src = fs::read_to_string(&templates_path).expect("templates.rs must exist");
+    assert!(
+        src.contains("generate_command_reference("),
+        "templates.rs MUST call generate_command_reference() at render time \
+         (FEAT-002 drift CONTRACT); none found in {}",
+        templates_path.display()
+    );
+}
+
+#[test]
+fn body_includes_generated_command_reference() {
+    let body = EnhanceProfile::Workflow.body();
+    // The runtime-spliced reference table appears under its own heading.
+    assert!(
+        body.contains("### Command Reference (generated)"),
+        "workflow body must carry the generated reference heading"
+    );
+    // And the table itself uses the canonical 2-col markdown header.
+    assert!(
+        body.contains("| Command | Description |"),
+        "workflow body must include the clap-generated table header"
+    );
+    // Pick a stable subcommand row that must appear post-generation.
+    assert!(
+        body.contains("| `task-mgr current` |"),
+        "workflow body must include the `task-mgr current` row"
+    );
+}
+
+#[test]
 fn profile_default_is_workflow() {
     assert_eq!(EnhanceProfile::default(), EnhanceProfile::Workflow);
 }

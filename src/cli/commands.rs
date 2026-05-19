@@ -1213,6 +1213,22 @@ EXAMPLES:
         #[command(subcommand)]
         cmd: EnhanceCommand,
     },
+
+    /// Print the curated cheat sheet + clap-generated command reference
+    ///
+    /// Three sections in order: Common Recipes (curated, hand-written),
+    /// Command Reference (auto-generated from every non-hidden clap
+    /// subcommand — drift CI ensures it never lies), and State
+    /// Inspection (one paragraph pointing operators at `task-mgr current`).
+    #[command(after_help = "\
+EXAMPLES:
+    # Render the cheat sheet to stdout
+    task-mgr cheatsheet
+
+    # Pipe to less for browsing
+    task-mgr cheatsheet | less -R
+")]
+    Cheatsheet,
 }
 
 /// Subcommands for `task-mgr enhance`.

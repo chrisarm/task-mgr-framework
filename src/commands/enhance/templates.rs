@@ -1,20 +1,29 @@
-//! Static template strings rendered into CLAUDE.md / AGENTS.md by
-//! `task-mgr enhance agents`.
-//!
-//! Templates are plain `&'static str` for v1 — no format-string interpolation
-//! is performed. Project-specific interpolation is deferred to a future PR.
+//! Templates rendered into CLAUDE.md / AGENTS.md by `task-mgr enhance
+//! agents` (and to stdout by `task-mgr enhance show`).
 //!
 //! Two profiles are exposed:
-//! - [`WORKFLOW_TEMPLATE`] — task-mgr CLI cheat sheet and workflow patterns
-//!   (mirrors §3a of the user-global CLAUDE.md, project-scoped).
-//! - [`FULL_TEMPLATE`] — `WORKFLOW_TEMPLATE` content plus general LLM-coding
-//!   guidelines (Think Before Coding, Simplicity First, Surgical Changes,
-//!   Goal-Driven Execution).
+//! - **workflow** — task-mgr CLI cheat sheet and workflow patterns
+//!   (mirrors §3a of the user-global CLAUDE.md, project-scoped). The
+//!   narrative half is the [`WORKFLOW_TEMPLATE`] `&'static str`; the
+//!   generated command reference table is appended at render time by
+//!   [`EnhanceProfile::body`] via
+//!   [`crate::cli::introspect::generate_command_reference`].
+//! - **full** — workflow profile plus general LLM-coding guidelines.
+//!
+//! ## Drift property
+//!
+//! `EnhanceProfile::body` is the SOLE entry point that fuses the
+//! narrative (`&'static str`) with the runtime-generated reference. The
+//! same `generate_command_reference()` call also drives
+//! [`crate::commands::cheatsheet::cheatsheet`], so the two consumers can
+//! never go out of sync. `tests/cheatsheet_drift.rs` is the CI gate that
+//! ensures every non-hidden clap subcommand appears in the generated
+//! table, closing the loop on "the docs can't lie about command names".
 //!
 //! Invariant: `FULL_TEMPLATE` is by construction the concatenation of
-//! `WORKFLOW_TEMPLATE` and the LLM-guidelines literal — both are produced
-//! from the same `workflow_body!()` and `llm_guidelines_body!()` macros, so
-//! the two profiles cannot drift.
+//! `WORKFLOW_TEMPLATE` and the LLM-guidelines literal — both produced
+//! from the same `workflow_body!()` and `llm_guidelines_body!()` macros,
+//! so the narrative halves cannot drift.
 
 /// Markers that fence the task-mgr-managed block inside the target file.
 /// These are the *only* substrings the enhance command will rewrite.
@@ -245,10 +254,29 @@ pub enum EnhanceProfile {
 
 impl EnhanceProfile {
     /// Render the profile body that goes inside the marker block.
-    pub fn body(self) -> &'static str {
-        match self {
+    ///
+    /// The narrative half (curated text + workflow patterns) is a
+    /// `&'static str` constant; the clap command-reference table is
+    /// appended at render time by calling
+    /// [`crate::cli::introspect::generate_command_reference`]. This is
+    /// the **CONTRACT** the FEAT-002 drift test enforces: the call below
+    /// MUST remain a literal call to `generate_command_reference` (not a
+    /// concatenation of a second `&'static str` literal) so that "the
+    /// docs can't reference a non-existent subcommand" stays a
+    /// compile-and-test-time guarantee.
+    pub fn body(self) -> String {
+        let narrative = match self {
             EnhanceProfile::Workflow => WORKFLOW_TEMPLATE,
             EnhanceProfile::Full => FULL_TEMPLATE,
+        };
+        let reference = crate::cli::introspect::generate_command_reference();
+        let mut out = String::with_capacity(narrative.len() + reference.len() + 64);
+        out.push_str(narrative);
+        out.push_str("\n### Command Reference (generated)\n\n");
+        out.push_str(&reference);
+        if !out.ends_with('\n') {
+            out.push('\n');
         }
+        out
     }
 }

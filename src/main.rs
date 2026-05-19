@@ -16,7 +16,7 @@ use task_mgr::cli::{
 };
 use task_mgr::commands::{
     LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
-    audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks, current,
+    audit_setup, auto_unblock_all, begin, cheatsheet, complete, count_resettable_tasks, current,
     decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
     format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail,
     import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
@@ -760,6 +760,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Current => {
             let result = current(&cli.dir)?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Cheatsheet => {
+            let result = cheatsheet();
             output_result(&result, cli.format);
             Ok(())
         }
