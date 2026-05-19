@@ -202,6 +202,84 @@ iteration and may revert your edit). Use the CLI subcommands above
 plus the `<task-status>` tag — never `Edit` or `Write` the JSON
 yourself.
 
+
+### Command Reference (generated)
+
+| Command | Description |
+| --- | --- |
+| `task-mgr init` | Initialize project (`.task-mgr/`) and/or import PRD JSON files |
+| `task-mgr list` | List tasks with optional filtering |
+| `task-mgr show` | Show detailed information about a single task |
+| `task-mgr next` | Get the next recommended task to work on |
+| `task-mgr complete` | Mark one or more tasks as completed |
+| `task-mgr fail` | Mark one or more tasks as failed (blocked, skipped, or irrelevant) |
+| `task-mgr run` | Run lifecycle management (begin, update, end) |
+| `task-mgr run begin` | Begin a new run session |
+| `task-mgr run update` | Update an active run with progress information |
+| `task-mgr run end` | End a run session |
+| `task-mgr export` | Export database state to JSON |
+| `task-mgr doctor` | Check database health and fix stale state |
+| `task-mgr skip` | Skip one or more tasks intentionally (defer for later without marking as failed) |
+| `task-mgr irrelevant` | Mark one or more tasks as irrelevant (no longer needed due to changed requireme… |
+| `task-mgr learn` | Record a learning from a task outcome |
+| `task-mgr recall` | Find relevant learnings for a task or query |
+| `task-mgr learnings` | List all learnings |
+| `task-mgr apply-learning` | Record that a learning was applied (confirmed useful) |
+| `task-mgr invalidate-learning` | Invalidate a learning via two-step degradation |
+| `task-mgr unblock` | Return a blocked task to todo status for retry |
+| `task-mgr unskip` | Return a skipped task to todo status for retry |
+| `task-mgr add` | Add a single task from JSON (stdin or --json) |
+| `task-mgr reset` | Reset task(s) to todo status for re-running |
+| `task-mgr stats` | Show progress summary (task counts, completion rate, learnings) |
+| `task-mgr history` | Show run history |
+| `task-mgr delete-learning` | Delete a learning from the database |
+| `task-mgr edit-learning` | Edit an existing learning |
+| `task-mgr review` | Review blocked and skipped tasks |
+| `task-mgr migrate` | Manage database schema migrations |
+| `task-mgr migrate status` | Show current migration status |
+| `task-mgr migrate up` | Apply the next pending migration |
+| `task-mgr migrate down` | Revert the most recent migration |
+| `task-mgr migrate all` | Apply all pending migrations (default behavior on db open) |
+| `task-mgr completions` | Generate shell completions |
+| `task-mgr loop` | Run autonomous agent loop |
+| `task-mgr loop init` | Initialize a database from a single PRD JSON file |
+| `task-mgr loop run` | Run the autonomous agent loop against a PRD |
+| `task-mgr status` | Show status dashboard for PRD projects |
+| `task-mgr batch` | Run multiple PRDs in sequence |
+| `task-mgr batch init` | Initialize a database from multiple PRD JSON files (one per glob match) |
+| `task-mgr batch run` | Run the autonomous agent loop across multiple PRDs |
+| `task-mgr import-learnings` | Import learnings from a progress.json or learnings JSON file |
+| `task-mgr archive` | Archive completed PRDs and extract learnings |
+| `task-mgr extract-learnings` | Extract learnings from a Claude output file using LLM analysis |
+| `task-mgr worktrees` | Manage git worktrees (list, prune, remove) |
+| `task-mgr worktrees list` | List all git worktrees with branch, path, and lock status |
+| `task-mgr worktrees prune` | Remove unlocked worktrees (skips locked and dirty) |
+| `task-mgr worktrees remove` | Remove a specific worktree by path or branch name |
+| `task-mgr man-pages` | Generate man pages for task-mgr and all subcommands |
+| `task-mgr curate` | Curate learnings (retire stale entries, unretire archived ones) |
+| `task-mgr curate retire` | Identify and soft-archive stale learnings |
+| `task-mgr curate unretire` | Restore soft-archived learnings by ID |
+| `task-mgr curate dedup` | Identify and merge duplicate learnings using LLM semantic analysis |
+| `task-mgr curate enrich` | Enrich learning metadata using LLM analysis |
+| `task-mgr curate embed` | Generate and store Ollama embeddings for active learnings |
+| `task-mgr curate count` | Show learning statistics: total, active, retired, and embedded counts |
+| `task-mgr decisions` | Manage key architectural decisions |
+| `task-mgr decisions list` | List key decisions (pending and deferred by default) |
+| `task-mgr decisions resolve` | Resolve a key decision by selecting an option |
+| `task-mgr decisions decline` | Decline a key decision (mark as not needed) |
+| `task-mgr decisions revert` | Revert a resolved or deferred decision back to pending |
+| `task-mgr models` | List Claude models and pin a default |
+| `task-mgr models list` | Print the available model IDs |
+| `task-mgr models set-default` | Pin a default model (user config by default, `--project` for project) |
+| `task-mgr models unset-default` | Clear the pinned default model |
+| `task-mgr models show` | Show the currently resolved default model and where it came from |
+| `task-mgr current` | Show the currently resolved active PRD context (prefix, source, target path) |
+| `task-mgr enhance` | Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md |
+| `task-mgr enhance agents` | Write or update the marker-fenced workflow block in target files |
+| `task-mgr enhance show` | Render the chosen profile to stdout. Never writes to disk |
+| `task-mgr enhance strip` | Remove the marker block (and its markers) from target files |
+| `task-mgr cheatsheet` | Print the curated cheat sheet + clap-generated command reference |
+| `task-mgr how` | Map a natural-language intent to canonical task-mgr commands |
 <!-- TASK_MGR:END -->
 
 ### Fallback runner config (Grok)
