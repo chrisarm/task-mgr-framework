@@ -330,6 +330,7 @@ fn slot_context_threads_bundle_task_id_through_run_slot_iteration() {
         slot_index: 0,
         working_root: project.path().to_path_buf(),
         prompt_bundle: bundle,
+        effective_runner: task_mgr::loop_engine::runner::RunnerKind::Claude,
     };
     let params = SlotIterationParams {
         db_dir: temp.path().to_path_buf(),

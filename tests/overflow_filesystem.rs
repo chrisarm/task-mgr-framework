@@ -62,6 +62,7 @@ fn make_event(task_id: &str, iteration: u32) -> OverflowEvent {
             new_effort: "high".to_string(),
         },
         dump_path: "/tmp/dummy.txt".to_string(),
+        runner: None,
     }
 }
 
@@ -280,6 +281,7 @@ fn jsonl_append_atomic_for_large_event() {
             new_model: model::OPUS_MODEL.to_string(),
         },
         dump_path: "/tmp/large-dump.txt".to_string(),
+        runner: None,
     };
 
     append_event_log(base, &event).expect("append large event");
@@ -506,6 +508,7 @@ fn jsonl_oversize_emits_warning() {
             new_effort: "high".to_string(),
         },
         dump_path: long_dump_path.clone(),
+        runner: None,
     };
 
     // Verify the fixture actually triggers the warning branch.

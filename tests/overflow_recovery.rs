@@ -28,7 +28,9 @@ use task_mgr::loop_engine::model::{OPUS_MODEL, OPUS_MODEL_1M, SONNET_MODEL};
 use task_mgr::loop_engine::overflow::{
     self, OverflowEvent, RecoveryAction, sanitize_id_for_filename,
 };
+use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- Test fixtures ---------------------------------------------------
 
@@ -111,6 +113,7 @@ fn rung_label(a: &RecoveryAction) -> &'static str {
         RecoveryAction::DowngradeEffort { .. } => "downgrade_effort",
         RecoveryAction::EscalateModel { .. } => "escalate_model",
         RecoveryAction::To1mModel { .. } => "to_1m_model",
+        RecoveryAction::FallbackToProvider { .. } => "fallback_to_provider",
         RecoveryAction::Blocked => "blocked",
     }
 }
@@ -154,6 +157,8 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         Some("run-test"),
         base,
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert!(
@@ -184,6 +189,8 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         Some("run-test"),
         base,
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a2), "escalate_model");
     assert!(
@@ -213,6 +220,8 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         Some("run-test"),
         base,
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert!(
@@ -242,6 +251,8 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
         Some("run-test"),
         base,
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a4), "blocked");
     assert!(matches!(a4, RecoveryAction::Blocked));
@@ -276,6 +287,8 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(
         rung_label(&action),
@@ -312,6 +325,8 @@ fn filename_sanitization_neutralizes_traversal() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -376,6 +391,8 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -443,6 +460,8 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
             None,
             tmp.path(),
             None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         assert_eq!(rung_label(&action), *expected, "scenario {i} rung mismatch");
     }
@@ -496,6 +515,8 @@ fn rotation_keeps_only_newest_three_dumps() {
             None,
             tmp.path(),
             None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         // Sleep enough for distinguishable mtimes on coarse filesystems —
         // resolution is at least 1s on common Linux setups (ext4 with
@@ -564,6 +585,8 @@ fn overflow_recovered_set_populated_after_first_overflow() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     assert!(
@@ -597,6 +620,8 @@ fn original_model_captured_on_first_overflow_only() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(
         ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -628,6 +653,8 @@ fn original_model_captured_on_first_overflow_only() {
             None,
             tmp.path(),
             None,
+            RunnerKind::Claude,
+            &ProjectConfig::default(),
         );
         assert_eq!(
             ctx.overflow_original_model.get(task_id).map(String::as_str),
@@ -662,6 +689,8 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
         Some("run-blk"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(matches!(action, RecoveryAction::Blocked));
     assert_eq!(task_status(&conn, task_id), "blocked");
@@ -707,6 +736,8 @@ fn no_pollution_outside_tempdir() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let canon_root = tmp.path().canonicalize().expect("canonicalize root");
@@ -765,6 +796,8 @@ fn override_persists_across_iterations() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&action), "escalate_model");
     assert_eq!(
@@ -812,6 +845,8 @@ fn original_model_captured_first_overflow_only() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a1), "downgrade_effort");
     assert_eq!(
@@ -838,6 +873,8 @@ fn original_model_captured_first_overflow_only() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a2), "escalate_model");
     assert_eq!(
@@ -865,6 +902,8 @@ fn original_model_captured_first_overflow_only() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&a3), "to_1m_model");
     assert_eq!(
@@ -898,6 +937,8 @@ fn run_id_none_serializes_correctly() {
         None, // <-- run_id is None
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let events = read_events(tmp.path());
@@ -940,6 +981,8 @@ fn effective_model_none_dump_header() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let sanitized = sanitize_id_for_filename(task_id);
@@ -984,6 +1027,8 @@ fn rung_4_writes_observability() {
         Some("run-r4obs"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert!(
         matches!(action, RecoveryAction::Blocked),
@@ -1041,6 +1086,8 @@ fn dump_uses_sent_effort_not_resolved() {
         None,
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     assert_eq!(rung_label(&action), "downgrade_effort");
     assert!(

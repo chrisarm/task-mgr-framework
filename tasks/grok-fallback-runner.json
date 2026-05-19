@@ -1,0 +1,1359 @@
+{
+  "branchName": "feat/grok-fallback-runner",
+  "description": "Add an LlmRunner trait abstraction with ClaudeRunner + GrokRunner impls, plus a 5th rung in the overflow recovery ladder and a RuntimeError fallback hook that promote tasks to Grok when the Claude ladder is exhausted. Default disabled; opt-in via .task-mgr/config.json. Phase 1 is a zero-behavior-change trait extraction (foundation); Phase 2 lights up Grok routing for explicit task models; Phase 3 wires the policy. Architect-reviewed and revised to handle 10+ edge cases around override precedence, tasks.model DB column writes, wave-mode wiring, idempotency guards, auth-failure short-circuits, and operator escape valves.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "Rust: No warnings in `cargo check` output",
+      "Rust: No warnings in `cargo clippy -- -D warnings` output",
+      "Rust: Scoped tests for touched files pass with `cargo test`",
+      "Rust: `cargo fmt --check` passes",
+      "No breaking changes to existing public spawn_claude signature (preserved via type aliases SpawnOpts = RunnerOpts and ClaudeResult = RunnerResult)",
+      "No new .unwrap() or .expect() in production code paths (existing #[cfg(test)] allow continues)",
+      "All eprintln! warnings include enough context to identify the failed operation (task ID, operation name, path if applicable)",
+      "Behavior unchanged when fallbackRunner config is absent or enabled:false — byte-identical to today's 4-rung ladder ending in Blocked"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "mergeStrategy": "Merge to main after MILESTONE-FINAL passes. Squash commits optional.",
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN — Anticipate edge cases before coding (operator escape valve, override-shadowing, wave-mode wiring)",
+      "2. PHASE 2 FOUNDATION — runner trait extraction now pays back 10x when adding OpenAI/Gemini later",
+      "3. FUNCTIONING CODE — pragmatic, reliable, wired in per PRD",
+      "4. CORRECTNESS — Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY — Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH — Docs, formatting, CLAUDE.md updates"
+    ],
+    "principles": [
+      "Single source of truth for effective_runner — compute once per iteration, pass to both spawn and idempotency guards",
+      "effective_model passed to handle_prompt_too_long MUST be the post-override value",
+      "Phase 1 must be byte-for-byte parity — type aliases preserve all 10 spawn_claude call sites",
+      "Wave + sequential mode share handle_prompt_too_long — overflow rung 4 works in both with no path-specific code",
+      "Wave-mode RuntimeError hook runs in post-wave aggregation on the main thread, NEVER in slot workers (IterationContext is not thread-safe)",
+      "tasks.model DB UPDATE is contractual when fallback fires — otherwise resolve_task_model shadows the in-memory override on next iteration",
+      "Operator intent wins — explicit tasks.model edit mid-loop clears all overrides on next iteration",
+      "In-memory overrides only — restart drops state (matches existing pattern), at most one wasted Claude iteration after restart per affected task",
+      "Token-equality provider detection — substring matching incorrectly classifies 'groq-llama-3' (Groq Inc.) as xAI Grok"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Substring matching .contains('grok') for provider detection — must use token-equality on '-' splits to avoid mis-routing 'groq-llama' (Groq Inc.) to xAI Grok",
+    "Re-deriving effective_runner in multiple places — compute ONCE per iteration and pass the value through",
+    "Passing prompt_result.resolved_model (pre-override) to handle_prompt_too_long — must pass effective_model (post-override) or idempotency guard breaks silently",
+    "Box<dyn LlmRunner> dynamic dispatch — use enum RunnerKind + static match dispatch (allocation-free; exhaustive-match guards against missing variant handlers)",
+    "OR-style idempotency guard (runner_overrides.get(task) OR provider_for_model(model)) — pin to the single computed effective_runner value; OR masks future drift",
+    "Skipping the tasks.model DB UPDATE when overflow rung 4 or RuntimeError hook sets runner_overrides — without it, resolve_task_model on next iteration silently shadows the override",
+    "Running RuntimeError fallback hook inside a slot worker — IterationContext is not thread-safe; wire it into the post-wave aggregation step on the main thread",
+    "Persisting runner_overrides / model_overrides / effort_overrides to DB — design decision is in-memory only (matches existing pattern); restart clears state",
+    "Counting TaskMgrError::GrokAuthFailure toward consecutive_failures — auth lapses must not push a healthy task into auto_block_task with a misleading reason",
+    "Parsing 'grok --help' output to check flag availability — brittle; minimum version goes in user-facing docs only",
+    "Tests that hand-build HashMaps to mock IterationContext state — use the real struct so wrong field names fail at compile time, not silently",
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Migrating background spawn_claude callers (curate, learnings, milestone, prd_reconcile, watchdog) to direct LlmRunner — out of v1 scope; they keep using the spawn_claude wrapper"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "reviewGuidelines": {
+    "priorityGuidelines": {
+      "critical": "1-10: Blocks further work, fix immediately",
+      "high": "11-20: Fix before phase completion",
+      "low": "51-99: Defer to hardening phase",
+      "medium": "21-50: Fix in current phase if time permits"
+    }
+  },
+  "taskPrefix": "5ba153a7",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Document every call site of escalate_task_model_if_needed in src/loop_engine/engine.rs",
+        "Document every reader of the tasks.model DB column (grep 'tasks.model', 'task_row.model', 'WHERE model', 'SET model')",
+        "Confirm and document: with fallbackRunner.enabled=false, the function's behavior is byte-identical (no Grok branch entered)",
+        "Document the contract: any UPDATE to tasks.model must be followed by an in-memory override insert (or vice versa) so resolve_task_model on the next iteration agrees with the runner-dispatch site",
+        "Document the Semantic Distinction between (1) Claude-tier escalation (within-provider, existing) and (2) Grok promotion (cross-provider, new) — same function, different exit paths, MUST NOT share counter semantics in a way that makes Grok promotion 'consume' a Claude escalation step",
+        "Output Consumer Impact Table written to tasks/progress-<prefix>.txt — for each consumer: file:line, usage, impact (OK / BREAKS / NEEDS_REVIEW), mitigation"
+      ],
+      "dependsOn": [],
+      "description": "FR-005 modifies engine.rs::escalate_task_model_if_needed (lines ~4581-4609): today it tops out at Opus; this PRD adds a Grok pivot when fallback is enabled AND tasks.consecutive_failures >= threshold AND model is already Opus. This task identifies all consumers of the function and the tasks.model column it writes, documents semantic distinctions between 'Claude escalation' and 'Grok promotion' contexts, and confirms whether the change is additive (gated on config) or modifies existing behavior under default settings.",
+      "estimatedEffort": "low",
+      "id": "ANALYSIS-001",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Per PRD §6 Consumers of Changed Behavior: engine.rs:4599-4602 writes tasks.model on Opus escalation. The fallback hook must also UPDATE tasks.model to grok-model in the same logical operation — otherwise on the next iteration resolve_task_model reads task_row.model = OPUS_MODEL (highest precedence at model.rs:150-152) and the in-memory runner override is silently shadowed. This analysis pins the contract.\n\nReference: PRD §6 'Consumers of Changed Behavior' table, §2.5 'tasks.model DB column interaction' Correctness Requirement.\n\nNo code changes — output is a progress-file Consumer Impact Table.",
+      "passes": true,
+      "priority": 0,
+      "qualityDimensions": [
+        "Read actual code; never infer call sites from variable names",
+        "Distinguish 'additive under default config' from 'modifies existing behavior' — the architect's review found the change is additive (gated) but the tasks.model write interaction with resolve_task_model is contractual and could regress silently if mishandled",
+        "Output is a Consumer Impact Table in the progress file with concrete file:line citations"
+      ],
+      "requiresHuman": false,
+      "taskType": "analysis",
+      "title": "Consumer analysis: escalate_task_model_if_needed gains a Grok pivot",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test file tests/runner_trait_dispatch.rs created (or extends existing test module)",
+        "Test: dispatch(RunnerKind::Claude, ...) with CLAUDE_BINARY pointing at /bin/echo (or equivalent mock) returns RunnerResult with the echoed stdout",
+        "Test: existing call sites still compile — write a compile-only assertion that takes SpawnOpts and ClaudeResult by name and confirms they're type-aliases of RunnerOpts and RunnerResult",
+        "Test: spawn_claude_echo helper (claude.rs:1221) compiles and runs unchanged",
+        "Known-bad discriminator: a test that would pass with a stub `dispatch` that always returns Ok(default) but FAIL when the actual subprocess does not run — assert on a specific stdout string the mock binary echoes",
+        "Test file compiles (may be #[ignore] until FEAT-001)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for US-001 (runner trait extraction). Tests must compile (may be #[ignore]'d or expected-to-fail until FEAT-001 lands). Cover: dispatch routes RunnerKind::Claude to ClaudeRunner; SpawnOpts and ClaudeResult continue to work as type aliases for RunnerOpts and RunnerResult; existing spawn_claude_echo helper compiles unchanged; CLAUDE_BINARY env var override continues to work through the new dispatch path.",
+      "edgeCases": [
+        "CLAUDE_BINARY env var unset → defaults to 'claude' on PATH (today's behavior preserved)",
+        "CLAUDE_BINARY env var set to a non-existent path → IoError surfaced through dispatch the same as today's spawn_claude",
+        "Concurrent test invocations setting CLAUDE_BINARY simultaneously → RUNNER_BINARY_MUTEX serializes (or per-runner mutex if separate)",
+        "Empty stdin / empty prompt → dispatch still returns Ok without panic",
+        "Prompt larger than ARG_MAX → still passed via stdin (not argv), so dispatch handles arbitrary-size prompts (existing behavior)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Type alias dropped or renamed during FEAT-001",
+          "expectedBehavior": "Compile error at every spawn_claude call site — caught at FEAT-001 implementation time"
+        },
+        {
+          "cause": "dispatch swallows the binary-not-found error",
+          "expectedBehavior": "TaskMgrError::IoError surfaced with the binary name in the message"
+        }
+      ],
+      "id": "TEST-INIT-001",
+      "invariants": [
+        "spawn_claude public signature is unchanged after FEAT-001 — type aliases preserve all 10 call sites",
+        "dispatch always returns Result<RunnerResult, TaskMgrError> — no panics on subprocess failure",
+        "Mock binaries via CLAUDE_BINARY continue to be testable seam"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "TDD: write tests first. Reference existing pattern at src/loop_engine/claude.rs:1221 (spawn_claude_echo) — clone shape for dispatch tests. The CLAUDE_BINARY mutex is at claude.rs:~1230; generalize to RUNNER_BINARY_MUTEX or keep two separate mutexes covering CLAUDE_BINARY and GROK_BINARY independently. Per learning #1810: IterationContext is NOT thread-safe — tests should NOT touch IterationContext from multiple threads.\n\nLearning [2728]: per-task HashMap pattern; mirror the shape but for runner_overrides.\n\nLearning [2286]: iteration_pipeline shared between sequential+slot — ANY new behavior in dispatch must work for BOTH wave-mode and sequential-mode call sites.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Use real RunnerOpts / RunnerResult / RunnerKind types — do not hand-build mock structs",
+        "Tests cover BOTH the success path AND the error path (binary missing)",
+        "Concurrent test mutex pattern matches existing CLAUDE_BINARY_MUTEX (claude.rs:~1230) — generalize, don't duplicate"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: LlmRunner trait + dispatch + ClaudeRunner parity",
+      "touchesFiles": [
+        "tests/runner_trait_dispatch.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: provider_for_model positive cases — 'grok-4', 'grok-4-fast', 'grok-code-fast-1', 'GROK-4', 'Grok-4-Fast' all return Provider::Grok",
+        "Test: provider_for_model defensive cases — 'groq-llama-70b', 'groq-llama-3' return Provider::Claude (Groq Inc. is NOT xAI; substring match would mis-route)",
+        "Test: provider_for_model default cases — 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5', None, '', 'unknown-model' all return Provider::Claude",
+        "Test: provider_for_model mixed-case — 'GROK-4-FAST' returns Grok via lowercase normalization",
+        "Test: escalate_model(Some('grok-4-fast')) returns None (provider guard)",
+        "Test: escalate_below_opus(Some('grok-4')) returns None",
+        "Test: to_1m_model(Some('grok-4-fast')) returns None",
+        "Test: claude-side escalation continues to work — escalate_model(Some(SONNET_MODEL)) returns Some(OPUS_MODEL); confirms guard doesn't over-fire",
+        "Test: GrokRunner with GROK_BINARY pointing at mock binary returns RunnerResult with echoed stdout",
+        "Test: GrokRunner with cleanup_title_artifact: true is silently ignored (no --session-id flag in grok)",
+        "Test: GrokRunner with PermissionMode::Dangerous emits --permission-mode bypassPermissions (or --always-approve — pin to ONE in FEAT-003 and assert that one)",
+        "Test file compiles (may be #[ignore] until FEAT-002, FEAT-003)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for US-002 (Provider routing, GrokRunner, escalation provider guards). Tests cover the token-equality algorithm for provider_for_model, the no-op behavior of escalate_model / escalate_below_opus / to_1m_model on non-Claude inputs, and the GrokRunner flag-mapping (via a mock GROK_BINARY).",
+      "edgeCases": [
+        "Model string 'claude-via-grok-proxy' (hypothetical) — token-equality splits on '-' to ['claude', 'via', 'grok', 'proxy']; 'grok' token present → routes to Grok (acceptable since the substring 'grok' was intentional; documents the algorithm's deterministic behavior even on adversarial strings)",
+        "Model string with trailing whitespace 'grok-4 ' — algorithm lowercases + splits + trims (must handle or document that trim is upstream)",
+        "Empty model string '' → Provider::Claude (default, preserving today's behavior for unset model)",
+        "Model string '-grok-' (leading/trailing dashes) — splits to ['', 'grok', ''] — 'grok' is a token → Grok (correct)",
+        "Model string 'grokomatic-1' (single non-split token) — splits to ['grokomatic', '1']; no token equals 'grok' exactly → Provider::Claude (correct: NOT xAI)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Substring match used instead of token-equality",
+          "expectedBehavior": "'groq-llama-70b' would falsely route to xAI's Grok runner; provider_for_model test for 'groq-llama-70b' catches this regression"
+        },
+        {
+          "cause": "Provider guard added to escalate_model but missed on escalate_below_opus or to_1m_model",
+          "expectedBehavior": "Tests for all three escalation functions catch the missed guard"
+        }
+      ],
+      "id": "TEST-INIT-002",
+      "invariants": [
+        "provider_for_model is pure (no side effects, no I/O)",
+        "provider_for_model is total: every &str input returns Provider::Claude or Provider::Grok, never panics",
+        "Escalation guards on escalate_model / escalate_below_opus / to_1m_model never silently promote a non-Claude model to a Claude tier"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Algorithm: provider_for_model lowercases the input, splits on '-', returns Grok iff any resulting token equals \"grok\" exactly. Reference: PRD §6 Public Contracts provider_for_model signature.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — relevant for the GrokRunner config bits (FR-002, FR-006) but the test scope here is the algorithm itself.\n\nLearning [869]: three-tier default resolution — runner selection mirrors this (override → provider-from-model → Claude default).",
+      "passes": true,
+      "priority": 2,
+      "qualityDimensions": [
+        "Token-equality algorithm pinned in test: lowercase + split on '-' + check any token equals 'grok' (NOT substring match)",
+        "Defensive Groq Inc. tests (groq-llama-*) are MANDATORY — Groq is a real vendor, mis-routing would cause silent runtime errors",
+        "Mock GROK_BINARY pattern mirrors CLAUDE_BINARY exactly (claude.rs:290) — generalize the mutex, don't duplicate the test harness"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: GrokRunner + provider_for_model token-equality + escalation guards",
+      "touchesFiles": [
+        "tests/provider_routing.rs",
+        "tests/grok_runner_unit.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: handle_prompt_too_long with fallbackRunner.enabled=true AND task on Claude → selects RecoveryAction::FallbackToProvider, inserts runner_overrides[task]=Grok and model_overrides[task]=cfg.model, executes UPDATE tasks SET model = ?1 WHERE id = ?2 (verify via DB read)",
+        "Test: handle_prompt_too_long with fallbackRunner.enabled=true AND task already on Grok (effective_runner == Grok) → returns RecoveryAction::Blocked, does NOT touch runner_overrides or tasks.model",
+        "Test: handle_prompt_too_long with fallbackRunner.enabled=false → 4-rung ladder, ends in Blocked (byte-identical to today)",
+        "Test: handle_prompt_too_long with fallbackRunner absent (None) → same as enabled=false",
+        "Test: RecoveryAction::FallbackToProvider serializes to JSON {\"action\":\"fallback_to_provider\",\"provider\":\"grok\",\"model\":\"grok-4-fast\"}",
+        "Test: OverflowEvent.runner = Some(\"grok\".to_string()) serializes to {\"runner\":\"grok\",...}; runner = None omits the field entirely (skip_serializing_if)",
+        "Test: user_message for FallbackToProvider includes task_id, current effort, current model, AND the new provider/model — exact-string assert",
+        "Test: existing 4-rung ladder tests (effort downgrade, escalate_below_opus, to_1m_model, blocked) continue to pass with no modification",
+        "Test file compiles (may be #[ignore] until FEAT-005, FEAT-006)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for US-003 (overflow fallback rung). Tests cover: rung 4 fires when config enabled AND effective_runner == Claude; rung 4 is skipped (falls through to Blocked) when effective_runner == Grok; tasks.model DB UPDATE is performed in the same operation; OverflowEvent.runner field serializes correctly; the new RecoveryAction variant uses 'fallback_to_provider' serde tag; user_message formatting is correct.",
+      "edgeCases": [
+        "fallbackRunner = Some(cfg) where cfg.enabled = false → fall through to Blocked",
+        "fallbackRunner JSON key set to null in config → loader returns None → fall through to Blocked",
+        "Idempotency: task overflowed on Claude, fallback fired, task now on Grok, overflows AGAIN → rung 4 skipped via effective_runner == Grok guard, returns Blocked",
+        "Idempotency variant: task has runner_overrides[task] = Grok BUT effective_model resolves to a Claude model (defensive — should never happen but if it does, the override wins because effective_runner formula consults overrides first) → rung 4 sees effective_runner == Grok, returns Blocked",
+        "OverflowEvent.runner field present in JSONL when fallback fires; absent (omitted) on normal Claude overflow events — confirms skip_serializing_if works",
+        "Existing JSONL consumers parsing the file see new 'fallback_to_provider' action value — document in CLAUDE.md update task; test asserts the literal string"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "tasks.model UPDATE skipped when rung 4 fires",
+          "expectedBehavior": "On next iteration's resolve_task_model, task_row.model = previous Claude model wins (highest precedence), overrides silently shadowed; test asserts post-rung-4 DB read returns grok-model"
+        },
+        {
+          "cause": "Idempotency guard uses OR of two non-equivalent predicates instead of single effective_runner",
+          "expectedBehavior": "Predicates can disagree under refactor; pin guard to single source"
+        },
+        {
+          "cause": "RecoveryAction variant renamed to FallbackToGrok instead of FallbackToProvider",
+          "expectedBehavior": "Provider field carries the provider name; variant name is provider-agnostic for future OpenAI/Gemini additions"
+        }
+      ],
+      "id": "TEST-INIT-003",
+      "invariants": [
+        "Order of operations in handle_prompt_too_long is preserved: ctx update → DB UPDATE → stderr → dump → JSONL → rotate (per learning #2031)",
+        "First-rung-wins contract preserved: rung 4 only fires when rungs 1-3 preconditions all fail AND its own preconditions pass",
+        "tasks.model DB UPDATE happens IN THE SAME logical operation as the runner_overrides insert — no test passes where one happens without the other"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §2.5 'Idempotency' and 'tasks.model DB column interaction'; PRD §3 US-003 ACs; PRD §6 Data Flow Contracts.\n\nLearning [2031]: order of operations is contractual — ctx → DB → stderr → dump → JSONL → rotate. Tests MUST verify this ordering is preserved.\n\nLearning [2256]: skip_serializing_if for backward-compat — apply to OverflowEvent.runner.\n\nLearning [2852]: wave + sequential share handle_prompt_too_long — tests must exercise BOTH paths (call from sequential at engine.rs:2532 AND from wave at engine.rs:~1352). Or write the test to exercise handle_prompt_too_long directly with each call path's typical inputs.",
+      "passes": true,
+      "priority": 3,
+      "qualityDimensions": [
+        "Use real IterationContext, ProjectConfig, Connection structs — do not hand-build mocks",
+        "DB write verification uses an actual rusqlite::Connection on an in-memory sqlite DB (use the existing test helper pattern at tests/overflow_filesystem.rs or similar)",
+        "Idempotency tests are MANDATORY — they catch the most subtle class of bugs (infinite Grok-to-Grok loops)"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: Overflow rung 4 (FallbackToProvider) + idempotency + RecoveryAction serialization",
+      "touchesFiles": [
+        "tests/overflow_fallback_rung.rs",
+        "src/loop_engine/overflow.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: escalate_task_model_if_needed with task already at Opus AND tasks.consecutive_failures = 2 AND fallback enabled → inserts runner_overrides[task]=Grok, model_overrides[task]=cfg.model, executes UPDATE tasks SET model = ?1",
+        "Test: same scenario but consecutive_failures = 1 → no promotion (threshold not met); existing Claude escalation behavior unchanged",
+        "Test: same scenario but task at Sonnet (not Opus yet) → Claude escalation to Opus fires first; promotion only on the NEXT failure cycle when at Opus + threshold met",
+        "Test: same scenario but fallbackRunner.enabled = false → no promotion; existing Opus escalation behavior unchanged byte-for-byte",
+        "Test: tasks.consecutive_failures is NOT reset by the Grok promotion — the count remains at threshold value after promotion (preserves existing failure-accounting contract)",
+        "Test: wave-mode wiring — assert that run_slot_iteration does NOT call escalate_task_model_if_needed (test inspects the slot-worker code path); hook is invoked from the post-wave aggregation step on the main thread",
+        "Test: GrokAuthFailure error returned from a prior Grok attempt does NOT increment consecutive_failures — synthetic mock returns GrokAuthFailure, assert counter unchanged",
+        "Test: idempotency — task already at Grok (effective_runner == Grok) → no promotion (skip), counter behavior unchanged",
+        "Test file compiles (may be #[ignore] until FEAT-007)"
+      ],
+      "dependsOn": [
+        "ANALYSIS-001"
+      ],
+      "description": "TDD scaffolding for US-004 (RuntimeError fallback hook in escalate_task_model_if_needed). Tests cover: hook fires when escalation resolves to Opus AND consecutive_failures >= threshold AND effective_runner == Claude AND config enabled; tasks.model DB UPDATE to the Grok model; counter does NOT reset on promotion; wave-mode wiring fires in post-wave aggregation, NEVER in slot worker; GrokAuthFailure does NOT count toward consecutive_failures.",
+      "edgeCases": [
+        "consecutive_failures resets via task-mgr complete mid-loop (operator action) → counter zeroed; threshold must re-accumulate before promotion",
+        "Wave mode: a slot returns Crash(RuntimeError); the main-thread post-aggregation step runs the hook — verify the hook never sees IterationContext fields mutated by another slot mid-call",
+        "consecutive_failures at exactly threshold-1 → no promotion (off-by-one guard)",
+        "consecutive_failures at exactly threshold → promotion fires (off-by-one guard)",
+        "consecutive_failures = 999 (much higher than threshold) → still fires promotion once; idempotency guard prevents repeated promotion attempts on subsequent iterations",
+        "Multiple failed Claude iterations followed by a Grok auth failure → consecutive_failures = N (pre-Grok), then unchanged after auth failure; if N >= threshold, the Claude-side promotion would have already fired, so subsequent attempt skips per idempotency"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Hook fired from inside run_slot_iteration (wave mode)",
+          "expectedBehavior": "Race on IterationContext mutation — test detects via thread-locality assertion or via inspection of run_slot_iteration's code path"
+        },
+        {
+          "cause": "GrokAuthFailure counted toward consecutive_failures",
+          "expectedBehavior": "Healthy task pushed into auto_block_task by auth lapse — test asserts counter unchanged after GrokAuthFailure"
+        },
+        {
+          "cause": "Counter reset on promotion",
+          "expectedBehavior": "Different from existing escalate_model contract — test asserts counter preserved across promotion"
+        }
+      ],
+      "id": "TEST-INIT-004",
+      "invariants": [
+        "Wave mode does NOT call escalate_task_model_if_needed from a slot worker — IterationContext is not thread-safe (learning #1810)",
+        "tasks.model DB UPDATE happens in the same transaction as the runner_overrides insert",
+        "GrokAuthFailure short-circuit: do not increment counter, do not re-attempt fallback"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; PRD §3 US-004; PRD §6 Affected Components engine.rs:4581-4609 (escalate_task_model_if_needed) and 'post-wave aggregation site'.\n\nLearning [1810]: IterationContext is NOT thread-safe — the post-wave aggregation is the only safe wiring point.\n\nLearning [1856]: per-task model escalation precedent.\n\nLearning [2728]: per-task HashMap pattern for tracking state across iterations.\n\nLearning [1860]: in parallel context, hints should buffer (not immediate-service) — applies to the RuntimeError hook needing to run AFTER all slots complete.",
+      "passes": true,
+      "priority": 4,
+      "qualityDimensions": [
+        "Wave-mode wiring test is MANDATORY — slot worker thread safety is a known footgun (learning #1810)",
+        "Tests use real engine.rs code paths — synthetic mocks for the failure stream, real IterationContext + Connection for state",
+        "Off-by-one guards on threshold are explicit tests, not implicit assumptions"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: RuntimeError fallback hook + tasks.model UPDATE + wave-mode post-aggregation wiring",
+      "touchesFiles": [
+        "tests/runtime_error_fallback.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: ProjectConfig with no 'fallbackRunner' key in JSON → fallback_runner field is None",
+        "Test: ProjectConfig with 'fallbackRunner': null in JSON → fallback_runner field is None",
+        "Test: ProjectConfig with full fallbackRunner object → fields parsed correctly (enabled, provider, model, cli_binary, runtimeErrorThreshold)",
+        "Test: ProjectConfig with partial fallbackRunner (missing runtimeErrorThreshold) → uses default value 2",
+        "Test: ProjectConfig with partial fallbackRunner (missing model) → uses default value 'grok-4-fast'",
+        "Test: ProjectConfig with fallbackRunner.enabled = false → loader returns Some(cfg) with enabled = false",
+        "Test: Startup binary-existence check fires when fallbackRunner.enabled = true AND grok binary missing → returns config error naming the missing binary",
+        "Test: Startup binary-existence check does NOT fire when fallbackRunner.enabled = false OR fallbackRunner = None",
+        "Test: Startup binary-existence check uses fallbackRunner.cli_binary when set; falls back to 'grok' on PATH when cli_binary = None",
+        "Test file compiles (may be #[ignore] until FEAT-004)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for US-005 (FallbackRunnerConfig schema). Tests cover: ProjectConfig.fallback_runner field round-trips JSON correctly (absent, null, present-enabled, present-disabled, partial fields); startup binary-existence check fires only when enabled=true and grok binary is missing.",
+      "edgeCases": [
+        "Config with fallbackRunner.cli_binary = '/nonexistent/path' AND enabled = true → startup check fires citing that path",
+        "Config with fallbackRunner.cli_binary = None AND enabled = true AND grok on PATH → startup check passes",
+        "ProjectConfig JSON with extra/unknown fields in fallbackRunner → serde tolerates (deny_unknown_fields NOT set; verify it's not silently accepting typo'd field names)",
+        "ProjectConfig with provider = 'openai' (future provider) → loader succeeds (we don't enum-restrict provider); runtime check elsewhere catches that no GrokRunner handles it"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "ProjectConfig with absent fallbackRunner panics or errors on load",
+          "expectedBehavior": "Optional field; absent key → None; load succeeds"
+        },
+        {
+          "cause": "Default value for runtime_error_threshold silently set to 0",
+          "expectedBehavior": "Default named function returns 2; test asserts the exact value"
+        }
+      ],
+      "id": "TEST-INIT-005",
+      "invariants": [
+        "Optional field at top level — Option<FallbackRunnerConfig> resolves to None on absence; never to Some-with-defaults",
+        "Startup check is the ONLY config-driven validation that fires before iteration begins",
+        "Defaults applied at field level (named serde defaults), not at struct level — partial JSON works correctly"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §3 US-005; PRD §6 FR-006 (startup binary check).\n\nLearning [2800]: named serde defaults for ProjectConfig — use this pattern for the FallbackRunnerConfig defaults.\n\nLearning [2366]: default function pattern with serde — same.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — applies directly.\n\nLearning [928]: serde default fn for always-resolved fields.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Round-trip serde tests cover ALL config variants (absent, null, present-enabled, present-disabled, partial) — config absence is the default state for most projects",
+        "Startup check tests cover both binary-found and binary-missing paths"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: ProjectConfig FallbackRunnerConfig serde round-trip + startup binary check",
+      "touchesFiles": [
+        "tests/fallback_config.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: Override-invalidation check — set up IterationContext with runner_overrides[task]=Grok AND overflow_original_task_model[task]=Some('claude-opus-4-7'); set tasks.model='claude-haiku-4-5' in DB; invoke check; assert all six override entries are cleared for that task",
+        "Test: After invalidation, the next runner-dispatch call spawns ClaudeRunner with claude-haiku-4-5 (confirming the operator's new explicit model takes effect)",
+        "Test: No-op edit case — set tasks.model to the SAME value already snapshotted; assert no maps were modified; assert no stderr message",
+        "Test: Operator clears tasks.model to NULL (was previously Some('claude-opus-4-7')) → invalidation fires (None differs from Some)",
+        "Test: Override-invalidation emits a one-line stderr notice mentioning the task ID with text 'Operator changed task model for ... clearing auto-recovery overrides'",
+        "Test: check_override_invalidation called on a task NOT in overflow_original_task_model → no-op (no DB read, no map changes)",
+        "Test file compiles (may be #[ignore] until FEAT-008)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for US-006 / FR-008 (override invalidation on explicit task-model change). Tests cover: invalidation fires when tasks.model differs from overflow_original_task_model snapshot; no-op edit does not clear overrides; all six override maps are cleared atomically; stderr notice is emitted.",
+      "edgeCases": [
+        "Operator sets tasks.model to the SAME value already there → no overrides cleared (no_op_edit_case test)",
+        "Operator clears tasks.model to NULL (was previously Some) → invalidation fires (None != Some)",
+        "Task has no entry in overflow_original_task_model → cheap no-op call (no DB query)",
+        "All six override maps must be cleared atomically — test asserts presence of each key BEFORE and absence AFTER"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Override invalidation uses cached value instead of fresh DB read",
+          "expectedBehavior": "Operator edit detected only on next loop restart; test asserts immediate detection via SQL UPDATE then invocation"
+        },
+        {
+          "cause": "Partial clear (only 3 of 6 fields)",
+          "expectedBehavior": "Stale state survives; test enumerates all 6 fields and asserts absence post-clear"
+        }
+      ],
+      "id": "TEST-INIT-006",
+      "invariants": [
+        "overflow_original_task_model snapshot is taken at FIRST overflow (entry().or_insert_with) — never overwritten",
+        "Override invalidation reads tasks.model from DB on each iteration (not cached) — operator edits land immediately",
+        "All six fields cleared together: runner_overrides, model_overrides, effort_overrides, overflow_recovered (remove), overflow_original_model, overflow_original_task_model"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §3 US-006; PRD §6 FR-008.\n\nUse in-memory sqlite test helper for DB writes.\n\nLearning [2728]: per-task HashMap pattern — assertions iterate over the six maps.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Override-invalidation test uses production-shaped struct (IterationContext + real DB write) — hand-built mocks could mask wrong-field bugs",
+        "All six maps verified in one test — catches partial-clear bugs"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: Override invalidation (operator escape valve)",
+      "touchesFiles": [
+        "tests/override_invalidation.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Test: GrokRunner with stderr 'not authenticated' from mock binary AND non-zero exit < 3s → returns TaskMgrError::GrokAuthFailure { hint: ... }",
+        "Test: GrokRunner with stderr 'please run grok login' AND non-zero exit < 3s → returns GrokAuthFailure",
+        "Test: GrokRunner with stderr 'grok login required' AND non-zero exit < 3s → returns GrokAuthFailure",
+        "Test: GrokRunner with stderr 'NOT AUTHENTICATED' (uppercase) AND non-zero exit < 3s → matches case-insensitively → returns GrokAuthFailure",
+        "Test: GrokRunner with stderr 'not authenticated' BUT non-zero exit AFTER 3s → returns generic IoError (past the fast-fail window)",
+        "Test: GrokRunner with stderr containing auth substring AND exit code 0 (warning, not error) → does NOT return GrokAuthFailure; treats as success",
+        "Test: GrokAuthFailure carries a non-empty `hint` field with operator-friendly remediation text",
+        "Test file compiles (may be #[ignore] until FEAT-003)"
+      ],
+      "dependsOn": [],
+      "description": "TDD scaffolding for FR-007 (Grok auth-failure sniff). Tests cover: GrokRunner returns TaskMgrError::GrokAuthFailure on well-known auth strings; fast-fail timing heuristic (< 3s); past-window cases return generic IoError; case-insensitive matching.",
+      "edgeCases": [
+        "Exit code 0 with auth substring in stderr → treat as success (warning, not failure)",
+        "Auth substring case variations (NOT AUTHENTICATED, Not Authenticated) → match case-insensitively",
+        "Non-zero exit AFTER 3 seconds with auth substring → past fast-fail window → generic IoError (the long delay implies the command did real work before failing, so it's likely a runtime error in the actual work, not an auth lapse)",
+        "Multiple known auth substrings present simultaneously → return GrokAuthFailure once (not panic, not duplicate)"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "Auth-failure sniff matches 'not authenticated' as a substring in a non-auth context (e.g., a tool-use error message)",
+          "expectedBehavior": "Combined with fast-fail heuristic (non-zero exit < 3s), false positives are extremely rare; if observed, narrow the substring to a more specific phrase"
+        },
+        {
+          "cause": "Sniff returns GrokAuthFailure for exit code 0 (success with warning)",
+          "expectedBehavior": "Sniff gated on non-zero exit; exit-0 cases bypass the sniff entirely"
+        }
+      ],
+      "id": "TEST-INIT-007",
+      "invariants": [
+        "GrokAuthFailure is a distinct error variant — handlers can pattern-match on it explicitly",
+        "Both conditions required: stderr substring AND fast-fail timing (< 3s non-zero exit)",
+        "Substring match is case-insensitive"
+      ],
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §6 FR-007.\n\nMock binary script must support: configurable stderr string, configurable exit code, configurable delay before exit. Use a shell wrapper around `sleep` + `echo`.\n\nFast-fail heuristic: 3-second threshold matches what the architect recommended; if the substring appears AFTER the command has been running for a while, it's likely a tool-use runtime error, not an auth lapse.",
+      "passes": true,
+      "priority": 5,
+      "qualityDimensions": [
+        "Auth-failure detection tests cover BOTH stderr substring match AND fast-fail timing window — both gates protect against false positives",
+        "Test mock binary writes specific stderr strings + controls exit code + controls timing — gives full coverage of the gate matrix"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Initial tests: GrokAuthFailure sniff (stderr substring + fast-fail timing)",
+      "touchesFiles": [
+        "tests/grok_auth_failure.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New file src/loop_engine/runner.rs created with LlmRunner trait, RunnerKind enum (Claude, Grok), RunnerOpts struct (renamed from SpawnOpts), RunnerResult struct (renamed from ClaudeResult), ClaudeRunner impl, and dispatch function",
+        "src/loop_engine/mod.rs re-exports the runner module",
+        "src/loop_engine/claude.rs:270 spawn_claude becomes a 5-10 line wrapper: builds RunnerKind::Claude, calls dispatch; public signature is unchanged",
+        "src/loop_engine/claude.rs:~95 SpawnOpts is converted to `pub(crate) type SpawnOpts<'a> = RunnerOpts<'a>;`",
+        "src/loop_engine/claude.rs:57 ClaudeResult is converted to `pub(crate) type ClaudeResult = RunnerResult;`",
+        "All 10 existing spawn_claude call sites compile with zero source modifications (verified by `cargo check` succeeding)",
+        "Existing spawn_claude_echo test helper (claude.rs:1221) continues to work — TEST-INIT-001 tests pass",
+        "Static dispatch via match — no `Box<dyn LlmRunner>` anywhere in the codebase",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-001-completed - LlmRunner trait extraction + ClaudeRunner wrapper`"
+      ],
+      "completionCheck": "cargo build --lib 2>&1 | tee /tmp/build.txt | tail -3 && grep -E 'error\\[' /tmp/build.txt | head -5",
+      "dependsOn": [
+        "TEST-INIT-001"
+      ],
+      "description": "Phase 1, US-001. Create src/loop_engine/runner.rs defining `trait LlmRunner: Send + Sync`, `enum RunnerKind { Claude, Grok }`, `struct RunnerOpts<'_>` (moved from claude.rs SpawnOpts), `struct RunnerResult` (moved from claude.rs ClaudeResult), `struct ClaudeRunner` impl wrapping the current spawn_claude body, and `fn dispatch(kind, prompt, mode, opts)`. Convert spawn_claude (claude.rs:270) into a thin wrapper that builds RunnerKind::Claude and calls dispatch. Preserve SpawnOpts and ClaudeResult as `type` aliases so all 10 existing call sites continue to compile with NO source modifications.",
+      "estimatedEffort": "high",
+      "id": "FEAT-001",
+      "model": "claude-opus-4-7",
+      "notes": "Move the body of spawn_claude (claude.rs:270-~600) into ClaudeRunner::spawn. The SpawnOpts struct fields are unchanged; the type just moves into runner.rs and gets a new name (RunnerOpts) with a backward-compat alias. Same for ClaudeResult → RunnerResult.\n\nReference rustdoc on prior art: ClaudeMergeResolver / MergeResolver trait pattern in src/loop_engine/merge_resolver.rs (learnings #1989, #2699 — `trait-based resolver with configurable timeout`). The same shape applies here.\n\nWHEN IN DOUBT: prefer minimal diff. Phase 1 is foundation; behavior changes belong in FEAT-002/003.\n\nDispatch function shape:\n```rust\npub(crate) fn dispatch(\n    kind: RunnerKind,\n    prompt: &str,\n    permission_mode: &PermissionMode,\n    opts: RunnerOpts<'_>,\n) -> TaskMgrResult<RunnerResult> {\n    match kind {\n        RunnerKind::Claude => ClaudeRunner.spawn(prompt, permission_mode, opts),\n        RunnerKind::Grok => unimplemented!(\"FEAT-003 lands the Grok runner\"),\n    }\n}\n```\nThe Grok arm panics with `unimplemented!` until FEAT-003 — that's fine because no call site requests RunnerKind::Grok until FEAT-005.",
+      "passes": true,
+      "priority": 6,
+      "qualityDimensions": [
+        "Type aliases preserve the public surface — all 10 call sites compile unchanged (zero source-level migration)",
+        "Static dispatch via enum match — Box<dyn> is prohibited (see prohibitedOutcomes)",
+        "ClaudeRunner body is the EXACT current spawn_claude implementation — no behavior changes, no incidental refactoring; phase 1 must be byte-identical to today's behavior",
+        "Module organization: trait + types + dispatch helper + both runner impls (ClaudeRunner here, GrokRunner in FEAT-003) live in src/loop_engine/runner.rs together"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Runner trait extraction: LlmRunner + ClaudeRunner + dispatch + type aliases",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs",
+        "src/loop_engine/mod.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/model.rs adds `pub enum Provider { Claude, Grok }`",
+        "src/loop_engine/model.rs adds `pub fn provider_for_model(model: Option<&str>) -> Provider` with the token-equality algorithm",
+        "Algorithm: `.unwrap_or(\"\").to_lowercase().split('-').any(|t| t == \"grok\")` returns Grok; else Claude",
+        "escalate_model has an early guard: `if provider_for_model(model) != Provider::Claude { return None; }`",
+        "escalate_below_opus has the same guard",
+        "to_1m_model has the same guard",
+        "All existing tests in model.rs continue to pass (regression check — guard must not over-fire on Claude inputs)",
+        "TEST-INIT-002 tests all pass: positive (grok-*), defensive (groq-llama-*), default (claude-*, None, ''), case-insensitive (GROK-4)",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-002-completed - Provider enum + provider_for_model + escalation guards`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine::model 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "TEST-INIT-002"
+      ],
+      "description": "Phase 2 part 1, US-002 + FR-003. Add `enum Provider { Claude, Grok }` and `fn provider_for_model(Option<&str>) -> Provider` to src/loop_engine/model.rs. The algorithm: lowercase input, split on '-', return Provider::Grok iff any token equals \"grok\" exactly (NOT substring match — must correctly classify 'groq-llama-70b' as Claude). Add early guards to escalate_model, escalate_below_opus, and to_1m_model that return None when provider_for_model(input) != Provider::Claude. These prevent cross-provider mis-escalation.",
+      "estimatedEffort": "low",
+      "id": "FEAT-002",
+      "notes": "Algorithm reference (PRD §6 Public Contracts):\n```rust\npub fn provider_for_model(model: Option<&str>) -> Provider {\n    let lower = model.unwrap_or(\"\").to_lowercase();\n    if lower.split('-').any(|t| t == \"grok\") {\n        Provider::Grok\n    } else {\n        Provider::Claude\n    }\n}\n```\nGuard shape for each escalation fn:\n```rust\npub fn escalate_model(model: Option<&str>) -> Option<String> {\n    if provider_for_model(model) != Provider::Claude {\n        return None;\n    }\n    // ... existing body unchanged ...\n}\n```\nLearning [1856]: per-task model escalation precedent — same shape, now with provider awareness.",
+      "passes": true,
+      "priority": 7,
+      "qualityDimensions": [
+        "Token-equality, NOT substring — 'groq-llama-70b' MUST classify as Claude (Groq Inc. is a real vendor, distinct from xAI)",
+        "Guards on ALL three escalation functions — missing one is a silent mis-escalation bug (e.g., to_1m_model promoting grok-4-fast to claude-opus-4-7[1m] would be a critical regression)",
+        "Pure functions — no I/O, no side effects, no panics on any input"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Provider routing: Provider enum + provider_for_model token-equality + escalation guards",
+      "touchesFiles": [
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/runner.rs adds `pub(crate) struct GrokRunner` impl of LlmRunner",
+        "Flag mapping is byte-correct per PRD §6 Public Contracts table: -p, --permission-mode (auto/dontAsk/bypassPermissions), --tools (NOT --allowedTools), --disallowed-tools (NOT --disallowedTools), --output-format streaming-json (NOT stream-json), --model, --effort, --cwd (or Command::current_dir)",
+        "Binary resolution chain: env::var(\"GROK_BINARY\") → opts.fallback_cli_binary (if threaded through RunnerOpts) → \"grok\" default",
+        "cleanup_title_artifact: true is silently ignored (no panic, no --session-id flag, no post-run cleanup)",
+        "TaskMgrError::GrokAuthFailure { hint: String } variant added; auth-failure sniff scans stderr (case-insensitive) for 'not authenticated', 'please run grok login', 'grok login required' combined with non-zero exit code within 3 seconds of spawn",
+        "dispatch function's RunnerKind::Grok arm calls GrokRunner.spawn (replaces previous unimplemented!)",
+        "Test mutex: RUNNER_BINARY_MUTEX (or equivalent) serializes tests setting GROK_BINARY and CLAUDE_BINARY",
+        "TEST-INIT-002 and TEST-INIT-007 tests pass (GrokRunner basic spawn AND GrokAuthFailure sniff)",
+        "spawn_grok_echo helper added to runner.rs (mirroring spawn_claude_echo at claude.rs:1221)",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-003-completed - GrokRunner impl + auth-failure sniff + RUNNER_BINARY_MUTEX`"
+      ],
+      "completionCheck": "cargo build --lib 2>&1 | tee /tmp/build.txt | tail -3 && grep -E 'error\\[' /tmp/build.txt | head -5",
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "TEST-INIT-007"
+      ],
+      "description": "Phase 2 part 2, US-002 + FR-002 + FR-007. Add `struct GrokRunner` impl in src/loop_engine/runner.rs. Maps Claude flags to grok equivalents per the PRD's flag table. Binary resolution: $GROK_BINARY → cli_binary (when config present) → 'grok' on PATH. cleanup_title_artifact: true is silently ignored. PermissionMode::Dangerous maps to `--permission-mode bypassPermissions`. Implements the auth-failure sniff: stderr substring match against known auth-failure phrases, combined with a fast-fail timing heuristic (non-zero exit within 3s), returns `TaskMgrError::GrokAuthFailure { hint }`. Update RunnerKind::Grok dispatch arm to call GrokRunner.spawn instead of unimplemented!. Generalize CLAUDE_BINARY_MUTEX to handle both env vars (either via a single RUNNER_BINARY_MUTEX or per-runner mutexes).",
+      "estimatedEffort": "high",
+      "id": "FEAT-003",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD §2.5 'GrokRunner binary resolution is config-independent', 'Grok authentication failure short-circuit'; PRD §6 Public Contracts flag mapping table; PRD §3 US-002 ACs.\n\nClaude CLI 2.1.110 writes an ai-title jsonl despite --no-session-persistence (claude.rs:344); grok has no equivalent so cleanup_title_artifact branches into a no-op for GrokRunner.\n\nFlag table (PRD §6):\n| claude | grok |\n|---|---|\n| -p PROMPT | -p PROMPT |\n| --no-session-persistence | (omit, implicit) |\n| --permission-mode auto | --permission-mode auto |\n| --permission-mode dontAsk | --permission-mode dontAsk |\n| --dangerously-skip-permissions | --permission-mode bypassPermissions |\n| --allowedTools X | --tools X |\n| --disallowedTools X | --disallowed-tools X |\n| --model M | --model M |\n| --effort E | --effort E |\n| --output-format stream-json | --output-format streaming-json |\n| --session-id UUID | (omit; cleanup_title_artifact silently ignored) |\n\nLearning [1989]: trait-based resolver with configurable timeout and signal handling (ClaudeMergeResolver) — share signal_flag plumbing.\n\nLearning [2699]: method extraction with responsibility-driven naming — apply to runner.rs helpers.",
+      "passes": true,
+      "priority": 8,
+      "qualityDimensions": [
+        "Auth-failure sniff is gated by BOTH stderr substring AND fast-fail timing — both gates protect against false positives",
+        "GrokAuthFailure carries a `hint` field with operator-friendly remediation text (e.g., 'run `grok login` to re-authenticate')",
+        "GrokRunner shares as much code as possible with ClaudeRunner — anything that's identical (signal handling, stdin write, PTY, env wiring) factors into shared helpers in runner.rs, not duplicated",
+        "Binary resolution chain is explicit, not relying on undocumented PATH lookup ambiguity",
+        "Short-circuit pattern (learning #1992): if binary doesn't exist, fail fast before subprocess spawn"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "GrokRunner impl: flag mapping + auth-failure sniff + GROK_BINARY mutex",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/project_config.rs adds `pub fallback_runner: Option<FallbackRunnerConfig>` field on ProjectConfig",
+        "FallbackRunnerConfig struct defined with fields: enabled (bool), provider (String), model (String), cli_binary (Option<String>), runtime_error_threshold (u32)",
+        "serde rename to camelCase: `#[serde(rename_all = \"camelCase\")]` on FallbackRunnerConfig; field `fallback_runner` on ProjectConfig serializes as `fallbackRunner`",
+        "Default impl for FallbackRunnerConfig produces enabled: false, provider: 'grok', model: 'grok-4-fast', cli_binary: None, runtime_error_threshold: 2",
+        "Optional field semantics: absent 'fallbackRunner' key → None; explicit `\"fallbackRunner\": null` → None; explicit object → Some with defaults applied for missing optional fields",
+        "Named serde defaults (per learning #2800) used for runtime_error_threshold and provider/model fields",
+        "Startup binary-existence check function added (e.g., in src/loop_engine/runner.rs or project_config.rs): given Option<&FallbackRunnerConfig>, returns Result<(), TaskMgrError> — Ok when None or enabled=false, Err with helpful message when enabled=true and binary missing",
+        "Loop startup (likely src/commands/loop_cmd/start.rs or wherever ProjectConfig is loaded for `task-mgr loop start`) calls the check before the first iteration; exits with the config error if it fails",
+        "TEST-INIT-005 config serde tests all pass",
+        "TEST-INIT-005 startup binary-check tests pass",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-004-completed - FallbackRunnerConfig schema + startup binary check`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine::project_config 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "FEAT-003"
+      ],
+      "description": "Phase 3c, US-005 + FR-006. Add `pub fallback_runner: Option<FallbackRunnerConfig>` to ProjectConfig (src/loop_engine/project_config.rs:11). Define `FallbackRunnerConfig { enabled: bool (default false), provider: String (default 'grok'), model: String (default 'grok-4-fast'), cli_binary: Option<String>, runtime_error_threshold: u32 (default 2) }` with camelCase serde rename. Add startup binary-existence check: when enabled=true, resolve cli_binary (or 'grok' default) and verify it exists on PATH; fail loop startup with a clear config error if missing. When enabled=false or absent: no check.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-004",
+      "notes": "Reference: PRD §3 US-005, FR-006; PRD §6 Public Contracts FallbackRunnerConfig.\n\nLearning [2800]: named serde defaults enable multiple ProjectConfig fields — direct precedent.\n\nLearning [2366]: default function pattern with serde — same.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — applies directly.\n\nLearning [928]: serde default fn for always-resolved fields.\n\nFor the startup check binary resolution: use the `which` crate (already a dependency? grep Cargo.toml) OR std::process::Command::new(path).arg('--version').output() check. Either works; prefer `which` if available for clarity.\n\nExample FallbackRunnerConfig JSON shape on disk:\n```json\n{\n  \"fallbackRunner\": {\n    \"enabled\": true,\n    \"provider\": \"grok\",\n    \"model\": \"grok-4-fast\",\n    \"runtimeErrorThreshold\": 2\n  }\n}\n```\n`cli_binary` is omitted when default `grok` is on PATH; specified only for non-standard install paths.",
+      "passes": true,
+      "priority": 9,
+      "qualityDimensions": [
+        "Optional field at top-level: Option<FallbackRunnerConfig> — absence reliably resolves to 'no fallback' without sentinel enabled:false",
+        "Named serde defaults per learning #2800 — concrete and testable",
+        "Startup check fires ONLY when enabled=true — explicit task-model routing into Grok without config does NOT pay the startup cost (FEAT-003's binary resolution chain handles it)",
+        "Clear error message names the binary path it tried"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "ProjectConfig: FallbackRunnerConfig schema + serde + startup binary check",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/runner.rs",
+        "src/commands/loop_cmd/start.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "IterationContext gains `pub runner_overrides: std::collections::HashMap<String, RunnerKind>` field (default `HashMap::new()`)",
+        "IterationContext gains `pub overflow_original_task_model: std::collections::HashMap<String, Option<String>>` field (default `HashMap::new()`)",
+        "Single-source effective_runner formula at engine.rs:561 (wave-mode spawn site) and engine.rs:2285 (sequential-mode spawn site): computed via `ctx.runner_overrides.get(&task_id).copied().unwrap_or_else(|| match provider_for_model(effective_model.as_deref()) { Provider::Grok => RunnerKind::Grok, Provider::Claude => RunnerKind::Claude })`",
+        "spawn_claude calls at both sites replaced with dispatch(effective_runner, ...) where effective_runner is the single computed value",
+        "effective_runner is also passed/available to handle_prompt_too_long invocations at engine.rs:2532 and engine.rs:~1352 (overflow handler call sites)",
+        "Tests verifying byte-identical behavior when runner_overrides is empty AND no Grok task model: both call sites continue to spawn ClaudeRunner (regression guard)",
+        "Default-empty case: if `runner_overrides.get(task_id)` returns None AND `effective_model` is None, `effective_runner` defaults to `RunnerKind::Claude` (regression test asserts default-empty IterationContext spawns ClaudeRunner — preserves today's behavior exactly)",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-005-completed - IterationContext runner_overrides + effective_runner formula at spawn sites`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine::engine 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "FEAT-002"
+      ],
+      "description": "Phase 3, US-003 + US-006 wiring. Add two fields to IterationContext (src/loop_engine/engine.rs:228-279): `runner_overrides: HashMap<String, RunnerKind>` and `overflow_original_task_model: HashMap<String, Option<String>>`. Wire the single-source effective_runner formula at the two main iteration call sites (engine.rs:561 wave, engine.rs:2285 sequential). The formula MUST be computed exactly once per iteration and passed to both spawn (via dispatch(effective_runner, ...)) AND any downstream idempotency guard. No re-derivation in other places.",
+      "estimatedEffort": "high",
+      "id": "FEAT-005",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD §6 Data Flow Contracts 'Per-task runner resolution (single source of truth)'; PRD §2.5 'Single source of truth for the effective runner'; PRD §6 Affected Components engine.rs:228-279.\n\nLearning [1832]: IterationContext pattern for state tracking — direct precedent for adding new fields.\n\nLearning [2728]: per-task crash tracking HashMap — runner_overrides mirrors this exact shape (HashMap<String, T> keyed by task_id).\n\nLearning [1810]: IterationContext is NOT thread-safe — these new fields are read/written only from the main thread (sequential mode) or post-wave aggregation (FEAT-007 will wire wave-mode for the RuntimeError hook).\n\nFactor the formula into a helper:\n```rust\nfn resolve_effective_runner(\n    ctx: &IterationContext,\n    task_id: &str,\n    effective_model: Option<&str>,\n) -> RunnerKind {\n    ctx.runner_overrides.get(task_id).copied().unwrap_or_else(|| {\n        match provider_for_model(effective_model) {\n            Provider::Grok => RunnerKind::Grok,\n            Provider::Claude => RunnerKind::Claude,\n        }\n    })\n}\n```\nCall it at both sites. Helper lives in engine.rs or runner.rs (caller's choice; prefer engine.rs to keep runner.rs free of IterationContext coupling).",
+      "passes": true,
+      "priority": 10,
+      "qualityDimensions": [
+        "Single source of truth: effective_runner is computed ONCE per iteration. Verified by grep — there is exactly ONE call to provider_for_model in engine.rs's iteration paths",
+        "Sequential and wave-mode wiring are byte-identical in shape — the formula is the same code at both sites, ideally factored into a helper (e.g., resolve_effective_runner)",
+        "Default behavior preserved: when runner_overrides is empty and effective_model has no grok token, effective_runner == RunnerKind::Claude and the existing spawn_claude path runs (now via dispatch)",
+        "Pattern matches model_overrides / effort_overrides (engine.rs:232, 237) — HashMap<String, T> keyed by task_id"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "IterationContext: runner_overrides + overflow_original_task_model fields + single-source effective_runner formula at spawn sites",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "RecoveryAction::FallbackToProvider { provider: String, model: String } variant added between To1mModel and Blocked",
+        "Serde tag confirmed: serializes as {\"action\": \"fallback_to_provider\", \"provider\": \"grok\", \"model\": \"grok-4-fast\"}",
+        "RecoveryAction::user_message arm formats: 'Prompt is too long for {task_id} at effort {effort}, model {model} — falling back to {grok_model} (Claude ladder exhausted)'",
+        "handle_prompt_too_long signature accepts effective_runner: RunnerKind AND project_config: &ProjectConfig (added params)",
+        "Rung 4 selection logic: only fires when rungs 1-3 preconditions all fail AND project_config.fallback_runner is Some(cfg) with cfg.enabled AND effective_runner == RunnerKind::Claude (idempotency: SINGLE-predicate guard — do NOT use `runner_overrides.get(task_id).is_none() || provider_for_model(...) == Claude`; the two-predicate OR is drift bait and is explicitly prohibited)",
+        "On rung 4: ctx.runner_overrides.insert(task_id, Grok), ctx.model_overrides.insert(task_id, cfg.model), AND DB UPDATE in the same logical step",
+        "DB UPDATE: `UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL WHERE id = ?2 AND status = 'in_progress'`",
+        "Step 2 capture (per learning #2031 order of operations): ctx.overflow_original_task_model.entry(task_id).or_insert_with(|| read_task_model_from_db(conn, task_id)) BEFORE the DB UPDATE (captures pre-fallback model for FR-008)",
+        "All overflow-recovery existing tests continue to pass (regression guard — 4-rung ladder behavior byte-identical when fallback disabled)",
+        "TEST-INIT-003 tests pass (rung selection + idempotency + DB UPDATE verification)",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-006-completed - Overflow rung 4 FallbackToProvider + tasks.model UPDATE`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine::overflow 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "FEAT-004",
+        "FEAT-005",
+        "TEST-INIT-003"
+      ],
+      "description": "Phase 3a part 1, US-003 + FR-004 (core rung logic). Add `RecoveryAction::FallbackToProvider { provider: String, model: String }` variant to overflow.rs:31 (serde tag 'fallback_to_provider'). Extend handle_prompt_too_long (overflow.rs:330) with rung 4 between to_1m_model and Blocked. Rung 4 fires when project_config.fallback_runner.enabled AND effective_runner == RunnerKind::Claude (single-source idempotency guard). On fire: ctx.runner_overrides.insert(task_id, Grok); ctx.model_overrides.insert(task_id, cfg.model); UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL WHERE id = ?2. Telemetry (OverflowEvent.runner, banner annotation) lives in FEAT-009.",
+      "estimatedEffort": "high",
+      "id": "FEAT-006",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD §3 US-003 ACs; PRD §6 Affected Components overflow.rs:330; PRD §6 Public Contracts RecoveryAction::FallbackToProvider; PRD §2.5 'tasks.model DB column interaction'.\n\nLearning [2031]: PromptTooLong recovery four-rung ladder contract — the order of operations (ctx → DB → stderr → dump → JSONL → rotate) is contractual; rung 4 inserts at the action-selection step only.\n\nLearning [2852]: wave + sequential share handle_prompt_too_long — rung 4 works in both paths automatically because the function is shared.\n\nLearning [1856]: per-task model escalation via IterationContext overrides — direct precedent.\n\nFEAT-009 lands the OverflowEvent.runner field and the iteration banner annotation — keep those out of THIS task. The DB UPDATE shape (preserve existing pattern at overflow.rs:374-379):\n```rust\nlet update_sql = match action {\n    RecoveryAction::FallbackToProvider { ref model, .. } => {\n        conn.execute(\n            \"UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL WHERE id = ?2 AND status = 'in_progress'\",\n            rusqlite::params![model, task_id],\n        )?;\n    }\n    RecoveryAction::Blocked => { /* existing */ }\n    _ => { /* existing status='todo' branch */ }\n};\n```\nCapture original task model BEFORE UPDATE (in Step 2 alongside overflow_original_model):\n```rust\nctx.overflow_original_task_model\n    .entry(task_id.to_string())\n    .or_insert_with(|| read_task_model_from_db(conn, task_id).unwrap_or(None));\n```",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "Single-source idempotency: rung 4 gated on effective_runner == Claude only (NO OR with runner_overrides.get directly — that's drift bait)",
+        "tasks.model UPDATE is contractual — without it, resolve_task_model on next iteration shadows the in-memory override",
+        "overflow_original_task_model snapshot captured BEFORE the UPDATE — captures the pre-fallback model so FR-008's operator-edit detection can later compare",
+        "Order of operations preserved (learning #2031) — durability before observability",
+        "user_message string is testable verbatim (TEST-INIT-003 asserts exact text)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Overflow rung 4: RecoveryAction::FallbackToProvider + handle_prompt_too_long extension + tasks.model UPDATE",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "OverflowEvent struct (overflow.rs:85) gains `pub runner: Option<String>` with `#[serde(skip_serializing_if = \"Option::is_none\")]`",
+        "OverflowEvent populated with `runner = Some(effective_runner_string)` at the JSONL write site in handle_prompt_too_long; `effective_runner_string` is 'claude' or 'grok' lowercase",
+        "Existing JSONL events (without the runner field) continue to deserialize correctly (legacy compat — confirmed via test that loads an old-format event JSON)",
+        "Iteration banner in engine.rs (find the overflow-recovered annotation site near the model line) gains '(via grok)' suffix when effective_runner == RunnerKind::Grok",
+        "Banner does NOT show the suffix when effective_runner == RunnerKind::Claude (no clutter for the default case)",
+        "Test: parse an OverflowEvent with runner='grok' from JSONL → field populated correctly",
+        "Test: parse a legacy OverflowEvent (no runner field) → field is None; no panic",
+        "Test: serialize an OverflowEvent with runner=None → 'runner' key OMITTED from JSON (skip_serializing_if works)",
+        "Test: serialize an OverflowEvent with runner=Some('grok') → 'runner':'grok' present",
+        "Banner test: spawn synthetic iteration with effective_runner=Grok; assert banner stderr contains '(via grok)'",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-009-completed - OverflowEvent.runner + iteration banner annotation`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine::overflow 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "FEAT-006"
+      ],
+      "description": "Phase 3a part 2, US-003 telemetry. Add the OverflowEvent.runner: Option<String> field with skip_serializing_if (backward-compatible JSONL parsing). Populate at the JSONL write site with Some(effective_runner-as-lowercase-string). Add iteration banner suffix '(via grok)' when effective_runner == RunnerKind::Grok. This is the observability layer for FEAT-006's recovery action.",
+      "estimatedEffort": "low",
+      "id": "FEAT-009",
+      "notes": "Reference: PRD §6 OverflowEvent.runner; PRD §2.5 banner annotation.\n\nLearning [2256]: skip_serializing_if for backward-compatible optional fields — direct precedent for OverflowEvent extensions.\n\nThe banner site is gated on IterationContext::overflow_recovered (HashSet — per src/loop_engine/CLAUDE.md 'banner annotation gates on overflow_recovered, NOT model_overrides'). Find the banner write site by grepping for 'overflow recovery from' in engine.rs.",
+      "passes": true,
+      "priority": 11,
+      "qualityDimensions": [
+        "skip_serializing_if preserves legacy JSONL parse compatibility (learning #2256)",
+        "Banner suffix is non-intrusive (only appears when state diverges from default)",
+        "Tests cover both directions (serialize and deserialize) of the new field — round-trip safety"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Overflow telemetry: OverflowEvent.runner field + iteration banner annotation",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "escalate_task_model_if_needed (engine.rs:~4581-4609) gains the fallback hook: after the existing Opus-escalation logic, check (model_now == OPUS && task_row.consecutive_failures >= cfg.threshold && effective_runner == Claude && cfg.enabled) → promote",
+        "Promotion writes: ctx.runner_overrides.insert(task_id, Grok); ctx.model_overrides.insert(task_id, cfg.model); UPDATE tasks SET model = ?1 WHERE id = ?2 (Grok model)",
+        "ctx.overflow_original_task_model.entry(task_id).or_insert_with(|| previous_value) captures pre-promotion model for FR-008 detection",
+        "Counter preserved: tasks.consecutive_failures is NOT reset by promotion (preserves existing failure-accounting contract)",
+        "Wave-mode wiring: the post-wave aggregation step in engine.rs (after process_slot_result for each slot) invokes escalate_task_model_if_needed once per slot that reported RuntimeError on the main thread — verify by `grep -n 'escalate_task_model_if_needed' src/loop_engine/engine.rs` showing ONLY main-thread call sites (no occurrence inside or reachable from run_slot_iteration)",
+        "Sequential-mode wiring: existing call site preserved (the function still fires from sequential at engine.rs:~2227 area)",
+        "GrokAuthFailure handling: when a prior iteration returned TaskMgrError::GrokAuthFailure, do NOT increment tasks.consecutive_failures for that iteration AND skip the promotion hook (cascade prevention)",
+        "Idempotency: effective_runner == Grok → skip promotion; task continues normal failure accounting; eventually auto_block_task fires per existing max_retries logic",
+        "TEST-INIT-004 tests pass",
+        "All existing escalate_task_model_if_needed tests continue to pass (regression guard — sequential behavior byte-identical when fallback disabled)",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-007-completed - RuntimeError Grok fallback hook + wave-mode post-aggregation wiring`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "consumerAnalysis": {
+        "consumers": [
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "NEEDS_REVIEW",
+            "line": 4581,
+            "mitigation": "ANALYSIS-001 produces the Consumer Impact Table; FEAT-007 must read that table before implementing",
+            "usage": "escalate_task_model_if_needed body — internal call site count from grep should be ~2 (sequential + wave post-aggregation)"
+          },
+          {
+            "file": "src/loop_engine/engine.rs",
+            "impact": "OK",
+            "line": 2236,
+            "mitigation": "Runner override read pattern already in place; new field follows same shape",
+            "usage": "ctx.model_overrides.get(&task_id) read at runner-dispatch site"
+          }
+        ],
+        "semanticDistinctions": [
+          {
+            "context": "Claude-tier escalation (within-provider)",
+            "currentBehavior": "Walk Sonnet → Opus; persist tasks.model on each step",
+            "requiredBehavior": "Keep: unchanged when fallback disabled or task at non-Opus tier"
+          },
+          {
+            "context": "Grok promotion (cross-provider, NEW)",
+            "currentBehavior": "n/a",
+            "requiredBehavior": "Fires after Opus reached AND consecutive_failures >= threshold AND effective_runner == Claude; sets in-memory override AND DB tasks.model in same logical operation"
+          }
+        ]
+      },
+      "dependsOn": [
+        "FEAT-006",
+        "ANALYSIS-001",
+        "TEST-INIT-004"
+      ],
+      "description": "Phase 3b, US-004 + FR-005. Modify engine.rs::escalate_task_model_if_needed: after Opus is reached/maintained AND tasks.consecutive_failures >= cfg.runtime_error_threshold AND effective_runner == RunnerKind::Claude AND fallback enabled, promote: insert runner_overrides + model_overrides, UPDATE tasks.model to grok model. The counter does NOT reset on promotion. Wire the hook firing into wave-mode via the post-wave aggregation step on the main thread (NOT inside run_slot_iteration — IterationContext is not thread-safe per learning #1810). GrokAuthFailure from a prior attempt does NOT increment consecutive_failures.",
+      "estimatedEffort": "high",
+      "id": "FEAT-007",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "Reference: PRD §3 US-004 ACs; PRD §6 FR-005; PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; PRD §6 Affected Components engine.rs:4581-4609 + 'post-wave aggregation site'.\n\nLearning [1810]: IterationContext is NOT thread-safe — wave-mode wiring MUST be on the main thread after slot workers complete.\n\nLearning [2728]: per-task crash tracking HashMap — pattern matches.\n\nLearning [1860]: reorder hints in parallel context should buffer, not immediate-service — apply same principle: RuntimeError hook fires AFTER all slots merge back, not from inside any slot.\n\nLearning [2286]: iteration_pipeline shared between sequential+slot — but this hook is OUTSIDE that pipeline; it's a per-task escalation that runs in the engine's main control flow.\n\nGate the hook with a no-op when fallback config is absent or disabled:\n```rust\nlet fallback_active = project_config.fallback_runner.as_ref().is_some_and(|c| c.enabled);\nif fallback_active && model_now == OPUS_MODEL && task_row.consecutive_failures >= cfg.runtime_error_threshold && effective_runner == RunnerKind::Claude {\n    // promote to Grok\n}\n```\n\nIMPORTANT: ANALYSIS-001 must complete first — read its Consumer Impact Table in the progress file before implementing this task.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "Wave-mode wiring lives in post-aggregation, NEVER in slot worker (learning #1810: IterationContext not thread-safe)",
+        "Counter preservation contract: promotion does NOT reset consecutive_failures (different from Claude escalation step semantics — make this explicit in code comments)",
+        "tasks.model UPDATE contract identical to FEAT-006 — same shape, same risk if skipped",
+        "GrokAuthFailure short-circuit: do NOT increment counter, do NOT promote (cascade prevention)"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "RuntimeError fallback hook in escalate_task_model_if_needed + wave-mode post-aggregation wiring",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New helper function `check_override_invalidation(ctx: &mut IterationContext, conn: &Connection, task_id: &str)` (location: engine.rs or a new src/loop_engine/override_invalidation.rs)",
+        "Function reads tasks.model from DB via `SELECT model FROM tasks WHERE id = ?1`",
+        "Function compares current tasks.model against ctx.overflow_original_task_model.get(task_id)",
+        "If task_id NOT in overflow_original_task_model → no-op (no overrides to invalidate)",
+        "If values match → no-op",
+        "If values differ → clear runner_overrides[task_id], model_overrides[task_id], effort_overrides[task_id], overflow_recovered.remove(task_id), overflow_original_model[task_id], overflow_original_task_model[task_id]; emit `eprintln!(\"Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh.\")`",
+        "Function called from BOTH iteration entry points (engine.rs:561 wave per-slot AND engine.rs:2285 sequential) BEFORE the effective_runner formula is computed",
+        "TEST-INIT-005 override-invalidation tests pass: invalidation fires on real edit; no-op edit leaves state in place",
+        "End-to-end test: set up runner_overrides[task]=Grok + overflow_original_task_model[task]=Some('claude-opus-4-7'); execute DB UPDATE setting tasks.model='claude-haiku-4-5'; run check_override_invalidation; assert all 6 maps no longer contain task_id; assert subsequent spawn uses haiku",
+        "No new warnings in cargo clippy",
+        "Commit message: `feat: FEAT-008-completed - Override invalidation operator escape valve`"
+      ],
+      "completionCheck": "cargo test --lib loop_engine 2>&1 | tee /tmp/t.txt | tail -3 && grep -E 'FAILED|error\\[' /tmp/t.txt | head -5",
+      "dependsOn": [
+        "FEAT-005",
+        "TEST-INIT-006"
+      ],
+      "description": "Phase 3, US-006 + FR-008. Implement the override-invalidation check that runs before every iteration's runner selection. The check reads tasks.model from DB and compares to overflow_original_task_model[task_id]. If they differ (operator edited the explicit model), drop runner_overrides, model_overrides, effort_overrides for that task AND remove from overflow_recovered AND remove overflow_original_model AND remove overflow_original_task_model. Emit a one-line stderr notice. This gives the operator a mid-loop escape valve.",
+      "estimatedEffort": "medium",
+      "id": "FEAT-008",
+      "modifiesBehavior": false,
+      "notes": "Reference: PRD §3 US-006 ACs; PRD §6 FR-008; PRD §2.5 'Override-clearing on explicit task-model change' (Correctness Requirement).\n\nThis is the operator escape valve. Without it, auto-recovery decisions stick until loop restart — bad UX when the operator decides to take manual control of a stuck task mid-loop.\n\nDetection precondition: the operator changed `tasks.model` via `task-mgr loop init --append --update-existing` OR via direct DB edit. Both paths land in the same place (tasks.model column).\n\nThe six fields to clear (per PRD §2.5 'Override-clearing'):\n1. runner_overrides[task_id]\n2. model_overrides[task_id]\n3. effort_overrides[task_id]\n4. overflow_recovered.remove(task_id)\n5. overflow_original_model[task_id]\n6. overflow_original_task_model[task_id]\n\nPlace the call at the TOP of each iteration's task-processing block (engine.rs:561 for wave, engine.rs:2285 for sequential), BEFORE effective_runner is computed.",
+      "passes": true,
+      "priority": 12,
+      "qualityDimensions": [
+        "Reads tasks.model FRESH from DB on each iteration (NOT cached) — operator edits land immediately",
+        "Six-field clear is atomic from the caller's perspective — wrapped in one function, no partial clears",
+        "Stderr notice is informative and identifies the task ID",
+        "No-op when there's nothing to invalidate (task_id absent from overflow_original_task_model) — cheap to call unconditionally"
+      ],
+      "requiresHuman": false,
+      "taskType": "implementation",
+      "title": "Override invalidation check on every iteration start (operator escape valve)",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All FEAT tasks reviewed; no .unwrap() / .expect() in production paths; no Box<dyn LlmRunner> anywhere (confirmed via grep)",
+        "provider_for_model uses token-equality (verified via test inputs 'groq-llama-70b' → Claude); escalation guards present on all three (escalate_model, escalate_below_opus, to_1m_model)",
+        "tasks.model UPDATE is paired with every runner_overrides insert in FEAT-006 AND FEAT-007 — no orphan overrides without DB sync",
+        "RuntimeError hook does NOT fire from inside run_slot_iteration — confirmed via code path inspection",
+        "Single-source effective_runner: exactly one call to provider_for_model in iteration paths; idempotency guard in handle_prompt_too_long rung 4 reads from effective_runner only — NOT an OR of two predicates",
+        "Override invalidation reads tasks.model fresh from DB on every call (no caching) — confirmed via code inspection",
+        "GrokAuthFailure handling: does NOT increment consecutive_failures, does NOT trigger second promotion attempt",
+        "All qualityDimensions on each task have a corresponding code element (or a test asserting the dimension)",
+        "Any issues found have corresponding CODE-FIX-xxx or WIRE-FIX-xxx tasks added via `task-mgr add --stdin --depended-on-by MILESTONE-1`",
+        "Commit message: `chore: CODE-REVIEW-1-completed - <N issues found / no issues found>`"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "FEAT-005",
+        "FEAT-006",
+        "FEAT-007",
+        "FEAT-008",
+        "FEAT-009"
+      ],
+      "description": "Full review of all Phase 1-3 implementation tasks (FEAT-001 through FEAT-008 + ANALYSIS-001). Verify: trait + dispatch correctness, no Box<dyn>, type aliases preserve all 10 spawn_claude call sites, provider_for_model token-equality (NOT substring), escalation guards on all three escalation functions, GrokRunner flag mapping, auth-failure sniff gating, runner_overrides + overflow_original_task_model wiring, single-source effective_runner formula, fallback rung 4 idempotency guard pinned to effective_runner, tasks.model DB UPDATE in same logical operation as override insert, RuntimeError hook wired in post-wave aggregation (NOT slot worker), override invalidation reads fresh from DB, ProjectConfig serde camelCase round-trip, qualityDimensions met. Spawn CODE-FIX or WIRE-FIX tasks for each issue found.",
+      "estimatedEffort": "medium",
+      "id": "CODE-REVIEW-1",
+      "model": "claude-opus-4-7",
+      "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1`. Priority for spawned fixes: 14-16. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line 'No issues found' in the progress file.\n\nCRITICAL focus areas (from architect review):\n- Single-source effective_runner formula — verify only one provider_for_model call in main iteration path\n- tasks.model DB UPDATE always paired with runner_overrides insert\n- Wave-mode RuntimeError hook NEVER inside slot worker\n- Idempotency guard pinned to single value (not OR of predicates)\n- provider_for_model token-equality (not substring) — defensive against 'groq-llama'\n- Auth-failure handling preserves counter integrity\n- Override invalidation reads fresh DB state every iteration",
+      "passes": true,
+      "priority": 13,
+      "qualityDimensions": [
+        "Read every file in touchesFiles end-to-end; do not skim",
+        "Use rust-python-code-reviewer agent for deep code review",
+        "Spawn fixes via `task-mgr add --stdin --depended-on-by MILESTONE-1` — atomic DB+JSON sync",
+        "Cross-cutting concerns (tasks.model contract, single-source effective_runner, wave-mode threading) get priority — these are the architect's highest-impact concerns"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Code review: runner trait + provider routing + fallback policy + override invalidation",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/claude.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All ANALYSIS, TEST-INIT, FEAT, and CODE-FIX/WIRE-FIX tasks have passes: true",
+        "`cargo fmt --check` passes",
+        "`cargo check` produces no warnings",
+        "`cargo clippy -- -D warnings` produces no warnings",
+        "`cargo test` runs the full workspace test suite; ALL tests pass (including any pre-existing tests that may have been latently broken before this PRD)",
+        "`cargo run --bin gen-docs -- --check` passes — model constants doc sync is unchanged but worth verifying since we touched model.rs",
+        "Manual smoke test: create a .task-mgr/config.json with `fallbackRunner: { enabled: false }` and run `task-mgr loop` on a tiny no-op task — confirm behavior is byte-identical to today (no Grok involvement, no startup binary check)",
+        "Manual smoke test: same config with `fallbackRunner: { enabled: true, model: 'grok-4-fast' }` and confirm startup binary check fires; if grok absent, helpful error message; if grok present, loop starts normally",
+        "If any test failure is unrelated to this PRD: triage per the prompt's MILESTONE protocol (fix if <12 unrelated, else spawn FIX-xxx tasks via task-mgr add --depended-on-by MILESTONE-2)",
+        "Commit message: `chore: MILESTONE-1-completed - Phase 1-3 integration, all tests green`"
+      ],
+      "dependsOn": [
+        "CODE-REVIEW-1"
+      ],
+      "description": "Gate checkpoint after Phase 1-3 (trait extraction + provider routing + fallback policy + override invalidation). Runs the FULL unscoped test suite + lint + fmt + clippy. Must leave the trunk fully green — including any pre-existing failures discovered during the full run. Per PRD: behavior must be byte-identical when fallbackRunner is absent or enabled=false.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-1",
+      "model": "claude-opus-4-7",
+      "notes": "This is a milestone — runs the full unscoped suite per the prompt's MILESTONE protocol. Pre-existing failures get fixed or spawned per the protocol (default: fix inline; escape hatch: >12 unrelated failures → spawn FIX-xxx tasks with verifyCommand).",
+      "passes": true,
+      "priority": 20,
+      "qualityDimensions": [
+        "Full unscoped test suite — milestone gate, not scoped per-iteration",
+        "Manual smoke tests confirm the operator-facing contract: behavior identical when fallback disabled OR config absent",
+        "Pre-existing failures get fixed inline (or spawned as FIX-xxx) — trunk-green invariant"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 1-3 milestone: all features + review fixes integrated; full test suite green",
+      "touchesFiles": [
+        "src/loop_engine/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New file tests/grok_runner_integration.rs created",
+        "Tests gated `#[ignore]` so CI without grok installed passes (run locally with `cargo test -- --ignored grok_runner_integration`)",
+        "Test fixture loads CLAUDE.md content + at least one skill file content + a synthetic 'learnings' section totaling 10-100 KB (representative iteration prompt scale)",
+        "Test: COMPLETE path — synthetic task that satisfies its acceptance with a print statement; assert `<promise>COMPLETE</promise>` in last 20 lines of stdout AND `<task-status>TEST-001:done</task-status>` present",
+        "Test: BLOCKED path — synthetic task with unspecified parameter; assert `<promise>BLOCKED</promise>` in last 20 lines",
+        "Test: REORDER path — synthetic task with a critical blocker eligible-alternative; assert `<reorder>OTHER-TASK-ID</reorder>` AND `<promise>BLOCKED</promise>`",
+        "Test runs grok with `--permission-mode plan` (no FS writes — safe for tests)",
+        "If tag emission drift observed on any test → spawn IMPL-FIX task to add system-prompt override via `--rules` per PRD Open Question",
+        "Commit message: `test: TEST-001-completed - Realistic-scale grok integration tests (ignored for CI)`"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Phase 2 integration test for US-002. Add tests/grok_runner_integration.rs (gated `#[ignore]` for CI without grok installed) that runs GrokRunner::spawn against a tmp scratch dir with `--permission-mode plan` and a REALISTIC-SCALE prompt fixture. The fixture must approximate a full iteration prompt: include CLAUDE.md + sample skill content + a synthetic learnings section, totaling 10-100 KB. Confirm the three control tags emit correctly (`<promise>COMPLETE</promise>`, `<task-status>ID:done</task-status>`, `<reorder>OTHER-ID</reorder>`). This is the architect's #1 risk mitigation (tag drift on real prompts vs spike's synthetic ones).",
+      "estimatedEffort": "medium",
+      "id": "TEST-001",
+      "notes": "Reference: PRD §6 Risks 'Tag-emission drift on real iteration prompts'; PRD §3 US-002 AC for #[ignore]'d integration test.\n\nFixture assembly:\n```rust\nlet prompt = format!(\n    \"{claude_md}\\n\\n{skill_content}\\n\\n{learnings_section}\\n\\n## Current Iteration\\nTask: ...\",\n    claude_md = std::fs::read_to_string(\"CLAUDE.md\")?,\n    skill_content = std::fs::read_to_string(\".claude/skills/tasks.md\").unwrap_or_default(),\n    learnings_section = generate_synthetic_learnings(50_000),  // ~50KB\n);\n```\n\nIf grok produces something other than the expected tags on the larger prompt, the fix per PRD Open Question is to add `--rules` system-prompt override that re-asserts the tag contract.",
+      "passes": true,
+      "priority": 25,
+      "qualityDimensions": [
+        "Realistic prompt scale (10-100 KB) — NOT spike-scale (1 KB). The spike validated the small case; this test confirms the large case",
+        "Three tag paths covered (COMPLETE, BLOCKED, REORDER) — same coverage as the original spike",
+        "Test is `#[ignore]`d for CI — run locally to validate; documented in test rustdoc",
+        "If drift observed: PRD Open Question #3 (eager --rules system-prompt override) becomes a follow-up; spawn IMPL-FIX-xxx to address"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Realistic-scale grok integration test fixture (#[ignore]'d for CI)",
+      "touchesFiles": [
+        "tests/grok_runner_integration.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New file tests/override_invalidation_e2e.rs created (or extends tests/override_invalidation.rs from TEST-INIT-005)",
+        "Test setup: create in-memory DB with tasks table; insert task with model='claude-opus-4-7'; pre-populate IterationContext with runner_overrides[task]=Grok, model_overrides[task]='grok-4-fast', overflow_original_task_model[task]=Some('claude-opus-4-7')",
+        "Test action: execute `UPDATE tasks SET model = 'claude-haiku-4-5' WHERE id = ?1` simulating operator edit",
+        "Test action: invoke check_override_invalidation(ctx, conn, task_id)",
+        "Test assertions: ctx.runner_overrides does NOT contain task_id; ctx.model_overrides does NOT contain task_id; ctx.effort_overrides does NOT contain task_id (if previously inserted); ctx.overflow_recovered does NOT contain task_id; ctx.overflow_original_model does NOT contain task_id; ctx.overflow_original_task_model does NOT contain task_id",
+        "Test assertion: stderr captured during the call contains the message `Operator changed task model for {task_id}`",
+        "Test: no-op edit — set tasks.model to the SAME value already there; assert no maps were modified; assert no stderr message",
+        "Commit message: `test: TEST-002-completed - End-to-end override invalidation`"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Phase 3 end-to-end test for US-006. Verifies the operator escape valve works against a real loop iteration: simulate operator updating `tasks.model` via the same path `task-mgr loop init --append --update-existing` would use; run one iteration; assert that runner_overrides + model_overrides + effort_overrides + overflow_recovered + overflow_original_model + overflow_original_task_model are all cleared for that task AND the new spawn uses the operator's chosen model.",
+      "estimatedEffort": "medium",
+      "id": "TEST-002",
+      "notes": "Reference: PRD §3 US-006 AC for the operator escape-valve test.\n\nLeverage the existing in-memory sqlite test helper pattern from tests/overflow_filesystem.rs or similar.\n\nLearning [2728]: per-task HashMap pattern — assertions iterate over the six maps.",
+      "passes": true,
+      "priority": 26,
+      "qualityDimensions": [
+        "Test uses REAL Connection (in-memory sqlite via the existing test helper pattern) — NOT a mock",
+        "All six maps verified in one test — catches partial-clear bugs",
+        "Stderr capture for the notice — operator-facing message is part of the contract",
+        "No-op test guards against over-zealous invalidation that would clear overrides on every iteration"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "End-to-end override invalidation: operator edit mid-loop clears overrides",
+      "touchesFiles": [
+        "tests/override_invalidation_e2e.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "New file tests/wave_runtime_error_fallback.rs created",
+        "Test: synthetic wave with slot 0 returning Crash(RuntimeError) and slot 1 returning a normal completion; main thread's post-aggregation runs the RuntimeError hook for slot 0's task",
+        "Test: assert ctx.runner_overrides mutation is observed AFTER all slots have joined (post-aggregation) — verify via instrumented IterationContext access log or via assert on call order",
+        "Test: run_slot_iteration code path inspection — assert no call to escalate_task_model_if_needed from within the slot worker (grep-like assertion or code-presence check)",
+        "Test: idempotency in wave — second wave iteration on the same task (now on Grok via override) sees Crash(RuntimeError) again; hook is invoked but skips promotion (effective_runner == Grok); counter continues incrementing toward max_retries",
+        "Sanity: synthetic wave with slot 0 spawning ClaudeRunner and slot 1 spawning GrokRunner both produce successful git commits; merge-back logic is runner-agnostic (PRD §2.5 'Wave mode: two slots on different runners merge back' edge case)",
+        "Commit message: `test: TEST-003-completed - Wave-mode RuntimeError fallback wiring`"
+      ],
+      "dependsOn": [
+        "MILESTONE-1"
+      ],
+      "description": "Phase 3 wave-mode-specific test for US-004. Verifies the RuntimeError fallback hook is wired correctly in wave mode: spawn a simulated wave with one slot returning Crash(RuntimeError); confirm the hook fires from the post-wave aggregation step (main thread); confirm it does NOT fire from inside run_slot_iteration; confirm IterationContext mutations are observed in the correct order.",
+      "estimatedEffort": "high",
+      "id": "TEST-003",
+      "notes": "Reference: PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; learning #1810 (IterationContext not thread-safe); learning #1860 (reorder hints buffer in parallel context); learning #2286 (iteration_pipeline shared sequential+slot).",
+      "passes": true,
+      "priority": 27,
+      "qualityDimensions": [
+        "Wave-mode wiring assertion is MANDATORY — learning #1810 confirms IterationContext is not thread-safe; this is the critical guard",
+        "Idempotency in wave context: second iteration sees override, skips promotion, falls through normal failure accounting",
+        "Tests use the production code path (post-aggregation), not a synthetic test-only invocation"
+      ],
+      "requiresHuman": false,
+      "taskType": "test",
+      "title": "Wave-mode RuntimeError fallback: hook fires from post-aggregation, not slot worker",
+      "touchesFiles": [
+        "tests/wave_runtime_error_fallback.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All TEST-xxx and IMPL-FIX-xxx tasks have passes: true",
+        "Full test suite passes: `cargo test` runs ALL tests; no failures",
+        "`cargo clippy -- -D warnings` produces no warnings",
+        "`cargo fmt --check` passes",
+        "Per-PRD test fixtures (e.g., the realistic-scale grok prompt fixture) work locally when grok is installed",
+        "Commit message: `chore: MILESTONE-2-completed - Integration phase verified`"
+      ],
+      "dependsOn": [
+        "MILESTONE-1",
+        "TEST-001",
+        "TEST-002",
+        "TEST-003"
+      ],
+      "description": "Gate checkpoint after the integration tests (TEST-001/002/003 + any spawned IMPL-FIX). Runs the FULL unscoped test suite. Trunk-green required.",
+      "estimatedEffort": "medium",
+      "id": "MILESTONE-2",
+      "model": "claude-opus-4-7",
+      "notes": "Standard MILESTONE protocol — full suite, fix or spawn for any unrelated failures.",
+      "passes": true,
+      "priority": 50,
+      "qualityDimensions": [
+        "Full unscoped test suite — milestone gate",
+        "Pre-existing failures fixed inline (or spawned per protocol)",
+        "Manual smoke test rerun: fallback enabled + disabled scenarios"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Phase 4 milestone: integration tests + override invalidation + wave-mode wiring verified",
+      "touchesFiles": [
+        "src/loop_engine/",
+        "tests/"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Trace document in tasks/progress-<prefix>.txt covering each handoff: JSON deserialization → ProjectConfig struct → IterationContext read site → effective_runner formula → dispatch call",
+        "For each handoff, identify the source file:line, the target file:line, and the data type at each end",
+        "Confirm camelCase JSON keys map to snake_case Rust fields correctly (learning #2485 contract)",
+        "Confirm Option<FallbackRunnerConfig> absence is handled at every read site (no .unwrap() on the Option)",
+        "If gaps found (e.g., config read but not passed through to a needed site): spawn WIRE-FIX-xxx task with rootCause + exactFix + verifyCommand",
+        "Commit message: `chore: INT-001-completed - Config-to-dispatch path verification` (or with spawned WIRE-FIX tasks if gaps)"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the cross-boundary data path: .task-mgr/config.json fallbackRunner → ProjectConfig.fallback_runner → IterationContext (read at iteration start) → effective_runner formula at spawn site → dispatch(runner_kind, ...). Confirm handoffs at each boundary preserve types and values correctly. Does NOT write new production code unless wiring is missing; spawn WIRE-FIX if gaps are found.",
+      "estimatedEffort": "low",
+      "id": "INT-001",
+      "notes": "Reference: PRD §6 Data Flow Contracts; learning #2485 (camelCase ↔ snake_case).",
+      "passes": true,
+      "priority": 55,
+      "qualityDimensions": [
+        "Trace is grounded in real code reads — every file:line cited from the actual codebase",
+        "Cross-module type transitions documented (JSON string keys → struct field snake_case)",
+        "No new production code in this task — verification only; gaps spawn WIRE-FIX"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration: ProjectConfig → IterationContext → runner dispatch end-to-end path verification",
+      "touchesFiles": [
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Trace document covering the round-trip: rung 4 fires → both writes happen → next iteration reads both → effective_runner == Grok",
+        "Verify by code reading: the DB UPDATE statement in overflow.rs (FEAT-006) actually executes against the connection passed in",
+        "Verify by code reading: resolve_task_model (model.rs:149) reads task_model from task_row.model (highest precedence)",
+        "Verify by code reading: ctx.model_overrides is consulted AFTER resolve_task_model in engine.rs:~2236 — overrides win",
+        "Confirm: even if DB UPDATE is skipped (hypothetical regression), in-memory model_overrides STILL wins on the spawn dispatch — but on next restart (in-memory cleared), the DB row controls (this is the persistence semantics from PRD §2.5)",
+        "If verification reveals the architect's concern is realized in code (override silently shadowed by stale tasks.model in some path): spawn WIRE-FIX-xxx with exact fix",
+        "Commit message: `chore: INT-002-completed - Override-to-DB consistency verification`"
+      ],
+      "dependsOn": [
+        "MILESTONE-2"
+      ],
+      "description": "Trace the second critical cross-boundary path: handle_prompt_too_long fires rung 4 → writes ctx.runner_overrides + ctx.model_overrides AND UPDATEs tasks.model column → next iteration's resolve_task_model reads tasks.model from the row AND ctx.model_overrides AND ctx.runner_overrides → effective_runner formula resolves to Grok. Confirms the architect's critical concern: in-memory override + DB column UPDATE stay in sync. Spawn WIRE-FIX if any path is broken.",
+      "estimatedEffort": "low",
+      "id": "INT-002",
+      "notes": "Reference: PRD §6 Consumers of Changed Behavior 'src/loop_engine/engine.rs:4599-4602' (escalate_task_model_if_needed writes tasks.model); PRD §2.5 'tasks.model DB column interaction'.\n\nThis traces the architect's #1 silent-bug class. If the trace reveals a real gap, the WIRE-FIX-xxx spawned here gets priority 57-65.",
+      "passes": true,
+      "priority": 56,
+      "qualityDimensions": [
+        "Read actual code at each cited line — do not infer from struct names",
+        "The architect's concern is the highest-impact silent bug class for this feature; this task is the verification gate"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "title": "Integration: handle_prompt_too_long → DB tasks.model UPDATE → resolve_task_model next-iteration consistency",
+      "touchesFiles": [
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/model.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "All INT-xxx tasks have passes: true",
+        "Full-context review of src/loop_engine/runner.rs, src/loop_engine/engine.rs, src/loop_engine/overflow.rs, src/loop_engine/model.rs, src/loop_engine/project_config.rs",
+        "DRY review: ClaudeRunner and GrokRunner share as much code as possible (signal handling, stdin write, env wiring) — duplicates flagged",
+        "Complexity review: any function over ~100 lines, any nested-conditional > 3 deep flagged",
+        "Pattern adherence: does the code match existing patterns (learning #1989/#2699 trait-based resolver shape, learning #2728 per-task HashMap, learning #2031 order of operations)?",
+        "Spawn REFACTOR-xxx tasks via `task-mgr add --stdin --depended-on-by MILESTONE-FINAL`",
+        "If no issues: emit status with 'No issues found' progress note",
+        "Commit message: `chore: REFACTOR-REVIEW-FINAL-completed - <N refactors spawned / no issues>`"
+      ],
+      "dependsOn": [
+        "INT-001",
+        "INT-002"
+      ],
+      "description": "Final review with full context (all features + tests + integration verified). Look for: DRY violations between ClaudeRunner and GrokRunner (shared signal handling, PTY plumbing, env wiring), complexity hotspots, coupling concerns, pattern adherence. Use rust-python-code-reviewer agent. Spawn REFACTOR-xxx tasks for issues found, dep-on MILESTONE-FINAL.",
+      "estimatedEffort": "medium",
+      "id": "REFACTOR-REVIEW-FINAL",
+      "model": "claude-opus-4-7",
+      "notes": "For each refactor: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Priority for spawned refactors: 71-85.",
+      "passes": true,
+      "priority": 70,
+      "qualityDimensions": [
+        "Use rust-python-code-reviewer agent — surface specific findings rather than vague impressions",
+        "Shared-code analysis between Claude and Grok runners is the highest-value DRY review (heaviest duplication risk)",
+        "Spawn refactors with clear scope — each REFACTOR-xxx should be a one-iteration task"
+      ],
+      "requiresHuman": false,
+      "taskType": "review",
+      "title": "Final refactoring review: full-context pass for DRY, clarity, pattern adherence",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "src/loop_engine/CLAUDE.md 'Overflow recovery and diagnostics' section updated to describe 5 rungs AND mention the operator escape valve (override invalidation on tasks.model change) AND Provider routing token-equality algorithm",
+        "Project CLAUDE.md (top-level) gains a mention of fallbackRunner config block under 'task-mgr workflow'",
+        "All new public symbols have rustdoc (per PRD §6 Documentation table): LlmRunner trait, RunnerKind, RunnerOpts, RunnerResult, ClaudeRunner, GrokRunner, dispatch, Provider, provider_for_model, FallbackRunnerConfig, RecoveryAction::FallbackToProvider, IterationContext::runner_overrides, IterationContext::overflow_original_task_model, TaskMgrError::GrokAuthFailure",
+        "grep `unwrap()` / `expect(` in production paths of touched files — zero new occurrences; grep `provider_for_model` / `dispatch(` / `RunnerKind::Grok` — each is reachable from a production call site (not just tests)",
+        "Test fixtures audit: any fixture for IterationContext / ProjectConfig / OverflowEvent uses the REAL struct (not a hand-built map) — grep for `HashMap::new()` and `json!({...})` patterns in test files; confirm they go through real struct constructors",
+        "Manual smoke test #1: .task-mgr/config.json with fallbackRunner absent → loop runs byte-identically to today",
+        "Manual smoke test #2: .task-mgr/config.json with fallbackRunner.enabled=true AND grok on PATH → loop starts, startup check passes",
+        "Manual smoke test #3: same as #2 BUT grok missing from PATH → loop exits with helpful config error before first iteration",
+        "Manual smoke test #4 (optional, requires grok login): force a synthetic overflow (oversize prompt) → confirm rung 4 fires → confirm `(via grok)` banner appears → confirm task completes via Grok",
+        "Commit message: `chore: VERIFY-001-completed - Docs + reachability + smoke verified`"
+      ],
+      "dependsOn": [
+        "REFACTOR-REVIEW-FINAL"
+      ],
+      "description": "Authoritative final check. Verify: architecture docs updated (src/loop_engine/CLAUDE.md 'Overflow recovery' section now describes 5 rungs), project CLAUDE.md mentions fallbackRunner config; all new public functions/symbols have rustdoc; no .unwrap() in production paths; test fixtures use real struct field names; grep-verified reachability for new symbols (provider_for_model, GrokRunner, RunnerKind, FallbackRunnerConfig, TaskMgrError::GrokAuthFailure); manual smoke test rerun confirming both enabled and disabled paths.",
+      "estimatedEffort": "medium",
+      "id": "VERIFY-001",
+      "model": "claude-opus-4-7",
+      "notes": "Reference: PRD §6 Documentation table; PRD §3 US-001 through US-006 ACs.\n\nThe smoke tests document themselves in the progress file — paste the exact commands run and the exact outputs observed.",
+      "passes": true,
+      "priority": 90,
+      "qualityDimensions": [
+        "Documentation is the most-leveraged artifact for future maintainers — invest in clarity over brevity here",
+        "Grep-verified reachability is non-optional — silent dead code is a known regression vector",
+        "Manual smoke test #3 (grok missing + enabled) is the highest-value operator-facing test — confirms the startup binary check actually fires"
+      ],
+      "requiresHuman": false,
+      "taskType": "verification",
+      "timeoutSecs": 1800,
+      "title": "Final validation: docs + reachability + manual smoke + grep gates",
+      "touchesFiles": [
+        "src/loop_engine/CLAUDE.md",
+        "CLAUDE.md",
+        "src/loop_engine/runner.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/engine.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "ALL tasks in tasks/grok-fallback-runner.json have passes: true",
+        "Full test suite passes: `cargo test` — zero failures, zero ignored that should run",
+        "`cargo clippy -- -D warnings` AND `cargo fmt --check` AND `cargo run --bin gen-docs -- --check` all pass",
+        "VERIFY-001 acceptance criteria all met (docs, reachability, manual smoke)",
+        "Primary Goals from PRD §2 verified — Goal 1 (rung 4 + config gating, smoke #1/#2/#4); Goal 2 (RuntimeError hook + wave-mode wiring via TEST-003); Goal 3 (10 spawn_claude callers unchanged, CODE-REVIEW-1 grep-confirmed); Goal 4 (default behavior unchanged when fallbackRunner absent, smoke #1); Goal 5 (operator escape valve via TEST-002)",
+        "Branch is ready to merge to main per the PRD's mergeStrategy",
+        "Commit message: `chore: MILESTONE-FINAL-completed - Grok fallback runner ready to merge`"
+      ],
+      "dependsOn": [
+        "VERIFY-001"
+      ],
+      "description": "Final gate. ALL tasks have passes: true. Full unscoped suite passes. Manual smoke tests pass. Docs updated. PRD's primary goals and success metrics are demonstrably met.",
+      "estimatedEffort": "low",
+      "id": "MILESTONE-FINAL",
+      "model": "claude-opus-4-7",
+      "notes": "Standard MILESTONE protocol. If any unrelated failure appears in the full-suite run, follow the spawn-FIX protocol from the prompt.",
+      "passes": true,
+      "priority": 99,
+      "qualityDimensions": [
+        "Final milestone — leave the trunk fully green AND fully tested AND fully documented",
+        "Map each PRD Primary Goal to the task that proves it",
+        "No outstanding TODO or FIXME comments introduced by this PRD's commits (grep)"
+      ],
+      "requiresHuman": false,
+      "taskType": "milestone",
+      "timeoutSecs": 1800,
+      "title": "Final milestone: all phases complete, all reviews resolved, trunk fully green, docs updated",
+      "touchesFiles": [
+        "src/loop_engine/",
+        "tests/",
+        "CLAUDE.md"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Each helper function under 60 lines",
+        "No behavior change: existing runner.rs tests pass unchanged",
+        "cargo test --lib loop_engine::runner passes",
+        "cargo clippy -- -D warnings clean",
+        "ClaudeRunner::spawn and GrokRunner::spawn under 160 lines each",
+        "Helpers do not match on provider — provider-specific divergence stays in per-runner bodies"
+      ],
+      "description": "ClaudeRunner::spawn (runner.rs:230-564, 335 lines) and GrokRunner::spawn (runner.rs:602-879, 277 lines) duplicate ~130 lines of process-lifecycle scaffolding nearly verbatim. Each runner re-implements: (1) env wiring (LOOP_ALLOW_DESTRUCTIVE, TASK_MGR_DIR canonicalize, ACTIVE_PREFIX_ENV, working_dir, process_group(0) cfg(unix)) — runner.rs:359-395 vs 690-709; (2) spawn + ErrorKind::NotFound → IoErrorWithContext mapping — 397-414 vs 712-726; (3) stdin write_all + BrokenPipe match — 418-439 vs 728-748; (4) watchdog construction (AtomicU64 completion_epoch + 2 AtomicBool flags + conditional watchdog thread) — 448-479 vs 750-778; (5) plain-mode stdout reader loop — 511-531 vs 819-839; (6) child.wait + watchdog teardown + atomic loads — 533-554 vs 841-855. Extract into private free fns in runner.rs: apply_common_env, spawn_with_context, write_prompt_to_stdin, spawn_watchdog, read_plain_stdout. Keep argv assembly + provider-specific stdio wiring (PTY vs piped) in the per-runner bodies.",
+      "estimatedEffort": "medium",
+      "id": "5ba153a7-REFACTOR-1-RUNNER-DRY",
+      "notes": "Reviewer report from REFACTOR-REVIEW-FINAL. Sole HIGH-severity issue. Subsumes MED-severity function-length finding.",
+      "passes": true,
+      "priority": 75,
+      "title": "Extract shared process-lifecycle helpers from ClaudeRunner and GrokRunner",
+      "touchesFiles": [
+        "src/loop_engine/runner.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "git log main..HEAD now includes the PR #9 commit bb9cb29 (or its merge equivalent)",
+        "git diff main..HEAD no longer shows phantom deletions of src/loop_engine/git_reconcile.rs or tasks/post-merge-slot-reconcile.* — those files reappear on the branch",
+        "tests/worktree_db_resolution.rs conflict resolved with both feature-side and main-side intent preserved (verify by reading the file end-to-end after resolution)",
+        "cargo test --lib loop_engine passes (scoped gate)",
+        "cargo test passes (full unscoped suite — milestone-level)",
+        "cargo clippy -- -D warnings clean",
+        "Merge commit message follows project conventions"
+      ],
+      "description": "From /review-loop H1. The feature branch's merge base is 0ac56743, but local main is at bb9cb29 (PR #9 — Post-merge slot completion reconciliation). git diff main..HEAD shows -728 lines on src/loop_engine/git_reconcile.rs and -756 lines across tasks/post-merge-slot-reconcile.{json,md} — these are NOT deletions on the feature branch, they are PR #9 content not yet on the branch. Merge main into the branch. Expect ONE conflict in tests/worktree_db_resolution.rs (both feature and main touched it post 0ac56743): on feature side commits 4288135 / 722e4fe modified it for grok-fallback work; on main side PR #9 modified it for slot reconciliation. Resolve preserving both behaviors. After merge: run cargo test --lib loop_engine (scoped) AND cargo test (full unscoped suite) AND cargo clippy -- -D warnings. Commit the merge with a conventional message. Do NOT force-push. Do NOT skip hooks.",
+      "estimatedEffort": "medium",
+      "id": "5ba153a7-REVIEW-FIX-1-MERGE-MAIN",
+      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. H1 of 3 high-severity findings. Reviewer cite: review reply, 'H1: rebase or merge main into the branch; resolve the single conflict in tests/worktree_db_resolution.rs'.",
+      "passes": true,
+      "priority": 80,
+      "title": "Merge main into feat/grok-fallback-runner; resolve worktree_db_resolution.rs conflict; re-run full suite",
+      "touchesFiles": [
+        "tests/worktree_db_resolution.rs",
+        "src/loop_engine/git_reconcile.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "H2: cargo test runtime_error_fallback passes a regression test that promotes from claude-opus-4-7[1m] at threshold",
+        "H2: engine.rs:4913 region no longer uses string-eq with OPUS_MODEL; uses ModelTier-based inclusive check",
+        "M1: threshold comparison uses u32 throughout or guards the cast",
+        "H3: each non-primary resolve_effective_runner call site has debug_assert_eq! cross-check against the primary, OR the primary value is threaded through; debug build catches a deliberate mismatch in test",
+        "M2: a wave-mode promotion test asserts exactly ONE banner line on stderr per promoted task per iteration (no duplicate)",
+        "M3: tests/fallback_config.rs covers the case where GROK_BINARY is set; check_fallback_runner_binary succeeds when GROK_BINARY points at a real binary even if cli_binary is None and `grok` is not on PATH",
+        "M5: TASK_MGR_GROK_AUTH_WINDOW_SECS env override implemented and exercised by a test that uses it to make the timing gate deterministic",
+        "L1: temp-script tests use TempDir or a Drop guard; no `remove_file` on a raw path",
+        "L2: overflow.rs:77 region uses `target_model` (not `grok_model`)",
+        "L3: engine.rs:235-238 rustdoc disambiguates the FEAT-007 reference",
+        "L4: a short comment near model_tier or provider_for_model pins the substring-vs-token divergence",
+        "L5: rustdoc field-clear order in engine.rs check_override_invalidation matches code order",
+        "cargo test --lib loop_engine passes",
+        "cargo test (full unscoped suite) passes",
+        "cargo clippy -- -D warnings clean"
+      ],
+      "dependsOn": [
+        "5ba153a7-REVIEW-FIX-1-MERGE-MAIN"
+      ],
+      "description": "From /review-loop on 2026-05-18 (H2, H3, M1, M2, M3, M5, L1-L5 bundled into one atomic fix). Implement each finding below; run cargo test --lib loop_engine + cargo clippy after every batch; commit at the end of the task.\n\n## H2 — was_at_opus misses Opus[1M] (src/loop_engine/engine.rs:4913)\nCurrent: `let was_at_opus = matches!(current_model.as_deref(), Some(m) if m == model::OPUS_MODEL);` — string-eq excludes `claude-opus-4-7[1m]`. Goal #2 of the PRD ('after the Opus ceiling is reached') intends the Opus *tier*, not the exact ID. Fix: use the inclusive ModelTier check (e.g. `matches!(model::model_tier(current_model.as_deref()), ModelTier::Opus)` — confirm the exact helper name in src/loop_engine/model.rs). Add a regression test in tests/runtime_error_fallback.rs that puts a task on `claude-opus-4-7[1m]` with consecutive_failures >= threshold and asserts promotion to Grok.\n\n## M1 — u32 → i32 cast (engine.rs:4914)\nSame line region. `new_count < fallback.runtime_error_threshold as i32` casts u32 lossily at >= 2^31. Compare in u32 space (or guard the cast). Default threshold is 2, so no behavior change for sane inputs; cleanup only.\n\n## H3 — effective_runner re-derivation drift guard\nresolve_effective_runner is called at engine.rs:1456, 1877, 2437, 2731, 4917. PRD §2.5 mandates a single computed value per iteration to prevent silent drift. Choose the lighter fix: at each non-primary call site, add `debug_assert_eq!(resolve_effective_runner(...), <primary_computed_value>);` cross-checks where the primary value is in scope. If threading the single value is cleaner, do that instead — but keep the diff small. Goal: a future refactor that returns the wrong value at one site fails a debug build before reaching production.\n\n## M2 — Double eprintln! on promotion\nFind the two promotion eprintln! sites (rung-4 in overflow.rs and the RuntimeError hook in engine.rs ~4937). Under wave-mode aggregation a single task can hit both in one wave. Consolidate so each promotion emits exactly one banner line per iteration. Acceptable approach: gate the second eprintln! on the override map being empty (i.e. first-time promotion only), or move the banner to a shared site after both gates have run.\n\n## M3 — check_fallback_runner_binary does not honor $GROK_BINARY (project_config.rs:283)\nThe startup check resolves `cli_binary or 'grok'` but skips the env var, while GrokRunner::spawn uses `$GROK_BINARY → cli_binary → 'grok'`. Mismatch confuses operators who set GROK_BINARY for test/dev. Update check_fallback_runner_binary to use the same resolution chain. Update tests/fallback_config.rs to cover the env-var-set case.\n\n## M5 — Fixed 3s GROK_AUTH_FAILURE_WINDOW with no env override (runner.rs:41)\nAdd TASK_MGR_GROK_AUTH_WINDOW_SECS env override mirroring the CLAUDE_BINARY test-only pattern. Parse u64, fall back to 3 on missing/invalid. Document in rustdoc as a test-only seam. Update tests/grok_auth_failure.rs to use the env override for the fast/slow case rather than depending on real timing.\n\n## L1 — Temp-script test cleanup hardening\ntests/grok_auth_failure.rs and tests/grok_runner_unit.rs use std::env::temp_dir() with `let _ = std::fs::remove_file(...)` cleanup. Wrap in a tempfile::TempDir or a Drop guard so test panics don't leak files.\n\n## L2 — Rename grok_model → target_model in RecoveryAction::FallbackToProvider.user_message (overflow.rs:77-81)\nThe provider name is configurable; the local should not bake 'grok' into the identifier. Pure rename.\n\n## L3 — Disambiguate FEAT-007 in IterationContext::crashed_last_iteration rustdoc (engine.rs:235-238)\nThe doc references 'FEAT-007' but this PRD also has its own FEAT-007. Clarify which PRD/scope.\n\n## L4 — Comment substring-vs-token divergence in model.rs\nmodel::model_tier uses substring matching while model::provider_for_model uses token equality (intentional). A short comment near either function pinning the divergence prevents a future 'fix' that aligns them and breaks Groq Inc. routing.\n\n## L5 — Reorder six-field clear rustdoc in engine.rs:4812-4817 to match code order\nCosmetic: the rustdoc lists the cleared fields in one order and the code clears them in another. Align.\n\n## Out of scope here\nL6 (the diff-stat 'deletions' that resolve when H1 merges main) is resolved by 5ba153a7-REVIEW-FIX-1-MERGE-MAIN. M4 was already resolved during review (assertion exists at tests/grok_runner_unit.rs:167).",
+      "estimatedEffort": "high",
+      "id": "5ba153a7-REVIEW-FIX-2-ALL",
+      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. Bundles H2, H3, M1, M2, M3, M5, L1-L5 into one atomic fix. Depends on 5ba153a7-REVIEW-FIX-1-MERGE-MAIN (H1) so the merged base is the starting point.",
+      "passes": false,
+      "priority": 81,
+      "title": "Address all remaining /review-loop findings: Opus[1M] gate, drift guards, banner dedupe, startup env parity, auth window env, low nits",
+      "touchesFiles": [
+        "src/loop_engine/engine.rs",
+        "src/loop_engine/overflow.rs",
+        "src/loop_engine/model.rs",
+        "src/loop_engine/project_config.rs",
+        "src/loop_engine/runner.rs",
+        "tests/runtime_error_fallback.rs",
+        "tests/grok_auth_failure.rs",
+        "tests/grok_runner_unit.rs",
+        "tests/fallback_config.rs"
+      ]
+    }
+  ],
+  "version": "1.0"
+}

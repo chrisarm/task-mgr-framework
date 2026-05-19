@@ -62,6 +62,7 @@ use crate::loop_engine::prd_reconcile::{
 use crate::loop_engine::progress;
 use crate::loop_engine::project_config;
 use crate::loop_engine::prompt::{self, BuildPromptParams};
+use crate::loop_engine::runner::{self, RunnerKind};
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::stale::StaleTracker;
 use crate::loop_engine::status_queries::read_prd_hints;
@@ -151,6 +152,12 @@ pub struct IterationParams<'a> {
     pub permission_mode: &'a PermissionMode,
     /// Paths to sibling PRD JSON files (batch mode only, empty otherwise).
     pub batch_sibling_prds: &'a [PathBuf],
+    /// Full per-project loop configuration (`.task-mgr/config.json`). Read
+    /// once at the start of `run_loop` and threaded through here so that
+    /// `overflow::handle_prompt_too_long` (FEAT-006 rung 4) can consult
+    /// `fallback_runner` without re-reading the file from every iteration.
+    /// Matches the wave-mode plumbing on `WaveIterationParams::project_config`.
+    pub project_config: &'a project_config::ProjectConfig,
 }
 
 /// Result of a single iteration.
@@ -213,7 +220,8 @@ pub struct IterationContext {
     /// Per-task crash flag for the most recent iteration on each task. The
     /// pipeline writes one entry per iteration:
     /// `map[task_id] = matches!(outcome, IterationOutcome::Crash(_))`.
-    /// `check_crash_escalation` (post-FEAT-007) consults this map directly,
+    /// `check_crash_escalation` (updated in the grok-fallback-runner PRD, task
+    /// FEAT-007 of that PRD) consults this map directly,
     /// replacing the `(last_task_id == current) && last_was_crash` predicate
     /// that today's two scalar fields encode.
     ///
@@ -278,6 +286,24 @@ pub struct IterationContext {
     /// - `1` — halts on any merge-back failure
     /// - `2` (default) — halts after two consecutive failure waves
     pub consecutive_merge_fail_waves: u32,
+    /// Per-task runner overrides. Pinned to the single computed
+    /// `effective_runner` at the spawn site (FEAT-005, PRD §2.5). Written by
+    /// the overflow rung-4 `FallbackToProvider` (FEAT-008) and the
+    /// RuntimeError fallback hook (FEAT-007); read at every spawn site via
+    /// [`resolve_effective_runner`]. Empty by default — preserves today's
+    /// pure-Claude behavior byte-for-byte (regression guard).
+    ///
+    /// Loop-thread-local: writes happen on the main thread only. Slot
+    /// workers receive a precomputed `RunnerKind` via `SlotContext` and
+    /// never touch this map (Learning #1810 thread-safety).
+    pub runner_overrides: std::collections::HashMap<String, RunnerKind>,
+    /// Per-task snapshot of the `tasks.model` DB column captured at the
+    /// moment a runner override was first inserted. Used by
+    /// `check_override_invalidation` (FEAT-008) to detect operator edits to
+    /// the model column and silently clear stale overrides. `None` value
+    /// records that the DB column was NULL at snapshot time, distinct from
+    /// the key being absent.
+    pub overflow_original_task_model: std::collections::HashMap<String, Option<String>>,
 }
 
 impl IterationContext {
@@ -299,8 +325,36 @@ impl IterationContext {
             pending_reorder_hints: Vec::new(),
             pending_slot_tasks: Vec::new(),
             consecutive_merge_fail_waves: 0,
+            runner_overrides: std::collections::HashMap::new(),
+            overflow_original_task_model: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Compute the effective runner for a task: per-task override → provider of
+/// the effective model → default Claude.
+///
+/// Single source of truth (PRD §2.5): every spawn site MUST resolve runner
+/// kind through this helper, never via an OR-style fallback. Re-deriving
+/// the formula independently in two places risks silent drift if either
+/// branch updates without the other (the prohibition is explicit in the
+/// PRD "Prohibited outcomes" list).
+///
+/// The helper lives in `engine.rs` (not `runner.rs`) so `runner.rs` stays
+/// free of `IterationContext` coupling — the runner module remains
+/// provider-neutral.
+pub fn resolve_effective_runner(
+    ctx: &IterationContext,
+    task_id: &str,
+    effective_model: Option<&str>,
+) -> RunnerKind {
+    ctx.runner_overrides
+        .get(task_id)
+        .copied()
+        .unwrap_or_else(|| match model::provider_for_model(effective_model) {
+            model::Provider::Grok => RunnerKind::Grok,
+            model::Provider::Claude => RunnerKind::Claude,
+        })
 }
 
 /// Per-slot execution context for parallel wave iterations.
@@ -329,6 +383,15 @@ pub struct SlotContext {
     /// identity from `prompt_bundle.task_id` so the bundle remains the
     /// canonical source-of-truth post-spawn.
     pub prompt_bundle: crate::loop_engine::prompt::slot::SlotPromptBundle,
+    /// Pre-resolved runner kind for this slot's task (FEAT-005). Computed on
+    /// the main thread via [`resolve_effective_runner`] BEFORE the worker
+    /// spawns, so the slot can dispatch without touching
+    /// `IterationContext.runner_overrides` (Learning #1810 thread-safety;
+    /// the no-override-maps-in-slot-body test enforces this). Default is
+    /// `RunnerKind::Claude` for slots constructed without main-thread
+    /// enrichment (e.g. test fixtures) — matches today's pure-Claude
+    /// behavior byte-for-byte.
+    pub effective_runner: RunnerKind,
 }
 
 /// Result of running one slot during a wave.
@@ -374,6 +437,12 @@ pub struct SlotResult {
     /// `task_difficulty` instead of hardcoding `None`. `None` when the task
     /// has no difficulty set or for `slot_failure_result` entries.
     pub task_difficulty: Option<String>,
+    /// Pre-resolved runner kind threaded from `SlotContext::effective_runner`.
+    /// Used by `process_slot_result` so the overflow rung-4 idempotency guard
+    /// pins on the same value the slot used to dispatch (PRD §2.5 single-source
+    /// rule). Defaults to `RunnerKind::Claude` for failure entries where no
+    /// slot was actually dispatched.
+    pub effective_runner: RunnerKind,
 }
 
 /// Aggregate result of a parallel wave.
@@ -464,6 +533,7 @@ fn slot_early_exit(slot: &SlotContext, exit: SlotEarlyExit) -> SlotResult {
         section_sizes: slot.prompt_bundle.section_sizes.clone(),
         dropped_sections: slot.prompt_bundle.dropped_sections.clone(),
         task_difficulty: slot.prompt_bundle.difficulty.clone(),
+        effective_runner: slot.effective_runner,
     }
 }
 
@@ -559,7 +629,13 @@ pub fn run_slot_iteration(
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
 
-    let claude_result = claude::spawn_claude(
+    // FEAT-005: dispatch via the precomputed effective_runner (resolved on
+    // the main thread in `run_wave_iteration` before the slot was spawned).
+    // The slot body MUST NOT read the IterationContext override maps
+    // directly (Learning #1810; enforced by the source-sniff test in
+    // tests/runtime_error_fallback.rs).
+    let claude_result = runner::dispatch(
+        slot.effective_runner,
         &bundle.prompt,
         &params.permission_mode,
         claude::SpawnOpts {
@@ -579,7 +655,31 @@ pub fn run_slot_iteration(
         },
     );
     monitor::stop_monitor(monitor_handle);
-    let claude_result = claude_result?;
+    // FEAT-007: route TaskMgrError::GrokAuthFailure into a Crash(GrokAuthFailure)
+    // outcome instead of propagating out of the slot. The post-wave aggregator
+    // detects this variant and skips both the failure-counter increment AND
+    // the Grok promotion hook (cascade prevention).
+    let claude_result = match claude_result {
+        Ok(r) => r,
+        Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
+            eprintln!(
+                "[slot {}] Grok auth failure for task {}: {}",
+                slot.slot_index, task_id, hint
+            );
+            return Ok(slot_early_exit(
+                slot,
+                SlotEarlyExit {
+                    outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
+                    files_modified: task_files,
+                    should_stop: false,
+                    output: hint,
+                    effective_model,
+                    effective_effort: effort,
+                },
+            ));
+        }
+        Err(e) => return Err(e),
+    };
 
     if claude_result.timed_out {
         eprintln!(
@@ -661,6 +761,7 @@ pub fn run_slot_iteration(
         section_sizes: bundle.section_sizes.clone(),
         dropped_sections: bundle.dropped_sections.clone(),
         task_difficulty: bundle.difficulty.clone(),
+        effective_runner: slot.effective_runner,
     })
 }
 
@@ -737,6 +838,7 @@ fn slot_failure_result(
         section_sizes: Vec::new(),
         dropped_sections: Vec::new(),
         task_difficulty: None,
+        effective_runner: RunnerKind::Claude,
     }
 }
 
@@ -1231,6 +1333,13 @@ fn build_slot_contexts(
                 slot_index: idx,
                 working_root: path.clone(),
                 prompt_bundle,
+                // Default to Claude. Main-thread enrichment in
+                // `run_wave_iteration` overwrites with the resolved value
+                // from `resolve_effective_runner(ctx, ...)` before the slot
+                // thread spawns. Test fixtures that call `build_slot_contexts`
+                // directly (without the enrichment step) inherit Claude —
+                // the default-empty regression behavior.
+                effective_runner: RunnerKind::Claude,
             }
         })
         .collect()
@@ -1352,6 +1461,24 @@ fn process_slot_result(
             cluster_effort: slot_result.iteration_result.effective_effort,
             section_sizes: slot_result.section_sizes.clone(),
         };
+        // FEAT-005/H3: use the pre-dispatch runner threaded from SlotContext
+        // so the rung-4 idempotency guard pins on the same value the slot used.
+        // The assertion cross-checks that re-derivation from the result's
+        // effective_model agrees (catches drift if runner_overrides logic
+        // changes). W4: kept as a real `assert_eq!` (not `debug_assert_eq!`)
+        // so drift is caught in release builds too — the cost is one HashMap
+        // lookup vs. a silent dispatch mismatch that would route the wrong
+        // model id to the wrong runner binary.
+        let effective_runner = slot_result.effective_runner;
+        assert_eq!(
+            resolve_effective_runner(
+                ctx,
+                tid,
+                slot_result.iteration_result.effective_model.as_deref()
+            ),
+            effective_runner,
+            "effective_runner drift: process_slot_result re-derivation diverged from pre-dispatch value"
+        );
         let _ = overflow::handle_prompt_too_long(
             ctx,
             params.conn,
@@ -1363,6 +1490,8 @@ fn process_slot_result(
             Some(params.run_id),
             params.db_dir,
             Some(slot_idx),
+            effective_runner,
+            params.project_config,
         );
     }
 
@@ -1798,7 +1927,25 @@ pub fn run_wave_iteration(
     let n_slots = group.len();
     let slot_paths: &[PathBuf] = &params.slot_worktree_paths[..n_slots];
     let slot_prompt_params = build_slot_prompt_params(&params);
-    let slot_contexts = build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
+    let mut slot_contexts =
+        build_slot_contexts(params.conn, group, slot_paths, &slot_prompt_params);
+    // FEAT-005: resolve effective runner per slot on the main thread before
+    // spawning the worker. Single source of truth for the formula — slots
+    // never read `ctx.runner_overrides` directly (Learning #1810). The
+    // effective_model mirrors what `run_slot_iteration` recomputes internally
+    // (bundle.resolved_model → params.default_model fallback) so the
+    // runner resolution sees the same model string the slot will use.
+    for slot in slot_contexts.iter_mut() {
+        // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
+        check_override_invalidation(ctx, params.conn, &slot.prompt_bundle.task_id);
+        let effective_model = slot
+            .prompt_bundle
+            .resolved_model
+            .as_deref()
+            .or(params.default_model);
+        slot.effective_runner =
+            resolve_effective_runner(ctx, &slot.prompt_bundle.task_id, effective_model);
+    }
     let slot_params = build_shared_slot_params(&params);
 
     // Run wave (blocks until every spawned slot thread joins).
@@ -1810,6 +1957,46 @@ pub fn run_wave_iteration(
     let mut agg = WaveAggregator::new(wave_result.outcomes.len());
     for slot_result in &mut wave_result.outcomes {
         process_slot_result(slot_result, &mut params, ctx, &mut agg);
+    }
+
+    // FEAT-007: post-wave retry tracking. Mirrors the sequential call site in
+    // `run_loop` (engine.rs:~3992) so wave-mode RuntimeError slots feed the
+    // `consecutive_failures` counter, the Claude-tier escalation ladder, AND
+    // the new Grok promotion hook on the main thread (Learning #1810:
+    // IterationContext is not thread-safe; this MUST NOT run inside a slot
+    // worker). Skips claim-fail entries (`claim_succeeded == false`) so a
+    // synthetic crash record never increments the counter on a task that
+    // never actually executed. Crash(GrokAuthFailure) short-circuits — auth
+    // lapses are operator problems, not task failures.
+    for slot_result in &wave_result.outcomes {
+        if !slot_result.claim_succeeded {
+            continue;
+        }
+        let Some(ref task_id) = slot_result.iteration_result.task_id else {
+            continue;
+        };
+        if matches!(
+            slot_result.iteration_result.outcome,
+            IterationOutcome::Completed
+                | IterationOutcome::Empty
+                | IterationOutcome::Reorder(_)
+                | IterationOutcome::RateLimit
+                | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
+        ) {
+            continue;
+        }
+        if let Err(e) = handle_task_failure(
+            params.conn,
+            task_id,
+            params.iteration as i64,
+            ctx,
+            params.project_config.fallback_runner.as_ref(),
+        ) {
+            eprintln!(
+                "Warning: failed to start retry tracking transaction for slot {} task {}: {}",
+                slot_result.slot_index, task_id, e
+            );
+        }
     }
 
     // CrashTracker policy per FEAT-010 AC.
@@ -2335,6 +2522,14 @@ pub fn run_iteration(
         );
     }
 
+    // FEAT-008: operator escape valve — clear stale overrides if tasks.model changed.
+    check_override_invalidation(ctx, params.conn, &task_id);
+
+    // FEAT-005/009: resolve effective runner once per iteration (PRD §2.5
+    // single source of truth). Placed before the banner so the "(via grok)"
+    // annotation can be included in the iteration header.
+    let effective_runner = resolve_effective_runner(ctx, &task_id, effective_model.as_deref());
+
     // Step 5: Print iteration header (with post-escalation effective_model + effort)
     eprintln!(
         "{}",
@@ -2347,6 +2542,7 @@ pub fn run_iteration(
             effort,
             &ctx.overflow_recovered,
             &ctx.overflow_original_model,
+            effective_runner,
         )
     );
 
@@ -2358,7 +2554,8 @@ pub fn run_iteration(
         prompt_result.task_difficulty.as_deref(),
         Arc::clone(&monitor_handle.last_activity_epoch),
     );
-    let claude_result = claude::spawn_claude(
+    let claude_result = runner::dispatch(
+        effective_runner,
         &prompt_result.prompt,
         params.permission_mode,
         claude::SpawnOpts {
@@ -2387,7 +2584,29 @@ pub fn run_iteration(
     );
     monitor::stop_monitor(monitor_handle);
     claude::cleanup_ghost_sessions();
-    let claude_result = claude_result?;
+    // FEAT-007: surface TaskMgrError::GrokAuthFailure as a Crash(GrokAuthFailure)
+    // outcome instead of bubbling out of the iteration. The retry-tracking site
+    // in `run_loop` skips this variant so an xAI auth lapse never pushes a
+    // healthy task toward `auto_block_task`.
+    let claude_result = match claude_result {
+        Ok(r) => r,
+        Err(crate::error::TaskMgrError::GrokAuthFailure { hint }) => {
+            eprintln!("Grok auth failure for task {}: {}", task_id, hint);
+            return Ok(IterationResult {
+                outcome: IterationOutcome::Crash(config::CrashType::GrokAuthFailure),
+                task_id: Some(task_id),
+                files_modified: task_files,
+                should_stop: false,
+                output: hint,
+                effective_model,
+                effective_effort: effort,
+                key_decisions_count: 0,
+                conversation: None,
+                shown_learning_ids: Vec::new(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Step 6.1: Print hints for denied tools
     let denied_cmds = claude::extract_denied_commands(&claude_result.permission_denials);
@@ -2600,6 +2819,9 @@ pub fn run_iteration(
         outcome,
         IterationOutcome::Crash(config::CrashType::PromptTooLong)
     ) {
+        // FEAT-006/H3: use the primary effective_runner computed above (PRD §2.5
+        // single-source rule — never re-derive). The outer binding from the
+        // banner step is in scope here; shadowing it would be drift-prone.
         let _ = overflow::handle_prompt_too_long(
             ctx,
             params.conn,
@@ -2611,6 +2833,8 @@ pub fn run_iteration(
             Some(params.run_id),
             params.db_dir,
             None,
+            effective_runner,
+            params.project_config,
         );
     }
 
@@ -3756,6 +3980,7 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
             user_default_model: user_default_model.as_deref(),
             permission_mode: &permission_mode,
             batch_sibling_prds: &run_config.batch_sibling_prds,
+            project_config: &project_config,
         };
 
         let mut result = match run_iteration(&mut ctx, &iteration_params) {
@@ -3940,6 +4165,9 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Retry tracking: increment consecutive_failures for non-Completed task failures.
         // Excluded: Empty (no task attempted), Reorder (not a failure), RateLimit (external).
+        // FEAT-007: also exclude Crash(GrokAuthFailure) — an xAI auth lapse is an operator
+        // problem, not a task failure; incrementing here would push a healthy task toward
+        // auto_block_task with a misleading reason.
         if let Some(ref task_id) = result.task_id
             && !matches!(
                 result.outcome,
@@ -3947,8 +4175,15 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
                     | IterationOutcome::Empty
                     | IterationOutcome::Reorder(_)
                     | IterationOutcome::RateLimit
+                    | IterationOutcome::Crash(config::CrashType::GrokAuthFailure)
             )
-            && let Err(e) = handle_task_failure(&mut conn, task_id, iteration as i64)
+            && let Err(e) = handle_task_failure(
+                &mut conn,
+                task_id,
+                iteration as i64,
+                &mut ctx,
+                project_config.fallback_runner.as_ref(),
+            )
         {
             eprintln!("Warning: failed to start retry tracking transaction: {}", e);
         }
@@ -4623,6 +4858,62 @@ pub fn check_crash_escalation(
     }
 }
 
+/// Operator escape valve: detect when an operator edited `tasks.model` in the
+/// DB out-of-band and clear any stale auto-recovery overrides for that task.
+///
+/// Called at the top of every iteration (both wave and sequential) BEFORE
+/// `resolve_effective_runner`. Short-circuits immediately when `task_id` has no
+/// entry in `ctx.overflow_original_task_model` — the dominant case (most tasks
+/// never trigger the overflow ladder) is free.
+///
+/// When the current DB value differs from the snapshot, all six per-task
+/// override entries are cleared (in the same order the code removes them):
+/// 1. `runner_overrides`
+/// 2. `model_overrides`
+/// 3. `effort_overrides`
+/// 4. `overflow_recovered`
+/// 5. `overflow_original_model`
+/// 6. `overflow_original_task_model`
+///
+/// A single stderr line is emitted so operators can see the escape valve fired.
+/// DB read errors are logged and treated as no-op so a transient failure never
+/// blocks the iteration.
+pub fn check_override_invalidation(ctx: &mut IterationContext, conn: &Connection, task_id: &str) {
+    // No snapshot → no override was ever set for this task; skip DB round-trip.
+    if !ctx.overflow_original_task_model.contains_key(task_id) {
+        return;
+    }
+
+    let current_model: Option<String> = match conn.query_row(
+        "SELECT model FROM tasks WHERE id = ?1",
+        rusqlite::params![task_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Warning: check_override_invalidation({task_id}): DB read failed: {e}");
+            return;
+        }
+    };
+
+    let snapshotted = ctx.overflow_original_task_model.get(task_id);
+    if snapshotted.map(Option::as_deref) == Some(current_model.as_deref()) {
+        return;
+    }
+
+    // Operator changed tasks.model — clear all six per-task override channels.
+    ctx.runner_overrides.remove(task_id);
+    ctx.model_overrides.remove(task_id);
+    ctx.effort_overrides.remove(task_id);
+    ctx.overflow_recovered.remove(task_id);
+    ctx.overflow_original_model.remove(task_id);
+    ctx.overflow_original_task_model.remove(task_id);
+
+    eprintln!(
+        "Operator changed task model for {task_id} — clearing auto-recovery overrides; resolving fresh."
+    );
+}
+
 /// Treat `Some("")` and `Some("   ")` as "no model known" so both escalation
 /// paths (`check_crash_escalation` and `escalate_task_model_if_needed`) share
 /// the same baseline-fallback semantics.
@@ -4646,21 +4937,60 @@ pub fn should_escalate_for_consecutive_failures(consecutive_failures: i32) -> bo
     consecutive_failures >= 2
 }
 
-/// Escalate the model for a task in the DB when consecutive failures reach the threshold.
+/// W5: deferred Grok promotion bundle. Carries everything needed to mutate
+/// `IterationContext` after a DB write commits. Used by
+/// `escalate_task_model_if_needed_inner` to decouple the DB step from the
+/// ctx step so transactional callers (`handle_task_failure`) can hold the
+/// ctx mutations until `tx.commit()` returns Ok — preventing a one-iteration
+/// dirty-ctx-vs-rolled-back-DB window when commit fails.
+pub(crate) struct PendingPromotion {
+    task_id: String,
+    pre_promotion_model: Option<String>,
+    grok_model: String,
+    new_count: i32,
+}
+
+/// Apply a deferred promotion to the `IterationContext`. Idempotent w.r.t.
+/// `overflow_original_task_model` (`or_insert_with` preserves the first
+/// snapshot). Emits the one-line stderr banner exactly once per promotion
+/// (gated on whether `runner_overrides` already held an entry — see M2 in
+/// the FEAT-007 commit).
+pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPromotion) {
+    ctx.overflow_original_task_model
+        .entry(p.task_id.clone())
+        .or_insert_with(|| p.pre_promotion_model.clone());
+    let already_promoted = ctx.runner_overrides.contains_key(&p.task_id);
+    ctx.runner_overrides
+        .insert(p.task_id.clone(), RunnerKind::Grok);
+    ctx.model_overrides
+        .insert(p.task_id.clone(), p.grok_model.clone());
+    if !already_promoted {
+        eprintln!(
+            "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
+            p.task_id, p.grok_model, p.new_count
+        );
+    }
+}
+
+/// Inner helper: performs the DB writes for escalation/promotion but does
+/// **not** mutate `ctx`. Returns the escalated model AND an optional
+/// `PendingPromotion` the caller must apply via `apply_pending_promotion`
+/// after any enclosing transaction commits. Transactional callers
+/// (`handle_task_failure`) MUST use this variant + apply post-commit to
+/// avoid dirty-ctx on rollback.
 ///
-/// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
-/// - `None` or empty model assumes sonnet baseline → escalates to opus.
-/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
-///
-/// Returns `Some(new_model)` if escalation fired, `None` if below threshold or
-/// the model tier is unknown. The DB is updated in-place when `Some` is returned.
-pub fn escalate_task_model_if_needed(
+/// Reads `ctx` immutably to resolve the effective runner (for the
+/// idempotency guard). Does not capture override-snapshot state — that is
+/// part of the deferred apply.
+pub(crate) fn escalate_task_model_if_needed_inner(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
-) -> TaskMgrResult<Option<String>> {
+    ctx: &IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
+) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     if !should_escalate_for_consecutive_failures(new_count) {
-        return Ok(None);
+        return Ok((None, None));
     }
     let current_model: Option<String> =
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
@@ -4681,7 +5011,93 @@ pub fn escalate_task_model_if_needed(
             task_id, new_model, new_count
         );
     }
-    Ok(escalated)
+
+    // FEAT-007: Grok fallback promotion. Fires only when the task was
+    // ALREADY at Opus before this call (i.e. the Claude escalation step was
+    // a no-op self-loop or no escalation was needed) — Sonnet-tier
+    // escalations get a fresh chance at Opus before any Grok pivot is
+    // considered. The effective runner is computed against the
+    // pre-escalation model so a task already on Grok skips this branch via
+    // Provider::Grok (idempotency).
+    let fallback = match cfg {
+        Some(c) if c.enabled => c,
+        _ => return Ok((escalated, None)),
+    };
+    // H2: use ModelTier-based inclusive check so both OPUS_MODEL and OPUS_MODEL_1M
+    // qualify as "at Opus" — string-eq on OPUS_MODEL excluded the 1M variant.
+    let was_at_opus = matches!(
+        model::model_tier(current_model.as_deref()),
+        model::ModelTier::Opus
+    );
+    // M1: compare in u32 space; new_count is a DB counter (always >= 0 in practice)
+    // but guard the negative case to keep the cast sound for all inputs.
+    if !was_at_opus || new_count < 0 || (new_count as u32) < fallback.runtime_error_threshold {
+        return Ok((escalated, None));
+    }
+    let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
+    if effective_runner != RunnerKind::Claude {
+        return Ok((escalated, None));
+    }
+
+    // All gates passed — promote to Grok. DB write happens here; ctx
+    // mutations are bundled into a `PendingPromotion` for the caller to
+    // apply after commit. The pre-promotion snapshot of `tasks.model` is
+    // captured BEFORE the UPDATE rewrites it so the FEAT-008 override-
+    // invalidation detector sees the original value on next iteration.
+    conn.execute(
+        "UPDATE tasks SET model = ? WHERE id = ?",
+        rusqlite::params![fallback.model, task_id],
+    )?;
+    let promotion = PendingPromotion {
+        task_id: task_id.to_string(),
+        pre_promotion_model: current_model,
+        grok_model: fallback.model.clone(),
+        new_count,
+    };
+    Ok((Some(fallback.model.clone()), Some(promotion)))
+}
+
+/// Escalate the model for a task in the DB when consecutive failures reach the threshold.
+///
+/// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
+/// - `None` or empty model assumes sonnet baseline → escalates to opus.
+/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
+///
+/// **FEAT-007 Grok promotion**: after the Claude-tier escalation runs, when
+/// `cfg.enabled` AND the post-escalation model is Opus AND `effective_runner`
+/// resolves to Claude AND `new_count >= cfg.runtime_error_threshold`, the
+/// task is promoted to the Grok runner. The promotion writes BOTH the
+/// `tasks.model` column AND the in-memory override maps on `ctx`
+/// (`runner_overrides`, `model_overrides`) so the next iteration's
+/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
+/// `tasks.model` value is captured into `ctx.overflow_original_task_model`
+/// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
+/// detector can spot operator edits later.
+///
+/// When `cfg` is `None` or `!enabled`, behavior is byte-identical to the
+/// pre-FEAT-007 ladder (Sonnet → Opus → terminal). The `ctx` argument is
+/// otherwise unused in that path.
+///
+/// Returns `Some(new_model)` if escalation OR promotion fired, `None` if
+/// below threshold, the model tier is unknown (e.g. already at Grok), or
+/// the Opus self-loop produced no change AND promotion conditions weren't met.
+/// The DB is updated in-place when `Some` is returned.
+///
+/// This is the convenience variant — DB and ctx writes happen back-to-back.
+/// Transactional callers should prefer `escalate_task_model_if_needed_inner`
+/// + `apply_pending_promotion` (see W5).
+pub fn escalate_task_model_if_needed(
+    conn: &Connection,
+    task_id: &str,
+    new_count: i32,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
+) -> TaskMgrResult<Option<String>> {
+    let (model, pending) = escalate_task_model_if_needed_inner(conn, task_id, new_count, ctx, cfg)?;
+    if let Some(p) = pending {
+        apply_pending_promotion(ctx, &p);
+    }
+    Ok(model)
 }
 
 /// Increment `consecutive_failures` for a task in the DB.
@@ -4738,10 +5154,20 @@ pub fn auto_block_task(
 /// `current_iteration` is used to set `blocked_at_iteration` on auto-blocked tasks for
 /// decay tracking. Escalation is skipped when auto-block fires on the same iteration
 /// (the escalated model would never be used).
+///
+/// **FEAT-007**: `ctx` threads `IterationContext` through so the embedded
+/// `escalate_task_model_if_needed` call can write Grok promotion overrides
+/// (paired with the DB UPDATE). `cfg` carries the optional fallback-runner
+/// configuration; pass `None` to suppress the Grok branch entirely (preserves
+/// pre-FEAT-007 behavior byte-for-byte). Callers MUST short-circuit BEFORE
+/// invoking this when the iteration outcome is `Crash(GrokAuthFailure)` so
+/// auth lapses do not push healthy tasks toward `auto_block_task`.
 pub fn handle_task_failure(
     conn: &mut Connection,
     task_id: &str,
     current_iteration: i64,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
 ) -> TaskMgrResult<()> {
     let tx = conn.transaction()?;
 
@@ -4761,11 +5187,24 @@ pub fn handle_task_failure(
         )
         .unwrap_or(3);
 
-    // Only escalate if auto-block won't immediately follow (escalated model would never be used)
-    if !should_auto_block(new_count, max_retries)
-        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count)
-    {
-        eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+    // W5: stage the Grok promotion's ctx mutations as a `PendingPromotion`
+    // and defer applying them until `tx.commit()?` returns Ok below. If
+    // commit fails, the in-memory ctx stays consistent with the rolled-back
+    // DB (no dirty `runner_overrides` / `model_overrides` entries pointing
+    // to a Grok model the DB still records as Opus).
+    //
+    // Only escalate if auto-block won't immediately follow — the escalated
+    // model would never be used.
+    let mut pending_promotion: Option<PendingPromotion> = None;
+    if !should_auto_block(new_count, max_retries) {
+        match escalate_task_model_if_needed_inner(&tx, task_id, new_count, ctx, cfg) {
+            Ok((_model, promotion)) => {
+                pending_promotion = promotion;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+            }
+        }
     }
 
     if should_auto_block(new_count, max_retries) {
@@ -4780,6 +5219,11 @@ pub fn handle_task_failure(
     }
 
     tx.commit()?;
+
+    // Commit succeeded — safe to mutate ctx.
+    if let Some(p) = pending_promotion {
+        apply_pending_promotion(ctx, &p);
+    }
 
     Ok(())
 }
@@ -4912,6 +5356,93 @@ mod tests {
     use super::*;
     use crate::loop_engine::model::{HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
     use crate::loop_engine::test_utils::{EnvGuard, setup_test_db};
+
+    // --- FEAT-005: resolve_effective_runner + IterationContext fields ---
+    //
+    // Regression guards for the single-source effective_runner formula
+    // (PRD §2.5). The default-empty IterationContext + no Grok model case
+    // MUST resolve to `RunnerKind::Claude` so today's pure-Claude behavior
+    // is preserved byte-for-byte. An explicit `runner_overrides` entry
+    // wins over the model-derived provider — that's how FEAT-007 / FEAT-008
+    // pin a task to Grok once a fallback fires.
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_no_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        assert_eq!(
+            resolve_effective_runner(&ctx, "ANY-TASK-001", None),
+            RunnerKind::Claude,
+            "default-empty IterationContext with effective_model=None MUST \
+             default to ClaudeRunner — preserves pre-FEAT-005 behavior",
+        );
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_claude_model_resolves_to_claude() {
+        let ctx = IterationContext::new(8);
+        for model in &[OPUS_MODEL, SONNET_MODEL, HAIKU_MODEL] {
+            assert_eq!(
+                resolve_effective_runner(&ctx, "TASK-001", Some(model)),
+                RunnerKind::Claude,
+                "Claude model {model} with empty runner_overrides MUST resolve to Claude",
+            );
+        }
+    }
+
+    #[test]
+    fn feat_005_default_empty_ctx_with_grok_model_resolves_to_grok() {
+        let ctx = IterationContext::new(8);
+        // Token-equality on `-` splits — `grok-4-fast` has token `grok`.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("grok-4-fast")),
+            RunnerKind::Grok,
+            "Grok model with empty runner_overrides MUST resolve to Grok via \
+             provider_for_model token-equality",
+        );
+        // Groq Inc. (different vendor) MUST NOT mis-route — substring match
+        // would catch `groq-llama-3` because `grok` is a substring of `groq`;
+        // token-equality correctly rejects it.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-001", Some("groq-llama-3")),
+            RunnerKind::Claude,
+            "Groq Inc. model (different vendor) MUST NOT mis-route to Grok",
+        );
+    }
+
+    #[test]
+    fn feat_005_runner_override_wins_over_model_derived_provider() {
+        let mut ctx = IterationContext::new(8);
+        ctx.runner_overrides
+            .insert("TASK-PINNED".to_string(), RunnerKind::Grok);
+        // Model says Claude (Opus), but the override pins to Grok — override wins.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-PINNED", Some(OPUS_MODEL)),
+            RunnerKind::Grok,
+            "explicit runner_overrides entry MUST win over the model-derived \
+             provider — that's how FEAT-007/FEAT-008 pin a task post-fallback",
+        );
+        // A different task with no override falls through to the model's provider.
+        assert_eq!(
+            resolve_effective_runner(&ctx, "TASK-OTHER", Some(OPUS_MODEL)),
+            RunnerKind::Claude,
+            "other tasks without overrides MUST still resolve via the model",
+        );
+    }
+
+    #[test]
+    fn feat_005_iteration_context_new_initializes_runner_fields_empty() {
+        let ctx = IterationContext::new(8);
+        assert!(
+            ctx.runner_overrides.is_empty(),
+            "fresh IterationContext.runner_overrides MUST be empty — regression \
+             guard against accidental seeded entries that would silently route \
+             tasks through a non-Claude runner",
+        );
+        assert!(
+            ctx.overflow_original_task_model.is_empty(),
+            "fresh IterationContext.overflow_original_task_model MUST be empty",
+        );
+    }
 
     // --- LoopResult Default tests ---
 
@@ -6310,7 +6841,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6338,7 +6870,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6523,7 +7056,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 2).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 2, &mut ctx, None).unwrap();
         assert_eq!(
             result,
             Some(OPUS_MODEL.to_string()),
@@ -6551,7 +7085,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = escalate_task_model_if_needed(&conn, "T-001", 1).unwrap();
+        let mut ctx = IterationContext::new(8);
+        let result = escalate_task_model_if_needed(&conn, "T-001", 1, &mut ctx, None).unwrap();
         assert_eq!(result, None, "no escalation at 1 failure (threshold is 2)");
         let model: Option<String> = conn
             .query_row("SELECT model FROM tasks WHERE id = 'T-001'", [], |r| {
@@ -7041,6 +7576,7 @@ mod tests {
                 slot_index,
                 working_root,
                 prompt_bundle,
+                effective_runner: RunnerKind::Claude,
             }
         }
 
@@ -7078,6 +7614,7 @@ mod tests {
                 section_sizes: Vec::new(),
                 dropped_sections: Vec::new(),
                 task_difficulty: None,
+                effective_runner: RunnerKind::Claude,
             };
             assert_eq!(sr.slot_index, 1);
             assert!(matches!(

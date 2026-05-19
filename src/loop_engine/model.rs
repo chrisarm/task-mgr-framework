@@ -37,6 +37,56 @@ pub const OPUS_MODEL_1M: &str = "claude-opus-4-7[1m]";
 pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
 pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// LLM provider classification.
+///
+/// Computed from a model id by [`provider_for_model`] (token-equality on the
+/// lowercased, hyphen-split model string). Used to pick the right
+/// `RunnerKind` and to short-circuit Claude-only helpers like
+/// [`escalate_model`] when the active model belongs to a different provider.
+///
+/// New provider variants are added here when a new runner is plumbed
+/// through `dispatch`; today the only two are Claude (default) and Grok
+/// (FR-002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    /// Anthropic Claude models (default for unknown / unset inputs).
+    Claude,
+    /// xAI Grok models (`grok-4`, `grok-4-fast`, `grok-code-fast-1`, …).
+    Grok,
+}
+
+/// Classify a model id as a provider.
+///
+/// Algorithm: lowercase the input, split on `-`, return [`Provider::Grok`]
+/// iff *some token is exactly* `"grok"`. Every other input — including
+/// `None`, the empty string, `"unknown-model"`, the Claude model constants,
+/// and Groq Inc. models like `"groq-llama-70b"` — falls through to
+/// [`Provider::Claude`].
+///
+/// Token-equality (not substring matching) is load-bearing: `groq-llama-3`
+/// from Groq Inc. is **not** an xAI product, and `.contains("grok")` would
+/// mis-route it. Splitting on `-` and comparing each token to the literal
+/// `"grok"` rejects Groq cleanly. Total function: every `Option<&str>`
+/// input produces some `Provider`; never panics.
+///
+/// # Examples
+///
+/// ```ignore
+/// use task_mgr::loop_engine::model::{Provider, provider_for_model};
+/// assert_eq!(provider_for_model(Some("grok-4-fast")), Provider::Grok);
+/// assert_eq!(provider_for_model(Some("groq-llama-3")), Provider::Claude);
+/// assert_eq!(provider_for_model(Some("claude-opus-4-7")), Provider::Claude);
+/// assert_eq!(provider_for_model(None), Provider::Claude);
+/// ```
+pub fn provider_for_model(model: Option<&str>) -> Provider {
+    let lower = model.unwrap_or("").to_ascii_lowercase();
+    if lower.split('-').any(|t| t == "grok") {
+        Provider::Grok
+    } else {
+        Provider::Claude
+    }
+}
+
 /// Mapping from task difficulty to Claude CLI `--effort` level.
 ///
 /// Scaling: low difficulty → medium effort, medium → high, high → xhigh.
@@ -83,6 +133,14 @@ pub fn difficulty_rank(difficulty: Option<&str>) -> Option<usize> {
 ///
 /// Variants are ordered from lowest to highest capability/cost.
 /// `Default` represents an unknown or unspecified model.
+///
+/// Note: `model_tier` uses **substring** matching (`.contains("opus")` etc.)
+/// because model variant suffixes like `[1m]` must still map to the correct
+/// tier. `provider_for_model` deliberately uses **token equality** on `-`
+/// splits to avoid mis-routing Groq Inc. models (`groq-llama-3`, which
+/// contains "groq" but not the token "grok") to the xAI Grok runner. The
+/// two functions' matching strategies are intentionally different — do not
+/// "unify" them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelTier {
     /// No model specified or unrecognized model string
@@ -210,6 +268,9 @@ pub fn downgrade_effort(effort: Option<&str>) -> Option<&'static str> {
 /// - None → None
 /// - unknown/Default tier → None (cannot escalate unrecognized model)
 pub fn escalate_model(model: Option<&str>) -> Option<String> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         None => None,
         Some(m) => match model_tier(Some(m)) {
@@ -239,6 +300,9 @@ pub fn escalate_model(model: Option<&str>) -> Option<String> {
 /// - opus (incl. 1M variant) → None (already at ceiling)
 /// - None / unknown tier → None
 pub fn escalate_below_opus(model: Option<&str>) -> Option<&'static str> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         None => None,
         Some(m) => match model_tier(Some(m)) {
@@ -259,6 +323,9 @@ pub fn is_1m_model(model: Option<&str>) -> bool {
 /// Currently only Opus has a 1M variant. Returns `None` if the model is
 /// already 1M, not Opus-tier, or `None`.
 pub fn to_1m_model(model: Option<&str>) -> Option<&'static str> {
+    if provider_for_model(model) != Provider::Claude {
+        return None;
+    }
     match model {
         Some(m) if is_1m_model(Some(m)) => None,
         Some(m) if model_tier(Some(m)) == ModelTier::Opus => Some(OPUS_MODEL_1M),

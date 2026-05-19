@@ -32,7 +32,9 @@ use task_mgr::loop_engine::config::{CrashType, IterationOutcome};
 use task_mgr::loop_engine::engine::IterationContext;
 use task_mgr::loop_engine::model::SONNET_MODEL;
 use task_mgr::loop_engine::overflow::{self, OverflowEvent, RecoveryAction};
+use task_mgr::loop_engine::project_config::ProjectConfig;
 use task_mgr::loop_engine::prompt::PromptResult;
+use task_mgr::loop_engine::runner::RunnerKind;
 
 // ---------- Test fixtures ---------------------------------------------------
 
@@ -157,6 +159,8 @@ fn slot_2_prompt_too_long_invokes_handler_with_slot_2_task_id() {
                 Some("run-wave"),
                 tmp.path(),
                 Some(slot_idx),
+                RunnerKind::Claude,
+                &ProjectConfig::default(),
             );
             last_action = Some(action);
         }
@@ -215,6 +219,8 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
         Some("run-wave"),
         tmp.path(),
         Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
     // Re-claim (production: task selection re-picks the row).
     conn.execute(
@@ -233,6 +239,8 @@ fn slot_2_recovery_keying_excludes_sibling_slot_task_ids() {
         Some("run-wave"),
         tmp.path(),
         Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     // Only slot 2's task_id is present in the per-task state maps.
@@ -323,6 +331,8 @@ fn slot_index_present_in_jsonl_for_wave_event() {
         Some("run-wave"),
         tmp.path(),
         Some(2),
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let raw_events = read_event_values(tmp.path());
@@ -376,6 +386,8 @@ fn slot_index_omitted_for_sequential_jsonl_event() {
         Some("run-seq"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     let events = read_event_values(tmp.path());
@@ -416,6 +428,8 @@ fn sequential_prompt_too_long_unchanged() {
         Some("run-seq"),
         tmp.path(),
         None,
+        RunnerKind::Claude,
+        &ProjectConfig::default(),
     );
 
     // Rung 1 fired: effort downgrade.

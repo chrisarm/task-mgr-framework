@@ -58,6 +58,7 @@ fn migrate_db(db_dir: &Path) {
         .arg(db_dir)
         .args(["migrate", "all"])
         .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .output()
         .expect("spawn task-mgr migrate");
     assert!(
@@ -306,6 +307,7 @@ fn models_show_from_worktree_prints_db_dir_and_source() {
         .current_dir(&wt)
         .args(["models", "show"])
         .env_remove("TASK_MGR_DIR")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
         .output()
         .expect("spawn task-mgr models show");
     assert!(
