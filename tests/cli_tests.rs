@@ -2651,3 +2651,109 @@ fn test_add_emits_arrow_context_line_as_first_stderr() {
         "first stderr line must start with '→ active prefix='; got: {first_line:?}"
     );
 }
+
+// ============================================================================
+// FEAT-004: task-mgr how advisor integration tests
+// ============================================================================
+
+#[test]
+fn test_how_appears_in_top_level_help_as_visible_subcommand() {
+    Command::new(cargo_bin("task-mgr"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("how"));
+}
+
+#[test]
+fn test_how_change_task_status_lists_status_verbs() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "change task status"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete"))
+        .stdout(predicate::str::contains("fail"))
+        .stdout(predicate::str::contains("skip"))
+        .stdout(predicate::str::contains("reset"));
+}
+
+#[test]
+fn test_how_add_follow_up_lists_three_depended_on_by_forms() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["how", "add a follow-up task"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    let count = stdout.matches("--depended-on-by").count();
+    assert!(
+        count >= 3,
+        "expected >= 3 --depended-on-by forms; got {count} in:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_how_where_will_my_add_land_points_at_current() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "where will my add land"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task-mgr current"));
+}
+
+#[test]
+fn test_how_unrelated_query_points_at_cheatsheet() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "totally unrelated nonsense query"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no recipe matched"))
+        .stdout(predicate::str::contains("task-mgr cheatsheet"));
+}
+
+#[test]
+fn test_how_no_arg_lists_intents_one_per_line() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .arg("how")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(stdout.contains("Available intents"));
+    // At least the canonical bags appear on their own lines.
+    for bag in ["status", "follow-up", "sync"] {
+        assert!(
+            stdout.lines().any(|l| l == bag),
+            "missing intent bag '{bag}' on its own line in:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_how_empty_string_lists_intents() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", ""])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Available intents"));
+}
+
+#[test]
+fn test_how_multi_match_separated_by_horizontal_rule() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "sync json"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("---"));
+}

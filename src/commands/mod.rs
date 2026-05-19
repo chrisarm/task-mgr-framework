@@ -35,8 +35,10 @@ pub mod enhance;
 pub mod export;
 pub mod fail;
 pub mod history;
+pub mod how;
 pub mod import_learnings;
 pub mod init;
+pub mod intents;
 pub mod invalidate_learning;
 pub mod irrelevant;
 pub mod learn;
@@ -89,6 +91,7 @@ pub use history::{
     format_detail_text as format_history_detail_text, format_text as format_history_text, history,
     history_detail,
 };
+pub use how::{HowResult, format_text as format_how_text, how};
 pub use import_learnings::{
     ImportLearningsResult, format_text as format_import_learnings_text, import_learnings,
 };

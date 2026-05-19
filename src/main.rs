@@ -18,7 +18,7 @@ use task_mgr::commands::{
     LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
     audit_setup, auto_unblock_all, begin, cheatsheet, complete, count_resettable_tasks, current,
     decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
-    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail,
+    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail, how,
     import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
     list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
     reset_all_tasks, reset_tasks, resolve_decision_cmd, revert_decision_cmd, show, skip, stats,
@@ -766,6 +766,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Cheatsheet => {
             let result = cheatsheet();
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::How { query } => {
+            let result = how(query.as_deref());
             output_result(&result, cli.format);
             Ok(())
         }

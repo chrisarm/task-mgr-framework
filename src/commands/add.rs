@@ -250,6 +250,12 @@ pub fn add_with_conn(
         );
     }
 
+    // Hard-refuse cross-PRD `--depended-on-by` before any DB write. Each
+    // foreign-prefix target gets a worked refusal naming the foreign PRD's
+    // path and both fix commands. Pre-flight runs before the DB transaction
+    // opens so a refusal can never leak a stray row or touch the target JSON.
+    reject_cross_prd_depended_on_by(conn, depended_on_by, resolved_ctx.as_ref())?;
+
     let prefixed_depended_on_by: Vec<String>;
     let effective_depended_on_by: &[String] = if let Some(ref ctx) = resolved_ctx {
         let prefix = &ctx.prefix;
@@ -591,6 +597,96 @@ fn reject_foreign_prefix(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Extract the PRD prefix from a task id.
+///
+/// Returns `Some(prefix)` only when the id has the shape `<prefix>-<type>-<num>`
+/// (i.e. contains at least two dashes). Single-segment ids like `MILESTONE-1`
+/// return `None` — they're treated as bare ids and will be auto-prefixed.
+///
+/// Mirrors [`AddTaskInput::task_prefix`] but operates on arbitrary id strings
+/// (used for `--depended-on-by` targets that don't live on the input struct).
+fn extract_id_prefix(id: &str) -> Option<&str> {
+    let first_dash = id.find('-')?;
+    let prefix = &id[..first_dash];
+    if id[first_dash + 1..].contains('-') {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+/// Hard-refuse cross-PRD `--depended-on-by` before any DB write.
+///
+/// For each `--depended-on-by` target id, extract its prefix and compare
+/// against the active PRD's prefix:
+///
+/// * Bare id (no recognizable prefix) → skip; auto-prefix path handles it.
+/// * Prefix matches the active prefix → OK (same PRD).
+/// * Active prefix unset (caller passed `None`) → refuse with a "no active
+///   PRD" message so the operator must explicitly opt in to a PRD.
+/// * Foreign prefix registered in `prd_metadata` → refuse with the PRD's
+///   actual path AND both fix commands.
+/// * Foreign prefix not registered anywhere → refuse with a hint pointing at
+///   `task-mgr list --prefix <p>`.
+///
+/// This runs BEFORE `conn.unchecked_transaction()` so a refusal can never
+/// leak a stray row or touch the target JSON file. The check only reads
+/// `prd_metadata` / `prd_files` (no writes); a refusal is reproducible
+/// across retries.
+fn reject_cross_prd_depended_on_by(
+    conn: &Connection,
+    depended_on_by: &[String],
+    active_ctx: Option<&ResolvedContext>,
+) -> TaskMgrResult<()> {
+    for target_id in depended_on_by {
+        let Some(target_prefix) = extract_id_prefix(target_id) else {
+            continue;
+        };
+        let Some(ctx) = active_ctx else {
+            return Err(TaskMgrError::invalid_state(
+                "add",
+                "depended-on-by",
+                "an active PRD prefix to scope the target",
+                format!(
+                    "no active PRD; set TASK_MGR_ACTIVE_PREFIX or pass --from-json \
+                     (target '{target_id}' carries prefix '{target_prefix}')"
+                ),
+            ));
+        };
+        if target_prefix == ctx.prefix {
+            continue;
+        }
+        let foreign_path = locate_prd_json(conn, Some(target_prefix))?;
+        let active_prefix = &ctx.prefix;
+        return Err(match foreign_path {
+            Some(path) => TaskMgrError::invalid_state(
+                "add",
+                "depended-on-by",
+                format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
+                format!(
+                    "Refusing: target '{target_id}' lives in PRD {} (prefix {target_prefix}), \
+                     but active prefix is {active_prefix}. \
+                     Fixes: (a) TASK_MGR_ACTIVE_PREFIX={target_prefix} task-mgr add --stdin \
+                     --depended-on-by {target_id} '{{...}}'  (b) task-mgr add --from-json \
+                     tasks/<correct-prd>.json --stdin --depended-on-by {target_id} '{{...}}'",
+                    path.display(),
+                ),
+            ),
+            None => TaskMgrError::invalid_state(
+                "add",
+                "depended-on-by",
+                format!("a task id belonging to the active PRD (prefix '{active_prefix}')"),
+                format!(
+                    "Refusing: target '{target_id}' carries prefix '{target_prefix}', which is \
+                     not registered in any known PRD. Run `task-mgr list --prefix {target_prefix}` \
+                     to find the right id."
+                ),
+            ),
+        });
     }
     Ok(())
 }
@@ -1527,5 +1623,237 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rel_count, 1, "dependsOn must be recorded with prefixed ID");
+    }
+
+    // --- FEAT-004: extract_id_prefix + reject_cross_prd_depended_on_by ---
+
+    #[test]
+    fn extract_id_prefix_returns_first_segment_when_two_dashes() {
+        assert_eq!(
+            extract_id_prefix("5ba153a7-MILESTONE-FINAL"),
+            Some("5ba153a7")
+        );
+        assert_eq!(extract_id_prefix("alpha-FEAT-001"), Some("alpha"));
+    }
+
+    #[test]
+    fn extract_id_prefix_returns_none_for_single_segment_ids() {
+        assert_eq!(extract_id_prefix("MILESTONE-1"), None);
+        assert_eq!(extract_id_prefix("STANDALONE"), None);
+        assert_eq!(extract_id_prefix(""), None);
+    }
+
+    /// Build a `ResolvedContext` for tests without needing the DB lookup
+    /// machinery — locate_prd_json is the only DB-touching side effect.
+    fn fake_ctx(prefix: &str, prd_path: &str) -> ResolvedContext {
+        ResolvedContext {
+            prefix: prefix.to_string(),
+            source: ResolutionSource::EnvVar,
+            prd_json_path: PathBuf::from(prd_path),
+        }
+    }
+
+    #[test]
+    fn cross_prd_check_no_active_ctx_with_prefixed_target_refuses() {
+        let conn = memory_db();
+        // Active context is None → any prefixed target refuses.
+        let err = reject_cross_prd_depended_on_by(&conn, &["X-MILESTONE-FINAL".to_string()], None)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no active PRD"), "{msg}");
+        assert!(msg.contains("TASK_MGR_ACTIVE_PREFIX"), "{msg}");
+        assert!(msg.contains("--from-json"), "{msg}");
+    }
+
+    #[test]
+    fn cross_prd_check_no_active_ctx_bare_target_ok() {
+        let conn = memory_db();
+        // Bare id (no recognizable prefix) is fine even without an active context.
+        reject_cross_prd_depended_on_by(&conn, &["MILESTONE-1".to_string()], None).unwrap();
+    }
+
+    #[test]
+    fn cross_prd_check_same_prefix_passes() {
+        let conn = memory_db();
+        let ctx = fake_ctx("alpha", "");
+        reject_cross_prd_depended_on_by(&conn, &["alpha-MILESTONE-FINAL".to_string()], Some(&ctx))
+            .unwrap();
+    }
+
+    #[test]
+    fn cross_prd_check_known_foreign_prd_refuses_with_path_and_both_fixes() {
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "active-project", "other-prefix");
+        seed_prefix(&conn, 2, "foreign-project", "5ba153a7");
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (2, ?, 'task_list')",
+            ["/tmp/foreign-prd.json"],
+        )
+        .unwrap();
+        let ctx = fake_ctx("other-prefix", "/tmp/active.json");
+
+        let err = reject_cross_prd_depended_on_by(
+            &conn,
+            &["5ba153a7-MILESTONE-FINAL".to_string()],
+            Some(&ctx),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+
+        // Required substrings from acceptance criteria:
+        assert!(msg.contains("Refusing:"), "{msg}");
+        assert!(msg.contains("5ba153a7-MILESTONE-FINAL"), "{msg}");
+        assert!(msg.contains("/tmp/foreign-prd.json"), "{msg}");
+        assert!(msg.contains("(prefix 5ba153a7)"), "{msg}");
+        assert!(msg.contains("but active prefix is other-prefix"), "{msg}");
+        // Fix (a): env-var-and-rerun command.
+        assert!(
+            msg.contains("TASK_MGR_ACTIVE_PREFIX=5ba153a7 task-mgr add"),
+            "fix (a) missing: {msg}"
+        );
+        // Fix (b): --from-json reference.
+        assert!(
+            msg.contains("--from-json tasks/<correct-prd>.json"),
+            "fix (b) missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn cross_prd_check_unknown_foreign_prefix_refuses_with_list_hint() {
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "active-project", "alpha");
+        // 'unknown' is NOT registered.
+        let ctx = fake_ctx("alpha", "");
+
+        let err =
+            reject_cross_prd_depended_on_by(&conn, &["unknown-FEAT-001".to_string()], Some(&ctx))
+                .unwrap_err();
+        let msg = format!("{err}");
+
+        assert!(msg.contains("Refusing:"), "{msg}");
+        assert!(msg.contains("unknown-FEAT-001"), "{msg}");
+        assert!(
+            msg.contains("not registered in any known PRD"),
+            "must explain absence: {msg}"
+        );
+        assert!(
+            msg.contains("task-mgr list --prefix unknown"),
+            "must suggest list command: {msg}"
+        );
+    }
+
+    #[test]
+    fn cross_prd_check_empty_depended_on_by_ok() {
+        let conn = memory_db();
+        let ctx = fake_ctx("alpha", "");
+        reject_cross_prd_depended_on_by(&conn, &[], Some(&ctx)).unwrap();
+        reject_cross_prd_depended_on_by(&conn, &[], None).unwrap();
+    }
+
+    #[test]
+    fn cross_prd_check_runs_before_db_writes_no_partial_state() {
+        // End-to-end via add_with_conn: a foreign-prefix --depended-on-by must
+        // refuse with NO new rows in the tasks table and NO modification to
+        // the target PRD JSON file's mtime.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "other-prefix");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "active-project", "other-prefix");
+        seed_prefix(&conn, 2, "foreign-project", "5ba153a7");
+
+        // Real on-disk PRD JSON so we can check mtime + content invariance.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let initial = r#"{"userStories":[]}"#;
+        std::fs::write(tmp.path(), initial).unwrap();
+        conn.execute(
+            "INSERT INTO prd_files (prd_id, file_path, file_type) VALUES (2, ?, 'task_list')",
+            [tmp.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let mtime_before = std::fs::metadata(tmp.path()).unwrap().modified().unwrap();
+        let rows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+
+        let input = minimal_input("NEW-FIX-001");
+        let err = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["5ba153a7-MILESTONE-FINAL".to_string()],
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("Refusing:"), "{msg}");
+
+        // Row count invariant: no stray row.
+        let rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows_before, rows_after, "no DB row may be added on refusal");
+
+        // File mtime + content invariant: target JSON untouched.
+        let mtime_after = std::fs::metadata(tmp.path()).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "target JSON mtime must not change on refusal",
+        );
+        let content_after = std::fs::read_to_string(tmp.path()).unwrap();
+        assert_eq!(content_after, initial, "target JSON content unchanged");
+    }
+
+    #[test]
+    fn cross_prd_check_fires_before_duplicate_id_check() {
+        // Known-bad guard: an impl that checked DB duplicate-id FIRST would
+        // surface "X already exists" instead of "Refusing:" for this input.
+        // Set up a state where BOTH checks would fail; assert the cross-PRD
+        // refusal wins so we know the order of pre-flight checks is correct.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "alpha");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "alpha-project", "alpha");
+        seed_prefix(&conn, 2, "beta-project", "beta");
+        // Pre-seed the would-be auto-prefixed id so the dup-id check WOULD fire.
+        seed_task(&conn, "alpha-NEW-001");
+
+        let input = minimal_input("NEW-001");
+        let err =
+            add_with_conn(&conn, input, None, &["beta-MILESTONE-FINAL".to_string()]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Refusing:"),
+            "cross-PRD check must fire first; got: {msg}"
+        );
+        assert!(
+            !msg.contains("already exists"),
+            "duplicate-id error must NOT win: {msg}"
+        );
+    }
+
+    #[test]
+    fn cross_prd_check_same_prefix_does_not_regress_existing_behavior() {
+        // Regression check: same-PRD --depended-on-by (the common case) still
+        // works after the new pre-flight is in place.
+        let _iso = isolate_env();
+        let _set = EnvVarGuard::set(ACTIVE_PREFIX_ENV, "5ba153a7");
+        let conn = memory_db();
+        seed_prefix(&conn, 1, "p", "5ba153a7");
+        seed_task(&conn, "5ba153a7-MILESTONE-FINAL");
+
+        let input = minimal_input("NEW-FIX-001");
+        let res = add_with_conn(
+            &conn,
+            input,
+            None,
+            &["5ba153a7-MILESTONE-FINAL".to_string()],
+        );
+        assert!(
+            res.is_ok(),
+            "same-PRD add must still succeed: {:?}",
+            res.err()
+        );
+        let r = res.unwrap();
+        assert_eq!(r.task_id, "5ba153a7-NEW-FIX-001");
     }
 }

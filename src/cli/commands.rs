@@ -1229,6 +1229,30 @@ EXAMPLES:
     task-mgr cheatsheet | less -R
 ")]
     Cheatsheet,
+
+    /// Map a natural-language intent to canonical task-mgr commands.
+    ///
+    /// Hand-curated keyword bags — case-insensitive, deterministic, no
+    /// LLM or embedding lookups. Visible subcommand (not hidden) so
+    /// `task-mgr --help` advertises it. With no arg, lists the available
+    /// intents; with multiple matches, joins recipes with `---`.
+    #[command(after_help = "\
+EXAMPLES:
+    # Discover available intents (lists every keyword bag, one per line)
+    task-mgr how
+
+    # Map an intent to a recipe
+    task-mgr how 'change task status'
+    task-mgr how 'add a follow-up task'
+    task-mgr how 'where will my add land'
+
+    # Multiple matches are joined by `---`
+    task-mgr how 'sync json'
+")]
+    How {
+        /// Free-text intent. Case-insensitive. Omit to list intents.
+        query: Option<String>,
+    },
 }
 
 /// Subcommands for `task-mgr enhance`.
