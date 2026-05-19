@@ -186,7 +186,37 @@ rolled back. The pattern is: inner helper performs DB writes only and
 returns an `Option<PendingPromotion>`; the caller applies it via
 `apply_pending_promotion` **only after `tx.commit()?` returns Ok**. Direct
 callers (tests, sequential non-transactional paths) use the convenience
-wrapper `escalate_task_model_if_needed` which applies immediately.
+wrapper `escalate_task_model_if_needed` which applies immediately. Same
+shape applies to any future "in-memory state mutation paired with DB
+write inside a transaction" — split inner-helper / apply-pending /
+defer-until-commit.
+
+**Binary-resolution env var "" must fall through, and existence ≠
+executable** (`runner.rs::resolve_grok_binary`
++ `project_config.rs::check_fallback_runner_binary`): both the runtime
+resolver and the startup probe MUST treat an empty/whitespace
+`GROK_BINARY` (or `CLAUDE_BINARY`) value as "unset" — `export VAR=""` is
+a common shell footgun and a divergence between resolver and probe
+surfaces as a confusing startup failure on a host where PATH lookup
+would have succeeded. The startup probe additionally checks the
+executable bit on Unix (`metadata.mode() & 0o111 != 0`) rather than just
+`Path::exists()`; a non-executable file at the path produces a clearer
+error up-front than a `std::io::Error` from spawn at first use. Any new
+"binary path probe" code (additional providers, sidecar tools) should
+honor both invariants — see `is_executable_path` in
+`project_config.rs`.
+
+**Single-source-of-truth drift sentinels are `assert!`, not
+`debug_assert!`** (`engine.rs::process_slot_result` cross-check of
+`slot_result.effective_runner` vs. `resolve_effective_runner(...)`
+re-derivation): when a sentinel guards against a silent dispatch
+mismatch (wrong-runner spawn, wrong-model resolution, wrong-binary
+exec), the check belongs in release builds too. `debug_assert!` is
+compiled out and the silent-mismatch consequence dwarfs the cost of a
+single HashMap lookup. Reserve `debug_assert!` for invariants whose
+violation is loud (panic in a downstream layer) or whose cost is
+real (e.g., O(n) over a large collection). The drift sentinel is
+cheap and the failure is silent — use `assert!`.
 
 ## Iteration pipeline (shared)
 
