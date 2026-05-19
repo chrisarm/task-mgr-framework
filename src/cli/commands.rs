@@ -1171,6 +1171,28 @@ GENERATED MAN PAGES:
         action: ModelsAction,
     },
 
+    /// Show the currently resolved active PRD context (prefix, source, target path)
+    ///
+    /// Exits 0 in all cases — "no active PRD" is a probe result, not an error.
+    #[command(after_help = "\
+EXAMPLES:
+    # Show the active PRD context
+    task-mgr current
+
+    # Machine-readable (JSON)
+    task-mgr --format json current | jq '.context.prefix'
+
+OUTPUT:
+    active prefix=<p>  source=<src>  target=<path>
+
+    source is one of: env (TASK_MGR_ACTIVE_PREFIX), single-prefix (auto),
+    from-json (--from-json flag), or none (ambiguous / empty DB).
+
+    When no PRD can be resolved, prints:
+    no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX
+")]
+    Current,
+
     /// Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md
     #[command(after_help = "\
 EXAMPLES:

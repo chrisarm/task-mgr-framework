@@ -16,13 +16,13 @@ use task_mgr::cli::{
 };
 use task_mgr::commands::{
     LearnParams, LearningsListParams, RecallCmdParams, ReviewOptions, add, apply_learning,
-    audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks, decline_decision_cmd,
-    doctor, end, export, fail, format_doctor_verbose, format_init_verbose, format_next_verbose,
-    format_recall_verbose, get_reviewable_tasks, history, history_detail, import_learnings, init,
-    invalidate_learning, irrelevant, learn, list, list_decisions, list_learnings, migrate_all,
-    migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall, reset_all_tasks, reset_tasks,
-    resolve_decision_cmd, revert_decision_cmd, show, skip, stats, unblock, unskip, update,
-    worktrees_list, worktrees_prune, worktrees_remove,
+    audit_setup, auto_unblock_all, begin, complete, count_resettable_tasks, current,
+    decline_decision_cmd, doctor, end, export, fail, format_doctor_verbose, format_init_verbose,
+    format_next_verbose, format_recall_verbose, get_reviewable_tasks, history, history_detail,
+    import_learnings, init, invalidate_learning, irrelevant, learn, list, list_decisions,
+    list_learnings, migrate_all, migrate_down_cmd, migrate_status, migrate_up_cmd, next, recall,
+    reset_all_tasks, reset_tasks, resolve_decision_cmd, revert_decision_cmd, show, skip, stats,
+    unblock, unskip, update, worktrees_list, worktrees_prune, worktrees_remove,
 };
 use task_mgr::db::{DbDirSource, LockGuard, ResolvedDbDir, open_connection, resolve_db_dir};
 use task_mgr::handlers::{
@@ -754,6 +754,12 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
 
         Commands::Stats => {
             let result = stats(&cli.dir)?;
+            output_result(&result, cli.format);
+            Ok(())
+        }
+
+        Commands::Current => {
+            let result = current(&cli.dir)?;
             output_result(&result, cli.format);
             Ok(())
         }

@@ -2532,3 +2532,122 @@ fn test_init_from_json_with_enhance_imports_prd_and_skips_enhance() {
         "shim path must not auto-create AGENTS.md when --enhance is passed"
     );
 }
+
+// ============================================================================
+// Test: task-mgr current
+// ============================================================================
+
+#[test]
+fn test_current_empty_db_exits_zero_with_no_active_prd_message() {
+    // Initialize project schema without importing any PRD (no from-json).
+    let temp_dir = TempDir::new().unwrap();
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("init")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("current")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no active PRD"));
+}
+
+#[test]
+fn test_current_with_single_prefix_prints_context_line() {
+    let temp_dir = setup_initialized_tempdir();
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("current")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("active prefix="))
+        .stdout(predicate::str::contains("source="))
+        .stdout(predicate::str::contains("target="));
+}
+
+#[test]
+fn test_current_format_json_returns_context_object() {
+    let temp_dir = setup_initialized_tempdir();
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args(["--format", "json", "current"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("must be valid JSON");
+    // context key exists; may be null (no active PRD) or an object
+    assert!(
+        json.get("context").is_some(),
+        "JSON must have 'context' key"
+    );
+}
+
+#[test]
+fn test_read_only_commands_do_not_emit_arrow_context_line() {
+    let temp_dir = setup_initialized_tempdir();
+    // show, list, next must NOT emit the `→ active prefix=` stderr line
+    for subcmd in &["list", "next"] {
+        let output = Command::new(cargo_bin("task-mgr"))
+            .args(["--dir", temp_dir.path().to_str().unwrap()])
+            .arg(subcmd)
+            .env_remove("TASK_MGR_ACTIVE_PREFIX")
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8_lossy(&output);
+        assert!(
+            !stderr.contains("→ active prefix="),
+            "{subcmd} must not emit '→ active prefix=' on stderr; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_add_emits_arrow_context_line_as_first_stderr() {
+    // Copy fixture to the tempdir so `add` syncs into a local file (not the fixture).
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = sample_prd_path();
+    let local_prd = temp_dir.path().join("sample_prd.json");
+    fs::copy(&prd_path, &local_prd).unwrap();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            local_prd.to_str().unwrap(),
+        ])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args(["add", "--stdin"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .write_stdin(r#"{"id":"ADD-CANARY-001","title":"canary task for add stderr test"}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    // First non-empty stderr line must start with `→ active prefix=`
+    let first_line = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    assert!(
+        first_line.starts_with("→ active prefix="),
+        "first stderr line must start with '→ active prefix='; got: {first_line:?}"
+    );
+}

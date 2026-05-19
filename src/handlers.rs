@@ -26,15 +26,15 @@ use crate::commands::curate::{
     format_retire_text, format_unretire_text,
 };
 use crate::commands::{
-    ApplyLearningResult, BeginResult, CompleteResult, DecisionDeclineResult, DecisionResolveResult,
-    DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult, EnhanceResult,
-    ExportResult, FailResult, HistoryResult, ImportLearningsResult, InitResult,
+    ApplyLearningResult, BeginResult, CompleteResult, CurrentResult, DecisionDeclineResult,
+    DecisionResolveResult, DecisionRevertResult, DecisionsListResult, DoctorResult, EndResult,
+    EnhanceResult, ExportResult, FailResult, HistoryResult, ImportLearningsResult, InitResult,
     InvalidateLearningResult, IrrelevantResult, LearnResult, LearningsListResult, ListResult,
     MigrateResult, NextResult, RecallCmdResult, ResetResult, ReviewResult, RunDetailResult,
     SetupAuditResult, ShowResult, SkipResult, StatsResult, StatusResult, UnblockResult,
     UnskipResult, UpdateResult, WorktreesResult, format_apply_learning_text, format_begin_text,
-    format_complete_text, format_decisions_list_text, format_decline_text, format_doctor_text,
-    format_end_text, format_enhance_text, format_export_text, format_fail_text,
+    format_complete_text, format_current_text, format_decisions_list_text, format_decline_text,
+    format_doctor_text, format_end_text, format_enhance_text, format_export_text, format_fail_text,
     format_history_detail_text, format_history_text, format_import_learnings_text,
     format_init_text, format_invalidate_learning_text, format_irrelevant_text, format_learn_text,
     format_learnings_text, format_list_text, format_migrate_text, format_next_text,
@@ -73,6 +73,7 @@ macro_rules! impl_text_formattable {
 }
 
 impl_text_formattable!(crate::commands::AddResult, crate::commands::format_add_text);
+impl_text_formattable!(CurrentResult, format_current_text);
 impl_text_formattable!(InitResult, format_init_text);
 impl_text_formattable!(ListResult, format_list_text);
 impl_text_formattable!(ShowResult, format_show_text);

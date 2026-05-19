@@ -26,6 +26,7 @@ pub mod add;
 pub mod apply_learning;
 pub mod complete;
 pub mod curate;
+pub mod current;
 pub mod decisions;
 pub mod dependency_checker;
 pub mod doctor;
@@ -53,13 +54,17 @@ pub mod stats;
 pub mod unblock;
 pub mod worktrees;
 
-pub use add::{AddResult, AddTaskInput, PrioritySource, add, format_text as format_add_text};
+pub use add::{
+    AddResult, AddTaskInput, PrioritySource, ResolutionSource, ResolvedContext, add,
+    format_text as format_add_text, resolve_context,
+};
 pub use apply_learning::{
     ApplyLearningResult, apply_learning, format_text as format_apply_learning_text,
 };
 pub use complete::{
     CompleteResult, TaskCompletionResult, complete, format_text as format_complete_text,
 };
+pub use current::{CurrentResult, current, format_text as format_current_text};
 pub use decisions::{
     DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult, DecisionSummary,
     DecisionsListResult, decline_decision_cmd, format_decline_text,

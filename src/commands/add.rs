@@ -10,6 +10,7 @@
 //! queue is empty), guaranteeing the new task ranks ahead on the next
 //! iteration.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -232,9 +233,26 @@ pub fn add_with_conn(
     // Auto-prefix: when exactly one active PRD prefix exists, prepend it to the
     // task ID and all cross-references. Idempotent — already-prefixed IDs are
     // left unchanged.
-    let resolved_prefix = resolve_active_prefix(conn)?;
+    let resolved_ctx = resolve_context(conn)?;
+
+    // Emit resolved-context line as the FIRST stderr output, before any write
+    // or downstream warning. Agents can read stderr line 1 to learn which PRD
+    // is active without running a separate `task-mgr current`.
+    if let Some(ref ctx) = resolved_ctx {
+        let target = if ctx.prd_json_path == PathBuf::new() {
+            "(none)".to_string()
+        } else {
+            ctx.prd_json_path.display().to_string()
+        };
+        eprintln!(
+            "→ active prefix={}  source={}  target={}",
+            ctx.prefix, ctx.source, target,
+        );
+    }
+
     let prefixed_depended_on_by: Vec<String>;
-    let effective_depended_on_by: &[String] = if let Some(ref prefix) = resolved_prefix {
+    let effective_depended_on_by: &[String] = if let Some(ref ctx) = resolved_ctx {
+        let prefix = &ctx.prefix;
         reject_foreign_prefix(conn, &input.id, &input.depends_on, depended_on_by, prefix)?;
         let original_id = input.id.clone();
         input.apply_prefix(prefix);
@@ -378,6 +396,72 @@ fn resolve_priority(
         },
         Err(_) => (0, PrioritySource::AutoEmptyQueue),
     }
+}
+
+/// How the active prefix was resolved.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionSource {
+    /// Resolved from `TASK_MGR_ACTIVE_PREFIX` environment variable.
+    EnvVar,
+    /// Resolved because exactly one prefix exists in `prd_metadata`.
+    SinglePrefix,
+    /// Resolved from an explicit `--from-json` flag (reserved for future use).
+    FromJsonFlag,
+    /// Could not resolve: env var absent and DB has zero or 2+ prefixes.
+    None,
+}
+
+impl fmt::Display for ResolutionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolutionSource::EnvVar => write!(f, "env"),
+            ResolutionSource::SinglePrefix => write!(f, "single-prefix"),
+            ResolutionSource::FromJsonFlag => write!(f, "from-json"),
+            ResolutionSource::None => write!(f, "none"),
+        }
+    }
+}
+
+/// Resolved context: which prefix is active, how it was found, and which PRD
+/// JSON it maps to. Used by `task-mgr current` and the leading stderr line on
+/// write operations.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedContext {
+    pub prefix: String,
+    pub source: ResolutionSource,
+    pub prd_json_path: PathBuf,
+}
+
+/// Resolve the active prefix and annotate it with source + target PRD path.
+///
+/// Returns `Ok(None)` when the DB has zero or 2+ prefixes and `TASK_MGR_ACTIVE_PREFIX`
+/// is not set — the caller should treat this as "no active PRD" rather than an
+/// error. Propagates `Err` for stale env pins or DB failures.
+pub fn resolve_context(conn: &Connection) -> TaskMgrResult<Option<ResolvedContext>> {
+    let env_value = std::env::var(crate::loop_engine::claude::ACTIVE_PREFIX_ENV).ok();
+    let env_set = env_value.as_deref().is_some_and(|v| !v.is_empty());
+
+    // Delegate all validation logic to resolve_active_prefix (single implementation).
+    let prefix_opt = resolve_active_prefix(conn)?;
+
+    let Some(prefix) = prefix_opt else {
+        return Ok(None);
+    };
+
+    let source = if env_set {
+        ResolutionSource::EnvVar
+    } else {
+        ResolutionSource::SinglePrefix
+    };
+
+    let prd_json_path = locate_prd_json(conn, Some(&prefix))?.unwrap_or_default();
+
+    Ok(Some(ResolvedContext {
+        prefix,
+        source,
+        prd_json_path,
+    }))
 }
 
 /// Returns all non-NULL `task_prefix` values from `prd_metadata`.
