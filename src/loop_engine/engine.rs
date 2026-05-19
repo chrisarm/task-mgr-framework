@@ -1463,10 +1463,14 @@ fn process_slot_result(
         };
         // FEAT-005/H3: use the pre-dispatch runner threaded from SlotContext
         // so the rung-4 idempotency guard pins on the same value the slot used.
-        // The debug_assert cross-checks that re-derivation from the result's
-        // effective_model agrees (catches drift if runner_overrides logic changes).
+        // The assertion cross-checks that re-derivation from the result's
+        // effective_model agrees (catches drift if runner_overrides logic
+        // changes). W4: kept as a real `assert_eq!` (not `debug_assert_eq!`)
+        // so drift is caught in release builds too — the cost is one HashMap
+        // lookup vs. a silent dispatch mismatch that would route the wrong
+        // model id to the wrong runner binary.
         let effective_runner = slot_result.effective_runner;
-        debug_assert_eq!(
+        assert_eq!(
             resolve_effective_runner(
                 ctx,
                 tid,
@@ -4933,40 +4937,60 @@ pub fn should_escalate_for_consecutive_failures(consecutive_failures: i32) -> bo
     consecutive_failures >= 2
 }
 
-/// Escalate the model for a task in the DB when consecutive failures reach the threshold.
+/// W5: deferred Grok promotion bundle. Carries everything needed to mutate
+/// `IterationContext` after a DB write commits. Used by
+/// `escalate_task_model_if_needed_inner` to decouple the DB step from the
+/// ctx step so transactional callers (`handle_task_failure`) can hold the
+/// ctx mutations until `tx.commit()` returns Ok — preventing a one-iteration
+/// dirty-ctx-vs-rolled-back-DB window when commit fails.
+pub(crate) struct PendingPromotion {
+    task_id: String,
+    pre_promotion_model: Option<String>,
+    grok_model: String,
+    new_count: i32,
+}
+
+/// Apply a deferred promotion to the `IterationContext`. Idempotent w.r.t.
+/// `overflow_original_task_model` (`or_insert_with` preserves the first
+/// snapshot). Emits the one-line stderr banner exactly once per promotion
+/// (gated on whether `runner_overrides` already held an entry — see M2 in
+/// the FEAT-007 commit).
+pub(crate) fn apply_pending_promotion(ctx: &mut IterationContext, p: &PendingPromotion) {
+    ctx.overflow_original_task_model
+        .entry(p.task_id.clone())
+        .or_insert_with(|| p.pre_promotion_model.clone());
+    let already_promoted = ctx.runner_overrides.contains_key(&p.task_id);
+    ctx.runner_overrides
+        .insert(p.task_id.clone(), RunnerKind::Grok);
+    ctx.model_overrides
+        .insert(p.task_id.clone(), p.grok_model.clone());
+    if !already_promoted {
+        eprintln!(
+            "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
+            p.task_id, p.grok_model, p.new_count
+        );
+    }
+}
+
+/// Inner helper: performs the DB writes for escalation/promotion but does
+/// **not** mutate `ctx`. Returns the escalated model AND an optional
+/// `PendingPromotion` the caller must apply via `apply_pending_promotion`
+/// after any enclosing transaction commits. Transactional callers
+/// (`handle_task_failure`) MUST use this variant + apply post-commit to
+/// avoid dirty-ctx on rollback.
 ///
-/// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
-/// - `None` or empty model assumes sonnet baseline → escalates to opus.
-/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
-///
-/// **FEAT-007 Grok promotion**: after the Claude-tier escalation runs, when
-/// `cfg.enabled` AND the post-escalation model is Opus AND `effective_runner`
-/// resolves to Claude AND `new_count >= cfg.runtime_error_threshold`, the
-/// task is promoted to the Grok runner. The promotion writes BOTH the
-/// `tasks.model` column AND the in-memory override maps on `ctx`
-/// (`runner_overrides`, `model_overrides`) so the next iteration's
-/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
-/// `tasks.model` value is captured into `ctx.overflow_original_task_model`
-/// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
-/// detector can spot operator edits later.
-///
-/// When `cfg` is `None` or `!enabled`, behavior is byte-identical to the
-/// pre-FEAT-007 ladder (Sonnet → Opus → terminal). The `ctx` argument is
-/// otherwise unused in that path.
-///
-/// Returns `Some(new_model)` if escalation OR promotion fired, `None` if
-/// below threshold, the model tier is unknown (e.g. already at Grok), or
-/// the Opus self-loop produced no change AND promotion conditions weren't met.
-/// The DB is updated in-place when `Some` is returned.
-pub fn escalate_task_model_if_needed(
+/// Reads `ctx` immutably to resolve the effective runner (for the
+/// idempotency guard). Does not capture override-snapshot state — that is
+/// part of the deferred apply.
+pub(crate) fn escalate_task_model_if_needed_inner(
     conn: &Connection,
     task_id: &str,
     new_count: i32,
-    ctx: &mut IterationContext,
+    ctx: &IterationContext,
     cfg: Option<&project_config::FallbackRunnerConfig>,
-) -> TaskMgrResult<Option<String>> {
+) -> TaskMgrResult<(Option<String>, Option<PendingPromotion>)> {
     if !should_escalate_for_consecutive_failures(new_count) {
-        return Ok(None);
+        return Ok((None, None));
     }
     let current_model: Option<String> =
         conn.query_row("SELECT model FROM tasks WHERE id = ?", [task_id], |r| {
@@ -4997,7 +5021,7 @@ pub fn escalate_task_model_if_needed(
     // Provider::Grok (idempotency).
     let fallback = match cfg {
         Some(c) if c.enabled => c,
-        _ => return Ok(escalated),
+        _ => return Ok((escalated, None)),
     };
     // H2: use ModelTier-based inclusive check so both OPUS_MODEL and OPUS_MODEL_1M
     // qualify as "at Opus" — string-eq on OPUS_MODEL excluded the 1M variant.
@@ -5008,41 +5032,72 @@ pub fn escalate_task_model_if_needed(
     // M1: compare in u32 space; new_count is a DB counter (always >= 0 in practice)
     // but guard the negative case to keep the cast sound for all inputs.
     if !was_at_opus || new_count < 0 || (new_count as u32) < fallback.runtime_error_threshold {
-        return Ok(escalated);
+        return Ok((escalated, None));
     }
     let effective_runner = resolve_effective_runner(ctx, task_id, current_model.as_deref());
     if effective_runner != RunnerKind::Claude {
-        return Ok(escalated);
+        return Ok((escalated, None));
     }
 
-    // All gates passed — promote to Grok. Capture the pre-promotion model
-    // snapshot for FEAT-008 override-invalidation detection BEFORE the DB
-    // UPDATE rewrites tasks.model.
-    ctx.overflow_original_task_model
-        .entry(task_id.to_string())
-        .or_insert_with(|| current_model.clone());
-
+    // All gates passed — promote to Grok. DB write happens here; ctx
+    // mutations are bundled into a `PendingPromotion` for the caller to
+    // apply after commit. The pre-promotion snapshot of `tasks.model` is
+    // captured BEFORE the UPDATE rewrites it so the FEAT-008 override-
+    // invalidation detector sees the original value on next iteration.
     conn.execute(
         "UPDATE tasks SET model = ? WHERE id = ?",
         rusqlite::params![fallback.model, task_id],
     )?;
-    // M2: gate banner on first promotion only. In wave-mode a task with
-    // Crash(PromptTooLong) can reach both the overflow rung-4 banner and this
-    // RuntimeError hook in the same wave; the overflow handler fires first and
-    // inserts into runner_overrides, so a pre-existing entry means the banner
-    // already printed (no duplicate).
-    let already_promoted = ctx.runner_overrides.contains_key(task_id);
-    ctx.runner_overrides
-        .insert(task_id.to_string(), RunnerKind::Grok);
-    ctx.model_overrides
-        .insert(task_id.to_string(), fallback.model.clone());
-    if !already_promoted {
-        eprintln!(
-            "Promoted task {} to Grok runner (model={}) after {} consecutive failures at Opus",
-            task_id, fallback.model, new_count
-        );
+    let promotion = PendingPromotion {
+        task_id: task_id.to_string(),
+        pre_promotion_model: current_model,
+        grok_model: fallback.model.clone(),
+        new_count,
+    };
+    Ok((Some(fallback.model.clone()), Some(promotion)))
+}
+
+/// Escalate the model for a task in the DB when consecutive failures reach the threshold.
+///
+/// Follows the same sonnet-baseline pattern as `check_crash_escalation`:
+/// - `None` or empty model assumes sonnet baseline → escalates to opus.
+/// - Sonnet → opus, Haiku → sonnet, Opus → opus (no-op at ceiling).
+///
+/// **FEAT-007 Grok promotion**: after the Claude-tier escalation runs, when
+/// `cfg.enabled` AND the post-escalation model is Opus AND `effective_runner`
+/// resolves to Claude AND `new_count >= cfg.runtime_error_threshold`, the
+/// task is promoted to the Grok runner. The promotion writes BOTH the
+/// `tasks.model` column AND the in-memory override maps on `ctx`
+/// (`runner_overrides`, `model_overrides`) so the next iteration's
+/// `resolve_task_model` + `resolve_effective_runner` agree. The pre-promotion
+/// `tasks.model` value is captured into `ctx.overflow_original_task_model`
+/// via `entry().or_insert_with(...)` so the FEAT-008 override-invalidation
+/// detector can spot operator edits later.
+///
+/// When `cfg` is `None` or `!enabled`, behavior is byte-identical to the
+/// pre-FEAT-007 ladder (Sonnet → Opus → terminal). The `ctx` argument is
+/// otherwise unused in that path.
+///
+/// Returns `Some(new_model)` if escalation OR promotion fired, `None` if
+/// below threshold, the model tier is unknown (e.g. already at Grok), or
+/// the Opus self-loop produced no change AND promotion conditions weren't met.
+/// The DB is updated in-place when `Some` is returned.
+///
+/// This is the convenience variant — DB and ctx writes happen back-to-back.
+/// Transactional callers should prefer `escalate_task_model_if_needed_inner`
+/// + `apply_pending_promotion` (see W5).
+pub fn escalate_task_model_if_needed(
+    conn: &Connection,
+    task_id: &str,
+    new_count: i32,
+    ctx: &mut IterationContext,
+    cfg: Option<&project_config::FallbackRunnerConfig>,
+) -> TaskMgrResult<Option<String>> {
+    let (model, pending) = escalate_task_model_if_needed_inner(conn, task_id, new_count, ctx, cfg)?;
+    if let Some(p) = pending {
+        apply_pending_promotion(ctx, &p);
     }
-    Ok(Some(fallback.model.clone()))
+    Ok(model)
 }
 
 /// Increment `consecutive_failures` for a task in the DB.
@@ -5132,11 +5187,24 @@ pub fn handle_task_failure(
         )
         .unwrap_or(3);
 
-    // Only escalate if auto-block won't immediately follow (escalated model would never be used)
-    if !should_auto_block(new_count, max_retries)
-        && let Err(e) = escalate_task_model_if_needed(&tx, task_id, new_count, ctx, cfg)
-    {
-        eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+    // W5: stage the Grok promotion's ctx mutations as a `PendingPromotion`
+    // and defer applying them until `tx.commit()?` returns Ok below. If
+    // commit fails, the in-memory ctx stays consistent with the rolled-back
+    // DB (no dirty `runner_overrides` / `model_overrides` entries pointing
+    // to a Grok model the DB still records as Opus).
+    //
+    // Only escalate if auto-block won't immediately follow — the escalated
+    // model would never be used.
+    let mut pending_promotion: Option<PendingPromotion> = None;
+    if !should_auto_block(new_count, max_retries) {
+        match escalate_task_model_if_needed_inner(&tx, task_id, new_count, ctx, cfg) {
+            Ok((_model, promotion)) => {
+                pending_promotion = promotion;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to escalate model for {}: {}", task_id, e);
+            }
+        }
     }
 
     if should_auto_block(new_count, max_retries) {
@@ -5151,6 +5219,11 @@ pub fn handle_task_failure(
     }
 
     tx.commit()?;
+
+    // Commit succeeded — safe to mutate ctx.
+    if let Some(p) = pending_promotion {
+        apply_pending_promotion(ctx, &p);
+    }
 
     Ok(())
 }

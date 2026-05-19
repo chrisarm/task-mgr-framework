@@ -267,6 +267,27 @@ fn default_fallback_runtime_error_threshold() -> u32 {
     2
 }
 
+/// Check that `path` exists, is a regular file, and (on Unix) has the
+/// executable bit set for some user class. Spawn will only succeed against
+/// an executable file, so the startup probe should reject non-executable
+/// paths up-front rather than letting them fail with a less-helpful
+/// `std::io::Error` at first promotion. On non-Unix targets, falls back to
+/// `exists()` (no mode bits available).
+fn is_executable_path(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// Verify that the Grok fallback binary is reachable at loop startup.
 ///
 /// Returns `Ok(())` when:
@@ -274,12 +295,14 @@ fn default_fallback_runtime_error_threshold() -> u32 {
 /// - `cfg.enabled` is `false` (explicitly disabled — no PATH probe occurs).
 ///
 /// Returns `Err` when `cfg.enabled` is `true` and the resolved binary path
-/// does not exist. The error message names the binary so operators can
-/// diagnose without re-reading config.
+/// does not exist OR is not executable. The error message names the binary
+/// so operators can diagnose without re-reading config.
 ///
-/// Binary resolution order:
-/// 1. `cfg.cli_binary` — probed at the path verbatim (not re-resolved via PATH).
-/// 2. `None` — searches PATH directories for the bare name `"grok"`.
+/// Binary resolution order (matches `runner::resolve_grok_binary`):
+/// 1. `GROK_BINARY` env var when set AND non-empty/non-whitespace.
+/// 2. `cfg.cli_binary` when set AND non-empty/non-whitespace — probed at
+///    the path verbatim (not re-resolved via PATH).
+/// 3. Bare name `"grok"` — searches PATH directories.
 pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskMgrResult<()> {
     let cfg = match cfg {
         None => return Ok(()),
@@ -287,20 +310,32 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
         Some(c) => c,
     };
 
-    // Resolution order mirrors GrokRunner::spawn: GROK_BINARY env var →
-    // cfg.cli_binary → bare "grok" on PATH. Keeping the same priority chain
-    // prevents operators who set GROK_BINARY for dev/test from hitting a
-    // misleading "binary not found" startup error.
-    let (binary, found) = if let Ok(env_bin) = std::env::var("GROK_BINARY") {
-        let exists = std::path::Path::new(&env_bin).exists();
-        (env_bin, exists)
-    } else if let Some(explicit) = &cfg.cli_binary {
-        let exists = std::path::Path::new(explicit).exists();
-        (explicit.clone(), exists)
+    // Resolution order mirrors runner::resolve_grok_binary exactly:
+    // GROK_BINARY env var (if non-empty) → cfg.cli_binary (if non-empty) →
+    // bare "grok" on PATH. Empty/whitespace values fall through to the next
+    // link — common shell footgun (`export GROK_BINARY=""` should not cause
+    // a misleading startup failure when grok is on PATH).
+    let env_bin = std::env::var("GROK_BINARY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let cli_bin = cfg
+        .cli_binary
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+        .cloned();
+
+    let (binary, found) = if let Some(env_bin) = env_bin {
+        let exec = is_executable_path(std::path::Path::new(&env_bin));
+        (env_bin, exec)
+    } else if let Some(explicit) = cli_bin {
+        let exec = is_executable_path(std::path::Path::new(&explicit));
+        (explicit, exec)
     } else {
         let name = "grok";
         let found = std::env::var_os("PATH")
-            .map(|path_var| std::env::split_paths(&path_var).any(|dir| dir.join(name).exists()))
+            .map(|path_var| {
+                std::env::split_paths(&path_var).any(|dir| is_executable_path(&dir.join(name)))
+            })
             .unwrap_or(false);
         (name.to_string(), found)
     };
@@ -312,7 +347,7 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
             resource_type: "Fallback runner binary".to_string(),
             id: format!(
                 "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
-                 correct path, then retry"
+                 correct path (must be an executable file), then retry"
             ),
         })
     }

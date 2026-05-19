@@ -285,6 +285,99 @@ fn startup_check_honors_grok_binary_env_var() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// W1 — empty/whitespace GROK_BINARY falls through to cli_binary/PATH
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// W1: an operator with `export GROK_BINARY=""` in their env should not get a
+/// confusing startup failure when `cli_binary` is a real executable. The
+/// runtime resolver (`runner::resolve_grok_binary`) already skips
+/// empty/whitespace values; the startup check must agree.
+#[test]
+fn startup_check_skips_empty_grok_binary_env() {
+    if !std::path::Path::new("/usr/bin/true").exists() {
+        return;
+    }
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::set_var("GROK_BINARY", "") };
+
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        cli_binary: Some("/usr/bin/true".to_string()),
+        ..Default::default()
+    };
+    let result = check_fallback_runner_binary(Some(&cfg));
+
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
+    result.expect(
+        "GROK_BINARY=\"\" must fall through to cli_binary — the runtime \
+         resolver does the same, and a divergence would surface as a \
+         spurious startup failure on a misconfigured env",
+    );
+}
+
+#[test]
+fn startup_check_skips_whitespace_grok_binary_env() {
+    if !std::path::Path::new("/usr/bin/true").exists() {
+        return;
+    }
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::set_var("GROK_BINARY", "   ") };
+
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        cli_binary: Some("/usr/bin/true".to_string()),
+        ..Default::default()
+    };
+    let result = check_fallback_runner_binary(Some(&cfg));
+
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
+    result.expect("whitespace-only GROK_BINARY must fall through to cli_binary");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 — non-executable file at the resolved path fails the check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// W2: on Unix, the startup check should reject a path that exists but is not
+/// executable (e.g. a regular text file). Catches the misconfiguration up-front
+/// instead of letting spawn fail with a less-helpful `std::io::Error` at
+/// first promotion.
+#[cfg(unix)]
+#[test]
+fn startup_check_rejects_non_executable_cli_binary() {
+    let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutation is process-global; serialized via GROK_BINARY_MUTEX.
+    unsafe { std::env::remove_var("GROK_BINARY") };
+
+    let dir = TempDir::new().expect("tempdir");
+    let non_exec = dir.path().join("not-executable.txt");
+    fs::write(&non_exec, b"i am a regular file, not a binary").expect("write file");
+    // Ensure no exec bit is set (default umask should already do this, but be
+    // explicit so the test is deterministic across hosts).
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&non_exec).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&non_exec, perms).expect("set perms");
+
+    let cfg = FallbackRunnerConfig {
+        enabled: true,
+        cli_binary: Some(non_exec.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let err = check_fallback_runner_binary(Some(&cfg))
+        .expect_err("non-executable file at cli_binary path MUST fail the startup check");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(non_exec.to_str().unwrap()),
+        "error message MUST name the offending path; got: {msg}",
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AC #10 — test file compiles
 // ─────────────────────────────────────────────────────────────────────────────
 

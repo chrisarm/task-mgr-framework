@@ -58,12 +58,29 @@ fn grok_auth_failure_window() -> Duration {
 }
 
 /// Case-insensitive substrings that, combined with a non-zero exit within
-/// [`GROK_AUTH_FAILURE_WINDOW`] of spawn, indicate an unauthenticated Grok
-/// install. Comparison is done against a lowercased copy of stderr.
+/// [`GROK_AUTH_FAILURE_WINDOW_DEFAULT_SECS`] of spawn, indicate an
+/// unauthenticated Grok install. Comparison is done against a lowercased
+/// copy of stderr.
+///
+/// **Runbook**: this list is the auth-failure short-circuit's only signal.
+/// A missed match silently fails open — the task gets counted toward
+/// `consecutive_failures` and may be auto-blocked with a misleading
+/// "max retries exceeded" reason instead of "grok auth failed". On each
+/// grok CLI version bump, re-capture the unauthenticated stderr output and
+/// extend this list if new phrasing appears (see
+/// `src/loop_engine/CLAUDE.md` "Grok auth-failure detection").
 const GROK_AUTH_FAILURE_SUBSTRINGS: &[&str] = &[
     "not authenticated",
     "please run grok login",
     "grok login required",
+    "login required",
+    "authentication required",
+    "authentication failed",
+    "unauthorized",
+    "401",
+    "invalid api key",
+    "api key not found",
+    "missing api key",
 ];
 
 /// Operator hint surfaced via [`TaskMgrError::GrokAuthFailure`]. Single source
@@ -1150,6 +1167,40 @@ mod tests {
         ));
         assert!(!stderr_contains_auth_failure("some unrelated error"));
         assert!(!stderr_contains_auth_failure(""));
+    }
+
+    /// W3: broaden auth-failure coverage so the short-circuit doesn't silently
+    /// fail open when grok phrases the rejection differently across CLI
+    /// versions. Each line below contains only ONE of the W3-added phrases
+    /// (no overlap with the original three) so it asserts the new entry
+    /// independently.
+    #[test]
+    fn stderr_contains_auth_failure_w3_broader_phrasing() {
+        // "login required" alone (without "grok ") — newer CLIs may drop the prefix.
+        assert!(stderr_contains_auth_failure(
+            "Error: login required to use this command"
+        ));
+        // "authentication required" — generic phrasing.
+        assert!(stderr_contains_auth_failure(
+            "Error: authentication required"
+        ));
+        // "authentication failed" — credentials present but rejected.
+        assert!(stderr_contains_auth_failure("AUTHENTICATION FAILED"));
+        // Bare "unauthorized" without a leading 401.
+        assert!(stderr_contains_auth_failure("HTTP error: Unauthorized"));
+        // Bare 401 without "unauthorized" word.
+        assert!(stderr_contains_auth_failure("server returned 401"));
+        // API-key variants — relevant if grok ever surfaces upstream xAI errors.
+        assert!(stderr_contains_auth_failure("Invalid API key"));
+        assert!(stderr_contains_auth_failure("api key not found"));
+        assert!(stderr_contains_auth_failure("Missing API key in request"));
+
+        // Negative controls — common error phrases that must NOT match.
+        assert!(!stderr_contains_auth_failure("file not found"));
+        assert!(!stderr_contains_auth_failure("rate limit exceeded"));
+        assert!(!stderr_contains_auth_failure(
+            "internal server error (500)"
+        ));
     }
 
     /// Unit: binary resolution chain prefers `$GROK_BINARY`, then

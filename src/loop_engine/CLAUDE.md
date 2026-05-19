@@ -162,6 +162,32 @@ via `IterationContext::overflow_original_model.entry().or_insert_with(...)`.
 ctx update → DB UPDATE → stderr → dump → JSONL → rotate. Recovery state must
 be durable before any best-effort observability writes.
 
+**Grok auth-failure detection** (`runner.rs::GROK_AUTH_FAILURE_SUBSTRINGS` +
+`stderr_contains_auth_failure`): the auth-failure short-circuit relies on a
+small set of case-insensitive substrings matched against captured stderr.
+A missed match silently fails open — the task is counted toward
+`consecutive_failures` and may be auto-blocked with a misleading "max
+retries exceeded" reason rather than "grok auth failed". On every grok CLI
+version bump, re-capture the unauthenticated stderr output via
+`grok login --logout` (or by intentionally invalidating the token) and run
+the binary once; extend the substring list in `runner.rs` if new phrasing
+appears. Negative controls (`stderr_contains_auth_failure_w3_broader_phrasing`
+in `runner.rs` unit tests) keep the list from drifting into false positives
+on common error phrases like "file not found" or "rate limit exceeded".
+
+**Transactional promotion ctx writes are deferred** (`engine.rs::handle_task_failure`
++ `escalate_task_model_if_needed_inner` + `apply_pending_promotion`): the
+RuntimeError fallback hook runs inside the same DB transaction that
+increments `consecutive_failures` and (optionally) auto-blocks. If the ctx
+mutations (`runner_overrides`, `model_overrides`,
+`overflow_original_task_model`) happened inside the transaction body and
+`tx.commit()` failed, the in-memory ctx would claim a promotion the DB
+rolled back. The pattern is: inner helper performs DB writes only and
+returns an `Option<PendingPromotion>`; the caller applies it via
+`apply_pending_promotion` **only after `tx.commit()?` returns Ok**. Direct
+callers (tests, sequential non-transactional paths) use the convenience
+wrapper `escalate_task_model_if_needed` which applies immediately.
+
 ## Iteration pipeline (shared)
 
 Sequential (`run_iteration`) and parallel-wave (`run_slot_iteration` +

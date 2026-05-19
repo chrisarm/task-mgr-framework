@@ -569,6 +569,88 @@ fn promotion_fires_at_opus_1m_and_threshold() {
     );
 }
 
+// ── W5 — Promotion ctx writes are deferred until after tx.commit() ───────────
+
+/// W5: `handle_task_failure` runs inside a transaction. If the Grok-promotion
+/// ctx mutations (`runner_overrides`, `model_overrides`,
+/// `overflow_original_task_model`) happened BEFORE `tx.commit()`, a commit
+/// failure (disk full, busy timeout, etc.) would leave the in-memory ctx
+/// claiming a promotion that the DB rolled back. Next iteration would
+/// dispatch the Grok runner against a `tasks.model` still pointing at Opus.
+///
+/// The fix is to use the deferred-apply variant: call
+/// `escalate_task_model_if_needed_inner` (which performs only DB writes and
+/// returns a `PendingPromotion` describing the ctx changes), then call
+/// `apply_pending_promotion` ONLY after `tx.commit()?` returns Ok.
+///
+/// This source-grep test pins the wiring so a future refactor that calls the
+/// non-deferred convenience function from inside the transaction surfaces as
+/// a test failure rather than as a rare correctness regression.
+#[test]
+fn handle_task_failure_defers_promotion_ctx_writes_until_after_commit() {
+    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
+        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+
+    let start = source
+        .find("pub fn handle_task_failure(")
+        .expect("expected `pub fn handle_task_failure(` to be defined in engine.rs");
+    // The next top-level definition after handle_task_failure marks the
+    // function body end. Use a search past the opening `{` to find the next
+    // `\nfn ` or `\npub fn ` or `\npub(crate) fn ` declaration.
+    let after_open = &source[start..];
+    let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+        .iter()
+        .filter_map(|marker| after_open[marker.len()..].find(marker).map(|p| p + marker.len()))
+        .min()
+        .expect("expected another top-level fn after handle_task_failure");
+    let body = &after_open[..body_end_rel];
+
+    // The body MUST call the deferred-apply pair.
+    assert!(
+        body.contains("escalate_task_model_if_needed_inner"),
+        "handle_task_failure MUST call escalate_task_model_if_needed_inner (the \
+         deferred-apply variant) so ctx mutations stay bundled in a \
+         PendingPromotion until after tx.commit() succeeds. W5: \
+         escalate_task_model_if_needed (the immediate-apply convenience) inside \
+         the transaction leaves ctx dirty if commit fails.",
+    );
+    assert!(
+        body.contains("apply_pending_promotion"),
+        "handle_task_failure MUST call apply_pending_promotion to actually \
+         install the deferred ctx mutations after commit succeeds.",
+    );
+
+    // The apply_pending_promotion call MUST appear AFTER tx.commit() in the
+    // function body.
+    let commit_idx = body
+        .find("tx.commit()")
+        .expect("expected `tx.commit()` in handle_task_failure body");
+    let apply_idx = body
+        .find("apply_pending_promotion")
+        .expect("expected `apply_pending_promotion` in handle_task_failure body");
+    assert!(
+        apply_idx > commit_idx,
+        "apply_pending_promotion MUST be called AFTER tx.commit() in \
+         handle_task_failure — calling it before would defeat the W5 fix \
+         (ctx would still be dirty on commit failure). commit at byte {}, \
+         apply at byte {}.",
+        commit_idx,
+        apply_idx,
+    );
+
+    // Belt-and-suspenders: the convenience `escalate_task_model_if_needed`
+    // (without `_inner`) MUST NOT appear inside handle_task_failure. Use
+    // a word-boundary check by looking for the bare name not followed by
+    // `_inner`. We search for the call form `escalate_task_model_if_needed(`
+    // which the convenience function uses but the inner variant does not.
+    assert!(
+        !body.contains("escalate_task_model_if_needed("),
+        "handle_task_failure MUST NOT call the convenience \
+         escalate_task_model_if_needed( — that variant applies ctx writes \
+         immediately and breaks the W5 commit-deferred guarantee.",
+    );
+}
+
 // ── AC #9 — Test file compiles ────────────────────────────────────────────────
 
 /// Compile-only contract pin: importing the symbols above already proves
