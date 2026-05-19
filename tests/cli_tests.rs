@@ -2532,3 +2532,364 @@ fn test_init_from_json_with_enhance_imports_prd_and_skips_enhance() {
         "shim path must not auto-create AGENTS.md when --enhance is passed"
     );
 }
+
+// ============================================================================
+// Test: task-mgr current
+// ============================================================================
+
+#[test]
+fn test_current_empty_db_exits_zero_with_no_active_prd_message() {
+    // Initialize project schema without importing any PRD (no from-json).
+    let temp_dir = TempDir::new().unwrap();
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("init")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("current")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no active PRD"));
+}
+
+#[test]
+fn test_current_with_single_prefix_prints_context_line() {
+    let temp_dir = setup_initialized_tempdir();
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .arg("current")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("active prefix="))
+        .stdout(predicate::str::contains("source="))
+        .stdout(predicate::str::contains("target="));
+}
+
+#[test]
+fn test_current_format_json_returns_context_object() {
+    let temp_dir = setup_initialized_tempdir();
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args(["--format", "json", "current"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("must be valid JSON");
+    // context key exists; may be null (no active PRD) or an object
+    assert!(
+        json.get("context").is_some(),
+        "JSON must have 'context' key"
+    );
+}
+
+#[test]
+fn test_read_only_commands_do_not_emit_arrow_context_line() {
+    let temp_dir = setup_initialized_tempdir();
+    // show, list, next must NOT emit the `→ active prefix=` stderr line
+    for subcmd in &["list", "next"] {
+        let output = Command::new(cargo_bin("task-mgr"))
+            .args(["--dir", temp_dir.path().to_str().unwrap()])
+            .arg(subcmd)
+            .env_remove("TASK_MGR_ACTIVE_PREFIX")
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8_lossy(&output);
+        assert!(
+            !stderr.contains("→ active prefix="),
+            "{subcmd} must not emit '→ active prefix=' on stderr; got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_add_emits_arrow_context_line_as_first_stderr() {
+    // Copy fixture to the tempdir so `add` syncs into a local file (not the fixture).
+    let temp_dir = TempDir::new().unwrap();
+    let prd_path = sample_prd_path();
+    let local_prd = temp_dir.path().join("sample_prd.json");
+    fs::copy(&prd_path, &local_prd).unwrap();
+
+    Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args([
+            "init",
+            "--no-prefix",
+            "--from-json",
+            local_prd.to_str().unwrap(),
+        ])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success();
+
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["--dir", temp_dir.path().to_str().unwrap()])
+        .args(["add", "--stdin"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .write_stdin(r#"{"id":"ADD-CANARY-001","title":"canary task for add stderr test"}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8_lossy(&output);
+    // First non-empty stderr line must start with `→ active prefix=`
+    let first_line = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    assert!(
+        first_line.starts_with("→ active prefix="),
+        "first stderr line must start with '→ active prefix='; got: {first_line:?}"
+    );
+}
+
+// ============================================================================
+// FEAT-004: task-mgr how advisor integration tests
+// ============================================================================
+
+#[test]
+fn test_how_appears_in_top_level_help_as_visible_subcommand() {
+    Command::new(cargo_bin("task-mgr"))
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("how"));
+}
+
+#[test]
+fn test_how_change_task_status_lists_status_verbs() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "change task status"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete"))
+        .stdout(predicate::str::contains("fail"))
+        .stdout(predicate::str::contains("skip"))
+        .stdout(predicate::str::contains("reset"));
+}
+
+#[test]
+fn test_how_add_follow_up_lists_three_depended_on_by_forms() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["how", "add a follow-up task"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    let count = stdout.matches("--depended-on-by").count();
+    assert!(
+        count >= 3,
+        "expected >= 3 --depended-on-by forms; got {count} in:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_how_where_will_my_add_land_points_at_current() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "where will my add land"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task-mgr current"));
+}
+
+#[test]
+fn test_how_unrelated_query_points_at_cheatsheet() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "totally unrelated nonsense query"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no recipe matched"))
+        .stdout(predicate::str::contains("task-mgr cheatsheet"));
+}
+
+#[test]
+fn test_how_no_arg_lists_intents_one_per_line() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .arg("how")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(stdout.contains("Available intents"));
+    // At least the canonical bags appear on their own lines.
+    for bag in ["status", "follow-up", "sync"] {
+        assert!(
+            stdout.lines().any(|l| l == bag),
+            "missing intent bag '{bag}' on its own line in:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_how_empty_string_lists_intents() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", ""])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Available intents"));
+}
+
+#[test]
+fn test_how_multi_match_separated_by_horizontal_rule() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["how", "sync json"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("---"));
+}
+
+// ============================================================================
+// Test: Wrong-name / wrong-flag hints on clap parse errors (FEAT-003)
+// ============================================================================
+
+/// Table-driven positive cases: each wrong invocation must exit non-zero and
+/// produce a `hint:` line on stderr containing the expected substring.
+#[test]
+fn test_wrong_name_and_flag_hints() {
+    struct Case {
+        args: &'static [&'static str],
+        expected_hint_substr: &'static str,
+    }
+
+    let cases = [
+        Case {
+            args: &["set-status", "FOO", "done"],
+            expected_hint_substr: "hint: task-mgr has no `set-status` subcommand",
+        },
+        Case {
+            args: &["recall", "--top-k", "5"],
+            expected_hint_substr: "hint: task-mgr recall has no `--top-k`",
+        },
+        Case {
+            args: &["learnings", "show", "2236"],
+            expected_hint_substr: "hint:",
+        },
+        Case {
+            args: &["remove", "FOO"],
+            expected_hint_substr: "hint: task-mgr has no `remove` subcommand",
+        },
+        Case {
+            args: &["update", "FOO-1", "--title", "x"],
+            expected_hint_substr: "hint: task-mgr has no `update` subcommand",
+        },
+    ];
+
+    for case in &cases {
+        Command::new(cargo_bin("task-mgr"))
+            .args(case.args)
+            .env_remove("TASK_MGR_ACTIVE_PREFIX")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(case.expected_hint_substr));
+    }
+}
+
+/// `set-status` hint must also include the worked status-transition table.
+#[test]
+fn test_set_status_hint_includes_transition_table() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["set-status", "FOO", "done"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hint: task-mgr has no `set-status` subcommand",
+        ))
+        .stderr(predicate::str::contains("complete"))
+        .stderr(predicate::str::contains("irrelevant"));
+}
+
+/// `remove` hint must suggest `irrelevant`, not a nonexistent `remove` command.
+#[test]
+fn test_remove_hint_suggests_irrelevant_fact_check() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["remove", "FOO"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(
+        stderr.contains("irrelevant"),
+        "remove hint must mention `irrelevant`, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("task-mgr remove"),
+        "remove hint must not suggest a nonexistent `task-mgr remove` command, got:\n{stderr}"
+    );
+}
+
+/// `recall --top-k` hint must suggest `--limit <N>` (per-subcommand scoping).
+#[test]
+fn test_recall_top_k_hint_suggests_limit() {
+    Command::new(cargo_bin("task-mgr"))
+        .args(["recall", "--top-k", "5"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--limit"));
+}
+
+/// `update` hint must reference the JSON-edit + loop-init workflow.
+#[test]
+fn test_update_hint_references_loop_init() {
+    let output = Command::new(cargo_bin("task-mgr"))
+        .args(["update", "FOO-1", "--title", "x"])
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output);
+    assert!(
+        stderr.contains("loop init") || stderr.contains("--append"),
+        "update hint should reference loop-init workflow, got:\n{stderr}"
+    );
+}
+
+/// Negative: random unknown flag (`--foo`) must produce NO `hint:` line.
+#[test]
+fn test_random_unknown_flag_produces_no_hint() {
+    Command::new(cargo_bin("task-mgr"))
+        .arg("--foo")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hint:").not());
+}
+
+/// Negative: typo close to a real command (`inits`) must produce NO `hint:` line.
+#[test]
+fn test_typo_close_to_real_command_produces_no_hint() {
+    Command::new(cargo_bin("task-mgr"))
+        .arg("inits")
+        .env_remove("TASK_MGR_ACTIVE_PREFIX")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hint:").not());
+}

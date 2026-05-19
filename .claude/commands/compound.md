@@ -77,7 +77,11 @@ cat tasks/progress-$PREFIX.txt
 git -C $WORKTREE log main..HEAD --oneline
 
 # 3. Learnings already recorded mid-loop for this PRD
-task-mgr recall --prefix $PREFIX --limit 30
+# `recall` has no --prefix flag; query by topic instead, or list recent and scan
+# for the PRD's prefix tag (mid-loop learnings should carry the prefix).
+task-mgr recall --query "$PRD_TOPIC_OR_TITLE" --tags "$PREFIX" --limit 30
+# Fallback if you don't trust the vector match:
+task-mgr learnings --recent 30
 
 # 4. Changed files (to scope CLAUDE.md §5 greps and to understand subsystem touch)
 git -C $WORKTREE diff --stat main..HEAD
@@ -125,7 +129,7 @@ task-mgr learn \
   --files "<optional file paths>"
 ```
 
-Tag hygiene: reuse existing tags where they fit (`task-mgr recall --list-tags` if you're unsure). Inventing a new tag for every learning defeats the recall index.
+Tag hygiene: reuse existing tags where they fit. There is no dedicated "list all tags" command; the practical proxy is `task-mgr recall --tags <candidate-tag> --limit 1` — if it returns nothing, that tag isn't in active use yet. Inventing a new tag for every learning defeats the recall index.
 
 ### 2.3 Architectural decisions → `tm-decisions`
 
@@ -233,13 +237,19 @@ Count the results where confidence ≥ 50%. If **count ≥ 12**, the pattern has
    ```
    (Capture the returned ID however `task-mgr learn` surfaces it — may be in stdout or require a follow-up `recall` to find.)
 
-3. **Mark source learnings superseded.** If `task-mgr` supports tag-add on existing learnings, use it:
+3. **Mark source learnings superseded** via the first-class supersession edge (one row per pair in `learning_supersessions`; `recall` then excludes the sources by default):
    ```bash
-   for id in $MATCHED_IDS; do
-     task-mgr learn-tag $id --add "superseded-by:$POINTER_ID"
+   for src_id in $MATCHED_IDS; do
+     task-mgr edit-learning $POINTER_ID --supersedes $src_id
    done
    ```
-   If it doesn't, **record in the compound report** as a human-follow-up item listing the IDs — do not silently drop this step. Current CLI (as of 2026) has `edit-learning` for supersession and tag management; there is no `learn-tag` subcommand.
+   If you also want a discoverable tag on the sources (optional — `--supersedes` alone is sufficient for filtering):
+   ```bash
+   for src_id in $MATCHED_IDS; do
+     task-mgr edit-learning $src_id --add-tags "superseded-by:$POINTER_ID"
+   done
+   ```
+   There is no `task-mgr learn-tag` subcommand — `edit-learning --add-tags` / `--remove-tags` / `--supersedes` cover all of: tagging existing learnings, supersession edges, and content edits.
 
 4. **Flag in the compound report:**
    ```
@@ -258,7 +268,7 @@ For every artifact written, confirm it's retrievable by the system that'll consu
 | ------------------ | ------------------------------------------------------------------------------------ |
 | `CLAUDE.md §5`     | `grep -n '<keyword from new entry>' $WORKTREE/CLAUDE.md`                             |
 | `task-mgr learn`   | `task-mgr recall --tags <new-tag> --limit 3`                                         |
-| `tm-decisions`     | `task-mgr decisions list --tag <tag>` (or `/tm-decisions` equivalent)                |
+| `tm-decisions`     | `task-mgr decisions list` (scan for the relevant decision; `--tag` filter is not yet supported) |
 | Copy voice         | `grep -n '<pattern name>' $WORKTREE/docs/architecture/copy-voice.md`                 |
 | Changelog          | `grep -n '<PRD title>' $WORKTREE/docs/change_logs/CHANGELOG_$TODAY.md`               |
 | Agent draft        | `ls ~/.claude/agents/<name>.md.draft`                                                |

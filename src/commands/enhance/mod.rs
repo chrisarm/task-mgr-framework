@@ -439,7 +439,7 @@ pub fn enhance_agents(params: AgentsParams) -> Result<EnhanceResult, TaskMgrErro
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in &targets {
-        let outcome = agents_one(target, body, params.create, params.dry_run);
+        let outcome = agents_one(target, &body, params.create, params.dry_run);
         if matches!(outcome.action, ActionTaken::Skipped) {
             eprintln!(
                 "skipping {} (not found; pass --create to create)",
@@ -469,7 +469,7 @@ pub fn enhance_show(params: ShowParams) -> Result<EnhanceResult, TaskMgrError> {
         profile: Some(params.profile),
         dry_run: false,
         targets: Vec::new(),
-        rendered: Some(body.to_string()),
+        rendered: Some(body),
     })
 }
 

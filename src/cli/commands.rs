@@ -1171,6 +1171,28 @@ GENERATED MAN PAGES:
         action: ModelsAction,
     },
 
+    /// Show the currently resolved active PRD context (prefix, source, target path)
+    ///
+    /// Exits 0 in all cases — "no active PRD" is a probe result, not an error.
+    #[command(after_help = "\
+EXAMPLES:
+    # Show the active PRD context
+    task-mgr current
+
+    # Machine-readable (JSON)
+    task-mgr --format json current | jq '.context.prefix'
+
+OUTPUT:
+    active prefix=<p>  source=<src>  target=<path>
+
+    source is one of: env (TASK_MGR_ACTIVE_PREFIX), single-prefix (auto),
+    from-json (--from-json flag), or none (ambiguous / empty DB).
+
+    When no PRD can be resolved, prints:
+    no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX
+")]
+    Current,
+
     /// Manage the task-mgr-fenced block in CLAUDE.md / AGENTS.md
     #[command(after_help = "\
 EXAMPLES:
@@ -1190,6 +1212,46 @@ EXAMPLES:
     Enhance {
         #[command(subcommand)]
         cmd: EnhanceCommand,
+    },
+
+    /// Print the curated cheat sheet + clap-generated command reference
+    ///
+    /// Three sections in order: Common Recipes (curated, hand-written),
+    /// Command Reference (auto-generated from every non-hidden clap
+    /// subcommand — drift CI ensures it never lies), and State
+    /// Inspection (one paragraph pointing operators at `task-mgr current`).
+    #[command(after_help = "\
+EXAMPLES:
+    # Render the cheat sheet to stdout
+    task-mgr cheatsheet
+
+    # Pipe to less for browsing
+    task-mgr cheatsheet | less -R
+")]
+    Cheatsheet,
+
+    /// Map a natural-language intent to canonical task-mgr commands.
+    ///
+    /// Hand-curated keyword bags — case-insensitive, deterministic, no
+    /// LLM or embedding lookups. Visible subcommand (not hidden) so
+    /// `task-mgr --help` advertises it. With no arg, lists the available
+    /// intents; with multiple matches, joins recipes with `---`.
+    #[command(after_help = "\
+EXAMPLES:
+    # Discover available intents (lists every keyword bag, one per line)
+    task-mgr how
+
+    # Map an intent to a recipe
+    task-mgr how 'change task status'
+    task-mgr how 'add a follow-up task'
+    task-mgr how 'where will my add land'
+
+    # Multiple matches are joined by `---`
+    task-mgr how 'sync json'
+")]
+    How {
+        /// Free-text intent. Case-insensitive. Omit to list intents.
+        query: Option<String>,
     },
 }
 

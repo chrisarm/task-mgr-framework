@@ -24,8 +24,10 @@
 
 pub mod add;
 pub mod apply_learning;
+pub mod cheatsheet;
 pub mod complete;
 pub mod curate;
+pub mod current;
 pub mod decisions;
 pub mod dependency_checker;
 pub mod doctor;
@@ -33,8 +35,10 @@ pub mod enhance;
 pub mod export;
 pub mod fail;
 pub mod history;
+pub mod how;
 pub mod import_learnings;
 pub mod init;
+pub mod intents;
 pub mod invalidate_learning;
 pub mod irrelevant;
 pub mod learn;
@@ -53,13 +57,18 @@ pub mod stats;
 pub mod unblock;
 pub mod worktrees;
 
-pub use add::{AddResult, AddTaskInput, PrioritySource, add, format_text as format_add_text};
+pub use add::{
+    AddResult, AddTaskInput, PrioritySource, ResolutionSource, ResolvedContext, add,
+    format_text as format_add_text, resolve_context,
+};
 pub use apply_learning::{
     ApplyLearningResult, apply_learning, format_text as format_apply_learning_text,
 };
+pub use cheatsheet::{CheatsheetResult, cheatsheet, format_text as format_cheatsheet_text};
 pub use complete::{
     CompleteResult, TaskCompletionResult, complete, format_text as format_complete_text,
 };
+pub use current::{CurrentResult, current, format_text as format_current_text};
 pub use decisions::{
     DecisionDeclineResult, DecisionResolveResult, DecisionRevertResult, DecisionSummary,
     DecisionsListResult, decline_decision_cmd, format_decline_text,
@@ -82,6 +91,7 @@ pub use history::{
     format_detail_text as format_history_detail_text, format_text as format_history_text, history,
     history_detail,
 };
+pub use how::{HowResult, format_text as format_how_text, how};
 pub use import_learnings::{
     ImportLearningsResult, format_text as format_import_learnings_text, import_learnings,
 };
