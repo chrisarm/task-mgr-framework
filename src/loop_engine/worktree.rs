@@ -2216,7 +2216,27 @@ fn handle_conflict_for_slot(
 }
 
 /// Fast-forward each successfully-merged slot worktree to the updated main
-/// branch head. Slots whose `--ff-only` fails are demoted to `failed_slots`.
+/// branch head. Slots whose `--ff-only` fails are demoted to `failed_slots`,
+/// EXCEPT when the only thing blocking the fast-forward is a dirty per-PRD
+/// progress file.
+///
+/// The merge-up step ([`merge_slot_branches_with_resolver`]) relies on the
+/// `merge=union` driver (see [`ensure_progress_union_merge`]) to fold parallel
+/// slots' progress logs together. That driver only fires on a *real* 3-way
+/// merge — never on a fast-forward. So when this sync-down step runs
+/// `git merge --ff-only` against a slot whose working tree has uncommitted
+/// progress churn (the engine truncates the per-PRD progress file at wave
+/// boundaries), git refuses with "local changes would be overwritten" and the
+/// slot is lost. Two such waves in a row abort the whole loop, even though the
+/// only casualty is engine-managed bookkeeping.
+///
+/// Recovery (the lossless form of "commit the progress file and let it union
+/// into the merge"): when EVERY tracked dirty path in the slot is a progress
+/// file, commit those paths on the slot's ephemeral branch and fold the base in
+/// via a real `git merge` so the union driver concatenates the two logs. Any
+/// non-progress dirt — or any failing git step — falls back to the original
+/// demote path, so real uncommitted work is never silently committed or
+/// dropped. See [`recover_progress_only_slot`].
 fn fast_forward_merged_slots(
     outcomes: &mut MergeOutcomes,
     slot_paths: &[PathBuf],
@@ -2233,10 +2253,29 @@ fn fast_forward_merged_slots(
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 let detail = format_git_failure(&output.stdout, &output.stderr);
-                outcomes.merged_slots.retain(|s| *s != slot);
-                outcomes
-                    .failed_slots
-                    .push((slot, detail, SlotFailureKind::PreResolver));
+                match recover_progress_only_slot(slot, slot_path, branch_name) {
+                    ProgressRecovery::Recovered => {
+                        eprintln!(
+                            "info: slot {} progress-only sync conflict auto-resolved \
+                             (committed dirty progress + union-merged {})",
+                            slot, branch_name
+                        );
+                    }
+                    ProgressRecovery::NotApplicable => {
+                        outcomes.merged_slots.retain(|s| *s != slot);
+                        outcomes
+                            .failed_slots
+                            .push((slot, detail, SlotFailureKind::PreResolver));
+                    }
+                    ProgressRecovery::Failed(msg) => {
+                        outcomes.merged_slots.retain(|s| *s != slot);
+                        outcomes.failed_slots.push((
+                            slot,
+                            format!("{} | progress-only recovery failed: {}", detail, msg),
+                            SlotFailureKind::PreResolver,
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 outcomes.merged_slots.retain(|s| *s != slot);
@@ -2247,6 +2286,153 @@ fn fast_forward_merged_slots(
                 ));
             }
         }
+    }
+}
+
+/// Result of attempting to recover a slot whose sync-down `--ff-only` was
+/// rejected solely because of dirty per-PRD progress file(s).
+enum ProgressRecovery {
+    /// Base was folded in via a real union merge after committing the dirty
+    /// progress file(s). The slot stays in `merged_slots`.
+    Recovered,
+    /// The recovery does not apply: the tracked dirty set was empty (the
+    /// fast-forward was blocked by something other than working-tree changes,
+    /// e.g. divergence or an untracked collision) or it contained a
+    /// non-progress path. The caller demotes the slot exactly as before.
+    NotApplicable,
+    /// Recovery applied (progress-only dirt) but a git step failed. Carries a
+    /// diagnostic; the caller demotes the slot.
+    Failed(String),
+}
+
+/// Whether `path` (a repo-root-relative slash path from `git status`) is a
+/// per-PRD progress file. Mirrors the anchored `tasks/progress*.txt` /
+/// `.task-mgr/tasks/progress*.txt` patterns in [`ATTR_BODY`]: a `progress*.txt`
+/// file directly under one of the two conventional dirs, no deeper nesting.
+fn is_progress_path(path: &str) -> bool {
+    let is_progress_basename = |basename: &str| {
+        basename.starts_with("progress") && basename.ends_with(".txt") && !basename.contains('/')
+    };
+    if let Some(rest) = path.strip_prefix("tasks/") {
+        return is_progress_basename(rest);
+    }
+    if let Some(rest) = path.strip_prefix(".task-mgr/tasks/") {
+        return is_progress_basename(rest);
+    }
+    false
+}
+
+/// Tracked working-tree changes (modified/added/deleted/renamed; staged or not)
+/// in `slot_path`. Untracked files are excluded — they never block
+/// `git merge --ff-only` unless the incoming commit adds the same path, and in
+/// that rare case the real merge below is the final arbiter.
+fn dirty_tracked_paths(slot_path: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(slot_path)
+        .output()
+        .map_err(|e| format!("git status spawn: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        // Porcelain v1 lines are "XY <path>" (XY = 2-char status, then a
+        // space). Renames are "XY <old> -> <new>" — the post-rename path is the
+        // one present in the working tree.
+        if line.len() < 4 {
+            continue;
+        }
+        let rest = &line[3..];
+        let path = match rest.split_once(" -> ") {
+            Some((_old, new)) => new,
+            None => rest,
+        };
+        paths.push(path.trim().to_string());
+    }
+    Ok(paths)
+}
+
+/// Attempt option-B recovery for a slot whose sync-down `--ff-only` to
+/// `branch_name` was rejected.
+///
+/// Guard: recovery applies only when the tracked dirty set is non-empty AND
+/// every entry is a [`is_progress_path`]. Otherwise returns
+/// [`ProgressRecovery::NotApplicable`] so the caller demotes the slot — this is
+/// what keeps real uncommitted work from being silently committed.
+///
+/// When applicable: stage and commit the dirty progress file(s) on the slot's
+/// ephemeral branch (turning the FF blocker into a committed change), then run
+/// a real `git merge` of the base — the `merge=union` driver concatenates the
+/// two progress logs instead of conflicting. A failed merge is aborted so the
+/// slot worktree is never left mid-merge.
+fn recover_progress_only_slot(
+    slot: usize,
+    slot_path: &Path,
+    branch_name: &str,
+) -> ProgressRecovery {
+    let dirty = match dirty_tracked_paths(slot_path) {
+        Ok(d) => d,
+        Err(e) => return ProgressRecovery::Failed(e),
+    };
+    if dirty.is_empty() || !dirty.iter().all(|p| is_progress_path(p)) {
+        return ProgressRecovery::NotApplicable;
+    }
+
+    let add = Command::new("git")
+        .args(["add", "--"])
+        .args(&dirty)
+        .current_dir(slot_path)
+        .output();
+    match add {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            return ProgressRecovery::Failed(format!(
+                "git add progress: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(e) => return ProgressRecovery::Failed(format!("git add spawn: {}", e)),
+    }
+
+    let commit_msg = format!("chore(loop): commit slot {} progress before union sync", slot);
+    let commit = Command::new("git")
+        .args(["commit", "--no-verify", "-m", &commit_msg])
+        .current_dir(slot_path)
+        .output();
+    match commit {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            return ProgressRecovery::Failed(format!(
+                "git commit progress: {}",
+                format_git_failure(&o.stdout, &o.stderr)
+            ));
+        }
+        Err(e) => return ProgressRecovery::Failed(format!("git commit spawn: {}", e)),
+    }
+
+    // A real merge (NOT --ff-only): the slot now carries a commit the base
+    // lacks, so the union driver runs on the progress file's conflicting hunk.
+    let merge = Command::new("git")
+        .args(["merge", "--no-edit", branch_name])
+        .current_dir(slot_path)
+        .output();
+    match merge {
+        Ok(o) if o.status.success() => ProgressRecovery::Recovered,
+        Ok(o) => {
+            let detail = format_git_failure(&o.stdout, &o.stderr);
+            // Never leave a half-applied merge in the slot worktree.
+            let _ = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(slot_path)
+                .output();
+            ProgressRecovery::Failed(format!("union merge: {}", detail))
+        }
+        Err(e) => ProgressRecovery::Failed(format!("git merge spawn: {}", e)),
     }
 }
 
@@ -4361,6 +4547,198 @@ detached
             msg.contains("stash limit exceeded"),
             "diagnostic should mention stash limit: {}",
             msg
+        );
+    }
+
+    // --- progress-only sync-down recovery (fast_forward_merged_slots) ---
+
+    /// Run a git command in `dir` and assert it succeeded; returns stdout.
+    fn run_git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {:?} spawn: {}", args, e));
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn test_is_progress_path_matcher() {
+        // Positive: conventional per-PRD progress files.
+        assert!(is_progress_path("tasks/progress.txt"));
+        assert!(is_progress_path("tasks/progress-7de9539c.txt"));
+        assert!(is_progress_path(".task-mgr/tasks/progress.txt"));
+        assert!(is_progress_path(".task-mgr/tasks/progress-P1.txt"));
+        // Negative: wrong dir, nested deeper, wrong name, or wrong extension.
+        assert!(!is_progress_path("progress.txt"));
+        assert!(!is_progress_path("src/progress.txt"));
+        assert!(!is_progress_path("tasks/sub/progress.txt"));
+        assert!(!is_progress_path("tasks/notes.txt"));
+        assert!(!is_progress_path("tasks/progress.md"));
+        assert!(!is_progress_path("tasks/prd-foo.json"));
+    }
+
+    /// The incident shape: a slot whose only dirty path is the per-PRD progress
+    /// file. The sync-down `--ff-only` is rejected, but recovery commits the
+    /// progress file and union-merges the base — the slot stays merged, base
+    /// content arrives, and BOTH sides' progress lines survive.
+    #[test]
+    fn test_ff_sync_recovers_progress_only_dirty_slot() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/progress-only-recovery";
+
+        // Commit a progress file on main so both slots inherit it.
+        fs::create_dir_all(tmp.path().join("tasks")).expect("mkdir tasks");
+        fs::write(tmp.path().join("tasks/progress-test.txt"), "base line 1\n").expect("write prog");
+        run_git_ok(tmp.path(), &["add", "."]);
+        run_git_ok(tmp.path(), &["commit", "-m", "seed progress"]);
+
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Advance the base branch (via slot 0) with new progress lines AND a
+        // new file, simulating other slots' merged-up work.
+        fs::write(
+            paths[0].join("tasks/progress-test.txt"),
+            "base line 1\nbase line 2\n",
+        )
+        .expect("advance base progress");
+        fs::write(paths[0].join("base-only.txt"), "from base\n").expect("write base-only");
+        run_git_ok(&paths[0], &["add", "."]);
+        run_git_ok(&paths[0], &["commit", "-m", "base advance"]);
+
+        // Slot 1: uncommitted churn on the progress file — the FF blocker.
+        fs::write(
+            paths[1].join("tasks/progress-test.txt"),
+            "base line 1\nslot dirty line\n",
+        )
+        .expect("dirty slot progress");
+
+        let mut outcomes = MergeOutcomes {
+            merged_slots: vec![1],
+            ..Default::default()
+        };
+        fast_forward_merged_slots(&mut outcomes, &paths, branch);
+
+        assert!(
+            outcomes.failed_slots.is_empty(),
+            "progress-only dirt must NOT demote the slot: {:?}",
+            outcomes.failed_slots
+        );
+        assert_eq!(outcomes.merged_slots, vec![1], "slot stays merged");
+
+        // Base content folded in.
+        assert!(
+            paths[1].join("base-only.txt").exists(),
+            "base-only.txt should be present after union merge"
+        );
+        // Both sides' progress survives the union; no conflict markers.
+        let prog = fs::read_to_string(paths[1].join("tasks/progress-test.txt")).expect("read prog");
+        assert!(prog.contains("base line 2"), "base progress lost: {}", prog);
+        assert!(
+            prog.contains("slot dirty line"),
+            "slot's uncommitted progress lost: {}",
+            prog
+        );
+        assert!(!prog.contains("<<<<<<<"), "conflict markers leaked: {}", prog);
+
+        // Working tree is clean after recovery.
+        let status = run_git_ok(&paths[1], &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "slot WT not clean: {}", status);
+    }
+
+    /// Guard: when a NON-progress tracked file is ALSO dirty, recovery must NOT
+    /// fire — the slot is demoted exactly as before, so real uncommitted work is
+    /// never silently committed.
+    #[test]
+    fn test_ff_sync_demotes_when_non_progress_also_dirty() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/mixed-dirt-demote";
+
+        fs::create_dir_all(tmp.path().join("tasks")).expect("mkdir tasks");
+        fs::write(tmp.path().join("tasks/progress-test.txt"), "base line 1\n").expect("write prog");
+        run_git_ok(tmp.path(), &["add", "."]);
+        run_git_ok(tmp.path(), &["commit", "-m", "seed progress"]);
+
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Base modifies file.txt (so a dirty file.txt blocks the FF) + progress.
+        fs::write(paths[0].join("file.txt"), "base edit\n").expect("base edits file.txt");
+        fs::write(
+            paths[0].join("tasks/progress-test.txt"),
+            "base line 1\nbase line 2\n",
+        )
+        .expect("advance base progress");
+        run_git_ok(&paths[0], &["add", "."]);
+        run_git_ok(&paths[0], &["commit", "-m", "base advance"]);
+
+        // Slot 1 dirty on BOTH a real file and the progress file.
+        fs::write(paths[1].join("file.txt"), "slot uncommitted real work\n")
+            .expect("dirty real file");
+        fs::write(
+            paths[1].join("tasks/progress-test.txt"),
+            "base line 1\nslot churn\n",
+        )
+        .expect("dirty progress");
+
+        let mut outcomes = MergeOutcomes {
+            merged_slots: vec![1],
+            ..Default::default()
+        };
+        fast_forward_merged_slots(&mut outcomes, &paths, branch);
+
+        assert!(
+            !outcomes.merged_slots.contains(&1),
+            "slot must be removed from merged_slots when real work is dirty"
+        );
+        let demoted = outcomes
+            .failed_slots
+            .iter()
+            .find(|(s, _, _)| *s == 1)
+            .expect("slot 1 must be demoted to failed_slots");
+        assert_eq!(demoted.2, SlotFailureKind::PreResolver);
+        // Recovery must NOT have committed: the real dirty file is untouched.
+        let real = fs::read_to_string(paths[1].join("file.txt")).expect("read file.txt");
+        assert_eq!(
+            real, "slot uncommitted real work\n",
+            "real uncommitted work must be preserved, not committed"
+        );
+    }
+
+    /// Guard: a slot dirty on only a NON-progress file is demoted (the original
+    /// behavior is unchanged for the non-progress case).
+    #[test]
+    fn test_ff_sync_demotes_non_progress_only_dirty() {
+        let tmp = setup_git_repo_with_file();
+        let branch = "feat/non-progress-demote";
+
+        let _slot0 = ensure_worktree(tmp.path(), branch, true, None).expect("slot 0");
+        let paths = ensure_slot_worktrees(tmp.path(), branch, 2).expect("ensure_slot_worktrees");
+
+        // Base modifies file.txt; slot 1 is dirty on file.txt → FF blocked.
+        fs::write(paths[0].join("file.txt"), "base edit\n").expect("base edits file.txt");
+        run_git_ok(&paths[0], &["add", "."]);
+        run_git_ok(&paths[0], &["commit", "-m", "base advance"]);
+        fs::write(paths[1].join("file.txt"), "slot dirty\n").expect("dirty file.txt");
+
+        let mut outcomes = MergeOutcomes {
+            merged_slots: vec![1],
+            ..Default::default()
+        };
+        fast_forward_merged_slots(&mut outcomes, &paths, branch);
+
+        assert!(!outcomes.merged_slots.contains(&1), "slot demoted");
+        assert!(
+            outcomes.failed_slots.iter().any(|(s, _, _)| *s == 1),
+            "slot 1 in failed_slots: {:?}",
+            outcomes.failed_slots
         );
     }
 
