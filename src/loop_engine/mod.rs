@@ -40,6 +40,7 @@ pub mod status_queries;
 pub mod usage;
 pub mod user_config;
 pub mod watchdog;
+pub(crate) mod wave_scheduler;
 pub mod worktree;
 
 #[cfg(test)]

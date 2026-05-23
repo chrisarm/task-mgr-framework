@@ -351,14 +351,18 @@ fn run_iteration_wires_review_model_override_at_the_right_spot() {
 /// Claude `--model` to the Grok runner or trips the drift sentinel.
 #[test]
 fn run_wave_iteration_wires_review_model_override_into_bundle() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+    // `run_wave_iteration` was carved into `wave_scheduler.rs` (PRD 02,
+    // FEAT-003); the source-grep follows it there.
+    let source = std::fs::read_to_string("src/loop_engine/wave_scheduler.rs")
+        .expect("could not read src/loop_engine/wave_scheduler.rs from tests/ cwd");
 
     let start = source
         .find("pub fn run_wave_iteration(")
-        .expect("expected `pub fn run_wave_iteration(` to be defined in engine.rs");
+        .expect("expected `pub fn run_wave_iteration(` to be defined in wave_scheduler.rs");
     let after_open = &source[start..];
-    let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+    // `run_wave_iteration` is the last top-level fn in `wave_scheduler.rs`, so
+    // the body ends at the `#[cfg(test)]` test module rather than another fn.
+    let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn ", "\n#[cfg(test)]"]
         .iter()
         .filter_map(|marker| {
             after_open[marker.len()..]
@@ -366,7 +370,7 @@ fn run_wave_iteration_wires_review_model_override_into_bundle() {
                 .map(|p| p + marker.len())
         })
         .min()
-        .expect("expected another top-level fn after run_wave_iteration");
+        .expect("expected a top-level fn or test module after run_wave_iteration");
     let body = &after_open[..body_end_rel];
 
     assert!(

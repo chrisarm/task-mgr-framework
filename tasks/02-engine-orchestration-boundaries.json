@@ -113,7 +113,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Pick PRDs that exercise the relevant defenses: sequential = curate-session-cleanup.json (mostly sequential, exercises overflow ladder); wave = parallel-task-execution.json (exercises slot-0 path threading, halt threshold, ephemeral overlay). If those PRDs are unavailable, pick equivalents. The RunnerKind audit is shared with prd-01-runner-capability-enforcement.md FR-005; either PRD's owner can produce it first; the other consumes it.",
-      "passes": false,
+      "passes": true,
       "priority": 1,
       "qualityDimensions": [
         "Baselines are deterministic — re-running on main produces a byte-identical capture (modulo intentionally-normalized timestamps / run-ids)",
@@ -163,7 +163,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Phase 2 foundation: this assertion is the long-term enforcement mechanism. The PRD's biggest risk (wave/sequential divergence as fields drift) is closed by this test. Spend the time to make it robust — manual verification that adding a field breaks compile is the acceptance test for the test itself.",
-      "passes": false,
+      "passes": true,
       "priority": 2,
       "qualityDimensions": [
         "The test must actually fail to compile (not run-time fail) when ProcessingParams drifts — the whole point is compile-time enforcement",
@@ -212,7 +212,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "See src/loop_engine/CLAUDE.md `## Parallel-slot scheduling` section for the canonical defense-layer list (1-5). Touch the test files only to verify their existence and current pass status; do not modify them in this task. Any gap-fill TEST-xxx spawned here is its own task.",
-      "passes": false,
+      "passes": true,
       "priority": 3,
       "qualityDimensions": [
         "Inventory is exhaustive — if you cannot find a test for defense layer N, flag the gap explicitly rather than silently moving on",
@@ -252,7 +252,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "First extraction. slot.rs imports recovery functions from their current engine.rs locations; those `use crate::loop_engine::engine::{check_override_invalidation, ...}` lines update to `use crate::loop_engine::recovery::{...}` in FEAT-002 when recovery.rs lands. Bottom-up extraction order: slot.rs is the leaf consumer that wave_scheduler.rs (FEAT-003) will import; recovery.rs (FEAT-002) is the cross-cutting helper. Architect-rec order: slot before recovery so the second extraction (recovery) exercises the cross-module call shape with a real consumer (slot.rs).",
-      "passes": false,
+      "passes": true,
       "priority": 4,
       "qualityDimensions": [
         "Byte-identical observable behavior on a 2-slot wave-mode dogfood scenario",
@@ -294,7 +294,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Approach A per PRD §6. Approach B (leave recovery in engine.rs) was rejected because future recovery primitives compound the refactor cost. Tests for this cluster live in engine.rs today — they move in the SAME commit as the code, no exceptions. The slot.rs import-update is included in this task's commit because slot.rs is the first cross-module consumer of recovery functions; iteration.rs and wave_scheduler.rs come in later FEATs and will import recovery directly from the new location.",
-      "passes": false,
+      "passes": true,
       "priority": 5,
       "qualityDimensions": [
         "Byte-identical observable behavior on the dogfood-baseline scenarios — REVIEW-001's diff will catch any drift",
