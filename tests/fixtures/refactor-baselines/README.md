@@ -16,6 +16,14 @@ capture commands below:
   literal `main`. `engine.rs` is byte-identical to this commit until CONTRACT/
   REFACTOR tasks begin.
 - **Build:** `cargo build --bin task-mgr`
+- **Re-frozen at REVIEW-001 (2026-05-23):** ANALYSIS-001's original scenarios
+  ran 3 + 4 = 7 task-iterations, short of REVIEW-001's "aggregate ≥ 10" gate.
+  The scenarios were expanded to 6 + 5 = 11 and the baselines re-frozen — but
+  still against the **pre-carve** binary built from `93fe80f` (checked out in a
+  detached worktree, `TASK_MGR_BIN` pointed at it), so they remain an honest
+  pre-refactor reference. Because the carve is a pure code-move, the carved
+  binary reproduces them byte-for-byte; expanding the scenarios only widens the
+  orchestration coverage the diff asserts.
 
 ## Files
 
@@ -29,13 +37,18 @@ capture commands below:
 
 ## Scenarios
 
-- **sequential** (`--parallel 1`, `--no-worktree`): three tasks in a strict
+- **sequential** (`--parallel 1`, `--no-worktree`): six tasks in a strict
   dependency chain. Exercises outer `run_loop` + sequential `run_iteration` +
   the per-task completion pipeline. One task per iteration, no wave scheduling.
-- **wave** (`--parallel 2`, worktree mode): four independent tasks (disjoint
-  `touchesFiles`, no inter-deps) so both slots fill each wave. Exercises
+- **wave** (`--parallel 2`, worktree mode): five independent tasks (disjoint
+  `touchesFiles`, no inter-deps) so both slots fill the first two waves and the
+  third wave runs a single slot (the partial-fill path). Exercises
   `run_wave_iteration` + `ensure_slot_worktrees` (slot-0 path threading,
   defense layer #1) + `run_slot_iteration` + `process_slot_result` + merge-back.
+
+Together the two scenarios complete **11 task-iterations** (6 sequential + 5
+wave), satisfying REVIEW-001's "aggregate iteration count ≥ 10 across both
+scenarios" gate.
 
 These are minimal purpose-built equivalents of the PRD's suggested
 `curate-session-cleanup.json` (sequential) and `parallel-task-execution.json`
