@@ -160,13 +160,20 @@ fn find_status_column_mutations_outside_cfg_test(content: &str) -> Vec<usize> {
 
         let lower = code_part.to_lowercase();
         // Match the common ways we write UPDATE on the tasks table
-        if lower.contains("update tasks") || lower.contains("update \"tasks\"") || lower.contains("update 'tasks'") {
+        if lower.contains("update tasks")
+            || lower.contains("update \"tasks\"")
+            || lower.contains("update 'tasks'")
+        {
             // Collect a small window to handle multi-line string literals
             let mut fragment = code_part.to_string();
             for j in 1..=3 {
                 if let Some(next) = lines.get(idx + j) {
                     // Also respect // comments on continuation lines
-                    let next_code = if let Some(c) = next.find("//") { &next[..c] } else { next };
+                    let next_code = if let Some(c) = next.find("//") {
+                        &next[..c]
+                    } else {
+                        next
+                    };
                     fragment.push(' ');
                     fragment.push_str(next_code);
                     if fragment.contains(';') || fragment.matches('"').count() % 2 == 0 {
@@ -325,9 +332,7 @@ fn no_orphan_raw_status_updates_outside_lifecycle() {
         // duplicate of a line the exact pass already reported).
         let status_hits = find_status_column_mutations_outside_cfg_test(&content);
         for line_no in status_hits {
-            if rel != EXPECTED_FILE
-                && !offending.iter().any(|(f, l)| f == &rel && *l == line_no)
-            {
+            if rel != EXPECTED_FILE && !offending.iter().any(|(f, l)| f == &rel && *l == line_no) {
                 offending.push((rel.clone(), line_no));
             }
             // If it *is* the blessed file we silently ignore it here — it was

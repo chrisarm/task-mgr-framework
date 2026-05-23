@@ -52,14 +52,18 @@ Do **not** hardcode model IDs — they change with each Claude release and must 
 - `high` → `xhigh`
 <!-- MODELS:END -->
 
+**Resolve review model** — Before stamping `model` on review-class tasks (`CODE-REVIEW-*`, `MILESTONE-FINAL`), read `.task-mgr/config.json` and check `reviewModel`. If set, use that value for those tasks; otherwise fall back to opus. Default recommendation: `grok-4`.
+
 **Model assignment rubric** (set `model` field on tasks that need a specific tier; omit for tasks that should use the PRD-level default):
 
 | Task type                                                                  | Assign `model`             | Rationale                                              |
 | -------------------------------------------------------------------------- | -------------------------- | ------------------------------------------------------ |
 | `FEAT-xxx` / `FIX-xxx` with `estimatedEffort: "high"` OR `modifiesBehavior: true` | opus                | Complex implementation — stronger model reduces rework |
 | `ANALYSIS-xxx`                                                             | opus                       | Deep semantic and consumer analysis                    |
-| `CODE-REVIEW-1` / `REFACTOR-REVIEW-FINAL`                                  | opus                       | Nuanced quality/security/architecture judgment         |
-| `MILESTONE-xxx`                                                            | opus                       | Runs full test suite + must fix any pre-existing failures |
+| `CODE-REVIEW-*`                                                            | reviewModel (default `grok-4`, else opus) | Second-model perspective on implementation review      |
+| `REFACTOR-REVIEW-FINAL`                                                    | opus                       | Nuanced quality/security/architecture judgment         |
+| `MILESTONE-FINAL`                                                          | reviewModel (default `grok-4`, else opus) | Final gate — full test suite + must fix any pre-existing failures |
+| `MILESTONE-1` / `MILESTONE-2`                                              | opus                       | Intermediate checkpoints — full gate                  |
 | `VERIFY-xxx`                                                               | opus                       | Final validation gate, thoroughness required           |
 | All other implementation, test, and fix tasks                              | _(omit — use PRD default)_ | Standard work handled by the Sonnet default            |
 
@@ -378,7 +382,7 @@ The agent checks these before starting any task. If the required task in the oth
       "preflightChecks": ["docker --version", "protoc --version"],
       "completionCheck": "cargo test -p deskmait-proto",
       "notes": "Implementation hints, gotchas",
-      "model": "<opus-id-if-review/milestone, omit otherwise>",
+      "model": "<reviewModel-for-CODE-REVIEW-*/MILESTONE-FINAL, opus-for-REFACTOR-REVIEW-FINAL/MILESTONE-1-2/VERIFY, omit otherwise>",
       "timeoutSecs": 1800,
       "touchesFiles": ["path/to/file.rs"],
       "dependsOn": [],
@@ -888,7 +892,7 @@ Every task list follows a lean phased structure. The table below is the spine fo
 | - | -------- | ------------------------------- | --------------- | ---------------- | ----------------------------------- | ---------------------- |
 | 0 | 0-1      | `CONTRACT-xxx` (optional)       | contract        | — / `/spike`     | —                                   | opus (if complex)      |
 | 1 | 2-12     | `FEAT-xxx` / `FIX-xxx`          | implementation  | —                | relevant CONTRACT (if any)          | —                      |
-| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | opus                   |
+| 2 | 13       | `CODE-REVIEW-1` (large PRDs only) | review        | —                | all early FEAT/FIX + CONTRACT       | reviewModel (default grok-4) |
 | 2a| 14-20    | `CODE-FIX-xxx` / `WIRE-FIX-xxx` | implementation  | CODE-REVIEW-1    | —                                   | —                      |
 | 3 | 70       | `REFACTOR-REVIEW-FINAL` (optional) | review       | —                | all implementation                  | opus                   |
 | 3a| 71-85    | `REFACTOR-xxx`                  | implementation  | REFACTOR-REVIEW-FINAL | —                                | —                      |
@@ -997,7 +1001,7 @@ All review tasks share this structure. Vary per the table below.
   ],
   "priority": <P>,
   "estimatedEffort": "medium",
-  "model": "<opus-id>",
+  "model": "<reviewModel-for-CODE-REVIEW-1, opus-for-REFACTOR-REVIEW-FINAL>",
   "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by <MILESTONE>` — atomic DB+JSON sync, no manual edit. If no issues, emit `<task-status><REVIEW-ID>:done</task-status>` with a one-line progress note.",
   "dependsOn": [<see table>]
 }

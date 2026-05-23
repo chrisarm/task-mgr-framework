@@ -20,10 +20,7 @@ impl<'a> TaskLifecycle<'a> {
     /// (when no `audit_note` override; review.rs's auto path supplies one
     /// and skips the validation). Does NOT clear `last_error` (distinct
     /// from unblock_one).
-    pub(crate) fn unskip_one(
-        &mut self,
-        intent: &TransitionIntent,
-    ) -> TaskMgrResult<()> {
+    pub(crate) fn unskip_one(&mut self, intent: &TransitionIntent) -> TaskMgrResult<()> {
         let id = intent.task_id.as_str();
 
         let (status_str, current_notes): (String, Option<String>) = self

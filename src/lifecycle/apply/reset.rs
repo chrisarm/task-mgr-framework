@@ -39,9 +39,7 @@ impl<'a> TaskLifecycle<'a> {
                         row.get(0)
                     })
                     .map_err(|e| match e {
-                        rusqlite::Error::QueryReturnedNoRows => {
-                            TaskMgrError::task_not_found(id)
-                        }
+                        rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(id),
                         _ => TaskMgrError::from(e),
                     })?;
                 status_str.parse()?
@@ -72,9 +70,7 @@ impl<'a> TaskLifecycle<'a> {
         let audit = intent
             .audit_note
             .clone()
-            .unwrap_or_else(|| {
-                format!("[RESET] Reset to todo from {previous} status")
-            });
+            .unwrap_or_else(|| format!("[RESET] Reset to todo from {previous} status"));
         let new_notes = match &current_notes {
             Some(existing) if !existing.is_empty() => format!("{existing}\n\n{audit}"),
             _ => audit,

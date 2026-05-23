@@ -209,18 +209,24 @@ fn direct_tasklifecycle_apply_stderr_contract() {
 
     let mut applied_flag = false;
     let stderr = capture_stderr(|| {
-        let mut lc = TaskLifecycle::new(&mut conn)
-            .with_prd_sync(&prd_path, "FEAT-");
+        let mut lc = TaskLifecycle::new(&mut conn).with_prd_sync(&prd_path, "FEAT-");
         let results = lc.apply(&intents);
         assert_eq!(results.len(), 1);
         applied_flag = results[0].applied;
     });
 
-    assert!(applied_flag, "DB write must succeed; PRD sync is best-effort");
+    assert!(
+        applied_flag,
+        "DB write must succeed; PRD sync is best-effort"
+    );
 
     // Verify DB is done before (or at) the warning
     let status: String = conn
-        .query_row("SELECT status FROM tasks WHERE id = 'FEAT-DIR-1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT status FROM tasks WHERE id = 'FEAT-DIR-1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(status, "done");
 

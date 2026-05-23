@@ -253,12 +253,16 @@ fn resurrect_for_iteration_prefix_filters_out_cross_prd_ids() {
 fn resurrect_with_model_override_resets_in_progress_and_sets_model() {
     let (_dir, mut conn) = setup();
     insert_task(&conn, "FEAT-OVF-1", "in_progress");
-    conn.execute("UPDATE tasks SET model = 'claude-sonnet' WHERE id = 'FEAT-OVF-1'", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE tasks SET model = 'claude-sonnet' WHERE id = 'FEAT-OVF-1'",
+        [],
+    )
+    .unwrap();
 
     let applied = {
         let lc = TaskLifecycle::new(&mut conn);
-        lc.resurrect_with_model_override("FEAT-OVF-1", "grok-4-fast").unwrap()
+        lc.resurrect_with_model_override("FEAT-OVF-1", "grok-4-fast")
+            .unwrap()
     };
     assert!(applied);
 
