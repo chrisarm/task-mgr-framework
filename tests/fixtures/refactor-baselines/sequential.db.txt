@@ -1,0 +1,256 @@
+                CHECK(confidence IN ('high', 'medium', 'low')),
+                CHECK(outcome IN ('failure', 'success', 'workaround', 'pattern')),
+                CHECK(rel_type IN ('dependsOn', 'synergyWith', 'batchWith', 'conflictsWith')),
+                CHECK(status IN ('active', 'completed', 'aborted')),
+                CHECK(status IN ('started', 'completed', 'failed', 'skipped')),
+                CHECK(status IN ('todo', 'in_progress', 'done', 'blocked', 'skipped', 'irrelevant')),
+                FROM learning_tags
+                FROM learning_tags
+                SELECT group_concat(tag, ' ')
+                SELECT group_concat(tag, ' ')
+                WHERE learning_id = NEW.learning_id
+                WHERE learning_id = OLD.learning_id
+            ), '')
+            ), '')
+            CHECK (id_lo < id_hi)
+            INSERT INTO learnings_fts(learnings_fts, rowid, title, content, tags_text)
+            INSERT INTO learnings_fts(learnings_fts, rowid, title, content, tags_text)
+            INSERT INTO learnings_fts(rowid, title, content, tags_text)
+            INSERT INTO learnings_fts(rowid, title, content, tags_text)
+            PRIMARY KEY (id_lo, id_hi),
+            SET tags_text = COALESCE((
+            SET tags_text = COALESCE((
+            UNIQUE(learning_id, tag)
+            UNIQUE(old_learning_id, new_learning_id)
+            UNIQUE(prd_id, file_path)
+            UNIQUE(run_id, task_id, iteration)
+            UNIQUE(task_id, file_path)
+            UNIQUE(task_id, related_id, rel_type)
+            UPDATE learnings
+            UPDATE learnings
+            VALUES ('delete', old.id, old.title, old.content, old.tags_text);
+            VALUES ('delete', old.id, old.title, old.content, old.tags_text);
+            VALUES (new.id, new.title, new.content, new.tags_text);
+            VALUES (new.id, new.title, new.content, new.tags_text);
+            WHERE id = NEW.learning_id;
+            WHERE id = OLD.learning_id;
+            acceptance_criteria TEXT,  -- JSON array stored as TEXT
+            applies_to_errors TEXT,             -- JSON array of error patterns
+            applies_to_files TEXT,              -- JSON array of file patterns
+            applies_to_task_types TEXT,         -- JSON array of task type prefixes
+            blocked_at_iteration INTEGER,  -- Global iteration when task was blocked (for decay)
+            branch_name TEXT,
+            completed_at TEXT,         -- When task was marked done
+            confidence TEXT NOT NULL DEFAULT 'medium'
+            content TEXT NOT NULL,
+            content,
+            content=learnings,
+            content_rowid=id
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            default_model TEXT
+            description TEXT NOT NULL,
+            description TEXT,
+            description TEXT,
+            dimensions INTEGER NOT NULL,
+            duration_seconds INTEGER,
+            embedding BLOB NOT NULL,
+            ended_at TEXT,
+            ended_at TEXT,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            external_git_repo TEXT,
+            file_path TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_type TEXT NOT NULL CHECK(file_type IN ('prd', 'task_list', 'prompt')),
+            global_acceptance_criteria TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY CHECK(id = 1),  -- Only allow one row
+            id TEXT PRIMARY KEY NOT NULL,
+            id_hi INTEGER NOT NULL,
+            id_lo INTEGER NOT NULL,
+            imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+            iteration INTEGER NOT NULL,
+            iteration INTEGER NOT NULL,    -- Which iteration within the run
+            iteration_count INTEGER NOT NULL DEFAULT 0,
+            iteration_counter INTEGER NOT NULL DEFAULT 0,
+            last_applied_at TEXT
+            last_commit TEXT,              -- Most recent git commit hash
+            last_error TEXT,           -- Most recent error message
+            last_files TEXT,               -- JSON array of recently modified files
+            last_run_id TEXT,                      -- Most recent run
+            last_shown_at TEXT,
+            last_task_id TEXT,                     -- Last selected task
+            learning_id INTEGER NOT NULL REFERENCES learnings(id) ON DELETE CASCADE,
+            learning_id INTEGER PRIMARY KEY REFERENCES learnings(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            new_learning_id INTEGER NOT NULL REFERENCES learnings(id) ON DELETE CASCADE,
+            notes TEXT
+            notes TEXT,
+            notes TEXT, archived_at TEXT DEFAULT NULL,
+            old_learning_id INTEGER NOT NULL REFERENCES learnings(id) ON DELETE CASCADE,
+            options TEXT NOT NULL,
+            outcome TEXT NOT NULL
+            prd_id INTEGER NOT NULL DEFAULT 1 REFERENCES prd_metadata(id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL DEFAULT 50,
+            priority_philosophy TEXT,
+            project TEXT NOT NULL,
+            raw_json TEXT,
+            reason TEXT,
+            rel_type TEXT NOT NULL
+            related_id TEXT NOT NULL,
+            resolution TEXT,
+            resolved_at TEXT,
+            review_guidelines TEXT,
+            review_scope TEXT,         -- JSON object stored as TEXT (optional)
+            root_cause TEXT,                    -- What caused the issue (for failures)
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL REFERENCES runs(run_id),
+            run_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT REFERENCES runs(run_id) ON DELETE SET NULL,
+            severity TEXT,             -- For review tasks (optional)
+            skipped_at_iteration INTEGER   -- Global iteration when task was skipped (for decay)
+            solution TEXT,                      -- How it was resolved
+            source_review TEXT,        -- For review tasks (optional)
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT,           -- When task was first claimed
+            status TEXT NOT NULL DEFAULT 'active'
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'resolved', 'deferred')),
+            status TEXT NOT NULL DEFAULT 'started'
+            status TEXT NOT NULL DEFAULT 'todo'
+            tag TEXT NOT NULL,
+            tags_text,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            task_id TEXT REFERENCES tasks(id),
+            task_prefix TEXT UNIQUE,
+            times_applied INTEGER NOT NULL DEFAULT 0,
+            times_shown INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL,
+            title TEXT NOT NULL,
+            title TEXT NOT NULL,
+            title,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        )');
+        );
+        );
+        );
+        );
+        );
+        );
+        );
+        );
+        , archived_at TEXT DEFAULT NULL);
+        , archived_at TEXT DEFAULT NULL);
+        , default_max_retries INTEGER);
+        , model TEXT, difficulty TEXT, escalation_note TEXT, required_tests TEXT DEFAULT NULL, max_retries INTEGER NOT NULL DEFAULT 3, consecutive_failures INTEGER NOT NULL DEFAULT 0, archived_at TEXT DEFAULT NULL, requires_human INTEGER DEFAULT 0, human_review_timeout INTEGER DEFAULT NULL, claims_shared_infra INTEGER DEFAULT NULL);
+        , schema_version INTEGER NOT NULL DEFAULT 0);
+        , window_shown INTEGER NOT NULL DEFAULT 0, window_applied INTEGER NOT NULL DEFAULT 0, window_start_iteration INTEGER, tags_text TEXT NOT NULL DEFAULT '', retired_at TEXT DEFAULT NULL);
+        END;
+        END;
+        END;
+        END;
+        END;
+/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */
+BEGIN TRANSACTION;
+COMMIT;
+CREATE INDEX idx_dedup_dismissals_hi ON dedup_dismissals(id_hi);
+CREATE INDEX idx_key_decisions_archived_at ON key_decisions(archived_at);
+CREATE INDEX idx_key_decisions_run_id ON key_decisions(run_id);
+CREATE INDEX idx_key_decisions_status ON key_decisions(status);
+CREATE INDEX idx_learning_embeddings_model ON learning_embeddings(model);
+CREATE INDEX idx_learning_tags_learning_id ON learning_tags(learning_id);
+CREATE INDEX idx_learning_tags_tag ON learning_tags(tag);
+CREATE INDEX idx_learnings_created_at ON learnings(created_at DESC);
+CREATE INDEX idx_learnings_outcome ON learnings(outcome);
+CREATE INDEX idx_learnings_run_id ON learnings(run_id);
+CREATE INDEX idx_learnings_task_id ON learnings(task_id);
+CREATE INDEX idx_prd_files_prd_id ON prd_files(prd_id);
+CREATE INDEX idx_run_tasks_archived_at ON run_tasks(archived_at);
+CREATE INDEX idx_run_tasks_run_id ON run_tasks(run_id);
+CREATE INDEX idx_run_tasks_task_id ON run_tasks(task_id);
+CREATE INDEX idx_runs_archived_at ON runs(archived_at);
+CREATE INDEX idx_runs_status ON runs(status);
+CREATE INDEX idx_supersessions_new ON learning_supersessions(new_learning_id);
+CREATE INDEX idx_supersessions_old ON learning_supersessions(old_learning_id);
+CREATE INDEX idx_task_files_file_path ON task_files(file_path);
+CREATE INDEX idx_task_files_task_id ON task_files(task_id);
+CREATE INDEX idx_task_relationships_rel_type ON task_relationships(rel_type);
+CREATE INDEX idx_task_relationships_related_id ON task_relationships(related_id);
+CREATE INDEX idx_task_relationships_task_id ON task_relationships(task_id);
+CREATE INDEX idx_task_relationships_type_taskid ON task_relationships(rel_type, task_id, related_id);
+CREATE INDEX idx_tasks_archived_at ON tasks(archived_at);
+CREATE INDEX idx_tasks_priority ON tasks(priority);
+CREATE INDEX idx_tasks_status ON tasks(status);
+CREATE INDEX idx_tasks_status_priority ON tasks(status, priority);
+CREATE TABLE IF NOT EXISTS "prd_metadata" (
+CREATE TABLE IF NOT EXISTS 'learnings_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS 'learnings_fts_data'(id INTEGER PRIMARY KEY, block BLOB);
+CREATE TABLE IF NOT EXISTS 'learnings_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB);
+CREATE TABLE IF NOT EXISTS 'learnings_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);
+CREATE TABLE dedup_dismissals (
+CREATE TABLE global_state (
+CREATE TABLE key_decisions (
+CREATE TABLE learning_embeddings (
+CREATE TABLE learning_supersessions (
+CREATE TABLE learning_tags (
+CREATE TABLE learnings (
+CREATE TABLE prd_files (
+CREATE TABLE run_tasks (
+CREATE TABLE runs (
+CREATE TABLE task_files (
+CREATE TABLE task_relationships (
+CREATE TABLE tasks (
+CREATE TRIGGER learning_tags_ad AFTER DELETE ON learning_tags BEGIN
+CREATE TRIGGER learning_tags_ai AFTER INSERT ON learning_tags BEGIN
+CREATE TRIGGER learnings_ad AFTER DELETE ON learnings BEGIN
+CREATE TRIGGER learnings_ai AFTER INSERT ON learnings BEGIN
+CREATE TRIGGER learnings_au AFTER UPDATE ON learnings BEGIN
+DELETE FROM sqlite_sequence;
+INSERT INTO global_state VALUES(1,3,'65b0714d-SEQ-003',NULL,'TIMESTAMP','TIMESTAMP',19);
+INSERT INTO learnings_fts_config VALUES('version',4);
+INSERT INTO learnings_fts_data VALUES(1,x'');
+INSERT INTO learnings_fts_data VALUES(10,x'00000000000000');
+INSERT INTO prd_files VALUES(1,1,'tasks/sequential.json','task_list');
+INSERT INTO prd_files VALUES(2,1,'tasks/sequential-prompt.md','prompt');
+INSERT INTO prd_files VALUES(3,1,'<WORK>','task_list');
+INSERT INTO prd_files VALUES(4,1,'<WORK>','prompt');
+INSERT INTO prd_metadata VALUES(1,'carve-baseline-sequential','carve-baseline/sequential','Sequential dogfood scenario for the engine.rs carve. Three tasks in a strict dependency chain so the loop runs run_iteration once per task with no wave scheduling. Exercises the outer run_loop + sequential run_iteration + per-task completion pipeline.','{"description":"Strict order","hierarchy":["1. Chain order"]}','{"criteria":["All tasks complete in order"],"description":"All pass"}','{"priorityGuidelines":{"critical":"1-10"}}',unistr('{\u000a  "branchName": "carve-baseline/sequential",\u000a  "description": "Sequential dogfood scenario for the engine.rs carve. Three tasks in a strict dependency chain so the loop runs run_iteration once per task with no wave scheduling. Exercises the outer run_loop + sequential run_iteration + per-task completion pipeline.",\u000a  "globalAcceptanceCriteria": {\u000a    "criteria": [\u000a      "All tasks complete in order"\u000a    ],\u000a    "description": "All pass"\u000a  },\u000a  "priorityPhilosophy": {\u000a    "description": "Strict order",\u000a    "hierarchy": [\u000a      "1. Chain order"\u000a    ]\u000a  },\u000a  "project": "carve-baseline-sequential",\u000a  "reviewGuidelines": {\u000a    "priorityGuidelines": {\u000a      "critical": "1-10"\u000a    }\u000a  },\u000a  "taskPrefix": "65b0714d",\u000a  "userStories": [\u000a    {\u000a      "acceptanceCriteria": [\u000a        "Completes"\u000a      ],\u000a      "batchWith": [],\u000a      "conflictsWith": [],\u000a      "dependsOn": [],\u000a      "description": "Head of the chain.",\u000a      "id": "SEQ-001",\u000a      "passes": true,\u000a      "priority": 1,\u000a      "synergyWith": [],\u000a      "title": "First sequential task",\u000a      "touchesFiles": [\u000a        "src/seq_a.rs"\u000a      ]\u000a    },\u000a    {\u000a      "acceptanceCriteria": [\u000a        "Completes"\u000a      ],\u000a      "batchWith": [],\u000a      "conflictsWith": [],\u000a      "dependsOn": [\u000a        "SEQ-001"\u000a      ],\u000a      "description": "Depends on SEQ-001.",\u000a      "id": "SEQ-002",\u000a      "passes": true,\u000a      "priority": 2,\u000a      "synergyWith": [],\u000a      "title": "Second sequential task",\u000a      "touchesFiles": [\u000a        "src/seq_b.rs"\u000a      ]\u000a    },\u000a    {\u000a      "acceptanceCriteria": [\u000a        "Completes"\u000a      ],\u000a      "batchWith": [],\u000a      "conflictsWith": [],\u000a      "dependsOn": [\u000a        "SEQ-002"\u000a      ],\u000a      "description": "Depends on SEQ-002.",\u000a      "id": "SEQ-003",\u000a      "passes": true,\u000a      "priority": 3,\u000a      "synergyWith": [],\u000a      "title": "Third sequential task",\u000a      "touchesFiles": [\u000a        "src/seq_c.rs"\u000a      ]\u000a    }\u000a  ],\u000a  "version": "1.0"\u000a}'),'TIMESTAMP','TIMESTAMP',NULL,'65b0714d',NULL,NULL);
+INSERT INTO run_tasks VALUES(1,'<UUID>','65b0714d-SEQ-001','completed',1,'TIMESTAMP','TIMESTAMP',3,NULL,NULL);
+INSERT INTO run_tasks VALUES(2,'<UUID>','65b0714d-SEQ-002','completed',2,'TIMESTAMP','TIMESTAMP',3,NULL,NULL);
+INSERT INTO run_tasks VALUES(3,'<UUID>','65b0714d-SEQ-003','completed',3,'TIMESTAMP','TIMESTAMP',3,NULL,NULL);
+INSERT INTO runs VALUES('<UUID>','TIMESTAMP','TIMESTAMP','completed','<SHA>','[]',7,NULL,NULL);
+INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','learnings_fts','learnings_fts',0,'CREATE VIRTUAL TABLE learnings_fts USING fts5(
+INSERT INTO sqlite_sequence VALUES('prd_files',10);
+INSERT INTO sqlite_sequence VALUES('prd_metadata',5);
+INSERT INTO sqlite_sequence VALUES('run_tasks',3);
+INSERT INTO sqlite_sequence VALUES('task_files',15);
+INSERT INTO sqlite_sequence VALUES('task_relationships',10);
+INSERT INTO task_files VALUES(13,'65b0714d-SEQ-001','src/seq_a.rs');
+INSERT INTO task_files VALUES(14,'65b0714d-SEQ-002','src/seq_b.rs');
+INSERT INTO task_files VALUES(15,'65b0714d-SEQ-003','src/seq_c.rs');
+INSERT INTO task_relationships VALUES(10,'65b0714d-SEQ-003','65b0714d-SEQ-002','dependsOn');
+INSERT INTO task_relationships VALUES(9,'65b0714d-SEQ-002','65b0714d-SEQ-001','dependsOn');
+INSERT INTO tasks VALUES('65b0714d-SEQ-001','First sequential task','Head of the chain.',1,'done',NULL,'["Completes"]',NULL,NULL,NULL,'TIMESTAMP','TIMESTAMP','TIMESTAMP','TIMESTAMP',NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,3,0,NULL,0,NULL,NULL);
+INSERT INTO tasks VALUES('65b0714d-SEQ-002','Second sequential task','Depends on SEQ-001.',2,'done',NULL,'["Completes"]',NULL,NULL,NULL,'TIMESTAMP','TIMESTAMP','TIMESTAMP','TIMESTAMP',NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,3,0,NULL,0,NULL,NULL);
+INSERT INTO tasks VALUES('65b0714d-SEQ-003','Third sequential task','Depends on SEQ-002.',3,'done',NULL,'["Completes"]',NULL,NULL,NULL,'TIMESTAMP','TIMESTAMP','TIMESTAMP','TIMESTAMP',NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,3,0,NULL,0,NULL,NULL);
+PRAGMA foreign_keys=OFF;
+PRAGMA writable_schema=OFF;
+PRAGMA writable_schema=ON;

@@ -1,0 +1,46 @@
+Warning: 2 uncommitted change(s) detected. Continuing in --yes mode.
+
+╔══════════════════════════════════════════════╗
+║         AUTONOMOUS AGENT LOOP START          ║
+╠══════════════════════════════════════════════╣
+║  PRD: sequential                             ║
+║  Branch: carve-baseline/sequential           ║
+║  Max iterations: 6                           ║
+╠══════════════════════════════════════════════╣
+║  DB: .task-mgr/tasks.db                      ║
+║  Stop: touch tasks/.stop-<SHA> to stop    ║
+║  Pause: touch tasks/.pause-<SHA> to pause ║
+╚══════════════════════════════════════════════╝
+Warning: could not read source file: src/seq_a.rs
+
+═══ Iteration 1/6 ═══ Task: <SHA>-SEQ-001 ═══ Model: claude-opus-4-7 ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+MOCK completing <SHA>-SEQ-001
+Task <SHA>-SEQ-001 completed (detected from <completed> tag)
+Wrapper committed changes for task <SHA>-SEQ-001 (<SHA>)
+PRD file changed, re-importing tasks...
+Warning: could not read source file: src/seq_b.rs
+
+═══ Iteration 2/6 ═══ Task: <SHA>-SEQ-002 ═══ Model: claude-opus-4-7 ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+MOCK completing <SHA>-SEQ-002
+Task <SHA>-SEQ-002 completed (detected from <completed> tag)
+Wrapper committed changes for task <SHA>-SEQ-002 (<SHA>)
+PRD file changed, re-importing tasks...
+Warning: could not read source file: src/seq_c.rs
+
+═══ Iteration 3/6 ═══ Task: <SHA>-SEQ-003 ═══ Model: claude-opus-4-7 ═══ Effort: (default) ═══ Elapsed: <DURATION> ═══
+MOCK completing <SHA>-SEQ-003
+Task <SHA>-SEQ-003 completed (detected from <completed> tag)
+Wrapper committed changes for task <SHA>-SEQ-003 (<SHA>)
+PRD file changed, re-importing tasks...
+All tasks complete!
+
+╔══════════════════════════════════════════════╗
+║          AUTONOMOUS AGENT LOOP END           ║
+╠══════════════════════════════════════════════╣
+║  PRD: sequential                             ║
+║  Iterations: 4                               ║
+║  Tasks completed: 3                          ║
+║  Total time: <DURATION>                              ║
+║  Exit reason: all tasks complete             ║
+╚══════════════════════════════════════════════╝
+[auto-review] stdout is not a TTY (CI / redirected); run `claude "/review-loop tasks/sequential.json"` manually
