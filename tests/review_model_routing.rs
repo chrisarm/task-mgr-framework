@@ -268,14 +268,18 @@ fn wave_non_review_slot_bundle_is_untouched_when_review_model_is_set() {
 /// the canonical access pattern.
 #[test]
 fn run_iteration_wires_review_model_override_at_the_right_spot() {
-    let source = std::fs::read_to_string("src/loop_engine/engine.rs")
-        .expect("could not read src/loop_engine/engine.rs from tests/ cwd");
+    // `run_iteration` was carved into `iteration.rs` (PRD 02, FEAT-004); the
+    // sequential body lives there now, not in `engine.rs`.
+    let source = std::fs::read_to_string("src/loop_engine/iteration.rs")
+        .expect("could not read src/loop_engine/iteration.rs from tests/ cwd");
 
     let start = source
         .find("pub fn run_iteration(")
-        .expect("expected `pub fn run_iteration(` to be defined in engine.rs");
+        .expect("expected `pub fn run_iteration(` to be defined in iteration.rs");
     let after_open = &source[start..];
-    // Find the next top-level fn declaration to mark the body end.
+    // Find the next top-level fn declaration to mark the body end, falling back
+    // to end-of-file: post-carve `run_iteration` is the last (and only) fn in
+    // `iteration.rs`, so there is no trailing top-level fn marker.
     let body_end_rel = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
         .iter()
         .filter_map(|marker| {
@@ -284,7 +288,7 @@ fn run_iteration_wires_review_model_override_at_the_right_spot() {
                 .map(|p| p + marker.len())
         })
         .min()
-        .expect("expected another top-level fn after run_iteration");
+        .unwrap_or(after_open.len());
     let body = &after_open[..body_end_rel];
 
     // Wiring check #1: helper is called.

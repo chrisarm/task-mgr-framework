@@ -1188,13 +1188,11 @@ fn claim_failed_slot_does_not_pollute_crash_map() {
 //
 // The helpers are named for their POST-CARVE homes. The wave body now lives in
 // `slot.rs` (`slot::process_slot_result`, carved in FEAT-001); the sequential
-// body still lives in `engine.rs` (`run_iteration`) until its own carve task
-// moves it into `iteration.rs`. Update the references in these comments as the
-// remaining carve tasks land — the mechanism is unaffected by the move because
-// it pins the *type*, not a source location.
+// body now lives in `iteration.rs` (`iteration::run_iteration`, carved in
+// FEAT-004). The mechanism is unaffected by the move because it pins the
+// *type*, not a source location.
 
-/// Sequential call site — `iteration::run_iteration` post-carve, today
-/// `engine.rs::run_iteration`.
+/// Sequential call site — `iteration::run_iteration`.
 fn sequential_call_site_destructures_full_params(params: ProcessingParams<'_>) {
     // Exhaustive, `..`-free destructure. Do NOT add `..`: that would defeat
     // the compile-time field-parity guarantee.

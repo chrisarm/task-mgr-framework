@@ -338,7 +338,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Largest extraction by line count (~1800). Approach: move symbols in dependency-order within wave_scheduler.rs (build_* helpers first, then handle_*, then the orchestration entry points). Each step is a separate cargo check; do not let the half-extracted state survive across iterations. The test for defense layer #1 (slot-path threading) is NEW in this extraction — it's a regression test the existing code lacks; add it as the first thing inside wave_scheduler.rs.",
-      "passes": false,
+      "passes": true,
       "priority": 6,
       "qualityDimensions": [
         "All five defense-layer regression tests stay green throughout (run scoped suite after every step of the extraction)",
