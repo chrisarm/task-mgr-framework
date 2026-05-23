@@ -43,7 +43,10 @@ fn make_conn_with_task(task_id: &str, model: Option<&str>) -> Connection {
             title TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'todo',
             started_at TEXT,
-            model TEXT
+            model TEXT,
+            last_error TEXT,
+            blocked_at_iteration INTEGER,
+            updated_at TEXT
         )"#,
         [],
     )
@@ -113,7 +116,7 @@ fn enabled_fallback_cfg() -> ProjectConfig {
 fn fallback_disabled_walks_existing_four_rung_to_blocked() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "DIS-FEAT-001";
-    let conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
@@ -125,7 +128,7 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -182,14 +185,14 @@ fn fallback_disabled_walks_existing_four_rung_to_blocked() {
 fn fallback_absent_matches_disabled_byte_for_byte() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ABS-FEAT-001";
-    let conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let project_cfg = ProjectConfig::default();
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -218,14 +221,14 @@ fn fallback_absent_matches_disabled_byte_for_byte() {
 fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "PROMO-FEAT-001";
-    let conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
+    let mut conn = make_conn_with_task(task_id, Some(OPUS_MODEL_1M));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let project_cfg = enabled_fallback_cfg();
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -289,7 +292,7 @@ fn fallback_enabled_claude_at_ceiling_promotes_to_grok() {
 fn fallback_enabled_task_already_on_grok_returns_blocked() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ALREADY-GROK-001";
-    let conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
+    let mut conn = make_conn_with_task(task_id, Some(GROK_DEFAULT_MODEL));
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let project_cfg = enabled_fallback_cfg();
@@ -300,7 +303,7 @@ fn fallback_enabled_task_already_on_grok_returns_blocked() {
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(GROK_DEFAULT_MODEL),

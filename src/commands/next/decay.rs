@@ -19,6 +19,7 @@ use rusqlite::Connection;
 
 use crate::TaskMgrResult;
 use crate::db::prefix::prefix_and;
+use crate::lifecycle::{DecayItem, DecayPlan, TaskLifecycle};
 
 /// Apply automatic decay to blocked/skipped tasks that have exceeded the threshold.
 ///
@@ -36,7 +37,7 @@ use crate::db::prefix::prefix_and;
 ///
 /// A vector of (task_id, previous_status) tuples for tasks that were decayed.
 pub fn apply_decay(
-    conn: &Connection,
+    conn: &mut Connection,
     threshold: i64,
     verbose: bool,
     task_prefix: Option<&str>,
@@ -81,21 +82,23 @@ pub fn apply_decay(
         ORDER BY id
         "#
     );
-    let mut stmt = conn.prepare(&sql)?;
 
-    let tasks_to_decay: Vec<(String, String)> = if let Some(pattern) = prefix_param {
-        stmt.query_map(
-            rusqlite::params![current_iteration, threshold, pattern],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?
-        .filter_map(|r| r.ok())
-        .collect()
-    } else {
-        stmt.query_map([current_iteration, threshold], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
+    let tasks_to_decay: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        if let Some(pattern) = prefix_param {
+            stmt.query_map(
+                rusqlite::params![current_iteration, threshold, pattern],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .filter_map(|r| r.ok())
+            .collect()
+        } else {
+            stmt.query_map([current_iteration, threshold], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
     };
 
     if tasks_to_decay.is_empty() {
@@ -108,35 +111,20 @@ pub fn apply_decay(
         current_iteration, threshold
     );
 
-    // Reset decayed tasks back to todo
-    for (task_id, _old_status) in &tasks_to_decay {
-        // Get current notes
-        let current_notes: Option<String> = conn
-            .query_row("SELECT notes FROM tasks WHERE id = ?", [task_id], |row| {
-                row.get(0)
+    // Route through the lifecycle service: status write + notes append happen
+    // in a single atomic UPDATE per task (CASE WHEN for the notes append, no
+    // SELECT-then-UPDATE round-trip). The matrix gate enforces the
+    // blocked/skipped → todo entry condition.
+    let plan = DecayPlan {
+        items: tasks_to_decay
+            .iter()
+            .map(|(task_id, _old_status)| DecayItem {
+                task_id: task_id.clone(),
+                audit_label: audit_note.clone(),
             })
-            .ok();
-
-        // Build new notes with audit message
-        let new_notes = match current_notes {
-            Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-            _ => audit_note.clone(),
-        };
-
-        // Reset task: status -> todo, clear decay iteration columns
-        conn.execute(
-            r#"
-            UPDATE tasks
-            SET status = 'todo',
-                blocked_at_iteration = NULL,
-                skipped_at_iteration = NULL,
-                notes = ?,
-                updated_at = datetime('now')
-            WHERE id = ?
-            "#,
-            rusqlite::params![new_notes, task_id],
-        )?;
-    }
+            .collect(),
+    };
+    TaskLifecycle::new(conn).decay_reset(plan)?;
 
     Ok(tasks_to_decay)
 }

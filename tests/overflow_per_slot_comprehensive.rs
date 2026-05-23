@@ -27,7 +27,10 @@ fn make_conn_with_tasks(task_ids: &[&str]) -> Connection {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'todo',
-            started_at TEXT
+            started_at TEXT,
+            last_error TEXT,
+            blocked_at_iteration INTEGER,
+            updated_at TEXT
         )"#,
         [],
     )
@@ -96,7 +99,7 @@ fn reset_to_in_progress(conn: &Connection, task_id: &str) {
 #[allow(clippy::too_many_arguments)]
 fn dispatch_wave_overflows(
     ctx: &mut IterationContext,
-    conn: &Connection,
+    conn: &mut Connection,
     all_task_ids: &[&str],
     crashing_slots: &[usize],
     effort: Option<&str>,
@@ -158,12 +161,12 @@ fn eight_slot_wave_one_overflow_isolated_to_slot_3() {
         "W8-1-SLOT6",
         "W8-1-SLOT7",
     ];
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
 
     let results = dispatch_wave_overflows(
         &mut ctx,
-        &conn,
+        &mut conn,
         &task_ids,
         &[3],
         Some("xhigh"),
@@ -233,12 +236,12 @@ fn eight_slot_wave_two_overflows_isolated_to_slots_1_and_5() {
         "W8-2-SLOT6",
         "W8-2-SLOT7",
     ];
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
 
     let results = dispatch_wave_overflows(
         &mut ctx,
-        &conn,
+        &mut conn,
         &task_ids,
         &[1, 5],
         Some("xhigh"),
@@ -315,13 +318,13 @@ fn eight_slot_wave_four_overflows_even_slots_independent_recovery() {
         "W8-4-SLOT6",
         "W8-4-SLOT7",
     ];
-    let conn = make_conn_with_tasks(&task_ids);
+    let mut conn = make_conn_with_tasks(&task_ids);
     let mut ctx = IterationContext::new(10);
 
     let crashing = [0usize, 2, 4, 6];
     let results = dispatch_wave_overflows(
         &mut ctx,
-        &conn,
+        &mut conn,
         &task_ids,
         &crashing,
         Some("xhigh"),
@@ -492,13 +495,13 @@ fn jsonl_deserialization_round_trips_numeric_slot_index() {
 fn sequential_jsonl_event_has_no_slot_index_field() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "SEQ-NO-SLOT-TASK";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -533,7 +536,7 @@ fn sequential_jsonl_event_has_no_slot_index_field() {
 fn dump_rotation_keeps_newest_3_across_wave_iterations() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ROTAT-TASK-001";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
@@ -549,7 +552,7 @@ fn dump_rotation_keeps_newest_3_across_wave_iterations() {
         reset_to_in_progress(&conn, task_id);
         let _ = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_id,
             effort,
             model,
@@ -595,7 +598,7 @@ fn dump_rotation_namespaces_are_per_task_id() {
     let tmp = TempDir::new().expect("tempdir");
     let task_a = "ROTAT-TASK-A";
     let task_b = "ROTAT-TASK-B";
-    let conn = make_conn_with_tasks(&[task_a, task_b]);
+    let mut conn = make_conn_with_tasks(&[task_a, task_b]);
     let mut ctx = IterationContext::new(10);
 
     let pr_a = make_prompt_result(task_a);
@@ -606,7 +609,7 @@ fn dump_rotation_namespaces_are_per_task_id() {
         reset_to_in_progress(&conn, task_a);
         let _ = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_a,
             Some("xhigh"),
             Some(SONNET_MODEL),
@@ -628,7 +631,7 @@ fn dump_rotation_namespaces_are_per_task_id() {
         reset_to_in_progress(&conn, task_b);
         let _ = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_b,
             Some("xhigh"),
             Some(SONNET_MODEL),
@@ -672,14 +675,14 @@ fn dump_rotation_namespaces_are_per_task_id() {
 fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "TRANS-TASK-001";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Wave overflow: slot 4, Sonnet, xhigh → rung 1 (DowngradeEffort).
     let wave_action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -710,7 +713,7 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
     // Sequential overflow: same task_id, now at high effort → rung 2 (EscalateModel).
     let seq_action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(SONNET_MODEL),
@@ -776,14 +779,14 @@ fn overflow_recovered_persists_from_wave_through_sequential_transition() {
 fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "TRANS-TASK-002";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Sequential overflow: Haiku, xhigh → rung 1.
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(HAIKU_MODEL),
@@ -807,7 +810,7 @@ fn overflow_recovered_persists_from_sequential_through_wave_transition() {
     // Wave overflow: Haiku at high → rung 2 (EscalateModel: Haiku → Sonnet).
     let wave_action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(HAIKU_MODEL),
@@ -850,14 +853,14 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
     let tmp = TempDir::new().expect("tempdir");
     let wave1_task = "PERSIST-W1-TASK";
     let wave2_task = "PERSIST-W2-TASK";
-    let conn = make_conn_with_tasks(&[wave1_task, wave2_task]);
+    let mut conn = make_conn_with_tasks(&[wave1_task, wave2_task]);
     let mut ctx = IterationContext::new(10);
 
     // Wave 1: wave1_task overflows.
     let pr1 = make_prompt_result(wave1_task);
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         wave1_task,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -876,7 +879,7 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
     let pr2 = make_prompt_result(wave2_task);
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         wave2_task,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -927,7 +930,7 @@ fn overflow_recovered_is_persistent_across_consecutive_waves() {
 fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "WIRE-FIX-001-DIFF-TASK";
-    let conn = make_conn_with_tasks(&[task_id]);
+    let mut conn = make_conn_with_tasks(&[task_id]);
     let mut ctx = IterationContext::new(10);
 
     let pr = PromptResult {
@@ -944,7 +947,7 @@ fn wave_overflow_jsonl_contains_task_difficulty_from_slot() {
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),

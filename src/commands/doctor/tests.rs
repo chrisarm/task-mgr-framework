@@ -25,21 +25,21 @@ fn insert_test_task(conn: &rusqlite::Connection, id: &str, status: &str) {
 
 #[test]
 fn test_no_stale_tasks_when_healthy() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "todo");
     insert_test_task(&conn, "US-002", "done");
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.stale_tasks, 0);
 }
 
 #[test]
 fn test_detects_stale_in_progress_task() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     // Create an in_progress task with no active run
     insert_test_task(&conn, "US-001", "in_progress");
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.stale_tasks, 1);
     assert_eq!(result.issues[0].issue_type, IssueType::StaleInProgressTask);
@@ -48,7 +48,7 @@ fn test_detects_stale_in_progress_task() {
 
 #[test]
 fn test_in_progress_task_with_active_run_is_not_stale() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
     // Create an active run tracking this task
@@ -63,13 +63,13 @@ fn test_in_progress_task_with_active_run_is_not_stale() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.stale_tasks, 0);
 }
 
 #[test]
 fn test_in_progress_task_with_completed_run_is_stale() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
     // Create a completed run (not active)
@@ -84,7 +84,7 @@ fn test_in_progress_task_with_completed_run_is_stale() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.stale_tasks, 1);
 }
 
@@ -92,7 +92,7 @@ fn test_in_progress_task_with_completed_run_is_stale() {
 
 #[test]
 fn test_detects_active_run_without_end() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     // Create an active run without ended_at
     conn.execute(
@@ -101,7 +101,7 @@ fn test_detects_active_run_without_end() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.active_runs, 1);
     assert!(
@@ -114,7 +114,7 @@ fn test_detects_active_run_without_end() {
 
 #[test]
 fn test_completed_runs_not_flagged() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     // Create a completed run
     conn.execute(
@@ -123,7 +123,7 @@ fn test_completed_runs_not_flagged() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.active_runs, 0);
 }
 
@@ -131,7 +131,7 @@ fn test_completed_runs_not_flagged() {
 
 #[test]
 fn test_detects_orphaned_relationship() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "todo");
 
     // Create a relationship to a non-existent task
@@ -141,7 +141,7 @@ fn test_detects_orphaned_relationship() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.orphaned_relationships, 1);
     assert!(result.issues.iter().any(|i| {
@@ -151,7 +151,7 @@ fn test_detects_orphaned_relationship() {
 
 #[test]
 fn test_valid_relationships_not_flagged() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "todo");
     insert_test_task(&conn, "US-002", "todo");
 
@@ -162,7 +162,7 @@ fn test_valid_relationships_not_flagged() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.orphaned_relationships, 0);
 }
 
@@ -170,10 +170,10 @@ fn test_valid_relationships_not_flagged() {
 
 #[test]
 fn test_auto_fix_resets_stale_task() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
-    let result = doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.total_fixed, 1);
     assert!(result.fixed.iter().any(|f| f.entity_id == "US-001"));
@@ -197,7 +197,7 @@ fn test_auto_fix_resets_stale_task() {
 
 #[test]
 fn test_auto_fix_aborts_active_run() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     conn.execute(
         "INSERT INTO runs (run_id, status, started_at) VALUES ('run-stuck', 'active', datetime('now'))",
@@ -205,7 +205,7 @@ fn test_auto_fix_aborts_active_run() {
     )
     .unwrap();
 
-    let result = doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
     assert!(
         result
@@ -237,7 +237,7 @@ fn test_auto_fix_aborts_active_run() {
 
 #[test]
 fn test_auto_fix_deletes_orphaned_relationship() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "todo");
 
     conn.execute(
@@ -246,7 +246,7 @@ fn test_auto_fix_deletes_orphaned_relationship() {
     )
     .unwrap();
 
-    let result = doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
     assert!(
         result
@@ -268,7 +268,7 @@ fn test_auto_fix_deletes_orphaned_relationship() {
 
 #[test]
 fn test_auto_fix_also_fixes_run_tasks() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
     // Create an active run with a started run_task
@@ -283,7 +283,7 @@ fn test_auto_fix_also_fixes_run_tasks() {
     )
     .unwrap();
 
-    doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
+    doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
     // Verify run_tasks was also marked as failed
     let run_task_status: String = conn
@@ -300,10 +300,10 @@ fn test_auto_fix_also_fixes_run_tasks() {
 
 #[test]
 fn test_without_auto_fix_no_changes() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.stale_tasks, 1);
     assert!(result.fixed.is_empty());
@@ -322,7 +322,7 @@ fn test_without_auto_fix_no_changes() {
 
 #[test]
 fn test_healthy_database() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "todo");
     insert_test_task(&conn, "US-002", "done");
 
@@ -340,7 +340,7 @@ fn test_healthy_database() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.total_issues, 0);
     assert!(result.issues.is_empty());
@@ -467,7 +467,7 @@ fn test_doctor_result_serialization() {
 
 #[test]
 fn test_multiple_issues_all_types() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     // Create a stale task
     insert_test_task(&conn, "US-001", "in_progress");
@@ -487,7 +487,7 @@ fn test_multiple_issues_all_types() {
     )
     .unwrap();
 
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.stale_tasks, 1);
     assert_eq!(result.summary.active_runs, 1);
@@ -497,7 +497,7 @@ fn test_multiple_issues_all_types() {
 
 #[test]
 fn test_preserves_existing_notes_on_fix() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     // Create task with existing notes
     conn.execute(
@@ -506,7 +506,7 @@ fn test_preserves_existing_notes_on_fix() {
     )
     .unwrap();
 
-    doctor(&conn, true, false, 0, false, tmp_dir.path()).unwrap();
+    doctor(&mut conn, true, false, 0, false, tmp_dir.path()).unwrap();
 
     let notes: String = conn
         .query_row("SELECT notes FROM tasks WHERE id = 'US-001'", [], |row| {
@@ -522,11 +522,11 @@ fn test_preserves_existing_notes_on_fix() {
 
 #[test]
 fn test_dry_run_shows_would_fix_without_modifying() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     // Create a stale task
     insert_test_task(&conn, "US-001", "in_progress");
 
-    let result = doctor(&conn, true, true, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, true, 0, false, tmp_dir.path()).unwrap();
 
     // Should have the issue
     assert_eq!(result.summary.stale_tasks, 1);
@@ -548,11 +548,11 @@ fn test_dry_run_shows_would_fix_without_modifying() {
 
 #[test]
 fn test_dry_run_implies_auto_fix_for_output() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "US-001", "in_progress");
 
     // Even without auto_fix=true, dry_run should show what would be fixed
-    let result = doctor(&conn, false, true, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, true, 0, false, tmp_dir.path()).unwrap();
 
     assert!(result.dry_run);
     assert!(!result.auto_fix); // auto_fix flag itself is false
@@ -569,7 +569,7 @@ fn test_dry_run_implies_auto_fix_for_output() {
 
 #[test]
 fn test_dry_run_all_issue_types() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     // Create a stale task
     insert_test_task(&conn, "US-001", "in_progress");
@@ -589,7 +589,7 @@ fn test_dry_run_all_issue_types() {
     )
     .unwrap();
 
-    let result = doctor(&conn, true, true, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, true, 0, false, tmp_dir.path()).unwrap();
 
     assert!(result.dry_run);
     assert_eq!(result.summary.total_issues, 3);
@@ -795,22 +795,22 @@ fn setup_git_repo_with_commits(dir: &std::path::Path, commits: &[&str]) {
 
 #[test]
 fn test_reconcile_git_disabled_by_default() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
     // reconcile_git=false, so no reconciliation even though commit exists
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.reconciled, 0);
 }
 
 #[test]
 fn test_reconcile_git_detects_completed_task() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
-    let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, true, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.reconciled, 1);
     assert!(
@@ -823,11 +823,11 @@ fn test_reconcile_git_detects_completed_task() {
 
 #[test]
 fn test_reconcile_git_skips_done_tasks() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "done"); // already done
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
-    let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, true, tmp_dir.path()).unwrap();
 
     // Task already done, so no reconciliation needed
     assert_eq!(result.summary.reconciled, 0);
@@ -835,25 +835,25 @@ fn test_reconcile_git_skips_done_tasks() {
 
 #[test]
 fn test_reconcile_git_skips_nonexistent_tasks() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     // Don't insert any task — ID in commit doesn't exist in DB
     setup_git_repo_with_commits(
         tmp_dir.path(),
         &["feat: [GHOST-001] This task doesn't exist"],
     );
 
-    let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, true, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.reconciled, 0);
 }
 
 #[test]
 fn test_reconcile_git_auto_fix_marks_done() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
-    let result = doctor(&conn, true, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, false, 0, true, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.reconciled, 1);
     assert_eq!(result.summary.total_fixed, 1);
@@ -886,11 +886,11 @@ fn test_reconcile_git_auto_fix_marks_done() {
 
 #[test]
 fn test_reconcile_git_dry_run_no_changes() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
-    let result = doctor(&conn, true, true, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, true, true, 0, true, tmp_dir.path()).unwrap();
 
     assert_eq!(result.summary.reconciled, 1);
     assert!(result.fixed.is_empty());
@@ -910,7 +910,7 @@ fn test_reconcile_git_dry_run_no_changes() {
 
 #[test]
 fn test_reconcile_git_multiple_tasks() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
     insert_test_task(&conn, "FEAT-002", "in_progress");
     insert_test_task(&conn, "FEAT-003", "done"); // already done, skip
@@ -923,7 +923,7 @@ fn test_reconcile_git_multiple_tasks() {
         ],
     );
 
-    let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, true, tmp_dir.path()).unwrap();
 
     // FEAT-001 and FEAT-002 should be reconciliation candidates, FEAT-003 is already done
     assert_eq!(result.summary.reconciled, 2);
@@ -931,17 +931,17 @@ fn test_reconcile_git_multiple_tasks() {
 
 #[test]
 fn test_reconcile_git_no_git_repo() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     insert_test_task(&conn, "FEAT-001", "todo");
 
     // No git repo initialized — should handle gracefully
-    let result = doctor(&conn, false, false, 0, true, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, true, tmp_dir.path()).unwrap();
     assert_eq!(result.summary.reconciled, 0);
 }
 
 #[test]
 fn test_reconcile_git_preserves_existing_notes() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
     conn.execute(
         "INSERT INTO tasks (id, title, status, priority, notes) VALUES ('FEAT-001', 'Test', 'todo', 10, 'Pre-existing notes')",
         [],
@@ -949,7 +949,7 @@ fn test_reconcile_git_preserves_existing_notes() {
     .unwrap();
     setup_git_repo_with_commits(tmp_dir.path(), &["feat: [FEAT-001] Foundation module"]);
 
-    doctor(&conn, true, false, 0, true, tmp_dir.path()).unwrap();
+    doctor(&mut conn, true, false, 0, true, tmp_dir.path()).unwrap();
 
     let notes: String = conn
         .query_row("SELECT notes FROM tasks WHERE id = 'FEAT-001'", [], |row| {
@@ -1057,7 +1057,7 @@ fn test_git_reconciliation_serialization() {
 /// find_active_runs_without_end results (verified through doctor()).
 #[test]
 fn test_archived_run_excluded_from_active_runs_without_end() {
-    let (tmp_dir, conn) = setup_test_db();
+    let (tmp_dir, mut conn) = setup_test_db();
 
     conn.execute(
         "INSERT INTO runs (run_id, status, started_at) VALUES ('r-archived', 'active', datetime('now'))",
@@ -1074,7 +1074,7 @@ fn test_archived_run_excluded_from_active_runs_without_end() {
 
     // doctor() internally calls find_active_runs_without_end; archived runs must
     // not be reported as abandoned active runs.
-    let result = doctor(&conn, false, false, 0, false, tmp_dir.path()).unwrap();
+    let result = doctor(&mut conn, false, false, 0, false, tmp_dir.path()).unwrap();
     assert_eq!(
         result.summary.active_runs, 0,
         "Archived runs must not be counted as active runs without end"

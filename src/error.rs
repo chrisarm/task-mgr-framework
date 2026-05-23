@@ -11,6 +11,7 @@
 //! - `NotFound` includes the resource type and identifier
 //! - `InvalidState` includes both expected and actual states
 
+use crate::loop_engine::runner::RunnerKind;
 use thiserror::Error;
 
 /// Result type alias for task-mgr operations.
@@ -167,6 +168,22 @@ pub enum TaskMgrError {
         /// Underlying I/O failure (connection refused, timeout, malformed JSON, ...).
         #[source]
         source: std::io::Error,
+    },
+
+    /// A RunnerOpts field encoding a capability unsupported by the selected runner was set.
+    ///
+    /// Enforcement is field-presence, not value-validity: only non-default capability-driven
+    /// field values trigger this. The three fields together identify the offending call site.
+    #[error(
+        "runner {runner_kind:?} does not support capability {capability_name} (field {field_name:?} was set)"
+    )]
+    UnsupportedRunnerCapability {
+        /// The runner that was asked to handle a capability it does not support.
+        runner_kind: RunnerKind,
+        /// Human-readable capability name (e.g. "UsePty").
+        capability_name: &'static str,
+        /// The RunnerOpts field name that encoded the capability (e.g. "use_pty").
+        field_name: &'static str,
     },
 
     /// Grok CLI failed to authenticate.
@@ -701,6 +718,19 @@ mod tests {
         assert!(validate_safe_path(".gitignore", "touchesFiles", None).is_ok());
         assert!(validate_safe_path(".github/workflows/ci.yml", "touchesFiles", None).is_ok());
         assert!(validate_safe_path("src/.hidden", "touchesFiles", None).is_ok());
+    }
+
+    #[test]
+    fn test_unsupported_runner_capability_display() {
+        let err = TaskMgrError::UnsupportedRunnerCapability {
+            runner_kind: RunnerKind::Grok,
+            capability_name: "UsePty",
+            field_name: "use_pty",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Grok"), "runner_kind must appear: {msg}");
+        assert!(msg.contains("UsePty"), "capability_name must appear: {msg}");
+        assert!(msg.contains("use_pty"), "field_name must appear: {msg}");
     }
 
     #[test]

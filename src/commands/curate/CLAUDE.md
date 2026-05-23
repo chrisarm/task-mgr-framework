@@ -135,14 +135,17 @@ the crate): `load_dismissals`, `record_dismissals`, `clear_dismissals`,
 `is_fully_dismissed`, `compute_dismissal_pairs`, plus the private `normalize_pair`
 / `unordered_pairs`.
 
-## Curate session cleanup workaround
+## Session cleanup workaround
 
 Claude Code 2.1.110 writes an `ai-title` jsonl to `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
-even with `--no-session-persistence`. To avoid polluting the user's projects dir, `curate dedup`
-and `curate enrich` opt into `spawn_claude`'s `cleanup_title_artifact` arg: a fixed UUID is
-passed via `--session-id` (before `-p`, required — Claude parses flags only left of the prompt)
-and, after `child.wait()` returns, that exact file is removed synchronously. An earlier detached
-30s-delay thread design was replaced because threads die when the parent `task-mgr` process
-exits; synchronous post-wait cleanup is both simpler and guaranteed to run. Scope is narrow —
-loops and learning ingestion do NOT opt in; only the curate call sites do. See `spawn_claude`
-and `cleanup_title_artifact_sync` in `src/loop_engine/claude.rs`.
+even with `--no-session-persistence`. To avoid polluting the user's projects dir, every
+`spawn_claude` invocation injects a known UUID via `--session-id` (before `-p`, required —
+Claude parses flags only left of the prompt) and, after `child.wait()` returns, `dispatch`
+calls `LlmRunner::cleanup_session` to remove that exact file synchronously. Cleanup is
+unconditional (no per-call opt-in) and provider-aware: `GrokRunner::cleanup_session`
+removes its per-session directory under `~/.grok/sessions/<encoded-cwd>/<uuid>/` while
+preserving `prompt_history.jsonl`. An earlier detached 30s-delay thread design was
+replaced because threads die when the parent `task-mgr` process exits; synchronous
+post-wait cleanup is both simpler and guaranteed to run. See `LlmRunner`,
+`cleanup_claude_session_artifact`, and `grok_encoded_session_dir` in
+`src/loop_engine/runner.rs`.

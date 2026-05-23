@@ -22,6 +22,10 @@
 //! - `check_crash_escalation` is pure: same inputs → same output, no side
 //!   effects. Pipeline tests exercise the full write path.
 
+// FEAT-010: this test crate intentionally exercises the deprecated
+// `auto_block_task` shim to lock its contract during the migration.
+#![allow(deprecated)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -513,7 +517,8 @@ fn blocked_task_retains_crash_flag_auto_block_does_not_clear_map() {
     );
 
     // Auto-block: writes `blocked` to the DB — does NOT touch the map.
-    auto_block_task(&conn, "TASK-BLK", 3, 1).expect("auto_block_task");
+    #[allow(deprecated)]
+    auto_block_task(&mut conn, "TASK-BLK", 3, 1).expect("auto_block_task");
 
     // Verify DB state is blocked.
     let status: String = conn
@@ -563,7 +568,8 @@ fn blocked_task_non_crash_outcome_map_reflects_false() {
     );
 
     // Admin blocks the task (e.g. manual action or overflow rung 4).
-    auto_block_task(&conn, "TASK-BLK2", 3, 1).expect("auto_block_task");
+    #[allow(deprecated)]
+    auto_block_task(&mut conn, "TASK-BLK2", 3, 1).expect("auto_block_task");
 
     // Map still reflects false — the task's last iteration was not a crash.
     assert_eq!(

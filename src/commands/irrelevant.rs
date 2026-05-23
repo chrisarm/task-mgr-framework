@@ -1,61 +1,37 @@
-//! Irrelevant command implementation.
-//!
-//! The irrelevant command marks one or more tasks as no longer needed due to
-//! changed requirements or learnings. This is a deliberate decision that a task
-//! is no longer needed - distinct from failure or skipping.
-//!
-//! Irrelevant tasks are permanently excluded from task selection.
+//! Irrelevant command — mark tasks as no longer needed. Routes through
+//! `TaskLifecycle::apply` (PRD §6 Category A); the lifecycle service owns
+//! the status mutation, notes formatting, and run_tasks bookkeeping.
 
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::lifecycle::{TaskLifecycle, TransitionChange, TransitionIntent, TransitionSource};
 use crate::models::TaskStatus;
 use crate::{TaskMgrError, TaskMgrResult};
 
-/// Result of marking a single task as irrelevant.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskIrrelevantResult {
-    /// The task that was marked irrelevant
     pub task_id: String,
-    /// Previous status before marking irrelevant
     pub previous_status: TaskStatus,
-    /// Reason for marking irrelevant
     pub reason: String,
-    /// Learning ID that made this task irrelevant (if provided)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub learning_id: Option<i64>,
-    /// Whether the task was already irrelevant
     pub was_already_irrelevant: bool,
 }
 
-/// Result of marking multiple tasks as irrelevant.
 #[derive(Debug, Clone, Serialize)]
 pub struct IrrelevantResult {
-    /// Results for each task
     pub tasks: Vec<TaskIrrelevantResult>,
-    /// Number of tasks marked as irrelevant
     pub irrelevant_count: usize,
-    /// Run ID if tracking was enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
 }
 
-/// Mark one or more tasks as irrelevant with a reason.
-///
-/// # Arguments
-/// * `conn` - Database connection (mutable for transaction support)
-/// * `task_ids` - IDs of tasks to mark as irrelevant
-/// * `reason` - Reason why tasks are no longer relevant
-/// * `run_id` - Optional run ID for tracking
-/// * `learning_id` - Optional learning ID that made these tasks irrelevant
-///
-/// # Returns
-/// * `Ok(IrrelevantResult)` - Information about the tasks
-/// * `Err(TaskMgrError)` - If any task not found or already done
-///
-/// # Atomicity
-/// When multiple task IDs are provided, all operations are wrapped in a
-/// transaction. Either all tasks are marked as irrelevant, or none are (on error).
+/// Mark tasks as irrelevant. Pre-validates every task (must not be Done)
+/// before any writes; either every task transitions or the call returns
+/// an error untouched. Routes status mutation through
+/// `TaskLifecycle::apply`; the `audit_note` override carries the optional
+/// learning_id suffix.
 pub fn irrelevant(
     conn: &mut Connection,
     task_ids: &[String],
@@ -63,110 +39,77 @@ pub fn irrelevant(
     run_id: Option<&str>,
     learning_id: Option<i64>,
 ) -> TaskMgrResult<IrrelevantResult> {
-    // Wrap all operations in a transaction for atomicity
-    let tx = conn.transaction()?;
-
-    let mut results = Vec::with_capacity(task_ids.len());
-
+    let mut previous_statuses = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
-        let result = irrelevant_single_task(&tx, task_id, reason, run_id, learning_id)?;
-        results.push(result);
+        let status_str: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?", [task_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
+                _ => TaskMgrError::from(e),
+            })?;
+        let previous: TaskStatus = status_str.parse()?;
+        if previous == TaskStatus::Done {
+            return Err(TaskMgrError::invalid_state(
+                "Task", task_id, "not done", "done",
+            ));
+        }
+        previous_statuses.push(previous);
     }
 
-    // Commit the transaction - all changes are atomic
-    tx.commit()?;
-
-    let irrelevant_count = results.len();
-
+    let audit_note = match learning_id {
+        Some(lid) => format!("[IRRELEVANT (learning #{lid})] {reason}"),
+        None => format!("[IRRELEVANT] {reason}"),
+    };
+    let run_task_reason = match learning_id {
+        Some(lid) => format!("{reason} (learning #{lid})"),
+        None => reason.to_string(),
+    };
+    let intents: Vec<TransitionIntent> = task_ids
+        .iter()
+        .map(|id| TransitionIntent {
+            task_id: id.clone(),
+            change: TransitionChange::Irrelevant,
+            source: TransitionSource::Operator,
+            reason: Some(run_task_reason.clone()),
+            fail_status: None,
+            audit_note: Some(audit_note.clone()),
+        })
+        .collect();
+    let outcomes = {
+        let mut lc = match run_id {
+            Some(rid) => TaskLifecycle::with_run(conn, rid),
+            None => TaskLifecycle::new(conn),
+        };
+        lc.apply(&intents)
+    };
+    for outcome in &outcomes {
+        if !outcome.applied
+            && let Some(crate::lifecycle::TransitionRejectReason::DispatchFailed(msg)) =
+                &outcome.reason
+        {
+            return Err(TaskMgrError::lock_error_with_hint(
+                format!("irrelevant dispatch failed for {}: {msg}", outcome.task_id),
+                "internal lifecycle dispatch error; check earlier stderr for details",
+            ));
+        }
+    }
+    let tasks: Vec<TaskIrrelevantResult> = task_ids
+        .iter()
+        .zip(previous_statuses)
+        .map(|(id, previous_status)| TaskIrrelevantResult {
+            task_id: id.clone(),
+            previous_status,
+            reason: reason.to_string(),
+            learning_id,
+            was_already_irrelevant: previous_status == TaskStatus::Irrelevant,
+        })
+        .collect();
     Ok(IrrelevantResult {
-        tasks: results,
-        irrelevant_count,
+        irrelevant_count: tasks.len(),
+        tasks,
         run_id: run_id.map(String::from),
-    })
-}
-
-/// Mark a single task as irrelevant.
-fn irrelevant_single_task(
-    conn: &Connection,
-    task_id: &str,
-    reason: &str,
-    run_id: Option<&str>,
-    learning_id: Option<i64>,
-) -> TaskMgrResult<TaskIrrelevantResult> {
-    // Query current task status
-    let (previous_status, current_notes): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, notes FROM tasks WHERE id = ?",
-            [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => TaskMgrError::task_not_found(task_id),
-            _ => TaskMgrError::from(e),
-        })?;
-
-    let previous_status: TaskStatus = previous_status.parse()?;
-
-    // Validate that task is not already done (completed successfully)
-    if previous_status == TaskStatus::Done {
-        return Err(TaskMgrError::invalid_state(
-            "Task", task_id, "not done", "done",
-        ));
-    }
-
-    // Check if already irrelevant
-    let was_already_irrelevant = previous_status == TaskStatus::Irrelevant;
-
-    // Build notes with irrelevant reason and optional learning reference
-    let irrelevant_note = if let Some(lid) = learning_id {
-        format!("[IRRELEVANT (learning #{})] {}", lid, reason)
-    } else {
-        format!("[IRRELEVANT] {}", reason)
-    };
-
-    let new_notes = match current_notes {
-        Some(existing) if !existing.is_empty() => {
-            format!("{}\n\n{}", existing, irrelevant_note)
-        }
-        _ => irrelevant_note,
-    };
-
-    // Update task status to irrelevant (do NOT increment error_count)
-    conn.execute(
-        "UPDATE tasks SET status = 'irrelevant', notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![new_notes, task_id],
-    )?;
-
-    // If run_id provided, update run_tasks if exists
-    if let Some(run_id) = run_id {
-        let run_task_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_tasks WHERE run_id = ? AND task_id = ?)",
-                rusqlite::params![run_id, task_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if run_task_exists {
-            let notes = if let Some(lid) = learning_id {
-                format!("{} (learning #{})", reason, lid)
-            } else {
-                reason.to_string()
-            };
-            conn.execute(
-                "UPDATE run_tasks SET status = 'skipped', notes = ?, ended_at = datetime('now') \
-                 WHERE run_id = ? AND task_id = ?",
-                rusqlite::params![notes, run_id, task_id],
-            )?;
-        }
-    }
-
-    Ok(TaskIrrelevantResult {
-        task_id: task_id.to_string(),
-        previous_status,
-        reason: reason.to_string(),
-        learning_id,
-        was_already_irrelevant,
     })
 }
 

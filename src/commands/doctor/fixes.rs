@@ -8,29 +8,21 @@
 use rusqlite::Connection;
 
 use crate::TaskMgrResult;
+use crate::lifecycle::{RepairItem, RepairPlan, TaskLifecycle};
+use crate::models::TaskStatus;
 
 /// Fix a stale in_progress task by resetting to todo with audit note.
-pub fn fix_stale_task(conn: &Connection, task_id: &str) -> TaskMgrResult<()> {
-    // Get current notes
-    let current_notes: Option<String> = conn
-        .query_row("SELECT notes FROM tasks WHERE id = ?", [task_id], |row| {
-            row.get(0)
-        })
-        .ok();
-
-    // Build new notes with audit message
+pub fn fix_stale_task(conn: &mut Connection, task_id: &str) -> TaskMgrResult<()> {
     let audit_note =
         "[DOCTOR] Reset from 'in_progress' to 'todo' - no active run tracking this task";
-    let new_notes = match current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note.to_string(),
+    let plan = RepairPlan {
+        items: vec![RepairItem {
+            task_id: task_id.to_string(),
+            target: TaskStatus::Todo,
+            audit_label: Some(audit_note.to_string()),
+        }],
     };
-
-    conn.execute(
-        "UPDATE tasks SET status = 'todo', started_at = NULL, notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![new_notes, task_id],
-    )?;
-
+    TaskLifecycle::new(conn).repair_stale(plan)?;
     Ok(())
 }
 
@@ -61,20 +53,12 @@ pub fn fix_active_run(conn: &Connection, run_id: &str) -> TaskMgrResult<()> {
 
 /// Fix a git reconciliation task by marking it as done.
 ///
-/// Sets the task status to 'done' with a completion timestamp and audit note
-/// referencing the git commit that completed it.
+/// Sets the task status to 'done' with an audit note referencing the git commit.
 pub fn fix_git_reconciliation(
-    conn: &Connection,
+    conn: &mut Connection,
     task_id: &str,
     commit_msg: &str,
 ) -> TaskMgrResult<()> {
-    // Get current notes
-    let current_notes: Option<String> = conn
-        .query_row("SELECT notes FROM tasks WHERE id = ?", [task_id], |row| {
-            row.get(0)
-        })
-        .ok();
-
     let audit_note = if commit_msg.is_empty() {
         "[DOCTOR] Reconciled from git history - task found in commit log".to_string()
     } else {
@@ -83,17 +67,14 @@ pub fn fix_git_reconciliation(
             commit_msg
         )
     };
-
-    let new_notes = match current_notes {
-        Some(existing) if !existing.is_empty() => format!("{}\n\n{}", existing, audit_note),
-        _ => audit_note,
+    let plan = RepairPlan {
+        items: vec![RepairItem {
+            task_id: task_id.to_string(),
+            target: TaskStatus::Done,
+            audit_label: Some(audit_note),
+        }],
     };
-
-    conn.execute(
-        "UPDATE tasks SET status = 'done', completed_at = datetime('now'), notes = ?, updated_at = datetime('now') WHERE id = ?",
-        rusqlite::params![new_notes, task_id],
-    )?;
-
+    TaskLifecycle::new(conn).repair_stale(plan)?;
     Ok(())
 }
 

@@ -44,7 +44,10 @@ fn make_conn_with_task(task_id: &str) -> Connection {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'todo',
-            started_at TEXT
+            started_at TEXT,
+            last_error TEXT,
+            blocked_at_iteration INTEGER,
+            updated_at TEXT
         )"#,
         [],
     )
@@ -141,14 +144,14 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     let tmp = TempDir::new().expect("tempdir");
     let base = tmp.path();
     let task_id = "FOO-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Iter 1: Sonnet + xhigh → downgrade_effort to high.
     let a1 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -180,7 +183,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     // Iter 2: Sonnet + high → escalate_below_opus to Opus.
     let a2 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(SONNET_MODEL),
@@ -211,7 +214,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     // Iter 3: Opus + high → to_1m_model.
     let a3 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL),
@@ -242,7 +245,7 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
     // Iter 4: Opus[1M] + high → blocked (no further escape).
     let a4 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -272,13 +275,13 @@ fn ladder_walk_sonnet_xhigh_to_blocked() {
 fn explicit_opus_at_floor_skips_to_1m_rung() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "BAR-FEAT-099";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL),
@@ -310,13 +313,13 @@ fn explicit_opus_at_floor_skips_to_1m_rung() {
 fn filename_sanitization_neutralizes_traversal() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "FOO/BAR..baz";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -374,7 +377,7 @@ fn filename_sanitization_neutralizes_traversal() {
 fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "QUX-FEAT-007";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
     let prompt_body = pr.prompt.clone();
@@ -382,7 +385,7 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -432,7 +435,7 @@ fn dump_content_includes_breakdown_note_and_verbatim_prompt() {
 fn jsonl_appends_one_line_per_iteration_with_matching_action() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ZAP-FEAT-002";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
@@ -451,7 +454,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
         .unwrap();
         let action = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_id,
             *effort,
             *model,
@@ -489,7 +492,7 @@ fn jsonl_appends_one_line_per_iteration_with_matching_action() {
 fn rotation_keeps_only_newest_three_dumps() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ROT-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
@@ -506,7 +509,7 @@ fn rotation_keeps_only_newest_three_dumps() {
         .unwrap();
         let _ = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_id,
             Some("xhigh"),
             Some(SONNET_MODEL),
@@ -565,7 +568,7 @@ fn rotation_keeps_only_newest_three_dumps() {
 fn overflow_recovered_set_populated_after_first_overflow() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "OR-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
@@ -576,7 +579,7 @@ fn overflow_recovered_set_populated_after_first_overflow() {
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -604,14 +607,14 @@ fn overflow_recovered_set_populated_after_first_overflow() {
 fn original_model_captured_on_first_overflow_only() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "OM-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Iter 1: original model = Sonnet.
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -644,7 +647,7 @@ fn original_model_captured_on_first_overflow_only() {
         .unwrap();
         let _ = overflow::handle_prompt_too_long(
             &mut ctx,
-            &conn,
+            &mut conn,
             task_id,
             *effort,
             *model,
@@ -674,13 +677,13 @@ fn original_model_captured_on_first_overflow_only() {
 fn blocked_rung_writes_both_dump_and_jsonl() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "BLK-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -721,13 +724,13 @@ fn blocked_rung_writes_both_dump_and_jsonl() {
 fn no_pollution_outside_tempdir() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "ISO-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -780,14 +783,14 @@ fn no_pollution_outside_tempdir() {
 fn override_persists_across_iterations() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "OVR-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Rung 2 fires: Sonnet at effort floor (high) → escalate to Opus.
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(SONNET_MODEL),
@@ -829,14 +832,14 @@ fn override_persists_across_iterations() {
 fn original_model_captured_first_overflow_only() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "OMC-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     // Observation 1: Sonnet+xhigh → rung 1 (downgrade_effort).
     let a1 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -864,7 +867,7 @@ fn original_model_captured_first_overflow_only() {
     // Observation 2: Sonnet+high → rung 2 (escalate_model).
     let a2 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(SONNET_MODEL),
@@ -893,7 +896,7 @@ fn original_model_captured_first_overflow_only() {
     // *current* effective_model is Opus, the snapshot must remain Sonnet.
     let a3 = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL),
@@ -922,13 +925,13 @@ fn original_model_captured_first_overflow_only() {
 fn run_id_none_serializes_correctly() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "RNI-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         Some(SONNET_MODEL),
@@ -966,13 +969,13 @@ fn run_id_none_serializes_correctly() {
 fn effective_model_none_dump_header() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "EMN-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let _ = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"),
         None, // <-- effective_model is None
@@ -1012,13 +1015,13 @@ fn effective_model_none_dump_header() {
 fn rung_4_writes_observability() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "R4OBS-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("high"),
         Some(OPUS_MODEL_1M),
@@ -1071,13 +1074,13 @@ fn rung_4_writes_observability() {
 fn dump_uses_sent_effort_not_resolved() {
     let tmp = TempDir::new().expect("tempdir");
     let task_id = "DUE-FEAT-001";
-    let conn = make_conn_with_task(task_id);
+    let mut conn = make_conn_with_task(task_id);
     let mut ctx = IterationContext::new(10);
     let pr = make_prompt_result(task_id);
 
     let action = overflow::handle_prompt_too_long(
         &mut ctx,
-        &conn,
+        &mut conn,
         task_id,
         Some("xhigh"), // sent effort
         Some(SONNET_MODEL),

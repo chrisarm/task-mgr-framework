@@ -6,6 +6,10 @@
 //!
 //! Does NOT duplicate unit tests already in src/loop_engine/engine.rs.
 
+// FEAT-010: this test crate intentionally exercises the deprecated
+// `auto_block_task` shim to lock its contract during the migration.
+#![allow(deprecated)]
+
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -141,10 +145,11 @@ fn test_should_auto_block_parameterized_max_retries_values() {
 /// last_error message contains both the failure count and the task ID.
 #[test]
 fn test_auto_block_message_contains_task_id_and_failure_count() {
-    let (_dir, conn) = setup_db();
+    let (_dir, mut conn) = setup_db();
     insert_retry_task(&conn, "FAIL-007", Some(SONNET_MODEL), 3, 3);
 
-    auto_block_task(&conn, "FAIL-007", 3, 1).unwrap();
+    #[allow(deprecated)]
+    auto_block_task(&mut conn, "FAIL-007", 3, 1).unwrap();
 
     let (_, _, status, last_error) = read_task_state(&conn, "FAIL-007");
     assert_eq!(
@@ -183,10 +188,11 @@ fn test_auto_block_message_contains_task_id_and_failure_count() {
 /// template interpolation is not hard-coded.
 #[test]
 fn test_auto_block_message_task_id_interpolation() {
-    let (_dir, conn) = setup_db();
+    let (_dir, mut conn) = setup_db();
     insert_retry_task(&conn, "XYZ-999", Some(SONNET_MODEL), 5, 5);
 
-    auto_block_task(&conn, "XYZ-999", 5, 1).unwrap();
+    #[allow(deprecated)]
+    auto_block_task(&mut conn, "XYZ-999", 5, 1).unwrap();
 
     let (_, _, _, last_error) = read_task_state(&conn, "XYZ-999");
     let err = last_error.expect("auto_block_task must populate last_error");
