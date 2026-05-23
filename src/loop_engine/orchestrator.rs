@@ -60,6 +60,7 @@ use crate::loop_engine::prd_reconcile::{
 use crate::loop_engine::progress;
 use crate::loop_engine::signals::{self, SignalFlag, handle_human_review};
 use crate::loop_engine::status_queries::read_prd_hints;
+use crate::loop_engine::wave_scheduler::classify_drained_queue;
 use crate::loop_engine::worktree;
 use crate::models::RunStatus;
 
@@ -1289,6 +1290,20 @@ pub async fn run_loop(mut run_config: LoopRunConfig) -> LoopResult {
 
         // Track consecutive stale iterations and abort if stuck
         if matches!(result.outcome, IterationOutcome::NoEligibleTasks) {
+            // Drained-but-stuck short-circuit (shared with the wave path): if
+            // no schedulable work remains and only blocked/skipped tasks are
+            // left, exit immediately with the classifier's named verdict
+            // instead of spinning to the stale-abort threshold. `classify`
+            // never returns the clean (exit 0) variant here — `run_iteration`
+            // already returns `Completed` for that case — but we apply whatever
+            // it reports so the two paths share one source of truth.
+            if let Some(drained) = classify_drained_queue(&conn, task_prefix.as_deref()) {
+                eprintln!("{}", drained.reason);
+                exit_code = drained.exit_code;
+                exit_reason = drained.reason;
+                final_run_status = drained.run_status;
+                break;
+            }
             ctx.stale_tracker.check("stale", "stale"); // same hash → increment
             if ctx.stale_tracker.should_abort() {
                 eprintln!(

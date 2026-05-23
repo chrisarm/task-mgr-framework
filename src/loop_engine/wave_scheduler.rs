@@ -59,6 +59,7 @@ use crate::loop_engine::engine::{
 use crate::loop_engine::git_reconcile::{
     reconcile_external_git_completions, reconcile_merged_slot_completions,
 };
+use crate::loop_engine::prd_reconcile::reconcile_passes_with_db;
 use crate::loop_engine::merge_resolver;
 use crate::loop_engine::model;
 use crate::loop_engine::progress;
@@ -251,13 +252,93 @@ fn wave_preflight_check(
     None
 }
 
-/// No eligible tasks were selected for this wave. Drives the stale tracker
-/// exactly like sequential does on `IterationOutcome::NoEligibleTasks`,
-/// returning a terminal outcome when the tracker tripped its abort threshold.
+/// No eligible tasks were selected for this wave.
+///
+/// Before counting an empty selection as a stale iteration, this mirrors the
+/// two checks the sequential path runs when `build_prompt` returns `Ok(None)`
+/// (`run_iteration`, the `remaining == 0` exit and the auto-recovery sweep) —
+/// behaviors the wave path previously lacked, which let a fully-completed PRD
+/// abort with the misleading "no eligible tasks after N consecutive stale
+/// iterations" (exit 1) instead of exiting cleanly:
+///
+/// 1. **Queue drained → terminal exit.** If no schedulable tasks remain, return
+///    a terminal outcome via `classify_drained_queue` (the shared
+///    sequential/wave predicate): exit 0 when only done/irrelevant remain,
+///    exit 1 when `blocked`/`skipped` work was left stuck. Same classifier used
+///    by the all-complete exit at the bottom of `run_wave_iteration`.
+/// 2. **Stranded `in_progress` recovery.** Reconcile any PRD `passes: true`
+///    rows the DB never marked done, then reset tasks a prior wave left in
+///    `in_progress` (merge-back failure / completion-detection gap). Safe here:
+///    selection runs on the main thread before any slot spawns, and the prior
+///    wave's slot threads have all joined, so nothing is legitimately
+///    mid-flight. If recovery frees anything, retry next wave WITHOUT touching
+///    the stale tracker — progress is now possible. A *static* stranding
+///    self-corrects: the next empty-group pass recovers nothing and falls
+///    through to the stale path. A task that is repeatedly claimed then
+///    re-stranded would not advance the stale counter, but it is bounded by
+///    `max_iterations` (and, for the merge-back-failure variant, by the FEAT-002
+///    consecutive-merge-fail halt threshold).
+///
+/// Only a genuinely stuck queue (tasks remain, none eligible, nothing
+/// recoverable) drives the stale tracker, returning a terminal outcome when the
+/// tracker tripped its abort threshold.
 fn handle_no_eligible_tasks(
-    params: &WaveIterationParams<'_>,
+    params: &mut WaveIterationParams<'_>,
     ctx: &mut IterationContext,
 ) -> WaveOutcome {
+    let task_prefix = params.task_prefix;
+    let prd_path = params.prd_path;
+
+    // (1) Queue genuinely drained → terminal completion exit, NOT a stale
+    // failure. The classifier separates a fully-successful drain (exit 0) from
+    // one where tasks were left blocked/skipped (non-zero exit, named reason)
+    // so the loop-end banner is honest.
+    if let Some(drained) = classify_drained_queue(params.conn, task_prefix) {
+        progress::log_iteration(
+            params.progress_path,
+            params.iteration,
+            None,
+            &IterationOutcome::Completed,
+            &[],
+            None,
+            None,
+            None,
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: Some(WaveTerminal {
+                exit_code: drained.exit_code,
+                reason: drained.reason,
+                run_status: Some(drained.run_status),
+            }),
+            was_stopped: false,
+            failed_merges: Vec::new(),
+        };
+    }
+
+    // (2) Tasks remain but none are eligible → attempt auto-recovery before
+    // counting this as stale.
+    reconcile_passes_with_db(params.conn, prd_path, task_prefix);
+    let recovered = TaskLifecycle::new(params.conn)
+        .recover_in_progress_for_prefix(task_prefix)
+        .unwrap_or(0);
+    if recovered > 0 {
+        eprintln!(
+            "Auto-recovered {} stale in_progress task(s), retrying task selection next wave...",
+            recovered
+        );
+        return WaveOutcome {
+            tasks_completed: 0,
+            iteration_consumed: true,
+            terminal: None,
+            was_stopped: false,
+            failed_merges: Vec::new(),
+        };
+    }
+
+    // (3) Genuinely stuck: nothing eligible, nothing recoverable. Count toward
+    // the stale-abort threshold exactly as before.
     ctx.stale_tracker.check("stale", "stale");
     progress::log_iteration(
         params.progress_path,
@@ -488,11 +569,16 @@ fn build_slot_prompt_params<'a>(
 /// Count tasks still in flight for the current PRD prefix. "Done",
 /// "skipped", "irrelevant" and "blocked" are terminal — anything else is
 /// still work to do.
-fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
+pub(crate) fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) -> i64 {
     let (clause, param) = prefix_and(task_prefix);
+    // `archived_at IS NULL` is mandatory: archiving stamps `archived_at` on all
+    // prefix-matched rows regardless of status (archive.rs), so an archived
+    // todo/in_progress row would otherwise count as remaining work and the wave
+    // would never recognize completion. Matches the sequential predicate and is
+    // locked by archive.rs::test_archived_tasks_invisible_to_status_count_query.
     let sql = format!(
         "SELECT COUNT(*) FROM tasks WHERE status NOT IN \
-         ('done','irrelevant','skipped','blocked') {clause}"
+         ('done','irrelevant','skipped','blocked') AND archived_at IS NULL {clause}"
     );
     let p_vec: Vec<&dyn rusqlite::types::ToSql> = match &param {
         Some(p) => vec![p],
@@ -500,6 +586,79 @@ fn count_remaining_active_tasks(conn: &Connection, task_prefix: Option<&str>) ->
     };
     conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
         .unwrap_or(0)
+}
+
+/// Count tasks in a single terminal-but-unfinished `status` for the current PRD
+/// prefix (`blocked` or `skipped`). Both are excluded from
+/// `count_remaining_active_tasks` (not schedulable) but, unlike
+/// `done`/`irrelevant`, represent work that did not finish — the drain
+/// classifier uses them to avoid reporting a clean "all tasks complete".
+/// `archived_at IS NULL` — see `count_remaining_active_tasks`.
+fn count_tasks_in_status(conn: &Connection, task_prefix: Option<&str>, status: &str) -> i64 {
+    let (clause, param) = prefix_and(task_prefix);
+    let sql =
+        format!("SELECT COUNT(*) FROM tasks WHERE status = ?1 AND archived_at IS NULL {clause}");
+    let mut p_vec: Vec<&dyn rusqlite::types::ToSql> = vec![&status];
+    if let Some(p) = &param {
+        p_vec.push(p);
+    }
+    conn.query_row(&sql, p_vec.as_slice(), |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Terminal outcome for a loop that finds no schedulable tasks. Shared by the
+/// sequential and wave paths so the "what counts as clean completion vs stuck"
+/// predicate lives in exactly one place (see `src/loop_engine/CLAUDE.md`).
+pub(crate) struct DrainedOutcome {
+    pub(crate) exit_code: i32,
+    pub(crate) reason: String,
+    pub(crate) run_status: RunStatus,
+}
+
+/// Classify the loop-end state when no *schedulable* tasks remain (no `todo` /
+/// `in_progress` rows — `count_remaining_active_tasks == 0`).
+///
+/// Returns `None` while schedulable work is still in flight (the caller should
+/// keep looping / recovering). When the queue is drained, distinguishes:
+///
+/// - **Fully successful** — every remaining row is `done`/`irrelevant`: exit 0,
+///   `RunStatus::Completed`, reason "all tasks complete".
+/// - **Stuck** — at least one `blocked` and/or `skipped` row remains: a
+///   non-zero exit, `RunStatus::Aborted`, and a reason naming the counts plus a
+///   `task-mgr review` hint. `skipped` is treated as unfinished work (not a
+///   clean success) — a deliberate product decision so neither execution path
+///   claims completion while deferred work is outstanding.
+pub(crate) fn classify_drained_queue(
+    conn: &Connection,
+    task_prefix: Option<&str>,
+) -> Option<DrainedOutcome> {
+    if count_remaining_active_tasks(conn, task_prefix) != 0 {
+        return None;
+    }
+    let blocked = count_tasks_in_status(conn, task_prefix, "blocked");
+    let skipped = count_tasks_in_status(conn, task_prefix, "skipped");
+    if blocked == 0 && skipped == 0 {
+        return Some(DrainedOutcome {
+            exit_code: 0,
+            reason: "all tasks complete".to_string(),
+            run_status: RunStatus::Completed,
+        });
+    }
+    let mut parts = Vec::new();
+    if blocked > 0 {
+        parts.push(format!("{blocked} blocked"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    Some(DrainedOutcome {
+        exit_code: 1,
+        reason: format!(
+            "no schedulable tasks remain ({}) — run `task-mgr review` to resolve",
+            parts.join(", ")
+        ),
+        run_status: RunStatus::Aborted,
+    })
 }
 
 /// Sleep between waves so the loop respects `--iteration-delay` the same
@@ -801,7 +960,7 @@ pub fn run_wave_iteration(
         if !result.ephemeral_block_diagnostics.is_empty() {
             return handle_ephemeral_deadlock(&params, ctx, result.ephemeral_block_diagnostics);
         }
-        return handle_no_eligible_tasks(&params, ctx);
+        return handle_no_eligible_tasks(&mut params, ctx);
     }
 
     // Selected at least one eligible task → reset stale tracker (mirrors
@@ -1081,14 +1240,16 @@ pub fn run_wave_iteration(
         };
     }
 
-    if agg.any_completed && count_remaining_active_tasks(params.conn, params.task_prefix) == 0 {
+    if agg.any_completed
+        && let Some(drained) = classify_drained_queue(params.conn, params.task_prefix)
+    {
         return WaveOutcome {
             tasks_completed,
             iteration_consumed: true,
             terminal: Some(WaveTerminal {
-                exit_code: 0,
-                reason: "all tasks complete".to_string(),
-                run_status: Some(RunStatus::Completed),
+                exit_code: drained.exit_code,
+                reason: drained.reason,
+                run_status: Some(drained.run_status),
             }),
             was_stopped: false,
             failed_merges,
@@ -1191,7 +1352,8 @@ mod tests {
     use crate::loop_engine::runner::RunnerKind;
     use crate::loop_engine::signals::SignalFlag;
     use crate::loop_engine::test_utils::{
-        insert_run, insert_task, insert_task_file, setup_git_repo, setup_test_db,
+        get_task_status, insert_relationship, insert_run, insert_task, insert_task_file,
+        setup_git_repo, setup_test_db,
     };
     use crate::models::Task;
     use rusqlite::Connection;
@@ -1467,6 +1629,14 @@ mod tests {
     #[test]
     fn test_run_wave_iteration_no_eligible_tasks_increments_stale_tracker() {
         let (temp, mut conn) = setup_test_db();
+        // Genuinely-stuck queue: FEAT-B (todo) dependsOn FEAT-A (blocked).
+        // FEAT-A is terminal so it isn't a candidate; FEAT-B's dependency is
+        // unsatisfied so it isn't eligible → empty group, but FEAT-B keeps
+        // `count_remaining_active_tasks` non-zero so the all-complete and
+        // recovery short-circuits don't fire and we exercise the stale path.
+        insert_task(&conn, "FEAT-A", "Blocked dep", "blocked", 10);
+        insert_task(&conn, "FEAT-B", "Dependent", "todo", 20);
+        insert_relationship(&conn, "FEAT-B", "FEAT-A", "dependsOn");
         let tmp = tempfile::TempDir::new().unwrap();
         let base_prompt = tmp.path().join("base.md");
         std::fs::write(&base_prompt, "base").unwrap();
@@ -1509,6 +1679,12 @@ mod tests {
     #[test]
     fn test_run_wave_iteration_third_no_eligible_wave_aborts_via_stale() {
         let (temp, mut conn) = setup_test_db();
+        // Genuinely-stuck queue (see sibling test): a todo task whose only
+        // dependency is blocked. Keeps the queue non-empty so the stale
+        // path — not the all-complete short-circuit — is exercised.
+        insert_task(&conn, "FEAT-A", "Blocked dep", "blocked", 10);
+        insert_task(&conn, "FEAT-B", "Dependent", "todo", 20);
+        insert_relationship(&conn, "FEAT-B", "FEAT-A", "dependsOn");
         let tmp = tempfile::TempDir::new().unwrap();
         let base_prompt = tmp.path().join("base.md");
         std::fs::write(&base_prompt, "base").unwrap();
@@ -1545,6 +1721,155 @@ mod tests {
         assert_eq!(t.exit_code, 1);
         assert!(t.reason.contains("no eligible tasks"), "got: {}", t.reason);
         assert!(t.run_status.is_none());
+    }
+
+    /// Regression: a wave that selects no eligible tasks because the queue
+    /// is fully and successfully drained (only done/irrelevant) must exit
+    /// cleanly as "all tasks complete" (exit 0, RunStatus::Completed) — NOT
+    /// spin into the stale tracker and abort with exit 1. Mirrors the
+    /// sequential `remaining == 0 → "All tasks complete!"` exit that the
+    /// wave path previously lacked.
+    #[test]
+    fn test_run_wave_iteration_drained_queue_exits_complete_not_stale() {
+        let (temp, mut conn) = setup_test_db();
+        // Every row terminal AND successful: done + irrelevant only.
+        insert_task(&conn, "FEAT-A", "Done", "done", 10);
+        insert_task(&conn, "FEAT-D", "Irrelevant", "irrelevant", 40);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_prompt = tmp.path().join("base.md");
+        std::fs::write(&base_prompt, "base").unwrap();
+        let prd = tmp.path().join("prd.json");
+        let progress = tmp.path().join("progress.txt");
+        let mode = PermissionMode::Dangerous;
+        let signal = SignalFlag::new();
+        let mut ctx = IterationContext::new(5);
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+        let outcome = run_wave_iteration(
+            make_wave_params(
+                &mut conn,
+                temp.path(),
+                tmp.path(),
+                "main",
+                &[],
+                &base_prompt,
+                &mode,
+                &signal,
+                tmp.path(),
+                &prd,
+                &progress,
+                2,
+                &project_cfg,
+                &prd_implicit,
+            ),
+            &mut ctx,
+        );
+        let t = outcome.terminal.expect("terminal expected");
+        assert_eq!(t.exit_code, 0, "drained queue must exit 0, got {t:?}");
+        assert_eq!(t.reason, "all tasks complete");
+        assert!(matches!(t.run_status, Some(RunStatus::Completed)));
+        // Crucially, the stale tracker was NOT touched.
+        assert_eq!(ctx.stale_tracker.count(), 0);
+    }
+
+    /// A drained queue that still has `blocked` and/or `skipped` tasks must
+    /// NOT report a clean "all tasks complete". The classifier downgrades it
+    /// to a non-zero exit with `RunStatus::Aborted` and a reason naming the
+    /// counts, so the loop-end banner is honest about stuck/deferred work.
+    /// `skipped` downgrades just like `blocked` (product decision).
+    #[test]
+    fn test_run_wave_iteration_drained_with_blocked_downgrades() {
+        let (temp, mut conn) = setup_test_db();
+        insert_task(&conn, "FEAT-A", "Done", "done", 10);
+        insert_task(&conn, "FEAT-C", "Blocked", "blocked", 30);
+        insert_task(&conn, "FEAT-E", "Skipped", "skipped", 50);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_prompt = tmp.path().join("base.md");
+        std::fs::write(&base_prompt, "base").unwrap();
+        let prd = tmp.path().join("prd.json");
+        let progress = tmp.path().join("progress.txt");
+        let mode = PermissionMode::Dangerous;
+        let signal = SignalFlag::new();
+        let mut ctx = IterationContext::new(5);
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+        let outcome = run_wave_iteration(
+            make_wave_params(
+                &mut conn,
+                temp.path(),
+                tmp.path(),
+                "main",
+                &[],
+                &base_prompt,
+                &mode,
+                &signal,
+                tmp.path(),
+                &prd,
+                &progress,
+                2,
+                &project_cfg,
+                &prd_implicit,
+            ),
+            &mut ctx,
+        );
+        let t = outcome.terminal.expect("terminal expected");
+        assert_eq!(t.exit_code, 1, "blocked/skipped must downgrade exit, got {t:?}");
+        assert!(t.reason.contains("blocked"), "got: {}", t.reason);
+        assert!(t.reason.contains("skipped"), "got: {}", t.reason);
+        assert!(matches!(t.run_status, Some(RunStatus::Aborted)));
+        assert_eq!(ctx.stale_tracker.count(), 0);
+    }
+
+    /// Regression: a wave that selects nothing because a prior wave left a
+    /// task stranded in `in_progress` (merge-back / completion-detection
+    /// gap) must auto-recover it to `todo` and retry next wave WITHOUT
+    /// counting toward the stale-abort threshold. Mirrors the sequential
+    /// auto-recovery sweep the wave path previously lacked.
+    #[test]
+    fn test_run_wave_iteration_recovers_stranded_in_progress_not_stale() {
+        let (temp, mut conn) = setup_test_db();
+        // No eligible todo candidate; the only active row is stranded
+        // in_progress (not a selection candidate, so the group is empty).
+        insert_task(&conn, "FEAT-A", "Stranded", "in_progress", 10);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_prompt = tmp.path().join("base.md");
+        std::fs::write(&base_prompt, "base").unwrap();
+        let prd = tmp.path().join("prd.json");
+        let progress = tmp.path().join("progress.txt");
+        let mode = PermissionMode::Dangerous;
+        let signal = SignalFlag::new();
+        let mut ctx = IterationContext::new(5);
+        let project_cfg = crate::loop_engine::project_config::ProjectConfig::default();
+        let prd_implicit: Vec<String> = Vec::new();
+        let outcome = run_wave_iteration(
+            make_wave_params(
+                &mut conn,
+                temp.path(),
+                tmp.path(),
+                "main",
+                &[],
+                &base_prompt,
+                &mode,
+                &signal,
+                tmp.path(),
+                &prd,
+                &progress,
+                2,
+                &project_cfg,
+                &prd_implicit,
+            ),
+            &mut ctx,
+        );
+        // Recovery path: iteration consumed, no terminal, stale untouched.
+        assert!(
+            outcome.terminal.is_none(),
+            "recovery wave must not be terminal, got {:?}",
+            outcome.terminal
+        );
+        assert!(outcome.iteration_consumed);
+        assert_eq!(ctx.stale_tracker.count(), 0, "recovery must not bump stale");
+        // The stranded task was reset to todo so the next wave can claim it.
+        assert_eq!(get_task_status(&conn, "FEAT-A"), "todo");
     }
 
     #[test]

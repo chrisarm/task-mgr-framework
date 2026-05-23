@@ -55,6 +55,7 @@ use crate::loop_engine::recovery::{
     check_crash_escalation, check_override_invalidation, probe_rate_limit_lifted,
     prompt_overflow_result, update_trackers,
 };
+use crate::loop_engine::wave_scheduler::classify_drained_queue;
 use crate::loop_engine::runner;
 use crate::loop_engine::signals;
 use crate::loop_engine::usage::{self, UsageCheckResult};
@@ -227,7 +228,17 @@ pub fn run_iteration(
                 .conn
                 .query_row(&rem_sql, rem_params.as_slice(), |row| row.get(0))
                 .unwrap_or(0);
-            if remaining == 0 {
+            // Clean-completion decision routes through the shared
+            // `classify_drained_queue` so the sequential and wave paths cannot
+            // drift on "what counts as complete". A clean drain (only
+            // done/irrelevant) exits here as `Completed`; a stuck drain
+            // (blocked/skipped left, nothing schedulable) falls through to the
+            // no-op recovery below and returns `NoEligibleTasks`, which the
+            // outer loop turns into an immediate, named exit via the same
+            // classifier (so it no longer has to spin three stale iterations).
+            if classify_drained_queue(params.conn, params.task_prefix)
+                .is_some_and(|d| d.exit_code == 0)
+            {
                 eprintln!("All tasks complete!");
                 return Ok(IterationResult {
                     outcome: IterationOutcome::Completed,

@@ -267,6 +267,45 @@ table below), human-review trigger, rate-limit waits, pause-signal
 handling, slot merge resolution (see "Slot merge-back conflict
 resolution" below).
 
+## Drained-queue classification (sequential ↔ wave parity)
+
+When no *schedulable* task can be selected, both execution paths decide the
+loop-end verdict through ONE helper, `engine::classify_drained_queue`, so they
+cannot drift on "what counts as complete vs stuck":
+
+- **Clean drain** — only `done`/`irrelevant` remain → exit 0,
+  `RunStatus::Completed`, reason "all tasks complete".
+- **Stuck drain** — at least one `blocked` and/or `skipped` row remains with no
+  schedulable work → exit 1, `RunStatus::Aborted`, reason names the counts +
+  a `task-mgr review` hint. **`skipped` is treated as unfinished work, not a
+  clean success** (deliberate product decision — neither path may claim
+  completion while deferred work is outstanding).
+- **Not drained** — any `todo`/`in_progress` row exists →
+  `count_remaining_active_tasks != 0` → returns `None`; the caller keeps
+  looping / recovering.
+
+Call sites:
+- **Wave**: `handle_no_eligible_tasks` (empty group) AND the all-complete exit
+  at the bottom of `run_wave_iteration` (guarded by `agg.any_completed`).
+- **Sequential**: the clean-complete check in `run_iteration`'s `build_prompt`
+  `Ok(None)` arm, plus a drained-but-stuck short-circuit in `run_loop`'s
+  `NoEligibleTasks` branch (exits immediately with the named reason instead of
+  spinning to the 3-iteration stale-abort threshold).
+
+**Empty-group ≠ stale.** Before counting an empty wave selection toward the
+stale tracker, `handle_no_eligible_tasks` first runs the same auto-recovery the
+sequential path does (`reconcile_passes_with_db` + `recover_in_progress_for_prefix`)
+— a task a finished slot left stranded in `in_progress` is reset to `todo` and
+retried next wave WITHOUT incrementing stale. Only a genuinely stuck queue
+(nothing schedulable, nothing recoverable, no blocked/skipped terminal) drives
+the stale counter. This closed a bug where a fully-completed PRD aborted with
+exit 1 "no eligible tasks after 3 consecutive stale iterations".
+
+**`archived_at IS NULL` is mandatory** in `count_remaining_active_tasks` and
+`count_tasks_in_status` — archiving stamps `archived_at` on prefix-matched rows
+regardless of status, so an archived row would otherwise mis-classify the drain
+(locked by `archive.rs::test_archived_tasks_invisible_to_status_count_query`).
+
 ## Slot merge-back conflict resolution
 
 When parallel-slot waves finish, `merge_slot_branches_with_resolver` (in
