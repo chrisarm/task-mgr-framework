@@ -361,6 +361,69 @@ pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskM
     }
 }
 
+/// Verify that the Grok binary is reachable when `reviewModel` routes to Grok.
+///
+/// Returns `Ok(())` when:
+/// - `review_model` is `None` (not configured), or
+/// - `review_model` resolves to a Claude provider (no Grok binary needed).
+///
+/// Returns `Err` when `review_model` resolves to Grok AND the resolved binary
+/// path does not exist OR is not executable. The error message names the model
+/// and binary so operators can diagnose without re-reading config.
+///
+/// Binary resolution order (matches `runner::resolve_grok_binary`):
+/// 1. `GROK_BINARY` env var when set AND non-empty/non-whitespace.
+/// 2. `fallback_cli_binary` when set AND non-empty/non-whitespace — probed at
+///    the path verbatim (not re-resolved via PATH).
+/// 3. Bare name `"grok"` — searches PATH directories.
+pub fn check_review_model_binary(
+    review_model: Option<&str>,
+    fallback_cli_binary: Option<&str>,
+) -> TaskMgrResult<()> {
+    use crate::loop_engine::model::{Provider, provider_for_model};
+
+    if provider_for_model(review_model) != Provider::Grok {
+        return Ok(());
+    }
+
+    let env_bin = std::env::var("GROK_BINARY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let cli_bin = fallback_cli_binary
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string);
+
+    let (binary, found) = if let Some(env_bin) = env_bin {
+        let exec = is_executable_path(std::path::Path::new(&env_bin));
+        (env_bin, exec)
+    } else if let Some(explicit) = cli_bin {
+        let exec = is_executable_path(std::path::Path::new(&explicit));
+        (explicit, exec)
+    } else {
+        let name = "grok";
+        let found = std::env::var_os("PATH")
+            .map(|path_var| {
+                std::env::split_paths(&path_var).any(|dir| is_executable_path(&dir.join(name)))
+            })
+            .unwrap_or(false);
+        (name.to_string(), found)
+    };
+
+    if found {
+        Ok(())
+    } else {
+        Err(TaskMgrError::NotFound {
+            resource_type: "Grok CLI binary required by reviewModel".to_string(),
+            id: format!(
+                "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
+                 correct path, then run `grok login` to authenticate \
+                 (reviewModel = {rm})",
+                rm = review_model.unwrap_or("<unknown>")
+            ),
+        })
+    }
+}
+
 /// Read project config from `<db_dir>/config.json`.
 ///
 /// Returns default (empty) config if the file doesn't exist.
@@ -932,5 +995,64 @@ mod tests {
         fs::write(dir.path().join("config.json"), r#"{"auto_review": false}"#).unwrap();
         let config = read_project_config(dir.path());
         assert!(config.auto_review, "snake_case key must not set the field");
+    }
+
+    // ---- check_review_model_binary tests ----
+
+    #[test]
+    fn test_check_review_model_binary_claude_provider_is_noop() {
+        // When reviewModel resolves to Claude, the probe must succeed regardless
+        // of whether grok is on PATH — no PATH lookup must occur.
+        assert!(check_review_model_binary(Some("claude-opus-4-7"), None).is_ok());
+        assert!(check_review_model_binary(Some("claude-sonnet-4-6"), None).is_ok());
+    }
+
+    #[test]
+    fn test_check_review_model_binary_none_is_noop() {
+        // Unset reviewModel → probe is always a no-op.
+        assert!(check_review_model_binary(None, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_review_model_binary_grok_missing_binary_errors() {
+        // reviewModel resolves to Grok AND the binary is absent → Err.
+        // Inject a path that definitely doesn't exist as GROK_BINARY so the
+        // probe never falls through to the system PATH. The mutex serializes
+        // against other tests that mutate the GROK_BINARY env var.
+        use crate::loop_engine::test_utils::GROK_BINARY_MUTEX;
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let bogus = "/tmp/task-mgr-test-nonexistent-grok-binary-xyz";
+        unsafe { std::env::set_var("GROK_BINARY", bogus) };
+        let result = check_review_model_binary(Some("grok-4"), None);
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        assert!(result.is_err(), "missing grok binary must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("grok-4"),
+            "error should mention the reviewModel value; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_review_model_binary_grok_explicit_missing_cli_binary_errors() {
+        // When fallbackRunner.cliBinary is set to a non-existent path AND
+        // GROK_BINARY is unset, the probe checks the explicit path and errors.
+        use crate::loop_engine::test_utils::GROK_BINARY_MUTEX;
+        let _guard = GROK_BINARY_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let bogus_cli = "/tmp/task-mgr-test-nonexistent-grok-cli-xyz";
+        // Ensure GROK_BINARY is absent so we fall through to fallback_cli_binary.
+        unsafe { std::env::remove_var("GROK_BINARY") };
+        let result = check_review_model_binary(Some("grok-4-fast"), Some(bogus_cli));
+        assert!(
+            result.is_err(),
+            "non-existent cliBinary path must return Err"
+        );
+    }
+
+    #[test]
+    fn test_check_review_model_binary_groq_not_grok_is_noop() {
+        // "groq-llama-3" must NOT be classified as Grok (token-equality rule).
+        // Probe must succeed even if grok binary is absent.
+        assert!(check_review_model_binary(Some("groq-llama-3"), None).is_ok());
     }
 }

@@ -1093,10 +1093,18 @@ fn run(cli: Cli, resolved_db_dir: ResolvedDbDir) -> Result<(), TaskMgrError> {
                     // iteration if the fallback runner binary is missing.
                     {
                         use task_mgr::loop_engine::project_config::{
-                            check_fallback_runner_binary, read_project_config,
+                            check_fallback_runner_binary, check_review_model_binary,
+                            read_project_config,
                         };
                         let proj_cfg = read_project_config(&cli.dir);
                         check_fallback_runner_binary(proj_cfg.fallback_runner.as_ref())?;
+                        check_review_model_binary(
+                            proj_cfg.review_model.as_deref(),
+                            proj_cfg
+                                .fallback_runner
+                                .as_ref()
+                                .and_then(|fr| fr.cli_binary.as_deref()),
+                        )?;
                     }
 
                     let run_config = task_mgr::loop_engine::engine::LoopRunConfig {
