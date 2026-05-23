@@ -296,96 +296,20 @@ fn is_executable_path(path: &std::path::Path) -> bool {
     }
 }
 
-/// Verify that the Grok fallback binary is reachable at loop startup.
+/// Resolve and probe the Grok binary path.
 ///
-/// Returns `Ok(())` when:
-/// - `cfg` is `None` (fallback not configured), or
-/// - `cfg.enabled` is `false` (explicitly disabled — no PATH probe occurs).
-///
-/// Returns `Err` when `cfg.enabled` is `true` and the resolved binary path
-/// does not exist OR is not executable. The error message names the binary
-/// so operators can diagnose without re-reading config.
-///
-/// Binary resolution order (matches `runner::resolve_grok_binary`):
+/// Resolution order (matches `runner::resolve_grok_binary`):
 /// 1. `GROK_BINARY` env var when set AND non-empty/non-whitespace.
-/// 2. `cfg.cli_binary` when set AND non-empty/non-whitespace — probed at
-///    the path verbatim (not re-resolved via PATH).
+/// 2. `fallback_cli_binary` when set AND non-empty/non-whitespace — probed verbatim.
 /// 3. Bare name `"grok"` — searches PATH directories.
-pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskMgrResult<()> {
-    let cfg = match cfg {
-        None => return Ok(()),
-        Some(c) if !c.enabled => return Ok(()),
-        Some(c) => c,
-    };
-
-    // Resolution order mirrors runner::resolve_grok_binary exactly:
-    // GROK_BINARY env var (if non-empty) → cfg.cli_binary (if non-empty) →
-    // bare "grok" on PATH. Empty/whitespace values fall through to the next
-    // link — common shell footgun (`export GROK_BINARY=""` should not cause
-    // a misleading startup failure when grok is on PATH).
-    let env_bin = std::env::var("GROK_BINARY")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let cli_bin = cfg
-        .cli_binary
-        .as_ref()
-        .filter(|v| !v.trim().is_empty())
-        .cloned();
-
-    let (binary, found) = if let Some(env_bin) = env_bin {
-        let exec = is_executable_path(std::path::Path::new(&env_bin));
-        (env_bin, exec)
-    } else if let Some(explicit) = cli_bin {
-        let exec = is_executable_path(std::path::Path::new(&explicit));
-        (explicit, exec)
-    } else {
-        let name = "grok";
-        let found = std::env::var_os("PATH")
-            .map(|path_var| {
-                std::env::split_paths(&path_var).any(|dir| is_executable_path(&dir.join(name)))
-            })
-            .unwrap_or(false);
-        (name.to_string(), found)
-    };
-
-    if found {
-        Ok(())
-    } else {
-        Err(TaskMgrError::NotFound {
-            resource_type: "Fallback runner binary".to_string(),
-            id: format!(
-                "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
-                 correct path (must be an executable file), then retry"
-            ),
-        })
-    }
-}
-
-/// Verify that the Grok binary is reachable when `reviewModel` routes to Grok.
 ///
-/// Returns `Ok(())` when:
-/// - `review_model` is `None` (not configured), or
-/// - `review_model` resolves to a Claude provider (no Grok binary needed).
+/// Returns `Ok(())` when the resolved binary is an executable file.
+/// Returns `Err(binary_name)` when it is missing or not executable.
 ///
-/// Returns `Err` when `review_model` resolves to Grok AND the resolved binary
-/// path does not exist OR is not executable. The error message names the model
-/// and binary so operators can diagnose without re-reading config.
-///
-/// Binary resolution order (matches `runner::resolve_grok_binary`):
-/// 1. `GROK_BINARY` env var when set AND non-empty/non-whitespace.
-/// 2. `fallback_cli_binary` when set AND non-empty/non-whitespace — probed at
-///    the path verbatim (not re-resolved via PATH).
-/// 3. Bare name `"grok"` — searches PATH directories.
-pub fn check_review_model_binary(
-    review_model: Option<&str>,
-    fallback_cli_binary: Option<&str>,
-) -> TaskMgrResult<()> {
-    use crate::loop_engine::model::{Provider, provider_for_model};
-
-    if provider_for_model(review_model) != Provider::Grok {
-        return Ok(());
-    }
-
+/// Empty/whitespace values fall through to the next link — common shell
+/// footgun (`export GROK_BINARY=""` must not cause a misleading failure
+/// when grok is on PATH).
+fn resolve_and_verify_grok_binary(fallback_cli_binary: Option<&str>) -> Result<(), String> {
     let env_bin = std::env::var("GROK_BINARY")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -409,10 +333,47 @@ pub fn check_review_model_binary(
         (name.to_string(), found)
     };
 
-    if found {
-        Ok(())
-    } else {
-        Err(TaskMgrError::NotFound {
+    if found { Ok(()) } else { Err(binary) }
+}
+
+/// Verify that the Grok fallback binary is reachable at loop startup.
+///
+/// Returns `Ok(())` when `cfg` is `None` or `cfg.enabled` is `false`.
+/// Returns `Err` when `cfg.enabled` is `true` and the binary is missing or
+/// not executable. The error names the binary for operator diagnostics.
+pub fn check_fallback_runner_binary(cfg: Option<&FallbackRunnerConfig>) -> TaskMgrResult<()> {
+    let cfg = match cfg {
+        None => return Ok(()),
+        Some(c) if !c.enabled => return Ok(()),
+        Some(c) => c,
+    };
+    resolve_and_verify_grok_binary(cfg.cli_binary.as_deref()).map_err(|binary| {
+        TaskMgrError::NotFound {
+            resource_type: "Fallback runner binary".to_string(),
+            id: format!(
+                "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
+                 correct path (must be an executable file), then retry"
+            ),
+        }
+    })
+}
+
+/// Verify that the Grok binary is reachable when `reviewModel` routes to Grok.
+///
+/// Returns `Ok(())` when `review_model` is `None` or resolves to a non-Grok
+/// provider. Returns `Err` when it resolves to Grok and the binary is missing
+/// or not executable. The error names the model and binary for diagnostics.
+pub fn check_review_model_binary(
+    review_model: Option<&str>,
+    fallback_cli_binary: Option<&str>,
+) -> TaskMgrResult<()> {
+    use crate::loop_engine::model::{Provider, provider_for_model};
+
+    if provider_for_model(review_model) != Provider::Grok {
+        return Ok(());
+    }
+    resolve_and_verify_grok_binary(fallback_cli_binary).map_err(|binary| {
+        TaskMgrError::NotFound {
             resource_type: "Grok CLI binary required by reviewModel".to_string(),
             id: format!(
                 "{binary} — install the Grok CLI or set `fallbackRunner.cliBinary` to the \
@@ -420,8 +381,8 @@ pub fn check_review_model_binary(
                  (reviewModel = {rm})",
                 rm = review_model.unwrap_or("<unknown>")
             ),
-        })
-    }
+        }
+    })
 }
 
 /// Read project config from `<db_dir>/config.json`.
