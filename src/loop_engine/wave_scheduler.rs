@@ -17,8 +17,13 @@
 //! inline test modules that stay in `engine.rs`, so moving them would widen the
 //! carve's blast radius. The leaf concerns this module depends on come from
 //! `slot.rs` (FEAT-001: `run_slot_iteration`, `claim_slot_task`,
-//! `process_slot_result`, `slot_failure_result`) and `recovery.rs` (FEAT-002:
-//! `handle_task_failure`, `check_override_invalidation`).
+//! `process_slot_result`, `slot_failure_result`), `recovery.rs` (FEAT-002:
+//! `handle_task_failure`, `check_override_invalidation`),
+//! `iteration_pipeline.rs` (the shared post-Claude pipeline invoked inside
+//! `slot.rs::process_slot_result` — not called directly here, but every wave
+//! iteration result flows through it), and `worktree.rs` (merge-back via
+//! `merge_slot_branches_with_resolver`, ephemeral branch hygiene, stash
+//! preflight, and `union_slot_progress_files`).
 //!
 //! `engine.rs` re-exports `run_wave_iteration` / `run_parallel_wave` `pub` so
 //! the external import paths integration tests rely on stay valid (FR-008); the

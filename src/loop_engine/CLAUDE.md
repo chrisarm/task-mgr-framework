@@ -107,7 +107,7 @@ the path collapses to rungs 1-3 → blocked.
 
 **Operator escape valve — `check_override_invalidation`**: at the top of
 every iteration (before `resolve_effective_runner`),
-`engine::check_override_invalidation` compares the current `tasks.model` DB
+`recovery::check_override_invalidation` compares the current `tasks.model` DB
 value against `ctx.overflow_original_task_model[task_id]` (the snapshot
 captured at first overflow / RuntimeError fallback). When they diverge — i.e.
 an operator edited `tasks.model` out-of-band — all six per-task auto-recovery
@@ -175,7 +175,7 @@ appears. Negative controls (`stderr_contains_auth_failure_w3_broader_phrasing`
 in `runner.rs` unit tests) keep the list from drifting into false positives
 on common error phrases like "file not found" or "rate limit exceeded".
 
-**Transactional promotion ctx writes are deferred** (`engine.rs::handle_task_failure`
+**Transactional promotion ctx writes are deferred** (`recovery.rs::handle_task_failure`
 + `escalate_task_model_if_needed_inner` + `apply_pending_promotion`): the
 RuntimeError fallback hook runs inside the same DB transaction that
 increments `consecutive_failures` and (optionally) auto-blocks. If the ctx
@@ -207,7 +207,7 @@ honor both invariants — see `is_executable_path` in
 `project_config.rs`.
 
 **Single-source-of-truth drift sentinels are `assert!`, not
-`debug_assert!`** (`engine.rs::process_slot_result` cross-check of
+`debug_assert!`** (`slot.rs::process_slot_result` cross-check of
 `slot_result.effective_runner` vs. `resolve_effective_runner(...)`
 re-derivation): when a sentinel guards against a silent dispatch
 mismatch (wrong-runner spawn, wrong-model resolution, wrong-binary
@@ -385,7 +385,7 @@ parallel-slot merge-back failure waves before the engine halts. Single
 failures are recoverable (next wave gets a clean slate from the
 resolver); two-in-a-row indicate a cascading state. The reset/halt
 contract is implemented once in
-`apply_merge_fail_reset_and_halt_check` (`src/loop_engine/engine.rs`)
+`apply_merge_fail_reset_and_halt_check` (`src/loop_engine/wave_scheduler.rs`)
 and called from the wave-loop boundary — sequential-loop and wave-loop
 paths must not re-implement it.
 
@@ -584,9 +584,15 @@ For the full site→verb audit table and source-allowance matrix see
 | Concern | File | Symbol |
 | --- | --- | --- |
 | Status mutation SSoT | `src/lifecycle/mod.rs` | `TaskLifecycle`, six public verbs |
+| Outer loop entry point | `src/loop_engine/orchestrator.rs` | `run_loop`, `on_run_completed` |
+| Sequential iteration body | `src/loop_engine/iteration.rs` | `run_iteration` |
+| Wave scheduling + merge-back | `src/loop_engine/wave_scheduler.rs` | `run_wave_iteration`, `run_parallel_wave` |
+| Per-slot lifecycle + result | `src/loop_engine/slot.rs` | `run_slot_iteration`, `process_slot_result` |
+| Per-task recovery cluster | `src/loop_engine/recovery.rs` | `check_crash_escalation`, `check_override_invalidation`, `handle_task_failure` |
 | Slot path threading | `src/loop_engine/worktree.rs` | `merge_slot_branches_with_resolver` |
-| Halt threshold contract | `src/loop_engine/engine.rs` | `apply_merge_fail_reset_and_halt_check` |
-| Failed-merge struct | `src/loop_engine/engine.rs` | `FailedMerge`, `SYNTHETIC_DEADLOCK_SLOT` |
+| Halt threshold contract | `src/loop_engine/wave_scheduler.rs` | `apply_merge_fail_reset_and_halt_check` |
+| Failed-merge struct | `src/loop_engine/engine.rs` | `FailedMerge` |
+| Deadlock sentinel | `src/loop_engine/wave_scheduler.rs` | `SYNTHETIC_DEADLOCK_SLOT` |
 | Implicit overlap baseline | `src/commands/next/selection.rs` | `IMPLICIT_OVERLAP_FILES`, `BUILDY_TASK_PREFIXES` |
 | Cross-wave overlay | `src/loop_engine/worktree.rs` + `src/commands/next/selection.rs` | `list_unmerged_branch_files`, `ephemeral_overlay` parameter |
 | Startup hygiene + slot-0 guard | `src/loop_engine/worktree.rs` | `reconcile_stale_ephemeral_slots`, `classify_ephemeral_branch` |
@@ -595,7 +601,8 @@ For the full site→verb audit table and source-allowance matrix see
 | LLM runner dispatch | `src/loop_engine/runner.rs` + `src/loop_engine/engine.rs` | `RunnerKind`, `dispatch`, `ClaudeRunner`, `GrokRunner`, `resolve_effective_runner` |
 | Capability surface | `src/loop_engine/runner.rs` | `RunnerCapability`, `LlmRunner::supports`, `enforce_capabilities`, `CHECKS` |
 | Provider routing | `src/loop_engine/model.rs` | `Provider`, `provider_for_model` |
-| Operator escape valve | `src/loop_engine/engine.rs` | `check_override_invalidation`, `IterationContext::overflow_original_task_model` |
+| Operator escape valve | `src/loop_engine/recovery.rs` | `check_override_invalidation` |
+| Overflow original model snapshot | `src/loop_engine/engine.rs` | `IterationContext::overflow_original_task_model` |
 | Fallback runner config | `src/loop_engine/project_config.rs` | `FallbackRunnerConfig`, `check_fallback_runner_binary` |
 | Auto-review launch boundary | `src/loop_engine/auto_review.rs` | `maybe_fire`, `maybe_fire_inner`, `ProcessLauncher` |
 | Shared post-Claude pipeline | `src/loop_engine/iteration_pipeline.rs` | `process_iteration_output` |

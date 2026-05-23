@@ -12,6 +12,16 @@
 //! `engine.rs` and are imported here — they are consumed by `IterationContext`
 //! and by tests outside the `loop_engine` module, so moving them would widen
 //! the carve's blast radius.
+//!
+//! **Post-spawn processing**: `process_slot_result` delegates to
+//! `iteration_pipeline::process_iteration_output` (the shared post-Claude
+//! pipeline) so wave-mode picks up learning extraction, bandit feedback,
+//! `<task-status>` dispatch, and the completion fallback identically to the
+//! sequential path.
+//!
+//! **Per-task recovery is NOT owned here**: auto-block, crash escalation, and
+//! model/provider promotion live in `recovery.rs` and are invoked by
+//! `wave_scheduler.rs` after it collects the `SlotResult` from this module.
 
 use std::sync::Arc;
 
