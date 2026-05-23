@@ -81,7 +81,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Per PRD §6 Consumers of Changed Behavior: engine.rs:4599-4602 writes tasks.model on Opus escalation. The fallback hook must also UPDATE tasks.model to grok-model in the same logical operation — otherwise on the next iteration resolve_task_model reads task_row.model = OPUS_MODEL (highest precedence at model.rs:150-152) and the in-memory runner override is silently shadowed. This analysis pins the contract.\n\nReference: PRD §6 'Consumers of Changed Behavior' table, §2.5 'tasks.model DB column interaction' Correctness Requirement.\n\nNo code changes — output is a progress-file Consumer Impact Table.",
-      "passes": true,
+      "passes": false,
       "priority": 0,
       "qualityDimensions": [
         "Read actual code; never infer call sites from variable names",
@@ -132,7 +132,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "TDD: write tests first. Reference existing pattern at src/loop_engine/claude.rs:1221 (spawn_claude_echo) — clone shape for dispatch tests. The CLAUDE_BINARY mutex is at claude.rs:~1230; generalize to RUNNER_BINARY_MUTEX or keep two separate mutexes covering CLAUDE_BINARY and GROK_BINARY independently. Per learning #1810: IterationContext is NOT thread-safe — tests should NOT touch IterationContext from multiple threads.\n\nLearning [2728]: per-task HashMap pattern; mirror the shape but for runner_overrides.\n\nLearning [2286]: iteration_pipeline shared between sequential+slot — ANY new behavior in dispatch must work for BOTH wave-mode and sequential-mode call sites.",
-      "passes": true,
+      "passes": false,
       "priority": 1,
       "qualityDimensions": [
         "Use real RunnerOpts / RunnerResult / RunnerKind types — do not hand-build mock structs",
@@ -190,7 +190,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Algorithm: provider_for_model lowercases the input, splits on '-', returns Grok iff any resulting token equals \"grok\" exactly. Reference: PRD §6 Public Contracts provider_for_model signature.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — relevant for the GrokRunner config bits (FR-002, FR-006) but the test scope here is the algorithm itself.\n\nLearning [869]: three-tier default resolution — runner selection mirrors this (override → provider-from-model → Claude default).",
-      "passes": true,
+      "passes": false,
       "priority": 2,
       "qualityDimensions": [
         "Token-equality algorithm pinned in test: lowercase + split on '-' + check any token equals 'grok' (NOT substring match)",
@@ -251,7 +251,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §2.5 'Idempotency' and 'tasks.model DB column interaction'; PRD §3 US-003 ACs; PRD §6 Data Flow Contracts.\n\nLearning [2031]: order of operations is contractual — ctx → DB → stderr → dump → JSONL → rotate. Tests MUST verify this ordering is preserved.\n\nLearning [2256]: skip_serializing_if for backward-compat — apply to OverflowEvent.runner.\n\nLearning [2852]: wave + sequential share handle_prompt_too_long — tests must exercise BOTH paths (call from sequential at engine.rs:2532 AND from wave at engine.rs:~1352). Or write the test to exercise handle_prompt_too_long directly with each call path's typical inputs.",
-      "passes": true,
+      "passes": false,
       "priority": 3,
       "qualityDimensions": [
         "Use real IterationContext, ProjectConfig, Connection structs — do not hand-build mocks",
@@ -313,7 +313,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; PRD §3 US-004; PRD §6 Affected Components engine.rs:4581-4609 (escalate_task_model_if_needed) and 'post-wave aggregation site'.\n\nLearning [1810]: IterationContext is NOT thread-safe — the post-wave aggregation is the only safe wiring point.\n\nLearning [1856]: per-task model escalation precedent.\n\nLearning [2728]: per-task HashMap pattern for tracking state across iterations.\n\nLearning [1860]: in parallel context, hints should buffer (not immediate-service) — applies to the RuntimeError hook needing to run AFTER all slots complete.",
-      "passes": true,
+      "passes": false,
       "priority": 4,
       "qualityDimensions": [
         "Wave-mode wiring test is MANDATORY — slot worker thread safety is a known footgun (learning #1810)",
@@ -368,7 +368,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §3 US-005; PRD §6 FR-006 (startup binary check).\n\nLearning [2800]: named serde defaults for ProjectConfig — use this pattern for the FallbackRunnerConfig defaults.\n\nLearning [2366]: default function pattern with serde — same.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — applies directly.\n\nLearning [928]: serde default fn for always-resolved fields.",
-      "passes": true,
+      "passes": false,
       "priority": 5,
       "qualityDimensions": [
         "Round-trip serde tests cover ALL config variants (absent, null, present-enabled, present-disabled, partial) — config absence is the default state for most projects",
@@ -419,7 +419,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §3 US-006; PRD §6 FR-008.\n\nUse in-memory sqlite test helper for DB writes.\n\nLearning [2728]: per-task HashMap pattern — assertions iterate over the six maps.",
-      "passes": true,
+      "passes": false,
       "priority": 5,
       "qualityDimensions": [
         "Override-invalidation test uses production-shaped struct (IterationContext + real DB write) — hand-built mocks could mask wrong-field bugs",
@@ -471,7 +471,7 @@
       ],
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §6 FR-007.\n\nMock binary script must support: configurable stderr string, configurable exit code, configurable delay before exit. Use a shell wrapper around `sleep` + `echo`.\n\nFast-fail heuristic: 3-second threshold matches what the architect recommended; if the substring appears AFTER the command has been running for a while, it's likely a tool-use runtime error, not an auth lapse.",
-      "passes": true,
+      "passes": false,
       "priority": 5,
       "qualityDimensions": [
         "Auth-failure detection tests cover BOTH stderr substring match AND fast-fail timing window — both gates protect against false positives",
@@ -507,7 +507,7 @@
       "id": "FEAT-001",
       "model": "claude-opus-4-7",
       "notes": "Move the body of spawn_claude (claude.rs:270-~600) into ClaudeRunner::spawn. The SpawnOpts struct fields are unchanged; the type just moves into runner.rs and gets a new name (RunnerOpts) with a backward-compat alias. Same for ClaudeResult → RunnerResult.\n\nReference rustdoc on prior art: ClaudeMergeResolver / MergeResolver trait pattern in src/loop_engine/merge_resolver.rs (learnings #1989, #2699 — `trait-based resolver with configurable timeout`). The same shape applies here.\n\nWHEN IN DOUBT: prefer minimal diff. Phase 1 is foundation; behavior changes belong in FEAT-002/003.\n\nDispatch function shape:\n```rust\npub(crate) fn dispatch(\n    kind: RunnerKind,\n    prompt: &str,\n    permission_mode: &PermissionMode,\n    opts: RunnerOpts<'_>,\n) -> TaskMgrResult<RunnerResult> {\n    match kind {\n        RunnerKind::Claude => ClaudeRunner.spawn(prompt, permission_mode, opts),\n        RunnerKind::Grok => unimplemented!(\"FEAT-003 lands the Grok runner\"),\n    }\n}\n```\nThe Grok arm panics with `unimplemented!` until FEAT-003 — that's fine because no call site requests RunnerKind::Grok until FEAT-005.",
-      "passes": true,
+      "passes": false,
       "priority": 6,
       "qualityDimensions": [
         "Type aliases preserve the public surface — all 10 call sites compile unchanged (zero source-level migration)",
@@ -545,7 +545,7 @@
       "estimatedEffort": "low",
       "id": "FEAT-002",
       "notes": "Algorithm reference (PRD §6 Public Contracts):\n```rust\npub fn provider_for_model(model: Option<&str>) -> Provider {\n    let lower = model.unwrap_or(\"\").to_lowercase();\n    if lower.split('-').any(|t| t == \"grok\") {\n        Provider::Grok\n    } else {\n        Provider::Claude\n    }\n}\n```\nGuard shape for each escalation fn:\n```rust\npub fn escalate_model(model: Option<&str>) -> Option<String> {\n    if provider_for_model(model) != Provider::Claude {\n        return None;\n    }\n    // ... existing body unchanged ...\n}\n```\nLearning [1856]: per-task model escalation precedent — same shape, now with provider awareness.",
-      "passes": true,
+      "passes": false,
       "priority": 7,
       "qualityDimensions": [
         "Token-equality, NOT substring — 'groq-llama-70b' MUST classify as Claude (Groq Inc. is a real vendor, distinct from xAI)",
@@ -585,7 +585,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Reference: PRD §2.5 'GrokRunner binary resolution is config-independent', 'Grok authentication failure short-circuit'; PRD §6 Public Contracts flag mapping table; PRD §3 US-002 ACs.\n\nClaude CLI 2.1.110 writes an ai-title jsonl despite --no-session-persistence (claude.rs:344); grok has no equivalent so cleanup_title_artifact branches into a no-op for GrokRunner.\n\nFlag table (PRD §6):\n| claude | grok |\n|---|---|\n| -p PROMPT | -p PROMPT |\n| --no-session-persistence | (omit, implicit) |\n| --permission-mode auto | --permission-mode auto |\n| --permission-mode dontAsk | --permission-mode dontAsk |\n| --dangerously-skip-permissions | --permission-mode bypassPermissions |\n| --allowedTools X | --tools X |\n| --disallowedTools X | --disallowed-tools X |\n| --model M | --model M |\n| --effort E | --effort E |\n| --output-format stream-json | --output-format streaming-json |\n| --session-id UUID | (omit; cleanup_title_artifact silently ignored) |\n\nLearning [1989]: trait-based resolver with configurable timeout and signal handling (ClaudeMergeResolver) — share signal_flag plumbing.\n\nLearning [2699]: method extraction with responsibility-driven naming — apply to runner.rs helpers.",
-      "passes": true,
+      "passes": false,
       "priority": 8,
       "qualityDimensions": [
         "Auth-failure sniff is gated by BOTH stderr substring AND fast-fail timing — both gates protect against false positives",
@@ -625,7 +625,7 @@
       "estimatedEffort": "medium",
       "id": "FEAT-004",
       "notes": "Reference: PRD §3 US-005, FR-006; PRD §6 Public Contracts FallbackRunnerConfig.\n\nLearning [2800]: named serde defaults enable multiple ProjectConfig fields — direct precedent.\n\nLearning [2366]: default function pattern with serde — same.\n\nLearning [2485]: camelCase JSON / snake_case Rust serde — applies directly.\n\nLearning [928]: serde default fn for always-resolved fields.\n\nFor the startup check binary resolution: use the `which` crate (already a dependency? grep Cargo.toml) OR std::process::Command::new(path).arg('--version').output() check. Either works; prefer `which` if available for clarity.\n\nExample FallbackRunnerConfig JSON shape on disk:\n```json\n{\n  \"fallbackRunner\": {\n    \"enabled\": true,\n    \"provider\": \"grok\",\n    \"model\": \"grok-4-fast\",\n    \"runtimeErrorThreshold\": 2\n  }\n}\n```\n`cli_binary` is omitted when default `grok` is on PATH; specified only for non-standard install paths.",
-      "passes": true,
+      "passes": false,
       "priority": 9,
       "qualityDimensions": [
         "Optional field at top-level: Option<FallbackRunnerConfig> — absence reliably resolves to 'no fallback' without sentinel enabled:false",
@@ -664,7 +664,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Reference: PRD §6 Data Flow Contracts 'Per-task runner resolution (single source of truth)'; PRD §2.5 'Single source of truth for the effective runner'; PRD §6 Affected Components engine.rs:228-279.\n\nLearning [1832]: IterationContext pattern for state tracking — direct precedent for adding new fields.\n\nLearning [2728]: per-task crash tracking HashMap — runner_overrides mirrors this exact shape (HashMap<String, T> keyed by task_id).\n\nLearning [1810]: IterationContext is NOT thread-safe — these new fields are read/written only from the main thread (sequential mode) or post-wave aggregation (FEAT-007 will wire wave-mode for the RuntimeError hook).\n\nFactor the formula into a helper:\n```rust\nfn resolve_effective_runner(\n    ctx: &IterationContext,\n    task_id: &str,\n    effective_model: Option<&str>,\n) -> RunnerKind {\n    ctx.runner_overrides.get(task_id).copied().unwrap_or_else(|| {\n        match provider_for_model(effective_model) {\n            Provider::Grok => RunnerKind::Grok,\n            Provider::Claude => RunnerKind::Claude,\n        }\n    })\n}\n```\nCall it at both sites. Helper lives in engine.rs or runner.rs (caller's choice; prefer engine.rs to keep runner.rs free of IterationContext coupling).",
-      "passes": true,
+      "passes": false,
       "priority": 10,
       "qualityDimensions": [
         "Single source of truth: effective_runner is computed ONCE per iteration. Verified by grep — there is exactly ONE call to provider_for_model in engine.rs's iteration paths",
@@ -706,7 +706,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": false,
       "notes": "Reference: PRD §3 US-003 ACs; PRD §6 Affected Components overflow.rs:330; PRD §6 Public Contracts RecoveryAction::FallbackToProvider; PRD §2.5 'tasks.model DB column interaction'.\n\nLearning [2031]: PromptTooLong recovery four-rung ladder contract — the order of operations (ctx → DB → stderr → dump → JSONL → rotate) is contractual; rung 4 inserts at the action-selection step only.\n\nLearning [2852]: wave + sequential share handle_prompt_too_long — rung 4 works in both paths automatically because the function is shared.\n\nLearning [1856]: per-task model escalation via IterationContext overrides — direct precedent.\n\nFEAT-009 lands the OverflowEvent.runner field and the iteration banner annotation — keep those out of THIS task. The DB UPDATE shape (preserve existing pattern at overflow.rs:374-379):\n```rust\nlet update_sql = match action {\n    RecoveryAction::FallbackToProvider { ref model, .. } => {\n        conn.execute(\n            \"UPDATE tasks SET model = ?1, status = 'todo', started_at = NULL WHERE id = ?2 AND status = 'in_progress'\",\n            rusqlite::params![model, task_id],\n        )?;\n    }\n    RecoveryAction::Blocked => { /* existing */ }\n    _ => { /* existing status='todo' branch */ }\n};\n```\nCapture original task model BEFORE UPDATE (in Step 2 alongside overflow_original_model):\n```rust\nctx.overflow_original_task_model\n    .entry(task_id.to_string())\n    .or_insert_with(|| read_task_model_from_db(conn, task_id).unwrap_or(None));\n```",
-      "passes": true,
+      "passes": false,
       "priority": 11,
       "qualityDimensions": [
         "Single-source idempotency: rung 4 gated on effective_runner == Claude only (NO OR with runner_overrides.get directly — that's drift bait)",
@@ -746,7 +746,7 @@
       "estimatedEffort": "low",
       "id": "FEAT-009",
       "notes": "Reference: PRD §6 OverflowEvent.runner; PRD §2.5 banner annotation.\n\nLearning [2256]: skip_serializing_if for backward-compatible optional fields — direct precedent for OverflowEvent extensions.\n\nThe banner site is gated on IterationContext::overflow_recovered (HashSet — per src/loop_engine/CLAUDE.md 'banner annotation gates on overflow_recovered, NOT model_overrides'). Find the banner write site by grepping for 'overflow recovery from' in engine.rs.",
-      "passes": true,
+      "passes": false,
       "priority": 11,
       "qualityDimensions": [
         "skip_serializing_if preserves legacy JSONL parse compatibility (learning #2256)",
@@ -818,7 +818,7 @@
       "model": "claude-opus-4-7",
       "modifiesBehavior": true,
       "notes": "Reference: PRD §3 US-004 ACs; PRD §6 FR-005; PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; PRD §6 Affected Components engine.rs:4581-4609 + 'post-wave aggregation site'.\n\nLearning [1810]: IterationContext is NOT thread-safe — wave-mode wiring MUST be on the main thread after slot workers complete.\n\nLearning [2728]: per-task crash tracking HashMap — pattern matches.\n\nLearning [1860]: reorder hints in parallel context should buffer, not immediate-service — apply same principle: RuntimeError hook fires AFTER all slots merge back, not from inside any slot.\n\nLearning [2286]: iteration_pipeline shared between sequential+slot — but this hook is OUTSIDE that pipeline; it's a per-task escalation that runs in the engine's main control flow.\n\nGate the hook with a no-op when fallback config is absent or disabled:\n```rust\nlet fallback_active = project_config.fallback_runner.as_ref().is_some_and(|c| c.enabled);\nif fallback_active && model_now == OPUS_MODEL && task_row.consecutive_failures >= cfg.runtime_error_threshold && effective_runner == RunnerKind::Claude {\n    // promote to Grok\n}\n```\n\nIMPORTANT: ANALYSIS-001 must complete first — read its Consumer Impact Table in the progress file before implementing this task.",
-      "passes": true,
+      "passes": false,
       "priority": 12,
       "qualityDimensions": [
         "Wave-mode wiring lives in post-aggregation, NEVER in slot worker (learning #1810: IterationContext not thread-safe)",
@@ -858,7 +858,7 @@
       "id": "FEAT-008",
       "modifiesBehavior": false,
       "notes": "Reference: PRD §3 US-006 ACs; PRD §6 FR-008; PRD §2.5 'Override-clearing on explicit task-model change' (Correctness Requirement).\n\nThis is the operator escape valve. Without it, auto-recovery decisions stick until loop restart — bad UX when the operator decides to take manual control of a stuck task mid-loop.\n\nDetection precondition: the operator changed `tasks.model` via `task-mgr loop init --append --update-existing` OR via direct DB edit. Both paths land in the same place (tasks.model column).\n\nThe six fields to clear (per PRD §2.5 'Override-clearing'):\n1. runner_overrides[task_id]\n2. model_overrides[task_id]\n3. effort_overrides[task_id]\n4. overflow_recovered.remove(task_id)\n5. overflow_original_model[task_id]\n6. overflow_original_task_model[task_id]\n\nPlace the call at the TOP of each iteration's task-processing block (engine.rs:561 for wave, engine.rs:2285 for sequential), BEFORE effective_runner is computed.",
-      "passes": true,
+      "passes": false,
       "priority": 12,
       "qualityDimensions": [
         "Reads tasks.model FRESH from DB on each iteration (NOT cached) — operator edits land immediately",
@@ -902,7 +902,7 @@
       "id": "CODE-REVIEW-1",
       "model": "claude-opus-4-7",
       "notes": "For each issue: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-1`. Priority for spawned fixes: 14-16. If no issues, emit `<task-status>CODE-REVIEW-1:done</task-status>` with a one-line 'No issues found' in the progress file.\n\nCRITICAL focus areas (from architect review):\n- Single-source effective_runner formula — verify only one provider_for_model call in main iteration path\n- tasks.model DB UPDATE always paired with runner_overrides insert\n- Wave-mode RuntimeError hook NEVER inside slot worker\n- Idempotency guard pinned to single value (not OR of predicates)\n- provider_for_model token-equality (not substring) — defensive against 'groq-llama'\n- Auth-failure handling preserves counter integrity\n- Override invalidation reads fresh DB state every iteration",
-      "passes": true,
+      "passes": false,
       "priority": 13,
       "qualityDimensions": [
         "Read every file in touchesFiles end-to-end; do not skim",
@@ -943,7 +943,7 @@
       "id": "MILESTONE-1",
       "model": "claude-opus-4-7",
       "notes": "This is a milestone — runs the full unscoped suite per the prompt's MILESTONE protocol. Pre-existing failures get fixed or spawned per the protocol (default: fix inline; escape hatch: >12 unrelated failures → spawn FIX-xxx tasks with verifyCommand).",
-      "passes": true,
+      "passes": false,
       "priority": 20,
       "qualityDimensions": [
         "Full unscoped test suite — milestone gate, not scoped per-iteration",
@@ -977,7 +977,7 @@
       "estimatedEffort": "medium",
       "id": "TEST-001",
       "notes": "Reference: PRD §6 Risks 'Tag-emission drift on real iteration prompts'; PRD §3 US-002 AC for #[ignore]'d integration test.\n\nFixture assembly:\n```rust\nlet prompt = format!(\n    \"{claude_md}\\n\\n{skill_content}\\n\\n{learnings_section}\\n\\n## Current Iteration\\nTask: ...\",\n    claude_md = std::fs::read_to_string(\"CLAUDE.md\")?,\n    skill_content = std::fs::read_to_string(\".claude/skills/tasks.md\").unwrap_or_default(),\n    learnings_section = generate_synthetic_learnings(50_000),  // ~50KB\n);\n```\n\nIf grok produces something other than the expected tags on the larger prompt, the fix per PRD Open Question is to add `--rules` system-prompt override that re-asserts the tag contract.",
-      "passes": true,
+      "passes": false,
       "priority": 25,
       "qualityDimensions": [
         "Realistic prompt scale (10-100 KB) — NOT spike-scale (1 KB). The spike validated the small case; this test confirms the large case",
@@ -1010,7 +1010,7 @@
       "estimatedEffort": "medium",
       "id": "TEST-002",
       "notes": "Reference: PRD §3 US-006 AC for the operator escape-valve test.\n\nLeverage the existing in-memory sqlite test helper pattern from tests/overflow_filesystem.rs or similar.\n\nLearning [2728]: per-task HashMap pattern — assertions iterate over the six maps.",
-      "passes": true,
+      "passes": false,
       "priority": 26,
       "qualityDimensions": [
         "Test uses REAL Connection (in-memory sqlite via the existing test helper pattern) — NOT a mock",
@@ -1043,7 +1043,7 @@
       "estimatedEffort": "high",
       "id": "TEST-003",
       "notes": "Reference: PRD §2.5 'Wave-mode wiring for RuntimeError fallback'; learning #1810 (IterationContext not thread-safe); learning #1860 (reorder hints buffer in parallel context); learning #2286 (iteration_pipeline shared sequential+slot).",
-      "passes": true,
+      "passes": false,
       "priority": 27,
       "qualityDimensions": [
         "Wave-mode wiring assertion is MANDATORY — learning #1810 confirms IterationContext is not thread-safe; this is the critical guard",
@@ -1077,7 +1077,7 @@
       "id": "MILESTONE-2",
       "model": "claude-opus-4-7",
       "notes": "Standard MILESTONE protocol — full suite, fix or spawn for any unrelated failures.",
-      "passes": true,
+      "passes": false,
       "priority": 50,
       "qualityDimensions": [
         "Full unscoped test suite — milestone gate",
@@ -1109,7 +1109,7 @@
       "estimatedEffort": "low",
       "id": "INT-001",
       "notes": "Reference: PRD §6 Data Flow Contracts; learning #2485 (camelCase ↔ snake_case).",
-      "passes": true,
+      "passes": false,
       "priority": 55,
       "qualityDimensions": [
         "Trace is grounded in real code reads — every file:line cited from the actual codebase",
@@ -1142,7 +1142,7 @@
       "estimatedEffort": "low",
       "id": "INT-002",
       "notes": "Reference: PRD §6 Consumers of Changed Behavior 'src/loop_engine/engine.rs:4599-4602' (escalate_task_model_if_needed writes tasks.model); PRD §2.5 'tasks.model DB column interaction'.\n\nThis traces the architect's #1 silent-bug class. If the trace reveals a real gap, the WIRE-FIX-xxx spawned here gets priority 57-65.",
-      "passes": true,
+      "passes": false,
       "priority": 56,
       "qualityDimensions": [
         "Read actual code at each cited line — do not infer from struct names",
@@ -1177,7 +1177,7 @@
       "id": "REFACTOR-REVIEW-FINAL",
       "model": "claude-opus-4-7",
       "notes": "For each refactor: `echo '{...}' | task-mgr add --stdin --depended-on-by MILESTONE-FINAL`. Priority for spawned refactors: 71-85.",
-      "passes": true,
+      "passes": false,
       "priority": 70,
       "qualityDimensions": [
         "Use rust-python-code-reviewer agent — surface specific findings rather than vague impressions",
@@ -1216,7 +1216,7 @@
       "id": "VERIFY-001",
       "model": "claude-opus-4-7",
       "notes": "Reference: PRD §6 Documentation table; PRD §3 US-001 through US-006 ACs.\n\nThe smoke tests document themselves in the progress file — paste the exact commands run and the exact outputs observed.",
-      "passes": true,
+      "passes": false,
       "priority": 90,
       "qualityDimensions": [
         "Documentation is the most-leveraged artifact for future maintainers — invest in clarity over brevity here",
@@ -1255,7 +1255,7 @@
       "id": "MILESTONE-FINAL",
       "model": "claude-opus-4-7",
       "notes": "Standard MILESTONE protocol. If any unrelated failure appears in the full-suite run, follow the spawn-FIX protocol from the prompt.",
-      "passes": true,
+      "passes": false,
       "priority": 99,
       "qualityDimensions": [
         "Final milestone — leave the trunk fully green AND fully tested AND fully documented",
@@ -1270,88 +1270,6 @@
         "src/loop_engine/",
         "tests/",
         "CLAUDE.md"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "Each helper function under 60 lines",
-        "No behavior change: existing runner.rs tests pass unchanged",
-        "cargo test --lib loop_engine::runner passes",
-        "cargo clippy -- -D warnings clean",
-        "ClaudeRunner::spawn and GrokRunner::spawn under 160 lines each",
-        "Helpers do not match on provider — provider-specific divergence stays in per-runner bodies"
-      ],
-      "description": "ClaudeRunner::spawn (runner.rs:230-564, 335 lines) and GrokRunner::spawn (runner.rs:602-879, 277 lines) duplicate ~130 lines of process-lifecycle scaffolding nearly verbatim. Each runner re-implements: (1) env wiring (LOOP_ALLOW_DESTRUCTIVE, TASK_MGR_DIR canonicalize, ACTIVE_PREFIX_ENV, working_dir, process_group(0) cfg(unix)) — runner.rs:359-395 vs 690-709; (2) spawn + ErrorKind::NotFound → IoErrorWithContext mapping — 397-414 vs 712-726; (3) stdin write_all + BrokenPipe match — 418-439 vs 728-748; (4) watchdog construction (AtomicU64 completion_epoch + 2 AtomicBool flags + conditional watchdog thread) — 448-479 vs 750-778; (5) plain-mode stdout reader loop — 511-531 vs 819-839; (6) child.wait + watchdog teardown + atomic loads — 533-554 vs 841-855. Extract into private free fns in runner.rs: apply_common_env, spawn_with_context, write_prompt_to_stdin, spawn_watchdog, read_plain_stdout. Keep argv assembly + provider-specific stdio wiring (PTY vs piped) in the per-runner bodies.",
-      "estimatedEffort": "medium",
-      "id": "5ba153a7-REFACTOR-1-RUNNER-DRY",
-      "notes": "Reviewer report from REFACTOR-REVIEW-FINAL. Sole HIGH-severity issue. Subsumes MED-severity function-length finding.",
-      "passes": true,
-      "priority": 75,
-      "title": "Extract shared process-lifecycle helpers from ClaudeRunner and GrokRunner",
-      "touchesFiles": [
-        "src/loop_engine/runner.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "git log main..HEAD now includes the PR #9 commit bb9cb29 (or its merge equivalent)",
-        "git diff main..HEAD no longer shows phantom deletions of src/loop_engine/git_reconcile.rs or tasks/post-merge-slot-reconcile.* — those files reappear on the branch",
-        "tests/worktree_db_resolution.rs conflict resolved with both feature-side and main-side intent preserved (verify by reading the file end-to-end after resolution)",
-        "cargo test --lib loop_engine passes (scoped gate)",
-        "cargo test passes (full unscoped suite — milestone-level)",
-        "cargo clippy -- -D warnings clean",
-        "Merge commit message follows project conventions"
-      ],
-      "description": "From /review-loop H1. The feature branch's merge base is 0ac56743, but local main is at bb9cb29 (PR #9 — Post-merge slot completion reconciliation). git diff main..HEAD shows -728 lines on src/loop_engine/git_reconcile.rs and -756 lines across tasks/post-merge-slot-reconcile.{json,md} — these are NOT deletions on the feature branch, they are PR #9 content not yet on the branch. Merge main into the branch. Expect ONE conflict in tests/worktree_db_resolution.rs (both feature and main touched it post 0ac56743): on feature side commits 4288135 / 722e4fe modified it for grok-fallback work; on main side PR #9 modified it for slot reconciliation. Resolve preserving both behaviors. After merge: run cargo test --lib loop_engine (scoped) AND cargo test (full unscoped suite) AND cargo clippy -- -D warnings. Commit the merge with a conventional message. Do NOT force-push. Do NOT skip hooks.",
-      "estimatedEffort": "medium",
-      "id": "5ba153a7-REVIEW-FIX-1-MERGE-MAIN",
-      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. H1 of 3 high-severity findings. Reviewer cite: review reply, 'H1: rebase or merge main into the branch; resolve the single conflict in tests/worktree_db_resolution.rs'.",
-      "passes": true,
-      "priority": 80,
-      "title": "Merge main into feat/grok-fallback-runner; resolve worktree_db_resolution.rs conflict; re-run full suite",
-      "touchesFiles": [
-        "tests/worktree_db_resolution.rs",
-        "src/loop_engine/git_reconcile.rs"
-      ]
-    },
-    {
-      "acceptanceCriteria": [
-        "H2: cargo test runtime_error_fallback passes a regression test that promotes from claude-opus-4-7[1m] at threshold",
-        "H2: engine.rs:4913 region no longer uses string-eq with OPUS_MODEL; uses ModelTier-based inclusive check",
-        "M1: threshold comparison uses u32 throughout or guards the cast",
-        "H3: each non-primary resolve_effective_runner call site has debug_assert_eq! cross-check against the primary, OR the primary value is threaded through; debug build catches a deliberate mismatch in test",
-        "M2: a wave-mode promotion test asserts exactly ONE banner line on stderr per promoted task per iteration (no duplicate)",
-        "M3: tests/fallback_config.rs covers the case where GROK_BINARY is set; check_fallback_runner_binary succeeds when GROK_BINARY points at a real binary even if cli_binary is None and `grok` is not on PATH",
-        "M5: TASK_MGR_GROK_AUTH_WINDOW_SECS env override implemented and exercised by a test that uses it to make the timing gate deterministic",
-        "L1: temp-script tests use TempDir or a Drop guard; no `remove_file` on a raw path",
-        "L2: overflow.rs:77 region uses `target_model` (not `grok_model`)",
-        "L3: engine.rs:235-238 rustdoc disambiguates the FEAT-007 reference",
-        "L4: a short comment near model_tier or provider_for_model pins the substring-vs-token divergence",
-        "L5: rustdoc field-clear order in engine.rs check_override_invalidation matches code order",
-        "cargo test --lib loop_engine passes",
-        "cargo test (full unscoped suite) passes",
-        "cargo clippy -- -D warnings clean"
-      ],
-      "dependsOn": [
-        "5ba153a7-REVIEW-FIX-1-MERGE-MAIN"
-      ],
-      "description": "From /review-loop on 2026-05-18 (H2, H3, M1, M2, M3, M5, L1-L5 bundled into one atomic fix). Implement each finding below; run cargo test --lib loop_engine + cargo clippy after every batch; commit at the end of the task.\n\n## H2 — was_at_opus misses Opus[1M] (src/loop_engine/engine.rs:4913)\nCurrent: `let was_at_opus = matches!(current_model.as_deref(), Some(m) if m == model::OPUS_MODEL);` — string-eq excludes `claude-opus-4-7[1m]`. Goal #2 of the PRD ('after the Opus ceiling is reached') intends the Opus *tier*, not the exact ID. Fix: use the inclusive ModelTier check (e.g. `matches!(model::model_tier(current_model.as_deref()), ModelTier::Opus)` — confirm the exact helper name in src/loop_engine/model.rs). Add a regression test in tests/runtime_error_fallback.rs that puts a task on `claude-opus-4-7[1m]` with consecutive_failures >= threshold and asserts promotion to Grok.\n\n## M1 — u32 → i32 cast (engine.rs:4914)\nSame line region. `new_count < fallback.runtime_error_threshold as i32` casts u32 lossily at >= 2^31. Compare in u32 space (or guard the cast). Default threshold is 2, so no behavior change for sane inputs; cleanup only.\n\n## H3 — effective_runner re-derivation drift guard\nresolve_effective_runner is called at engine.rs:1456, 1877, 2437, 2731, 4917. PRD §2.5 mandates a single computed value per iteration to prevent silent drift. Choose the lighter fix: at each non-primary call site, add `debug_assert_eq!(resolve_effective_runner(...), <primary_computed_value>);` cross-checks where the primary value is in scope. If threading the single value is cleaner, do that instead — but keep the diff small. Goal: a future refactor that returns the wrong value at one site fails a debug build before reaching production.\n\n## M2 — Double eprintln! on promotion\nFind the two promotion eprintln! sites (rung-4 in overflow.rs and the RuntimeError hook in engine.rs ~4937). Under wave-mode aggregation a single task can hit both in one wave. Consolidate so each promotion emits exactly one banner line per iteration. Acceptable approach: gate the second eprintln! on the override map being empty (i.e. first-time promotion only), or move the banner to a shared site after both gates have run.\n\n## M3 — check_fallback_runner_binary does not honor $GROK_BINARY (project_config.rs:283)\nThe startup check resolves `cli_binary or 'grok'` but skips the env var, while GrokRunner::spawn uses `$GROK_BINARY → cli_binary → 'grok'`. Mismatch confuses operators who set GROK_BINARY for test/dev. Update check_fallback_runner_binary to use the same resolution chain. Update tests/fallback_config.rs to cover the env-var-set case.\n\n## M5 — Fixed 3s GROK_AUTH_FAILURE_WINDOW with no env override (runner.rs:41)\nAdd TASK_MGR_GROK_AUTH_WINDOW_SECS env override mirroring the CLAUDE_BINARY test-only pattern. Parse u64, fall back to 3 on missing/invalid. Document in rustdoc as a test-only seam. Update tests/grok_auth_failure.rs to use the env override for the fast/slow case rather than depending on real timing.\n\n## L1 — Temp-script test cleanup hardening\ntests/grok_auth_failure.rs and tests/grok_runner_unit.rs use std::env::temp_dir() with `let _ = std::fs::remove_file(...)` cleanup. Wrap in a tempfile::TempDir or a Drop guard so test panics don't leak files.\n\n## L2 — Rename grok_model → target_model in RecoveryAction::FallbackToProvider.user_message (overflow.rs:77-81)\nThe provider name is configurable; the local should not bake 'grok' into the identifier. Pure rename.\n\n## L3 — Disambiguate FEAT-007 in IterationContext::crashed_last_iteration rustdoc (engine.rs:235-238)\nThe doc references 'FEAT-007' but this PRD also has its own FEAT-007. Clarify which PRD/scope.\n\n## L4 — Comment substring-vs-token divergence in model.rs\nmodel::model_tier uses substring matching while model::provider_for_model uses token equality (intentional). A short comment near either function pinning the divergence prevents a future 'fix' that aligns them and breaks Groq Inc. routing.\n\n## L5 — Reorder six-field clear rustdoc in engine.rs:4812-4817 to match code order\nCosmetic: the rustdoc lists the cleared fields in one order and the code clears them in another. Align.\n\n## Out of scope here\nL6 (the diff-stat 'deletions' that resolve when H1 merges main) is resolved by 5ba153a7-REVIEW-FIX-1-MERGE-MAIN. M4 was already resolved during review (assertion exists at tests/grok_runner_unit.rs:167).",
-      "estimatedEffort": "high",
-      "id": "5ba153a7-REVIEW-FIX-2-ALL",
-      "notes": "Spawned by /review-loop on 2026-05-18 after backward-looking review of the completed grok-fallback-runner loop. Bundles H2, H3, M1, M2, M3, M5, L1-L5 into one atomic fix. Depends on 5ba153a7-REVIEW-FIX-1-MERGE-MAIN (H1) so the merged base is the starting point.",
-      "passes": false,
-      "priority": 81,
-      "title": "Address all remaining /review-loop findings: Opus[1M] gate, drift guards, banner dedupe, startup env parity, auth window env, low nits",
-      "touchesFiles": [
-        "src/loop_engine/engine.rs",
-        "src/loop_engine/overflow.rs",
-        "src/loop_engine/model.rs",
-        "src/loop_engine/project_config.rs",
-        "src/loop_engine/runner.rs",
-        "tests/runtime_error_fallback.rs",
-        "tests/grok_auth_failure.rs",
-        "tests/grok_runner_unit.rs",
-        "tests/fallback_config.rs"
       ]
     }
   ],

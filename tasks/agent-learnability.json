@@ -1,0 +1,404 @@
+{
+  "branchName": "feat/agent-learnability",
+  "description": "Cut time-to-first-correct-task-mgr-call for fresh-context agents from ~5 wrong invocations to <=1. Add `task-mgr current` (resolved-context probe), `task-mgr cheatsheet` (curated recipes + clap-introspection-generated reference + drift CI), `task-mgr how` (intent advisor), wrong-name/wrong-flag hint table on clap parse errors, and hard-refuse `task-mgr add --depended-on-by <id>` when the target lives in a different PRD than the active prefix. Complementary to the CLI-fix plan in /home/chris/.claude/plans/task-mgr-task-mgmt-ergonomics.md (which adds remove/update/--from-json on add). Plan: /home/chris/.claude/plans/plan-out-how-to-lazy-pixel.md.",
+  "globalAcceptanceCriteria": {
+    "criteria": [
+      "No warnings in `cargo check` output (scoped to touched crate)",
+      "No warnings in `cargo clippy -- -D warnings` (scoped to touched crate)",
+      "All scoped tests pass with `cargo test -p task-mgr <module-or-fn>`",
+      "`cargo fmt --check` passes",
+      "No breaking changes to existing CLI subcommands or flags unless documented in task description",
+      "Every new subcommand is registered in `src/cli/commands.rs` (enum), `src/main.rs` (dispatch), AND `src/handlers.rs` (impl) per learning 1405",
+      "Tests that read CLI state must `Command::env_remove(\"TASK_MGR_ACTIVE_PREFIX\")` per learning 2644/2903"
+    ],
+    "description": "These criteria apply to ALL implementation tasks"
+  },
+  "model": "claude-sonnet-4-6",
+  "priorityPhilosophy": {
+    "description": "Hierarchy of what matters most when implementing tasks",
+    "hierarchy": [
+      "1. PLAN - Anticipate edge cases before coding",
+      "2. PHASE 2 FOUNDATION - ~1 day now to save ~2+ weeks later (1:10+ ratio); we are pre-launch, foundations compound",
+      "3. FUNCTIONING CODE - Pragmatic, reliable, wired in per plan",
+      "4. CORRECTNESS - Compiles, type-checks, scoped tests pass deterministically",
+      "5. CODE QUALITY - Clean code, qualityDimensions satisfied, no warnings",
+      "6. POLISH - Docs, formatting, minor improvements"
+    ],
+    "principles": [
+      "Quality dimensions explicit - qualityDimensions on every task tells you what 'good' looks like",
+      "Phase 2 foundation - prefer solutions that lay strong post-launch foundations (1:10+ savings ratio)",
+      "Edge cases = test cases - every known edge case must have a corresponding test",
+      "Scoped per-iteration tests, full suite at REVIEW-001 - REVIEW must leave the trunk green including pre-existing failures",
+      "Ship working code with tests to prove it; handle Option/Result explicitly; avoid unwrap() in production"
+    ]
+  },
+  "prohibitedOutcomes": [
+    "Tests that only assert 'no crash' or check type without verifying content",
+    "Tests that mirror implementation internals (break when refactoring)",
+    "Abstractions with only one concrete use",
+    "Error messages that don't identify what went wrong or what to do about it",
+    "Catch-all error handlers that swallow context",
+    "Hand-written documentation that duplicates clap-discoverable information (defeats Prong 2 drift CI)",
+    "Subprocess invocations of `task-mgr --help` from tests or runtime code (use clap::CommandFactory per learning 160)"
+  ],
+  "project": "task-mgr",
+  "requires": [],
+  "taskPrefix": "49c1fe42",
+  "userStories": [
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr current` prints exactly `active prefix=<p>  source=<src>  target=<path>` on one line and exits 0",
+        "Positive: `task-mgr current` with no resolvable PRD prints `no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX` and exits 0 (probe, not error)",
+        "Positive: `task-mgr add --stdin --depended-on-by <id> '{...}'` emits a leading `→ active prefix=... source=... target=...` stderr line BEFORE any DB write or warning",
+        "Unit test: ResolutionSource::EnvVar when env var set and matches a known prefix",
+        "Unit test: ResolutionSource::SinglePrefix when env empty and DB has exactly one prefix",
+        "Unit test: ResolutionSource::None when env empty and DB has zero or 2+ prefixes",
+        "Unit test: `task-mgr current` against an empty DB exits 0 with the 'no active PRD' message",
+        "Negative: read-only commands (show, list, next) do NOT emit the resolved-context stderr line - assert no `→ active prefix` substring in their stderr",
+        "Known-bad: a naive impl that prints the stderr line AFTER any warning would pass a 'line present' check. Test must read stderr line 1 (first non-empty) and assert it starts with `→ active prefix=`",
+        "CONTRACT: ResolvedContext struct fields { prefix: String, source: ResolutionSource, prd_json_path: PathBuf } - grep both src/commands/add.rs and src/commands/current.rs to confirm matching access (no parallel struct)",
+        "Failure mode: if TASK_MGR_ACTIVE_PREFIX is set to a value not in any known PRD - exit non-zero with `Stale TASK_MGR_ACTIVE_PREFIX=<x>; known prefixes: <list>` (preserve current add.rs behavior; verify regression)",
+        "Tests use `Command::env_remove(\"TASK_MGR_ACTIVE_PREFIX\")` per learning 2644/2903",
+        "Commit message: `feat: FEAT-001-completed - task-mgr current + ResolvedContext stderr on writes`"
+      ],
+      "dependsOn": [],
+      "description": "Promote the currently-implicit resolution of active prefix + target PRD JSON to a first-class `ResolvedContext { prefix: String, source: ResolutionSource, prd_json_path: PathBuf }`. Emit it as a leading stderr line on `add` (any write op that resolves prefix). Add new `task-mgr current` read-only subcommand that prints the same struct.\n\nDO: reuse `resolve_active_prefix` in src/commands/add.rs:305-350 - wrap, don't replace. Add a `ResolutionSource` enum (EnvVar, SinglePrefix, FromJsonFlag, None) so the source is observable. New subcommand follows the 6-file shape from learning 1405.\n\nDO NOT: emit the stderr line on read-only commands (show, list, next) - keeps quiet output for the hot path. Do NOT re-implement resolution logic in current.rs - it must call the same helper used by add.\n\nEdge cases:\n- Empty DB: current exits 0 with 'no active PRD; pass --from-json or set TASK_MGR_ACTIVE_PREFIX'\n- Multi-prefix DB, env unset: ResolutionSource::None, suggest setting env var\n- env var set to non-existent prefix: exit non-zero with 'Stale TASK_MGR_ACTIVE_PREFIX=<x>; known prefixes: ...' (preserve current add.rs behavior)\n- env var with case mismatch: must NOT auto-match - exact comparison\n\nKnown-bad to guard against:\n- Printing the stderr line AFTER 'Added task' would pass any 'line present' assertion but the agent already missed the chance to abort. The test must assert line position == 1.\n- Duplicating resolution: two call sites doing their own env lookup would drift. Test must assert a single resolve_active_prefix call per command invocation (use a counter via DI or trace).",
+      "edgeCases": [
+        "Empty DB: ResolutionSource::None, exit 0 with hint",
+        "Multi-prefix DB with env unset: ResolutionSource::None (cannot auto-pick)",
+        "env var set to non-existent prefix: exit non-zero with 'Stale TASK_MGR_ACTIVE_PREFIX=<x>'",
+        "env var with case mismatch (lowercase vs uppercase prefix): NO auto-match - exact comparison required",
+        "PRD JSON path resolves to a file that no longer exists on disk: print path anyway with stderr warning 'path does not exist on disk'"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "TASK_MGR_ACTIVE_PREFIX set to unknown prefix",
+          "expectedBehavior": "Exit non-zero with 'Stale TASK_MGR_ACTIVE_PREFIX=<x>; known prefixes: <list>' (preserves current add.rs behavior - regression check required)"
+        },
+        {
+          "cause": "DB connection fails during current invocation",
+          "expectedBehavior": "Exit non-zero with the DB error, do NOT print partial context"
+        }
+      ],
+      "id": "FEAT-001",
+      "modifiesBehavior": false,
+      "notes": "Learning [2644]/[2903]: clean env var in tests via Command::env_remove. Learning [1405]: new top-level subcommand spans 6 files - src/cli/commands.rs (enum variant), src/main.rs (dispatch), src/handlers.rs (impl wire-up), src/commands/current.rs (impl), src/cli/tests.rs (exhaustive match), tests for the new command. Learning [1069]: clap enum extension breaks exhaustive matches - update tests/cli_tests.rs. Plan: Prong 3a. Reuse: src/commands/add.rs:305-350 resolve_active_prefix is the lift point.",
+      "passes": true,
+      "priority": 1,
+      "qualityDimensions": [
+        "Resolution happens exactly once per command invocation (no duplicate prefix lookups across helper calls)",
+        "Stderr context is emitted via a single function call from a shared helper - no copy-paste of formatting between commands",
+        "`task-mgr current` is read-only - does not open a write transaction or touch DB connection write paths",
+        "ResolutionSource enum is exhaustive and named for the SOURCE not the OUTCOME (EnvVar/SinglePrefix/FromJsonFlag/None - not 'Auto'/'Manual')",
+        "Tests are hermetic - use Command::env_remove per learning 2644/2903; never depend on the host shell's env"
+      ],
+      "taskType": "implementation",
+      "title": "task-mgr current + ResolvedContext stderr on writes",
+      "touchesFiles": [
+        "src/commands/current.rs",
+        "src/commands/add.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "src/handlers.rs",
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr cheatsheet` exits 0 with sections in order: `## Common Recipes` (curated), `## Command Reference` (generated table), `## State Inspection` (one paragraph pointing to `task-mgr current`)",
+        "Positive: `task-mgr enhance show` output contains the SAME generated reference table as `task-mgr cheatsheet` (substring match)",
+        "Positive: src/cli/introspect.rs exposes a single `fn generate_command_reference() -> String` consumed by cheatsheet, enhance/templates, and tests/cheatsheet_drift.rs",
+        "Drift test: tests/cheatsheet_drift.rs enumerates clap::CommandFactory::command().get_subcommands() and asserts every non-hidden subcommand appears in generate_command_reference() output",
+        "Drift test: for every `--flag` mentioned in the curated recipes block, asserts the flag exists on its named subcommand (parses the recipe markdown for `task-mgr <cmd> ... --<flag>` patterns)",
+        "Drift test: introducing a `set-status` reference into the curated recipes block (without adding a real `set-status` subcommand) causes the test to fail with a clear diff",
+        "Negative: the strings `set-status`, `add --from-json`, `recall --top-k`, `learnings show <N>` MUST NOT appear in `task-mgr cheatsheet` stdout (assert with grep)",
+        "Negative: cheatsheet/enhance/drift test MUST NOT spawn `task-mgr --help` as a subprocess - grep for `Command::new(\"task-mgr\")` returns no hits in their source",
+        "Known-bad: an impl that hand-codes the reference table as a second &'static str would pass a 'cheatsheet renders' check. Drift test must reject this by comparing the table's subcommand set to CommandFactory's set",
+        "CONTRACT: enhance/templates.rs uses generate_command_reference() at render time (not concatenated at compile time as another literal) - grep enhance/templates.rs for the function call",
+        "Failure mode: if CommandFactory returns zero subcommands (degenerate test state) - cheatsheet renders curated section only with a stderr warning, no panic",
+        "qualityDimensions met: drift CI runs in <100ms hermetic (no fs, no subprocess), curated recipes <=30 lines",
+        "Commit message: `feat: FEAT-002-completed - task-mgr cheatsheet + clap-introspection drift CI`"
+      ],
+      "dependsOn": [],
+      "description": "One canonical, always-accurate cheat sheet. Split WORKFLOW_TEMPLATE (currently a 175-line `&'static str` in src/commands/enhance/templates.rs:26-200) into (a) curated narrative + recipes, (b) a generated command/flag reference table walking `clap::Command::get_subcommands()`. Expose via new `task-mgr cheatsheet` subcommand AND consume in `task-mgr enhance agents` so the marker block in CLAUDE.md/AGENTS.md uses the generated table. Add `tests/cheatsheet_drift.rs` as the CI gate that prevents docs from referencing non-existent commands or flags.\n\nDO: use clap::CommandFactory (per learning 160) - no subprocess spawning. Write the generator into a new `src/cli/introspect.rs` module so cheatsheet, enhance/templates, and the drift test all consume the SAME source. Curated recipes section is a short `&'static str` literal (the 'I want to ... -> run ...' map for the top 10 ops).\n\nDO NOT: regenerate documentation prose from clap output - keep narrative hand-written. Clap can't capture the WHY; only the WHAT. Don't hand-code a second copy of the reference table for cheatsheet - that's the drift bug we're closing.\n\nEdge cases:\n- Subcommand with empty after_help: render with about line only (no example)\n- Subcommand with multi-line about: take first line, ellipsize rest\n- Nested subcommands (loop init, loop run): render the leaf path (e.g. 'loop init'), not just 'loop'\n- Hidden subcommands: exclude from generated reference\n\nKnown-bad:\n- A hand-coded reference table in cheatsheet.rs would pass a 'table renders' test but reintroduce drift. Drift test must enumerate clap::CommandFactory::command().get_subcommands() and assert the table contains every non-hidden one and no extras.\n- Spawning `task-mgr --help` as a subprocess to populate the reference - violates learning 160 and adds binary-on-PATH coupling.",
+      "edgeCases": [
+        "Subcommand with empty after_help: render about line only, no example",
+        "Subcommand with multi-line about: first line, ellipsize",
+        "Nested subcommands (loop init, loop run): render leaf path, not just parent",
+        "Hidden subcommands: exclude from generated reference",
+        "Subcommand whose about is missing entirely: render name with `(no description)` placeholder"
+      ],
+      "estimatedEffort": "high",
+      "failureModes": [
+        {
+          "cause": "CommandFactory returns zero subcommands (degenerate clap state in tests)",
+          "expectedBehavior": "Render curated section only, emit stderr warning, do not panic"
+        },
+        {
+          "cause": "after_help contains malformed/unparseable markdown",
+          "expectedBehavior": "Use the raw text as-is; do not panic; do not silently drop"
+        }
+      ],
+      "id": "FEAT-002",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": false,
+      "notes": "Learning [160]: clap::CommandFactory::command().get_subcommands() is the correct introspection entry. Learning [1069]: cli/tests.rs exhaustive match will break when the new Cheatsheet enum variant is added. Learning [1405]: 6+ file shape - mirror it. Learning [2329]: backwards-compat pattern N/A here (pure addition). Learning [2797]: confirms 'verify docs against compiled binary' is the right pattern. Plan: Prong 2 + Prong 3b. Reuse: src/commands/enhance/templates.rs WORKFLOW_TEMPLATE macro composition pattern.\n\n## Curated cheat-sheet starter list (deconfliction feed, 2026-05-18)\n\nUse this as the source-of-truth set for the FEAT-002 curated-recipes block and to seed the generated reference. Drop anything that doesn't fit the <=30-line budget. The \"negative anchors\" list is the smoking-gun set the audit removed from CLAUDE.md — re-introducing any of these strings into cheatsheet stdout should be a drift-test failure.\n\nCurated recipes (intent → command):\n\n- Look up one task: `task-mgr show <task-id>`\n- List tasks (filter): `task-mgr list` + `--status` / `--prefix` / `--task-type`\n- Pick next eligible task + claim: `task-mgr next --claim` (with `--prefix $PREFIX` in loop)\n- Add a new task (fixup / follow-up): `echo '{…}' | task-mgr add --stdin --depended-on-by <CONTRACT-id-or-milestone>`\n- Mark status from a loop iteration: emit `<task-status>TASK-ID:done</task-status>` (done / failed / skipped / irrelevant / blocked)\n- Mark status outside the loop: `task-mgr complete | fail | skip | unblock | unskip | reset <task-id>` — NO `set-status`\n- Record a learning: `task-mgr learn --outcome <success|failure|workaround|pattern> --title \"…\" --tags \"…\"`\n- Recall learnings for THIS task: `task-mgr recall --for-task <task-id>`\n- Recall by query: `task-mgr recall --query \"<text>\"` (`--allow-degraded` for offline)\n- Initialize DB from a PRD JSON: `task-mgr loop init <prd>.json` — mid-loop sync: `--append --update-existing`\n- Run the autonomous loop: `task-mgr loop run <prd>.json --yes`\n- Run multiple PRDs: `task-mgr batch init '…/*.json' && task-mgr batch run '…/*.json' --yes`\n- List architectural decisions: `task-mgr decisions list`\n- Ratify a decision: `task-mgr decisions resolve <id> <letter>`\n- Edit / tag / supersede a learning: `task-mgr edit-learning <id> --add-tags / --remove-tags / --supersedes <src-id>`\n- Apply / invalidate a learning: `task-mgr apply-learning <id>` / `task-mgr invalidate-learning <id>`\n\nNegative anchors (must NOT appear in cheatsheet stdout — clap-verified wrong on 2026-05-18):\n\n- `task-mgr set-status` — no such subcommand. Real verbs: complete / fail / skip / unblock / unskip / reset. Inside a loop: `<task-status>` tag.\n- `task-mgr learn-tag` — no such subcommand. Use `edit-learning --add-tags` and/or `--supersedes`.\n- `task-mgr add --from-json` — `--from-json` is on `init`, not on `add`. `add` accepts `--stdin` / `--json`.\n- `task-mgr recall --top-k` / `--list-tags` / `--prefix` — none exist. Use `--limit` / `--tags <single>` / `--for-task`.\n- `task-mgr decisions list --tag` — no such flag. Use `--format json` and filter externally.\n- `task-mgr learnings show <N>` — no such subcommand. Use `task-mgr learnings --recent N`.\n\nTwo complementary drift gates (orthogonal — do NOT bundle into FEAT-002):\n\n- FEAT-002's hermetic `tests/cheatsheet_drift.rs` gates renderer-vs-CLI: \"generator never falls behind the clap tree\". This is in-scope.\n- A future `task-mgr enhance agents --check` would gate file-on-disk-vs-renderer: \"CLAUDE.md / AGENTS.md never falls behind the generator\". Different failure class; out of scope for this PRD. Ship as a small follow-up after FEAT-002 lands.\n",
+      "passes": false,
+      "priority": 2,
+      "qualityDimensions": [
+        "Drift CI is hermetic: no subprocess, no fs reads, runs in <100ms (learning 160 pattern)",
+        "Curated recipes section is concise (<=30 lines): the top 10 operations only - if it grows past 30 lines, split into separate doc",
+        "Generated table includes `about` blurb + 1 example per subcommand (pulled from after_help first non-empty line)",
+        "All three consumers (cheatsheet, enhance/templates, drift test) call the SAME generate_command_reference() function - single source of truth, enforced by grep test",
+        "introspect.rs has no dependency on commands/ - lives in src/cli/ to avoid circular deps"
+      ],
+      "taskType": "implementation",
+      "title": "task-mgr cheatsheet + clap-introspection-generated reference + drift CI",
+      "touchesFiles": [
+        "src/cli/introspect.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/cli/mod.rs",
+        "src/commands/cheatsheet.rs",
+        "src/commands/mod.rs",
+        "src/commands/enhance/templates.rs",
+        "src/main.rs",
+        "src/handlers.rs",
+        "tests/cheatsheet_drift.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: `task-mgr set-status FOO done` exits non-zero, stderr contains BOTH clap's 'unrecognized subcommand' line AND a `hint: task-mgr has no `set-status` subcommand. To change status:` worked transition table",
+        "Positive: `task-mgr recall --top-k 5` exits non-zero, stderr contains `hint: task-mgr recall has no `--top-k`. Use `--limit <N>`.`",
+        "Positive: `task-mgr learnings show 2236` exits non-zero, stderr contains `hint:` suggesting `task-mgr recall --query ... --limit 1`",
+        "Positive: `task-mgr remove FOO` exits non-zero, stderr contains `hint:` suggesting `task-mgr irrelevant FOO --reason '...'`",
+        "Positive: `task-mgr update FOO-1 --title x` exits non-zero, stderr contains `hint:` referencing the JSON-edit + loop-init-update-existing workflow",
+        "Unit test (table-driven): for each (invocation, expected_hint_substring) pair, run via assert_cmd::Command and assert stderr contains the substring",
+        "Negative: `task-mgr --foo` (random unknown flag, NOT in hints table) produces clap's default error with NO `hint:` line - assert stderr does not contain 'hint:'",
+        "Negative: `task-mgr inits` (typo close to `init`, NOT in hints table) produces clap's default 'did you mean init' with NO `hint:` line",
+        "Negative: hints must not lie - `task-mgr remove` hint MUST suggest `irrelevant`, not a future `remove` command. Hardcoded fact-check test asserts the literal string `irrelevant` appears in the remove hint",
+        "Known-bad: an impl that prints hints on EVERY error would spam normal usage. The negative tests above guard this; specifically assert random-flag and typo-close-to-real-command produce no hint",
+        "qualityDimensions met: hint tables are pure data (grep `if`/`match` in error_recovery.rs lookup - <5 control-flow keywords); per-subcommand scoping (wrong-flag hints check the failing subcommand path, not just flag name)",
+        "Failure mode: if error_recovery code panics during formatting - fallback to clap's default unmodified; assert via deliberate panic injection test that the binary still exits non-zero with clap's message",
+        "Commit message: `feat: FEAT-003-completed - wrong-name/flag hint table on clap parse errors`"
+      ],
+      "dependsOn": [],
+      "description": "Wrap clap's parse error surface so that known-wrong invocations carry a worked example. Static WRONG_NAME_HINTS and WRONG_FLAG_HINTS maps cover the patterns observed in the failure trace.\n\nDO: define both tables as `static [(name, hint); N]` arrays in a new src/cli/error_recovery.rs. Initial coverage:\n- `set-status` -> status-transition table (complete/fail/skip/reset/unblock/unskip/irrelevant)\n- `remove` / `delete` -> `task-mgr irrelevant <id> --reason ...` (cross-reference the CLI-fix plan that will add `remove`)\n- `update` / `edit` / `change` -> 'no `update` subcommand yet - edit the JSON in the worktree, then `task-mgr loop init <prd>.json --append --update-existing`' (cross-reference the other plan)\n- `learnings show <N>` / `learnings get <N>` -> 'use `task-mgr recall --query <text> --limit 1` or `task-mgr learnings | grep <N>`'\n- `recall --top-k` -> 'no `--top-k`. Use `--limit <N>`.'\n\nDO NOT: replace clap's normal error path - WRAP it. Clap's normal error message still prints; our `hint: ...` goes on a separate trailing stderr line.\n\nEdge cases:\n- Typo close to a real command but not in hints table (`task-mgr inits`): fall through to clap's built-in 'did you mean' with no extra hint\n- Subcommand with `--top-k` style flag that DOES exist elsewhere: verify wrong-flag hints are scoped per-subcommand, not global\n- ANSI color codes around clap's error output: don't break our hint placement; hint goes on its own line after clap's reset sequence\n\nKnown-bad:\n- A hint engine that prints hints on EVERY clap error would spam normal usage (e.g. typing `task-mgr --foo` for a true typo). Test asserts `task-mgr --foo` produces NO hint, just clap's default.\n- A 'remove' hint that lies by suggesting a non-existent `task-mgr remove` command (post-CLI-fix-plan, this becomes real - but until then, suggest `irrelevant`)",
+      "edgeCases": [
+        "Typo close to a real command but not in hints table: fall through to clap's 'did you mean' with no extra hint",
+        "Wrong-flag for a flag name that exists on a DIFFERENT subcommand: scope to the failing subcommand, don't suggest the unrelated one",
+        "ANSI color codes in clap's error output: hint placement does not break formatting",
+        "Recovery fn itself panics: fall back to clap's unmodified default"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "error_recovery panics during hint formatting",
+          "expectedBehavior": "Catch via std::panic::catch_unwind, fall back to clap's default error path, log to stderr"
+        }
+      ],
+      "id": "FEAT-003",
+      "modifiesBehavior": false,
+      "notes": "Plan: Prong 4a. Addresses the specific wrong invocations from the failure trace (see plan Context section). Learning [2797] supports the 'lying docs cause real failures' rationale. This hint table is the safety net for the moment a wrong invocation slips through despite Prong 2 docs accuracy. Reuse: assert_cmd::Command pattern used elsewhere in tests/cli_tests.rs.",
+      "passes": false,
+      "priority": 3,
+      "qualityDimensions": [
+        "Hint tables are pure data - no branching logic in lookup beyond exact-match on string key",
+        "Wrong-flag hints are scoped per-subcommand (look at the path that failed, not global)",
+        "Hints are short: <=5 lines, with a copy-pasteable corrected example",
+        "Adding a new entry is a single-line change to the static array - no schema migration, no new fn",
+        "Error recovery is wrapper-shaped: clap's print happens first, hint appended after; no replacement"
+      ],
+      "taskType": "implementation",
+      "title": "Wrong-name / wrong-flag hint table on clap parse errors",
+      "touchesFiles": [
+        "src/cli/error_recovery.rs",
+        "src/cli/mod.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive (how): `task-mgr how 'change task status'` exits 0, stdout contains 'complete', 'fail', 'skip', 'reset' as a transition table",
+        "Positive (how): `task-mgr how 'add a follow-up task'` exits 0, stdout contains the three canonical `task-mgr add --stdin --depended-on-by ...` forms",
+        "Positive (how): `task-mgr how 'where will my add land'` exits 0, stdout points to `task-mgr current`",
+        "Positive (how): `task-mgr how 'totally unrelated nonsense query'` exits 0 with `no recipe matched. Run \\`task-mgr cheatsheet\\` for the full surface.`",
+        "Positive (how): `task-mgr how` with no arg lists available intent keyword bags, one per line, exits 0",
+        "Positive (how): `task-mgr how` appears in `task-mgr --help` output - it is a VISIBLE subcommand, not hidden",
+        "Positive (refusal): `TASK_MGR_ACTIVE_PREFIX=other-prefix task-mgr add --stdin --depended-on-by 5ba153a7-MILESTONE-FINAL '{...}'` exits non-zero, stderr contains `Refusing: target ... lives in PRD <other>.json (prefix 5ba153a7), but active prefix is other-prefix`",
+        "Positive (refusal): refusal message contains BOTH suggested fixes: `TASK_MGR_ACTIVE_PREFIX=5ba153a7 task-mgr add ...` AND a reference to `--from-json tasks/<correct-prd>.json` (when that flag ships from the CLI-fix plan)",
+        "Positive (refusal): same call with `TASK_MGR_ACTIVE_PREFIX=5ba153a7` succeeds as today - regression check",
+        "Unit test (refusal): pre-flight check runs BEFORE the DB transaction opens - verify by injecting a DB-failure mock and confirming the refusal still fires (no DB error wrapper around it)",
+        "Unit test (refusal): assert DB row count and target JSON file mtime are unchanged after a refusal (no partial writes)",
+        "Known-bad (refusal): an impl that runs the check AFTER the DB write would pass 'error emitted' tests but leak a stray row. Row-count and mtime assertions guard this",
+        "CONTRACT: cross-PRD detection calls FEAT-001's `resolve_active_prefix` and ResolvedContext - grep src/commands/add.rs for both names (single source of truth, no parallel resolution)",
+        "Failure mode: --depended-on-by references an id whose prefix matches NO known PRD - suggest `task-mgr list --prefix <p>` to find the right id, refuse",
+        "Edge case (how): `how ''` empty arg lists intents one per line, exits 0",
+        "Edge case (how): `how 'sync json'` matches >1 intent - print all matches separated by `---`, exit 0",
+        "modifiesBehavior caller audit: progress log lists every caller of `task-mgr add --stdin --depended-on-by` found in tests/*.rs and .task-mgr/tasks/*-prompt.md, with the per-caller verdict (OK / updated / no change needed)",
+        "qualityDimensions met: intent matching is deterministic case-insensitive; refusal happens before DB transaction; refusal message includes exact fix command; how and cheatsheet outputs are non-overlapping",
+        "Commit message: `feat: FEAT-004-completed - task-mgr how + hard-refuse cross-PRD --depended-on-by`"
+      ],
+      "dependsOn": [
+        "FEAT-001"
+      ],
+      "description": "Two related changes that share the cross-PRD detection logic.\n\n(a) New visible `task-mgr how '<intent>'` subcommand: hand-curated keyword -> recipe map covering the 10 most common intents. NOT LLM-powered - static, deterministic, fast.\n\n(b) Hard-refusal logic in `task-mgr add` when `--depended-on-by <id>` resolves to a PRD JSON different from the active prefix's PRD. Current behavior silently writes to the wrong file (learning 2236/2281); this change makes it an explicit error with a worked fix.\n\nDO: define `INTENTS: &[(&[&str], &str)]` in src/commands/intents.rs - array of (keyword bag, recipe text) tuples. Matching = case-insensitive `contains_all` on tokens. Cover top 10 intents:\n  1. change task status (complete/fail/skip/reset/unblock/unskip/irrelevant)\n  2. add follow-up task (three canonical --depended-on-by forms)\n  3. spawn fix from REVIEW (--depended-on-by REVIEW-001 with FIX-xxx id)\n  4. sync JSON into a running effort (loop init --append --update-existing)\n  5. ratify a tm-decision (`tm-decisions resolve <id> <letter>`)\n  6. recall learnings for a task (recall --for-task <id>)\n  7. find tasks by file (list --touches-file <path>)\n  8. debug 'where will my add land' (`task-mgr current`)\n  9. switch active PRD (export TASK_MGR_ACTIVE_PREFIX=...)\n  10. view active PRD (`task-mgr current`)\n\nDO: apply learning 1559 - validate `--depended-on-by` target's PRD BEFORE any DB write. If the target's prefix doesn't match the active prefix's PRD, emit a worked refusal that includes the exact env-var-and-rerun command.\n\nDO NOT: use LLM / embedding lookup for intents - keep it static, deterministic, fast. Do NOT auto-redirect on cross-PRD mismatch (user explicitly chose hard-refuse). Do NOT regress the existing same-PRD --depended-on-by behavior.\n\nmodifiesBehavior: TRUE - silent landing -> hard error. Search for callers of `task-mgr add --stdin --depended-on-by` in:\n  - tests/*.rs (assert_cmd invocations)\n  - .task-mgr/tasks/*-prompt.md (existing loop prompts may rely on the silent behavior)\n  - scripts/ and any shell history fixtures\nEach caller affected must be documented in the progress log; either update the caller or assert in a test that the new behavior matches expectations.\n\nEdge cases:\n- `how ''` (empty query): list all intent keywords, exit 0\n- `how` query matching multiple intents: print all matches separated by `---`, exit 0\n- Cross-PRD ref with no active prefix resolved: refuse with 'no active PRD; set TASK_MGR_ACTIVE_PREFIX or pass --from-json'\n- --depended-on-by references an id whose prefix is in NO known PRD: suggest `task-mgr list` and refuse",
+      "edgeCases": [
+        "how '' (empty query): list available intents, exit 0",
+        "how query matching multiple intents: print all matches separated by ---, exit 0",
+        "Cross-PRD ref with no active prefix resolved: refuse with 'no active PRD; set TASK_MGR_ACTIVE_PREFIX or pass --from-json'",
+        "--depended-on-by id with unknown prefix (orphan/typo): suggest `task-mgr list --prefix <p>` and refuse",
+        "Existing test fixtures in tests/cli_tests.rs that depend on silent-landing behavior: must be identified and updated"
+      ],
+      "estimatedEffort": "medium",
+      "failureModes": [
+        {
+          "cause": "--depended-on-by id has prefix matching no known PRD",
+          "expectedBehavior": "Refuse with 'no PRD found for prefix <p>; run `task-mgr list --prefix <p>` to verify the id exists'"
+        },
+        {
+          "cause": "Active prefix resolves to None (multi-prefix DB, no env var)",
+          "expectedBehavior": "Refuse with 'no active PRD; set TASK_MGR_ACTIVE_PREFIX=<correct> or pass --from-json tasks/<correct>.json'"
+        }
+      ],
+      "id": "FEAT-004",
+      "model": "claude-opus-4-7",
+      "modifiesBehavior": true,
+      "notes": "modifiesBehavior=true: silent landing becomes hard error. Audit all callers per Behavior Modification Protocol in prompt file. Learning [1559]: pre-flight validation before DB writes - mirror this pattern (validate ALL --depended-on-by targets before opening transaction). Learning [2236]/[2281]: this is the smoking-gun failure mode that motivates the refusal. Learning [2894]: DB/JSON sync lag - this change makes the silent-misroute failure mode impossible at the source. Plan: Prong 4b. Reuse: FEAT-001's ResolvedContext + ResolutionSource enum (single source of truth for resolution).",
+      "passes": false,
+      "priority": 4,
+      "qualityDimensions": [
+        "Intent matching is deterministic and case-insensitive (no surprises across machines)",
+        "Cross-PRD refusal happens before DB transaction opens (per learning 1559)",
+        "Refusal message includes the exact fix command, not just a description of what went wrong",
+        "`how` and `cheatsheet` outputs are non-overlapping: how is intent-keyed; cheatsheet is surface-keyed",
+        "INTENTS table is pure data; matching fn is <20 lines",
+        "Cross-PRD detection reuses FEAT-001's ResolvedContext - no parallel resolution code"
+      ],
+      "taskType": "implementation",
+      "title": "task-mgr how advisor + hard-refuse cross-PRD --depended-on-by",
+      "touchesFiles": [
+        "src/commands/how.rs",
+        "src/commands/intents.rs",
+        "src/commands/add.rs",
+        "src/commands/mod.rs",
+        "src/cli/commands.rs",
+        "src/cli/tests.rs",
+        "src/main.rs",
+        "src/handlers.rs",
+        "tests/cli_tests.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "No duplicated formatting helpers across current.rs / cheatsheet.rs / how.rs (DRY)",
+        "ResolvedContext + resolve_active_prefix have ONE callsite per consumer module - grep across src/commands/ and src/cli/ confirms no parallel resolution code",
+        "introspect.rs generate_command_reference() is called by cheatsheet, enhance/templates, AND tests/cheatsheet_drift.rs - grep confirms 3 distinct call sites",
+        "All new subcommands follow the 6-file shape from learning 1405 - verify each of current/cheatsheet/how registers in: src/cli/commands.rs, src/main.rs, src/handlers.rs, src/commands/<name>.rs, src/commands/mod.rs, tests file",
+        "Functions in new modules are <30 lines (flag complex ones for splitting)",
+        "Issues found spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001` (atomic DB+JSON sync, no manual JSON edit)",
+        "If no issues found: emit `<task-status>REFACTOR-001:done</task-status>` with one-line progress note 'No refactor needed'"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004"
+      ],
+      "description": "Review all FEAT-001..004 implementations for refactoring opportunities. Specifically look for:\n\n1. Duplication across current.rs / cheatsheet.rs / how.rs - all three render text from static data. If two of them grew similar formatting helpers, extract a shared module.\n2. Shared helpers between error_recovery.rs (wrong-name/flag hints) and intents.rs (how recipes) - both are 'lookup hand-curated string by key'. Don't merge if the data shapes differ; do merge if a common Lookup<Key, Text> trait emerged.\n3. ResolvedContext consumers (FEAT-001 in add.rs, FEAT-004 cross-PRD check) - verify they call the SAME helper, not parallel impls.\n4. introspect.rs callers (cheatsheet, enhance/templates, drift test) - verify single source of truth.\n5. New subcommands (current, cheatsheet, how) - all 3 follow the same 6-file shape per learning 1405. Verify consistency.\n\nDO: invoke /simplify on any single touchpoint that's ugly (don't wait for review-spawn churn). Spawn REFACTOR-FIX-xxx via `task-mgr add --stdin --depended-on-by REVIEW-001` for cross-cutting refactors only.\n\nDO NOT: refactor for hypothetical future use; only for current-code DRY/clarity.",
+      "estimatedEffort": "high",
+      "id": "REFACTOR-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for atomic DB+JSON sync. Use /simplify directly on isolated ugly touchpoints. Reuse helpers from src/loop_engine/prompt_sections/ (small static composers) if the shape matches.",
+      "passes": false,
+      "priority": 98,
+      "qualityDimensions": [
+        "DRY across new modules (current.rs / cheatsheet.rs / how.rs)",
+        "Single-source-of-truth for ResolvedContext + introspect generator",
+        "Pattern consistency with existing 6-file subcommand shape (learning 1405)",
+        "Functions <30 lines"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Review for refactoring opportunities",
+      "touchesFiles": [
+        "src/commands/current.rs",
+        "src/commands/cheatsheet.rs",
+        "src/commands/how.rs",
+        "src/commands/intents.rs",
+        "src/commands/add.rs",
+        "src/cli/error_recovery.rs",
+        "src/cli/introspect.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs"
+      ]
+    },
+    {
+      "acceptanceCriteria": [
+        "Positive: All new code reachable from production entry points - grep-verify each of `Commands::Current`, `Commands::Cheatsheet`, `Commands::How` is registered in main.rs dispatch",
+        "Positive: All errors propagated with context (map_err, no unwrap in production paths)",
+        "Positive: FULL `cargo fmt --check && cargo check && cargo clippy -- -D warnings && cargo test` (no scope filter) all clean",
+        "Negative: No unwrap() in production code paths in new modules - grep src/commands/{current,cheatsheet,how,intents}.rs and src/cli/{error_recovery,introspect}.rs for `unwrap(` returns 0 hits",
+        "Negative: No dead code warnings for new modules",
+        "End-to-end smoke 1 (FEAT-003): `task-mgr set-status FOO done` exits non-zero with worked hint",
+        "End-to-end smoke 2 (FEAT-004): cross-PRD refusal with mismatched env var refuses with no JSON file modified, no DB row added",
+        "End-to-end smoke 3 (FEAT-002): `task-mgr cheatsheet` output contains zero of {set-status, add --from-json, recall --top-k, learnings show}",
+        "End-to-end smoke 4 (FEAT-001): `task-mgr current` prints `active prefix=... source=... target=...` line and exits 0",
+        "End-to-end smoke 5 (FEAT-004): `task-mgr how 'change task status'` returns transition table",
+        "End-to-end smoke 6 (drift test): adding a fake `--top-k` reference into curated recipes causes tests/cheatsheet_drift.rs to fail with a clear diff (verified by adding then reverting in the same iteration)",
+        "Documentation: project CLAUDE.md `## task-mgr workflow` block references `current`, `cheatsheet`, `how` - grep confirms",
+        "Documentation: progress log notes that ~/.claude/CLAUDE.md edit (removing `set-status` reference) is the USER'S responsibility - flag as follow-up",
+        "Pre-existing test failures fixed inline (or single FIX-xxx spawned if >~12 unrelated failures per the prompt-file pragmatic escape hatch)",
+        "If issues found: FIX-xxx tasks spawned via `task-mgr add --stdin --depended-on-by REVIEW-001`",
+        "If no issues found: emit `<task-status>REVIEW-001:done</task-status>` with one-line 'Clean review' note"
+      ],
+      "dependsOn": [
+        "FEAT-001",
+        "FEAT-002",
+        "FEAT-003",
+        "FEAT-004",
+        "REFACTOR-001"
+      ],
+      "description": "Final code review. RUNS THE FULL QUALITY GATE (unscoped cargo test, cargo clippy -- -D warnings, cargo fmt --check). Replays the failure-trace from the plan Context section as an end-to-end smoke.\n\nDO: check every new subcommand is reachable via `task-mgr --help`; new modules registered in handlers.rs and main.rs; cli/tests.rs exhaustive match updated. Run FULL cargo test (no scope filter) - this is THE place the full suite runs.\n\nDO: end-to-end smoke verification:\n  1. `task-mgr set-status FOO done` -> exits non-zero with worked hint (FEAT-003)\n  2. `TASK_MGR_ACTIVE_PREFIX=stale task-mgr add --depended-on-by <foreign-prd-id> '...'` -> refuses, no JSON written, no DB row added (FEAT-004)\n  3. `task-mgr cheatsheet` -> shows only real commands; introducing `set-status` reference into curated recipes fails CI (FEAT-002)\n  4. `task-mgr current` -> reports prefix + source + path (FEAT-001)\n  5. `task-mgr how 'change task status'` -> returns transition table (FEAT-004)\n  6. Drift test: introduce a fake `--top-k` reference into the curated recipes block -> tests/cheatsheet_drift.rs fails\n\nDO: documentation - update the managed `## task-mgr workflow` block in project CLAUDE.md to reference `current`, `cheatsheet`, and `how`. Note in progress log that the global ~/.claude/CLAUDE.md edit (removing `set-status` reference) is the USER'S responsibility - flag it as a follow-up.\n\nDO NOT: skip the wiring check - unconnected code is the #1 failure mode. Do NOT scope the test suite (no `cargo test -p <crate>` - this task runs the unscoped suite).",
+      "estimatedEffort": "medium",
+      "id": "REVIEW-001",
+      "model": "claude-opus-4-7",
+      "notes": "Spawn fixes via `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` for atomic DB+JSON sync. The end-to-end smokes are the contractual replay of the failure trace from /home/chris/.claude/plans/plan-out-how-to-lazy-pixel.md (Context section). If implementation drifted from plan, update remaining tasks via `task-mgr loop init tasks/agent-learnability.json --append --update-existing`.",
+      "passes": false,
+      "priority": 99,
+      "qualityDimensions": [
+        "No unwrap in production code in new modules",
+        "All new subcommands wired to production entry points (grep-verified)",
+        "Full suite green including pre-existing failures",
+        "End-to-end smoke replays the failure-trace from the plan",
+        "Documentation updated for project CLAUDE.md; global ~/.claude/CLAUDE.md flagged as USER follow-up"
+      ],
+      "taskType": "review",
+      "timeoutSecs": 1800,
+      "title": "Code review + final verification + full quality gate",
+      "touchesFiles": [
+        "src/commands/current.rs",
+        "src/commands/cheatsheet.rs",
+        "src/commands/how.rs",
+        "src/commands/intents.rs",
+        "src/commands/add.rs",
+        "src/cli/error_recovery.rs",
+        "src/cli/introspect.rs",
+        "src/cli/commands.rs",
+        "src/main.rs",
+        "src/handlers.rs",
+        "tests/cheatsheet_drift.rs",
+        "tests/cli_tests.rs",
+        "CLAUDE.md"
+      ]
+    }
+  ],
+  "version": "1.0"
+}
