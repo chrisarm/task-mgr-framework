@@ -243,7 +243,7 @@
       "id": "REFACTOR-001",
       "model": "claude-opus-4-7",
       "notes": "If issues: `echo '{...}' | task-mgr add --stdin --depended-on-by REVIEW-001` (priority 50-97). If clean, emit `<task-status>REFACTOR-001:done</task-status>` with a one-line note.",
-      "passes": false,
+      "passes": true,
       "priority": 98,
       "qualityDimensions": [
         "DRY across the two dispatch sites",
